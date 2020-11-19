@@ -8,8 +8,7 @@ def generate_random_number() -> int:
     # TODO: Implement PRG
     # TODO: Do not forget to change the output type to Zp (and similar types)
 
-    return 1
-    # return random.randint(2 ** 0, 2 ** 32)
+    return random.randint(2 ** 0, 2 ** 32)
 
 
 def share_secret(arg: Any) -> Tuple[Any, Any]:
