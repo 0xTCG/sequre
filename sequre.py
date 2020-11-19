@@ -1,6 +1,6 @@
 from typing import Any
 
-from mpc import arithmetics
+from mpc import preprocess, arithmetics
 from networking.mainframe import Mainframe
 
 
@@ -29,4 +29,4 @@ class Sequre:
     
     def multiply(self: 'Sequre', x: Any, y: Any) -> Any:
         return self.mf(arithmetics.multiply)(
-            x, y, secret_args_mask='11', preprocess=arithmetics.get_multiplication_triple)
+            x, y, secret_args_mask='11', preprocess=preprocess.get_multiplication_triple)
