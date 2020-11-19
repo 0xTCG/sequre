@@ -1,0 +1,2 @@
+NUMBER_OF_CLIENTS: int = 3
+
