@@ -1,4 +1,4 @@
-from typing import Callable, List
+from typing import Callable, List, Any
 
 from networking.client import Client
 from utils.constants import NUMBER_OF_CLIENTS
@@ -26,6 +26,10 @@ class Mainframe:
         # Temp local scenario:
         return Client(pid)
     
+    def __client_call(self: 'Mainframe', client: Client, func: Callable, *args) -> Any:
+        # Temp local scenario
+        return client.call(func, *args)
+    
     def __call(self: 'Mainframe', func: Callable) -> Callable:
         def secure_func(*args, args_mask: str): 
             shared_args: List[tuple] = [
@@ -33,7 +37,7 @@ class Mainframe:
                 for arg, mask in zip(args, args_mask)]
                 
             returned_values: list = [
-                client.call(func, *[arg[i] for arg in shared_args])
+                self.__client_call(client, func, *[arg[i] for arg in shared_args])
                 for i, client in enumerate(self.clients[1:])]
             
             return reconstruct_secret(returned_values)
