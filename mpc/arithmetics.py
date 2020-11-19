@@ -21,12 +21,6 @@ def multiply_scalar(x: Any, a: Any, client: Client, context_id: int) -> tuple:
     return 0, x * a
 
 
-def get_multiplication_triple() -> List[tuple]:
-    triple: List[tuple] = [generate_random_number()] * 2
-    triple.append(math.prod(triple))
-
-    return [share_secret(e) for e in triple]
-
 def multiply(x: Any, y: Any, a: Any, b: Any, c: Any, client: Client, context_id: int) -> tuple:
     x_a = client.get_counter_client().get_shared(
         context_id=context_id,
