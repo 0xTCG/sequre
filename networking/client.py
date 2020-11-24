@@ -43,3 +43,6 @@ class Client:
         other_shared = self.get_counter_client().get_shared(context_id, secrets, transform)
 
         return self_shared + other_shared
+    
+    def load_shared_from_path(self: 'Client', context_id: Any, data_path: str) -> list:
+        raise NotImplementedError()
