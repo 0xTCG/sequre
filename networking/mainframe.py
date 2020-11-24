@@ -56,16 +56,27 @@ class Mainframe:
         public_value = values[0][0]
         shared_values = [val[1] for val in values]
         return public_value + sum(shared_values)
+    
+    def __load_shared_from_path(self: 'Mainframe', context_id: Any, data_path: str) -> List[tuple]:
+        return [shared_pair for shared_pair in zip(
+            self.clients[CP1].load_shared_from_path(context_id, data_path),
+            self.clients[CP2].load_shared_from_path(context_id, data_path))]
+
+    def __get_shared_inputs(self: 'Mainframe', *args, secret_args_mask: str,
+                            context_id: Any, data_path: str = None) -> List[tuple]:
+        if len(args) > 0:
+            return [self.__share_secret(
+                        arg,
+                        context_id=context_id,
+                        mask=int(mask))
+                    for arg, mask in zip(args, secret_args_mask)]
+        return self.__load_shared_from_path(context_id, data_path)
 
     def __call(self: 'Mainframe', func: Callable) -> Callable:
         def secure_func(*args, secret_args_mask: str, preprocess: Callable): 
             context_id: int = uuid.uuid1()
-            shared_args: List[tuple] = [
-                self.__share_secret(
-                    arg,
-                    context_id=context_id,
-                    mask=int(mask))
-                for arg, mask in zip(args, secret_args_mask)]
+            shared_args: List[tuple] = self.__get_shared_inputs(
+                *args, secret_args_mask=secret_args_mask, context_id=context_id)
             
             if preprocess:
                 extra_args: List[tuple] = self.__client_call(
