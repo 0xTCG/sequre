@@ -48,7 +48,7 @@ class Mainframe:
             return [share_secret(
                         self.clients, arg,
                         context_id=context_id,
-                        mask=int(mask))
+                        private=bool(int(mask)))
                     for arg, mask in zip(args, secret_args_mask)]
         return load_shared_from_path(self.clients, context_id, data_path)
 

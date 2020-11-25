@@ -30,6 +30,9 @@ class Client:
     
     def get_shared(self: 'Client', context_id: int, secrets: list, transform: Callable) -> Any:
         return transform([self.__context[context_id][i] for i in secrets])
+    
+    def get_param(self: 'Client', context_id: int, param_index: int) -> Any:
+        return self.__context[context_id][param_index]
 
     def get_counter_client(self: 'Client') -> 'Client':
         if self.pid == CP0:

@@ -3,6 +3,8 @@ from typing import Any, Tuple, Callable
 
 from networking.client import Client
 
+from custom_types.vector import Vector
+
 
 def generate_random_number() -> int:
     # TODO: Implement PRG
@@ -14,6 +16,9 @@ def generate_random_number() -> int:
 def decompose(arg: Any) -> Tuple[Any, Any]:
     r: int = generate_random_number()
 
+    if isinstance(arg, Vector):
+        return Vector([r] * len(arg)), arg - r
+    
     return r, arg - r
 
 
@@ -27,8 +32,8 @@ def prune_context(clients: list, context_id: int):
         client.prune_context(context_id)
 
 
-def share_secret(clients: list, value: Any, context_id: int, mask: int = 1):
-    shared_pair: tuple = decompose(value) if mask else (value, ) * 2
+def share_secret(clients: list, value: Any, context_id: int, private: bool = True):
+    shared_pair: tuple = decompose(value) if private else (value, ) * 2
     append_to_context(clients, context_id, shared_pair)
 
 

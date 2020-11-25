@@ -3,6 +3,8 @@ from typing import Any
 from mpc import preprocess, arithmetics
 from networking.mainframe import Mainframe
 
+from custom_types.vector import Vector
+
 
 class Sequre:
     def __init__(self: 'Sequre'):
@@ -31,3 +33,8 @@ class Sequre:
         return self.mf(arithmetics.multiply)(
             x, y, secret_args_mask='11',
             preprocess=preprocess.get_multiplication_triple)
+
+    def evaluate_polynomial(self: 'Sequre', x: Vector, coef: Vector, exp: Vector) -> Any:
+        return self.mf(arithmetics.evaluate_polynomial)(
+            x, coef, exp, secret_args_mask='111',
+            preprocess=preprocess.beaver_partition)
