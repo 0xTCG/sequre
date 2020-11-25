@@ -17,16 +17,17 @@ class Sequre:
 
     def add(self: 'Sequre', x: Any, y: Any) -> Any:
         return self.mf(arithmetics.add)(
-            x, y, secret_args_mask='11', preprocess=None)
+            x, y, secret_args_mask='11')
 
     def add_public(self: 'Sequre', x: Any, a: Any) -> Any:
         return self.mf(arithmetics.add_scalar)(
-            x, a, secret_args_mask='10', preprocess=None)
+            x, a, secret_args_mask='10')
     
     def multiply_public(self: 'Sequre', x: Any, a: Any) -> Any:
         return self.mf(arithmetics.multiply_scalar)(
-            x, a, secret_args_mask='10', preprocess=None)
+            x, a, secret_args_mask='10')
     
     def multiply(self: 'Sequre', x: Any, y: Any) -> Any:
         return self.mf(arithmetics.multiply)(
-            x, y, secret_args_mask='11', preprocess=preprocess.get_multiplication_triple)
+            x, y, secret_args_mask='11',
+            preprocess=preprocess.get_multiplication_triple)

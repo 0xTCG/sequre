@@ -18,16 +18,15 @@ class Client:
         # Temp local solution:
         del self.__other_clients[other.pid]
 
-    def call(self: 'Client', secure_fn: Callable, *args) -> Any:
-        # TODO: Implement async/sync callstack
-        
-        return secure_fn(*args)
+    def call(self: 'Client', secure_fn: Callable, context_id: int) -> Any:
+        return secure_fn(self, context_id, *self.__context[context_id])
     
     def append_to_context(self: 'Client', context_id: int, shared: Any):
         self.__context[context_id].append(shared)
     
     def prune_context(self: 'Client', context_id: int):
-        del self.__context[context_id]
+        if context_id in self.__context:
+            del self.__context[context_id]
     
     def get_shared(self: 'Client', context_id: int, secrets: list, transform: Callable) -> Any:
         return transform([self.__context[context_id][i] for i in secrets])
@@ -37,6 +36,9 @@ class Client:
             raise ValueError('Preprocess client has no counter client.')
         
         return self.__other_clients[int(not self.pid)]
+    
+    def get_other_clients(self: 'Client') -> list:
+        return list(self.__other_clients.values())
 
     def reconstruct_secret(self: 'Client', context_id: int, secrets: list, transform: Callable) -> Any:
         self_shared = self.get_shared(context_id, secrets, transform)
