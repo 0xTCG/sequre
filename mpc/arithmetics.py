@@ -3,25 +3,24 @@ import math
 from typing import Any, List
 
 from networking.client import Client
-from mpc.secret import generate_random_number, share_secret
 from utils.constants import CP2
 from utils.lambdas import subtract
 
 
-def add(x: Any, y: Any, client: Client, context_id: int) -> tuple:
+def add(client: Client, context_id: int, x: Any, y: Any) -> tuple:
     return 0, x + y
 
 
-def add_scalar(x: Any, a: Any, client: Client, context_id: int) -> tuple:
+def add_scalar(client: Client, context_id: int, x: Any, a: Any) -> tuple:
     a *= int(client.pid == CP2)
     return 0, x + a
 
 
-def multiply_scalar(x: Any, a: Any, client: Client, context_id: int) -> tuple:
+def multiply_scalar(client: Client, context_id: int, x: Any, a: Any) -> tuple:
     return 0, x * a
 
 
-def multiply(x: Any, y: Any, a: Any, b: Any, c: Any, client: Client, context_id: int) -> tuple:
+def multiply(client: Client, context_id: int, x: Any, y: Any, a: Any, b: Any, c: Any) -> tuple:
     x_a = client.get_counter_client().get_shared(
         context_id=context_id,
         secrets=[0, 2],
