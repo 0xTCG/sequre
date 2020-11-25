@@ -16,17 +16,16 @@ def get_multiplication_triple(client: Client, context_id: int) -> List[tuple]:
 
 
 def beaver_partition(client: Client, context_id: int) -> List[tuple]:
-    x: Vector = client.get_param(0)
-    peaky_blinders: Vector = Vector([generate_random_number()] * len(x))
     computing_clients: list = client.get_other_clients()
+    vector_len: int = len(computing_clients[0].get_param(context_id, 0))
+    peaky_blinders: Vector = Vector([generate_random_number()] * vector_len)
     share_secret(clients=computing_clients, context_id=context_id, value=peaky_blinders)
 
     x_r = sum([
-        client.get_counter_client().get_shared(
+        client.get_shared(
             context_id=context_id,
             secrets=[0, -1],
             transform=subtract)
-        for client in computing_clients])
+        for client in computing_clients], Vector([0] * vector_len))
     
-    share_secret(clients=computing_clients, context_id=context_id, value=x_r, mask=0)
-
+    share_secret(clients=computing_clients, context_id=context_id, value=x_r, private=False)
