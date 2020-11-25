@@ -19,6 +19,7 @@ def beaver_partition(client: Client, context_id: int) -> List[tuple]:
     computing_clients: list = client.get_other_clients()
     vector_len: int = len(computing_clients[0].get_param(context_id, 0))
     peaky_blinders: Vector = Vector([generate_random_number()] * vector_len)
+    client.append_to_context(context_id=context_id, shared=peaky_blinders)
     share_secret(clients=computing_clients, context_id=context_id, value=peaky_blinders)
 
     x_r = sum([
