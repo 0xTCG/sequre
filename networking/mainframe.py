@@ -1,11 +1,11 @@
 import uuid
-from typing import Callable, List, Any
+from typing import Callable, List, Any, Tuple
 from functools import partial
 from itertools import permutations
 
 from networking.client import Client
 from utils.constants import NUMBER_OF_CLIENTS, CP0, CP1, CP2
-from mpc.secret import share_secret
+from mpc.secret import decompose, share_secret, load_shared_from_path, append_to_context, prune_context
 
 class Mainframe:
     def __init__(self: 'Mainframe'):
@@ -33,67 +33,51 @@ class Mainframe:
         # Temp local scenario:
         return Client(pid)
     
-    def __client_call(self: 'Mainframe', client: Client, func: Callable, *args) -> Any:
+    def __client_call(self: 'Mainframe', client: Client, func: Callable, context_id: int) -> Any:
         # Temp local scenario:
-        return client.call(func, *args)
-    
-    def __append_to_context(self: 'Mainframe', context_id: int, shared_pair: tuple):
-        shared_1, shared_2 = shared_pair
-        self.clients[CP1].append_to_context(context_id, shared_1)
-        self.clients[CP2].append_to_context(context_id, shared_2)
-
-    def __share_secret(self: 'Mainframe', value: Any, context_id: int, mask: int) -> tuple:
-        shared_pair: tuple = share_secret(value) if mask else (value, ) * 2
-        self.__append_to_context(context_id, shared_pair)
-
-        return shared_pair
-    
-    def __prune_context(self: 'Mainframe', context_id: int):
-        for client in self.computing_clients:
-            client.prune_context(context_id)
+        return client.call(func, context_id)
     
     def __reconstruct_secret(self: 'Mainframe', values: List[tuple]) -> Any:
         public_value = values[0][0]
         shared_values = [val[1] for val in values]
         return public_value + sum(shared_values)
-    
-    def __load_shared_from_path(self: 'Mainframe', context_id: Any, data_path: str) -> List[tuple]:
-        return [shared_pair for shared_pair in zip(
-            self.clients[CP1].load_shared_from_path(context_id, data_path),
-            self.clients[CP2].load_shared_from_path(context_id, data_path))]
 
-    def __get_shared_inputs(self: 'Mainframe', *args, secret_args_mask: str,
-                            context_id: Any, data_path: str = None) -> List[tuple]:
+    def __set_shareds(self: 'Mainframe', *args, secret_args_mask: str,
+                            context_id: Any, data_path: str) -> List[tuple]:
         if len(args) > 0:
-            return [self.__share_secret(
-                        arg,
+            return [share_secret(
+                        self.clients, arg,
                         context_id=context_id,
                         mask=int(mask))
                     for arg, mask in zip(args, secret_args_mask)]
-        return self.__load_shared_from_path(context_id, data_path)
+        return load_shared_from_path(self.clients, context_id, data_path)
 
     def __call(self: 'Mainframe', func: Callable) -> Callable:
-        def secure_func(*args, secret_args_mask: str, preprocess: Callable): 
+        def secure_func(*args,
+                        secret_args_mask: str = None,
+                        preprocess: Callable = None,
+                        data_path: str = None):
             context_id: int = uuid.uuid1()
-            shared_args: List[tuple] = self.__get_shared_inputs(
-                *args, secret_args_mask=secret_args_mask, context_id=context_id)
+            self.__set_shareds(
+                *args,
+                secret_args_mask=secret_args_mask,
+                context_id=context_id,
+                data_path=data_path)
             
-            if preprocess:
-                extra_args: List[tuple] = self.__client_call(
+            if preprocess is not None:
+                self.__client_call(
                     client=self.preprocess_client,
-                    func=preprocess)
-                for shared_pair in extra_args:
-                    self.__append_to_context(context_id, shared_pair)
-                shared_args.extend(extra_args)
+                    func=preprocess,
+                    context_id=context_id)
                 
             returned_values: list = [
                 self.__client_call(
-                    client,
-                    partial(func, client=client, context_id=context_id),
-                    *[arg[i] for arg in shared_args])
-                for i, client in enumerate(self.computing_clients)]
+                    client=client,
+                    func=func,
+                    context_id=context_id)
+                for client in self.computing_clients]
             
-            self.__prune_context(context_id)
+            prune_context(clients=self.clients, context_id=context_id)
             return self.__reconstruct_secret(returned_values)
             
         return secure_func 
