@@ -7,7 +7,7 @@ from custom_types.vector import Vector
 
 
 def expand_binomial(constant: int, degree: int) -> list:
-    return [math.comb(degree, i) * constant ** i for i in range(degree + 1, -1, -1)]
+    return [math.comb(degree, i) * constant ** i for i in range(degree, -1, -1)]
 
 
 def term_masks(degrees: list) -> tuple:
@@ -23,7 +23,7 @@ def expand_polynomial_term(constant: int, degrees: list, operands: list) -> dict
     terms_coefs: dict = dict()
 
     for term_mask in term_masks(degrees):
-        terms_coefs[term_mask] = math.prod([binomials[i][j] for i, j in enumerate(term_mask)])
+        terms_coefs[term_mask] = constant * math.prod([binomials[i][j] for i, j in enumerate(term_mask)])
 
     return terms_coefs
 

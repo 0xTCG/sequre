@@ -19,3 +19,10 @@ class Vector:
         if not isinstance(other, Vector):
             other = Vector([other] * len(self._v))
         return Vector([e_1 + e_2 for e_1, e_2 in zip(self._v, other._v)])
+    
+    def __iter__(self: 'Vector'):
+        for e in self._v:
+            yield e
+    
+    def __getitem__(self: 'Vector', idx: int):
+        return self._v[idx]
