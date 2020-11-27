@@ -5,6 +5,7 @@ from mpc.secret import generate_random_number, decompose, share_secret
 from networking.client import Client
 from custom_types.vector import Vector
 from utils.lambdas import subtract
+from utils.numerics import term_masks
 
 
 def get_multiplication_triple(client: Client, context_id: int) -> List[tuple]:
@@ -30,3 +31,14 @@ def beaver_partition(client: Client, context_id: int) -> List[tuple]:
         for client in computing_clients], Vector([0] * vector_len))
     
     share_secret(clients=computing_clients, context_id=context_id, value=x_r, private=False)
+    
+    all_term_masks = set()
+    for degrees in computing_clients[0].get_param(context_id, 2):
+        all_term_masks |= set(term_masks(degrees))
+    all_term_masks = sorted(list(all_term_masks))
+    
+    term_values = Vector([
+        math.prod([peaky_blinder ** exponent for peaky_blinder, exponent in zip(peaky_blinders, term_mask)])
+        for term_mask in all_term_masks])
+    share_secret(clients=computing_clients, context_id=context_id, value=term_values)
+    

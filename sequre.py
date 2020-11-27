@@ -34,7 +34,7 @@ class Sequre:
             x, y, secret_args_mask='11',
             preprocess=preprocess.get_multiplication_triple)
 
-    def evaluate_polynomial(self: 'Sequre', x: Vector, coef: Vector, exp: Vector) -> Any:
+    def evaluate_polynomial(self: 'Sequre', x: Vector, coef: list, degrees_list: list) -> Any:
         return self.mf(arithmetics.evaluate_polynomial)(
-            x, coef, exp, secret_args_mask='111',
+            x, coef, degrees_list, secret_args_mask='111',
             preprocess=preprocess.beaver_partition)
