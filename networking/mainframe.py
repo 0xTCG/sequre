@@ -5,7 +5,9 @@ from itertools import permutations
 
 from networking.client import Client
 from utils.constants import NUMBER_OF_CLIENTS, CP0, CP1, CP2
-from mpc.secret import decompose, share_secret, load_shared_from_path, append_to_context, prune_context
+from mpc.secret import (
+    decompose, share_secret, load_shared_from_path,
+    append_to_context, prune_context, decompose_mask)
 
 class Mainframe:
     def __init__(self: 'Mainframe'):
@@ -48,13 +50,13 @@ class Mainframe:
             return [share_secret(
                         self.clients, arg,
                         context_id=context_id,
-                        private=bool(int(mask)))
-                    for arg, mask in zip(args, secret_args_mask)]
+                        private=bool(mask))
+                    for arg, mask in zip(args, reversed(list(decompose_mask(secret_args_mask, len(args)))))]
         return load_shared_from_path(self.clients, context_id, data_path)
 
     def __call(self: 'Mainframe', func: Callable) -> Callable:
         def secure_func(*args,
-                        secret_args_mask: str = None,
+                        secret_args_mask: int = None,
                         preprocess: Callable = None,
                         data_path: str = None):
             context_id: int = uuid.uuid1()
