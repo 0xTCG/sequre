@@ -40,3 +40,9 @@ def share_secret(clients: list, value: Any, context_id: int, private: bool = Tru
 def load_shared_from_path(clients: list, context_id: Any, data_path: str):
         for client in clients:
             client.load_shared_from_path(context_id, data_path)
+
+
+def decompose_mask(mask: int, limit: int) -> bool:
+    for _ in range(limit):
+        yield bool(mask % 2)
+        mask //= 2
