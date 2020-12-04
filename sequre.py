@@ -1,6 +1,6 @@
 from typing import Any
 
-from mpc import preprocess, arithmetics
+from mpc import preprocess, arithmetics, structures
 from networking.mainframe import Mainframe
 
 from custom_types.vector import Vector
@@ -37,4 +37,8 @@ class Sequre:
     def evaluate_polynomial(self: 'Sequre', x: Vector, coef: list, degrees_list: list, share_inputs: bool) -> Any:
         return self.mf(arithmetics.evaluate_polynomial)(
             x, coef, degrees_list, secret_args_mask=4 * share_inputs,
-            preprocess=preprocess.beaver_partition)
+            preprocess=preprocess.polinomial_partition)
+
+    def table_lookup(self: 'Sequre', k: Any, table_id: int, share_inputs: bool) -> Any:
+        return self.mf(structures.table_lookup)(Vector([k]), table_id, secret_args_mask=2 * share_inputs,
+            preprocess=preprocess.lookup_partition)
