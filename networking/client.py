@@ -9,6 +9,110 @@ class Client:
         self.pid = pid
         self.__context = defaultdict(list)
         self.__other_clients = dict()
+
+        self._construct_cache()
+    
+    def _construct_lagrange_cache(self: 'Client'):
+        """
+        Mat<ZZ_p> table;
+
+        // Table 0
+        table.SetDims(1, 2);
+        if (pid > 0) {
+            table[0][0] = 1;
+            table[0][1] = 0;
+        }
+        table_type_ZZ[0] = true;
+        table_cache[0] = table;
+        table_field_index[0] = 2;
+
+        // Table 1
+        int half_len = Param::NBIT_K / 2;
+        table.SetDims(2, half_len + 1);
+        if (pid > 0) {
+            for (int i = 0; i < half_len + 1; i++) {
+            if (i == 0) {
+                table[0][i] = 1;
+                table[1][i] = 1;
+            } else {
+                table[0][i] = table[0][i - 1] * 2;
+                table[1][i] = table[1][i - 1] * 4;
+            }
+            }
+        }
+        table_type_ZZ[1] = true;
+        table_cache[1] = table;
+        table_field_index[1] = 1;
+
+        // Table 2: parameters (intercept, slope) for piecewise-linear approximation
+        // of
+        //          negative log-sigmoid function
+        table.SetDims(2, 64);
+        if (pid > 0) {
+            ifstream ifs;
+            ifs.open("sigmoid_approx.txt");
+            if (!ifs.is_open()) {
+            DBG("Error opening sigmoid_approx.txt");
+            clear(table);
+            }
+            for (int i = 0; i < table.NumCols(); i++) {
+            double intercept, slope;
+            ifs >> intercept >> slope;
+
+            ZZ_p fp_intercept, fp_slope;
+            DoubleToFP(fp_intercept, intercept, Param::NBIT_K, Param::NBIT_F);
+            DoubleToFP(fp_slope, slope, Param::NBIT_K, Param::NBIT_F);
+
+            table[0][i] = fp_intercept;
+            table[1][i] = fp_slope;
+            }
+            ifs.close();
+        }
+        table_type_ZZ[2] = false;
+        table_cache[2] = table;
+        table_field_index[2] = 0;
+
+        // DBG("Generating lagrange cache");
+
+        for (int cid = 0; cid < table_cache.length(); cid++) {
+            long nrow = table_cache[cid].NumRows();
+            long ncol = table_cache[cid].NumCols();
+            bool index_by_ZZ = table_type_ZZ[cid];
+            if (index_by_ZZ) {
+            lagrange_cache[cid].SetDims(nrow, 2 * ncol);
+            } else {
+            lagrange_cache[cid].SetDims(nrow, ncol);
+            }
+
+            if (pid > 0) {
+            // DBG("Lagrange interpolation for Table {}... ",cid);
+            for (int i = 0; i < nrow; i++) {
+                Vec<long> x;
+                Vec<ZZ_p> y;
+                if (index_by_ZZ) {
+                x.SetLength(2 * ncol);
+                y.SetLength(2 * ncol);
+                } else {
+                x.SetLength(ncol);
+                y.SetLength(ncol);
+                }
+                for (int j = 0; j < ncol; j++) {
+                x[j] = j + 1;
+                y[j] = table_cache[cid][i][j];
+                if (index_by_ZZ) {
+                    x[j + ncol] = x[j] + conv<long>(primes[table_field_index[cid]]);
+                    y[j + ncol] = table_cache[cid][i][j];
+                }
+                }
+
+                lagrange_interp(lagrange_cache[cid][i], x, y);
+            }
+            }
+        """
+        pass
+    
+    def _construct_cache(self: 'Client'):
+        self._construct_lagrange_cache()
     
     def client_connect(self: 'Client', other: 'Client'):
         # Temp local solution
