@@ -16,7 +16,7 @@ def connect(socket: CSocket, port: int) -> bool:
             return True
         
         print("Connection failed, retrying..")
-        time.sleep(2)
+        time.sleep(1)
 
     return False
 
@@ -29,4 +29,6 @@ def listen(socket: CSocket, port: int):
 
 
 def open_channel(socket: CSocket, port: int):
+    print(f'Listening init {port}')
     listen(socket, port)
+    print(f'Listening at {port}')

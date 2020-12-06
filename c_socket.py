@@ -1,3 +1,5 @@
+
+import sys
 import socket
 from typing import Any
 
@@ -19,14 +21,15 @@ class CSocket:
     def connect(self: 'CSocket', address: str) -> bool:
         try:
             self.m_sock.connect(address)
-        except socket.error:
+        except socket.error as msg:
+            print(f"Could not connect to {address}. {msg}")
             return False
         
         return True
     
     def close(self: 'CSocket'):
         if self.m_sock is not None and not self.m_sock._closed:
-            self.m_sock.shutdown(0)
+            self.m_sock.shutdown(socket.SHUT_RDWR)
             self.m_sock.close()
     
     def bind(self: 'CSocket', port: int):
@@ -41,7 +44,7 @@ class CSocket:
     
     def send(self: 'CSocket', data: bytes, nLen: int, nFlags: int = 0) -> int:
         self.bytes_sent += nLen
-        return self.m_sock.send(data, nFlags)
+        return self.m_sock.sendall(data, nFlags)
 
     def receive(self: 'CSocket', nLen: int, nFlags: int = 0) -> bytes:
         self.bytes_received += nLen
@@ -53,9 +56,9 @@ class CSocket:
         while (n > 0):
             ret = self.m_sock.recv(n, nFlags)
             p += ret
-            n -= len(ret)
+            n -= sys.getsizeof(ret)
 
-        return nLen
+        return p
     
     def reset_stats(self: 'CSocket'):
         self.bytes_received = 0
