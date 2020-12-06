@@ -15,6 +15,8 @@ class MPCEnv:
 
         if (not self.setup_channels(pairs)):
             raise ValueError("MPCEnv::Initialize: failed to initialize communication channels")
+
+        return True
     
     def setup_channels(self: 'MPCEnv', pairs: list) -> bool:
         for pair in pairs:
@@ -41,7 +43,7 @@ class MPCEnv:
             if (p_1 == self.pid):
                 open_channel(self.sockets[pother], port)
             elif (not connect(self.sockets[pother], port)):
-                    raise ValueError("Failed to connect with P{pother}")
+                raise ValueError(f"Failed to connect with P{pother}")
 
         return True
 
@@ -49,8 +51,9 @@ class MPCEnv:
         return self.sockets[from_pid].receive(sys.getsizeof(bool))
 
     def send_bool(self: 'MPCEnv', flag: bool, to_pid: int):
-        self.sockets[to_pid].send(flag, sys.getsizeof(bool))
+        self.sockets[to_pid].send(bytes(flag), sys.getsizeof(bool))
 
     def clean_up(self: 'MPCEnv'):
-        for socket in self.sockets:
+        print(f'Cleaning up MPC for PID {self.pid}')
+        for socket in self.sockets.values():
             socket.close()
