@@ -51,10 +51,12 @@ class CSocket:
 
         p: bytes = bytes(0)
         n: int = nLen
-        ret: int = 0
+        ret: bytes = bytes(0)
         
         while (n > 0):
             ret = self.m_sock.recv(n, nFlags)
+            if not ret:
+                return p
             p += ret
             n -= sys.getsizeof(ret)
 
