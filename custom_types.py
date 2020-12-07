@@ -2,7 +2,7 @@ from param import BASE_P
 
 
 class Zp:
-    def __init__(self: 'Zp', value: int):
+    def __init__(self: 'Zp', value: int = 0):
         self.value = value
     
     def __neg__(self: 'Zp') -> 'Zp':
@@ -44,3 +44,6 @@ class Zp:
     
     def __hash__(self: 'Zp') -> int:
         return hash(self.value)
+    
+    def to_bytes(self: 'Zp') -> bytes:
+        return self.value.to_bytes((self.value.bit_length() + 7) // 8, 'big')
