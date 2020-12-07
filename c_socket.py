@@ -42,25 +42,18 @@ class CSocket:
     def accept(self: 'CSocket'):
         self.m_sock, _ = self.m_sock.accept()
     
-    def send(self: 'CSocket', data: bytes, nLen: int, nFlags: int = 0) -> int:
-        self.bytes_sent += nLen
-        return self.m_sock.sendall(data, nFlags)
+    def send(self: 'CSocket', data: bytes, n_len: int, n_flags: int = 0) -> int:
+        self.bytes_sent += n_len
+        return self.m_sock.sendall(data)
 
-    def receive(self: 'CSocket', nLen: int, nFlags: int = 0) -> bytes:
-        self.bytes_received += nLen
-
-        p: bytes = bytes(0)
-        n: int = nLen
-        ret: bytes = bytes(0)
+    def receive(self: 'CSocket', n_flags: int = 0) -> bytes:
+        received_data: bytes = bytes(0)
+        packet_size: int = 2 ** 10
         
-        while (n > 0):
-            ret = self.m_sock.recv(n, nFlags)
-            if not ret:
-                return p
-            p += ret
-            n -= sys.getsizeof(ret)
+        received_data: bytes = self.m_sock.recv(packet_size, n_flags)
 
-        return p
+        self.bytes_received += len(received_data)
+        return received_data
     
     def reset_stats(self: 'CSocket'):
         self.bytes_received = 0
