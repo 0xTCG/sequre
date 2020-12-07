@@ -5,6 +5,7 @@ import os
 import param
 from mpc import MPCEnv
 from utils import get_address
+from custom_types import Zp
 
 
 def gwas_protocol(mpc: MPCEnv, pid: int) -> bool:
@@ -23,10 +24,8 @@ def client(pid: int):
 
     # This is here just to keep P0 online until the end for data transfer
     # In practice, P0 would send data in advance before each phase and go offline
-    if (pid == 0):
-        a = mpc.receive_bool(2)
-        print(f'Received {bool(a)}')
-    elif (pid == 2): mpc.send_bool(False, 0)
+    if (pid == 0): mpc.receive_bool(2)
+    elif (pid == 2): mpc.send_bool(True, 0)
 
     mpc.clean_up()
 

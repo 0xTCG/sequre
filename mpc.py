@@ -51,7 +51,7 @@ class MPCEnv:
         return self.sockets[from_pid].receive(sys.getsizeof(bool))
 
     def send_bool(self: 'MPCEnv', flag: bool, to_pid: int):
-        self.sockets[to_pid].send(bytes(flag), sys.getsizeof(bool))
+        self.sockets[to_pid].send(bytes(flag), sys.getsizeof(flag))
 
     def clean_up(self: 'MPCEnv'):
         print(f'Cleaning up MPC for PID {self.pid}')
