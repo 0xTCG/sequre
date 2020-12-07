@@ -1,8 +1,10 @@
 import sys
+import time
 
 import param
 from c_socket import CSocket
 from connect import connect, open_channel
+from custom_types import Zp
 
 
 class MPCEnv:
@@ -53,7 +55,27 @@ class MPCEnv:
     def send_bool(self: 'MPCEnv', flag: bool, to_pid: int):
         self.sockets[to_pid].send(bytes(flag), sys.getsizeof(flag))
 
+    def send_elem(self: 'MPCEnv', elem: Zp, to_pid: int):
+        self.sockets[to_pid].send(elem.to_bytes(), sys.getsizeof(elem.value))
+    
+    def receive_elem(self: 'MPCEnv', from_pid: int) -> Zp:
+        return Zp(int.from_bytes(self.sockets[from_pid].receive(), 'big'))
+
     def clean_up(self: 'MPCEnv'):
-        print(f'Cleaning up MPC for PID {self.pid}')
         for socket in self.sockets.values():
             socket.close()
+  
+    def reveal_sym(self: 'MPCEnv', elem: Zp) -> Zp:
+        if (self.pid == 0):
+            return None
+
+        received_elem: Zp = None
+        if (self.pid == 1):
+            self.send_elem(elem, 3 - self.pid)
+            received_elem = self.receive_elem(3 - self.pid)
+        else:
+            received_elem = self.receive_elem(3 - self.pid)
+            self.send_elem(elem, 3 - self.pid)
+
+        return elem + received_elem
+    
