@@ -28,8 +28,8 @@ def client(pid: int):
 
     # This is here just to keep P0 online until the end for data transfer
     # In practice, P0 would send data in advance before each phase and go offline
-    # if (pid == 0): mpc.receive_bool(2)
-    # elif (pid == 2): mpc.send_bool(True, 0)
+    if (pid == 0): mpc.receive_bool(2)
+    elif (pid == 2): mpc.send_bool(True, 0)
 
     mpc.clean_up()
 
