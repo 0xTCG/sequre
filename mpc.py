@@ -1,5 +1,6 @@
 import sys
 import time
+import random
 
 import param
 from c_socket import CSocket
@@ -10,6 +11,7 @@ from custom_types import Zp
 class MPCEnv:
     def __init__(self: 'MPCEnv'):
         self.sockets: dict = dict()
+        self.prg_states: dict = dict()
         self.pid: int = None
     
     def initialize(self: 'MPCEnv', pid: int, pairs: list) -> bool:
@@ -17,6 +19,9 @@ class MPCEnv:
 
         if (not self.setup_channels(pairs)):
             raise ValueError("MPCEnv::Initialize: failed to initialize communication channels")
+            
+        if (not self.setup_prgs()):
+            raise ValueError("MPCEnv::Initialize: failed to initialize PRGs")
 
         return True
     
@@ -49,8 +54,15 @@ class MPCEnv:
 
         return True
 
+    def setup_prgs(self: 'MPCEnv') -> bool:
+        for other_pid in set(range(3)) - {self.pid}:
+            random.seed(hash((min(self.pid, other_pid), max(self.pid, other_pid))))
+            self.prg_states[other_pid] = random.getstate()
+        
+        return True
+
     def receive_bool(self: 'MPCEnv', from_pid: int) -> bool:
-        return self.sockets[from_pid].receive(sys.getsizeof(bool))
+        return self.sockets[from_pid].receive()
 
     def send_bool(self: 'MPCEnv', flag: bool, to_pid: int):
         self.sockets[to_pid].send(bytes(flag), sys.getsizeof(flag))
