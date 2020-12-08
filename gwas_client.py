@@ -33,8 +33,8 @@ def client(pid: int):
 
     mpc.clean_up()
 
-    if (success): print("Protocol successfully completed")
-    else: raise ValueError("Protocol abnormally terminated")
+    if (success): print(f"Protocol successfully completed for {pid}")
+    else: raise ValueError(f"Protocol abnormally terminated for {pid}")
 
 
 def main():

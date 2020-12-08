@@ -55,6 +55,9 @@ class MPCEnv:
         return True
 
     def setup_prgs(self: 'MPCEnv') -> bool:
+        random.seed()
+        self.prg_states[self.pid] = random.getstate() 
+        
         for other_pid in set(range(3)) - {self.pid}:
             random.seed(hash((min(self.pid, other_pid), max(self.pid, other_pid))))
             self.prg_states[other_pid] = random.getstate()
@@ -90,4 +93,37 @@ class MPCEnv:
             self.send_elem(elem, 3 - self.pid)
 
         return elem + received_elem
+    
+    def switch_seed(self: 'MPCEnv', pid: int):
+        self.prg_states[self.pid] = random.getstate()
+        random.setstate(self.prg_states[pid])
+    
+    def restore_seed(self: 'MPCEnv', pid: int):
+        self.prg_states[pid] = random.getstate()
+        random.setstate(self.prg_states[self.pid])
+
+    def rand_elem(self: 'MPCEnv') -> Zp:
+        return Zp(random.randint(0, param.BASE_P))
+
+    def beaver_partition(self: 'MPCEnv', x: Zp) -> tuple:
+        x_r = Zp(0)
+        r = Zp(0)
+        if (self.pid == 0):
+            self.switch_seed(1)
+            r_1: Zp = self.rand_elem()
+            self.restore_seed(1)
+
+            self.switch_seed(2)
+            r_2: Zp = self.rand_elem()
+            self.restore_seed(2)
+
+            r: Zp = r_1 + r_2
+        else:
+            self.switch_seed(0)
+            r: Zp = self.rand_elem()
+            self.restore_seed(0)
+
+            x_r = self.reveal_sym(x - r)
+        
+        return x_r, r
     
