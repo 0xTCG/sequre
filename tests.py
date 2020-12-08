@@ -26,6 +26,10 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         if pid != 0:
             revealed_value: Zp = mpc.reveal_sym(Zp(10) if pid == 1 else Zp(7))
             assert_values(revealed_value, Zp(17))
+        
+        x_r, r = mpc.beaver_partition(Zp(10) if pid == 1 else Zp(7))
+        if pid != 0:
+            assert_values(x_r + mpc.reveal_sym(r), Zp(17))
 
     print(f'All tests passed at {pid}!')
 
