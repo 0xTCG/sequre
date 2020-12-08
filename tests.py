@@ -1,5 +1,5 @@
 import time
-from custom_types import Zp
+from custom_types import Zp, Vector
 from mpc import MPCEnv
 
 
@@ -21,6 +21,19 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
     test_val = Zp(2)
     test_val *= Zp(3)
     assert_values(test_val, Zp(6))
+    # Vector
+    assert_values(Vector([1]) + Vector([1]), Vector([2]))
+    test_val = Vector([1])
+    test_val += Vector([1])
+    assert_values(test_val, Vector([2]))
+    assert_values(Vector([2]) - Vector([1]), Vector([1]))
+    test_val = Vector([2])
+    test_val -= Vector([1])
+    assert_values(test_val, Vector([1]))
+    assert_values(Vector([2]) * Vector([3]), Vector([6]))
+    test_val = Vector([2])
+    test_val *= Vector([3])
+    assert_values(test_val, Vector([6]))
 
     if mpc is not None and pid is not None:
         if pid != 0:
@@ -28,8 +41,22 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_values(revealed_value, Zp(17))
         
         x_r, r = mpc.beaver_partition(Zp(10) if pid == 1 else Zp(7))
-        if pid != 0:
+        if pid == 0:
+            mpc.send_elem(r, 1)
+            mpc.send_elem(r, 2)
+        else:
+            r_0 = mpc.receive_elem(0)
+            assert_values(r_0, mpc.reveal_sym(r))
             assert_values(x_r + mpc.reveal_sym(r), Zp(17))
+        
+        x_r, r = mpc.beaver_partition(Vector([Zp(10), Zp(11), Zp(12)]) if pid == 1 else Vector([Zp(3), Zp(4), Zp(5)]))
+        if pid == 0:
+            mpc.send_elem(r, 1)
+            mpc.send_elem(r, 2)
+        else:
+            r_0 = mpc.receive_vector(0)
+            assert_values(r_0, mpc.reveal_sym(r))
+            assert_values(x_r + mpc.reveal_sym(r), Vector([Zp(13), Zp(15), Zp(17)]))
 
     print(f'All tests passed at {pid}!')
 
