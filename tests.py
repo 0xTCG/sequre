@@ -62,6 +62,17 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         if pid != 0:
             revealed_p = Matrix().from_value(mpc.reveal_sym(p))
             assert_values(revealed_p[10], Vector([Zp(1024), Zp(1048576), Zp(60466176)]))
+        
+        coeff = Matrix().from_value(Vector([Vector([Zp(1)] * 3), Vector([Zp(2)] * 3), Vector([Zp(3)] * 3)]))
+        p = mpc.evaluate_poly(Vector([Zp(1), Zp(2), Zp(3)]), coeff)
+        if pid != 0:
+            revealed_p = mpc.reveal_sym(p)
+            expected_mat = Vector(
+                [Vector([Zp(1)] * 3),
+                 Vector([Zp(4), Zp(8), Zp(12)]),
+                 Vector([Zp(12), Zp(48), Zp(108)])])
+            assert_values(revealed_p, expected_mat)
+                
 
     print(f'All tests passed at {pid}!')
 
