@@ -258,3 +258,15 @@ class MPCEnv:
         
         return b
     
+    def evaluate_poly(self: 'MPCEnv', x: Vector, coeff: Matrix) -> Matrix:
+        n: int = len(x)
+        npoly: int = coeff.num_rows()
+        deg: int = coeff.num_cols() - 1
+
+        pows: Matrix = self.powers(x, deg)
+
+        if (self.pid > 0):
+            return Matrix().from_value(coeff * pows)
+        
+        return Matrix(npoly, n)
+    
