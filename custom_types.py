@@ -154,5 +154,8 @@ class Matrix(Vector):
     def num_rows(self: 'Matrix') -> int:
         return len(self.value)
     
+    def num_cols(self: 'Matrix') -> int:
+        return len(self.value[0])
+    
     def to_bytes(self: 'Matrix') -> bytes:
         return b';'.join([v.to_bytes() for v in self.value])
