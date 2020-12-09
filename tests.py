@@ -1,5 +1,5 @@
 import time
-from custom_types import Zp, Vector
+from custom_types import Zp, Vector, Matrix
 from mpc import MPCEnv
 
 
@@ -57,6 +57,11 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             r_0 = mpc.receive_vector(0)
             assert_values(r_0, mpc.reveal_sym(r))
             assert_values(x_r + mpc.reveal_sym(r), Vector([Zp(13), Zp(15), Zp(17)]))
+        
+        p = mpc.powers(Vector([Zp(1), Zp(2), Zp(3)]), 10)
+        if pid != 0:
+            revealed_p = Matrix().from_value(mpc.reveal_sym(p))
+            assert_values(revealed_p[10], Vector([Zp(1024), Zp(1048576), Zp(60466176)]))
 
     print(f'All tests passed at {pid}!')
 

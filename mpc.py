@@ -7,7 +7,7 @@ from functools import partial
 import param
 from c_socket import CSocket
 from connect import connect, open_channel
-from custom_types import Zp, Vector
+from custom_types import Zp, Vector, Matrix
 
 
 class MPCEnv:
@@ -15,6 +15,7 @@ class MPCEnv:
         self.sockets: dict = dict()
         self.prg_states: dict = dict()
         self.pid: int = None
+        self.pascal_cache: dict = dict()
     
     def initialize(self: 'MPCEnv', pid: int, pairs: list) -> bool:
         self.pid = pid
@@ -81,6 +82,16 @@ class MPCEnv:
     def receive_vector(self: 'MPCEnv', from_pid: int) -> Vector:
         values = self.sockets[from_pid].receive().decode("utf-8").split('.')
         return Vector([Zp(int(v)) for v in values])
+    
+    def receive_matrix(self: 'MPCEnv', from_pid: int) -> Matrix:
+        row_values = self.sockets[from_pid].receive().decode("utf-8").split(';')
+        matrix: Matrix = Matrix(len(row_values))
+
+        for i, row_value in enumerate(row_values):
+            decoded_vector = Vector([Zp(int(e)) for e in row_value.split('.')])
+            matrix[i] = decoded_vector
+        
+        return matrix
 
     def clean_up(self: 'MPCEnv'):
         for socket in self.sockets.values():
@@ -95,6 +106,8 @@ class MPCEnv:
             receive_func = self.receive_elem
         if isinstance(elem, Vector):
             receive_func = self.receive_vector
+        if isinstance(elem, Matrix):
+            receive_func = self.receive_matrix
 
         received_elem: Zp = None
         if (self.pid == 1):
@@ -115,7 +128,7 @@ class MPCEnv:
         random.setstate(self.prg_states[self.pid])
 
     def rand_elem(self: 'MPCEnv') -> Zp:
-        return Zp(random.randint(0, param.BASE_P))
+        return Zp.randzp()
     
     def rand_vector(self: 'MPCEnv', size: int) -> Vector:
         return Vector([self.rand_elem() for _ in range(size)])
@@ -148,6 +161,32 @@ class MPCEnv:
         
         return x_r, r
     
+    def mul_elem(self: 'MPCEnv', v_1: Vector, v_2: Vector) -> Vector:
+        return v_1 * v_2
+
+    def rand_mat(self: 'MPCEnv', m: int, n: int) -> Matrix:
+        return Matrix(m, n, randomise=True)
+
+    def get_pascal_matrix(self: 'MPCEnv', pow: int) -> Matrix:
+        if pow not in self.pascal_cache:
+            pascal_matrix: Matrix = self.calculate_pascal_matrix(pow)
+            self.pascal_cache[pow] = pascal_matrix
+
+        return self.pascal_cache[pow]
+    
+    def calculate_pascal_matrix(self: 'MPCEnv', pow: int) -> Matrix:
+        t = Matrix(pow + 1, pow + 1)
+        for i in range(pow + 1):
+            for j in range(pow + 1):
+                if (j > i):
+                    t[i][j] = Zp(0)
+                elif (j == 0 or j == i):
+                    t[i][j] = Zp(1)
+                else:
+                    t[i][j] = t[i - 1][j - 1] + t[i - 1][j]
+        
+        return t
+
     def powers(self: 'MPCEnv', x: Vector, pow: int) -> Matrix:
         assert pow >= 1
 
@@ -156,11 +195,11 @@ class MPCEnv:
         
         if (pow == 1):
             b.set_dims(2, n)
-        if (self.pid > 0):
-            if (self.pid == 1):
-                b[0] += Zp(1)
-            b[1] = x
-        else: # pow > 1
+            if (self.pid > 0):
+                if (self.pid == 1):
+                    b[0] += Vector([Zp(1)] * n)
+                b[1] = x * Vector([Zp(1)] * n)
+        else:  # pow > 1
             x_r, r = self.beaver_partition(x)
 
             if (self.pid == 0):
@@ -176,7 +215,7 @@ class MPCEnv:
 
                 r_pow -= r_
 
-                self.send_mat(r_pow, 2)
+                self.send_elem(r_pow, 2)
 
                 b.set_dims(pow + 1, n)
             else:
@@ -186,7 +225,7 @@ class MPCEnv:
                     r_pow = self.rand_mat(pow - 1, n)
                     self.restore_seed(0)
                 else:  # pid == 2
-                    r_pow = self.receive_mat(0, pow - 1, n)
+                    r_pow = self.receive_matrix(0)
 
                 x_r_pow = Matrix(pow - 1, n)
                 x_r_pow[0] = self.mul_elem(x_r, x_r)
@@ -198,21 +237,22 @@ class MPCEnv:
                 b.set_dims(pow + 1, n)
 
                 if (self.pid == 1):
-                    b[0] += Zp(1)
-                b[1] = x
+                    b[0] += Vector([Zp(1)] * n)
+                b[1] = x * Vector([Zp(1)] * n)
 
                 for p in range(2, pow + 1):
-                    if (self.pid == 1): b[p] = x_r_pow[p - 2]
+                    if (self.pid == 1):
+                        b[p] = x_r_pow[p - 2] * Vector([Zp(1)] * n)
 
                     if (p == 2):
-                        b[p] += pascal_matrix[p][1] * self.mul_elem(x_r, r)
+                        b[p] += Vector([pascal_matrix[p][1]] * n) * self.mul_elem(x_r, r)
                     else:
-                        b[p] += pascal_matrix[p][1] * self.mul_elem(x_r_pow[p - 3], r)
+                        b[p] += Vector([pascal_matrix[p][1]] * n) * self.mul_elem(x_r_pow[p - 3], r)
 
                         for j in range(2, p - 1):
-                            b[p] += pascal_matrix[p][j] * self.mul_elem(x_r_pow[p - 2 - j], r_pow[j - 2])
-
-                        b[p] += pascal_matrix[p][p - 1] * self.mul_elem(x_r, r_pow[p - 3])
+                            b[p] += Vector([pascal_matrix[p][j]] * n) * self.mul_elem(x_r_pow[p - 2 - j], r_pow[j - 2])
+                        
+                        b[p] += Vector([pascal_matrix[p][p - 1]] * n) * self.mul_elem(x_r, r_pow[p - 3])
 
                     b[p] += r_pow[p - 2]
         
