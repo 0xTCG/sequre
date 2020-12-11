@@ -49,9 +49,7 @@ class CSocket:
     def receive(self: 'CSocket', n_flags: int = 0) -> bytes:
         received_data: bytes = bytes(0)
         packet_size: int = 2 ** 20  # Temp local solution. TODO: Implement packeting.
-        
         received_data: bytes = self.m_sock.recv(packet_size, n_flags)
-
         self.bytes_received += len(received_data)
         return received_data
     
