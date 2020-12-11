@@ -2,9 +2,41 @@ import random
 from param import BASE_P
 
 
+class TypeOps:
+    @staticmethod
+    def set_bit(x: int, p: int) -> int:
+        if p < 0:
+            raise ValueError(f'Invalid bit index: {p}')
+
+        return x | (1 << p)
+    
+    @staticmethod
+    def trunc_elem(elem: int, k: int) -> int:
+        return elem & ((1 << k) - 1)
+    
+    @staticmethod
+    def left_shift(elem: int, k: int) -> int:
+        if k < 0:
+            return elem >> k
+        
+        return elem << k
+    
+    @staticmethod
+    def right_shift(elem: int, k: int) -> int:
+        if k < 0:
+            return elem << k
+        
+        return elem >> k
+    
+    @staticmethod
+    def bit(elem: int, k: int) -> int:
+        return int((elem & (1 << k)) != 0)
+
+
 class Zp:
-    def __init__(self: 'Zp', value: int = 0):
-        self.value = value
+    def __init__(self: 'Zp', value: int = 0, base: int = BASE_P):
+        self.base = base
+        self.value = value % self.base
     
     def __int__(self: 'Zp') -> int:
         return self.value
@@ -49,12 +81,18 @@ class Zp:
     def __hash__(self: 'Zp') -> int:
         return hash(self.value)
     
+    def __pow__(self: 'Zp', e: int) -> 'Zp':
+        return (self.value ** e) % self.base
+    
     def to_bytes(self: 'Zp') -> bytes:
         return self.value.to_bytes((self.value.bit_length() + 7) // 8, 'big')
     
+    def inv(self: 'Zp') -> 'Zp':
+        return (self.value ** (self.base - 2)) % self.base
+    
     @staticmethod
-    def randzp() -> 'Zp':
-        return Zp(random.randint(0, BASE_P))
+    def randzp(base: int = BASE_P) -> 'Zp':
+        return Zp(random.randint(0, base))
 
 
 class Vector:
@@ -125,9 +163,9 @@ class Vector:
 
 # This inheritance will be easy to refactor to .seq via extend
 class Matrix(Vector):
-    def __init__(self: 'Matrix', m: int = 0, n: int = 0, randomise: bool = False):
+    def __init__(self: 'Matrix', m: int = 0, n: int = 0, randomise: bool = False, t: object = Zp):
         self.value = [
-            Vector([(Zp.randzp() if randomise else Zp(0)) for _ in range(n)])
+            Vector([(Zp.randzp() if randomise else t(0)) for _ in range(n)])
             for _ in range(m)]
         self.type_ = Vector
     
