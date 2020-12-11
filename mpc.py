@@ -155,13 +155,16 @@ class MPCEnv:
         return Vector([Zp(int(v)) for v in values])
     
     def receive_matrix(self: 'MPCEnv', from_pid: int) -> Matrix:
+        # print(f'Gotta receive from ', from_pid)
         row_values = self.sockets[from_pid].receive().decode("utf-8").split(';')
+        # print(f'Received row values from ', from_pid, row_values)
         matrix: Matrix = Matrix(len(row_values))
 
         for i, row_value in enumerate(row_values):
             decoded_vector = Vector([Zp(int(e)) for e in row_value.split('.')])
             matrix[i] = decoded_vector
         
+        # print(f'Received matrix ', matrix)
         return matrix
 
     def clean_up(self: 'MPCEnv'):
@@ -175,10 +178,10 @@ class MPCEnv:
         receive_func = None
         if isinstance(elem, Zp):
             receive_func = self.receive_elem
-        if isinstance(elem, Vector):
-            receive_func = self.receive_vector
-        if isinstance(elem, Matrix):
+        elif isinstance(elem, Matrix):
             receive_func = self.receive_matrix
+        elif isinstance(elem, Vector):
+            receive_func = self.receive_vector
 
         received_elem: Zp = None
         if (self.pid == 1):
@@ -187,7 +190,7 @@ class MPCEnv:
         else:
             received_elem = receive_func(3 - self.pid)
             self.send_elem(elem, 3 - self.pid)
-
+            
         return elem + received_elem
     
     def switch_seed(self: 'MPCEnv', pid: int):
@@ -209,11 +212,13 @@ class MPCEnv:
         rand_func = None
         if isinstance(x, Zp):
             rand_func = self.rand_elem
+        elif isinstance(x, Matrix):
+            rand_func = partial(Matrix, m=x.num_rows(), n=x.num_cols(), randomise=True)
         elif isinstance(x, Vector):
             rand_func = partial(self.rand_vector, size=len(x))
         x_r = type_()
         r = type_()
-        if (self.pid == 0):
+        if self.pid == 0:
             self.switch_seed(1)
             r_1: Zp = rand_func()
             self.restore_seed(1)
@@ -227,8 +232,11 @@ class MPCEnv:
             self.switch_seed(0)
             r: Zp = rand_func()
             self.restore_seed(0)
-
-            x_r = self.reveal_sym(x - r)
+            
+            if isinstance(x, Matrix):  # Temp hack. Will be removed in .seq
+                x_r = self.reveal_sym(Matrix().from_value(x - r))
+            else:
+                x_r = self.reveal_sym(x - r)
         
         return x_r, r
     
@@ -348,7 +356,7 @@ class MPCEnv:
     
     def beaver_mult(self: 'MPCEnv', x_r: Matrix, r_1: Matrix,
                     y_r: Matrix, r_2: Matrix, elem_wise: bool, fid: int) -> Matrix:
-        xy = Matrix(x_r.num_rows(), x_r.num_cols())
+        xy = Matrix(r_1.num_rows(), r_1.num_cols())
         if self.pid == 0:
             r_1_r_2 = self.mul_elem(r_1, r_2) if elem_wise else r_1.mult(r_2)
             xy += r_1_r_2
@@ -371,34 +379,55 @@ class MPCEnv:
     def beaver_mult_elem(self: 'MPCEnv', x_1_r: Matrix, r_1: Matrix, x_2_r: Matrix, r_2: Matrix, fid: int = 0) -> Matrix:
         return self.beaver_mult(x_1_r, r_1, x_2_r, r_2, True, fid)
     
-    def beaver_reconstruct(self: 'MPCEnv', m: Matrix, fid: int = 0):
+    def beaver_reconstruct(self: 'MPCEnv', elem: object, fid: int = 0) -> Matrix:
+            receive_func = None
+            if isinstance(elem, Zp):
+                receive_func = self.receive_elem
+            elif isinstance(elem, Matrix):
+                receive_func = self.receive_matrix
+            elif isinstance(elem, Vector):
+                receive_func = self.receive_vector
+            
+            rand_func = None
+            if isinstance(elem, Zp):
+                rand_func = self.rand_elem
+            elif isinstance(elem, Matrix):
+                rand_func = partial(Matrix, m=elem.num_rows(), n=elem.num_cols(), randomise=True)
+            elif isinstance(elem, Vector):
+                rand_func = partial(self.rand_vector, size=len(elem))
+
             if self.pid == 0:
                 self.switch_seed(1)
-                mask = Matrix(m.num_rows(), m.num_cols(), randomise=True)  # fid was here
+                mask = rand_func()  # fid was here
                 self.restore_seed(1)
 
-                m -= mask
+                # m -= mask
                 # Mod(ab, fid);
-
-                self.send_elem(m, 2)  # fid was here
+                mm = Matrix().from_value(elem - mask) if isinstance(elem, Matrix) else elem - mask
+                time.sleep(2)  # TODO: Fix sockets and remove this wait!
+                self.send_elem(mm, 2)  # fid was here
+                return mm
             else:
-                if self.pid == 2:
-                    rr = self.receive_matrix(0)  # fid was here
-                else:
+                rr = None
+                if self.pid == 1:
                     self.switch_seed(0)
-                    rr = Matrix(m.num_rows(), m.num_cols, randomise=True)  # fid was here
+                    rr = rand_func()  # fid was here
                     self.restore_seed(0)
+                else:
+                    rr = receive_func(0)  # fid was here
+                    
 
-                m += rr
+                return elem + rr
                 # Mod(ab, fid);
-
+            
     def mult_elem(self: 'MPCEnv', a: Matrix, b: Matrix, fid: int = 0) -> Matrix:
         x_1_r, r_1 = self.beaver_partition(a, fid)
         x_2_r, r_2 = self.beaver_partition(b, fid)
         
         c = self.beaver_mult_elem(x_1_r, r_1, x_2_r, r_2, fid)
-
-        return self.beaver_reconstruct(c, fid)
+        c = self.beaver_reconstruct(c, fid)
+        
+        return c
     
     def fp_to_double_elem(self: 'MPCEnv', a: Zp, k: int, f: int) -> float:
         mat = Matrix(1, 1)
@@ -433,6 +462,9 @@ class MPCEnv:
         return b
 
     def print_fp_elem(self: 'MPCEnv', elem: Zp) -> float:
+        # print('Elem', elem, type(elem))
+        if self.pid == 0:
+            return None
         revealed_elem: Zp = self.reveal_sym(elem)
         elem_float: float = self.fp_to_double_elem(revealed_elem, param.NBIT_K, param.NBIT_F)
 
@@ -442,6 +474,8 @@ class MPCEnv:
         return elem_float
 
     def print_fp(self: 'MPCEnv', mat: Matrix) -> Matrix:
+        if self.pid == 0:
+            return None
         revealed_mat: Vector = self.reveal_sym(mat)
         mat_float: Matrix = self.fp_to_double(revealed_mat, param.NBIT_K, param.NBIT_F)
 
@@ -502,18 +536,21 @@ class MPCEnv:
             r -= r_mask
             r_low -= r_low_mask
 
-            self.send_elem(r, 2)
-            self.send_elem(r_low, 2)
-        elif (self.pid == 2):
+            time.sleep(3)  # TODO: Fix with new sockets.
+            self.send_elem(Matrix().from_value(r), 2)
+            self.send_elem(Matrix().from_value(r_low), 2)
+            print('Sent ...')
+        elif self.pid == 2:
             r = self.receive_matrix(0)
             r_low = self.receive_matrix(0)
+            print('Received ...')
         else:
             self.switch_seed(0)
             r = self.rand_mat(a.num_rows(), a.num_cols())
             r_low = self.rand_mat(a.num_rows(), a.num_cols())
             self.restore_seed(0)
 
-        c = a + r if self.pid > 0 else Matrix(a.num_rows(), a.num_cols())
+        c = Matrix().from_value(a + r) if self.pid > 0 else Matrix(a.num_rows(), a.num_cols())
         c = self.reveal_sym(c)
 
         c_low = Matrix(a.num_rows(), a.num_cols())

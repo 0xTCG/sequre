@@ -82,13 +82,14 @@ class Zp:
         return hash(self.value)
     
     def __pow__(self: 'Zp', e: int) -> 'Zp':
-        return (self.value ** e) % self.base
+        return Zp(pow(self.value, e, self.base))
     
     def to_bytes(self: 'Zp') -> bytes:
         return self.value.to_bytes((self.value.bit_length() + 7) // 8, 'big')
     
     def inv(self: 'Zp') -> 'Zp':
-        return (self.value ** (self.base - 2)) % self.base
+        p: int = self.base
+        return Zp(pow(self.value, p - 2, p))
     
     @staticmethod
     def randzp(base: int = BASE_P) -> 'Zp':
@@ -104,6 +105,8 @@ class Vector:
         return Vector([-e for e in self.value])
     
     def __iadd__(self: 'Vector', other: 'Vector') -> 'Vector':
+        if isinstance(other, Zp):
+            other = Vector([other] * len(self))
         self.value = [self_e + other_e for self_e, other_e in zip(self.value, other.value)]
         return self
     
@@ -112,6 +115,8 @@ class Vector:
         return self
     
     def __imul__(self: 'Vector', other: 'Vector') -> 'Vector':
+        if isinstance(other, Zp):
+            other = Vector([other] * len(self))
         self.value = [self_e * other_e for self_e, other_e in zip(self.value, other.value)]
         return self
     
@@ -151,6 +156,12 @@ class Vector:
     
     def __setitem__(self: 'Vector', idx: int, value: object):
         self.value[idx] = value
+    
+    def num_rows(self: 'Vector') -> int:
+        return len(self.value)
+    
+    def num_cols(self: 'Vector') -> int:
+        return len(self.value[0])
 
     def to_bytes(self: 'Vector') -> bytes:
         return b'.'.join([bytes(str(e), encoding='utf8') for e in self.value])
