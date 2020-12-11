@@ -7,7 +7,7 @@ from functools import partial
 import param
 from c_socket import CSocket
 from connect import connect, open_channel
-from custom_types import Zp, Vector, Matrix
+from custom_types import Zp, Vector, Matrix, TypeOps
 
 
 class MPCEnv:
@@ -16,6 +16,11 @@ class MPCEnv:
         self.prg_states: dict = dict()
         self.pid: int = None
         self.pascal_cache: dict = dict()
+        self.table_cache: dict = dict()
+        self.lagrange_cache: dict = dict()
+        self.table_field_index: dict = dict()
+        self.primes: dict = dict()
+        self.invpow_cache: dict = dict()
     
     def initialize(self: 'MPCEnv', pid: int, pairs: list) -> bool:
         self.pid = pid
@@ -25,6 +30,72 @@ class MPCEnv:
             
         if (not self.setup_prgs()):
             raise ValueError("MPCEnv::Initialize: failed to initialize PRGs")
+
+        # # Lagrange cache
+        # # Table 0
+        # table = Matrix(1, 2)
+        # if (self.pid > 0):
+        #     table[0][0] = Zp(1)
+        #     table[0][1] = Zp(0)
+
+        # table.type_ = int  # table_type_ZZ[0] = true;
+        # self.table_cache[0] = table
+        # self.table_field_index[0] = 2
+
+        # # Table 1
+        # half_len: int = param.NBIT_K // 2
+        # table = Matrix(2, half_len + 1)
+        # if (self.pid > 0):
+        #     for i in range(0, half_len + 1):
+        #         if (i == 0):
+        #             table[0][i] = Zp(1)
+        #             table[1][i] = Zp(1)
+        #         else:
+        #             table[0][i] = table[0][i - 1] * 2
+        #             table[1][i] = table[1][i - 1] * 4
+
+        # table.type_ = int  # table_type_ZZ[1] = true;
+        # self.table_cache[1] = table
+        # self.table_field_index[1] = 1
+
+        # # Table 2: parameters (intercept, slope) for piecewise-linear approximation
+        # # of negative log-sigmoid function
+        # table = Matrix(2, 64)
+        # if (self.pid > 0):
+        #     with open('sigmoid_approx.txt') as f:
+        #         for i in range(0, table.num_cols()):
+        #             intercept, slope = f.readline().split()
+        #             fp_intercept: Zp = self.double_to_fp(
+        #                 float(intercept), param.NBIT_K, param.NBIT_F)
+        #             fp_slope: Zp = self.double_to_fp(float(slope), param.NBIT_K, param.NBIT_F)
+
+        #             table[0][i] = fp_intercept
+        #             table[1][i] = fp_slope
+
+        # table.type_ = Zp  # table_type_ZZ[2] = false;
+        # self.table_cache[2] = table
+        # self.table_field_index[2] = 0
+
+        # for cid in range(0, len(self.table_cache)):
+        #     nrow: int = self.table_cache[cid].num_rows()
+        #     ncol: int = self.table_cache[cid].num_cols()
+        #     index_by_ZZ: bool = self.table_cache[cid].type_ == int
+        #     self.lagrange_cache[cid] = Matrix(nrow, (2 if index_by_ZZ else 1) * ncol)
+
+        #     if (self.pid > 0):
+        #         for i in range(0, nrow):
+        #             x = Vector([0] * ncol * (2 if index_by_ZZ else 1))
+        #             y = Vector([Zp(0)] * ncol * (2 if index_by_ZZ else 1))
+                    
+        #             for j in range(0, ncol):
+        #                 x[j] = j + 1
+        #                 y[j] = self.table_cache[cid][i][j]
+        #                 if (index_by_ZZ):
+        #                     x[j + ncol] = x[j] + int(self.primes[self.table_field_index[cid]])
+        #                     y[j + ncol] = self.table_cache[cid][i][j]
+
+        #             self.lagrange_cache[cid][i] = self.lagrange_interp(x, y)
+        # End of Lagrange cache
 
         return True
     
@@ -133,7 +204,7 @@ class MPCEnv:
     def rand_vector(self: 'MPCEnv', size: int) -> Vector:
         return Vector([self.rand_elem() for _ in range(size)])
 
-    def beaver_partition(self: 'MPCEnv', x: object) -> tuple:
+    def beaver_partition(self: 'MPCEnv', x: object, fid: int = 0) -> tuple:
         type_ = type(x)
         rand_func = None
         if isinstance(x, Zp):
@@ -270,3 +341,196 @@ class MPCEnv:
         
         return Matrix(npoly, n)
     
+    def add_public(self: 'MPCEnv', x: object, a: object) -> object:
+        if self.pid == 1:
+            return x + a
+        return x
+    
+    def beaver_mult(self: 'MPCEnv', x_r: Matrix, r_1: Matrix,
+                    y_r: Matrix, r_2: Matrix, elem_wise: bool, fid: int) -> Matrix:
+        xy = Matrix(x_r.num_rows(), x_r.num_cols())
+        if self.pid == 0:
+            r_1_r_2 = self.mul_elem(r_1, r_2) if elem_wise else r_1.mult(r_2)
+            xy += r_1_r_2
+        else:
+            if elem_wise:
+                for i in range(xy.num_rows()):
+                    for j in range(xy.num_cols()):
+                        xy[i][j] += x_r[i][j] * r_2[i][j]
+                        xy[i][j] += r_1[i][j] * y_r[i][j]
+                    if self.pid == 1:
+                        xy[i][j] += x_r[i][j] * y_r[i][j]
+            else:
+                xy += x_r * r_2
+                xy += r_1 * y_r
+                if self.pid == 1:
+                    xy += x_r * y_r
+
+        return xy
+
+    def beaver_mult_elem(self: 'MPCEnv', x_1_r: Matrix, r_1: Matrix, x_2_r: Matrix, r_2: Matrix, fid: int = 0) -> Matrix:
+        return self.beaver_mult(x_1_r, r_1, x_2_r, r_2, True, fid)
+    
+    def beaver_reconstruct(self: 'MPCEnv', m: Matrix, fid: int = 0):
+            if self.pid == 0:
+                self.switch_seed(1)
+                mask = Matrix(m.num_rows(), m.num_cols(), randomise=True)  # fid was here
+                self.restore_seed(1)
+
+                m -= mask
+                # Mod(ab, fid);
+
+                self.send_elem(m, 2)  # fid was here
+            else:
+                if self.pid == 2:
+                    rr = self.receive_matrix(0)  # fid was here
+                else:
+                    self.switch_seed(0)
+                    rr = Matrix(m.num_rows(), m.num_cols, randomise=True)  # fid was here
+                    self.restore_seed(0)
+
+                m += rr
+                # Mod(ab, fid);
+
+    def mult_elem(self: 'MPCEnv', a: Matrix, b: Matrix, fid: int = 0) -> Matrix:
+        x_1_r, r_1 = self.beaver_partition(a, fid)
+        x_2_r, r_2 = self.beaver_partition(b, fid)
+        
+        c = self.beaver_mult_elem(x_1_r, r_1, x_2_r, r_2, fid)
+
+        return self.beaver_reconstruct(c, fid)
+    
+    def fp_to_double_elem(self: 'MPCEnv', a: Zp, k: int, f: int) -> float:
+        mat = Matrix(1, 1)
+        mat[0][0] = a
+        return self.fp_to_double(mat, k, f)[0][0]
+    
+    def fp_to_double(self: 'MPCEnv', a: Matrix, k: int, f: int) -> Matrix:
+        base = a[0][0].base
+        b = Matrix(a.num_rows(), a.num_cols(), t=float)
+        twokm1: int = TypeOps.left_shift(1, k - 1)
+
+        for i in range(0, a.num_rows()):
+            for j in range(0, a.num_cols()):
+                x = int(a[i][j])
+                sn = 1
+                if x > twokm1:  # negative number
+                    x = base - x
+                    sn = -1
+
+                x_trunc = TypeOps.trunc_elem(x, k - 1)
+                x_int = TypeOps.right_shift(x_trunc, f)
+
+                # TODO: consider better ways of doing this?
+                x_frac = 0
+                for bi in range(0, f):
+                    if TypeOps.bit(x_trunc, bi) > 0:
+                        x_frac += 1
+                    x_frac /= 2
+
+                b[i][j] = sn * (x_int + x_frac)
+        
+        return b
+
+    def print_fp_elem(self: 'MPCEnv', elem: Zp) -> float:
+        revealed_elem: Zp = self.reveal_sym(elem)
+        elem_float: float = self.fp_to_double_elem(revealed_elem, param.NBIT_K, param.NBIT_F)
+
+        if self.pid == 2:
+            print(f'{self.pid}: {elem_float}')
+        
+        return elem_float
+
+    def print_fp(self: 'MPCEnv', mat: Matrix) -> Matrix:
+        revealed_mat: Vector = self.reveal_sym(mat)
+        mat_float: Matrix = self.fp_to_double(revealed_mat, param.NBIT_K, param.NBIT_F)
+
+        if self.pid == 2:
+            print(f'{self.pid}: {mat_float}')
+        
+        return mat_float
+
+    def double_to_fp(self: 'MPCEnv', x: float, k: int, f: int) -> Zp:
+        sn: int = 1
+        if (x < 0):
+            x = -x
+            sn = -sn
+
+        az: int = int(x)
+
+        az_shift: int = TypeOps.left_shift(az, f)
+        az_trunc: int = TypeOps.trunc_elem(az_shift, k - 1)
+
+        xf: float = x - az  # remainder
+        for fbit in range(f - 1, -1, -1):
+            xf *= 2
+            if (xf >= 1):
+                xf -= int(xf)
+                az_trunc = TypeOps.set_bit(az_trunc, fbit)
+        
+        return Zp(az_trunc * sn)
+    
+    def table_lookup(self: 'MPCEnv', x: Vector, table_id: int) -> Matrix:
+        return self.evaluate_poly(x, self.lagrange_cache[table_id])
+    
+    def rand_mat_bits(self: 'MPCEnv', num_rows: int, num_cols: int, num_bits: int) -> Matrix:
+        rand_mat = Matrix(num_rows, num_cols)
+
+        for i in range(num_rows):
+            for j in range(num_cols):
+                rand_mat[i][j] = Zp.randzp(base=(2 ** num_bits - 1))
+
+        return rand_mat
+
+    def trunc(self: 'MPCEnv', a: Matrix, k: int, m: int):
+        r = Matrix()
+        r_low = Matrix()
+        if (self.pid == 0):
+            r = self.rand_mat_bits(a.num_rows(), a.num_cols(), k + param.NBIT_V)
+            r_low.set_dims(a.num_rows(), a.num_cols())
+            
+            for i in range(0, a.num_rows()):
+                for j in range(0, a.num_cols()):
+                    r_low[i][j] = Zp(int(r[i][j]) & (2 ** m - 1))
+                    # r_low[i][j] = conv<ZZ_p>(trunc_ZZ(rep(r[i][j]), m));
+
+            self.switch_seed(1)
+            r_mask = self.rand_mat(a.num_rows(), a.num_cols())
+            r_low_mask = self.rand_mat(a.num_rows(), a.num_cols())
+            self.restore_seed(1)
+
+            r -= r_mask
+            r_low -= r_low_mask
+
+            self.send_elem(r, 2)
+            self.send_elem(r_low, 2)
+        elif (self.pid == 2):
+            r = self.receive_matrix(0)
+            r_low = self.receive_matrix(0)
+        else:
+            self.switch_seed(0)
+            r = self.rand_mat(a.num_rows(), a.num_cols())
+            r_low = self.rand_mat(a.num_rows(), a.num_cols())
+            self.restore_seed(0)
+
+        c = a + r if self.pid > 0 else Matrix(a.num_rows(), a.num_cols())
+        c = self.reveal_sym(c)
+
+        c_low = Matrix(a.num_rows(), a.num_cols())
+        if (self.pid > 0):
+            for i in range(0, a.num_rows()):
+                for j in range(0, a.num_cols()):
+                    c_low[i][j] = Zp(int(c[i][j]) & (2 ** m - 1))
+                    # c_low[i][j] = conv<ZZ_p>(trunc_ZZ(c[i][j]), m);
+
+        if (self.pid > 0):
+            a += r_low
+            if (self.pid == 1):
+                a -= c_low
+
+            if m not in self.invpow_cache:
+                twoinv = Zp(2).inv()
+                twoinvm = twoinv ** m
+                self.invpow_cache[m] = twoinvm
+                
+            a *= self.invpow_cache[m]
