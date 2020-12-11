@@ -1,10 +1,16 @@
 import time
+
+import param
 from custom_types import Zp, Vector, Matrix
 from mpc import MPCEnv
 
 
 def assert_values(result, expected):
     assert result == expected, f'Result: {result}. Expected: {expected}'
+
+
+def assert_approx(result, expected, error = 10 ** (-5)):
+    assert expected - error < result < expected + error, f'Result: {result}. Expected: {expected}'
 
 
 def test_all(mpc: MPCEnv = None, pid: int = None):
@@ -72,6 +78,24 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
                  Vector([Zp(4), Zp(8), Zp(12)]),
                  Vector([Zp(12), Zp(48), Zp(108)])])
             assert_values(revealed_p, expected_mat)
+        
+        if pid != 0:
+            a: Zp = mpc.double_to_fp(2 if pid == 1 else 1.14, param.NBIT_K, param.NBIT_F)
+            b: Zp = mpc.double_to_fp(3 if pid == 1 else 2.95, param.NBIT_K, param.NBIT_F)
+            assert_approx(mpc.print_fp_elem(a), 3.14)
+            assert_approx(mpc.print_fp_elem(b), 5.95)
+
+            pub: Zp = mpc.double_to_fp(5.07, param.NBIT_K, param.NBIT_F)
+            a = mpc.add_public(a, pub)
+            assert_approx(mpc.print_fp_elem(a), 8.21)
+
+            d: Zp = mpc.mult_elem(a, b)
+            mat = Matrix(1, 1)
+            mat[0][0] = d
+            mpc.trunc(mat)
+            mpc.print_fp(d)
+            mpc.print_fp(mat[0][0])
+            # assert_values(mpc.print_fp(d), 48.8495) 
                 
 
     print(f'All tests passed at {pid}!')
