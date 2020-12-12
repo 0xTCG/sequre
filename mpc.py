@@ -19,7 +19,7 @@ class MPCEnv:
         self.table_cache: dict = dict()
         self.lagrange_cache: dict = dict()
         self.table_field_index: dict = dict()
-        self.primes: dict = dict()
+        self.primes: dict = {0: param.BASE_P, 1: 31, 2: 17}
         self.invpow_cache: dict = dict()
     
     def initialize(self: 'MPCEnv', pid: int, pairs: list) -> bool:
@@ -31,73 +31,108 @@ class MPCEnv:
         if (not self.setup_prgs()):
             raise ValueError("MPCEnv::Initialize: failed to initialize PRGs")
 
-        # # Lagrange cache
-        # # Table 0
-        # table = Matrix(1, 2)
-        # if (self.pid > 0):
-        #     table[0][0] = Zp(1)
-        #     table[0][1] = Zp(0)
+        # Lagrange cache
+        # Table 0
+        table = Matrix(1, 2)
+        if (self.pid > 0):
+            table[0][0] = Zp(1)
+            table[0][1] = Zp(0)
 
-        # table.type_ = int  # table_type_ZZ[0] = true;
-        # self.table_cache[0] = table
-        # self.table_field_index[0] = 2
+        table.type_ = int  # table_type_ZZ[0] = true;
+        self.table_cache[0] = table
+        self.table_field_index[0] = 2
 
-        # # Table 1
-        # half_len: int = param.NBIT_K // 2
-        # table = Matrix(2, half_len + 1)
-        # if (self.pid > 0):
-        #     for i in range(0, half_len + 1):
-        #         if (i == 0):
-        #             table[0][i] = Zp(1)
-        #             table[1][i] = Zp(1)
-        #         else:
-        #             table[0][i] = table[0][i - 1] * 2
-        #             table[1][i] = table[1][i - 1] * 4
+        # Table 1
+        half_len: int = param.NBIT_K // 2
+        table = Matrix(2, half_len + 1)
+        if (self.pid > 0):
+            for i in range(0, half_len + 1):
+                if (i == 0):
+                    table[0][i] = Zp(1)
+                    table[1][i] = Zp(1)
+                else:
+                    table[0][i] = table[0][i - 1] * Zp(2)
+                    table[1][i] = table[1][i - 1] * Zp(4)
 
-        # table.type_ = int  # table_type_ZZ[1] = true;
-        # self.table_cache[1] = table
-        # self.table_field_index[1] = 1
+        table.type_ = int  # table_type_ZZ[1] = true;
+        self.table_cache[1] = table
+        self.table_field_index[1] = 1
 
-        # # Table 2: parameters (intercept, slope) for piecewise-linear approximation
-        # # of negative log-sigmoid function
-        # table = Matrix(2, 64)
-        # if (self.pid > 0):
-        #     with open('sigmoid_approx.txt') as f:
-        #         for i in range(0, table.num_cols()):
-        #             intercept, slope = f.readline().split()
-        #             fp_intercept: Zp = self.double_to_fp(
-        #                 float(intercept), param.NBIT_K, param.NBIT_F)
-        #             fp_slope: Zp = self.double_to_fp(float(slope), param.NBIT_K, param.NBIT_F)
+        # Table 2: parameters (intercept, slope) for piecewise-linear approximation
+        # of negative log-sigmoid function
+        table = Matrix(2, 64)
+        if (self.pid > 0):
+            with open('sigmoid_approx.txt') as f:
+                for i in range(0, table.num_cols()):
+                    intercept, slope = f.readline().split()
+                    fp_intercept: Zp = self.double_to_fp(
+                        float(intercept), param.NBIT_K, param.NBIT_F)
+                    fp_slope: Zp = self.double_to_fp(float(slope), param.NBIT_K, param.NBIT_F)
 
-        #             table[0][i] = fp_intercept
-        #             table[1][i] = fp_slope
+                    table[0][i] = fp_intercept
+                    table[1][i] = fp_slope
 
-        # table.type_ = Zp  # table_type_ZZ[2] = false;
-        # self.table_cache[2] = table
-        # self.table_field_index[2] = 0
+        table.type_ = Zp  # table_type_ZZ[2] = false;
+        self.table_cache[2] = table
+        self.table_field_index[2] = 0
 
-        # for cid in range(0, len(self.table_cache)):
-        #     nrow: int = self.table_cache[cid].num_rows()
-        #     ncol: int = self.table_cache[cid].num_cols()
-        #     index_by_ZZ: bool = self.table_cache[cid].type_ == int
-        #     self.lagrange_cache[cid] = Matrix(nrow, (2 if index_by_ZZ else 1) * ncol)
+        for cid in range(0, len(self.table_cache)):
+            nrow: int = self.table_cache[cid].num_rows()
+            ncol: int = self.table_cache[cid].num_cols()
+            index_by_ZZ: bool = self.table_cache[cid].type_ == int
+            self.lagrange_cache[cid] = Matrix(nrow, (2 if index_by_ZZ else 1) * ncol)
 
-        #     if (self.pid > 0):
-        #         for i in range(0, nrow):
-        #             x = Vector([0] * ncol * (2 if index_by_ZZ else 1))
-        #             y = Vector([Zp(0)] * ncol * (2 if index_by_ZZ else 1))
+            if (self.pid > 0):
+                for i in range(0, nrow):
+                    x = Vector([0] * ncol * (2 if index_by_ZZ else 1))
+                    y = Vector([Zp(0)] * ncol * (2 if index_by_ZZ else 1))
                     
-        #             for j in range(0, ncol):
-        #                 x[j] = j + 1
-        #                 y[j] = self.table_cache[cid][i][j]
-        #                 if (index_by_ZZ):
-        #                     x[j + ncol] = x[j] + int(self.primes[self.table_field_index[cid]])
-        #                     y[j + ncol] = self.table_cache[cid][i][j]
-
-        #             self.lagrange_cache[cid][i] = self.lagrange_interp(x, y)
+                    for j in range(0, ncol):
+                        x[j] = j + 1
+                        y[j] = self.table_cache[cid][i][j]
+                        if (index_by_ZZ):
+                            x[j + ncol] = x[j] + int(self.primes[self.table_field_index[cid]])
+                            y[j + ncol] = self.table_cache[cid][i][j]
+                    
+                    self.lagrange_cache[cid][i] = self.lagrange_interp(x, y)
         # End of Lagrange cache
 
+        if self.pid == 0:  # TODO: Fix with new sockets.
+            time.sleep(8)
         return True
+    
+    def lagrange_interp(self: 'MPCEnv', x: Vector, y: Vector, fid: int = 0) -> Vector:
+        n: int = len(y)
+
+        inv_table = dict()
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+
+                key: int = abs(x[i] - x[j])
+                if key not in inv_table:
+                    inv_table[key] = Zp(key).inv()  # fid used here
+
+        # Initialize numer and denom_inv
+        numer = Matrix(n, n)
+        denom_inv = Vector([1] * n)
+        numer[0] = y * Zp(1)
+
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+
+                for k in range(n - 1, -1, -1):
+                    numer[k][j] = (Zp(0) if k == 0 else numer[k - 1][j]) - Zp(x[i]) * numer[k][j]
+                    # Mod(numer[k][j], fid);
+                denom_inv[i] *= (1 if x[i] > x[j] else -1) * int(inv_table[abs(x[i] - x[j])])
+                # Mod(denom_inv[i], fid);
+
+        denom_inv = Vector([Zp(e) for e in denom_inv])
+        return numer.mult(denom_inv)
+        # Mod(c, fid);
     
     def setup_channels(self: 'MPCEnv', pairs: list) -> bool:
         for pair in pairs:

@@ -170,6 +170,9 @@ class Vector:
         if self.type_ is None:
             self.type_ = type(elem)
         self.value.append(elem)
+    
+    def mult(self: 'Vector', other: 'Vector') -> 'Vector':
+        return Vector([sum(row * other, other.type_(0)) for row in self.value])
 
 
 # This inheritance will be easy to refactor to .seq via extend
