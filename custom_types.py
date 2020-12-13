@@ -87,9 +87,14 @@ class Zp:
     def to_bytes(self: 'Zp') -> bytes:
         return self.value.to_bytes((self.value.bit_length() + 7) // 8, 'big')
     
-    def inv(self: 'Zp') -> 'Zp':
-        p: int = self.base
-        return Zp(pow(self.value, p - 2, p))
+    def inv(self: 'Zp', p: int = None) -> 'Zp':
+        p: int = self.base if p is None else p
+        return Zp(pow(self.value, p - 2, p), base=p)
+    
+    def set_field(self: 'Zp', field: int):
+        if field != self.base:
+            self.base = field
+            self.value %= self.base
     
     @staticmethod
     def randzp(base: int = BASE_P) -> 'Zp':
@@ -173,6 +178,10 @@ class Vector:
     
     def mult(self: 'Vector', other: 'Vector') -> 'Vector':
         return Vector([sum(row * other, other.type_(0)) for row in self.value])
+    
+    def set_field(self: 'Vector', field: int):
+        for v in self.value:
+            v.set_field(field)
 
 
 # This inheritance will be easy to refactor to .seq via extend
@@ -211,3 +220,20 @@ class Matrix(Vector):
     
     def to_bytes(self: 'Matrix') -> bytes:
         return b';'.join([v.to_bytes() for v in self.value])
+    
+    def reshape(self: 'Matrix', nrows: int, ncols: int):
+        assert self.num_rows() * self.num_cols() == nrows * ncols
+
+        b = Matrix(nrows, ncols)
+
+        ai: int = 0
+        aj: int = 0
+        for i in range(nrows):
+            for j in range(ncols):
+                b[i][j] = self[ai][aj]
+                aj += 1
+                if aj == self.num_cols():
+                    ai += 1
+                    aj = 0
+        
+        self.value = b.value
