@@ -854,21 +854,6 @@ class MPCEnv:
 
         # Initial approximation: 1 / x_scaled ~= 5.9430 - 10 * x_scaled + 5 * x_scaled^2
         s, _ = self.normalizer_even_exp(b)
-        # if self.pid == 0: print(f'FINAL S at {self.pid}', s)
-        # if self.pid == 0: print(f'FINAL A at {self.pid}', a)
-        # if self.pid == 0: print(f'FINAL B at {self.pid}', b)
-        
-        # raise Exception()
-        # s = Vector([Zp(0)] * 2)
-        # if (self.pid == 1):
-        #     s[0] = Zp(159482573418184356372497469311518688338292085995)
-        #     s[1] = Zp(581503681566990113299555434737691398678538636139)
-        # if (self.pid == 2):
-        #     s[0] = Zp(1302019063912718561831187363405052561693792168678)
-        #     s[1] = Zp(879997955763912804904129397978592746877300749414)
-        # if self.pid == 2: print(f'FINAL A at {self.pid}', a)
-        # if self.pid == 2: print(f'FINAL B at {self.pid}', b)
-        print(f'FINAL S at {self.pid}', s)
 
         b_scaled: Vector = self.mult_vec(b, s)
 
@@ -902,9 +887,6 @@ class MPCEnv:
         y: Vector = self.mult_vec(a, w)
         self.trunc_vec(y)
 
-        print('FINAL X prefin at', self.pid, x)
-        print('FINAL Y prefin at', self.pid, y)
-
         for _ in range(niter):
             xr, xm = self.beaver_partition(x)
             yr, ym = self.beaver_partition(y)
@@ -922,19 +904,12 @@ class MPCEnv:
             self.trunc_vec(x)
             self.trunc_vec(y)
 
-        print('FINAL X fin at', self.pid, x)
-        print('FINAL Y fin at', self.pid, y)
-
         if self.pid == 1:
             for i in range(len(x)):
                 x[i] += one
             
-        print('FINAL X fin alty at', self.pid, x)
-
         c: Vector = self.mult_vec(y, x)
         self.trunc_vec(c)
-
-        print('FINAL C fin at', self.pid, c)
 
         return c
 
@@ -1040,15 +1015,10 @@ class MPCEnv:
             rbits.set_field(self.primes[fid]),
             Tneg.set_field(self.primes[fid]), fid)
 
-        print('SEMI efir at ', self.pid, efir)
-        print('SEMI rfir at ', self.pid, rfir)
-
         efir = Matrix().from_value(efir).set_field(self.primes[fid])
         rfir = Matrix().from_value(rfir).set_field(self.primes[fid])
 
         double_flag: Vector = self.less_than_bits(efir, rfir, fid)
-
-        print('SEMI double_flag at ', self.pid, double_flag)
 
         odd_bits = Matrix(n, half_len, t=int)
         even_bits = Matrix(n, half_len, t=int)
@@ -1064,8 +1034,6 @@ class MPCEnv:
         odd_bits.set_field(self.primes[fid]).to_int()
         even_bits.set_field(self.primes[fid]).to_int()
 
-        print('SEMI even_bits at ', self.pid, odd_bits)
-
         odd_bit_sum = Vector([0] * n)
         even_bit_sum = Vector([0] * n)
         for i in range(n):
@@ -1079,9 +1047,6 @@ class MPCEnv:
         odd_bit_sum.set_field(self.primes[fid]).to_int()
         even_bit_sum.set_field(self.primes[fid]).to_int()
 
-        print('SEMI odd_bit_sum at ', self.pid, odd_bit_sum)
-        print('SEMI even_bit_sum at ', self.pid, even_bit_sum)
-
         # If double_flag = true, then use odd_bits, otherwise use even_bits
 
         diff = Vector([0] * n)
@@ -1093,18 +1058,12 @@ class MPCEnv:
             double_flag.set_field(self.primes[fid]),
             diff.set_field(self.primes[fid]), fid).to_int()
         
-        print('SEMI diff at ', self.pid, diff)
-
         chosen_bit_sum = Vector([0] * n)
         if self.pid != 0:
             chosen_bit_sum = even_bit_sum + diff
             chosen_bit_sum.set_field(self.primes[fid])
         
-        print('SEMI chosen_bit_sum at ', self.pid, chosen_bit_sum)
-
         b_mat: Matrix = self.table_lookup(chosen_bit_sum, 1)
-
-        print('SEMI b_mat at ', self.pid, b_mat)
 
         if self.pid > 0:
             b_sqrt: Vector = b_mat[0]
