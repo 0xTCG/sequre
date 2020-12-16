@@ -42,10 +42,10 @@ class Zp:
         return self.value
 
     def __neg__(self: 'Zp') -> 'Zp':
-        return Zp(-self.value % BASE_P)
+        return Zp(-self.value, base=self.base)
     
     def __iadd__(self: 'Zp', other: 'Zp') -> 'Zp':
-        self.value = (self.value + other.value) % BASE_P
+        self.value = (self.value + other.value) % self.base
         return self
     
     def __isub__(self: 'Zp', other: 'Zp') -> 'Zp':
@@ -53,11 +53,11 @@ class Zp:
         return self
     
     def __imul__(self: 'Zp', other: 'Zp') -> 'Zp':
-        self.value = (self.value * other.value) % BASE_P
+        self.value = (self.value * other.value) % self.base
         return self
     
     def __add__(self: 'Zp', other: 'Zp') ->  'Zp':
-        z = Zp(self.value)
+        z = Zp(self.value, base=self.base)
         z += other
         return z
     
@@ -65,7 +65,7 @@ class Zp:
         return self + -other
     
     def __mul__(self: 'Zp', other: 'Zp') -> 'Zp':
-        z = Zp(self.value)
+        z = Zp(self.value, base=self.base)
         z *= other
         return z
     
@@ -82,7 +82,7 @@ class Zp:
         return hash(self.value)
     
     def __pow__(self: 'Zp', e: int) -> 'Zp':
-        return Zp(pow(self.value, e, self.base))
+        return Zp(pow(self.value, e, self.base), base=self.base)
     
     def to_bytes(self: 'Zp') -> bytes:
         return self.value.to_bytes((self.value.bit_length() + 7) // 8, 'big')
@@ -96,21 +96,30 @@ class Zp:
             self.base = field
             self.value %= self.base
     
+    def to_field(self: 'Zp', field: int) -> 'Zp':
+        return Zp(self.value, base=field)
+    
     @staticmethod
     def randzp(base: int = BASE_P) -> 'Zp':
-        return Zp(random.randint(0, base))
+        return Zp(1, base=base)
+        # return Zp(random.randint(0, base), base=base)
 
 
 class Vector:
     def __init__(self: 'Vector', value: list = None):
-        self.value = [] if value is None else value
+        self.value = []
+        if value is not None:
+            for v in value:
+                type_v = type(v)
+                v_ = v if isinstance(v, int) or isinstance(v, float) else Zp(v.value, v.base) if isinstance(v, Zp) else type_v(v.value)  # This hack will be avoided in .seq
+                self.value.append(v_)
         self.type_ = type(value[0]) if value else None
     
     def __neg__(self: 'Vector') -> 'Vector':
         return Vector([-e for e in self.value])
     
     def __iadd__(self: 'Vector', other: 'Vector') -> 'Vector':
-        if isinstance(other, Zp):
+        if isinstance(other, Zp) or isinstance(other, int):
             other = Vector([other] * len(self))
         self.value = [self_e + other_e for self_e, other_e in zip(self.value, other.value)]
         return self
@@ -120,7 +129,7 @@ class Vector:
         return self
     
     def __imul__(self: 'Vector', other: 'Vector') -> 'Vector':
-        if isinstance(other, Zp):
+        if isinstance(other, Zp) or isinstance(other, int):
             other = Vector([other] * len(self))
         self.value = [self_e * other_e for self_e, other_e in zip(self.value, other.value)]
         return self
@@ -176,12 +185,42 @@ class Vector:
             self.type_ = type(elem)
         self.value.append(elem)
     
-    def mult(self: 'Vector', other: 'Vector') -> 'Vector':
-        return Vector([sum(row * other, other.type_(0)) for row in self.value])
+    def mult(self: 'Vector', other: 'Vector') -> 'Matrix':
+        assert self.num_cols() == other.num_rows()
+
+        type_ = type(self[0][0])  # Temp hack
+        new_mat = Matrix(self.num_rows(), other.num_cols(), t=type_)
+
+        for i in range(self.num_rows()):
+            for j in range(other.num_cols()):
+                new_mat[i][j] = sum(
+                    [self[i][k] * other[k][j] for k in range(self.num_cols())],
+                    type_(0))
+        
+        return new_mat
     
-    def set_field(self: 'Vector', field: int):
-        for v in self.value:
-            v.set_field(field)
+    def set_field(self: 'Vector', field: int = BASE_P) -> 'Vector':
+        for i, v in enumerate(self.value):
+            if isinstance(v, int):
+                self.value[i] = Zp(v, base=field)
+                self.type_ = Zp
+            else:
+                v.set_field(field)
+        return self
+    
+    def to_field(self: 'Vector', field: int) -> 'Vector':
+        new_v = Vector(self)
+        new_v.set_field(field)
+        return new_v
+    
+    def to_int(self: 'Vector') -> 'Vector':
+        for i, v in enumerate(self.value):
+            if isinstance(v, Zp):
+                self.value[i] = int(v)
+            else:
+                v.to_int()
+        
+        return self
 
 
 # This inheritance will be easy to refactor to .seq via extend
@@ -203,12 +242,12 @@ class Matrix(Vector):
         self.value = value
         return self
     
-    def set_dims(self: 'Matrix', m: int, n: int):
-        new_mat: list = [Vector([Zp(0)] * n) for _ in range(m)]
+    def set_dims(self: 'Matrix', m: int, n: int, base: int = BASE_P):
+        new_mat: list = [Vector([Zp(0, base=base)] * n) for _ in range(m)]
 
-        for i, row in enumerate(self.value):
-            for j, cell in enumerate(row):
-                new_mat[i][j] = cell
+        for i in range(min(len(self.value), m)):
+            for j in range(min(len(self.value[i]), n)):
+                new_mat[i][j] = self.value[i][j]
         
         self.value = new_mat
     
@@ -219,6 +258,8 @@ class Matrix(Vector):
         return len(self.value[0])
     
     def to_bytes(self: 'Matrix') -> bytes:
+        if int(self[0][0]) == 119881670874624059276163306221842029527465:
+            print('FOUND ONE!!!!!!!!!!!!')
         return b';'.join([v.to_bytes() for v in self.value])
     
     def reshape(self: 'Matrix', nrows: int, ncols: int):
