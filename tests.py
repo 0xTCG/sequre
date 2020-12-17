@@ -116,6 +116,17 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_values(revealed_p, expected_p)
 
         a = Vector([Zp(7, BASE_P), Zp(256, BASE_P), Zp(99, BASE_P), Zp(50, BASE_P)])
+        b, b_inv = mpc.fp_sqrt(a)
+        float_b_1 = mpc.print_fp_elem(b[0], fid=0)
+        float_b_2 = mpc.print_fp_elem(b[1], fid=0)
+        float_b_3 = mpc.print_fp_elem(b[2], fid=0)
+        float_b_4 = mpc.print_fp_elem(b[3], fid=0)
+        float_b_inv_1 = mpc.print_fp_elem(b_inv[0], fid=0)
+        float_b_inv_2 = mpc.print_fp_elem(b_inv[1], fid=0)
+        float_b_inv_3 = mpc.print_fp_elem(b_inv[2], fid=0)
+        float_b_inv_4 = mpc.print_fp_elem(b_inv[3], fid=0)
+
+        a = Vector([Zp(7, BASE_P), Zp(256, BASE_P), Zp(99, BASE_P), Zp(50, BASE_P)])
         b = Vector([Zp(6, BASE_P), Zp(16, BASE_P), Zp(3, BASE_P), Zp(40, BASE_P)])
         d = mpc.fp_div(a, b, fid=0)
         float_d_1 = mpc.print_fp_elem(d[0], fid=0)
