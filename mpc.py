@@ -76,8 +76,9 @@ class MPCEnv:
                 for i in range(0, table.num_cols()):
                     intercept, slope = f.readline().split()
                     fp_intercept: Zp = self.double_to_fp(
-                        float(intercept), param.NBIT_K, param.NBIT_F)
-                    fp_slope: Zp = self.double_to_fp(float(slope), param.NBIT_K, param.NBIT_F)
+                        float(intercept), param.NBIT_K, param.NBIT_F,
+                        fid=0)
+                    fp_slope: Zp = self.double_to_fp(float(slope), param.NBIT_K, param.NBIT_F, fid=0)
 
                     table[0][i] = fp_intercept
                     table[1][i] = fp_slope
@@ -95,7 +96,7 @@ class MPCEnv:
             if (self.pid > 0):
                 for i in range(0, nrow):
                     x = Vector([0] * ncol * (2 if index_by_ZZ else 1))
-                    y = Vector([Zp(0)] * ncol * (2 if index_by_ZZ else 1))
+                    y = Vector([Zp(0, base=self.primes[0])] * ncol * (2 if index_by_ZZ else 1))
                     
                     for j in range(0, ncol):
                         x[j] = j + 1
@@ -104,11 +105,11 @@ class MPCEnv:
                             x[j + ncol] = x[j] + int(self.primes[self.table_field_index[cid]])
                             y[j + ncol] = self.table_cache[cid][i][j]
                     
-                    self.lagrange_cache[cid][i] = self.lagrange_interp(x, y)
+                    self.lagrange_cache[cid][i] = self.lagrange_interp(x, y, fid=0)
             
         # End of Lagrange cache
     
-    def lagrange_interp(self: 'MPCEnv', x: Vector, y: Vector, fid: int = 0) -> Vector:
+    def lagrange_interp(self: 'MPCEnv', x: Vector, y: Vector, fid: int) -> Vector:
         n: int = len(y)
 
         inv_table = dict()
@@ -119,7 +120,7 @@ class MPCEnv:
 
                 key: int = abs(x[i] - x[j])
                 if key not in inv_table:
-                    inv_table[key] = Zp(key).inv(self.primes[fid])
+                    inv_table[key] = Zp(key, base=self.primes[fid]).inv(self.primes[fid])
         
         # Initialize numer and denom_inv
         numer = Matrix(n, n).set_field(self.primes[fid])
@@ -192,14 +193,14 @@ class MPCEnv:
     def send_elem(self: 'MPCEnv', elem: Zp, to_pid: int):
         self.sockets[to_pid].send(elem.to_bytes(), sys.getsizeof(elem.value))
     
-    def receive_elem(self: 'MPCEnv', from_pid: int, fid: int = 0) -> Zp:
+    def receive_elem(self: 'MPCEnv', from_pid: int, fid: int) -> Zp:
         return Zp(int.from_bytes(self.sockets[from_pid].receive(), 'big'), base=self.primes[fid])
     
-    def receive_vector(self: 'MPCEnv', from_pid: int, fid: int = 0) -> Vector:
+    def receive_vector(self: 'MPCEnv', from_pid: int, fid: int) -> Vector:
         values = self.sockets[from_pid].receive().decode("utf-8").split('.')
         return Vector([Zp(int(v), base=self.primes[fid]) for v in values])
     
-    def receive_matrix(self: 'MPCEnv', from_pid: int, fid: int = 0) -> Matrix:
+    def receive_matrix(self: 'MPCEnv', from_pid: int, fid: int) -> Matrix:
         row_values = self.sockets[from_pid].receive().decode("utf-8").split(';')
         matrix: Matrix = Matrix(len(row_values))
 
@@ -213,17 +214,17 @@ class MPCEnv:
         for socket in self.sockets.values():
             socket.close()
   
-    def reveal_sym(self: 'MPCEnv', elem: Zp) -> Zp:
+    def reveal_sym(self: 'MPCEnv', elem: Zp, fid: int) -> Zp:
         if (self.pid == 0):
             return deepcopy(elem)
         
         receive_func = None
         if isinstance(elem, Zp):
-            receive_func = self.receive_elem
+            receive_func = partial(self.receive_elem, fid=fid)
         elif isinstance(elem, Matrix):
-            receive_func = self.receive_matrix
+            receive_func = partial(self.receive_matrix, fid=fid)
         elif isinstance(elem, Vector):
-            receive_func = self.receive_vector
+            receive_func = partial(self.receive_vector, fid=fid)
 
         received_elem: Zp = None
         if (self.pid == 1):
@@ -243,24 +244,24 @@ class MPCEnv:
         self.prg_states[pid] = random.getstate()
         random.setstate(self.prg_states[self.pid])
 
-    def rand_elem(self: 'MPCEnv', fid: int = 0) -> Zp:
+    def rand_elem(self: 'MPCEnv', fid: int) -> Zp:
         return Zp.randzp(self.primes[fid])
     
-    def rand_vector(self: 'MPCEnv', size: int) -> Vector:
-        return Vector([self.rand_elem() for _ in range(size)])
+    def rand_vector(self: 'MPCEnv', size: int, fid: int) -> Vector:
+        return Vector([self.rand_elem(fid) for _ in range(size)])
 
-    def beaver_partition(self: 'MPCEnv', x: object, fid: int = 0) -> tuple:
+    def beaver_partition(self: 'MPCEnv', x: object, fid: int) -> tuple:
         x_ = x.to_field(self.primes[fid])
         type_ = type(x)
         rand_func = None
         if isinstance(x, Zp):
-            rand_func = self.rand_elem
+            rand_func = partial(self.rand_elem, fid=fid)
         elif isinstance(x, Matrix):
-            rand_func = partial(Matrix, m=x_.num_rows(), n=x_.num_cols(), randomise=True)
+            rand_func = partial(self.rand_mat, m=x_.num_rows(), n=x_.num_cols(), fid=fid)
         elif isinstance(x, Vector):
-            rand_func = partial(self.rand_vector, size=len(x_))
-        x_r = type_()
-        r = type_()
+            rand_func = partial(self.rand_vector, size=len(x_), fid=fid)
+        x_r = Zp(0, self.primes[fid]) if isinstance(x, Zp) else type_()
+        r = Zp(0, self.primes[fid]) if isinstance(x, Zp) else type_()
         if self.pid == 0:
             self.switch_seed(1)
             r_1: Zp = rand_func()
@@ -279,9 +280,9 @@ class MPCEnv:
             r.set_field(self.primes[fid])
             
             if isinstance(x, Matrix):  # Temp hack. Will be removed in .seq
-                x_r = self.reveal_sym(Matrix().from_value(x_ - r))
+                x_r = self.reveal_sym(Matrix().from_value(x_ - r), fid=fid)
             else:
-                x_r = self.reveal_sym(x_ - r)
+                x_r = self.reveal_sym(x_ - r, fid=fid)
         
         x_r.set_field(self.primes[fid])
         r.set_field(self.primes[fid])
@@ -290,32 +291,30 @@ class MPCEnv:
     def mul_elem(self: 'MPCEnv', v_1: Vector, v_2: Vector) -> Vector:
         return v_1 * v_2
 
-    def rand_mat(self: 'MPCEnv', m: int, n: int, fid: int = 0) -> Matrix:
-        m = Matrix(m, n, randomise=True)
-        m.set_field(self.primes[fid])
-        return m
+    def rand_mat(self: 'MPCEnv', m: int, n: int, fid: int) -> Matrix:
+        return Matrix(m, n, randomise=True, base=self.primes[fid])
 
-    def get_pascal_matrix(self: 'MPCEnv', pow: int) -> Matrix:
+    def get_pascal_matrix(self: 'MPCEnv', pow: int, fid: int) -> Matrix:
         if pow not in self.pascal_cache:
-            pascal_matrix: Matrix = self.calculate_pascal_matrix(pow)
+            pascal_matrix: Matrix = self.calculate_pascal_matrix(pow, fid=fid)
             self.pascal_cache[pow] = pascal_matrix
 
         return self.pascal_cache[pow]
     
-    def calculate_pascal_matrix(self: 'MPCEnv', pow: int) -> Matrix:
-        t = Matrix(pow + 1, pow + 1)
+    def calculate_pascal_matrix(self: 'MPCEnv', pow: int, fid: int) -> Matrix:
+        t = Matrix(pow + 1, pow + 1).set_field(self.primes[fid])
         for i in range(pow + 1):
             for j in range(pow + 1):
                 if (j > i):
-                    t[i][j] = Zp(0)
+                    t[i][j] = Zp(0, base=self.primes[fid])
                 elif (j == 0 or j == i):
-                    t[i][j] = Zp(1)
+                    t[i][j] = Zp(1, base=self.primes[fid])
                 else:
                     t[i][j] = t[i - 1][j - 1] + t[i - 1][j]
         
         return t
 
-    def powers(self: 'MPCEnv', x: Vector, pow: int, fid: int = 0) -> Matrix:
+    def powers(self: 'MPCEnv', x: Vector, pow: int, fid: int) -> Matrix:
         assert pow >= 1
 
         n: int = len(x)
@@ -355,7 +354,7 @@ class MPCEnv:
                     r_pow = self.rand_mat(pow - 1, n, fid)
                     self.restore_seed(0)
                 else:  # pid == 2
-                    r_pow = self.receive_matrix(0)
+                    r_pow = self.receive_matrix(0, fid=fid)
 
                 x_r_pow = Matrix(pow - 1, n).set_field(self.primes[fid])
                 x_r_pow[0] = self.mul_elem(x_r, x_r)
@@ -363,7 +362,7 @@ class MPCEnv:
                     x_r_pow[p] = self.mul_elem(x_r_pow[p - 1], x_r)
                     x_r_pow[p].set_field(self.primes[fid])
 
-                pascal_matrix = self.get_pascal_matrix(pow)
+                pascal_matrix = self.get_pascal_matrix(pow, fid=0)
 
                 b.set_dims(pow + 1, n, base=self.primes[fid])
 
@@ -390,7 +389,7 @@ class MPCEnv:
         
         return b
     
-    def evaluate_poly(self: 'MPCEnv', x: Vector, coeff: Matrix, fid: int = 0) -> Matrix:
+    def evaluate_poly(self: 'MPCEnv', x: Vector, coeff: Matrix, fid: int) -> Matrix:
         n: int = len(x)
         npoly: int = coeff.num_rows()
         deg: int = coeff.num_cols() - 1
@@ -451,26 +450,26 @@ class MPCEnv:
         xy.set_field(self.primes[fid])
         return xy
 
-    def beaver_mult_elem(self: 'MPCEnv', x_1_r: Matrix, r_1: Matrix, x_2_r: Matrix, r_2: Matrix, fid: int = 0) -> Matrix:
+    def beaver_mult_elem(self: 'MPCEnv', x_1_r: Matrix, r_1: Matrix, x_2_r: Matrix, r_2: Matrix, fid: int) -> Matrix:
         return self.beaver_mult(x_1_r, r_1, x_2_r, r_2, True, fid)
     
-    def beaver_reconstruct(self: 'MPCEnv', elem: object, fid: int = 0) -> Matrix:
+    def beaver_reconstruct(self: 'MPCEnv', elem: object, fid: int) -> Matrix:
             elem_ = elem.to_field(self.primes[fid])
             receive_func = None
             if isinstance(elem, Zp):
-                receive_func = self.receive_elem
+                receive_func = partial(self.receive_elem, fid=fid)
             elif isinstance(elem, Matrix):
-                receive_func = self.receive_matrix
+                receive_func = partial(self.receive_matrix, fid=fid)
             elif isinstance(elem, Vector):
-                receive_func = self.receive_vector
+                receive_func = partial(self.receive_vector, fid=fid)
             
             rand_func = None
             if isinstance(elem, Zp):
-                rand_func = self.rand_elem
+                rand_func = partial(self.rand_elem, fid=fid)
             elif isinstance(elem, Matrix):
-                rand_func = partial(Matrix, m=elem.num_rows(), n=elem.num_cols(), randomise=True)
+                rand_func = partial(self.rand_mat, m=elem.num_rows(), n=elem.num_cols(), fid=fid)
             elif isinstance(elem, Vector):
-                rand_func = partial(self.rand_vector, size=len(elem))
+                rand_func = partial(self.rand_vector, size=len(elem), fid=fid)
 
             if self.pid == 0:
                 self.switch_seed(1)
@@ -496,7 +495,7 @@ class MPCEnv:
 
                 return (elem_ + rr).set_field(self.primes[fid])
             
-    def mult_elem(self: 'MPCEnv', a: Matrix, b: Matrix, fid: int = 0) -> Matrix:
+    def mult_elem(self: 'MPCEnv', a: Matrix, b: Matrix, fid: int) -> Matrix:
         x_1_r, r_1 = self.beaver_partition(a, fid)
         x_2_r, r_2 = self.beaver_partition(b, fid)
         
@@ -505,7 +504,7 @@ class MPCEnv:
         
         return c
     
-    def mult_vec(self: 'MPCEnv', a: Vector, b: Vector, fid: int = 0) -> Vector:
+    def mult_vec(self: 'MPCEnv', a: Vector, b: Vector, fid: int) -> Vector:
         x_1_r, r_1 = self.beaver_partition(a, fid)
         x_2_r, r_2 = self.beaver_partition(b, fid)
         
@@ -546,10 +545,10 @@ class MPCEnv:
         
         return b
 
-    def print_fp_elem(self: 'MPCEnv', elem: Zp) -> float:
+    def print_fp_elem(self: 'MPCEnv', elem: Zp, fid: int) -> float:
         if self.pid == 0:
             return None
-        revealed_elem: Zp = self.reveal_sym(elem)
+        revealed_elem: Zp = self.reveal_sym(elem, fid=fid)
         elem_float: float = self.fp_to_double_elem(revealed_elem, param.NBIT_K, param.NBIT_F)
 
         if self.pid == 2:
@@ -557,10 +556,10 @@ class MPCEnv:
         
         return elem_float
 
-    def print_fp(self: 'MPCEnv', mat: Matrix) -> Matrix:
+    def print_fp(self: 'MPCEnv', mat: Matrix, fid: int) -> Matrix:
         if self.pid == 0:
             return None
-        revealed_mat: Vector = self.reveal_sym(mat)
+        revealed_mat: Vector = self.reveal_sym(mat, fid=fid)
         mat_float: Matrix = self.fp_to_double(revealed_mat, param.NBIT_K, param.NBIT_F)
 
         if self.pid == 2:
@@ -568,7 +567,7 @@ class MPCEnv:
         
         return mat_float
 
-    def double_to_fp(self: 'MPCEnv', x: float, k: int, f: int) -> Zp:
+    def double_to_fp(self: 'MPCEnv', x: float, k: int, f: int, fid: int) -> Zp:
         sn: int = 1
         if (x < 0):
             x = -x
@@ -586,35 +585,36 @@ class MPCEnv:
                 xf -= int(xf)
                 az_trunc = TypeOps.set_bit(az_trunc, fbit)
         
-        return Zp(az_trunc * sn)
+        return Zp(az_trunc * sn, base=self.primes[fid])
     
-    def table_lookup(self: 'MPCEnv', x: Vector, table_id: int) -> Matrix:
-        return self.evaluate_poly(x, self.lagrange_cache[table_id])
+    def table_lookup(self: 'MPCEnv', x: Vector, table_id: int, fid: int) -> Matrix:
+        return self.evaluate_poly(x, self.lagrange_cache[table_id], fid=fid)
     
-    def rand_mat_bits(self: 'MPCEnv', num_rows: int, num_cols: int, num_bits: int) -> Matrix:
+    def rand_mat_bits(self: 'MPCEnv', num_rows: int, num_cols: int, num_bits: int, fid: int) -> Matrix:
+        # TODO change to int
         rand_mat = Matrix(num_rows, num_cols)
 
         for i in range(num_rows):
             for j in range(num_cols):
-                rand_mat[i][j] = Zp(Zp.randzp(base=(2 ** num_bits - 1)).value)
+                rand_mat[i][j] = Zp(Zp.randzp(base=((1 << num_bits) - 1)).value, base=self.primes[fid])
 
         return rand_mat
 
-    def trunc(self: 'MPCEnv', a: Matrix, k: int, m: int):
+    def trunc(self: 'MPCEnv', a: Matrix, k: int, m: int, fid: int):
         r = Matrix()
         r_low = Matrix()
         if (self.pid == 0):
-            r = self.rand_mat_bits(a.num_rows(), a.num_cols(), k + param.NBIT_V)
+            r = self.rand_mat_bits(a.num_rows(), a.num_cols(), k + param.NBIT_V, fid=fid)
             r_low.set_dims(a.num_rows(), a.num_cols())
             
             for i in range(0, a.num_rows()):
                 for j in range(0, a.num_cols()):
-                    r_low[i][j] = Zp(int(r[i][j]) & (2 ** m - 1))
+                    r_low[i][j] = Zp(int(r[i][j]) & ((1 << m) - 1), base=self.primes[fid])
                     # r_low[i][j] = conv<ZZ_p>(trunc_ZZ(rep(r[i][j]), m));
 
             self.switch_seed(1)
-            r_mask = self.rand_mat(a.num_rows(), a.num_cols())
-            r_low_mask = self.rand_mat(a.num_rows(), a.num_cols())
+            r_mask = self.rand_mat(a.num_rows(), a.num_cols(), fid=0)
+            r_low_mask = self.rand_mat(a.num_rows(), a.num_cols(), fid=0)
             self.restore_seed(1)
 
             r -= r_mask
@@ -624,22 +624,22 @@ class MPCEnv:
             self.send_elem(Matrix().from_value(r), 2)
             self.send_elem(Matrix().from_value(r_low), 2)
         elif self.pid == 2:
-            r = self.receive_matrix(0)
-            r_low = self.receive_matrix(0)
+            r = self.receive_matrix(0, fid=fid)
+            r_low = self.receive_matrix(0, fid=fid)
         else:
             self.switch_seed(0)
-            r = self.rand_mat(a.num_rows(), a.num_cols())
-            r_low = self.rand_mat(a.num_rows(), a.num_cols())
+            r = self.rand_mat(a.num_rows(), a.num_cols(), fid=0)
+            r_low = self.rand_mat(a.num_rows(), a.num_cols(), fid=0)
             self.restore_seed(0)
 
         c = Matrix().from_value(a + r) if self.pid > 0 else Matrix(a.num_rows(), a.num_cols())
-        c = self.reveal_sym(c)
+        c = self.reveal_sym(c, fid=fid)
 
         c_low = Matrix(a.num_rows(), a.num_cols())
         if (self.pid > 0):
             for i in range(0, a.num_rows()):
                 for j in range(0, a.num_cols()):
-                    c_low[i][j] = Zp(int(c[i][j]) & ((1 << m) - 1))
+                    c_low[i][j] = Zp(int(c[i][j]) & ((1 << m) - 1), base=self.primes[fid])
 
         if (self.pid > 0):
             a += r_low
@@ -647,7 +647,7 @@ class MPCEnv:
                 a -= c_low
 
             if m not in self.invpow_cache:
-                twoinv = Zp(2).inv()
+                twoinv = Zp(2, base=self.primes[fid]).inv()
                 twoinvm = twoinv ** m
                 self.invpow_cache[m] = twoinvm
                 
@@ -691,18 +691,18 @@ class MPCEnv:
         else:
             a.reshape(nrows, ncols)
 
-    def beaver_partition_bulk(self: 'Matrix', x: list, fid: int = 0) -> tuple:
+    def beaver_partition_bulk(self: 'Matrix', x: list, fid: int) -> tuple:
         # TODO: Do this in parallel
         partitions = [self.beaver_partition(e, fid) for e in x]
         x_r = [p[0] for p in partitions]
         r = [p[1] for p in partitions]
         return x_r, r
     
-    def beaver_reconstruct_bulk(self: 'Matrix', x: list, fid: int = 0) -> tuple:
+    def beaver_reconstruct_bulk(self: 'Matrix', x: list, fid: int) -> tuple:
         # TODO: Do this in parallel
         return [self.beaver_reconstruct(e, fid) for e in x]
 
-    def mult_aux_parallel(self: 'MPCEnv', a: list, b: list, elem_wise: bool, fid: int = 0) -> list:
+    def mult_aux_parallel(self: 'MPCEnv', a: list, b: list, elem_wise: bool, fid: int) -> list:
         assert len(a) == len(b)
         nmat: int = len(a)
 
@@ -728,7 +728,7 @@ class MPCEnv:
         
         return self.beaver_reconstruct_bulk(c, fid)
 
-    def mult_mat_parallel(self: 'MPCEnv', a: list, b: list, fid: int = 0) -> Vector:
+    def mult_mat_parallel(self: 'MPCEnv', a: list, b: list, fid: int) -> Vector:
         return self.mult_aux_parallel(a, b, False, fid)
 
     def prefix_or(self: 'MPCEnv', a: Matrix, fid: int) -> Matrix:
@@ -817,21 +817,21 @@ class MPCEnv:
         
         return b
     
-    def int_to_fp(self: 'MPCEnv', a: int, k: int, f: int) -> Zp:
+    def int_to_fp(self: 'MPCEnv', a: int, k: int, f: int, fid: int) -> Zp:
         sn = 1 if a >= 0 else -1
 
         az_shift: int = TypeOps.left_shift(a, f)
         az_trunc: int = TypeOps.trunc_elem(az_shift, k - 1)
 
-        return Zp(az_trunc * sn)
+        return Zp(az_trunc * sn, base=self.primes[fid])
 
-    def fp_div(self: 'MPCEnv', a: Vector, b: Vector) -> Vector:
+    def fp_div(self: 'MPCEnv', a: Vector, b: Vector, fid: int) -> Vector:
         assert len(a) == len(b)
 
         n: int = len(a)
         if n > param.DIV_MAX_N:
             nbatch: int = math.ceil(n / param.DIV_MAX_N)
-            c = Vector([Zp(0)] * n)
+            c = Vector([Zp(0, base=self.primes[fid])] * n)
             for i in range(nbatch):
                 start: int = param.DIV_MAX_N * i
                 end: int = start + param.DIV_MAX_N
@@ -839,13 +839,13 @@ class MPCEnv:
                     end = n
                 batch_size: int = end - start
 
-                a_copy = Vector([Zp(0)] * batch_size)
-                b_copy = Vector([Zp(0)] * batch_size)
+                a_copy = Vector([Zp(0, base=self.primes[fid])] * batch_size)
+                b_copy = Vector([Zp(0, base=self.primes[fid])] * batch_size)
                 for j in range(batch_size):
                     a_copy[j] = Vector(a[start + j])
                     b_copy[j] = Vector(b[start + j])
 
-                c_copy: Vector = self.fp_div(a_copy, b_copy)
+                c_copy: Vector = self.fp_div(a_copy, b_copy, fid=fid)
                 for j in range(batch_size):
                     c[start + j] = Vector(c_copy[j])
             return c
@@ -855,41 +855,41 @@ class MPCEnv:
         # Initial approximation: 1 / x_scaled ~= 5.9430 - 10 * x_scaled + 5 * x_scaled^2
         s, _ = self.normalizer_even_exp(b)
 
-        b_scaled: Vector = self.mult_vec(b, s)
+        b_scaled: Vector = self.mult_vec(b, s, fid=fid)
 
-        self.trunc_vec(b_scaled, param.NBIT_K, param.NBIT_K - param.NBIT_F)
+        self.trunc_vec(b_scaled, param.NBIT_K, param.NBIT_K - param.NBIT_F, fid=fid)
 
-        b_scaled_sq: Vector = self.mult_vec(b_scaled, b_scaled)
-        self.trunc_vec(b_scaled_sq)
+        b_scaled_sq: Vector = self.mult_vec(b_scaled, b_scaled, fid=fid)
+        self.trunc_vec(b_scaled_sq, fid=fid)
 
-        scaled_est = Vector([Zp(0)] * n)
+        scaled_est = Vector([Zp(0, base=self.primes[fid])] * n)
         if self.pid != 0:
-            scaled_est = -b_scaled * Zp(10) + b_scaled_sq * Zp(5)
+            scaled_est = -b_scaled * Zp(10, base=self.primes[fid]) + b_scaled_sq * Zp(5, base=self.primes[fid])
             if self.pid == 1:
-                coeff: Zp = self.double_to_fp(5.9430, param.NBIT_K, param.NBIT_F)
+                coeff: Zp = self.double_to_fp(5.9430, param.NBIT_K, param.NBIT_F, fid=fid)
                 scaled_est += coeff
 
-        w: Vector = self.mult_vec(scaled_est, s)
+        w: Vector = self.mult_vec(scaled_est, s, fid=fid)
         # scaled_est has bit length <= NBIT_F + 2, and s has bit length <= NBIT_K
         # so the bit length of w is at most NBIT_K + NBIT_F + 2
-        self.trunc_vec(w, param.NBIT_K + param.NBIT_F + 2, param.NBIT_K - param.NBIT_F)
+        self.trunc_vec(w, param.NBIT_K + param.NBIT_F + 2, param.NBIT_K - param.NBIT_F, fid=fid)
 
-        x: Vector = self.mult_vec(w, b)
-        self.trunc_vec(x)
+        x: Vector = self.mult_vec(w, b, fid=fid)
+        self.trunc_vec(x, fid=fid)
 
-        one: Zp = self.int_to_fp(1, param.NBIT_K, param.NBIT_F)
+        one: Zp = self.int_to_fp(1, param.NBIT_K, param.NBIT_F, fid=fid)
 
         x = -x
         if self.pid == 1:
             for i in range(len(x)):
                 x[i] += one
         
-        y: Vector = self.mult_vec(a, w)
-        self.trunc_vec(y)
+        y: Vector = self.mult_vec(a, w, fid=fid)
+        self.trunc_vec(y, fid=fid)
 
         for _ in range(niter):
-            xr, xm = self.beaver_partition(x)
-            yr, ym = self.beaver_partition(y)
+            xr, xm = self.beaver_partition(x, fid=fid)
+            yr, ym = self.beaver_partition(y, fid=fid)
 
             xpr = deepcopy(xr)
             if self.pid > 0:
@@ -898,25 +898,25 @@ class MPCEnv:
             y: Vector = self.beaver_mult_vec(yr, ym, xpr, xm, fid=0)
             x: Vector = self.beaver_mult_vec(xr, xm, xr, xm, fid=0)
 
-            x: Vector = self.beaver_reconstruct(x)
-            y: Vector = self.beaver_reconstruct(y)
+            x: Vector = self.beaver_reconstruct(x, fid=fid)
+            y: Vector = self.beaver_reconstruct(y, fid=fid)
 
-            self.trunc_vec(x)
-            self.trunc_vec(y)
+            self.trunc_vec(x, fid=fid)
+            self.trunc_vec(y, fid=fid)
 
         if self.pid == 1:
             for i in range(len(x)):
                 x[i] += one
             
-        c: Vector = self.mult_vec(y, x)
-        self.trunc_vec(c)
+        c: Vector = self.mult_vec(y, x, fid=fid)
+        self.trunc_vec(c, fid=fid)
 
         return c
 
-    def trunc_vec(self: 'MPCEnv', v: Vector, k: int = param.NBIT_K + param.NBIT_F, m: int = param.NBIT_F):
+    def trunc_vec(self: 'MPCEnv', v: Vector, k: int = param.NBIT_K + param.NBIT_F, m: int = param.NBIT_F, fid: int = 0):
         am = Matrix(1, len(v))
         am[0] = v
-        self.trunc(am, k, m)
+        self.trunc(am, k, m, fid=fid)
         v.value = am[0].value
     
     def less_than_bits_public(self: 'MPCEnv', a: Matrix, b_pub: Matrix, fid: int) -> Matrix:
@@ -931,17 +931,17 @@ class MPCEnv:
     
         return b
     
-    def rand_vec_bits(self: 'MPCEnv', n: int, bitlen: int) -> Vector:
-        am: Matrix = self.rand_mat_bits(1, n, bitlen)
+    def rand_vec_bits(self: 'MPCEnv', n: int, bitlen: int, fid: int) -> Vector:
+        am: Matrix = self.rand_mat_bits(1, n, bitlen, fid=fid)
         return am[0]
     
     def share_random_bits(self: 'MPCEnv', k: int, n: int, fid: int) -> tuple:
         if self.pid == 0:
-            r: Vector = self.rand_vec_bits(n, k + param.NBIT_V)
+            r: Vector = self.rand_vec_bits(n, k + param.NBIT_V, fid=fid)
             rbits: Matrix = self.num_to_bits(r, k)
 
             self.switch_seed(1)
-            r_mask: Vector = self.rand_vector(n)
+            r_mask: Vector = self.rand_vector(n, fid)
             rbits_mask: Matrix = self.rand_mat(n, k, fid).to_int()
             self.restore_seed(1)
 
@@ -954,11 +954,11 @@ class MPCEnv:
             self.send_elem(r, 2)
             self.send_elem(rbits, 2)
         elif self.pid == 2:
-            r: Vector = self.receive_vector(0)
-            rbits: Matrix = self.receive_matrix(0).to_int()
+            r: Vector = self.receive_vector(0, fid=fid)
+            rbits: Matrix = self.receive_matrix(0, fid=fid).to_int()
         else:
             self.switch_seed(0)
-            r: Vector = self.rand_vector(n)
+            r: Vector = self.rand_vector(n, fid)
             rbits: Matrix = self.rand_mat(n, k, fid).to_int()
             self.restore_seed(0)
         
@@ -970,8 +970,8 @@ class MPCEnv:
 
         r, rbits = self.share_random_bits(param.NBIT_K, n, fid)
 
-        e = Vector([Zp(0)] * n) if self.pid == 0 else a + r
-        e = self.reveal_sym(e)
+        e = Vector([Zp(0, base=self.primes[0])] * n) if self.pid == 0 else a + r
+        e = self.reveal_sym(e, fid=0)
 
         ebits = Matrix(n, param.NBIT_K, t=int) if self.pid == 0 else self.num_to_bits(e, param.NBIT_K)
 
@@ -1063,14 +1063,14 @@ class MPCEnv:
             chosen_bit_sum = even_bit_sum + diff
             chosen_bit_sum.set_field(self.primes[fid])
         
-        b_mat: Matrix = self.table_lookup(chosen_bit_sum, 1)
+        b_mat: Matrix = self.table_lookup(chosen_bit_sum, 1, fid=0)
 
         if self.pid > 0:
             b_sqrt: Vector = b_mat[0]
             b: Vector = b_mat[1]
             return b, b_sqrt
         
-        return Vector([Zp(0)] * n), Vector([Zp(0)] * n)
+        return Vector([Zp(0, base=self.primes[fid])] * n), Vector([Zp(0, base=self.primes[fid])] * n)
 
     def less_than_bits(self: 'MPCEnv', a: Matrix, b: Matrix, fid: int) -> Vector:
         return self.less_than_bits_aux(a, b, 0, fid)
@@ -1099,8 +1099,6 @@ class MPCEnv:
         
         f: Matrix = self.prefix_or(x, fid)
 
-        # print('LessThankBitsAux f at ', self.pid, f)
-
         if self.pid > 0:
             for i in range(n):
                 for j in range(L - 1, 0, -1):
@@ -1109,8 +1107,6 @@ class MPCEnv:
         
         f.to_int()
 
-        # print('LessThankBitsAux f alt at ', self.pid, f)
-        
         if public_flag == 2:
             c = Vector([0] * n)
             if self.pid > 0:
@@ -1135,4 +1131,110 @@ class MPCEnv:
         c_arr: list = self.mult_mat_parallel(f_arr, b_arr, fid)
 
         return Vector([int(c_arr[i][0][0]) if self.pid > 0 else 0 for i in range(n)])
-    
+
+
+    # def fp_sqrt(a: Vector) -> tuple:
+    #     n: int = len(a)
+
+    #     if n > param.DIV_MAX_N:
+    #         nbatch: int = math.ceil(n / param.DIV_MAX_N)
+    #         b = Vector()
+    #         b_inv.SetLength(n);
+    #         for (int i = 0; i < nbatch; i++) {
+    #         // DBG("FPSqrt on large vector: " << i + 1 << "/" << nbatch);
+    #         int start = Param::DIV_MAX_N * i;
+    #         int end = start + Param::DIV_MAX_N;
+    #         if (end > n) {
+    #             end = n;
+    #         }
+    #         int batch_size = end - start;
+    #         Vec<ZZ_p> a_copy;
+    #         a_copy.SetLength(batch_size);
+    #         for (int j = 0; j < batch_size; j++) {
+    #             a_copy[j] = a[start + j];
+    #         }
+    #         Vec<ZZ_p> b_copy, b_inv_copy;
+    #         FPSqrt(b_copy, b_inv_copy, a_copy);
+    #         for (int j = 0; j < batch_size; j++) {
+    #             b[start + j] = b_copy[j];
+    #             b_inv[start + j] = b_inv_copy[j];
+    #         }
+    #         }
+    #         return;
+    #     }
+
+    #     // TODO: Currently using the same # iter as division -- possibly need to
+    #     // update
+    #     int niter = 2 * ceil(log2(((double)Param::NBIT_K) / 3.5));
+
+    #     /* Initial approximation: 1 / sqrt(a_scaled) ~= 2.9581 - 4 * a_scaled + 2 *
+    #     * a_scaled^2 */
+    #     Vec<ZZ_p> s, s_sqrt;
+    #     NormalizerEvenExp(s, s_sqrt, a);
+
+    #     Vec<ZZ_p> a_scaled;
+    #     MultElem(a_scaled, a, s);
+    #     Trunc(a_scaled, Param::NBIT_K, Param::NBIT_K - Param::NBIT_F);
+
+    #     Vec<ZZ_p> a_scaled_sq;
+    #     MultElem(a_scaled_sq, a_scaled, a_scaled);
+    #     Trunc(a_scaled_sq);
+
+    #     Vec<ZZ_p> scaled_est;
+    #     if (pid == 0) {
+    #         scaled_est.SetLength(n);
+    #     } else {
+    #         scaled_est = -4 * a_scaled + 2 * a_scaled_sq;
+    #         if (pid == 1) {
+    #         ZZ_p coeff;
+    #         DoubleToFP(coeff, 2.9581, Param::NBIT_K, Param::NBIT_F);
+    #         for (int i = 0; i < n; i++) {
+    #             scaled_est[i] += coeff;
+    #         }
+    #         }
+    #     }
+
+    #     Vec<Mat<ZZ_p>> h_and_g;
+    #     h_and_g.SetLength(2);
+    #     h_and_g[0].SetDims(1, n);
+    #     h_and_g[1].SetDims(1, n);
+
+    #     MultElem(h_and_g[0][0], scaled_est, s_sqrt);
+    #     // Our scaled initial approximation (scaled_est) has bit length <= NBIT_F + 2
+    #     // and s_sqrt is at most NBIT_K/2 bits, so their product is at most NBIT_K/2 +
+    #     // NBIT_F + 2
+    #     Trunc(h_and_g[0], Param::NBIT_K / 2 + Param::NBIT_F + 2,
+    #             ((Param::NBIT_K - Param::NBIT_F) / 2) + 1);
+
+    #     h_and_g[1][0] = h_and_g[0][0] * 2;
+    #     MultElem(h_and_g[1][0], h_and_g[1][0], a);
+    #     Trunc(h_and_g[1]);
+
+    #     ZZ_p onepointfive;
+    #     DoubleToFP(onepointfive, 1.5, Param::NBIT_K, Param::NBIT_F);
+
+    #     for (int it = 0; it < niter; it++) {
+    #         Mat<ZZ_p> r;
+    #         MultElem(r, h_and_g[0], h_and_g[1]);
+    #         Trunc(r);
+    #         r = -r;
+    #         if (pid == 1) {
+    #         for (int i = 0; i < n; i++) {
+    #             r[0][i] += onepointfive;
+    #         }
+    #         }
+
+    #         Vec<Mat<ZZ_p>> r_dup;
+    #         r_dup.SetLength(2);
+    #         r_dup[0] = r;
+    #         r_dup[1] = r;
+
+    #         MultElemParallel(h_and_g, h_and_g, r_dup);
+    #         // TODO: write a version of Trunc with parallel processing
+    #         Trunc(h_and_g[0]);
+    #         Trunc(h_and_g[1]);
+    #     }
+
+    #     b_inv = 2 * h_and_g[0][0];
+    #     b = h_and_g[1][0];
+    #     }
