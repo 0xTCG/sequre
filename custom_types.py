@@ -2,7 +2,7 @@ import random
 
 from functools import partial
 
-from param import BASE_P
+from param import BASE_P, BASE_LEN
 
 
 class TypeOps:
@@ -34,6 +34,14 @@ class TypeOps:
     @staticmethod
     def bit(elem: int, k: int) -> int:
         return int((elem & (1 << k)) != 0)
+    
+    @staticmethod
+    def get_mat_len(m: int, n: int) -> int:
+        return m * n * BASE_LEN + m - 1 + (n - 1) * m
+    
+    @staticmethod
+    def get_vec_len(n: int) -> int:
+        return n * BASE_LEN + n - 1
 
 
 class Zp:
@@ -91,8 +99,9 @@ class Zp:
     def __pow__(self: 'Zp', e: int) -> 'Zp':
         return Zp(pow(self.value, e, self.base), base=self.base)
     
-    def to_bytes(self: 'Zp') -> bytes:
-        return self.value.to_bytes((self.value.bit_length() + 7) // 8, 'big')
+    def to_bytes(self: 'Zp') -> str:
+        base = b'0' * BASE_LEN
+        return (base + str(self).encode('utf-8'))[len(str(self)):]
     
     def inv(self: 'Zp', p: int = None) -> 'Zp':
         p: int = self.base if p is None else p
@@ -106,9 +115,11 @@ class Zp:
     def to_field(self: 'Zp', field: int) -> 'Zp':
         return Zp(self.value, base=field)
     
+    def get_bytes_len(self: 'Zp') -> int:
+        return BASE_LEN
+    
     @staticmethod
     def randzp(base: int = BASE_P) -> 'Zp':
-        # return Zp(1, base=base)
         return Zp(random.randint(0, 30), base=base)
 
 
@@ -185,7 +196,7 @@ class Vector:
         return len(self.value[0])
 
     def to_bytes(self: 'Vector') -> bytes:
-        return b'.'.join([bytes(str(e), encoding='utf8') for e in self.value])
+        return b'.'.join([(Zp(e, BASE_P) if isinstance(e, int) else e).to_bytes() for e in self.value])
     
     def append(self: 'Vector', elem: object):
         if self.type_ is None:
@@ -228,6 +239,9 @@ class Vector:
                 v.to_int()
         
         return self
+    
+    def get_bytes_len(self: 'Vector') -> int:
+        return TypeOps.get_vec_len(len(self))
 
 
 # This inheritance will be easy to refactor to .seq via extend
@@ -266,8 +280,6 @@ class Matrix(Vector):
         return len(self.value[0])
     
     def to_bytes(self: 'Matrix') -> bytes:
-        if int(self[0][0]) == 119881670874624059276163306221842029527465:
-            print('FOUND ONE!!!!!!!!!!!!')
         return b';'.join([v.to_bytes() for v in self.value])
     
     def reshape(self: 'Matrix', nrows: int, ncols: int):
@@ -286,3 +298,6 @@ class Matrix(Vector):
                     aj = 0
         
         self.value = b.value
+
+    def get_bytes_len(self: 'Matrix') -> int:
+        return TypeOps.get_mat_len(len(self), len(self[0]))

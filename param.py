@@ -1,4 +1,6 @@
 """ Module containing all params """
+import math
+
 # Ports
 # The party with smaller ID listens on the port
 # and the other connects to it. Make sure the firewall
@@ -18,3 +20,5 @@ NBIT_F: int = 45
 NBIT_V: int = 64
 
 DIV_MAX_N = 100000
+
+BASE_LEN: int = math.ceil(math.log10(BASE_P))

@@ -42,16 +42,25 @@ class CSocket:
     def accept(self: 'CSocket'):
         self.m_sock, _ = self.m_sock.accept()
     
-    def send(self: 'CSocket', data: bytes, n_len: int, n_flags: int = 0) -> int:
-        self.bytes_sent += n_len
-        return self.m_sock.sendall(data)
+    def send(self: 'CSocket', data: str):
+        totalsent = 0
+        while totalsent < len(data):
+            sent = self.m_sock.send(data[totalsent:])
+            if sent == 0:
+                raise RuntimeError("socket connection broken")
+            totalsent = totalsent + sent
+        return None
 
-    def receive(self: 'CSocket', n_flags: int = 0) -> bytes:
-        received_data: bytes = bytes(0)
-        packet_size: int = 2 ** 20  # Temp local solution. TODO: Implement packeting.
-        received_data: bytes = self.m_sock.recv(packet_size, n_flags)
-        self.bytes_received += len(received_data)
-        return received_data
+    def receive(self: 'CSocket', msg_len: int) -> bytes:
+        chunks = []
+        bytes_recd = 0
+        while bytes_recd < msg_len:
+            chunk = self.m_sock.recv(min(msg_len - bytes_recd, 2048))
+            if chunk == b'':
+                raise RuntimeError("socket connection broken")
+            chunks.append(chunk)
+            bytes_recd = bytes_recd + len(chunk)
+        return b''.join(chunks)
     
     def reset_stats(self: 'CSocket'):
         self.bytes_received = 0

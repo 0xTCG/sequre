@@ -54,7 +54,7 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             mpc.send_elem(r, 1)
             mpc.send_elem(r, 2)
         else:
-            r_0 = mpc.receive_elem(0, fid=0)
+            r_0 = mpc.receive_elem(0, msg_len=x_r.get_bytes_len(), fid=0)
             assert_values(r_0, mpc.reveal_sym(r, fid=0))
             assert_values(x_r + mpc.reveal_sym(r, fid=0), Zp(17, BASE_P))
         
@@ -63,7 +63,7 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             mpc.send_elem(r, 1)
             mpc.send_elem(r, 2)
         else:
-            r_0 = mpc.receive_vector(0, fid=0)
+            r_0 = mpc.receive_vector(0, msg_len=x_r.get_bytes_len(), fid=0)
             assert_values(r_0, mpc.reveal_sym(r, fid=0))
             assert_values(x_r + mpc.reveal_sym(r, fid=0), Vector([Zp(13, BASE_P), Zp(15, BASE_P), Zp(17, BASE_P)]))
         
