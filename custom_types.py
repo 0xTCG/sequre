@@ -120,7 +120,7 @@ class Zp:
     
     @staticmethod
     def randzp(base: int = BASE_P) -> 'Zp':
-        return Zp(random.randint(0, 30), base=base)
+        return Zp(random.randint(0, BASE_P - 1), base=base)
 
 
 class Vector:
