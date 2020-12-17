@@ -38,6 +38,8 @@ class TypeOps:
 
 class Zp:
     def __init__(self: 'Zp', value: int, base: int):
+        if not isinstance(value, int):
+            raise ValueError('Invalid value for Zp: ', value)
         self.base = base
         self.value = value % self.base
     
@@ -48,7 +50,8 @@ class Zp:
         return Zp(-self.value, base=self.base)
     
     def __iadd__(self: 'Zp', other: 'Zp') -> 'Zp':
-        self.value = (self.value + other.value) % self.base
+        other_val = other.value if isinstance(other, Zp) else other % self.base
+        self.value = (self.value + other_val) % self.base
         return self
     
     def __isub__(self: 'Zp', other: 'Zp') -> 'Zp':
@@ -56,7 +59,8 @@ class Zp:
         return self
     
     def __imul__(self: 'Zp', other: 'Zp') -> 'Zp':
-        self.value = (self.value * other.value) % self.base
+        other_val = other.value if isinstance(other, Zp) else other % self.base
+        self.value = (self.value * other_val) % self.base
         return self
     
     def __add__(self: 'Zp', other: 'Zp') ->  'Zp':
@@ -104,7 +108,8 @@ class Zp:
     
     @staticmethod
     def randzp(base: int = BASE_P) -> 'Zp':
-        return Zp(random.randint(0, 30), base=base)
+        return Zp(1, base=base)
+        # return Zp(random.randint(0, 30), base=base)
 
 
 class Vector:
@@ -242,7 +247,7 @@ class Matrix(Vector):
         return s
     
     def from_value(self: 'Matrix', value: Vector) -> 'Matrix':
-        self.value = value
+        self.value = Vector(value.value)
         return self
     
     def set_dims(self: 'Matrix', m: int, n: int, base: int = BASE_P):

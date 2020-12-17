@@ -96,7 +96,7 @@ class MPCEnv:
             if (self.pid > 0):
                 for i in range(0, nrow):
                     x = Vector([0] * ncol * (2 if index_by_ZZ else 1))
-                    y = Vector([Zp(0, base=self.primes[0])] * ncol * (2 if index_by_ZZ else 1))
+                    y = Vector([Zp(0, base=self.primes[0]) for _ in range(ncol * (2 if index_by_ZZ else 1))])
                     
                     for j in range(0, ncol):
                         x[j] = j + 1
@@ -324,7 +324,7 @@ class MPCEnv:
             b.set_dims(2, n, base=self.primes[fid])
             if (self.pid > 0):
                 if (self.pid == 1):
-                    b[0] += Vector([Zp(1, base=self.primes[fid])] * n)
+                    b[0] += Vector([Zp(1, base=self.primes[fid]) for _ in range(n)])
                 b[1] = Vector(x)
         else:  # pow > 1
             x_r, r = self.beaver_partition(x, fid)
@@ -367,22 +367,22 @@ class MPCEnv:
                 b.set_dims(pow + 1, n, base=self.primes[fid])
 
                 if (self.pid == 1):
-                    b[0] += Vector([Zp(1, base=self.primes[fid])] * n)
-                b[1] = x * Vector([Zp(1, base=self.primes[fid])] * n)
+                    b[0] += Vector([Zp(1, base=self.primes[fid]) for _ in range(n)])
+                b[1] = x * Vector([Zp(1, base=self.primes[fid]) for _ in range(n)])
 
                 for p in range(2, pow + 1):
                     if (self.pid == 1):
                         b[p] = Vector(x_r_pow[p - 2])
 
                     if (p == 2):
-                        b[p] += self.mul_elem(x_r, r) * Vector([pascal_matrix[p][1]] * n)
+                        b[p] += self.mul_elem(x_r, r) * Vector([pascal_matrix[p][1] for _ in range(n)])
                     else:
-                        b[p] += self.mul_elem(x_r_pow[p - 3], r) * Vector([pascal_matrix[p][1]] * n)
+                        b[p] += self.mul_elem(x_r_pow[p - 3], r) * Vector([pascal_matrix[p][1] for _ in range(n)])
 
                         for j in range(2, p - 1):
-                            b[p] += self.mul_elem(x_r_pow[p - 2 - j], r_pow[j - 2]) * Vector([pascal_matrix[p][j]] * n)
+                            b[p] += self.mul_elem(x_r_pow[p - 2 - j], r_pow[j - 2]) * Vector([pascal_matrix[p][j] for _ in range(n)])
                         
-                        b[p] += self.mul_elem(x_r, r_pow[p - 3]) * Vector([pascal_matrix[p][p - 1]] * n)
+                        b[p] += self.mul_elem(x_r, r_pow[p - 3]) * Vector([pascal_matrix[p][p - 1] for _ in range(n)])
 
                     b[p] += r_pow[p - 2]
         b.set_field(self.primes[fid])
@@ -410,7 +410,7 @@ class MPCEnv:
     
     def beaver_mult_vec(self: 'MPCEnv', ar: Vector, am: Vector, br: Vector,
                         bm: Vector, fid: int) -> Vector:
-        ab = Vector([Zp(0, base=self.primes[fid])] * len(am))
+        ab = Vector([Zp(0, base=self.primes[fid]) for _ in range(len(am))])
         if self.pid == 0:
             ab += self.mul_elem(am, bm)
         else:
@@ -831,7 +831,7 @@ class MPCEnv:
         n: int = len(a)
         if n > param.DIV_MAX_N:
             nbatch: int = math.ceil(n / param.DIV_MAX_N)
-            c = Vector([Zp(0, base=self.primes[fid])] * n)
+            c = Vector([Zp(0, base=self.primes[fid]) for _ in range(n)])
             for i in range(nbatch):
                 start: int = param.DIV_MAX_N * i
                 end: int = start + param.DIV_MAX_N
@@ -839,8 +839,8 @@ class MPCEnv:
                     end = n
                 batch_size: int = end - start
 
-                a_copy = Vector([Zp(0, base=self.primes[fid])] * batch_size)
-                b_copy = Vector([Zp(0, base=self.primes[fid])] * batch_size)
+                a_copy = Vector([Zp(0, base=self.primes[fid]) for _ in range(batch_size)])
+                b_copy = Vector([Zp(0, base=self.primes[fid]) for _ in range(batch_size)])
                 for j in range(batch_size):
                     a_copy[j] = Vector(a[start + j])
                     b_copy[j] = Vector(b[start + j])
@@ -862,7 +862,7 @@ class MPCEnv:
         b_scaled_sq: Vector = self.mult_vec(b_scaled, b_scaled, fid=fid)
         self.trunc_vec(b_scaled_sq, fid=fid)
 
-        scaled_est = Vector([Zp(0, base=self.primes[fid])] * n)
+        scaled_est = Vector([Zp(0, base=self.primes[fid]) for _ in range(n)])
         if self.pid != 0:
             scaled_est = -b_scaled * Zp(10, base=self.primes[fid]) + b_scaled_sq * Zp(5, base=self.primes[fid])
             if self.pid == 1:
@@ -970,7 +970,7 @@ class MPCEnv:
 
         r, rbits = self.share_random_bits(param.NBIT_K, n, fid)
 
-        e = Vector([Zp(0, base=self.primes[0])] * n) if self.pid == 0 else a + r
+        e = Vector([Zp(0, base=self.primes[0]) for _ in range(n)]) if self.pid == 0 else a + r
         e = self.reveal_sym(e, fid=0)
 
         ebits = Matrix(n, param.NBIT_K, t=int) if self.pid == 0 else self.num_to_bits(e, param.NBIT_K)
@@ -1070,7 +1070,7 @@ class MPCEnv:
             b: Vector = b_mat[1]
             return b, b_sqrt
         
-        return Vector([Zp(0, base=self.primes[fid])] * n), Vector([Zp(0, base=self.primes[fid])] * n)
+        return Vector([Zp(0, base=self.primes[fid]) for _ in range(n)]), Vector([Zp(0, base=self.primes[fid]) for _ in range(n)])
 
     def less_than_bits(self: 'MPCEnv', a: Matrix, b: Matrix, fid: int) -> Vector:
         return self.less_than_bits_aux(a, b, 0, fid)
@@ -1133,108 +1133,81 @@ class MPCEnv:
         return Vector([int(c_arr[i][0][0]) if self.pid > 0 else 0 for i in range(n)])
 
 
-    # def fp_sqrt(a: Vector) -> tuple:
-    #     n: int = len(a)
+    def fp_sqrt(self: 'MPCEnv', a: Vector) -> tuple:
+        n: int = len(a)
 
-    #     if n > param.DIV_MAX_N:
-    #         nbatch: int = math.ceil(n / param.DIV_MAX_N)
-    #         b = Vector()
-    #         b_inv.SetLength(n);
-    #         for (int i = 0; i < nbatch; i++) {
-    #         // DBG("FPSqrt on large vector: " << i + 1 << "/" << nbatch);
-    #         int start = Param::DIV_MAX_N * i;
-    #         int end = start + Param::DIV_MAX_N;
-    #         if (end > n) {
-    #             end = n;
-    #         }
-    #         int batch_size = end - start;
-    #         Vec<ZZ_p> a_copy;
-    #         a_copy.SetLength(batch_size);
-    #         for (int j = 0; j < batch_size; j++) {
-    #             a_copy[j] = a[start + j];
-    #         }
-    #         Vec<ZZ_p> b_copy, b_inv_copy;
-    #         FPSqrt(b_copy, b_inv_copy, a_copy);
-    #         for (int j = 0; j < batch_size; j++) {
-    #             b[start + j] = b_copy[j];
-    #             b_inv[start + j] = b_inv_copy[j];
-    #         }
-    #         }
-    #         return;
-    #     }
+        if n > param.DIV_MAX_N:
+            nbatch: int = math.ceil(n / param.DIV_MAX_N)
+            b = Vector([Zp(0, base=self.primes[0]) for _ in range(n)])
+            b_inv = Vector([Zp(0, base=self.primes[0]) for _ in range(n)])
+            for i in range(nbatch):
+                start: int = param.DIV_MAX_N * i
+                end: int = start + param.DIV_MAX_N
+                if end > n:
+                    end = n
+                batch_size: int = end - start
+                a_copy = Vector([Zp(0, base=self.primes[0]) for _ in range(batch_size)])
+                for j in range(batch_size):
+                    a_copy[j] = Zp(a[start + j], base=self.primes[0])
+                b_copy, b_inv_copy = self.fp_sqrt(a_copy)
+                for j in range(batch_size):
+                    b[start + j] = Zp(b_copy[j], base=self.primes[0])
+                    b_inv[start + j] = Zp(b_inv_copy[j], base=self.primes[0])
+            return b
 
-    #     // TODO: Currently using the same # iter as division -- possibly need to
-    #     // update
-    #     int niter = 2 * ceil(log2(((double)Param::NBIT_K) / 3.5));
+        # TODO: Currently using the same iter as division -- possibly need to update
+        niter: int = 2 * math.ceil(math.log2((param.NBIT_K) / 3.5))
 
-    #     /* Initial approximation: 1 / sqrt(a_scaled) ~= 2.9581 - 4 * a_scaled + 2 *
-    #     * a_scaled^2 */
-    #     Vec<ZZ_p> s, s_sqrt;
-    #     NormalizerEvenExp(s, s_sqrt, a);
+        # Initial approximation: 1 / sqrt(a_scaled) ~= 2.9581 - 4 * a_scaled + 2 * a_scaled^2
+        s, s_sqrt = self.normalizer_even_exp(a)
 
-    #     Vec<ZZ_p> a_scaled;
-    #     MultElem(a_scaled, a, s);
-    #     Trunc(a_scaled, Param::NBIT_K, Param::NBIT_K - Param::NBIT_F);
+        a_scaled: Vector = self.mult_vec(a, s, fid=0)
+        self.trunc_vec(a_scaled, param.NBIT_K, param.NBIT_K - param.NBIT_F, fid=0)
 
-    #     Vec<ZZ_p> a_scaled_sq;
-    #     MultElem(a_scaled_sq, a_scaled, a_scaled);
-    #     Trunc(a_scaled_sq);
+        a_scaled_sq: Vector = self.mult_vec(a_scaled, a_scaled, fid=0)
+        self.trunc_vec(a_scaled_sq, fid=0)
 
-    #     Vec<ZZ_p> scaled_est;
-    #     if (pid == 0) {
-    #         scaled_est.SetLength(n);
-    #     } else {
-    #         scaled_est = -4 * a_scaled + 2 * a_scaled_sq;
-    #         if (pid == 1) {
-    #         ZZ_p coeff;
-    #         DoubleToFP(coeff, 2.9581, Param::NBIT_K, Param::NBIT_F);
-    #         for (int i = 0; i < n; i++) {
-    #             scaled_est[i] += coeff;
-    #         }
-    #         }
-    #     }
+        scaled_est = Vector([Zp(0, base=self.primes[0]) for _ in range(n)])
+        if self.pid != 0:
+            scaled_est = a_scaled * (-4) + a_scaled_sq * 2
+            if self.pid == 1:
+                coeff: Zp = self.double_to_fp(2.9581, param.NBIT_K, param.NBIT_F, fid=0)
+                for i in range(n):
+                    scaled_est[i] += coeff
 
-    #     Vec<Mat<ZZ_p>> h_and_g;
-    #     h_and_g.SetLength(2);
-    #     h_and_g[0].SetDims(1, n);
-    #     h_and_g[1].SetDims(1, n);
+        h_and_g = [Matrix(1, n) for _ in range(2)]
 
-    #     MultElem(h_and_g[0][0], scaled_est, s_sqrt);
-    #     // Our scaled initial approximation (scaled_est) has bit length <= NBIT_F + 2
-    #     // and s_sqrt is at most NBIT_K/2 bits, so their product is at most NBIT_K/2 +
-    #     // NBIT_F + 2
-    #     Trunc(h_and_g[0], Param::NBIT_K / 2 + Param::NBIT_F + 2,
-    #             ((Param::NBIT_K - Param::NBIT_F) / 2) + 1);
+        h_and_g[0][0] = self.mult_vec(scaled_est, s_sqrt, fid=0)
+        # Our scaled initial approximation (scaled_est) has bit length <= NBIT_F + 2
+        # and s_sqrt is at most NBIT_K/2 bits, so their product is at most NBIT_K/2 +
+        # NBIT_F + 2
+        self.trunc(h_and_g[0], param.NBIT_K // 2 + param.NBIT_F + 2,
+                  (param.NBIT_K - param.NBIT_F) // 2 + 1, fid=0)
 
-    #     h_and_g[1][0] = h_and_g[0][0] * 2;
-    #     MultElem(h_and_g[1][0], h_and_g[1][0], a);
-    #     Trunc(h_and_g[1]);
+        h_and_g[1][0] = h_and_g[0][0] * 2
+        h_and_g[1][0] = self.mult_vec(h_and_g[1][0], a, fid=0)
+        self.trunc(h_and_g[1], k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F, fid=0)
 
-    #     ZZ_p onepointfive;
-    #     DoubleToFP(onepointfive, 1.5, Param::NBIT_K, Param::NBIT_F);
+        onepointfive: Zp = self.double_to_fp(1.5, param.NBIT_K, param.NBIT_F, fid=0)
 
-    #     for (int it = 0; it < niter; it++) {
-    #         Mat<ZZ_p> r;
-    #         MultElem(r, h_and_g[0], h_and_g[1]);
-    #         Trunc(r);
-    #         r = -r;
-    #         if (pid == 1) {
-    #         for (int i = 0; i < n; i++) {
-    #             r[0][i] += onepointfive;
-    #         }
-    #         }
+        for _ in range(niter):
+            h_and_g: list = [Matrix().from_value(h_and_g[0]),
+                             Matrix().from_value(h_and_g[1])]
+            r: Matrix = self.mult_elem(h_and_g[0], h_and_g[1], fid=0)
+            self.trunc(r, k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F, fid=0)
+            r = -r
+            if self.pid == 1:
+                for i in range(n):
+                    r[0][i] += onepointfive
 
-    #         Vec<Mat<ZZ_p>> r_dup;
-    #         r_dup.SetLength(2);
-    #         r_dup[0] = r;
-    #         r_dup[1] = r;
+            r_dup = [Matrix().from_value(r), Matrix().from_value(r)]
 
-    #         MultElemParallel(h_and_g, h_and_g, r_dup);
-    #         // TODO: write a version of Trunc with parallel processing
-    #         Trunc(h_and_g[0]);
-    #         Trunc(h_and_g[1]);
-    #     }
+            h_and_g: list = self.mult_aux_parallel(h_and_g, r_dup, True, fid=0)
+            # TODO: write a version of Trunc with parallel processing
+            self.trunc(h_and_g[0], k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F, fid=0)
+            self.trunc(h_and_g[1], k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F, fid=0)
 
-    #     b_inv = 2 * h_and_g[0][0];
-    #     b = h_and_g[1][0];
-    #     }
+        b_inv = h_and_g[0][0] * 2
+        b = h_and_g[1][0]
+        
+        return b, b_inv
