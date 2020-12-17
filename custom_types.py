@@ -1,4 +1,7 @@
 import random
+
+from functools import partial
+
 from param import BASE_P
 
 
@@ -34,7 +37,7 @@ class TypeOps:
 
 
 class Zp:
-    def __init__(self: 'Zp', value: int = 0, base: int = BASE_P):
+    def __init__(self: 'Zp', value: int, base: int):
         self.base = base
         self.value = value % self.base
     
@@ -195,7 +198,7 @@ class Vector:
             for j in range(other.num_cols()):
                 new_mat[i][j] = sum(
                     [self[i][k] * other[k][j] for k in range(self.num_cols())],
-                    type_(0))
+                    Zp(0, base=self[0][0].base) if isinstance(self[0][0], Zp) else type_(0))
         
         return new_mat
     
@@ -225,9 +228,10 @@ class Vector:
 
 # This inheritance will be easy to refactor to .seq via extend
 class Matrix(Vector):
-    def __init__(self: 'Matrix', m: int = 0, n: int = 0, randomise: bool = False, t: object = Zp):
+    def __init__(self: 'Matrix', m: int = 0, n: int = 0, randomise: bool = False, t: object = Zp, base: int = BASE_P):
+        type_constructor = partial(Zp, base=base) if t == Zp else t
         self.value = [
-            Vector([(Zp.randzp() if randomise else t(0)) for _ in range(n)])
+            Vector([(Zp.randzp(base) if randomise else type_constructor(0)) for _ in range(n)])
             for _ in range(m)]
         self.type_ = Vector
     
