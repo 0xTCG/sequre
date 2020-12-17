@@ -36,8 +36,6 @@ class MPCEnv:
 
         self.setup_tables()
 
-        if self.pid == 0:  # TODO: Fix with new sockets.
-            time.sleep(2 ** 4)
         return True
 
     def setup_tables(self: 'MPCEnv'):
@@ -185,27 +183,27 @@ class MPCEnv:
         return True
 
     def receive_bool(self: 'MPCEnv', from_pid: int) -> bool:
-        return self.sockets[from_pid].receive()
+        return bool(int(self.sockets[from_pid].receive(msg_len=1)))
 
     def send_bool(self: 'MPCEnv', flag: bool, to_pid: int):
-        self.sockets[to_pid].send(bytes(flag), sys.getsizeof(flag))
+        self.sockets[to_pid].send(str(int(flag)).encode('utf-8'))
 
     def send_elem(self: 'MPCEnv', elem: Zp, to_pid: int):
-        self.sockets[to_pid].send(elem.to_bytes(), sys.getsizeof(elem.value))
+        self.sockets[to_pid].send(elem.to_bytes())
     
-    def receive_elem(self: 'MPCEnv', from_pid: int, fid: int) -> Zp:
-        return Zp(int.from_bytes(self.sockets[from_pid].receive(), 'big'), base=self.primes[fid])
+    def receive_elem(self: 'MPCEnv', from_pid: int, msg_len: int, fid: int) -> Zp:
+        return Zp(int(self.sockets[from_pid].receive(msg_len=msg_len)), base=self.primes[fid])
     
-    def receive_vector(self: 'MPCEnv', from_pid: int, fid: int) -> Vector:
-        values = self.sockets[from_pid].receive().decode("utf-8").split('.')
+    def receive_vector(self: 'MPCEnv', from_pid: int, msg_len: int, fid: int) -> Vector:
+        values = self.sockets[from_pid].receive(msg_len=msg_len).split(b'.')
         return Vector([Zp(int(v), base=self.primes[fid]) for v in values])
     
-    def receive_matrix(self: 'MPCEnv', from_pid: int, fid: int) -> Matrix:
-        row_values = self.sockets[from_pid].receive().decode("utf-8").split(';')
+    def receive_matrix(self: 'MPCEnv', from_pid: int, msg_len: int, fid: int) -> Matrix:
+        row_values = self.sockets[from_pid].receive(msg_len=msg_len).split(b';')
         matrix: Matrix = Matrix(len(row_values))
 
         for i, row_value in enumerate(row_values):
-            decoded_vector = Vector([Zp(int(e), base=self.primes[fid]) for e in row_value.split('.')])
+            decoded_vector = Vector([Zp(int(e), base=self.primes[fid]) for e in row_value.split(b'.')])
             matrix[i] = decoded_vector
         
         return matrix
@@ -218,13 +216,14 @@ class MPCEnv:
         if (self.pid == 0):
             return deepcopy(elem)
         
+        msg_len=elem.get_bytes_len()
         receive_func = None
         if isinstance(elem, Zp):
-            receive_func = partial(self.receive_elem, fid=fid)
+            receive_func = partial(self.receive_elem, msg_len=msg_len, fid=fid)
         elif isinstance(elem, Matrix):
-            receive_func = partial(self.receive_matrix, fid=fid)
+            receive_func = partial(self.receive_matrix, msg_len=msg_len, fid=fid)
         elif isinstance(elem, Vector):
-            receive_func = partial(self.receive_vector, fid=fid)
+            receive_func = partial(self.receive_vector, msg_len=msg_len, fid=fid)
 
         received_elem: Zp = None
         if (self.pid == 1):
@@ -344,7 +343,7 @@ class MPCEnv:
                 r_pow -= r_
                 r_pow.set_field(self.primes[fid])
 
-                self.send_elem(r_pow, 2)
+                self.send_elem(Matrix().from_value(r_pow), 2)
 
                 b.set_dims(pow + 1, n, base=self.primes[fid])
             else:
@@ -353,8 +352,8 @@ class MPCEnv:
                     self.switch_seed(0)
                     r_pow = self.rand_mat(pow - 1, n, fid)
                     self.restore_seed(0)
-                else:  # pid == 2
-                    r_pow = self.receive_matrix(0, fid=fid)
+                else:
+                    r_pow = self.receive_matrix(0, msg_len=TypeOps.get_mat_len(pow - 1, n), fid=fid)
 
                 x_r_pow = Matrix(pow - 1, n).set_field(self.primes[fid])
                 x_r_pow[0] = self.mul_elem(x_r, x_r)
@@ -455,13 +454,14 @@ class MPCEnv:
     
     def beaver_reconstruct(self: 'MPCEnv', elem: object, fid: int) -> Matrix:
             elem_ = elem.to_field(self.primes[fid])
+            msg_len=elem.get_bytes_len()
             receive_func = None
             if isinstance(elem, Zp):
-                receive_func = partial(self.receive_elem, fid=fid)
+                receive_func = partial(self.receive_elem, msg_len=msg_len, fid=fid)
             elif isinstance(elem, Matrix):
-                receive_func = partial(self.receive_matrix, fid=fid)
+                receive_func = partial(self.receive_matrix, msg_len=msg_len, fid=fid)
             elif isinstance(elem, Vector):
-                receive_func = partial(self.receive_vector, fid=fid)
+                receive_func = partial(self.receive_vector, msg_len=msg_len, fid=fid)
             
             rand_func = None
             if isinstance(elem, Zp):
@@ -479,8 +479,7 @@ class MPCEnv:
 
                 mm = Matrix().from_value(elem_ - mask) if isinstance(elem, Matrix) else elem_ - mask
                 mm.set_field(self.primes[fid])
-                time.sleep(2)  # TODO: Fix sockets and remove this wait!
-                self.send_elem(mm, 2)
+                self.send_elem(Matrix().from_value(mm) if isinstance(elem, Matrix) else mm, 2)
                 return mm
             else:
                 rr = None
@@ -620,12 +619,11 @@ class MPCEnv:
             r -= r_mask
             r_low -= r_low_mask
 
-            time.sleep(3)  # TODO: Fix with new sockets.
             self.send_elem(Matrix().from_value(r), 2)
             self.send_elem(Matrix().from_value(r_low), 2)
         elif self.pid == 2:
-            r = self.receive_matrix(0, fid=fid)
-            r_low = self.receive_matrix(0, fid=fid)
+            r = self.receive_matrix(0, msg_len=TypeOps.get_mat_len(a.num_rows(), a.num_cols()), fid=fid)
+            r_low = self.receive_matrix(0, msg_len=TypeOps.get_mat_len(a.num_rows(), a.num_cols()), fid=fid)
         else:
             self.switch_seed(0)
             r = self.rand_mat(a.num_rows(), a.num_cols(), fid=0)
@@ -952,10 +950,10 @@ class MPCEnv:
             rbits.to_int()
 
             self.send_elem(r, 2)
-            self.send_elem(rbits, 2)
+            self.send_elem(Matrix().from_value(rbits), 2)
         elif self.pid == 2:
-            r: Vector = self.receive_vector(0, fid=fid)
-            rbits: Matrix = self.receive_matrix(0, fid=fid).to_int()
+            r: Vector = self.receive_vector(0, msg_len=TypeOps.get_vec_len(n), fid=fid)
+            rbits: Matrix = self.receive_matrix(0, msg_len=TypeOps.get_mat_len(n, k), fid=fid).to_int()
         else:
             self.switch_seed(0)
             r: Vector = self.rand_vector(n, fid)
