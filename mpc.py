@@ -438,16 +438,16 @@ class MPCEnv:
                 for i in range(xy.num_rows()):
                     for j in range(xy.num_cols()):
                         xy[i][j] += x_r_[i][j] * r_2_[i][j]
-                        xy[i][j] += r_1_[i][j] * y_r_[i][j]
-                    if self.pid == 1:
-                        xy[i][j] += x_r_[i][j] * y_r_[i][j]
+                        xy[i][j] += y_r_[i][j] * r_1_[i][j]
+                        if self.pid == 1:
+                            xy[i][j] += x_r_[i][j] * y_r_[i][j]
             else:
                 xy += x_r_.mult(r_2_)
                 xy += r_1_.mult(y_r_)
                 if self.pid == 1:
                     xy += x_r_.mult(y_r_)
 
-        xy.set_field(self.primes[fid])
+        # xy.set_field(self.primes[fid])
         return xy
 
     def beaver_mult_elem(self: 'MPCEnv', x_1_r: Matrix, r_1: Matrix, x_2_r: Matrix, r_2: Matrix, fid: int) -> Matrix:
