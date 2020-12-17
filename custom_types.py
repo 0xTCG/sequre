@@ -104,7 +104,6 @@ class Zp:
     
     @staticmethod
     def randzp(base: int = BASE_P) -> 'Zp':
-        # return Zp(30, base=base)
         return Zp(random.randint(0, 30), base=base)
 
 
