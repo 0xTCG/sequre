@@ -616,7 +616,6 @@ class MPCEnv:
             for i in range(0, a.num_rows()):
                 for j in range(0, a.num_cols()):
                     r_low[i][j] = Zp(int(r[i][j]) & ((1 << m) - 1), base=self.primes[fid])
-                    # r_low[i][j] = conv<ZZ_p>(trunc_ZZ(rep(r[i][j]), m));
 
             self.switch_seed(1)
             r_mask = self.rand_mat(a.num_rows(), a.num_cols(), fid=0)
@@ -734,7 +733,8 @@ class MPCEnv:
         return self.beaver_reconstruct_bulk(c, fid)
 
     def mult_mat_parallel(self: 'MPCEnv', a: list, b: list, fid: int) -> Vector:
-        return self.mult_aux_parallel(a, b, False, fid)
+        mults: list = self.mult_aux_parallel(a, b, False, fid)
+        return [Matrix().from_value(mult) for mult in mults]
 
     def prefix_or(self: 'MPCEnv', a: Matrix, fid: int) -> Matrix:
         n: int = a.num_rows()
@@ -1357,3 +1357,70 @@ class MPCEnv:
         ab.set_field(self.primes[fid])
 
         return ab
+
+    def qr_fact_square(self: 'MPCEnv', A: Matrix) -> Matrix:
+        assert A.num_rows() == A.num_cols()
+
+        n: int = A.num_rows()
+        R = Matrix(n, n)
+        Q = Matrix(n, n)
+
+        Ap = Matrix(n, n)
+        if self.pid != 0:
+            Ap = deepcopy(A)
+
+        one: Zp = self.double_to_fp(1, param.NBIT_K, param.NBIT_F, fid=0)
+
+        for i in range(n - 1):
+            v = Matrix(1, Ap.num_cols())
+            v[0] = self.householder(Ap[0])
+
+            vt = Matrix(Ap.num_cols(), 1)
+            if self.pid != 0:
+                vt = Matrix().from_value(v.transpose(inplace=False))
+            
+            P = self.mult_mat_parallel([vt], [v], fid=0)[0]
+            self.trunc(P, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+
+            if self.pid > 0:
+                P *= -2
+                if self.pid == 1:
+                    for j in range(P.num_cols()):
+                        P[j][j] += one
+            
+            B = Matrix(n - i, n - i)
+            if i == 0:
+                Q = deepcopy(P)
+                B = self.mult_mat_parallel([Ap], [P], fid=0)[0]
+                self.trunc(B, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+            else:
+                Qsub = Matrix(n - i, n)
+                if self.pid > 0:
+                    for j in range(n - i):
+                        Qsub[j] = Q[j + i]
+
+                left: list = [P, Ap]
+                right: list = [Qsub, P]
+
+                prod: list = self.mult_mat_parallel(left, right, fid=0)
+                # TODO: parallelize Trunc
+                self.trunc(prod[0], param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+                self.trunc(prod[1], param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+
+                if self.pid > 0:
+                    for j in range(n - i):
+                        Q[j + i] = Vector(prod[0][j].value)
+                    B = deepcopy(prod[1])
+            
+            Ap = Matrix(n - i - 1, n - i - 1)
+            if self.pid > 0:
+                for j in range(n - i):
+                    R[i + j][i] = Zp(B[j][0].value, B[j][0].base)
+                if i == n - 2:
+                    R[n - 1][n - 1] = Zp(B[1][1].value, B[1][1].base)
+
+                for j in range(n - i - 1):
+                    for k in range(n - i - 1):
+                        Ap[j][k] = Zp(B[j + 1][k + 1].value, B[j + 1][k + 1].base)
+            
+        return Q, R
