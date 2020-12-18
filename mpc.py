@@ -22,6 +22,7 @@ class MPCEnv:
         self.lagrange_cache: dict = dict()
         self.table_field_index: dict = dict()
         self.primes: dict = {0: param.BASE_P, 1: 31, 2: 17}  # Temp hardcoded. Needs to be calcualted on init.
+        self.primes_bits: dict = {k: math.ceil(math.log2(v)) for k, v in self.primes.items()}
         self.invpow_cache: dict = dict()
         self.or_lagrange_cache: dict = dict()
     
@@ -251,7 +252,7 @@ class MPCEnv:
 
     def beaver_partition(self: 'MPCEnv', x: object, fid: int) -> tuple:
         x_ = x.to_field(self.primes[fid])
-        type_ = type(x)
+
         rand_func = None
         if isinstance(x, Zp):
             rand_func = partial(self.rand_elem, fid=fid)
@@ -259,8 +260,10 @@ class MPCEnv:
             rand_func = partial(self.rand_mat, m=x_.num_rows(), n=x_.num_cols(), fid=fid)
         elif isinstance(x, Vector):
             rand_func = partial(self.rand_vector, size=len(x_), fid=fid)
-        x_r = Zp(0, self.primes[fid]) if isinstance(x, Zp) else type_()
-        r = Zp(0, self.primes[fid]) if isinstance(x, Zp) else type_()
+        x_r = Zp(0, self.primes[fid]) if isinstance(x, Zp) else Matrix(*x.get_dims()) if isinstance(x, Matrix) else Vector(
+              [Zp(0, self.primes[fid]) for _ in range(len(x))])
+        r = Zp(0, self.primes[fid]) if isinstance(x, Zp) else Matrix(*x.get_dims()) if isinstance(x, Matrix) else Vector(
+              [Zp(0, self.primes[fid]) for _ in range(len(x))])
         if self.pid == 0:
             self.switch_seed(1)
             r_1: Zp = rand_func()
@@ -409,7 +412,9 @@ class MPCEnv:
     
     def beaver_mult_vec(self: 'MPCEnv', ar: Vector, am: Vector, br: Vector,
                         bm: Vector, fid: int) -> Vector:
-        ab = Vector([Zp(0, base=self.primes[fid]) for _ in range(len(am))])
+        # Ugly instance checking will be bypassed with .seq generics
+        ab = (Vector([Zp(0, base=self.primes[fid]) for _ in range(len(am))])
+              if isinstance(am, Vector) else Zp(0, base=self.primes[fid]))
         if self.pid == 0:
             ab += self.mul_elem(am, bm)
         else:
@@ -418,7 +423,9 @@ class MPCEnv:
             if self.pid == 1:
                 ab += ar * br
 
-        return ab.set_field(self.primes[fid])
+        ab.set_field(self.primes[fid])
+
+        return ab
 
     def beaver_mult(self: 'MPCEnv', x_r: Matrix, r_1: Matrix,
                     y_r: Matrix, r_2: Matrix, elem_wise: bool, fid: int) -> Matrix:
@@ -921,7 +928,7 @@ class MPCEnv:
         return self.less_than_bits_aux(a, b_pub, 2, fid)
 
     def num_to_bits(self: 'MPCEnv', a: Vector, bitlen: int) -> Vector:
-        b = Matrix(len(a), bitlen)
+        b = Matrix(len(a), bitlen, t=int)
     
         for i in range(len(a)):
             for j in range(bitlen):
@@ -1209,3 +1216,138 @@ class MPCEnv:
         b = h_and_g[1][0]
         
         return b, b_inv
+    
+    def householder(self: 'MPCEnv', x: Vector) -> Vector:
+        n: int = len(x)
+
+        xr, xm = self.beaver_partition(x, fid=0)
+
+        xdot = Vector([self.beaver_inner_prod(xr, xm, fid=0)])
+        xdot = self.beaver_reconstruct(xdot, fid=0)
+        self.trunc_vec(xdot)
+
+        xnorm, _ = self.fp_sqrt(xdot)
+
+        x1 = Vector([Zp(x[0].value, base=x[0].base)])
+
+        x1sign: Vector = self.is_positive(x1)
+
+        x1sign *= 2
+        if self.pid == 1:
+            x1sign[0] -= 1
+
+        shift: Vector = self.mult_vec(xnorm, x1sign, fid=0)
+
+        sr, sm = self.beaver_partition(shift[0], fid=0)
+
+        dot_shift = self.beaver_mult_vec(xr[0], xm[0], sr, sm, fid=0)
+        dot_shift = self.beaver_reconstruct(dot_shift, fid=0)
+        self.trunc_vec(Vector([dot_shift]), fid=0)
+
+        vdot = Vector([Zp(0, base=self.primes[0])])
+        if self.pid > 0:
+            vdot[0] = (xdot[0] + dot_shift) * 2
+
+        _, vnorm_inv = self.fp_sqrt(vdot)
+
+        invr, invm = self.beaver_partition(vnorm_inv[0], fid=0)
+
+        vr = Vector([Zp(0, base=self.primes[0]) for _ in range(n)])
+        if self.pid > 0:
+            vr = Vector(xr)
+            vr[0] += sr
+        vm = Vector(xm)
+        vm[0] += sm
+
+        v: Vector = self.beaver_mult_vec(vr, vm, invr, invm, fid=0)
+        v: Vector = self.beaver_reconstruct(v, fid=0)
+        self.trunc_vec(v, fid=0)
+
+        return v
+    
+    def is_positive(self: 'MPCEnv', a: Vector) -> Vector:
+        n: int = len(a)
+        nbits: int = self.primes_bits[0]
+        fid: int = 2
+
+        r = Vector([Zp(0, base=self.primes[0]) for _ in range(n)])
+        r_bits = Matrix(n, nbits, t=int)
+        if self.pid == 0:
+            r: Vector = self.rand_vector(n, fid=0)
+            r_bits: Matrix = self.num_to_bits(r, nbits)
+
+            self.switch_seed(1)
+            r_mask: Vector = self.rand_vector(n, fid=0)
+            r_bits_mask: Matrix = self.rand_mat(n, nbits, fid=fid).to_int()
+            self.restore_seed(1)
+
+            r -= r_mask
+            r_bits -= r_bits_mask
+            r_bits.set_field(field=self.primes[fid])
+            r_bits = Matrix().from_value(r_bits).to_int()
+
+            self.send_elem(r, 2)
+            self.send_elem(r_bits, 2)
+        elif self.pid == 2:
+            r: Vector = self.receive_vector(0, msg_len=TypeOps.get_vec_len(n), fid=0)
+            r_bits: Matrix = self.receive_matrix(0, msg_len=TypeOps.get_mat_len(n, nbits), fid=fid).to_int()
+        else:
+            self.switch_seed(0)
+            r: Vector = self.rand_vector(n, fid=0)
+            r_bits: Matrix = self.rand_mat(n, nbits, fid=fid).to_int()
+            self.restore_seed(0)
+
+        c = Vector([Zp(0, base=self.primes[0])])
+        if self.pid != 0:
+            c = a * 2 + r
+
+        c = self.reveal_sym(c, fid=0)
+
+        c_bits = Matrix(n, nbits, t=int)
+        if self.pid != 0:
+            c_bits = self.num_to_bits(c, nbits)
+
+        # Incorrect result if r = 0, which happens with probaility 1 / BASE_P
+        no_overflow: Vector = self.less_than_bits_public(r_bits, c_bits, fid=fid)
+
+        c_xor_r = Vector([0] * n)
+        if self.pid > 0:
+            for i in range(n):
+                c_xor_r[i] = r_bits[i][nbits - 1] - 2 * c_bits[i][nbits - 1] * r_bits[i][nbits - 1]
+                if self.pid == 1:
+                    c_xor_r[i] += c_bits[i][nbits - 1]
+            c_xor_r.set_field(self.primes[fid]).to_int()
+        
+        lsb: Vector = self.mult_vec(c_xor_r, no_overflow, fid).to_int()
+        if self.pid > 0:
+            lsb *= 2
+            for i in range(n):
+                lsb[i] -= no_overflow[i] + c_xor_r[i]
+                if self.pid == 1:
+                    lsb[i] += 1
+            lsb.set_field(self.primes[fid]).to_int()
+
+        # 0, 1 -> 1, 2
+        if self.pid == 1:
+            for i in range(n):
+                lsb[i] += 1
+        
+        lsb.set_field(self.primes[fid])
+        b_mat: Matrix = self.table_lookup(lsb, 0, fid)
+
+        return b_mat[0]
+    
+    def beaver_inner_prod(self: 'MPCEnv', ar: Vector, am: Vector, fid: int) -> Vector:
+        ab = Zp(0, self.primes[fid])
+        
+        for i in range(len(ar)):
+            if self.pid == 0:
+                ab += am[i] * am[i]
+            else:
+                ab += ar[i] * am[i] * 2
+                if self.pid == 1:
+                    ab += ar[i] * ar[i]
+
+        ab.set_field(self.primes[fid])
+
+        return ab
