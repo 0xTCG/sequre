@@ -151,7 +151,20 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_approx(float_d_2, 16)
             assert_approx(float_d_3, 33)
             assert_approx(float_d_4, 1.25)
-                
+        
+        a = Vector([
+            mpc.double_to_fp(1.5, param.NBIT_K, param.NBIT_F, 0),
+            mpc.double_to_fp(0.5, param.NBIT_K, param.NBIT_F, 0),
+            mpc.double_to_fp(2.5, param.NBIT_K, param.NBIT_F, 0)])
+        v: Vector = mpc.householder(a)
+        float_v_1 = mpc.print_fp_elem(v[0], fid=0)
+        float_v_2 = mpc.print_fp_elem(v[1], fid=0)
+        float_v_3 = mpc.print_fp_elem(v[2], fid=0)
+        if pid != 0:
+            assert_approx(float_v_1, 0.86807)
+            assert_approx(float_v_2, 0.0973601)
+            assert_approx(float_v_3, 0.486801)
+
     print(f'All tests passed at {pid}!')
 
 

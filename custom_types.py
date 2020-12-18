@@ -107,10 +107,12 @@ class Zp:
         p: int = self.base if p is None else p
         return Zp(pow(self.value, p - 2, p), base=p)
     
-    def set_field(self: 'Zp', field: int):
+    def set_field(self: 'Zp', field: int) -> 'Zp':
         if field != self.base:
             self.base = field
             self.value %= self.base
+    
+        return self
     
     def to_field(self: 'Zp', field: int) -> 'Zp':
         return Zp(self.value, base=field)
@@ -264,6 +266,9 @@ class Matrix(Vector):
         self.value = Vector(value.value)
         return self
     
+    def get_dims(self: 'Matrix') -> tuple:
+        return len(self), len(self[0])
+
     def set_dims(self: 'Matrix', m: int, n: int, base: int = BASE_P):
         new_mat: list = [Vector([Zp(0, base=base)] * n) for _ in range(m)]
 
