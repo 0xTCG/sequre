@@ -164,6 +164,26 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_approx(float_v_1, 0.86807)
             assert_approx(float_v_2, 0.0973601)
             assert_approx(float_v_3, 0.486801)
+        
+        mat = Vector([
+            Vector([mpc.double_to_fp(4, param.NBIT_K, param.NBIT_F, 0) for _ in range(3)]),
+            Vector([mpc.double_to_fp(4.5, param.NBIT_K, param.NBIT_F, 0) for _ in range(3)]),
+            Vector([mpc.double_to_fp(5.5, param.NBIT_K, param.NBIT_F, 0) for _ in range(3)])])
+        mat = Matrix().from_value(mat)
+        q, r = mpc.qr_fact_square(mat)
+        result_q = mpc.print_fp(q, fid=0)
+        result_r = mpc.print_fp(r, fid=0)
+        expected_q = Vector([
+            Vector([-0.57735, -0.57735, -0.57735]),
+            Vector([-0.57735, 0.788675, -0.211325]),
+            Vector([-0.57735, -0.211325, 0.788675])])
+        expected_r = Vector([
+            Vector([-13.85640, 0, 0]),
+            Vector([-15.58846, 0, 0]),
+            Vector([-19.05255, 0, 0])])
+        if pid != 0:
+            assert_approx(result_q, expected_q)
+            assert_approx(result_r, expected_r)
 
     print(f'All tests passed at {pid}!')
 

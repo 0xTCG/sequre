@@ -1,6 +1,7 @@
 import random
 
 from functools import partial
+from copy import deepcopy
 
 from param import BASE_P, BASE_LEN
 
@@ -90,6 +91,18 @@ class Zp:
     def __neq__(self: 'Zp', other: 'Zp') -> bool:
         return self.value != other.value
     
+    def __lt__(self: 'Zp', other: 'Zp') -> bool:
+        return self.value < other.value
+    
+    def __gt__(self: 'Zp', other: 'Zp') -> bool:
+        return self.value > other.value
+    
+    def __le__(self: 'Zp', other: 'Zp') -> bool:
+        return self.value <= other.value
+    
+    def __ge__(self: 'Zp', other: 'Zp') -> bool:
+        return self.value >= other.value
+    
     def __str__(self: 'Zp') -> str:
         return str(self.value)
     
@@ -122,7 +135,8 @@ class Zp:
     
     @staticmethod
     def randzp(base: int = BASE_P) -> 'Zp':
-        return Zp(random.randint(0, BASE_P - 1), base=base)
+        return Zp(1, base=base)
+        # return Zp(random.randint(0, BASE_P - 1), base=base)
 
 
 class Vector:
@@ -139,7 +153,10 @@ class Vector:
         return Vector([-e for e in self.value])
     
     def __iadd__(self: 'Vector', other: 'Vector') -> 'Vector':
-        if isinstance(other, Zp) or isinstance(other, int):
+        # TODO: Enable debug mode for logging message bellow.
+        # if isinstance(other, float):
+        #     print('BE CAUTIOUS: Floats used in vector addition!')
+        if isinstance(other, Zp) or isinstance(other, int) or isinstance(other, float):
             other = Vector([other] * len(self))
         self.value = [self_e + other_e for self_e, other_e in zip(self.value, other.value)]
         return self
@@ -149,7 +166,10 @@ class Vector:
         return self
     
     def __imul__(self: 'Vector', other: 'Vector') -> 'Vector':
-        if isinstance(other, Zp) or isinstance(other, int):
+        # TODO: Enable debug mode for logging message bellow.
+        # if isinstance(other, float):
+        #     print('BE CAUTIOUS: Floats used in vector multiplication!')
+        if isinstance(other, Zp) or isinstance(other, int) or isinstance(other, float):
             other = Vector([other] * len(self))
         self.value = [self_e * other_e for self_e, other_e in zip(self.value, other.value)]
         return self
@@ -175,6 +195,18 @@ class Vector:
     
     def __neq__(self: 'Vector', other: 'Vector') -> bool:
         return not self == other
+    
+    def __lt__(self: 'Vector', other: 'Vector') -> bool:
+        for self_e, other_e in zip(self.value, other.value):
+            if not self_e < other_e:
+                return False
+        return True
+    
+    def __gt__(self: 'Vector', other: 'Vector') -> bool:
+        for self_e, other_e in zip(self.value, other.value):
+            if not self_e > other_e:
+                return False
+        return True
     
     def __str__(self: 'Vector') -> str:
         return str([str(e) for e in self.value])
@@ -306,3 +338,16 @@ class Matrix(Vector):
 
     def get_bytes_len(self: 'Matrix') -> int:
         return TypeOps.get_mat_len(len(self), len(self[0]))
+    
+    def transpose(self: 'Matrix', inplace: bool) -> 'Matrix':
+        m, n = self.get_dims()
+        t_mat = Matrix(n, m)
+
+        for i, row in enumerate(self.value):
+            for j, cell in enumerate(row):
+                t_mat[j][i] = deepcopy(cell)
+        
+        if inplace:
+            self = t_mat
+        
+        return t_mat
