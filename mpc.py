@@ -924,6 +924,12 @@ class MPCEnv:
         self.trunc(am, k, m, fid=fid)
         v.value = am[0].value
     
+    def trunc_elem(self: 'MPCEnv', elem: Zp, k: int = param.NBIT_K + param.NBIT_F, m: int = param.NBIT_F, fid: int = 0):
+        am = Matrix(1, 1)
+        am[0][0] = elem
+        self.trunc(am, k, m, fid=fid)
+        elem.value = am[0][0].value
+    
     def less_than_bits_public(self: 'MPCEnv', a: Matrix, b_pub: Matrix, fid: int) -> Matrix:
         return self.less_than_bits_aux(a, b_pub, 2, fid)
 
@@ -1242,7 +1248,7 @@ class MPCEnv:
 
         dot_shift = self.beaver_mult_vec(xr[0], xm[0], sr, sm, fid=0)
         dot_shift = self.beaver_reconstruct(dot_shift, fid=0)
-        self.trunc_vec(Vector([dot_shift]), fid=0)
+        self.trunc_elem(dot_shift, fid=0)
 
         vdot = Vector([Zp(0, base=self.primes[0])])
         if self.pid > 0:
@@ -1333,7 +1339,7 @@ class MPCEnv:
                 lsb[i] += 1
         
         lsb.set_field(self.primes[fid])
-        b_mat: Matrix = self.table_lookup(lsb, 0, fid)
+        b_mat: Matrix = self.table_lookup(lsb, 0, fid=0)
 
         return b_mat[0]
     
