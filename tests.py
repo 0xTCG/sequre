@@ -232,6 +232,25 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         if pid != 0:
             assert_approx(result_v, expected_v)
             assert_approx(result_l, expected_l)
+        
+        mat = Vector([
+            Vector([mpc.double_to_fp(4, param.NBIT_K, param.NBIT_F, 0),
+                    mpc.double_to_fp(3, param.NBIT_K, param.NBIT_F, 0),
+                    mpc.double_to_fp(2.5, param.NBIT_K, param.NBIT_F, 0)]),
+            Vector([mpc.double_to_fp(0.5, param.NBIT_K, param.NBIT_F, 0),
+                    mpc.double_to_fp(4.5, param.NBIT_K, param.NBIT_F, 0),
+                    mpc.double_to_fp(1.5, param.NBIT_K, param.NBIT_F, 0)]),
+            Vector([mpc.double_to_fp(5.5, param.NBIT_K, param.NBIT_F, 0),
+                    mpc.double_to_fp(2, param.NBIT_K, param.NBIT_F, 0),
+                    mpc.double_to_fp(1, param.NBIT_K, param.NBIT_F, 0)])])
+        q = mpc.orthonormal_basis(mat)
+        result_q = mpc.print_fp(q, fid=0)
+        expected_q = Vector([
+            Vector([-0.715542, -0.536656, -0.447214]),
+            Vector([0.595097, -0.803563, 0.0121201]),
+            Vector([0.365868, 0.257463, -0.894345])])
+        if pid != 0:
+            assert_approx(result_q, expected_q)
 
     print(f'All tests passed at {pid}!')
 
