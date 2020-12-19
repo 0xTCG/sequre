@@ -209,6 +209,29 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         if pid != 0:
             assert_approx(result_t, expected_t)
             assert_approx(result_q, expected_q)
+        
+        mat = Vector([
+            Vector([mpc.double_to_fp(4, param.NBIT_K, param.NBIT_F, 0),
+                    mpc.double_to_fp(3, param.NBIT_K, param.NBIT_F, 0),
+                    mpc.double_to_fp(2.5, param.NBIT_K, param.NBIT_F, 0)]),
+            Vector([mpc.double_to_fp(0.5, param.NBIT_K, param.NBIT_F, 0),
+                    mpc.double_to_fp(4.5, param.NBIT_K, param.NBIT_F, 0),
+                    mpc.double_to_fp(1.5, param.NBIT_K, param.NBIT_F, 0)]),
+            Vector([mpc.double_to_fp(5.5, param.NBIT_K, param.NBIT_F, 0),
+                    mpc.double_to_fp(2, param.NBIT_K, param.NBIT_F, 0),
+                    mpc.double_to_fp(1, param.NBIT_K, param.NBIT_F, 0)])])
+        v, l = mpc.eigen_decomp(mat)
+        result_v = mpc.print_fp(v, fid=0)
+        result_l = mpc.print_fp(Matrix().from_value(Vector([l])), fid=0)
+        expected_v = Vector([
+            Vector([0.650711, 0.672083, 0.353383]),
+            Vector([-0.420729, -0.0682978, 0.904612]),
+            Vector([0.632109, -0.73732, 0.238322])])
+        expected_l = Vector([
+            Vector([16.91242, -0.798897, 2.88648])])
+        if pid != 0:
+            assert_approx(result_v, expected_v)
+            assert_approx(result_l, expected_l)
 
     print(f'All tests passed at {pid}!')
 
