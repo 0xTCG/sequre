@@ -1557,3 +1557,82 @@ class MPCEnv:
                         Ap[j][k] = Ap_copy[j][k]
         
         return V, L
+
+    def orthonormal_basis(self: 'MPCEnv', A: Matrix) -> Matrix:
+        assert A.num_cols() >= A.num_rows()
+
+        c: int = A.num_rows()
+        n: int = A.num_cols()
+
+        v_list: list = []
+
+        Ap = Matrix(c, n)
+        if self.pid != 0:
+            Ap = Matrix().from_value(deepcopy(A))
+
+        one: Zp = self.double_to_fp(1, param.NBIT_K, param.NBIT_F, fid=0)
+
+        for i in range(c):
+            v = Matrix(1, Ap.num_cols())
+            v[0] = self.householder(Ap[0])
+
+            if self.pid == 0:
+                v_list.append(Vector([Zp(0, base=self.primes[0]) for _ in range(Ap.num_cols())]))
+            else:
+                v_list.append(Vector(v[0].value))
+
+            vt = Matrix(Ap.num_cols(), 1)
+            if self.pid != 0:
+                vt = v.transpose(inplace=False)
+
+            Apv = self.mult_mat_parallel([Ap], [vt], fid=0)[0]
+            self.trunc(Apv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+
+            B = self.mult_mat_parallel([Apv], [v], fid=0)[0]
+            self.trunc(B, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+
+            if self.pid > 0:
+                B *= -2
+                B += Ap
+
+            Ap = Matrix(B.num_rows() - 1, B.num_cols() - 1)
+            if self.pid > 0:
+                for j in range(B.num_rows() - 1):
+                    for k in range(B.num_cols() - 1):
+                        Ap[j][k] = Zp(B[j + 1][k + 1].value, B[j + 1][k + 1].base)
+
+        Q = Matrix(c, n)
+        if self.pid > 0:
+            if self.pid == 1:
+                for i in range(c):
+                    Q[i][i] = Zp(one.value, one.base)
+
+        for i in range(c - 1, -1, -1):
+            v = Matrix(1, len(v_list[i]))
+            if self.pid > 0:
+                v[0] = Vector(v_list[i].value)
+
+            vt = Matrix(v.num_cols(), 1)
+            if self.pid != 0:
+                vt = v.transpose(inplace=False)
+
+            Qsub = Matrix(c, n - i)
+            if self.pid > 0:
+                for j in range(c):
+                    for k in range(n - i):
+                        Qsub[j][k] = Zp(Q[j][k + i].value, Q[j][k + i].base)
+
+            Qv = self.mult_mat_parallel([Qsub], [vt], fid=0)[0]
+            self.trunc(Qv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+
+            Qvv = self.mult_mat_parallel([Qv], [v], fid=0)[0]
+            self.trunc(Qvv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+            if self.pid > 0:
+                Qvv *= -2
+
+            if self.pid > 0:
+                for j in range(c):
+                    for k in range(n - i):
+                        Q[j][k + i] += Qvv[j][k]
+
+        return Q
