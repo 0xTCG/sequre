@@ -1424,3 +1424,83 @@ class MPCEnv:
                         Ap[j][k] = Zp(B[j + 1][k + 1].value, B[j + 1][k + 1].base)
             
         return Q, R
+
+    def tridiag(self: 'MPCEnv', A: Matrix) -> tuple:
+        assert A.num_rows() == A.num_cols()
+        assert A.num_rows() > 2
+
+        n: int = A.num_rows()
+        one: Zp = self.double_to_fp(1, param.NBIT_K, param.NBIT_F, fid=0)
+
+        Q = Matrix(n, n)
+        T = Matrix(n, n)
+        if self.pid > 0:
+            if self.pid == 1:
+                for i in range(n):
+                    Q[i][i] = Zp(one.value, one.base)
+
+        Ap = Matrix(n, n)
+        if self.pid != 0:
+            Ap = Matrix().from_value(deepcopy(A))
+
+        for i in range(n - 2):
+            x = Vector([Zp(0, base=self.primes[0]) for _ in range(Ap.num_cols() - 1)])
+            if self.pid > 0:
+                for j in range(Ap.num_cols() - 1):
+                    x[j] = Zp(Ap[0][j + 1].value, Ap[0][j + 1].base)
+
+            v = Matrix(1, len(x))
+            v[0] = self.householder(x)
+
+            vt = Matrix(len(x), 1)
+            if self.pid != 0:
+                vt = Matrix().from_value(v.transpose(inplace=False))
+
+            vv = self.mult_mat_parallel([vt], [v], fid=0)[0]
+            self.trunc(vv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+
+            P = Matrix(Ap.num_cols(), Ap.num_cols())
+            if self.pid > 0:
+                P[0][0] = Zp(one.value, one.base) if self.pid == 1 else Zp(0, one.base)
+                for j in range(1, Ap.num_cols()):
+                    for k in range(1, Ap.num_cols()):
+                        P[j][k] = vv[j - 1][k - 1] * -2
+                        if self.pid == 1 and j == k:
+                            P[j][k] += one
+
+            # TODO: parallelize? (minor improvement)
+            PAp = self.mult_mat_parallel([P], [Ap], fid=0)[0]
+            self.trunc(PAp, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+            B = self.mult_mat_parallel([PAp], [P], fid=0)[0]
+            self.trunc(B, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+
+            Qsub = Matrix(n, n - i)
+            if self.pid > 0:
+                for j in range(n):
+                    for k in range(n - i):
+                        Qsub[j][k] = Zp(Q[j][k + i].value, Q[j][k + i].base)
+
+            Qsub = self.mult_mat_parallel([Qsub], [P], fid=0)[0]
+            self.trunc(Qsub, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+            if self.pid > 0:
+                for j in range(n):
+                    for k in range(n - i):
+                        Q[j][k + i] = Zp(Qsub[j][k].value, Qsub[j][k].base)
+
+            if self.pid > 0:
+                T[i][i] = Zp(B[0][0].value, B[0][0].base)
+                T[i + 1][i] = Zp(B[1][0].value, B[1][0].base)
+                T[i][i + 1] = Zp(B[0][1].value, B[0][1].base)
+                if i == n - 3:
+                    T[i + 1][i + 1] = Zp(B[1][1].value, B[1][1].base)
+                    T[i + 1][i + 2] = Zp(B[1][2].value, B[1][2].base)
+                    T[i + 2][i + 1] = Zp(B[2][1].value, B[2][1].base)
+                    T[i + 2][i + 2] = Zp(B[2][2].value, B[2][2].base)
+
+            Ap = Matrix(B.num_rows() - 1, B.num_cols() - 1)
+            if self.pid > 0:
+                for j in range(B.num_rows() - 1):
+                    for k in range(B.num_cols() - 1):
+                       Ap[j][k] = Zp(B[j + 1][k + 1].value, B[j + 1][k + 1].base)
+
+        return T, Q
