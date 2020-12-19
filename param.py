@@ -22,3 +22,4 @@ NBIT_V: int = 64
 DIV_MAX_N = 100000
 
 BASE_LEN: int = math.ceil(math.log10(BASE_P))
+ITER_PER_EVAL: int = 5
