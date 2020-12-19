@@ -1504,3 +1504,56 @@ class MPCEnv:
                        Ap[j][k] = Zp(B[j + 1][k + 1].value, B[j + 1][k + 1].base)
 
         return T, Q
+
+    def eigen_decomp(self: 'MPCEnv', A: Matrix) -> tuple:
+        assert A.num_rows() == A.num_cols()
+        n: int = A.num_rows()
+
+        L = Vector([Zp(0, base=self.primes[0]) for _ in range(n)])
+
+        Ap, Q = self.tridiag(A)
+
+        V = Matrix(n, n)
+        if self.pid != 0:
+            V = Q.transpose(inplace=False)
+
+        for i in range(n - 1, 0, -1):
+            for _ in range(param.ITER_PER_EVAL):
+                shift = Zp(Ap[i][i].value, Ap[i][i].base)
+                if self.pid > 0:
+                    for j in range(Ap.num_cols()):
+                        Ap[j][j] -= shift
+
+                Q, R = self.qr_fact_square(Ap)
+
+                Ap = self.mult_mat_parallel([Q], [R], fid=0)[0]
+                self.trunc(Ap, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+
+                if self.pid > 0:
+                    for j in range(Ap.num_cols()):
+                        Ap[j][j] += shift
+
+                Vsub = Matrix(i + 1, n)
+                if self.pid > 0:
+                    for j in range(i + 1):
+                        Vsub[j] = Vector(V[j].value)
+
+                Vsub = self.mult_mat_parallel([Q], [Vsub], fid=0)[0]
+                self.trunc(Vsub, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+
+                if self.pid > 0:
+                    for j in range(i + 1):
+                        V[j] = Vector(Vsub[j].value)
+
+            L[i] = Zp(Ap[i][i].value, Ap[i][i].base)
+            if i == 1:
+                L[0] = Zp(Ap[0][0].value, Ap[0][0].base)
+
+            Ap_copy: Matrix = deepcopy(Ap)
+            Ap = Matrix(i, i)
+            if self.pid > 0:
+                for j in range(i):
+                    for k in range(i):
+                        Ap[j][k] = Ap_copy[j][k]
+        
+        return V, L
