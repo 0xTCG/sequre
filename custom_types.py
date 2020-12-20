@@ -43,6 +43,10 @@ class TypeOps:
     @staticmethod
     def get_vec_len(n: int) -> int:
         return n * BASE_LEN + n - 1
+    
+    @staticmethod
+    def switch_pair(t: tuple) -> tuple:
+        return t[1], t[0]
 
 
 class Zp:
