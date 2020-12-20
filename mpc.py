@@ -23,6 +23,7 @@ class MPCEnv:
         self.table_field_index: dict = dict()
         self.primes: dict = {0: param.BASE_P, 1: 31, 2: 17}  # Temp hardcoded. Needs to be calcualted on init.
         self.primes_bits: dict = {k: math.ceil(math.log2(v)) for k, v in self.primes.items()}
+        self.primes_bytes: dict = {k: (v + 7) // 8 for k, v in self.primes_bits.items()}
         self.invpow_cache: dict = dict()
         self.or_lagrange_cache: dict = dict()
     
@@ -523,6 +524,11 @@ class MPCEnv:
         mat = Matrix(1, 1)
         mat[0][0] = a
         return self.fp_to_double(mat, k, f)[0][0]
+    
+    def fp_to_double_vec(self: 'MPCEnv', v: Vector, k: int, f: int) -> Vector:
+        mat = Matrix(1, len(v))
+        mat[0] = v
+        return self.fp_to_double(mat, k, f)[0]
     
     def fp_to_double(self: 'MPCEnv', a: Matrix, k: int, f: int) -> Matrix:
         base = a[0][0].base
@@ -1573,8 +1579,11 @@ class MPCEnv:
         one: Zp = self.double_to_fp(1, param.NBIT_K, param.NBIT_F, fid=0)
 
         for i in range(c):
+            print(f'Processing {i} of {c}. A shape: ({c}, {n})')
             v = Matrix(1, Ap.num_cols())
             v[0] = self.householder(Ap[0])
+
+            print(f'Found householder')
 
             if self.pid == 0:
                 v_list.append(Vector([Zp(0, base=self.primes[0]) for _ in range(Ap.num_cols())]))
@@ -1588,8 +1597,12 @@ class MPCEnv:
             Apv = self.mult_mat_parallel([Ap], [vt], fid=0)[0]
             self.trunc(Apv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
+            print(f'Multiplied matrices 1 at', self.pid)
+
             B = self.mult_mat_parallel([Apv], [v], fid=0)[0]
             self.trunc(B, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+
+            print(f'Multiplied matrices 2')
 
             if self.pid > 0:
                 B *= -2
@@ -1636,3 +1649,25 @@ class MPCEnv:
                         Q[j][k + i] += Qvv[j][k]
 
         return Q
+
+    def read_matrix(self: 'MPCEnv', f, nrows: int, ncols: int, fid: int) -> Matrix:
+        a = list()
+        
+        for _ in range(nrows):
+            a.append(self.read_vector(f, ncols, fid))
+        
+        return Matrix().from_value(Vector(a))
+    
+    def read_vector(self: 'MPCEnv', f, n: int, fid: int) -> Matrix:
+        a: list = list()
+        
+        for _ in range(n):
+            a.append(Zp(int(f.read(self.primes_bytes[0])), base=self.primes[fid]))
+        
+        return Vector(a)
+
+    def filter(self: 'MPCEnv', v: Vector, mask: Vector) -> Vector:
+        return Vector([e for i, e in enumerate(v.value) if mask[i].value == 1])
+    
+    def filter_rows(self: 'MPCEnv', mat: Matrix, mask: Vector) -> Matrix:
+        return Matrix().from_value(self.filter(mat, mask))
