@@ -7,7 +7,7 @@ from mpc import MPCEnv
 from utils import get_address
 from custom_types import Zp
 
-from tests import test_all
+from tests import test_all, benchmark
 
 
 def gwas_protocol(mpc: MPCEnv, pid: int) -> bool:

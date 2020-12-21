@@ -255,5 +255,26 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
     print(f'All tests passed at {pid}!')
 
 
+def benchmark(mpc: MPCEnv, pid: int):
+    import random
+    
+    m: int = 50
+    n: int = 50
+    mat = Vector([
+        Vector(
+            [mpc.double_to_fp(i * j, param.NBIT_K, param.NBIT_F, 0) for j in range(n)])
+            for i in range(m)])
+    mat = Matrix().from_value(mat)
+    
+    print('QR ...')
+    mpc.qr_fact_square(mat)
+    print('Tridiag ...')
+    mpc.tridiag(mat)
+    print('Eigen decomp ...')
+    mpc.eigen_decomp(mat)
+
+    print(f'Benchmarks done at {pid}!')
+
+
 if __name__ == "__main__":
     test_all()
