@@ -152,7 +152,7 @@ def logireg_protocol(mpc: MPCEnv, pid: int, test_run: bool = True) -> bool:
         for i in range(param.NUM_COVS):
             V[k + i] = cov[i] * fp_one
 
-    print('Finding orthonormal basis')
+    print('Finding orthonormal basis for ', V[0][0])
     V = mpc.orthonormal_basis(V)
 
     V_mean = Vector([Zp(0, base=param.BASE_P) for _ in range(V.num_rows())])
