@@ -1149,7 +1149,6 @@ class MPCEnv:
 
         return Vector([int(c_arr[i][0][0]) if self.pid > 0 else 0 for i in range(n)])
 
-
     def fp_sqrt(self: 'MPCEnv', a: Vector) -> tuple:
         n: int = len(a)
 
