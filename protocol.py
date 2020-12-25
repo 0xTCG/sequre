@@ -152,11 +152,11 @@ def logireg_protocol(mpc: MPCEnv, pid: int, test_run: bool = True) -> bool:
         for i in range(param.NUM_COVS):
             V[k + i] = cov[i] * fp_one
 
-    print('Finding orthonormal basis for ', V[0][0])
+    print('Finding orthonormal basis for ', cov.get_dims(), param.NUM_COVS, n1)
     V = mpc.orthonormal_basis(V)
 
     V_mean = Vector([Zp(0, base=param.BASE_P) for _ in range(V.num_rows())])
-    fp_denom: Zp = mpc.double_to_fp(1 / V.num_cols(), param.NBIT_K, param.NBIT_F)
+    fp_denom: Zp = mpc.double_to_fp(1 / V.num_cols(), param.NBIT_K, param.NBIT_F, fid=0)
     
     for i in range(len(V_mean)):
         V_mean[i] = sum(V[i], Zp(0, base=param.BASE_P)) * fp_denom
