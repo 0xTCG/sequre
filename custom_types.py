@@ -351,6 +351,6 @@ class Matrix(Vector):
                 t_mat[j][i] = deepcopy(cell)
         
         if inplace:
-            self = t_mat
+            self.value = t_mat.value
         
         return t_mat
