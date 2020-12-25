@@ -12,6 +12,7 @@ from tests import test_all, benchmark
 
 def gwas_protocol(mpc: MPCEnv, pid: int) -> bool:
     test_all(mpc, pid)
+    # benchmark(mpc, pid, m=15, n=1000)
     return True
 
 
