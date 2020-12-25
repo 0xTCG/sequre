@@ -42,14 +42,14 @@ class CSocket:
     def accept(self: 'CSocket'):
         self.m_sock, _ = self.m_sock.accept()
     
-    def send(self: 'CSocket', data: str):
+    def send(self: 'CSocket', data: str) -> int:
         totalsent = 0
         while totalsent < len(data):
             sent = self.m_sock.send(data[totalsent:])
             if sent == 0:
                 raise RuntimeError("socket connection broken")
             totalsent = totalsent + sent
-        return None
+        return totalsent
 
     def receive(self: 'CSocket', msg_len: int) -> bytes:
         chunks = []

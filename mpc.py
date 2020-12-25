@@ -190,8 +190,8 @@ class MPCEnv:
     def send_bool(self: 'MPCEnv', flag: bool, to_pid: int):
         self.sockets[to_pid].send(str(int(flag)).encode('utf-8'))
 
-    def send_elem(self: 'MPCEnv', elem: Zp, to_pid: int):
-        self.sockets[to_pid].send(elem.to_bytes())
+    def send_elem(self: 'MPCEnv', elem: Zp, to_pid: int) -> int:
+        return self.sockets[to_pid].send(elem.to_bytes())
     
     def receive_elem(self: 'MPCEnv', from_pid: int, msg_len: int, fid: int) -> Zp:
         return Zp(int(self.sockets[from_pid].receive(msg_len=msg_len)), base=self.primes[fid])
@@ -229,11 +229,13 @@ class MPCEnv:
 
         received_elem: Zp = None
         if (self.pid == 1):
-            self.send_elem(elem, 3 - self.pid)
+            sent_data = self.send_elem(elem, 3 - self.pid)
+            assert sent_data == msg_len, f'Sent {sent_data} bytes but expected {msg_len}'
             received_elem = receive_func(3 - self.pid)
         else:
             received_elem = receive_func(3 - self.pid)
-            self.send_elem(elem, 3 - self.pid)
+            sent_data = self.send_elem(elem, 3 - self.pid)
+            assert sent_data == msg_len, f'Sent {sent_data} bytes but expected {msg_len}'
             
         return elem + received_elem
     
@@ -1578,11 +1580,8 @@ class MPCEnv:
         one: Zp = self.double_to_fp(1, param.NBIT_K, param.NBIT_F, fid=0)
 
         for i in range(c):
-            print(f'Processing {i} of {c}. A shape: ({c}, {n})')
             v = Matrix(1, Ap.num_cols())
             v[0] = self.householder(Ap[0])
-
-            print(f'Found householder')
 
             if self.pid == 0:
                 v_list.append(Vector([Zp(0, base=self.primes[0]) for _ in range(Ap.num_cols())]))
@@ -1596,12 +1595,8 @@ class MPCEnv:
             Apv = self.mult_mat_parallel([Ap], [vt], fid=0)[0]
             self.trunc(Apv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
-            print(f'Multiplied matrices 1 at', self.pid)
-
             B = self.mult_mat_parallel([Apv], [v], fid=0)[0]
             self.trunc(B, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
-
-            print(f'Multiplied matrices 2')
 
             if self.pid > 0:
                 B *= -2
