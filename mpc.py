@@ -456,7 +456,6 @@ class MPCEnv:
                 if self.pid == 1:
                     xy += x_r_.mult(y_r_)
 
-        # xy.set_field(self.primes[fid])
         return xy
 
     def beaver_mult_elem(self: 'MPCEnv', x_1_r: Matrix, r_1: Matrix, x_2_r: Matrix, r_2: Matrix, fid: int) -> Matrix:
@@ -1729,6 +1728,7 @@ class MPCEnv:
         batch_size: int = (n + nbatch - 1) // nbatch
 
         for it in range(max_iter):
+            print(f'Logistic regression iteration {it} initialized')
             batch_index: int = it % nbatch
             start_ind: int = batch_size * batch_index
             end_ind: int = start_ind + batch_size
@@ -1764,21 +1764,22 @@ class MPCEnv:
             bvr, bvm = self.beaver_partition(bv, fid=0)
             bxr, bxm = self.beaver_partition(bx, fid=0)
 
-            h: Matrix = self.beaver_mult_vec(bvr, bvm, vr_batch, vm_batch, fid=0)
+            h: Matrix = self.beaver_mult(bvr, bvm, vr_batch, vm_batch, False, fid=0)
             for j in range(c):
-                xrvec = fp_one * xr_batch[j]
-                xmvec = fp_one * xm_batch[j]
-                h[j] = self.beaver_mult_vec(xrvec, xmvec, bxr[j], bxm[j], fid=0)
+                xrvec = xr_batch[j] * fp_one
+                xmvec = xm_batch[j] * fp_one
+                h[j] += self.beaver_mult_vec(xrvec, xmvec, bxr[j], bxm[j], fid=0)
             h: Matrix = self.beaver_reconstruct(h, fid=0)
-            h: Matrix = self.trunc(h, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+            self.trunc(h, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
             for j in range(c):
                 h[j] += b0[j]
 
-            hvec = h.flatten(inplace=False)
+            hvec = Matrix().from_value(h).flatten()
             _, s_grad_vec = self.neg_log_sigmoid(hvec, fid=0)
 
-            s_grad = s_grad_vec.reshape(c, cur_bsize)
+            s_grad = Matrix().from_value(Vector([s_grad_vec]))
+            s_grad.reshape(c, cur_bsize)
 
             d0 = Vector([Zp(0, base=param.BASE_P) for _ in range(c)])
             dv = Matrix(c, p)
@@ -1797,9 +1798,9 @@ class MPCEnv:
 
             vr_batch.transpose(inplace=True)
             vm_batch.transpose(inplace=True)
-            dv: Matrix = self.beaver_mult_vec(s_grad_r, s_grad_m, vr_batch, vm_batch, fid=0)
+            dv: Matrix = self.beaver_mult(s_grad_r, s_grad_m, vr_batch, vm_batch, False, fid=0)
             dv: Matrix = self.beaver_reconstruct(dv, fid=0)
-            dv: Matrix = self.trunc(dv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+            self.trunc(dv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
             step0: Vector = step0 * fp_memory - d0 * fp_bsize_inv
             stepv: Matrix = stepv * fp_memory - dv * fp_bsize_inv
@@ -1809,7 +1810,7 @@ class MPCEnv:
             self.trunc_vec(stepx, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
             b0: Vector = b0 + step0
-            bv: Matrix = bv + stepv
+            bv: Matrix = Matrix().from_value(bv + stepv)
             bx: Vector = bx + stepx
     
         return b0, bv, bx
@@ -1848,7 +1849,7 @@ class MPCEnv:
         params: Matrix = self.table_lookup(a_ind, 2, fid=0)
 
         b: Vector = self.mult_vec(params[1], a, fid=fid)
-        b: Vector = self.trunc_vec(b)
+        self.trunc_vec(b)
 
         if self.pid > 0:
             for j in range(n):
