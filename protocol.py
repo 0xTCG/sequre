@@ -165,7 +165,7 @@ def logireg_protocol(mpc: MPCEnv, pid: int, test_run: bool = True) -> bool:
     for i in range(len(V_mean)):
         V[i] += -V_mean[i]
 
-    V_var = mpc.inner_prod(V)
+    V_var = mpc.inner_prod(V, fid=0)
     mpc.trunc_vec(V_var)
     V_var *= fp_denom
     mpc.trunc_vec(V_var)
@@ -173,11 +173,9 @@ def logireg_protocol(mpc: MPCEnv, pid: int, test_run: bool = True) -> bool:
     print('Calculating fp_sqrt')
     _, V_stdinv = mpc.fp_sqrt(V_var)
     
-    mpc.mult_vec
-
     for i in range(len(V_mean)):
-        V[i] = mpc.mult_vec(V[i], V_stdinv[i])
-    mpc.trunc(V, k=param.NBIT_K + param.NBIT_F, m=param.NBIT_F)
+        V[i] = mpc.mult_vec(V[i], V_stdinv[i], fid=0)
+    mpc.trunc(V, k=param.NBIT_K + param.NBIT_F, m=param.NBIT_F, fid=0)
 
     gkeep: list = [False for _ in range(m0)]
     for j in range(m0):
@@ -205,7 +203,7 @@ def logireg_protocol(mpc: MPCEnv, pid: int, test_run: bool = True) -> bool:
         with open(get_cache_path(pid, 'logi_input'), 'br') as f:
             X, X_mask = mpc.beaver_read_from_file(f, ntop, n1)
     else:
-        with open(get_temp_path(pid, 'input_pheno_cov')) as f:
+        with open(get_temp_path(pid, 'logi_input')) as f:
             X = list()
             X_mask = list()
             for _ in range(ntop):
@@ -223,9 +221,9 @@ def logireg_protocol(mpc: MPCEnv, pid: int, test_run: bool = True) -> bool:
 
     # TODO: Haris. Implement data shuffling. (See original implementation)
 
-    V, V_mask = mpc.beaver_partition(V)
+    V, V_mask = mpc.beaver_partition(V, fid=0)
 
-    pheno, pheno_mask = mpc.beaver_partition(pheno)
+    pheno, pheno_mask = mpc.beaver_partition(pheno, fid=0)
 
     _, _, bx = mpc.parallel_logistic_regression(X, X_mask, V, V_mask, pheno, pheno_mask, 3)
 
