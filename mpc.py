@@ -1350,7 +1350,7 @@ class MPCEnv:
 
         return b_mat[0]
     
-    def beaver_inner_prod(self: 'MPCEnv', ar: Vector, am: Vector, fid: int) -> Vector:
+    def beaver_inner_prod(self: 'MPCEnv', ar: Vector, am: Vector, fid: int) -> Zp:
         ab = Zp(0, self.primes[fid])
         
         for i in range(len(ar)):
@@ -1361,9 +1361,22 @@ class MPCEnv:
                 if self.pid == 1:
                     ab += ar[i] * ar[i]
 
-        ab.set_field(self.primes[fid])
+        return ab.set_field(self.primes[fid])
+    
+    def beaver_inner_prod_pair(
+            self: 'MPCEnv', ar: Vector, am: Vector, br: Vector, bm: Vector, fid: int) -> Zp:
+        ab = Zp(0, self.primes[fid])
+        
+        for i in range(len(ar)):
+            if self.pid == 0:
+                ab += am[i] * bm[i]
+            else:
+                ab += ar[i] * bm[i]
+                ab += br[i] * am[i]
+                if self.pid == 1:
+                    ab += ar[i] * br[i]
 
-        return ab
+        return ab.set_field(self.primes[fid])
 
     def qr_fact_square(self: 'MPCEnv', A: Matrix) -> Matrix:
         assert A.num_rows() == A.num_cols()
@@ -1665,3 +1678,182 @@ class MPCEnv:
     
     def filter_rows(self: 'MPCEnv', mat: Matrix, mask: Vector) -> Matrix:
         return Matrix().from_value(self.filter(mat, mask))
+    
+    def inner_prod(self: 'MPCEnv', a: Matrix, fid: int) -> Matrix:
+        ar, am = self.beaver_partition(a, fid)
+
+        c = Vector([Zp(0, base=param.BASE_P) for _ in range(a.num_rows())])
+        for i in range(a.num_rows()):
+            c[i] = self.beaver_inner_prod(ar[i], am[i], fid)
+
+        return self.beaver_reconstruct(c, fid)
+
+    def parallel_logistic_regression(
+        self: 'MPCEnv', xr: Matrix, xm: Matrix, vr: Matrix,
+        vm: Matrix, yr: Vector, ym: Vector, max_iter: int) -> tuple:
+        n: int = vr.num_cols()
+        p: int = vr.num_rows()
+        c: int = xr.num_rows()
+        assert vm.num_rows() == p
+        assert vm.num_cols() == n
+        assert xm.num_rows() == c
+        assert xm.num_cols() == n
+        assert xr.num_cols() == n
+        assert len(yr) == n
+        assert len(ym) == n
+
+        b0 = Vector([Zp(0, base=param.BASE_P) for _ in range(c)])
+        bv = Matrix(c, p)
+        bx = Vector([Zp(0, base=param.BASE_P) for _ in range(c)])
+
+        yneg_r = -yr
+        yneg_m = -ym
+        if self.pid > 0:
+            for i in range(n):
+                yneg_r[i] += 1
+
+        yneg = deepcopy(yneg_m)
+        if self.pid == 1:
+            for i in range(n):
+                yneg[i] += yneg_r[i]
+
+        fp_memory: Zp = self.double_to_fp(0.5, param.NBIT_K, param.NBIT_F, fid=0)
+        fp_one: Zp = self.double_to_fp(1, param.NBIT_K, param.NBIT_F, fid=0)
+        eta: float = 0.3
+
+        step0 = Vector([Zp(0, base=param.BASE_P) for _ in range(c)])
+        stepv = Matrix(c, p)
+        stepx = Vector([Zp(0, base=param.BASE_P) for _ in range(c)])
+
+        nbatch: int = 10
+        batch_size: int = (n + nbatch - 1) // nbatch
+
+        for it in range(max_iter):
+            batch_index: int = it % nbatch
+            start_ind: int = batch_size * batch_index
+            end_ind: int = start_ind + batch_size
+            if end_ind > n:
+                end_ind = n
+            cur_bsize: int = end_ind - start_ind
+
+            xr_batch = Matrix(c, cur_bsize)
+            xm_batch = Matrix(c, cur_bsize)
+            vr_batch = Matrix(p, cur_bsize)
+            vm_batch = Matrix(p, cur_bsize)
+            yn_batch = Vector([Zp(0, base=param.BASE_P) for _ in range(cur_bsize)])
+            ynr_batch = Vector([Zp(0, base=param.BASE_P) for _ in range(cur_bsize)])
+            ynm_batch = Vector([Zp(0, base=param.BASE_P) for _ in range(cur_bsize)])
+
+            for j in range(c):
+                for i in range(cur_bsize):
+                    xr_batch[j][i].value = xr[j][start_ind + i].value
+                    xm_batch[j][i].value = xm[j][start_ind + i].value
+
+            for j in range(p):
+                for i in range(cur_bsize):
+                    vr_batch[j][i].value = vr[j][start_ind + i].value
+                    vm_batch[j][i].value = vm[j][start_ind + i].value
+
+            for i in range(cur_bsize):
+                yn_batch[i].value = yneg[start_ind + i].value
+                ynr_batch[i].value = yneg_r[start_ind + i].value
+                ynm_batch[i].value = yneg_m[start_ind + i].value
+
+            fp_bsize_inv: Zp = self.double_to_fp(eta * (1 / cur_bsize), param.NBIT_K, param.NBIT_F, fid=0)
+
+            bvr, bvm = self.beaver_partition(bv, fid=0)
+            bxr, bxm = self.beaver_partition(bx, fid=0)
+
+            h: Matrix = self.beaver_mult_vec(bvr, bvm, vr_batch, vm_batch, fid=0)
+            for j in range(c):
+                xrvec = fp_one * xr_batch[j]
+                xmvec = fp_one * xm_batch[j]
+                h[j] = self.beaver_mult_vec(xrvec, xmvec, bxr[j], bxm[j], fid=0)
+            h: Matrix = self.beaver_reconstruct(h, fid=0)
+            h: Matrix = self.trunc(h, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+
+            for j in range(c):
+                h[j] += b0[j]
+
+            hvec = h.flatten(inplace=False)
+            _, s_grad_vec = self.neg_log_sigmoid(hvec, fid=0)
+
+            s_grad = s_grad_vec.reshape(c, cur_bsize)
+
+            d0 = Vector([Zp(0, base=param.BASE_P) for _ in range(c)])
+            dv = Matrix(c, p)
+            dx = Vector([Zp(0, base=param.BASE_P) for _ in range(c)])
+
+            for j in range(c):
+                s_grad[j] += yn_batch * fp_one
+                d0[j] = sum(s_grad[j], Zp(0, base=param.BASE_P))
+
+            s_grad_r, s_grad_m = self.beaver_partition(s_grad, fid=0)
+
+            for j in range(c):
+                dx[j] = self.beaver_inner_prod_pair(
+                    xr_batch[j], xm_batch[j], s_grad_r[j], s_grad_m[j], fid=0)
+            dx = self.beaver_reconstruct(dx, fid=0)
+
+            vr_batch.transpose(inplace=True)
+            vm_batch.transpose(inplace=True)
+            dv: Matrix = self.beaver_mult_vec(s_grad_r, s_grad_m, vr_batch, vm_batch, fid=0)
+            dv: Matrix = self.beaver_reconstruct(dv, fid=0)
+            dv: Matrix = self.trunc(dv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+
+            step0: Vector = step0 * fp_memory - d0 * fp_bsize_inv
+            stepv: Matrix = stepv * fp_memory - dv * fp_bsize_inv
+            stepx: Vector = stepx * fp_memory - dx * fp_bsize_inv
+            self.trunc_vec(step0, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+            self.trunc(stepv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+            self.trunc_vec(stepx, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+
+            b0: Vector = b0 + step0
+            bv: Matrix = bv + stepv
+            bx: Vector = bx + stepx
+    
+        return b0, bv, bx
+
+    def neg_log_sigmoid(self: 'MPCEnv', a: Vector, fid: int) -> tuple:
+        n: int = len(a)
+        depth: int = 6
+        step: float = 4
+        cur: Vector = deepcopy(a)
+        a_ind = Vector([Zp(0, base=self.primes[fid]) for _ in range(len(a))])
+
+        for i in range(depth):
+            cur_sign: Vector = self.is_positive(cur)
+            index_step = Zp(1 << (depth - 1 - i), base=self.primes[fid])
+
+            for j in range(n):
+                a_ind[j] += cur_sign[j] * index_step
+
+            cur_sign *= 2
+            if self.pid == 1:
+                for j in range(n):
+                    cur_sign[j] -= 1
+
+            step_fp: Zp = self.double_to_fp(
+                step, param.NBIT_K, param.NBIT_F, fid=fid)
+
+            for j in range(n):
+                cur[j] -= step_fp * cur_sign[j]
+
+            step //= 2
+
+        if self.pid == 1:
+            for j in range(n):
+                a_ind[j] += 1
+
+        params: Matrix = self.table_lookup(a_ind, 2, fid=0)
+
+        b: Vector = self.mult_vec(params[1], a, fid=fid)
+        b: Vector = self.trunc_vec(b)
+
+        if self.pid > 0:
+            for j in range(n):
+                b[j] += params[0][j]
+
+        b_grad = deepcopy(params[1])
+
+        return b, b_grad
