@@ -322,6 +322,9 @@ class Matrix(Vector):
     def to_bytes(self: 'Matrix') -> bytes:
         return b';'.join([v.to_bytes() for v in self.value])
     
+    def flatten(self: 'Matrix') -> Vector:
+        return Vector([e for v in self.value for e in v])
+
     def reshape(self: 'Matrix', nrows: int, ncols: int):
         assert self.num_rows() * self.num_cols() == nrows * ncols
 
