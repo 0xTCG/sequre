@@ -179,10 +179,14 @@ class MPCEnv:
         self.prg_states[self.pid] = random.getstate() 
         
         for other_pid in set(range(3)) - {self.pid}:
-            random.seed(hash((min(self.pid, other_pid), max(self.pid, other_pid))))
-            self.prg_states[other_pid] = random.getstate()
+            self.import_seed(other_pid)
         
         return True
+    
+    def import_seed(self: 'MPCEnv', pid: int, seed: int = None):
+        seed: int = hash((min(self.pid, pid), max(self.pid, pid))) if seed is None else seed
+        random.seed(seed)
+        self.prg_states[pid] = random.getstate()
 
     def receive_bool(self: 'MPCEnv', from_pid: int) -> bool:
         return bool(int(self.sockets[from_pid].receive(msg_len=1)))
