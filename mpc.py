@@ -177,10 +177,13 @@ class MPCEnv:
     def setup_prgs(self: 'MPCEnv') -> bool:
         random.seed()
         self.prg_states[self.pid] = random.getstate() 
+        self.import_seed(-1, hash('global'))
         
         for other_pid in set(range(3)) - {self.pid}:
             self.import_seed(other_pid)
         
+        self.switch_seed(self.pid)
+
         return True
     
     def import_seed(self: 'MPCEnv', pid: int, seed: int = None):
@@ -617,7 +620,7 @@ class MPCEnv:
 
         return rand_mat
 
-    def trunc(self: 'MPCEnv', a: Matrix, k: int, m: int, fid: int):
+    def trunc(self: 'MPCEnv', a: Matrix, k: int = param.NBIT_K + param.NBIT_F, m: int = param.NBIT_F, fid: int):
         r = Matrix()
         r_low = Matrix()
         if (self.pid == 0):
