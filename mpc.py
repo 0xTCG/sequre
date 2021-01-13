@@ -620,7 +620,7 @@ class MPCEnv:
 
         return rand_mat
 
-    def trunc(self: 'MPCEnv', a: Matrix, k: int = param.NBIT_K + param.NBIT_F, m: int = param.NBIT_F, fid: int):
+    def trunc(self: 'MPCEnv', a: Matrix, k: int = param.NBIT_K + param.NBIT_F, m: int = param.NBIT_F, fid: int = 0):
         r = Matrix()
         r_low = Matrix()
         if (self.pid == 0):
