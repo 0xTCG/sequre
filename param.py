@@ -31,3 +31,28 @@ NUM_INDS: int = 1000
 NUM_SNPS = 1000
 NUM_COVS: int = 10
 NUM_DIM_TO_REMOVE = 5
+
+NUM_OVERSAMPLE = 10
+NUM_POWER_ITER: int = 5
+
+SNP_POS_FILE = "test_data/pos.txt"
+
+IMISS_UB: float = 0.05
+GMISS_UB: float = 0.1
+HET_LB: float = 0.25
+HET_UB: float = 0.30
+MAF_LB: float = 0.4
+MAF_UB: float = 0.6
+HWE_UB: float = 28.3740
+LD_DIST_THRES: int = 1000000
+DIV_MAX_N: int = 100000
+
+NUM_INDS: int = 1000
+NUM_SNPS: int = 1000
+NUM_COVS: int = 10
+
+PITER_BATCH_SIZE: int = 100
+PAR_THRES: int = 50
+NUM_THREADS: int = 20
+
+SKIP_QC: bool = False
