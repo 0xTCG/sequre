@@ -5,7 +5,7 @@ import param
 
 from mpc import MPCEnv
 from custom_types import Zp, Vector, Matrix, TypeOps
-from utils import get_cache_path, get_output_path, get_temp_path
+from utils import get_cache_path, get_output_path, get_temp_path, rand_int
 
 
 def logireg_protocol(mpc: MPCEnv, pid: int, test_run: bool = True) -> bool:
@@ -436,8 +436,8 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
                                     ihet[i] += g[1][j]
 
                 with open(get_cache_path(mpc.pid, "imiss_ihet")) as f:
-                    mpc.write_to_file(imiss, fs)
-                    mpc.write_to_file(ihet, fs)
+                    mpc.write_to_file(imiss, f)
+                    mpc.write_to_file(ihet, f)
 
                 print("Wrote results to cache")
 
@@ -524,15 +524,11 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
                 for p in range(1, 3):
                     mpc.import_seed(10 + p, int(f.readline()))
 
-            report_bsize: int = n1 // 10
             bsize: int = param.PITER_BATCH_SIZE
 
             # Containers for batching the computation
             g = list()
             g_mask = list()
-            Vec<ZZ_p> ctrl_vec, ctrl_mask_vec;
-            g.set_length(3);
-            g_mask.set_length(3);
             dosage = Matrix(bsize, m1)
             dosage_mask = Matrix(bsize, m1)
             miss = Matrix(bsize, m1)
@@ -550,8 +546,10 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
             for i in range(n1):
                 ind += 1
 
-                Mat<ZZ_p> g0, g0_mask
-                Vec<ZZ_p> miss0, miss0_mask;
+                g0 = Matrix()
+                g0_mask = Matrix()
+                miss0 = Vector()
+                miss0_mask = Vector()
 
                 while (ikeep[ind] != 1):
                     if mpc.pid > 0:
@@ -691,8 +689,8 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
         maf_ctrl: Vector = mpc.fp_div(dosage_sum_ctrl, dosage_tot_ctrl)
 
         with open(get_cache_path(mpc.pid, "maf"), 'wb') as f:
-            mpc.write_to_file(maf, fs)
-            mpc.write_to_file(maf_ctrl, fs)
+            mpc.write_to_file(maf, f)
+            mpc.write_to_file(maf_ctrl, f)
     print("done. ")
 
     Maf = Vector()  # MAJOR allele freq
@@ -740,7 +738,7 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
                 mpc.receive_vector(gkeep2, 2, TypeOps.get_vec_len(m1))
         else:
             gkeep2: Vector = mpc.less_than_public(maf, maf_ub)
-            tmp_vecmpc.not_less_than_public(maf, maf_lb)
+            tmp_vec = mpc.not_less_than_public(maf, maf_lb)
             gkeep2: Vector = mpc.mult_vec(gkeep2, tmp_vec)
 
             print("Locus Hardy-Weinberg equilibrium (HWE) filter ... ")
@@ -822,7 +820,7 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
         tmp_vec = mpc.fp_sqrt(g_std_bern_inv, g_var_bern)
 
         with open(get_cache_path(mpc.pid, "stdinv_bern"), 'wb') as f:
-            mpc.write_to_file(g_std_bern_inv, f);
+            mpc.write_to_file(g_std_bern_inv, f)
 
     g_mean = Vector([Zp(0, param.BASE_P) for _ in range(m2)])
     if mpc.pid > 0:
@@ -831,7 +829,6 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
     print("Starting population stratification analysis")
 
     selected: list = [0] * m2  # 1 selected, 0 unselected, -1 TBD
-    to_process: list = [False] * m2
 
     for i in range(m2):
         selected[i] = -1
@@ -968,7 +965,7 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
         print("sketch cache found")
         with open(get_cache_path(mpc.pid, "sketch")) as f:
             kp = int(f.readline())
-            Y_cur: Matrix = mpc.read_matrix(ifs, kp, m3)
+            Y_cur: Matrix = mpc.read_matrix(f, kp, m3)
     else:
         Y_cur_adj = Matrix(kp, m3)
         bucket_count: list = [0] * kp
@@ -1075,7 +1072,7 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
         mpc.trunc(Q_scaled_gmean)
 
         Q_scaled.transpose(inplace=True)  # m3-by-kp
-        # transpose(, Q_scaled_mask); // m3-by-kp, unlike mpc.Transpose, P0 also transposes
+        # transpose(, Q_scaled_mask); # m3-by-kp, unlike mpc.Transpose, P0 also transposes
         Q_scaled_mask.transpose(inplace=True)
         Q_scaled_gmean.transpose(inplace=True)  # m3-by-kp
         Q_scaled_gmean, Q_scaled_gmean_mask =  mpc.beaver_partition(Q_scaled_gmean)
@@ -1093,8 +1090,8 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
 
         with open(get_cache_path(mpc.pid, "pca_input")) as f:
             for cur in range(n1):
-                g[cur % bsize] = mpc.beaver_read_from_file(g_mask[cur % bsize], ifs, m3)
-                miss[cur % bsize] = mpc.beaver_read_from_file(miss_mask[cur % bsize], ifs, m3)
+                g[cur % bsize] = mpc.beaver_read_from_file(g_mask[cur % bsize], f, m3)
+                miss[cur % bsize] = mpc.beaver_read_from_file(miss_mask[cur % bsize], f, m3)
                 mpc.beaver_flip_bit(miss[cur % bsize], miss_mask[cur % bsize])
 
                 if cur % bsize == bsize - 1:
@@ -1200,11 +1197,10 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
             gQ -= gQ_adj_gmean
         gQ, gQ_mask = mpc.beaver_partition(gQ)
 
-        gQ_scaled.set_dims(kp, m3)
-        gQ_scaled.clear()
+        gQ_scaled = Matrix(kp, m3)
         
         for i in range(kp):
-            gQ_scaled[i] = mpc.beaver_mult_elem(gQ[i], gQ_mask[i], g_stdinv_pca, g_stdinv_pca_mask);
+            gQ_scaled[i] = mpc.beaver_mult_elem(gQ[i], gQ_mask[i], g_stdinv_pca, g_stdinv_pca_mask)
         gQ_scaled = mpc.beaver_reconstruct(gQ_scaled)
         mpc.trunc(gQ_scaled)
 
@@ -1231,7 +1227,7 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
         Z *= fp_m2_inv
         mpc.trunc(Z)
 
-        Z.transpose(inplace=True) // kp-by-n1
+        Z.transpose(inplace=True) # kp-by-n1
 
         Z, Z_mask = mpc.beaver_partition(Z)
 
