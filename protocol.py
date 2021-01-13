@@ -1,4 +1,5 @@
 import os
+from copy import deepcopy
 
 import param
 
@@ -24,21 +25,21 @@ def logireg_protocol(mpc: MPCEnv, pid: int, test_run: bool = True) -> bool:
     cov = Matrix(n0, param.NUM_COVS)
 
     if not test_run:
-        if (not os.path.exists(get_cache_path(pid, 'input_geno')) or
-            not os.path.exists(get_cache_path(pid, 'input_pheno_cov'))):
+        if (not os.path.exists(get_cache_path(mpc.pid, 'input_geno')) or
+            not os.path.exists(get_cache_path(mpc.pid, 'input_pheno_cov'))):
             print('Initial data sharing results not found:')
-            print(f'\t{get_cache_path(pid, "input_geno")}')
-            print(f'\t{get_cache_path(pid, "input_pheno_cov")}')
+            print(f'\t{get_cache_path(mpc.pid, "input_geno")}')
+            print(f'\t{get_cache_path(mpc.pid, "input_pheno_cov")}')
             return False
 
     print('Initial data sharing results found')
 
     if not test_run:
-        with open(get_cache_path(pid, 'input_geno'), 'rb') as f:
+        with open(get_cache_path(mpc.pid, 'input_geno'), 'rb') as f:
             pheno = mpc.read_vector(f, n0, fid=0)
             cov = mpc.read_matrix(f, n0, param.NUM_COVS, fid=0)
     else:
-        with open(get_temp_path(pid, 'input_pheno_cov')) as f:
+        with open(get_temp_path(mpc.pid, 'input_pheno_cov')) as f:
             pheno = list()
             cov = list()
             for _ in range(n0):
@@ -58,7 +59,7 @@ def logireg_protocol(mpc: MPCEnv, pid: int, test_run: bool = True) -> bool:
     print('Using locus missing rate filter from a previous run')
     
     if mpc.pid == 2:
-        with open(get_output_path(pid, 'gkeep1')) as f:
+        with open(get_output_path(mpc.pid, 'gkeep1')) as f:
             for i in range(m0):
                 gkeep1[i] = Zp(int(f.readline()), base=param.BASE_P)
         mpc.send_elem(gkeep1, 0)
@@ -73,7 +74,7 @@ def logireg_protocol(mpc: MPCEnv, pid: int, test_run: bool = True) -> bool:
     print('Using individual missing rate/het rate filters from a previous run')
     
     if mpc.pid == 2:
-        with open(get_output_path(pid, 'ikeep')) as f:
+        with open(get_output_path(mpc.pid, 'ikeep')) as f:
             lines = f.readlines()
             assert len(lines) == n0, f'{len(lines)} != {n0}'
             ikeep = Vector([Zp(int(e), base=param.BASE_P) for e in lines])
@@ -94,7 +95,7 @@ def logireg_protocol(mpc: MPCEnv, pid: int, test_run: bool = True) -> bool:
     print('Using MAF/HWE filters from a previous run')
     
     if mpc.pid == 2:
-        with open(get_output_path(pid, 'gkeep2')) as f:
+        with open(get_output_path(mpc.pid, 'gkeep2')) as f:
             for i in range(m1):
                 gkeep2[i] = Zp(int(f.readline()), base=param.BASE_P)
         mpc.send_elem(gkeep2, 0)
@@ -111,7 +112,7 @@ def logireg_protocol(mpc: MPCEnv, pid: int, test_run: bool = True) -> bool:
 
     if mpc.pid == 2:
         cavec = list()
-        with open(get_output_path(pid, 'assoc')) as f:
+        with open(get_output_path(mpc.pid, 'assoc')) as f:
             for i in range(m2):
                 val = float(f.readline())
                 cavec.append((i, val * val))
@@ -133,10 +134,10 @@ def logireg_protocol(mpc: MPCEnv, pid: int, test_run: bool = True) -> bool:
 
     print('Using eigenvectors from a previous run')
     if not test_run:
-        with open(get_cache_path(pid, 'eigen')):
+        with open(get_cache_path(mpc.pid, 'eigen')):
             V = mpc.read_matrix(k, n1)
     else:
-        with open(get_temp_path(pid, 'eigen')) as f:
+        with open(get_temp_path(mpc.pid, 'eigen')) as f:
             V = list()
             for _ in range(k):
                 V_row = list()
@@ -193,17 +194,17 @@ def logireg_protocol(mpc: MPCEnv, pid: int, test_run: bool = True) -> bool:
             gkeep[j] = (gkeep3[ind].value == 1)
             ind += 1
 
-    if not os.path.exists(get_cache_path(pid, 'logi_input')):
+    if not os.path.exists(get_cache_path(mpc.pid, 'logi_input')):
         raise NotImplementedError(
             'At this point, logi_input is expected in cache.\n'
             'TODO: Haris. Make it cache agnostic. (See original implementation)')
     
     print('logi_input cache found')
     if not test_run:
-        with open(get_cache_path(pid, 'logi_input'), 'br') as f:
+        with open(get_cache_path(mpc.pid, 'logi_input'), 'br') as f:
             X, X_mask = mpc.beaver_read_from_file(f, ntop, n1)
     else:
-        with open(get_temp_path(pid, 'logi_input')) as f:
+        with open(get_temp_path(mpc.pid, 'logi_input')) as f:
             X = list()
             X_mask = list()
             for _ in range(ntop):
@@ -230,7 +231,7 @@ def logireg_protocol(mpc: MPCEnv, pid: int, test_run: bool = True) -> bool:
     bx: Vector = mpc.reveal_sym(bx)
     if mpc.pid == 2:
         bx_double = mpc.fp_to_double_vec(bx, param.NBIT_K, param.NBIT_F)
-        output_path: str = get_output_path(pid, 'logi_coeff')
+        output_path: str = get_output_path(mpc.pid, 'logi_coeff')
         with open(output_path, 'w') as f:
             for num in bx_double.value:
                 f.write(f'{str(num)}\n')
@@ -264,7 +265,7 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
 
     print("Initial data sharing results found")
 
-    with open(get_cache_path(pid, "input_pheno_cov")) as f:
+    with open(get_cache_path(mpc.pid, "input_pheno_cov")) as f:
         pheno: Vector = mpc.read_vector(f, n0)
         cov = mpc.read_matrix(f, n0, param.NUM_COVS)
 
@@ -279,7 +280,7 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
     else:
         history: bool = False
         if mpc.pid == 2:
-            history = os.path.exists(get_output_path("gkeep1"))
+            history = os.path.exists(get_output_path(mpc.pid, "gkeep1"))
             mpc.send_bool(history, 0)
             mpc.send_bool(history, 1)
         else:
@@ -290,7 +291,7 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
             print("Using locus missing rate filter from a previous run")
         
             if mpc.pid == 2:
-                with open(get_output_path("gkeep1")):
+                with open(get_output_path(mpc.pid, "gkeep1")):
                     for i in range(m0):
                         gkeep1[i] = Zp(int(f.readline()), base=param.BASE_P)
 
@@ -301,16 +302,16 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
         else:
             gmiss: Vector = Vector([Zp(0, base=param.BASE_P) for _ in range(m0)])
             
-            if os.path.exists(get_cache_path(pid, "gmiss")):
+            if os.path.exists(get_cache_path(mpc.pid, "gmiss")):
                 print("Locus missing rate cache found")
 
-                with open(get_cache_path(pid, "gmiss")) as f:
+                with open(get_cache_path(mpc.pid, "gmiss")) as f:
                     gmiss = mpc.read_vector(f, m0)
             else:
                 print("Taking a pass to calculate locus missing rates:")
 
                 if mpc.pid > 0:
-                    with open(get_cache_path(pid, "input_geno")) as f:
+                    with open(get_cache_path(mpc.pid, "input_geno")) as f:
                         mpc.import_seed(10, int(f.readline()))
 
                         bsize: int = n0 // 10
@@ -336,7 +337,7 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
                             gmiss += miss
 
 
-                with open(get_cache_path(pid, "gmiss")) as f:
+                with open(get_cache_path(mpc.pid, "gmiss")) as f:
                     mpc.write_to_file(gmiss, f)
 
                 print("Wrote results to cache")
@@ -353,7 +354,7 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
                 gkeep1: Vector = mpc.receive_vector(2, TypeOps.get_vec_len(m0))
 
             if mpc.pid == 2:
-                with open(get_output_path("gkeep1"), 'w') as f:
+                with open(get_output_path(mpc.pid, "gkeep1"), 'w') as f:
                     for i in range(gkeep1.length()):
                         f.write(f'{gkeep1[i]}\n')
 
@@ -372,7 +373,7 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
     else:
         history: bool = False
         if mpc.pid == 2:
-            history = os.path.exists(get_output_path("ikeep"))
+            history = os.path.exists(get_output_path(mpc.pid, "ikeep"))
             mpc.send_bool(history, 0)
             mpc.send_bool(history, 1)
         else:
@@ -383,7 +384,7 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
             print("Using individual missing rate/het rate filters from a previous run")
         
             if mpc.pid == 2:
-                with open(get_output_path("ikeep")) as f:
+                with open(get_output_path(mpc.pid, "ikeep")) as f:
                     for i in range(n0):
                         ikeep[i] = Zp(int(f.readline()), base=param.BASE_P)
 
@@ -395,17 +396,17 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
             imiss = Vector([Zp(0, param.BASE_P) for _ in range(n0)])
             ihet = Vector([Zp(0, param.BASE_P) for _ in range(n0)])
 
-            if os.path.exists(get_cache_path(pid, "imiss_ihet")):
+            if os.path.exists(get_cache_path(mpc.pid, "imiss_ihet")):
                 print("Individual missing rate and het rate cache found")
 
-                with open(get_cache_path(pid, "imiss_ihet")) as f:
+                with open(get_cache_path(mpc.pid, "imiss_ihet")) as f:
                     imiss: Vector = mpc.read_vector(f, n0)
                     ihet: Vector = mpc.read_vector(f, n0)
             else:
                 print("Taking a pass to calculate individual missing rates and het rates:")
 
                 if mpc.pid > 0:
-                    with open(get_cache_path(pid, "input_geno")) as f:
+                    with open(get_cache_path(mpc.pid, "input_geno")) as f:
                         mpc.import_seed(10, int(f.readline()))
                         bsize: int = n0 // 10
 
@@ -434,7 +435,7 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
                                     imiss[i] += miss[j]
                                     ihet[i] += g[1][j]
 
-                with open(get_cache_path(pid, "imiss_ihet")) as f:
+                with open(get_cache_path(mpc.pid, "imiss_ihet")) as f:
                     mpc.write_to_file(imiss, fs)
                     mpc.write_to_file(ihet, fs)
 
@@ -482,1580 +483,1095 @@ def gwas_protocol(mpc: MPCEnv) -> bool:
                 mpc.receive_vector(ikeep, 2, TypeOps.get_vec_len(n0))
 
             if mpc.pid == 2:
-                with open(get_output_path("ikeep"), 'w') as f:
+                with open(get_output_path(mpc.pid, "ikeep"), 'w') as f:
                     for i in range(ikeep.length()):
                         f.write(f'{ikeep[i]}\n')
 
-    mpc.ProfilerPopState(true); // ind_miss/het
-
-    uint n1 = conv<uint>(Sum(ikeep));
-
-    print("n1: " << n1 << ", " << "m1: " << m1)
+    n1: int = int(sum(ikeep, Zp(0, base=param.BASE_P)))
 
     print("Filtering phenotypes and covariates")
-    mpc.Filter(pheno, ikeep, n1);
-    mpc.FilterRows(cov, ikeep, n1);
+    pheno: Vector = mpc.filter(pheno, gkeep1)
+    cov: Matrix = mpc.filter_rows(cov, ikeep)
 
-    Vec<ZZ_p> ctrl;
-    mpc.FlipBit(ctrl, pheno);
+    ctrl: Vector = mpc.flip_bit(pheno)
 
-    Vec<ZZ_p> ctrl_mask;
-    mpc.BeaverPartition(ctrl_mask, ctrl);
+    ctrl, ctrl_mask = mpc.beaver_partition(ctrl, fid=0)
 
-    Vec<ZZ_p> dosage_sum;
-    Vec<ZZ_p> gmiss, gmiss_ctrl, dosage_sum_ctrl;
-    Mat<ZZ_p> g_count_ctrl;
-    ZZ_p n1_ctrl(0);
+    dosage_sum: Vector = Vector([Zp(0, param.BASE_P) for _ in range(m1)])
+    gmiss: Vector = Vector([Zp(0, param.BASE_P) for _ in range(m1)])
+    gmiss_ctrl: Vector = Vector([Zp(0, param.BASE_P) for _ in range(m1)])
+    dosage_sum_ctrl: Vector = Vector([Zp(0, param.BASE_P) for _ in range(m1)])
+    g_count_ctrl = Matrix(3, m1)
+    n1_ctrl = Zp(0, param.BASE_P)
 
-    Init(gmiss, m1);
-    Init(gmiss_ctrl, m1);
-    Init(dosage_sum, m1);
-    Init(dosage_sum_ctrl, m1);
-    Init(g_count_ctrl, 3, m1);
-
-    mpc.ProfilerPushState("data_scan");
-
-    if (os.path.exists(get_cache_path(pid, "geno_stats"))) {
+    if (os.path.exists(get_cache_path(mpc.pid, "geno_stats"))):
         print("Genotype statistics cache found")
 
-        with open(get_cache_path(pid, "geno_stats"));
-        mpc.ReadFromFile(gmiss, ifs, m1);
-        mpc.ReadFromFile(gmiss_ctrl, ifs, m1);
-        mpc.ReadFromFile(dosage_sum, ifs, m1);
-        mpc.ReadFromFile(dosage_sum_ctrl, ifs, m1);
-        mpc.ReadFromFile(g_count_ctrl, ifs, 3, m1);
-        mpc.ReadFromFile(n1_ctrl, ifs);
-        ifs.close();
-    } else {
+        with open(get_cache_path(mpc.pid, "geno_stats")) as f:
+            gmiss: Vector = mpc.read_vector(f, m1, fid=0)
+            gmiss_ctrl: Vector = mpc.read_vector(f, m1, fid=0)
+            dosage_sum: Vector = mpc.read_vector(f, m1, fid=0)
+            dosage_sum_ctrl: Vector = mpc.read_vector(f, m1, fid=0)
+            g_count_ctrl: Matrix = mpc.read_matrix(f, 3, m1, fid=0)
+            n1_ctrl = Zp(int(f.readline()), param.BASE_P)
+    else:
         print("Taking a pass to calculate genotype statistics:")
 
-        with open(get_cache_path(pid, "input_geno"));
-        if (mpc.pid > 0) {
-        mpc.import_seed(10, ifs);
-        } else {
-        for (int p = 1; p <= 2; p++) {
-            mpc.import_seed(10 + p, ifs);
-        }
-        }
+        with open(get_cache_path(mpc.pid, "input_geno")) as f:
+            if mpc.pid > 0:
+                mpc.import_seed(10, int(f.readline()))
+            else:
+                for p in range(1, 3):
+                    mpc.import_seed(10 + p, int(f.readline()))
 
-        long report_bsize = n1 / 10;
+            report_bsize: int = n1 // 10
+            bsize: int = param.PITER_BATCH_SIZE
 
-        long bsize = param.PITER_BATCH_SIZE;
+            # Containers for batching the computation
+            g = list()
+            g_mask = list()
+            Vec<ZZ_p> ctrl_vec, ctrl_mask_vec;
+            g.set_length(3);
+            g_mask.set_length(3);
+            dosage = Matrix(bsize, m1)
+            dosage_mask = Matrix(bsize, m1)
+            miss = Matrix(bsize, m1)
+            miss_mask = Matrix(bsize, m1)
 
-        // Containers for batching the computation
-        Vec< Mat<ZZ_p> > g, g_mask;
-        Mat<ZZ_p> dosage, dosage_mask;
-        Mat<ZZ_p> miss, miss_mask;
-        Vec<ZZ_p> ctrl_vec, ctrl_mask_vec;
-        g.SetLength(3);
-        g_mask.SetLength(3);
-        dosage.SetDims(bsize, m1);
-        dosage_mask.SetDims(bsize, m1);
-        miss.SetDims(bsize, m1);
-        miss_mask.SetDims(bsize, m1);
-        for (int k = 0; k < 3; k++) {
-        g[k].SetDims(bsize, m1);
-        g_mask[k].SetDims(bsize, m1);
-        }
-        ctrl_vec.SetLength(bsize);
-        ctrl_mask_vec.SetLength(bsize);
+            for k in range(3):
+                g.append(Matrix(bsize, m1))
+                g_mask.append(Matrix(bsize, m1))
 
-        ind = -1;
-        tic();
-        for i in range(n1):
-        ind++;
+            ctrl_vec = Vector([Zp(0, param.BASE_P) for _ in range(bsize)])
+            ctrl_mask_vec = Vector([Zp(0, param.BASE_P) for _ in range(bsize)])
 
-        mpc.ProfilerPushState("file_io/rng");
+            ind: int = -1
 
-        Mat<ZZ_p> g0, g0_mask;
-        Vec<ZZ_p> miss0, miss0_mask;
+            for i in range(n1):
+                ind += 1
 
-        while (ikeep[ind] != 1) {
-            if (mpc.pid > 0) {
-            mpc.SkipData(ifs, 3, m0); // g
-            mpc.SkipData(ifs, m0); // miss
+                Mat<ZZ_p> g0, g0_mask
+                Vec<ZZ_p> miss0, miss0_mask;
 
-            mpc.switch_seed(10);
-            Matrix(g0_mask, 3, m0);
-            mpc.random_vector(miss0_mask, m0);
-            mpc.restore_seed();
-            } else {
-            for (int p = 1; p <= 2; p++) {
-                mpc.switch_seed(10 + p);
-                Matrix(g0_mask, 3, m0);
-                mpc.random_vector(miss0_mask, m0);
-                mpc.restore_seed();
-            }
-            }
-            ind++;
-        }
+                while (ikeep[ind] != 1):
+                    if mpc.pid > 0:
+                        mpc.skip_data(f, 3, m0)
+                        mpc.skip_data(f, m0)
 
-        if (mpc.pid > 0) {
-            mpc.ReadFromFile(g0, ifs, 3, m0); // g
-            mpc.ReadFromFile(miss0, ifs, m0); // miss
+                        mpc.switch_seed(10)
+                        g0_mask = Matrix(3, m0, randomise=True)
+                        miss0_mask: Vector = mpc.random_vector(m0)
+                        mpc.restore_seed(10)
+                    else:
+                        for p in range(1, 3):
+                            mpc.switch_seed(10 + p)
+                            g0_mask = Matrix(3, m0, randomise=True)
+                            miss0_mask: Vector = mpc.random_vector(m0)
+                            mpc.restore_seed(10 + p)
 
-            mpc.switch_seed(10);
-            Matrix(g0_mask, 3, m0);
-            mpc.random_vector(miss0_mask, m0);
-            mpc.restore_seed();
-        } else {
-            Init(g0, 3, m0);
-            Init(g0_mask, 3, m0);
-            Init(miss0, m0);
-            Init(miss0_mask, m0);
+                    ind += 1
 
-            for (int p = 1; p <= 2; p++) {
-            mpc.switch_seed(10 + p);
-            Matrix(tmp_mat, 3, m0);
-            mpc.random_vector(tmp_vec, m0);
-            mpc.restore_seed();
+                if mpc.pid > 0:
+                    g0: Matrix = mpc.read_matrix(f, 3, m0)
+                    miss0: Vector = mpc.read_vector(f, m0)
 
-            g0_mask += tmp_mat;
-            miss0_mask += tmp_vec;
-            }
-        }
-        
-        mpc.ProfilerPopState(false); // file_io/rng
+                    mpc.switch_seed(10)
+                    g0_mask = Matrix(3, m0, randomise=True)
+                    miss0_mask: Vector = mpc.random_vector(m0)
+                    mpc.restore_seed(10)
+                else:
+                    g0 = Matrix(3, m0)
+                    g0_mask = Matrix(3, m0)
+                    miss0 = Vector([Zp(0, param.BASE_P) for _ in range(m0)])
+                    miss0_mask = Vector([Zp(0, param.BASE_P) for _ in range(m0)])
 
-        // Filter out loci that failed missing rate filter
-        int ind2 = 0;
-        for j in range(m0):
-            if (gkeep1[j] == 1) {
-            for (int k = 0; k < 3; k++) {
-                g[k][i % bsize][ind2] = g0[k][j];
-                g_mask[k][i % bsize][ind2] = g0_mask[k][j];
-            }
-            miss[i % bsize][ind2] = miss0[j];
-            miss_mask[i % bsize][ind2] = miss0_mask[j];
-            ind2++;
-            }
-        }
+                    for p in range(1, 3):
+                        mpc.switch_seed(10 + p)
+                        tmp_mat = Matrix(3, m0, randomise=True)
+                        tmp_vec = mpc.random_vector(m0)
+                        mpc.restore_seed(10 + p)
 
-        dosage[i % bsize] = g[1][i % bsize] + 2 * g[2][i % bsize];
-        dosage_mask[i % bsize] = g_mask[1][i % bsize] + 2 * g_mask[2][i % bsize];
-
-        ctrl_vec[i % bsize] = ctrl[i];
-        ctrl_mask_vec[i % bsize] = ctrl_mask[i];
-
-        // Update running sums
-        if (mpc.pid > 0) {
-            n1_ctrl += ctrl_mask[i];
-            gmiss += miss_mask[i % bsize];
-            dosage_sum += dosage_mask[i % bsize];
-
-            if (mpc.pid == 1) {
-            n1_ctrl += ctrl[i];
-            gmiss += miss[i % bsize];
-            dosage_sum += dosage[i % bsize];
-            }
-        }
-
-        if (i % bsize == bsize - 1 || i == n1 - 1) {
-            if (i % bsize < bsize - 1) {
-            int new_bsize = (i % bsize) + 1;
-            for (int k = 0; k < 3; k++) {
-                g[k].SetDims(new_bsize, m1);
-                g_mask[k].SetDims(new_bsize, m1);
-            }
-            dosage.SetDims(new_bsize, m1);
-            dosage_mask.SetDims(new_bsize, m1);
-            miss.SetDims(new_bsize, m1);
-            miss_mask.SetDims(new_bsize, m1);
-            ctrl_vec.SetLength(new_bsize);
-            ctrl_mask_vec.SetLength(new_bsize);
-            }
-
-            mpc.BeaverMult(gmiss_ctrl, ctrl_vec, ctrl_mask_vec, miss, miss_mask);
-            mpc.BeaverMult(dosage_sum_ctrl, ctrl_vec, ctrl_mask_vec, dosage, dosage_mask);
-            for (int k = 0; k < 3; k++) {
-            mpc.BeaverMult(g_count_ctrl[k], ctrl_vec, ctrl_mask_vec, g[k], g_mask[k]);
-            }
-        }
-
-        if ((i + 1) % report_bsize == 0 || i == n1 - 1) {
-            print("\t" << i+1 << " / " << n1 << ", "; toc(); tic();
-        }
-        }
-
-        ifs.close();
-
-        mpc.BeaverReconstruct(gmiss_ctrl);
-        mpc.BeaverReconstruct(dosage_sum_ctrl);
-        mpc.BeaverReconstruct(g_count_ctrl);
-
-        // Write to cache
-        with open(get_cache_path(pid, "geno_stats")) as f:
-        mpc.write_to_file(gmiss, fs);
-        mpc.write_to_file(gmiss_ctrl, fs);
-        mpc.write_to_file(dosage_sum, fs);
-        mpc.write_to_file(dosage_sum_ctrl, fs);
-        mpc.write_to_file(g_count_ctrl, fs);
-        mpc.write_to_file(n1_ctrl, fs);
-        fs.close();
-
-        print("Wrote results to cache")
-    }
-
-    mpc.ProfilerPopState(true); // data_scan
-
-    mpc.ProfilerPushState("maf/hwe");
-
-    if (param.DEBUG) {
-        print("gmiss")
-        mpc.Print(gmiss, 5);
-        print("gmiss_ctrl")
-        mpc.Print(gmiss_ctrl, 5);
-        print("dosage_sum")
-        mpc.Print(dosage_sum, 5);
-        print("dosage_sum_ctrl")
-        mpc.Print(dosage_sum_ctrl, 5);
-        print("g_count_ctrl")
-        for i in range(3):
-        mpc.Print(g_count_ctrl[i], 5);
-        }
-    }
-
-    mpc.ProfilerPushState("maf");
-
-    // SNP MAF filter
-    print("Locus minor allele frequency (MAF) filter ... ")
-    ZZ_p maf_lb:Zp = mpc.double_to_fp(param.MAF_LB, param.NBIT_K, param.NBIT_F);
-    ZZ_p maf_ub:Zp = mpc.double_to_fp(param.MAF_UB, param.NBIT_K, param.NBIT_F);
-
-    Vec<ZZ_p> dosage_tot, dosage_tot_ctrl;
-    if (mpc.pid > 0) {
-        dosage_tot = -gmiss;
-        dosage_tot_ctrl = -gmiss_ctrl;
-        mpc.AddPublic(dosage_tot, ZZ_p(n1));
-        mpc.Add(dosage_tot_ctrl, n1_ctrl);
-        dosage_tot *= 2;
-        dosage_tot_ctrl *= 2;
-    } else {
-        dosage_tot.SetLength(m1);
-        dosage_tot_ctrl.SetLength(m1);
-    }
-
-    print("Calculating MAFs ... ") tic();
-    Vec<ZZ_p> maf, maf_ctrl;
-    if (os.path.exists(get_cache_path(pid, "maf"))) {
-        print("maf cache found")
-        with open(get_cache_path(pid, "maf"));
-        mpc.ReadFromFile(maf, ifs, dosage_tot.length());
-        mpc.ReadFromFile(maf_ctrl, ifs, dosage_tot_ctrl.length());
-        ifs.close();
-    } else {
-        mpc.ProfilerPushState("div");
-        mpc.FPDiv(maf, dosage_sum, dosage_tot); 
-        mpc.FPDiv(maf_ctrl, dosage_sum_ctrl, dosage_tot_ctrl); 
-        mpc.ProfilerPopState(false); // div
-
-        with open(get_cache_path(pid, "maf")) as f:
-        mpc.write_to_file(maf, fs);
-        mpc.write_to_file(maf_ctrl, fs);
-        fs.close();
-    }
-    print("done. "; toc();
-
-    Vec<ZZ_p> Maf, Maf_ctrl; // MAJOR allele freq
-    if (mpc.pid > 0) {
-        Maf = -maf;
-        Maf_ctrl = -maf_ctrl;
-        mpc.AddPublic(Maf, fp_one);
-        mpc.AddPublic(Maf_ctrl, fp_one);
-    } else {
-        Maf.SetLength(m1);
-        Maf_ctrl.SetLength(m1);
-    }
-
-    // Variance based on Bernoulli distribution over each allele
-    Vec<ZZ_p> g_var_bern;
-    mpc.MultElem(g_var_bern, maf, Maf);
-    mpc.Trunc(g_var_bern);
-
-    mpc.ProfilerPopState(true); // maf
-
-    if (param.DEBUG) {
-        print("maf")
-        mpc.PrintFP(maf, 5);
-        print("maf_ctrl")
-        mpc.PrintFP(maf_ctrl, 5);
-    }
-
-    Vec<ZZ_p> gkeep2;
-    Init(gkeep2, m1);
-
-    if (param.SKIP_QC) {
-        for i in range(m1):
-        gkeep2[i] = 1;
-        }
-        print("SNP MAF/HWE filters skipped")
-    } else {
-        bool history;
-        if (mpc.pid == 2) {
-        history = os.path.exists(get_output_path("gkeep2"));
-        mpc.send_bool(history, 0);
-        mpc.send_bool(history, 1);
-        } else {
-        // ask P2 if gkeep2 has been computed before
-        history = mpc.receive_bool(2);
-        }
-
-        if (history) {
-        print("Using MAF/HWE filters from a previous run")
-    
-        if (mpc.pid == 2) {
-            with open(get_output_path("gkeep2"));
-            for i in range(m1):
-            ifs >> gkeep2[i];
-            }
-            ifs.close();
-
-            mpc.send_elem(gkeep2, 0);
-            mpc.send_elem(gkeep2, 1);
-        } else {
-            mpc.receive_vector(gkeep2, 2, m1);
-        }
-        } else {
-        
-        mpc.ProfilerPushState("maf_filt");
-
-        mpc.less_than_public(gkeep2, maf, maf_ub);
-        mpc.NotLessThanPublic(tmp_vec, maf, maf_lb);
-        mpc.MultElem(gkeep2, gkeep2, tmp_vec);
-
-        mpc.ProfilerPopState(true); // maf_filt
-
-        mpc.ProfilerPushState("hwe_filt");
-
-        print("Locus Hardy-Weinberg equilibrium (HWE) filter ... ") tic();
-        ZZ_p hwe_ub:Zp = mpc.double_to_fp(param.HWE_UB, param.NBIT_K, param.NBIT_F); // p < 1e-7
-        
-        // Calculate expected genotype distribution in control group
-        Mat<ZZ_p> g_exp_ctrl;
-        Init(g_exp_ctrl, 3, m1);
-
-        mpc.MultElem(g_exp_ctrl[0], Maf_ctrl, Maf_ctrl); // AA
-        mpc.MultElem(g_exp_ctrl[1], Maf_ctrl, maf_ctrl); // Aa
-        if (mpc.pid > 0) {
-            g_exp_ctrl[1] *= 2;
-        }
-        mpc.MultElem(g_exp_ctrl[2], maf_ctrl, maf_ctrl); // aa
-
-        for i in range(3):
-            mpc.MultElem(g_exp_ctrl[i], g_exp_ctrl[i], dosage_tot_ctrl);
-        }
-        g_exp_ctrl *= twoinv; // dosage_tot_ctrl is twice the # individuals we actually want
-
-        mpc.Trunc(g_exp_ctrl);
-
-        print("\tCalculated expected genotype counts, "; toc(); tic();
-
-        Vec<ZZ_p> hwe_chisq; 
-        Init(hwe_chisq, m1);
-
-        if (os.path.exists(get_cache_path(pid, "hwe"))) {
-            print("HWE cache found")
-            with open(get_cache_path(pid, "hwe"));
-            mpc.ReadFromFile(hwe_chisq, ifs, m1);
-            ifs.close();
-        } else {
-            for i in range(3):
-            Vec<ZZ_p> diff;
-            if (mpc.pid > 0) {
-                diff = fp_one * g_count_ctrl[i] - g_exp_ctrl[i];
-            } else {
-                diff.SetLength(m1);
-            }
-
-            mpc.MultElem(diff, diff, diff); // square
-            mpc.Trunc(diff);
-
-            mpc.ProfilerPushState("div");
-            mpc.FPDiv(tmp_vec, diff, g_exp_ctrl[i]);
-            mpc.ProfilerPopState(false); // div
-            hwe_chisq += tmp_vec;
-
-            print("\tChi-square test (" << i+1 << "/3), "; toc(); tic();
-            }
-
-            with open(get_cache_path(pid, "hwe")) as f:
-            mpc.write_to_file(hwe_chisq, fs);
-            fs.close();
-        }
-
-        if (param.DEBUG) {
-            print("hwe")
-            mpc.PrintFP(hwe_chisq, 5);
-        }
-        
-        Vec<ZZ_p> hwe_filt;
-        mpc.less_than_public(hwe_filt, hwe_chisq, hwe_ub);
-        mpc.MultElem(gkeep2, gkeep2, hwe_filt);
-        hwe_filt.kill();
-
-        // Reveal which SNPs to discard 
-        mpc.reveal_sym(gkeep2);
+                        g0_mask += tmp_mat
+                        miss0_mask += tmp_vec
             
-        if (mpc.pid == 2) {
-            mpc.send_elem(gkeep2, 0);
-        elif (mpc.pid == 0) {
-            mpc.receive_vector(gkeep2, 2, m1);
-        }
 
-        if (mpc.pid == 2) {
-            owith open(get_output_path("gkeep2"));
-            for i in range(gkeep2.length()):
-            ofs << gkeep2[i])
-            }
-            ofs.close();
-        }
+            # Filter out loci that failed missing rate filter
+            ind2: int = 0
+            for j in range(m0):
+                if gkeep1[j] == 1:
+                    for k in range(3):
+                        g[k][i % bsize][ind2] = deepcopy(g0[k][j])
+                        g_mask[k][i % bsize][ind2] = deepcopy(g0_mask[k][j])
+                    miss[i % bsize][ind2] = deepcopy(miss0[j])
+                    miss_mask[i % bsize][ind2] = deepcopy(miss0_mask[j])
+                    ind2 += 1
 
-        mpc.ProfilerPopState(true); // hwe_filt
-        }
-    }
+            dosage[i % bsize] = g[1][i % bsize] + g[2][i % bsize] * 2
+            dosage_mask[i % bsize] = g_mask[1][i % bsize] + g_mask[2][i % bsize] * 2
 
-    uint m2 = conv<uint>(Sum(gkeep2));
-    print("n1: " << n1 << ", " << "m2: " << m2)
+            ctrl_vec[i % bsize] = deepcopy(ctrl[i])
+            ctrl_mask_vec[i % bsize] = deepcopy(ctrl_mask[i])
+
+            # Update running sums
+            if mpc.pid > 0:
+                n1_ctrl += ctrl_mask[i]
+                gmiss += miss_mask[i % bsize]
+                dosage_sum += dosage_mask[i % bsize]
+
+                if mpc.pid == 1:
+                    n1_ctrl += ctrl[i]
+                    gmiss += miss[i % bsize]
+                    dosage_sum += dosage[i % bsize]
+
+            if (i % bsize == bsize - 1 or i == n1 - 1):
+                if i % bsize < bsize - 1:
+                    new_bsize: int = (i % bsize) + 1
+
+                    for k in range(3):
+                        g[k].set_dims(new_bsize, m1)
+                        g_mask[k].set_dims(new_bsize, m1)
+
+                    dosage.set_dims(new_bsize, m1)
+                    dosage_mask.set_dims(new_bsize, m1)
+                    miss.set_dims(new_bsize, m1)
+                    miss_mask.set_dims(new_bsize, m1)
+                    ctrl_vec.set_length(new_bsize)
+                    ctrl_mask_vec.set_length(new_bsize)
+
+                gmiss_ctrl: Vector = mpc.beaver_mult_vec(
+                    ctrl_vec, ctrl_mask_vec, miss, miss_mask)
+                dosage_sum_ctrl: Vector = mpc.beaver_mult_vec(
+                    ctrl_vec, ctrl_mask_vec, dosage, dosage_mask)
+                for k in range(3):
+                    g_count_ctrl[k] = mpc.beaver_mult_vec(ctrl_vec, ctrl_mask_vec, g[k], g_mask[k])
+
+        gmiss_ctrl: Vector = mpc.beaver_reconstruct(gmiss_ctrl)
+        dosage_sum_ctrl: Vector = mpc.beaver_reconstruct(dosage_sum_ctrl)
+        g_count_ctrl: Vector = mpc.beaver_reconstruct(g_count_ctrl)
+
+        # Write to cache
+        with open(get_cache_path(mpc.pid, "geno_stats")) as f:
+            mpc.write_to_file(gmiss, f)
+            mpc.write_to_file(gmiss_ctrl, f)
+            mpc.write_to_file(dosage_sum, f)
+            mpc.write_to_file(dosage_sum_ctrl, f)
+            mpc.write_to_file(g_count_ctrl, f)
+            mpc.write_to_file(n1_ctrl, f)
+
+            print("Wrote results to cache")
+
+    # SNP MAF filter
+    print("Locus minor allele frequency (MAF) filter ... ")
+    maf_lb: Zp = mpc.double_to_fp(param.MAF_LB, param.NBIT_K, param.NBIT_F, fid=0)
+    maf_ub: Zp = mpc.double_to_fp(param.MAF_UB, param.NBIT_K, param.NBIT_F, fid=0)
+
+    dosage_tot = Vector()
+    dosage_tot_ctrl = Vector()
+    if mpc.pid > 0:
+        dosage_tot = -gmiss
+        dosage_tot_ctrl = -gmiss_ctrl
+        dosage_tot += Zp(n1, param.BASE_P)
+        dosage_tot_ctrl += n1_ctrl
+        dosage_tot *= 2
+        dosage_tot_ctrl *= 2
+    else:
+        dosage_tot.set_length(m1)
+        dosage_tot_ctrl.set_length(m1)
+
+    print("Calculating MAFs ... ")
+    maf = Vector()
+    maf_ctrl = Vector()
+    if (os.path.exists(get_cache_path(mpc.pid, "maf"))):
+        print("maf cache found")
+        with open(get_cache_path(mpc.pid, "maf")) as f:
+            maf: Vector = mpc.read_vector(f, dosage_tot.length())
+            maf_ctrl: Vector = mpc.read_vector(f, dosage_tot_ctrl.length())
+    else:
+        maf: Vector = mpc.fp_div(dosage_sum, dosage_tot)
+        maf_ctrl: Vector = mpc.fp_div(dosage_sum_ctrl, dosage_tot_ctrl)
+
+        with open(get_cache_path(mpc.pid, "maf"), 'wb') as f:
+            mpc.write_to_file(maf, fs)
+            mpc.write_to_file(maf_ctrl, fs)
+    print("done. ")
+
+    Maf = Vector()  # MAJOR allele freq
+    maf_ctrl = Vector()
+    if mpc.pid > 0:
+        Maf = -maf
+        Maf_ctrl = -maf_ctrl
+        Maf = mpc.add_public(Maf, fp_one)
+        Maf_ctrl = mpc.add_public(Maf_ctrl, fp_one)
+    else:
+        Maf.set_length(m1)
+        Maf_ctrl.set_length(m1)
+
+    # Variance based on Bernoulli distribution over each allele
+    g_var_bern: Vector = mpc.mult_vec(maf, Maf)
+    mpc.trunc_vec(g_var_bern)
+
+    gkeep2 = Vector([Zp(0, param.BASE_P) for _ in range(m1)])
+
+    if param.SKIP_QC:
+        for i in range(m1):
+            gkeep2[i] = 1
+        print("SNP MAF/HWE filters skipped")
+    else:
+        history: bool = False
+        if mpc.pid == 2:
+            history = os.path.exists(get_output_path(mpc.pid, "gkeep2"))
+            mpc.send_bool(history, 0)
+            mpc.send_bool(history, 1)
+        else:
+            # ask P2 if gkeep2 has been computed before
+            history = mpc.receive_bool(2)
+
+        if history:
+            print("Using MAF/HWE filters from a previous run")
+        
+            if mpc.pid == 2:
+                with open(get_output_path(mpc.pid, "gkeep2")) as f:
+                    for i in range(m1):
+                        gkeep2[i] = Zp(int(f.readline()), param.BASE_P)
+
+                mpc.send_elem(gkeep2, 0)
+                mpc.send_elem(gkeep2, 1)
+            else:
+                mpc.receive_vector(gkeep2, 2, TypeOps.get_vec_len(m1))
+        else:
+            gkeep2: Vector = mpc.less_than_public(maf, maf_ub)
+            tmp_vecmpc.not_less_than_public(maf, maf_lb)
+            gkeep2: Vector = mpc.mult_vec(gkeep2, tmp_vec)
+
+            print("Locus Hardy-Weinberg equilibrium (HWE) filter ... ")
+            hwe_ub: Zp = mpc.double_to_fp(param.HWE_UB, param.NBIT_K, param.NBIT_F)  # p < 1e-7
+            
+            # Calculate expected genotype distribution in control group
+            g_exp_ctrl = Matrix(3, m1)
+
+            g_exp_ctrl[0] = mpc.mult_vec(Maf_ctrl, Maf_ctrl)
+            g_exp_ctrl[1] = mpc.mult_vec(Maf_ctrl, maf_ctrl)
+            if mpc.pid > 0:
+                g_exp_ctrl[1] *= 2
+            g_exp_ctrl[2] = mpc.mult_vec(maf_ctrl, maf_ctrl)
+
+            for i in range(3):
+                g_exp_ctrl[i] = mpc.mult_vec(g_exp_ctrl[i], dosage_tot_ctrl)
+
+        g_exp_ctrl *= twoinv  # dosage_tot_ctrl is twice the # individuals we actually want
+
+        mpc.trunc(g_exp_ctrl, k=param.NBIT_K + param.NBIT_F, m=param.NBIT_F, fid=0)
+
+        print("\tCalculated expected genotype counts, ")
+
+        hwe_chisq = Vector([Zp(0, param.BASE_P) for _ in range(m1)])
+
+        if (os.path.exists(get_cache_path(mpc.pid, "hwe"))):
+            print("HWE cache found")
+            with open(get_cache_path(mpc.pid, "hwe")) as f:
+                hwe_chisq: Vector = mpc.read_vector(f, m1)
+        else:
+            for i in range(3):
+                diff: Vector = [Zp(0, param.BASE_P) for _ in range(m1)]
+                if mpc.pid > 0:
+                    diff = g_count_ctrl[i] * fp_one - g_exp_ctrl[i]
+
+                diff = mpc.mult_vec(diff, diff)
+                mpc.trunc_vec(diff)
+
+                tmp_vec = mpc.fp_div(diff, g_exp_ctrl[i], fid=0)
+                hwe_chisq += tmp_vec
+
+            with open(get_cache_path(mpc.pid, "hwe"), 'wb') as f:
+                mpc.write_to_file(hwe_chisq, f)
+
+        hwe_filt: Vector = mpc.less_than_public(hwe_chisq, hwe_ub)
+        gkeep2 = mpc.mult_vec(gkeep2, hwe_filt)
+
+        # Reveal which SNPs to discard 
+        mpc.reveal_sym(gkeep2)
+            
+        if mpc.pid == 2:
+            mpc.send_elem(gkeep2, 0)
+        elif mpc.pid == 0:
+            gkeep2 = mpc.receive_vector(2, TypeOps.get_vec_len(m1))
+
+        if mpc.pid == 2:
+            with open(get_output_path(mpc.pid, "gkeep2"), 'w') as f:
+                for i in range(len(gkeep2)):
+                    f.write(f'{gkeep2[i]}\n')
+
+    m2: int = int(sum(gkeep2, Zp(0, param.BASE_P)))
+    print("n1: ", n1, ", ", "m2: ", m2)
 
     print("Filtering genotype statistics")
-    mpc.Filter(g_var_bern, gkeep2, m2);
-    mpc.Filter(maf, gkeep2, m2);
-    FilterVec(snp_pos, gkeep2);
+    g_var_bern = mpc.filter(g_var_bern, gkeep2)
+    maf = mpc.filter(maf, gkeep2)
+    snp_pos = mpc.filter(snp_pos, gkeep2)
 
-    gmiss.kill();
-    gmiss_ctrl.kill();
-    dosage_sum.kill();
-    dosage_sum_ctrl.kill();
-    g_count_ctrl.kill();
-
-    mpc.ProfilerPopState(false); // maf/hwe
-    mpc.ProfilerPopState(true); // qc
-    mpc.ProfilerPushState("std_param");
-
-    Vec<ZZ_p> g_std_bern_inv;
-    if (os.path.exists(get_cache_path(pid, "stdinv_bern"))) {
+    g_std_bern_inv = Vector()
+    if (os.path.exists(get_cache_path(mpc.pid, "stdinv_bern"))):
         print("Genotype standard deviation cache found")
 
-        with open(get_cache_path(pid, "stdinv_bern"));
-        mpc.ReadFromFile(g_std_bern_inv, ifs, g_var_bern.length());
-        ifs.close();
+        with open(get_cache_path(mpc.pid, "stdinv_bern")) as f:
+            g_std_bern_inv = mpc.read_vector(f, len(g_var_bern))
 
-    } else {
+    else:
         print("Calculating genotype standard deviations (inverse)")
 
-        mpc.ProfilerPushState("sqrt");
-        mpc.FPSqrt(tmp_vec, g_std_bern_inv, g_var_bern);
-        mpc.ProfilerPopState(false); // sqrt
+        tmp_vec = mpc.fp_sqrt(g_std_bern_inv, g_var_bern)
 
-        with open(get_cache_path(pid, "stdinv_bern")) as f:
-        mpc.write_to_file(g_std_bern_inv, fs);
-        fs.close();
-    }
+        with open(get_cache_path(mpc.pid, "stdinv_bern"), 'wb') as f:
+            mpc.write_to_file(g_std_bern_inv, f);
 
-    if (param.DEBUG) {
-        print("g_std_bern_inv")
-        mpc.PrintFP(g_std_bern_inv, 5);
-    }
-
-    Vec<ZZ_p> g_mean;
-    if (mpc.pid > 0) {
-        g_mean = 2 * maf;
-    } else {
-        g_mean.SetLength(m2);
-    }
-
-    mpc.ProfilerPopState(true); // std_param
+    g_mean = Vector([Zp(0, param.BASE_P) for _ in range(m2)])
+    if mpc.pid > 0:
+        g_mean = maf * 2
 
     print("Starting population stratification analysis")
 
-    mpc.ProfilerPushState("pop_strat");
-    mpc.ProfilerPushState("select_snp");
-
-    Vec<int8_t> selected; // 1 selected, 0 unselected, -1 TBD
-    Vec<bool> to_process;
-    selected.SetLength(m2);
-    to_process.SetLength(m2);
+    selected: list = [0] * m2  # 1 selected, 0 unselected, -1 TBD
+    to_process: list = [False] * m2
 
     for i in range(m2):
-        selected[i] = -1;
-    }
+        selected[i] = -1
 
-    ZZ dist_thres(param.LD_DIST_THRES);
+    dist_thres: int = param.LD_DIST_THRES
     
-    ZZ prev(-1);
+    prev: int = -1
     for i in range(m2):
-        selected[i] = 0;
-        if (prev < 0 || snp_pos[i] - prev > dist_thres) {
-        selected[i] = 1;
-        prev = snp_pos[i];
-        }
-    }
+        selected[i] = 0
+        if prev < 0 or snp_pos[i] - prev > dist_thres:
+            selected[i] = 1
+            prev = snp_pos[i]
 
-    // At this point "selected" contains the SNP filter for PCA, shared across all parties
-    uint32_t m3 = 0;
-    for i in range(selected.length()):
-        if (selected[i] == 1) {
-        m3++;
-        }
-    }
+    # At this point "selected" contains the SNP filter for PCA, shared across all parties
+    m3: int = 0
+    for i in range(len(selected)):
+        if selected[i] == 1:
+            m3 += 1
 
-    print("SNP selection complete: " << m3 << " / " << m2 << " selected")
-    mpc.ProfilerPopState(false); // select_snp
-    mpc.ProfilerPushState("reduce_file");
+    print("SNP selection complete: ", m3, " / ", m2, " selected")
 
-    // Cache the reduced G for PCA
-    if (os.path.exists(get_cache_path(pid, "pca_input"))) {
+    # Cache the reduced G for PCA
+    if (os.path.exists(get_cache_path(mpc.pid, "pca_input"))):
         print("pca_input cache found")
-    } else {
-        Vec<bool> gkeep3;
-        gkeep3.SetLength(m0);
+    else:
+        gkeep3: list = [False] * m0
         for j in range(m0):
-        gkeep3[j] = gkeep1[j] == 1;
-        }
+            gkeep3[j] = (gkeep1[j] == 1)
 
-        ind = 0;
+        ind = 0
         for j in range(m0):
-        if (gkeep3[j]) {
-            gkeep3[j] = gkeep2[ind] == 1;
-            ind++;
-        }
-        }
+            if gkeep3[j]:
+                gkeep3[j] = (gkeep2[ind] == 1)
+                ind += 1
 
-        ind = 0;
+        ind = 0
         for j in range(m0):
-        if (gkeep3[j]) {
-            gkeep3[j] = selected[ind] == 1;
-            ind++;
-        }
-        }
+            if gkeep3[j]:
+                gkeep3[j] = (selected[ind] == 1)
+                ind += 1
 
-        with open(get_cache_path(pid, "input_geno"));
-        if (mpc.pid > 0) {
-        mpc.import_seed(10, ifs);
-        } else {
-        for (int p = 1; p <= 2; p++) {
-            mpc.import_seed(10 + p, ifs);
-        }
-        }
+        with open(get_cache_path(mpc.pid, "input_geno")) as f_geno:
+            if mpc.pid > 0:
+                mpc.import_seed(10, f_geno)
+            else:
+                for p in range(1, 3):
+                    mpc.import_seed(10 + p, f_geno)
 
-        long bsize = n1 / 10;
+            bsize: int = n1 // 10
 
-        print("Caching input data for PCA:")
+            print("Caching input data for PCA:")
 
-        with open(get_cache_path(pid, "pca_input")) as f:
+            with open(get_cache_path(mpc.pid, "pca_input")) as f_pca:
+                ind = -1
+                for i in range(n1):
+                    ind += 1
 
-        ind = -1;
-        tic();
-        for i in range(n1):
-        ind++;
+                    g0 = Matrix()
+                    g0_mask = Matrix()
+                    miss0 = Vector()
+                    miss0_mask = Vector()
 
-        mpc.ProfilerPushState("file_io/rng");
+                    while ikeep[ind] != 1:
+                        if mpc.pid > 0:
+                            mpc.skip_data(f_geno, 3, m0)
+                            mpc.skip_data(f_geno, m0)
 
-        Mat<ZZ_p> g0, g0_mask;
-        Vec<ZZ_p> miss0, miss0_mask;
+                            mpc.switch_seed(10)
+                            g0_mask = Matrix(3, m0, randomise=True)
+                            miss0_mask = mpc.random_vector(m0)
+                            mpc.restore_seed(10)
+                        else:
+                            for p in range(1, 3):
+                                mpc.switch_seed(10 + p)
+                                g0_mask = Matrix(3, m0, randomise=True)
+                                miss0_mask = mpc.random_vector(m0)
+                                mpc.restore_seed(10 + p)
+                        ind += 1
 
-        while (ikeep[ind] != 1) {
-            if (mpc.pid > 0) {
-            mpc.SkipData(ifs, 3, m0); // g
-            mpc.SkipData(ifs, m0); // miss
+                    if mpc.pid > 0:
+                        g0 = mpc.read_matrix(f_geno, 3, m0)
+                        miss0 = mpc.read_matrix(f_geno, m0)
 
-            mpc.switch_seed(10);
-            Matrix(g0_mask, 3, m0);
-            mpc.random_vector(miss0_mask, m0);
-            mpc.restore_seed();
-            } else {
-            for (int p = 1; p <= 2; p++) {
-                mpc.switch_seed(10 + p);
-                Matrix(g0_mask, 3, m0);
-                mpc.random_vector(miss0_mask, m0);
-                mpc.restore_seed();
-            }
-            }
-            ind++;
-        }
+                        mpc.switch_seed(10)
+                        g0_mask = Matrix(3, m0, randomise=True)
+                        miss0_mask = mpc.random_vector(m0)
+                        mpc.restore_seed(10)
+                    else:
+                        g0 = Matrix(3, m0)
+                        g0_mask = Matrix(3, m0)
+                        miss0 = Vector([Zp(0, param.BASE_P) for _ in range(m0)])
+                        miss0_mask = Vector([Zp(0, param.BASE_P) for _ in range(m0)])
 
-        if (mpc.pid > 0) {
-            mpc.ReadFromFile(g0, ifs, 3, m0); // g
-            mpc.ReadFromFile(miss0, ifs, m0); // miss
+                        for p in range(3):
+                            mpc.switch_seed(10 + p)
+                            tmp_mat = Matrix(3, m0, randomise=True)
+                            tmp_vec = mpc.random_vector(m0)
+                            mpc.restore_seed(10 + p)
 
-            mpc.switch_seed(10);
-            Matrix(g0_mask, 3, m0);
-            mpc.random_vector(miss0_mask, m0);
-            mpc.restore_seed();
-        } else {
-            Init(g0, 3, m0);
-            Init(g0_mask, 3, m0);
-            Init(miss0, m0);
-            Init(miss0_mask, m0);
+                            g0_mask += tmp_mat
+                            miss0_mask += tmp_vec
+                    
+                    # Filter out loci that failed missing rate filter
+                    g = Matrix(3, m3)
+                    g_mask = Matrix(3, m3)
+                    miss = Vector([Zp(0, param.BASE_P) for _ in range(m3)])
+                    miss_mask = Vector([Zp(0, param.BASE_P) for _ in range(m3)])
+                    ind2: int = 0
+                    for j in range(m0):
+                        if gkeep3[j]:
+                            for k in range(3):
+                                g[k][ind2] = g0[k][j]
+                                g_mask[k][ind2] = g0_mask[k][j]
+                            miss[ind2] = miss0[j]
+                            miss_mask[ind2] = miss0_mask[j]
+                            ind2 += 1
 
-            for (int p = 1; p <= 2; p++) {
-            mpc.switch_seed(10 + p);
-            Matrix(tmp_mat, 3, m0);
-            mpc.random_vector(tmp_vec, m0);
-            mpc.restore_seed();
+                    dosage: Vector = g[1] + g[2] * 2
+                    dosage_mask: Vector = g_mask[1] + g_mask[2] * 2
 
-            g0_mask += tmp_mat;
-            miss0_mask += tmp_vec;
-            }
-        }
-        
-        mpc.ProfilerPopState(false); // file_io/rng
+                    mpc.beaver_write_to_file(dosage, dosage_mask, f_pca)
+                    mpc.beaver_write_to_file(miss, miss_mask, f_pca)
 
-        // Filter out loci that failed missing rate filter
-        Mat<ZZ_p> g, g_mask;
-        Vec<ZZ_p> miss, miss_mask;
-        g.SetDims(3, m3);
-        g_mask.SetDims(3, m3);
-        miss.SetLength(m3);
-        miss_mask.SetLength(m3);
-        int ind2 = 0;
-        for j in range(m0):
-            if (gkeep3[j]) {
-            for (int k = 0; k < 3; k++) {
-                g[k][ind2] = g0[k][j];
-                g_mask[k][ind2] = g0_mask[k][j];
-            }
-            miss[ind2] = miss0[j];
-            miss_mask[ind2] = miss0_mask[j];
-            ind2++;
-            }
-        }
+    g_mean_pca: Vector = mpc.filter(g_mean, selected)
+    g_stdinv_pca: Vector = mpc.Filter(g_std_bern_inv, selected)
 
-        Vec<ZZ_p> dosage, dosage_mask;
-        dosage = g[1] + 2 * g[2];
-        dosage_mask = g_mask[1] + 2 * g_mask[2];
+    g_mean_pca_mask: Vector = mpc.beaver_partition(g_mean_pca)
+    g_stdinv_pca_mask: Vector = mpc.beaver_partition(g_stdinv_pca)
 
-        mpc.BeaverWriteToFile(dosage, dosage_mask, fs);
-        mpc.BeaverWriteToFile(miss, miss_mask, fs);
+    # Pass 2: Random sketch
+    Y_cur = Matrix(kp, m3)
 
-        if ((i + 1) % bsize == 0 || i == n1 - 1) {
-            print("\t" << i+1 << " / " << n1 << ", "; toc(); tic();
-        }
-        }
-
-        ifs.close();
-        fs.close();
-    }
-
-    mpc.ProfilerPopState(false); // reduce_file
-
-    Vec<ZZ_p> g_mean_pca = g_mean;
-    mpc.Filter(g_mean_pca, selected, m3);
-
-    Vec<ZZ_p> g_stdinv_pca = g_std_bern_inv;
-    mpc.Filter(g_stdinv_pca, selected, m3);
-
-    Vec<ZZ_p> g_mean_pca_mask, g_stdinv_pca_mask;
-    mpc.BeaverPartition(g_mean_pca_mask, g_mean_pca);
-    mpc.BeaverPartition(g_stdinv_pca_mask, g_stdinv_pca);
-
-    /* Pass 2: Random sketch */
-    Mat<ZZ_p> Y_cur;
-    Init(Y_cur, kp, m3);
-
-    if (os.path.exists(get_cache_path(pid, "sketch"))) {
-
+    if (os.path.exists(get_cache_path(mpc.pid, "sketch"))):
         print("sketch cache found")
-        with open(get_cache_path(pid, "sketch"), ios::in | ios::binary);
-        ifs >> kp;
-        mpc.ReadFromFile(Y_cur, ifs, kp, m3);
-        ifs.close();
+        with open(get_cache_path(mpc.pid, "sketch")) as f:
+            kp = int(f.readline())
+            Y_cur: Matrix = mpc.read_matrix(ifs, kp, m3)
+    else:
+        Y_cur_adj = Matrix(kp, m3)
+        bucket_count: list = [0] * kp
 
-    } else {
+        with open(get_cache_path(mpc.pid, "pca_input")) as f:
+            for cur in range(n1):
+                # Count sketch (use global PRG)
+                mpc.switch_seed(-1)
+                bucket_index: int = rand_int(0, kp - 1)
+                rand_sign: int = rand_int(0, 1) * 2 - 1
+                mpc.restore_seed(-1)
 
-        mpc.ProfilerPushState("rand_proj");
-        
-        Mat<ZZ_p> Y_cur_adj;
-        Init(Y_cur_adj, kp, m3);
+                g, g_mask = mpc.beaver_read_from_file(f, m3)
+                miss, miss_mask = mpc.beaver_read_from_file(f, m3)
 
-        Vec<int> bucket_count;
-        bucket_count.SetLength(kp);
+                # Flip miss bits so it points to places where g_mean should be subtracted
+                mpc.beaver_flip_bit(miss, miss_mask)
+
+                # Update running sum
+                if mpc.pid > 0:
+                    Y_cur[bucket_index] += g_mask * rand_sign
+                    if mpc.pid == 1:
+                        Y_cur[bucket_index] += g * rand_sign
+
+                # Update adjustment factor
+                miss *= rand_sign
+                miss_mask *= rand_sign
+                Y_cur_adj[bucket_index] = mpc.beaver_mult_elem(miss, miss_mask, g_mean_pca, g_mean_pca_mask)
+
+                bucket_count[bucket_index] += 1
+
+        # Subtract the adjustment factor
+        Y_cur_adj: Matrix = mpc.beaver_reconstruct(Y_cur_adj)
+        if mpc.pid > 0:
+            Y_cur = Y_cur * fp_one - Y_cur_adj
+
+        # Get rid of empty buckets and normalize nonempty ones
+        empty_slot: int = 0
         for i in range(kp):
-        bucket_count[i] = 0;
-        }
+            if bucket_count[i] > 0:
+                fp_count_inv: Zp = mpc.double_to_fp(
+                    1 / bucket_count[i], param.NBIT_K, param.NBIT_F)
+                Y_cur[empty_slot] = Y_cur[i] * fp_count_inv
+                empty_slot += 1
+        kp: int = empty_slot
+        Y_cur.set_dims(kp, m3)
+        mpc.trunc(Y_cur)
 
-        with open(get_cache_path(pid, "pca_input"), ios::in | ios::binary);
-        for (int cur = 0; cur < n1; cur++) {
-        // Count sketch (use global PRG)
-        mpc.switch_seed(-1);
-        long bucket_index = RandomBnd(kp);
-        long rand_sign = RandomBnd(2) * 2 - 1;
-        mpc.restore_seed();
+        with open(get_cache_path(mpc.pid, "sketch"), 'wb') as f:
+            f.write(bytes([kp]))
+            if mpc.pid > 0:
+                mpc.write_to_file(Y_cur, f)
 
-        Vec<ZZ_p> g, g_mask, miss, miss_mask;
-        mpc.BeaverReadFromFile(g, g_mask, ifs, m3);
-        mpc.BeaverReadFromFile(miss, miss_mask, ifs, m3);
+    Y_cur_mask: Matrix = mpc.beaver_partition(Y_cur)
 
-        // Flip miss bits so it points to places where g_mean should be subtracted
-        mpc.BeaverFlipBit(miss, miss_mask);
+    print(f"Initial sketch obtained, starting power iteration (num iter = {param.NUM_POWER_ITER})")
 
-        // Update running sum
-        if (mpc.pid > 0) {
-            Y_cur[bucket_index] += rand_sign * g_mask;
-            if (mpc.pid == 1) {
-            Y_cur[bucket_index] += rand_sign * g;
-            }
-        }
+    gQ = Matrix()
 
-        // Update adjustment factor
-        miss *= rand_sign;
-        miss_mask *= rand_sign;
-        mpc.BeaverMultElem(Y_cur_adj[bucket_index], miss, miss_mask, g_mean_pca, g_mean_pca_mask);
-
-        bucket_count[bucket_index]++;
-        }
-        ifs.close();
-
-        // Subtract the adjustment factor
-        mpc.BeaverReconstruct(Y_cur_adj);
-        if (mpc.pid > 0) {
-        Y_cur = fp_one * Y_cur - Y_cur_adj;
-        }
-        Y_cur_adj.kill();
-
-        if (param.DEBUG) {
-        print("Y_cur")
-        mpc.PrintFP(Y_cur[0], 5);
-        print("g_mean_pca")
-        mpc.PrintBeaverFP(g_mean_pca, g_mean_pca_mask, 10);
-        print("g_stdinv_pca")
-        mpc.PrintBeaverFP(g_stdinv_pca, g_stdinv_pca_mask, 10);
-        }
-
-        // Get rid of empty buckets and normalize nonempty ones
-        int empty_slot = 0;
-        for i in range(kp):
-        if (bucket_count[i] > 0) {
-            ZZ_p fp_count_inv:Zp = mpc.double_to_fp(1 / ((double) bucket_count[i]), param.NBIT_K, param.NBIT_F);
-            Y_cur[empty_slot] = Y_cur[i] * fp_count_inv;
-            empty_slot++;
-        }
-        }
-        kp = empty_slot;
-        Y_cur.SetDims(kp, m3);
-        mpc.Trunc(Y_cur);
-
-        mpc.ProfilerPopState(true); // rand_proj
-
-        with open(get_cache_path(pid, "sketch")) as f:
-        fs << kp;
-        if (mpc.pid > 0) {
-        mpc.write_to_file(Y_cur, fs);
-        }
-        fs.close();
-    }
-
-    mpc.ProfilerPushState("power_iter");
-
-    Mat<ZZ_p> Y_cur_mask;
-    mpc.BeaverPartition(Y_cur_mask, Y_cur);
-
-    print("Initial sketch obtained, starting power iteration (num iter = " << param.NUM_POWER_ITER << ")")
-    tic();
-
-    Mat<ZZ_p> gQ;
-
-    if (os.path.exists(get_cache_path(pid, "piter"))) {
-
+    if (os.path.exists(get_cache_path(mpc.pid, "piter"))):
         print("piter cache found")
-        with open(get_cache_path(pid, "piter"), ios::in | ios::binary);
-        mpc.ReadFromFile(gQ, ifs, n1, kp);
-        ifs.close();
+        with open(get_cache_path(mpc.pid, "piter")) as f:
+            gQ = mpc.read_from_file(f, n1, kp)
+    else:
+        # Divide by standard deviation
+        Y = Matrix(kp, m3)
+
+        for i in range(kp):
+            Y[i] = mpc.beaver_mult_elem(Y_cur[i], Y_cur_mask[i], g_stdinv_pca, g_stdinv_pca_mask)
+
+        Y = mpc.beaver_reconstruct(Y)
+        mpc.trunc(Y)
+
+        # Calculate orthonormal bases of Y
+        Q: Matrix = mpc.orthonormal_basis(Y)
+
+        gQ_adj = Matrix()
+        Q_mask = Matrix()
+        Q_scaled = Matrix()
+        Q_scaled_mask = Matrix()
+        Q_scaled_gmean = Matrix()
+        Q_scaled_gmean_mask = Matrix()
+
+        # Power iteration
+        for pit in range(param.NUM_POWER_ITER + 1):
+            # This section is ran before each iteration AND once after all iterations
+            Q, Q_mask = mpc.beaver_partition(Q)
+
+            # Normalize Q by standard deviations
+            Q_scaled = Matrix(kp, m3)
+            for i in range(kp):
+                Q_scaled[i] = mpc.beaver_mult_vec(Q[i], Q_mask[i], g_stdinv_pca, g_stdinv_pca_mask)
+
+        Q_scaled = mpc.beaver_reconstruct(Q_scaled)
+        mpc.trunc(Q_scaled)
+
+        Q_scaled, Q_scaled_mask = mpc.beaver_partition(Q_scaled)
+
+        # Pre-multiply with g_mean to simplify calculation of centering matrix
+        Q_scaled_gmean = Matrix(kp, m3)
+        for i in range(kp):
+            Q_scaled_gmean[i] = mpc.beaver_mult_vec(Q_scaled[i], Q_scaled_mask[i], g_mean_pca, g_mean_pca_mask)
+        Q_scaled_gmean = mpc.beaver_reconstruct(Q_scaled_gmean)
+        mpc.trunc(Q_scaled_gmean)
+
+        Q_scaled.transpose(inplace=True)  # m3-by-kp
+        # transpose(, Q_scaled_mask); // m3-by-kp, unlike mpc.Transpose, P0 also transposes
+        Q_scaled_mask.transpose(inplace=True)
+        Q_scaled_gmean.transpose(inplace=True)  # m3-by-kp
+        Q_scaled_gmean, Q_scaled_gmean_mask =  mpc.beaver_partition(Q_scaled_gmean)
+
+        bsize: int = param.PITER_BATCH_SIZE
+
+        g = Matrix(bsize, m3)
+        g_mask = Matrix(bsize, m3)
+        miss = Matrix(bsize, m3)
+        miss_mask = Matrix(bsize, m3)
         
-    } else {
+        # Pass 1
+        gQ = Matrix(n1, kp)
+        gQ_adj = Matrix(n1, kp)
 
-        // Divide by standard deviation
-        Mat<ZZ_p> Y;
-        Init(Y, kp, m3);
+        with open(get_cache_path(mpc.pid, "pca_input")) as f:
+            for cur in range(n1):
+                g[cur % bsize] = mpc.beaver_read_from_file(g_mask[cur % bsize], ifs, m3)
+                miss[cur % bsize] = mpc.beaver_read_from_file(miss_mask[cur % bsize], ifs, m3)
+                mpc.beaver_flip_bit(miss[cur % bsize], miss_mask[cur % bsize])
 
-        for i in range(kp):
-        mpc.BeaverMultElem(Y[i], Y_cur[i], Y_cur_mask[i], g_stdinv_pca, g_stdinv_pca_mask);
-        }
-        Y_cur.kill();
-        Y_cur_mask.kill();
+                if cur % bsize == bsize - 1:
+                    tmp_mat = Matrix(bsize, kp)
+                    tmp_mat = mpc.beaver_mult(g, g_mask, Q_scaled, Q_scaled_mask)
+                    for i in range(bsize):
+                        gQ[cur-(bsize-1)+i] = tmp_mat[i]
 
-        mpc.BeaverReconstruct(Y);
-        mpc.Trunc(Y);
+                tmp_mat = Matrix(bsize, kp)
+                tmp_mat = mpc.beaver_mult(miss, miss_mask, Q_scaled_gmean, Q_scaled_gmean_mask)
+                for i in range(bsize):
+                    gQ_adj[cur-(bsize-1)+i] = tmp_mat[i]
 
-        /* Calculate orthonormal bases of Y */
-        Mat<ZZ_p> Q;
-        mpc.ProfilerPushState("qr_m");
-        mpc.OrthonormalBasis(Q, Y);
-        mpc.ProfilerPopState(false); // qr_m
-        Y.kill();
+        remainder: int = n1 % bsize
+        if remainder > 0:
+            g.set_dims(remainder, m3)
+            g_mask.set_dims(remainder, m3)
+            miss.set_dims(remainder, m3)
+            miss_mask.set_dims(remainder, m3)
 
-        Mat<ZZ_p> gQ_adj;
-        Mat<ZZ_p> Q_mask;
-        Mat<ZZ_p> Q_scaled, Q_scaled_mask;
-        Mat<ZZ_p> Q_scaled_gmean, Q_scaled_gmean_mask;
-
-        /* Power iteration */
-        for (int pit = 0; pit <= param.NUM_POWER_ITER; pit++) {
-        /* This section is ran before each iteration AND once after all iterations */
-        mpc.BeaverPartition(Q_mask, Q);
-
-        // Normalize Q by standard deviations
-        Init(Q_scaled, kp, m3);
-        for i in range(kp):
-            mpc.BeaverMultElem(Q_scaled[i], Q[i], Q_mask[i], g_stdinv_pca, g_stdinv_pca_mask);
-        }
-        mpc.BeaverReconstruct(Q_scaled);
-        mpc.Trunc(Q_scaled);
-
-        mpc.BeaverPartition(Q_scaled_mask, Q_scaled);
-
-        // Pre-multiply with g_mean to simplify calculation of centering matrix
-        Init(Q_scaled_gmean, kp, m3);
-        for i in range(kp):
-            mpc.BeaverMultElem(Q_scaled_gmean[i], Q_scaled[i], Q_scaled_mask[i],
-                            g_mean_pca, g_mean_pca_mask);
-        }
-        mpc.BeaverReconstruct(Q_scaled_gmean);
-        mpc.Trunc(Q_scaled_gmean);
-
-        mpc.Transpose(Q_scaled); // m3-by-kp
-        transpose(Q_scaled_mask, Q_scaled_mask); // m3-by-kp, unlike mpc.Transpose, P0 also transposes
-        mpc.Transpose(Q_scaled_gmean); // m3-by-kp
-        mpc.BeaverPartition(Q_scaled_gmean_mask, Q_scaled_gmean);
-
-        Mat<ZZ_p> g, g_mask, miss, miss_mask;
-
-        long bsize = param.PITER_BATCH_SIZE;
-
-        Init(g, bsize, m3);
-        Init(g_mask, bsize, m3);
-        Init(miss, bsize, m3);
-        Init(miss_mask, bsize, m3);
-        
-        /* Pass 1 */
-        Init(gQ, n1, kp);
-        Init(gQ_adj, n1, kp);
-
-        mpc.ProfilerPushState("data_scan0");
-
-        mpc.ProfilerPushState("file_io");
-        with open(get_cache_path(pid, "pca_input"), ios::in | ios::binary);
-        for (int cur = 0; cur < n1; cur++) {
-            mpc.BeaverReadFromFile(g[cur % bsize], g_mask[cur % bsize], ifs, m3);
-            mpc.BeaverReadFromFile(miss[cur % bsize], miss_mask[cur % bsize], ifs, m3);
-            mpc.BeaverFlipBit(miss[cur % bsize], miss_mask[cur % bsize]);
-
-            if (cur % bsize == bsize - 1) {
-            mpc.ProfilerPopState(false); // file_io
-
-            Init(tmp_mat, bsize, kp);
-            mpc.BeaverMult(tmp_mat, g, g_mask, Q_scaled, Q_scaled_mask);
-            for i in range(bsize):
-                gQ[cur-(bsize-1)+i] = tmp_mat[i];
-            }
-
-            Init(tmp_mat, bsize, kp);
-            mpc.BeaverMult(tmp_mat, miss, miss_mask, Q_scaled_gmean, Q_scaled_gmean_mask);
-            for i in range(bsize):
-                gQ_adj[cur-(bsize-1)+i] = tmp_mat[i];
-            }
-
-            mpc.ProfilerPushState("file_io");
-            }
-        }
-        ifs.close();
-        mpc.ProfilerPopState(false); // file_io
-
-        long remainder = n1 % bsize;
-        if (remainder > 0) {
-            g.SetDims(remainder, m3);
-            g_mask.SetDims(remainder, m3);
-            miss.SetDims(remainder, m3);
-            miss_mask.SetDims(remainder, m3);
-
-            Init(tmp_mat, remainder, kp);
-            mpc.BeaverMult(tmp_mat, g, g_mask, Q_scaled, Q_scaled_mask);
+            tmp_mat = mpc.beaver_mult(g, g_mask, Q_scaled, Q_scaled_mask)
             for i in range(remainder):
-            gQ[n1-remainder+i] = tmp_mat[i];
-            }
+                gQ[n1-remainder+i] = tmp_mat[i]
 
-            Init(tmp_mat, remainder, kp);
-            mpc.BeaverMult(tmp_mat, miss, miss_mask, Q_scaled_gmean, Q_scaled_gmean_mask);
+            tmp_mat = Matrix(remainder, kp)
+            tmp_mat = mpc.beaver_mult(miss, miss_mask, Q_scaled_gmean, Q_scaled_gmean_mask)
             for i in range(remainder):
-            gQ_adj[n1-remainder+i] = tmp_mat[i];
-            }
+                gQ_adj[n1-remainder+i] = tmp_mat[i]
 
-        }
+        gQ = mpc.beaver_reconstruct(gQ)
+        gQ_adj = mpc.beaver_reconstruct(gQ_adj)
+        if mpc.pid > 0:
+            gQ -= gQ_adj
 
-        mpc.BeaverReconstruct(gQ);
-        mpc.BeaverReconstruct(gQ_adj);
-        if (mpc.pid > 0) {
-            gQ -= gQ_adj;
-        }
+        if pit == param.NUM_POWER_ITER:  # Quit if all iterations are performed
+            break
 
-        mpc.ProfilerPopState(false); // data_scan1
+        gQ.transpose(inplace=True)  # kp-by-n1
+        Q = mpc.orthonormal_basis(gQ)
+        Q.transpose(inplace=True)  # n1-by-kp
 
-        if (pit == param.NUM_POWER_ITER) { // Quit if all iterations are performed
-            break;
-        }
+        Q, Q_mask = mpc.beaver_partition(Q)
 
-        mpc.Transpose(gQ); // kp-by-n1
-        mpc.ProfilerPushState("qr_n");
-        mpc.OrthonormalBasis(Q, gQ);
-        mpc.ProfilerPopState(false); // qr_n
-        mpc.Transpose(Q); // n1-by-kp
+        gQ = Matrix(kp, m3)
+        gQ_adj = Matrix(kp, m3)
 
-        mpc.BeaverPartition(Q_mask, Q);
+        g = Matrix(bsize, m3)
+        g_mask = Matrix(bsize, m3)
+        miss = Matrix(bsize, m3)
+        miss_mask = Matrix(bsize, m3)
 
-        Init(gQ, kp, m3);
-        Init(gQ_adj, kp, m3);
+        Qsub = Matrix(bsize, kp)
+        Qsub_mask = Matrix(bsize, kp)
 
-        Init(g, bsize, m3);
-        Init(g_mask, bsize, m3);
-        Init(miss, bsize, m3);
-        Init(miss_mask, bsize, m3);
+        # Pass 2
+        with open(get_cache_path(mpc.pid, "pca_input")) as f:
+            for cur in range(n1):
+                g[cur % bsize] = mpc.beaver_read_from_file(g_mask[cur % bsize], f, m3)
+                miss[cur % bsize] = mpc.beaver_read_from_file(miss_mask[cur % bsize], f, m3)
+                mpc.beaver_flip_bit(miss[cur % bsize], miss_mask[cur % bsize])
 
-        Mat<ZZ_p> Qsub, Qsub_mask;
-        Init(Qsub, bsize, kp);
-        Init(Qsub_mask, bsize, kp);
+                Qsub[cur % bsize] = Q[cur]
+                Qsub_mask[cur % bsize] = Q_mask[cur]
 
-        mpc.ProfilerPushState("data_scan2");
+                if cur % bsize == bsize - 1:
+                    Qsub.transpose(inplace=True)
+                    Qsub_mask.transpose(inplace=True)
 
-        // Pass 2
-        mpc.ProfilerPushState("file_io");
-        with open(get_cache_path(pid, "pca_input"), ios::in | ios::binary);
-        for (int cur = 0; cur < n1; cur++) {
-            mpc.BeaverReadFromFile(g[cur % bsize], g_mask[cur % bsize], ifs, m3);
-            mpc.BeaverReadFromFile(miss[cur % bsize], miss_mask[cur % bsize], ifs, m3);
-            mpc.BeaverFlipBit(miss[cur % bsize], miss_mask[cur % bsize]);
+                    gQ = mpc.beaver_mult(Qsub, Qsub_mask, g, g_mask)
+                    gQ_adj = mpc.beaver_mult(Qsub, Qsub_mask, miss, miss_mask)
 
-            Qsub[cur % bsize] = Q[cur];
-            Qsub_mask[cur % bsize] = Q_mask[cur];
+                    Qsub.set_dims(bsize, kp)
+                    Qsub_mask.set_dims(bsize, kp)
 
-            if (cur % bsize == bsize - 1) {
-            mpc.ProfilerPopState(false); // file_io
-
-            mpc.Transpose(Qsub);
-            transpose(Qsub_mask, Qsub_mask);
-
-            mpc.BeaverMult(gQ, Qsub, Qsub_mask, g, g_mask);
-            mpc.BeaverMult(gQ_adj, Qsub, Qsub_mask, miss, miss_mask);
-
-            Qsub.SetDims(bsize, kp);
-            Qsub_mask.SetDims(bsize, kp);
-
-            mpc.ProfilerPushState("file_io");
-            }
-        }
-        ifs.close();
-        mpc.ProfilerPopState(false); // file_io
-
-        remainder = n1 % bsize;
-        if (remainder > 0) {
-            g.SetDims(remainder, m3);
-            g_mask.SetDims(remainder, m3);
-            miss.SetDims(remainder, m3);
-            miss_mask.SetDims(remainder, m3);
-            Qsub.SetDims(remainder, kp);
-            Qsub_mask.SetDims(remainder, kp);
+        remainder: int = n1 % bsize
+        if remainder > 0:
+            g.set_dims(remainder, m3)
+            g_mask.set_dims(remainder, m3)
+            miss.set_dims(remainder, m3)
+            miss_mask.set_dims(remainder, m3)
+            Qsub.set_dims(remainder, kp)
+            Qsub_mask.set_dims(remainder, kp)
             
-            mpc.Transpose(Qsub);
-            transpose(Qsub_mask, Qsub_mask);
+            Qsub.transpose(inplace=True)
+            Qsub_mask.transpose(inplace=True)
 
-            mpc.BeaverMult(gQ, Qsub, Qsub_mask, g, g_mask);
-            mpc.BeaverMult(gQ_adj, Qsub, Qsub_mask, miss, miss_mask);
-        }
+            gQ = mpc.beaver_mult(Qsub, Qsub_mask, g, g_mask)
+            gQ_adj = mpc.beaver_mult(Qsub, Qsub_mask, miss, miss_mask)
 
-        Qsub.kill();
-        Qsub_mask.kill();
-        g.kill();
-        g_mask.kill();
-        miss.kill();
-        miss_mask.kill();
+        gQ = mpc.beaver_reconstruct(gQ)
+        gQ_adj = mpc.beaver_reconstruct(gQ_adj)
 
-        mpc.BeaverReconstruct(gQ);
-        mpc.BeaverReconstruct(gQ_adj);
+        gQ_adj, gQ_adj_mask = mpc.beaver_partition(gQ_adj)
 
-        mpc.ProfilerPopState(false); // data_scan2
-
-        Mat<ZZ_p> gQ_adj_mask;
-        mpc.BeaverPartition(gQ_adj_mask, gQ_adj);
-
-        Mat<ZZ_p> gQ_adj_gmean;
-        Init(gQ_adj_gmean, kp, m3);
+        gQ_adj_gmean = Matrix(kp, m3)
         for i in range(kp):
-            mpc.BeaverMultElem(gQ_adj_gmean[i], gQ_adj[i], gQ_adj_mask[i],
-                            g_mean_pca, g_mean_pca_mask);
-        }
-        mpc.BeaverReconstruct(gQ_adj_gmean);
-        mpc.Trunc(gQ_adj_gmean);
+            gQ_adj_gmean[i] = mpc.beaver_mult_elem(
+                gQ_adj[i], gQ_adj_mask[i], g_mean_pca, g_mean_pca_mask)
+        gQ_adj_gmean = mpc.beaver_reconstruct(gQ_adj_gmean)
+        mpc.trunc(gQ_adj_gmean)
 
-        if (mpc.pid > 0) {
-            gQ -= gQ_adj_gmean;
-        }
-        gQ_adj_gmean.kill();
+        if mpc.pid > 0:
+            gQ -= gQ_adj_gmean
+        gQ, gQ_mask = mpc.beaver_partition(gQ)
 
-        Mat<ZZ_p> gQ_mask;
-        mpc.BeaverPartition(gQ_mask, gQ);
-
-        Mat<ZZ_p> gQ_scaled;
-        gQ_scaled.SetDims(kp, m3);
-        clear(gQ_scaled);
+        gQ_scaled.set_dims(kp, m3)
+        gQ_scaled.clear()
+        
         for i in range(kp):
-            mpc.BeaverMultElem(gQ_scaled[i], gQ[i], gQ_mask[i], g_stdinv_pca, g_stdinv_pca_mask);
-        }
-        mpc.BeaverReconstruct(gQ_scaled);
-        mpc.Trunc(gQ_scaled);
+            gQ_scaled[i] = mpc.beaver_mult_elem(gQ[i], gQ_mask[i], g_stdinv_pca, g_stdinv_pca_mask);
+        gQ_scaled = mpc.beaver_reconstruct(gQ_scaled)
+        mpc.trunc(gQ_scaled)
 
-        mpc.ProfilerPushState("qr_m");
-        mpc.OrthonormalBasis(Q, gQ_scaled);
-        mpc.ProfilerPopState(false); // qr_m
+        Q = mpc.orthonormal_basis(gQ_scaled)
 
-        print("Iter " << pit + 1 << " complete, "; toc();
-        tic();
-        }
+        with open(get_cache_path(mpc.pid, "piter")) as f:
+            if mpc.pid > 0:
+                mpc.write_to_file(gQ, f)
 
-        with open(get_cache_path(pid, "piter")) as f:
-        if (mpc.pid > 0) {
-        mpc.write_to_file(gQ, fs);
-        }
-        fs.close();
-
-    }
-
-    mpc.ProfilerPopState(true); // power_iter
     print("Power iteration complete")
 
-    Mat<ZZ_p> Z = gQ;
-    gQ.kill();
+    Z: Matrix = deepcopy(gQ)
 
     print("Data projected to subspace")
-    if (param.DEBUG) {
-        print("Z")
-        mpc.PrintFP(Z[0], 5);
-    }
+    V = Matrix(k, n1)
 
-    Mat<ZZ_p> V;
-    Init(V, k, n1);
-
-    /* Eigendecomposition */
-    if (os.path.exists(get_cache_path(pid, "eigen"))) {
-
+    # Eigendecomposition
+    if (os.path.exists(get_cache_path(mpc.pid, "eigen"))):
         print("eigen cache found")
-        with open(get_cache_path(pid, "eigen"));
-        mpc.ReadFromFile(V, ifs, k, n1);
-        ifs.close();
+        with open(get_cache_path(mpc.pid, "eigen")) as f:
+            V = mpc.read_from_file(f, k, n1)
+    else:
+        fp_m2_inv: Zp = mpc.double_to_fp(1 / m2, param.NBIT_K, param.NBIT_F)
+        Z *= fp_m2_inv
+        mpc.trunc(Z)
 
-    } else {
+        Z.transpose(inplace=True) // kp-by-n1
 
-        ZZ_p fp_m2_inv:Zp = mpc.double_to_fp(1 / ((double) m2), param.NBIT_K, param.NBIT_F);
-        Z *= fp_m2_inv;
-        mpc.Trunc(Z);
+        Z, Z_mask = mpc.beaver_partition(Z)
 
-        mpc.Transpose(Z); // kp-by-n1
-
-        Mat<ZZ_p> Z_mask;
-        mpc.BeaverPartition(Z_mask, Z);
-
-        /* Form covariance matrix */
-        Mat<ZZ_p> Z_gram;
-        Init(Z_gram, kp, kp);
+        # Form covariance matrix
+        Z_gram = Matrix(kp, kp)
         for i in range(kp):
-        mpc.BeaverMult(Z_gram[i], Z, Z_mask, Z[i], Z_mask[i]);
-        }
-        mpc.BeaverReconstruct(Z_gram);
-        mpc.Trunc(Z_gram);
+            Z_gram[i] = mpc.beaver_mult(Z, Z_mask, Z[i], Z_mask[i])
+        Z_gram = mpc.beaver_reconstruct(Z_gram)
+        mpc.trunc(Z_gram)
 
         print("Constructed reduced eigenvalue problem")
 
-        if (param.DEBUG) {
-        print("Z_gram")
-        mpc.PrintFP(Z_gram[0], 5);
-        }
+        U, L = mpc.EigenDecomp(Z_gram)
 
-        mpc.ProfilerPushState("eigen_solve");
-
-        Mat<ZZ_p> U;
-        Vec<ZZ_p> L;
-        mpc.EigenDecomp(U, L, Z_gram);
-        Z_gram.kill();
-
-        // Select top eigenvectors and eigenvalues
-        U.SetDims(k, kp);
-        L.SetLength(k);
+        # Select top eigenvectors and eigenvalues
+        U.set_dims(k, kp)
+        L.set_length(k)
 
         print("Selected K eigenvectors")
-        mpc.ProfilerPopState(false); // eigen_solve
+        # Recover singular vectors
+        U, U_mask = mpc.beaver_partition(U)
 
-        if (param.DEBUG) {
-        mpc.PrintFP(U[0], 5);
-        }
+        V = mpc.beaver_mult(U, U_mask, Z, Z_mask)
+        V = mpc.beaver_reconstruct(V)
+        mpc.trunc(V)
 
-        // Recover singular vectors
-        Mat<ZZ_p> U_mask;
-        mpc.BeaverPartition(U_mask, U);
+        with open(get_cache_path(mpc.pid, "eigen")) as f:
+            if mpc.pid > 0:
+                mpc.write_to_file(V, f)
 
-        mpc.BeaverMultMat(V, U, U_mask, Z, Z_mask);
-        U.kill();
-        U_mask.kill();
-        Z_mask.kill();
-        mpc.BeaverReconstruct(V);
-        mpc.Trunc(V);
-
-        with open(get_cache_path(pid, "eigen")) as f:
-        if (mpc.pid > 0) {
-        mpc.write_to_file(V, fs);
-        }
-        fs.close();
-
-    }
-
-    Z.kill();
-
-    mpc.ProfilerPopState(true); // pop_strat
-
-    mpc.ProfilerPushState("assoc_test");
-    mpc.ProfilerPushState("covar");
-
-    // Concatenate covariate matrix and jointly orthogonalize
-    mpc.Transpose(cov);
-    V.SetDims(k + param.NUM_COVS, n1);
-    if (mpc.pid > 0) {
+    # Concatenate covariate matrix and jointly orthogonalize
+    cov.transpose(inplace=True)
+    V.set_dims(k + param.NUM_COVS, n1)
+    if mpc.pid > 0:
         for i in range(param.NUM_COVS):
-        V[k + i] = cov[i] * fp_one;
-        }
-    }
-    cov.kill();
-    mpc.OrthonormalBasis(V, V);
+            V[k + i] = cov[i] * fp_one
+    V = mpc.orthonormal_basis(V)
 
-    Mat<ZZ_p> V_mask;
-    mpc.BeaverPartition(V_mask, V);
+    V, V_mask = mpc.beaver_partition(V)
 
     print("Bases for top singular vectors and covariates calculated")
-    mpc.ProfilerPopState(false); // covar
+    # Pass 4: Calculate GWAS statistics */
 
-    if (param.DEBUG) {
-        mpc.PrintBeaverFP(V[0], V_mask[0], 5);
-    }
+    pheno, pheno_mask = mpc.beaver_partition(pheno)
 
-    /* Pass 4: Calculate GWAS statistics */
-
-    Vec<ZZ_p> pheno_mask;
-    mpc.BeaverPartition(pheno_mask, pheno);
-
-    Vec<ZZ_p> Vp;
-    Init(Vp, k + param.NUM_COVS);
-    mpc.BeaverMult(Vp, V, V_mask, pheno, pheno_mask);
-    mpc.BeaverReconstruct(Vp);
-
-    Vec<ZZ_p> Vp_mask;
-    mpc.BeaverPartition(Vp_mask, Vp);
+    Vp: Vector = mpc.beaver_mult_vec(V, V_mask, pheno, pheno_mask)
+    Vp = mpc.beaver_reconstruct(Vp)
+    Vp, Vp_mask = mpc.beaver_partition(Vp)
     
-    Vec<ZZ_p> VVp;
-    Init(VVp, n1);
-    mpc.BeaverMult(VVp, Vp, Vp_mask, V, V_mask);
-    mpc.BeaverReconstruct(VVp);
-    mpc.Trunc(VVp);
+    VVp: Vector = mpc.beaver_mult(Vp, Vp_mask, V, V_mask)
+    VVp = mpc.beaver_reconstruct(VVp)
+    mpc.trunc_vec(VVp)
 
-    Vec<ZZ_p> VVp_mask;
-    mpc.BeaverPartition(VVp_mask, VVp);
+    VVp, VVp_mask = mpc.beaver_partition(VVp)
 
-    Vec<ZZ_p> p_hat, p_hat_mask;
-    p_hat = fp_one * pheno - VVp;
-    p_hat_mask = fp_one * pheno_mask - VVp_mask;
-
-    Vp.kill();
-    Vp_mask.kill();
-    VVp.kill();
-    VVp_mask.kill();
+    p_hat: Vector = pheno * fp_one - VVp
+    p_hat_mask: Vector = pheno_mask * fp_one - VVp_mask
 
     print("Phenotypes corrected")
 
-    Vec<ZZ_p> V_sum, V_sum_mask;
-    Init(V_sum, k + param.NUM_COVS);
-    Init(V_sum_mask, k + param.NUM_COVS);
+    V_sum = Vector([Zp(0, param.BASE_P) for _ in range(k + param.NUM_COVS)])
+    V_sum_mask = Vector([Zp(0, param.BASE_P) for _ in range(k + param.NUM_COVS)])
     for i in range(k + param.NUM_COVS):
         for j in range(n1):
-        V_sum[i] += V[i][j];
-        V_sum_mask[i] += V_mask[i][j];
-        }
-    }
+            V_sum[i] += V[i][j]
+            V_sum_mask[i] += V_mask[i][j]
 
-    Vec<ZZ_p> u;
-    Init(u, n1);
-    mpc.BeaverMult(u, V_sum, V_sum_mask, V, V_mask);
-    mpc.BeaverReconstruct(u);
-    mpc.Trunc(u);
-    if (mpc.pid > 0) {
-        u *= -1;
-        mpc.AddPublic(u, fp_one);
-    }
+    u: Vector = mpc.beaver_mult(V_sum, V_sum_mask, V, V_mask)
+    u = mpc.beaver_reconstruct(u)
+    mpc.trunc_vec(u)
+    if mpc.pid > 0:
+        u *= -1
+        u = mpc.add_public(u, fp_one)
+    u, u_mask = mpc.beaver_partition(u)
 
-    Vec<ZZ_p> u_mask;
-    mpc.BeaverPartition(u_mask, u);
+    print("Allocating sx, sxx, sxp, B ... ")
 
-    if (param.DEBUG) {
-        print("u")
-        mpc.PrintBeaverFP(u, u_mask, 10);
-    }
+    sx = Vector([Zp(0, base=param.BASE_P) for _ in range(m2)])
+    sxx = Vector([Zp(0, base=param.BASE_P) for _ in range(m2)])
+    sxp = Vector([Zp(0, base=param.BASE_P) for _ in range(m2)])
+    B = Matrix(k + param.NUM_COVS, m2)
 
-    print("Allocating sx, sxx, sxp, B ... ";
+    print("done.")
 
-    Vec<ZZ_p> sx, sxx, sxp;
-    Mat<ZZ_p> B;
-    Init(sx, m2);
-    Init(sxx, m2);
-    Init(sxp, m2);
-    Init(B, k + param.NUM_COVS, m2);
-
-    print("done.";
-
-    mpc.ProfilerPushState("data_scan");
-
-    if (os.path.exists(get_cache_path(pid, "gwas_stats"))) {
+    if (os.path.exists(get_cache_path(mpc.pid, "gwas_stats"))):
         print("GWAS statistics cache found")
-        with open(get_cache_path(pid, "gwas_stats"));
-        mpc.ReadFromFile(sx, ifs, m2);
-        mpc.ReadFromFile(sxx, ifs, m2);
-        mpc.ReadFromFile(sxp, ifs, m2);
-        mpc.ReadFromFile(B, ifs, k + param.NUM_COVS, m2);
-        ifs.close();
+        with open(get_cache_path(mpc.pid, "gwas_stats")) as f:
+            sx = mpc.read_from_file(f, m2)
+            sxx = mpc.read_from_file(f, m2)
+            sxp = mpc.read_from_file(f, m2)
+            B = mpc.read_from_file(f, k + param.NUM_COVS, m2)
+    else:
+        with open(get_cache_path(mpc.pid, "input_geno")) as f:
+            if mpc.pid > 0:
+                mpc.import_seed(10, f)
+            else:
+                for p in range(1, 3):
+                    mpc.import_seed(10 + p, int(f.readline()))
 
-    } else {
+            bsize: int = param.PITER_BATCH_SIZE
 
-        with open(get_cache_path(pid, "input_geno"));
-        if (mpc.pid > 0) {
-        mpc.import_seed(10, ifs);
-        } else {
-        for (int p = 1; p <= 2; p++) {
-            mpc.import_seed(10 + p, ifs);
-        }
-        }
+            print("Allocating batch variables ... ")
 
-        long bsize = param.PITER_BATCH_SIZE;
+            dosage = Matrix(bsize, m2)
+            dosage_mask = Matrix(bsize, m2)
 
-        print("Allocating batch variables ... ";
+            u_vec = Vector([Zp(0, param.BASE_P) for _ in range(bsize)])
+            u_mask_vec = Vector([Zp(0, param.BASE_P) for _ in range(bsize)])
+            p_hat_vec = Vector([Zp(0, param.BASE_P) for _ in range(bsize)])
+            p_hat_mask_vec = Vector([Zp(0, param.BASE_P) for _ in range(bsize)])
 
-        Mat<ZZ_p> dosage, dosage_mask;
-        Init(dosage, bsize, m2);
-        Init(dosage_mask, bsize, m2);
+            V.transpose(inplace=True)  # n1-by-(k + NUM_COVS)
+            V_mask.transpose(inplace=True)
 
-        Vec<ZZ_p> u_vec, u_mask_vec, p_hat_vec, p_hat_mask_vec;
-        Init(u_vec, bsize);
-        Init(u_mask_vec, bsize);
-        Init(p_hat_vec, bsize);
-        Init(p_hat_mask_vec, bsize);
+            V_sub = Matrix(bsize, k + param.NUM_COVS)
+            V_mask_sub = Matrix(bsize, k + param.NUM_COVS)
 
-        mpc.Transpose(V); // n1-by-(k + NUM_COVS)
-        transpose(V_mask, V_mask);
+            print("done.")
 
-        Mat<ZZ_p> V_sub, V_mask_sub;
-        Init(V_sub, bsize, k + param.NUM_COVS);
-        Init(V_mask_sub, bsize, k + param.NUM_COVS);
+            gkeep3: list = [False] * m0
+            for j in range(m0):
+                gkeep3[j] = (gkeep1[j] == 1)
 
-        print("done.")
+            ind = 0
+            for j in range(m0):
+                if gkeep3[j]:
+                    gkeep3[j] = (gkeep2[ind] == 1)
+                    ind += 1
 
-        Vec<bool> gkeep3;
-        gkeep3.SetLength(m0);
-        for j in range(m0):
-        gkeep3[j] = gkeep1[j] == 1;
-        }
+            ind = -1
+            print("GWAS pass:")
+            for cur in range(n1):
+                ind += 1
 
-        ind = 0;
-        for j in range(m0):
-        if (gkeep3[j]) {
-            gkeep3[j] = gkeep2[ind] == 1;
-            ind++;
-        }
-        }
+                while ikeep[ind] != 1:
+                    if mpc.pid > 0:
+                        mpc.skip_data(f, 3, m0)  # g
+                        mpc.skip_data(f, m0)  # miss
 
-        ind = -1;
-        tic();
-        mpc.ProfilerPushState("file_io/rng");
-        print("GWAS pass:")
-        for (int cur = 0; cur < n1; cur++) {
-        ind++;
+                        mpc.switch_seed(10)
+                        g0_mask = Matrix(3, m0, randomise=True)
+                        miss0_mask = mpc.random_vector(m0)
+                        mpc.restore_seed(10)
+                    else:
+                        for p in range(1, 3):
+                            mpc.switch_seed(10 + p)
+                            g0_mask = Matrix(3, m0, randomise=True)
+                            miss0_mask = mpc.random_vector(m0)
+                            mpc.restore_seed(10 + p)
+                    ind += 1
 
-        Mat<ZZ_p> g0, g0_mask;
-        Vec<ZZ_p> miss0, miss0_mask;
+                if mpc.pid > 0:
+                    g0 = mpc.read_from_file(f, 3, m0)  # g
+                    miss0 = mpc.read_from_file(f, m0)  # miss
 
-        while (ikeep[ind] != 1) {
-            if (mpc.pid > 0) {
-            mpc.SkipData(ifs, 3, m0); // g
-            mpc.SkipData(ifs, m0); // miss
+                    mpc.switch_seed(10)
+                    g0_mask = Matrix(3, m0, randomise=True)
+                    miss0_mask = mpc.random_vector(m0)
+                    mpc.restore_seed(10)
+                else:
+                    g0 = Matrix(3, m0)
+                    g0_mask = Matrix(3, m0)
+                    miss0 = Vector([Zp(0, param.BASE_P) for _ in range(m0)])
+                    miss0_mask = Vector([Zp(0, param.BASE_P) for _ in range(m0)])
 
-            mpc.switch_seed(10);
-            Matrix(g0_mask, 3, m0);
-            mpc.random_vector(miss0_mask, m0);
-            mpc.restore_seed();
-            } else {
-            for (int p = 1; p <= 2; p++) {
-                mpc.switch_seed(10 + p);
-                Matrix(g0_mask, 3, m0);
-                mpc.random_vector(miss0_mask, m0);
-                mpc.restore_seed();
-            }
-            }
-            ind++;
-        }
+                    for p in range(1 ,3):
+                        mpc.switch_seed(10 + p)
+                        tmp_mat = Matrix(3, m0, randomise=True)
+                        tmp_vec = mpc.random_vector(m0)
+                        mpc.restore_seed(10 + p)
 
-        if (mpc.pid > 0) {
-            mpc.ReadFromFile(g0, ifs, 3, m0); // g
-            mpc.ReadFromFile(miss0, ifs, m0); // miss
+                        g0_mask += tmp_mat
+                        miss0_mask += tmp_vec
+                
+                g = Matrix(3, m2)
+                miss = Vector([Zp(0, param.BASE_P) for _ in range(m2)])
+                g_mask = Matrix(3, m2)
+                miss_mask = Vector([Zp(0, param.BASE_P) for _ in range(m2)])
+                ind2: int = 0
+                
+                for j in range(m0):
+                    if gkeep3[j]:
+                        for k in range(3):
+                            g[k][ind2] = g0[k][j]
+                            g_mask[k][ind2] = g0_mask[k][j]
 
-            mpc.switch_seed(10);
-            Matrix(g0_mask, 3, m0);
-            mpc.random_vector(miss0_mask, m0);
-            mpc.restore_seed();
-        } else {
-            Init(g0, 3, m0);
-            Init(g0_mask, 3, m0);
-            Init(miss0, m0);
-            Init(miss0_mask, m0);
+                        miss[ind2] = miss0[j]
+                        miss_mask[ind2] = miss0_mask[j]
+                        ind2 += 1
 
-            for (int p = 1; p <= 2; p++) {
-            mpc.switch_seed(10 + p);
-            Matrix(tmp_mat, 3, m0);
-            mpc.random_vector(tmp_vec, m0);
-            mpc.restore_seed();
+            dosage[cur % bsize] = g[1] + g[2] * 2
+            dosage_mask[cur % bsize] = g_mask[1] + g_mask[2] * 2
 
-            g0_mask += tmp_mat;
-            miss0_mask += tmp_vec;
-            }
-        }
-        
-        Mat<ZZ_p> g, g_mask;
-        Vec<ZZ_p> miss, miss_mask;
-        g.SetDims(3, m2);
-        miss.SetLength(m2);
-        g_mask.SetDims(3, m2);
-        miss_mask.SetLength(m2);
-        int ind2 = 0;
-        for j in range(m0):
-            if (gkeep3[j]) {
-            for (int k = 0; k < 3; k++) {
-                g[k][ind2] = g0[k][j];
-                g_mask[k][ind2] = g0_mask[k][j];
-            }
-            miss[ind2] = miss0[j];
-            miss_mask[ind2] = miss0_mask[j];
-            ind2++;
-            }
-        }
+            u_vec[cur % bsize] = u[cur]
+            u_mask_vec[cur % bsize] = u_mask[cur]
+            p_hat_vec[cur % bsize] = p_hat[cur]
+            p_hat_mask_vec[cur % bsize] = p_hat_mask[cur]
 
-        dosage[cur % bsize] = g[1] + 2 * g[2];
-        dosage_mask[cur % bsize] = g_mask[1] + 2 * g_mask[2];
+            V_sub[cur % bsize] = V[cur]
+            V_mask_sub[cur % bsize] = V_mask[cur]
 
-        u_vec[cur % bsize] = u[cur];
-        u_mask_vec[cur % bsize] = u_mask[cur];
-        p_hat_vec[cur % bsize] = p_hat[cur];
-        p_hat_mask_vec[cur % bsize] = p_hat_mask[cur];
+            if cur % bsize == bsize - 1:
+                sx = mpc.beaver_mult(u_vec, u_mask_vec, dosage, dosage_mask)
+                sxp = mpc.beaver_mult(p_hat_vec, p_hat_mask_vec, dosage, dosage_mask)
 
-        V_sub[cur % bsize] = V[cur];
-        V_mask_sub[cur % bsize] = V_mask[cur];
+                sxx_tmp: Matrix = mpc.beaver_mult_elem(dosage, dosage_mask, dosage, dosage_mask)
+                for b in range(bsize):
+                    sxx += sxx_tmp[b]
 
-        if (cur % bsize == bsize - 1) {
-            mpc.ProfilerPopState(false); // file_io/rng
+                V_sub.transpose(inplace=True)  # (k + NUM_COVS)-by-bsize
+                V_mask_sub.transpose(inplace=True)
+                B = mpc.beaver_mult(V_sub, V_mask_sub, dosage, dosage_mask)
 
-            mpc.BeaverMult(sx, u_vec, u_mask_vec, dosage, dosage_mask);
-            mpc.BeaverMult(sxp, p_hat_vec, p_hat_mask_vec, dosage, dosage_mask);
+                dosage = Matrix(bsize, m2)
+                dosage_mask = Matrix(bsize, m2)
+                V_sub = Matrix(bsize, k + param.NUM_COVS)
+                V_mask_sub = Matrix(bsize, k + param.NUM_COVS)
 
-            Mat<ZZ_p> sxx_tmp;
-            Init(sxx_tmp, bsize, m2);
-            mpc.BeaverMultElem(sxx_tmp, dosage, dosage_mask, dosage, dosage_mask);
-            for (int b = 0; b < bsize; b++) {
-            sxx += sxx_tmp[b];
-            }
-            sxx_tmp.kill();
+        remainder: int = n1 % bsize
+        if remainder > 0:
+            dosage.set_dims(remainder, m2)
+            dosage_mask.set_dims(remainder, m2)
+            u_vec.set_length(remainder)
+            u_mask_vec.set_length(remainder)
+            p_hat_vec.set_length(remainder)
+            p_hat_mask_vec.set_length(remainder)
+            V_sub.set_dims(remainder, k + param.NUM_COVS)
+            V_mask_sub.set_dims(remainder, k + param.NUM_COVS)
 
-            mpc.Transpose(V_sub); // (k + NUM_COVS)-by-bsize
-            transpose(V_mask_sub, V_mask_sub);
+            sx = mpc.beaver_mult(u_vec, u_mask_vec, dosage, dosage_mask)
+            sxp = mpc.beaver_mult(p_hat_vec, p_hat_mask_vec, dosage, dosage_mask)
 
-            mpc.BeaverMult(B, V_sub, V_mask_sub, dosage, dosage_mask);
+            sxx_tmp: Matrix = mpc.beaver_mult_elem(dosage, dosage_mask, dosage, dosage_mask)
+            for b in range(remainder):
+                sxx += sxx_tmp[b]
 
-            print("\t" << cur+1 << " / " << n1 << ", "; toc(); tic();
+            V_sub.transpose(inplace=True)  # (k + NUM_COVS)-by-remainder
+            V_mask_sub.transpose(inplace=True)
 
-            Init(dosage, bsize, m2);
-            Init(dosage_mask, bsize, m2);
-            Init(V_sub, bsize, k + param.NUM_COVS);
-            Init(V_mask_sub, bsize, k + param.NUM_COVS);
+            B = mpc.beaver_mult(V_sub, V_mask_sub, dosage, dosage_mask)
 
-            mpc.ProfilerPushState("file_io/rng");
-        }
-        }
-        ifs.close();
-        mpc.ProfilerPopState(false); // file_io/rng
+        sx = mpc.beaver_reconstruct(sx)
+        sxp = mpc.beaver_reconstruct(sxp)
+        sxx = mpc.beaver_reconstruct(sxx)
+        B = mpc.beaver_reconstruct(B)
+        sxx *= fp_one
 
-        long remainder = n1 % bsize;
-        if (remainder > 0) {
-        dosage.SetDims(remainder, m2);
-        dosage_mask.SetDims(remainder, m2);
-        u_vec.SetLength(remainder);
-        u_mask_vec.SetLength(remainder);
-        p_hat_vec.SetLength(remainder);
-        p_hat_mask_vec.SetLength(remainder);
-        V_sub.SetDims(remainder, k + param.NUM_COVS);
-        V_mask_sub.SetDims(remainder, k + param.NUM_COVS);
-
-        mpc.BeaverMult(sx, u_vec, u_mask_vec, dosage, dosage_mask);
-        mpc.BeaverMult(sxp, p_hat_vec, p_hat_mask_vec, dosage, dosage_mask);
-
-        Mat<ZZ_p> sxx_tmp;
-        Init(sxx_tmp, remainder, m2);
-        mpc.BeaverMultElem(sxx_tmp, dosage, dosage_mask, dosage, dosage_mask);
-        for (int b = 0; b < remainder; b++) {
-            sxx += sxx_tmp[b];
-        }
-        sxx_tmp.kill();
-
-        mpc.Transpose(V_sub); // (k + NUM_COVS)-by-remainder
-        transpose(V_mask_sub, V_mask_sub);
-
-        mpc.BeaverMult(B, V_sub, V_mask_sub, dosage, dosage_mask);
-
-        print("\t" << n1 << " / " << n1 << ", "; toc(); tic();
-        }
-
-        mpc.BeaverReconstruct(sx);
-        mpc.BeaverReconstruct(sxp);
-        mpc.BeaverReconstruct(sxx);
-        mpc.BeaverReconstruct(B);
-        sxx *= fp_one;
-
-        with open(get_cache_path(pid, "gwas_stats")) as f:
-        mpc.write_to_file(sx, fs);
-        mpc.write_to_file(sxx, fs);
-        mpc.write_to_file(sxp, fs);
-        mpc.write_to_file(B, fs);
-        fs.close();
+        with open(get_cache_path(mpc.pid, "gwas_stats"), 'wb') as f:
+            mpc.write_to_file(sx, f)
+            mpc.write_to_file(sxx, f)
+            mpc.write_to_file(sxp, f)
+            mpc.write_to_file(B, f)
 
         print("Wrote results to cache")
-    }
 
-    mpc.ProfilerPopState(true); // data_scan
+    B.transpose(inplace=True)  # m2-by-(k + param.NUM_COVS)
 
-    if (param.DEBUG) {
-        print("sx")
-        mpc.PrintFP(sx, 3);
-        print("sxp")
-        mpc.PrintFP(sxp, 3);
-        print("sxx")
-        mpc.PrintFP(sxx, 3);
-        print("B")
-        mpc.PrintFP(B, 3, 3);
-    }
+    BB = mpc.inner_prod(B)  # m2
+    mpc.trunc(BB)
+    if mpc.pid > 0:
+        sxx -= BB
 
-    mpc.Transpose(B); // m2-by-(k + param.NUM_COVS)
-
-    Vec<ZZ_p> BB;
-    mpc.InnerProd(BB, B); // m2
-    mpc.Trunc(BB);
-    if (mpc.pid > 0) {
-        sxx -= BB;
-    }
-
-    ZZ_p sp(0);
-    if (mpc.pid > 0) {
+    sp = Zp(0, param.BASE_P)
+    if mpc.pid > 0:
         for i in range(n1):
-        sp += p_hat_mask[i];
-        if (mpc.pid == 1) {
-            sp += p_hat[i];
-        }
-        }
-    }
+            sp += p_hat_mask[i]
+            if mpc.pid == 1:
+                sp += p_hat[i]
 
-    ZZ_p spp(0);
-    mpc.BeaverInnerProd(spp, p_hat, p_hat_mask);
-    mpc.BeaverReconstruct(spp);
+    spp = Zp(0, param.BASE_P)
+    spp = mpc.beaver_inner_prod(p_hat, p_hat_mask)
+    spp = mpc.beaver_reconstruct(spp)
 
-    ZZ_p fp_n1_inv:Zp = mpc.double_to_fp(1 / ((double) n1), param.NBIT_K, param.NBIT_F);
-    sx *= fp_n1_inv;
-    sp *= fp_n1_inv;
+    fp_n1_inv: Zp = mpc.double_to_fp(1 / n1, param.NBIT_K, param.NBIT_F)
+    sx *= fp_n1_inv
+    sp *= fp_n1_inv
 
-    mpc.Trunc(sx);
-    mpc.Trunc(sp);
-    mpc.Trunc(spp);
+    mpc.trunc(sx)
+    mpc.trunc(sp)
+    mpc.trunc(spp)
 
-    Vec<ZZ_p> sx_mask;
-    mpc.BeaverPartition(sx_mask, sx);
+    sx_mask: Vector = mpc.beaver_partition(sx)
+    sp_mask: Zp = mpc.beaver_partition(sp)
 
-    ZZ_p sp_mask;
-    mpc.BeaverPartition(sp_mask, sp);
+    sp2 = Zp(0, param.BASE_P)
+    spsx = Vector([Zp(0, param.BASE_P) for _ in range(m2)])
+    sx2 = Vector([Zp(0, param.BASE_P) for _ in range(m2)])
 
-    Vec<ZZ_p> spsx, sx2;
-    ZZ_p sp2(0);
-    Init(spsx, m2);
-    Init(sx2, m2);
+    spsx = mpc.beaver_mult(sx, sx_mask, sp, sp_mask)
+    sp2 = mpc.beaver_mult(sp, sp_mask, sp, sp_mask)
+    sx2 = mpc.beaver_mult_elem(sx, sx_mask, sx, sx_mask)
 
-    mpc.BeaverMult(spsx, sx, sx_mask, sp, sp_mask);
-    mpc.BeaverMult(sp2, sp, sp_mask, sp, sp_mask);
-    mpc.BeaverMultElem(sx2, sx, sx_mask, sx, sx_mask);
+    spsx = mpc.beaver_reconstruct(spsx)
+    sp2 = mpc.beaver_reconstruct(sp2)
+    sx2 = mpc.beaver_reconstruct(sx2)
 
-    mpc.BeaverReconstruct(spsx);
-    mpc.BeaverReconstruct(sp2);
-    mpc.BeaverReconstruct(sx2);
+    spsx *= n1
+    sp2 *= n1
+    sx2 *= n1
 
-    spsx *= n1;
-    sp2 *= n1;
-    sx2 *= n1;
+    mpc.trunc(spsx)
+    mpc.trunc(sp2)
+    mpc.trunc(sx2)
 
-    mpc.Trunc(spsx);
-    mpc.Trunc(sp2);
-    mpc.Trunc(sx2);
-
-    Vec<ZZ_p> numer, denom;
-    Init(numer, m2);
-    Init(denom, m2 + 1);
-    if (mpc.pid > 0) {
-        numer = sxp - spsx;
+    numer = Vector([Zp(0, param.BASE_P) for _ in range(m2)])
+    denom = Vector([Zp(0, param.BASE_P) for _ in range(m2 + 1)])
+    if mpc.pid > 0:
+        numer = sxp - spsx
         for i in range(m2):
-        denom[i] = sxx[i] - sx2[i];
-        }
-        denom[m2] = spp - sp2;
-    }
+            denom[i] = sxx[i] - sx2[i]
+        denom[m2] = spp - sp2
 
-    Vec<ZZ_p> denom1_sqrt_inv;
-    if (os.path.exists(get_cache_path(pid, "denom_inv"))) {
+    denom1_sqrt_inv = Vector()
+    if (os.path.exists(get_cache_path(mpc.pid, "denom_inv"))):
         print("denom_inv cache found")
-        with open(get_cache_path(pid, "denom_inv"));
-        mpc.ReadFromFile(denom1_sqrt_inv, ifs, denom.length());
-        ifs.close();
-    } else {
-        mpc.ProfilerPushState("sqrt");
-        mpc.FPSqrt(tmp_vec, denom1_sqrt_inv, denom);
-        mpc.ProfilerPopState(false); // sqrt
+        with open(get_cache_path(mpc.pid, "denom_inv")) as f:
+            denom1_sqrt_inv = mpc.read_from_file(f, len(denom))
+    else:
+        tmp_vec = mpc.FPSqrt(denom1_sqrt_inv, denom)
 
-        with open(get_cache_path(pid, "denom_inv")) as f:
-        if (mpc.pid > 0) {
-        mpc.write_to_file(denom1_sqrt_inv, fs);
-        }
-        fs.close();
-    }
+        with open(get_cache_path(mpc.pid, "denom_inv"), 'wb') as f:
+            if mpc.pid > 0:
+               mpc.write_to_file(denom1_sqrt_inv, f)
 
-    denom.kill();
-    tmp_vec.kill();
+    denom2_sqrt_inv: Zp = denom1_sqrt_inv[m2]  # p term
+    denom1_sqrt_inv.set_length(m2)  # truncate
 
-    ZZ_p denom2_sqrt_inv = denom1_sqrt_inv[m2]; // p term
-    denom1_sqrt_inv.SetLength(m2); // truncate
+    z: Vector = mpc.mult_elem(numer, denom1_sqrt_inv)
+    mpc.trunc_vec(z)
 
-    Vec<ZZ_p> z;
-    mpc.MultElem(z, numer, denom1_sqrt_inv);
-    mpc.Trunc(z);
-
-    mpc.MultMat(z, z, denom2_sqrt_inv);
-    mpc.Trunc(z);
-
-    mpc.ProfilerPopState(false); // assoc_test
+    z *= denom2_sqrt_inv
+    mpc.trunc_vec(z)
 
     print("Association statistics calculated")
-    mpc.reveal_sym(z);
-    if (mpc.pid == 2) {
-        Vec<double> z_double;
-        FPToDouble(z_double, z, param.NBIT_K, param.NBIT_F);
-        owith open(get_output_path("assoc"), ios::out);
-        for i in range(z_double.length()):
-        ofs << z_double[i])
-        }
-        ofs.close();
-        print("Result written to " << get_output_path("assoc"))
-    }
+    z = mpc.reveal_sym(z)
+    if mpc.pid == 2:
+        z_double = mpc.fp_to_double_vec(z, param.NBIT_K, param.NBIT_F)
+        with open(get_output_path(mpc.pid, "assoc"), 'w') as f:
+            for i in range(len(z_double)):
+                f.write(f'{z_double[i]}\n')
+        print("Result written to ", get_output_path(mpc.pid, "assoc"))
 
-    mpc.ProfilerPopState(true); // main
-
-    return true;
-    }
+    return True
