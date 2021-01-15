@@ -95,7 +95,7 @@ class MPCEnv:
 
             if (self.pid > 0):
                 for i in range(0, nrow):
-                    x = Vector([0] * ncol * (2 if index_by_ZZ else 1))
+                    x = [0] * ncol * (2 if index_by_ZZ else 1)
                     y = Vector([Zp(0, base=self.primes[0]) for _ in range(ncol * (2 if index_by_ZZ else 1))])
                     
                     for j in range(0, ncol):
@@ -124,8 +124,8 @@ class MPCEnv:
         
         # Initialize numer and denom_inv
         numer = Matrix(n, n).set_field(self.primes[fid])
-        denom_inv = Vector([1] * n)
-        numer[0] = Vector(y).set_field(self.primes[fid])
+        denom_inv = [1] * n
+        numer[0] = y.set_field(self.primes[fid])
 
         for i in range(n):
             for j in range(n):
@@ -137,8 +137,6 @@ class MPCEnv:
                                     Zp(x[i], base=self.primes[fid]) * numer[k][j])
                 denom_inv[i] *= (1 if x[i] > x[j] else -1) * int(inv_table[abs(x[i] - x[j])])
 
-        denom_inv.set_field(self.primes[fid])
-        
         numer = Vector(
             [sum(row * denom_inv, Zp(0, base=self.primes[fid]))
              for row in numer.value])
@@ -337,7 +335,7 @@ class MPCEnv:
             if (self.pid > 0):
                 if (self.pid == 1):
                     b[0] += Vector([Zp(1, base=self.primes[fid]) for _ in range(n)])
-                b[1] = Vector(x)
+                b[1] = x
         else:  # pow > 1
             x_r, r = self.beaver_partition(x, fid)
 
@@ -673,28 +671,28 @@ class MPCEnv:
     
     def lagrange_interp_simple(self: 'MPCEnv', y: Vector, fid: int) -> Vector:
         n: int = len(y)
-        x = Vector(list(range(1, n + 1)))
+        x = list(range(1, n + 1))
 
         return self.lagrange_interp(x, y, fid)
 
     def fan_in_or(self: 'MPCEnv', a: Matrix, fid: int) -> Vector:
         n: int = a.num_rows()
         d: int = a.num_cols()
-        a_sum = Vector([0] * n)
+        a_sum = [0] * n
 
         if self.pid > 0:
             for i in range(n):
                 a_sum[i] = int(self.pid == 1)
                 for j in range(d):
                     a_sum[i] += int(a[i][j])
-        a_sum.set_field(self.primes[fid])
+        a_sum = Vector(a_sum).set_field(self.primes[fid])
 
         coeff = Matrix(1, d + 1, t=int)
 
         key: tuple = (d + 1, fid)
         if key not in self.or_lagrange_cache:
             y = Vector([int(i != 0) for i in range(d + 1)])
-            coeff_param = self.lagrange_interp_simple(y.set_field(self.primes[fid]), fid) # OR function
+            coeff_param = self.lagrange_interp_simple(y, fid) # OR function
             self.or_lagrange_cache[key] = coeff_param
 
         coeff[0] = deepcopy(self.or_lagrange_cache[key])
@@ -858,15 +856,15 @@ class MPCEnv:
                     end = n
                 batch_size: int = end - start
 
-                a_copy = Vector([Zp(0, base=self.primes[fid]) for _ in range(batch_size)])
-                b_copy = Vector([Zp(0, base=self.primes[fid]) for _ in range(batch_size)])
+                a_copy = None
+                b_copy = None
                 for j in range(batch_size):
-                    a_copy[j] = Vector(a[start + j])
-                    b_copy[j] = Vector(b[start + j])
+                    a_copy.append(Vector(a[start + j], deep_copy=True))
+                    b_copy.append(Vector(b[start + j], deep_copy=True))
 
                 c_copy: Vector = self.fp_div(a_copy, b_copy, fid=fid)
                 for j in range(batch_size):
-                    c[start + j] = Vector(c_copy[j])
+                    c[start + j] = Vector(c_copy[j], deep_copy=True)
             return c
 
         niter: int = 2 * math.ceil(math.log2(param.NBIT_K / 3.5)) + 1
@@ -1785,7 +1783,7 @@ class MPCEnv:
             hvec = Matrix().from_value(h).flatten()
             _, s_grad_vec = self.neg_log_sigmoid(hvec, fid=0)
 
-            s_grad = Matrix().from_value(Vector([s_grad_vec]))
+            s_grad = Matrix().from_value(Vector([s_grad_vec], deep_copy=True))
             s_grad.reshape(c, cur_bsize)
 
             d0 = Vector([Zp(0, base=param.BASE_P) for _ in range(c)])
