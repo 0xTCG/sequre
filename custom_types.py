@@ -51,8 +51,8 @@ class TypeOps:
 
 class Zp:
     def __init__(self: 'Zp', value: int, base: int):
-        if not isinstance(value, int):
-            raise ValueError('Invalid value for Zp: ', value)
+        # if not isinstance(value, int):
+        #     raise ValueError('Invalid value for Zp: ', value)
         self.base = base
         self.value = value % self.base
     
@@ -87,6 +87,14 @@ class Zp:
     def __mul__(self: 'Zp', other: 'Zp') -> 'Zp':
         z = Zp(self.value, base=self.base)
         z *= other
+        return z
+    
+    def __imod__(self: 'Zp', field: int) -> 'Zp':
+        return Zp(self.value % field, base=self.base)
+
+    def __mod__(self: 'Zp', field: int) -> 'Zp':
+        z = Zp(self.value, base=self.base)
+        z %= field
         return z
     
     def __eq__(self: 'Zp', other: 'Zp') -> bool:
@@ -143,13 +151,10 @@ class Zp:
 
 
 class Vector:
-    def __init__(self: 'Vector', value: list = None):
+    def __init__(self: 'Vector', value: list = None, deep_copy: bool = False):
         self.value = []
         if value is not None:
-            for v in value:
-                type_v = type(v)
-                v_ = v if isinstance(v, int) or isinstance(v, float) else Zp(v.value, v.base) if isinstance(v, Zp) else type_v(v.value)  # This hack will be avoided in .seq
-                self.value.append(v_)
+            self.value = deepcopy(value) if deep_copy else value
         self.type_ = type(value[0]) if value else None
     
     def __neg__(self: 'Vector') -> 'Vector':
@@ -161,7 +166,7 @@ class Vector:
         #     print('BE CAUTIOUS: Floats used in vector addition!')
         if isinstance(other, Zp) or isinstance(other, int) or isinstance(other, float):
             other = Vector([other] * len(self))
-        self.value = [self_e + other_e for self_e, other_e in zip(self.value, other.value)]
+        self.value = [self_e + other_e for self_e, other_e in zip(self, other)]
         return self
     
     def __isub__(self: 'Vector', other: 'Vector') -> 'Vector':
@@ -174,7 +179,7 @@ class Vector:
         #     print('BE CAUTIOUS: Floats used in vector multiplication!')
         if isinstance(other, Zp) or isinstance(other, int) or isinstance(other, float):
             other = Vector([other] * len(self))
-        self.value = [self_e * other_e for self_e, other_e in zip(self.value, other.value)]
+        self.value = [self_e * other_e for self_e, other_e in zip(self, other)]
         return self
     
     def __add__(self: 'Vector', other: 'Vector') ->  'Vector':
@@ -188,6 +193,16 @@ class Vector:
     def __mul__(self: 'Vector', other: 'Vector') -> 'Vector':
         z = Vector(self.value)
         z *= other
+        return z
+    
+    def __imod__(self: 'Vector', field: int) -> 'Vector':
+        for i, v in enumerate(self):
+            self[i] = v % field
+        return self
+
+    def __mod__(self: 'Vector', field: int) -> 'Vector':
+        z = Vector(self.value)
+        z %= field
         return z
     
     def __eq__(self: 'Vector', other: 'Vector') -> bool:
@@ -264,7 +279,7 @@ class Vector:
         return self
     
     def to_field(self: 'Vector', field: int) -> 'Vector':
-        new_v = Vector(self)
+        new_v = Vector(self.value, deep_copy=True)
         new_v.set_field(field)
         return new_v
     
