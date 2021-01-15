@@ -264,14 +264,17 @@ def benchmark(mpc: MPCEnv, pid: int, m: int, n: int):
             for i in range(m)])
     mat = Matrix().from_value(mat)
     
-    print('Orthonormal basis ...')
-    mpc.orthonormal_basis(mat)
-    print('QR ...')
-    mpc.qr_fact_square(mat)
-    print('Tridiag ...')
-    mpc.tridiag(mat)
+    # print('Orthonormal basis ...')
+    # mpc.orthonormal_basis(mat)
+    # print('QR ...')
+    # mpc.qr_fact_square(mat)
+    # print('Tridiag ...')
+    # mpc.tridiag(mat)
     print('Eigen decomp ...')
-    mpc.eigen_decomp(mat)
+    from profilehooks import profile
+    fn = profile(mpc.eigen_decomp) if pid == 2 else mpc.eigen_decomp
+    fn(mat)
+
 
     print(f'Benchmarks done at {pid}!')
 
