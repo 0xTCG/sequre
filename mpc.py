@@ -123,9 +123,9 @@ class MPCEnv:
                     inv_table[key] = Zp(key, base=self.primes[fid]).inv(self.primes[fid])
         
         # Initialize numer and denom_inv
-        numer = Matrix(n, n).set_field(self.primes[fid])
+        numer = Matrix(n, n, base=self.primes[fid])
         denom_inv = [1] * n
-        numer[0] = y.set_field(self.primes[fid])
+        numer[0] = y % self.primes[fid]
 
         for i in range(n):
             for j in range(n):
@@ -133,8 +133,7 @@ class MPCEnv:
                     continue
 
                 for k in range(n - 1, -1, -1):
-                    numer[k][j] = ((Zp(0, base=self.primes[fid]) if k == 0 else numer[k - 1][j]) - 
-                                    Zp(x[i], base=self.primes[fid]) * numer[k][j])
+                    numer[k][j] = (0 if k == 0 else numer[k - 1][j]) - int(numer[k][j] * x[i])
                 denom_inv[i] *= (1 if x[i] > x[j] else -1) * int(inv_table[abs(x[i] - x[j])])
 
         numer = Vector(
@@ -196,6 +195,8 @@ class MPCEnv:
         self.sockets[to_pid].send(str(int(flag)).encode('utf-8'))
 
     def send_elem(self: 'MPCEnv', elem: Zp, to_pid: int) -> int:
+        if isinstance(elem, int):
+            elem = Zp(elem, param.BASE_P)
         return self.sockets[to_pid].send(elem.to_bytes())
     
     def receive_elem(self: 'MPCEnv', from_pid: int, msg_len: int, fid: int) -> Zp:
@@ -282,20 +283,22 @@ class MPCEnv:
             self.restore_seed(2)
 
             r: Zp = r_1 + r_2
-            r.set_field(self.primes[fid])
+            r %= self.primes[fid]
         else:
             self.switch_seed(0)
             r: Zp = rand_func()
             self.restore_seed(0)
-            r.set_field(self.primes[fid])
+            r %= self.primes[fid]
+            
+            x_r = x_ - r
+            x_r %= self.primes[fid]
             
             if isinstance(x, Matrix):  # Temp hack. Will be removed in .seq
-                x_r = self.reveal_sym(Matrix().from_value(x_ - r), fid=fid)
+                x_r = self.reveal_sym(Matrix().from_value(x_r), fid=fid)
             else:
-                x_r = self.reveal_sym(x_ - r, fid=fid)
+                x_r = self.reveal_sym(x_r, fid=fid)
         
-        x_r.set_field(self.primes[fid])
-        r.set_field(self.primes[fid])
+        x_r %= self.primes[fid]
         return x_r, r
     
     def mul_elem(self: 'MPCEnv', v_1: Vector, v_2: Vector) -> Vector:
