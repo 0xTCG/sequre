@@ -50,7 +50,7 @@ class TypeOps:
 
 
 class Zp:
-    def __init__(self: 'Zp', value: int, base: int):
+    def __init__(self: 'Zp', value: int, base: int = BASE_P):
         # if not isinstance(value, int):
         #     raise ValueError('Invalid value for Zp: ', value)
         self.base = base
@@ -63,7 +63,7 @@ class Zp:
         return Zp(-self.value, base=self.base)
     
     def __iadd__(self: 'Zp', other: 'Zp') -> 'Zp':
-        other_val = other.value if isinstance(other, Zp) else other % self.base
+        other_val = int(other) % self.base
         self.value = (self.value + other_val) % self.base
         return self
     
@@ -72,7 +72,7 @@ class Zp:
         return self
     
     def __imul__(self: 'Zp', other: 'Zp') -> 'Zp':
-        other_val = other.value if isinstance(other, Zp) else other % self.base
+        other_val = int(other) % self.base
         self.value = (self.value * other_val) % self.base
         return self
     
@@ -90,7 +90,9 @@ class Zp:
         return z
     
     def __imod__(self: 'Zp', field: int) -> 'Zp':
-        return Zp(self.value % field, base=self.base)
+        self.value %= field
+        self.base = field
+        return self
 
     def __mod__(self: 'Zp', field: int) -> 'Zp':
         z = Zp(self.value, base=self.base)
@@ -124,9 +126,15 @@ class Zp:
     def __pow__(self: 'Zp', e: int) -> 'Zp':
         return Zp(pow(self.value, e, self.base), base=self.base)
     
+    def __getitem__(self: 'Zp', idx: int) -> int:
+        return self.value
+    
     def to_bytes(self: 'Zp') -> str:
         base = b'0' * BASE_LEN
         return (base + str(self).encode('utf-8'))[len(str(self)):]
+    
+    def to_int(self: 'Zp') -> int:
+        return int(self)
     
     def inv(self: 'Zp', p: int = None) -> 'Zp':
         p: int = self.base if p is None else p
@@ -137,6 +145,10 @@ class Zp:
             self.base = field
             self.value %= self.base
     
+        return self
+
+    def change_field(self: 'Zp', field: int) -> 'Zp':
+        self.base = field
         return self
     
     def to_field(self: 'Zp', field: int) -> 'Zp':
@@ -151,10 +163,10 @@ class Zp:
 
 
 class Vector:
-    def __init__(self: 'Vector', value: list = None, deep_copy: bool = False):
+    def __init__(self: 'Vector', value: list = None):
         self.value = []
         if value is not None:
-            self.value = deepcopy(value) if deep_copy else value
+            self.value = value
         self.type_ = type(value[0]) if value else None
     
     def __neg__(self: 'Vector') -> 'Vector':
@@ -177,8 +189,10 @@ class Vector:
         # TODO: Enable debug mode for logging message bellow.
         # if isinstance(other, float):
         #     print('BE CAUTIOUS: Floats used in vector multiplication!')
-        if isinstance(other, Zp) or isinstance(other, int) or isinstance(other, float):
-            other = Vector([other] * len(self))
+        if isinstance(other, int):
+            self.value = [self_e * other for self_e in self]
+            return self
+
         self.value = [self_e * other_e for self_e, other_e in zip(self, other)]
         return self
     
@@ -278,10 +292,17 @@ class Vector:
                 v.set_field(field)
         return self
     
+    def change_field(self: 'Vector', field: int) -> 'Vector':
+        if isinstance(self.value[0], int):
+            return self
+        
+        for e in self.value:
+            e.change_field(field)
+        return self
+    
     def to_field(self: 'Vector', field: int) -> 'Vector':
-        new_v = Vector(self.value, deep_copy=True)
-        new_v.set_field(field)
-        return new_v
+        is_int: bool = isinstance(self[0], int)
+        return Vector([(Zp(e, field) if is_int else e).to_field(field) for e in self.value])
     
     def to_int(self: 'Vector') -> 'Vector':
         for i, v in enumerate(self.value):
