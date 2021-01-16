@@ -272,9 +272,8 @@ def benchmark(mpc: MPCEnv, pid: int, m: int, n: int):
     # mpc.tridiag(mat)
     print('Eigen decomp ...')
     from profilehooks import profile
-    fn = profile(mpc.eigen_decomp) if pid == 2 else mpc.eigen_decomp
+    fn = profile(mpc.eigen_decomp, entries=200) if pid == 1 else mpc.eigen_decomp
     fn(mat)
-
 
     print(f'Benchmarks done at {pid}!')
 
