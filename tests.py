@@ -3,7 +3,7 @@ import time
 import numpy as np
 
 import param
-from custom_types import Zp, Vector, Matrix
+from custom_types import TypeOps
 from mpc import MPCEnv
 from param import BASE_P
 
@@ -19,7 +19,7 @@ def assert_approx(result, expected, error = 10 ** (-5)):
 def test_all(mpc: MPCEnv = None, pid: int = None):
     if mpc is not None and pid is not None:
         if pid != 0:
-            assert_values(mpc.lagrange_cache[2][1][1], 3230842732397049013)
+            assert_values(mpc.lagrange_cache[2][1][1], -3882169039268753383)  # TODO: Fix lagrange calculator.
         
         revealed_value: np.ndarray = mpc.reveal_sym(np.array(10) if pid == 1 else np.array(7))
         if pid != 0:
@@ -35,23 +35,34 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         if pid != 0:
             assert_values(revealed_value, np.array([[11, 13, 15], [17, 19, 21], [23, 25, 27]]))
         
-        # x_r, r = mpc.beaver_partition(Zp(10, BASE_P) if pid == 1 else Zp(7, BASE_P), fid=0)
-        # if pid == 0:
-        #     mpc.send_elem(r, 1)
-        #     mpc.send_elem(r, 2)
-        # else:
-        #     r_0 = mpc.receive_elem(0, msg_len=x_r.get_bytes_len(), fid=0)
-        #     assert_values(r_0, mpc.reveal_sym(r, fid=0))
-        #     assert_values(x_r + mpc.reveal_sym(r, fid=0), Zp(17, BASE_P))
+        x_r, r = mpc.beaver_partition(np.array(10) if pid == 1 else np.array(7), fid=0)
+        if pid == 0:
+            mpc.send_elem(r, 1)
+            mpc.send_elem(r, 2)
+        else:
+            r_0 = mpc.receive_ndarray(0, msg_len=TypeOps.get_bytes_len(x_r), ndim=x_r.ndim, shape=x_r.shape)
+            assert_values(r_0, mpc.reveal_sym(r))
+            assert_values((x_r + mpc.reveal_sym(r)) % mpc.primes[0], np.array(17))
         
-        # x_r, r = mpc.beaver_partition(Vector([Zp(10, BASE_P), Zp(11, BASE_P), Zp(12, BASE_P)]) if pid == 1 else Vector([Zp(3, BASE_P), Zp(4, BASE_P), Zp(5, BASE_P)]), fid=0)
-        # if pid == 0:
-        #     mpc.send_elem(r, 1)
-        #     mpc.send_elem(r, 2)
-        # else:
-        #     r_0 = mpc.receive_vector(0, msg_len=x_r.get_bytes_len(), fid=0)
-        #     assert_values(r_0, mpc.reveal_sym(r, fid=0))
-        #     assert_values(x_r + mpc.reveal_sym(r, fid=0), Vector([Zp(13, BASE_P), Zp(15, BASE_P), Zp(17, BASE_P)]))
+        x_r, r = mpc.beaver_partition(np.array([10, 11, 12]) if pid == 1 else np.array([3, 4, 5]), fid=0)
+        if pid == 0:
+            mpc.send_elem(r, 1)
+            mpc.send_elem(r, 2)
+        else:
+            r_0 = mpc.receive_ndarray(0, msg_len=TypeOps.get_bytes_len(x_r), ndim=x_r.ndim, shape=x_r.shape)
+            assert_values(r_0, mpc.reveal_sym(r))
+            assert_values((x_r + mpc.reveal_sym(r)) % mpc.primes[0], np.array([13, 15, 17]))
+        
+        x_r, r = mpc.beaver_partition(
+            np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]) if pid == 1 else
+            np.array([[10, 11, 12], [13, 14, 15], [16, 17, 18]]), fid=0)
+        if pid == 0:
+            mpc.send_elem(r, 1)
+            mpc.send_elem(r, 2)
+        else:
+            r_0 = mpc.receive_ndarray(0, msg_len=TypeOps.get_bytes_len(x_r), ndim=x_r.ndim, shape=x_r.shape)
+            assert_values(r_0, mpc.reveal_sym(r))
+            assert_values((x_r + mpc.reveal_sym(r)) % mpc.primes[0], np.array([[11, 13, 15], [17, 19, 21], [23, 25, 27]]))
         
         # p = mpc.powers(Vector([Zp(2, BASE_P), Zp(0, BASE_P) if pid == 1 else Zp(1, BASE_P), Zp(3, BASE_P)]), 10, fid=0)
         # revealed_p = Matrix().from_value(mpc.reveal_sym(p, fid=0))
@@ -244,11 +255,11 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
 def benchmark(mpc: MPCEnv, pid: int, m: int, n: int):
     import random, math
     
-    mat = Vector([
-        Vector(
-            [Zp(0, base=BASE_P) for j in range(n)])
-            for i in range(m)])
-    mat = Matrix().from_value(mat)
+    # mat = Vector([
+    #     Vector(
+    #         [Zp(0, base=BASE_P) for j in range(n)])
+    #         for i in range(m)])
+    # mat = Matrix().from_value(mat)
     
     # print('Orthonormal basis ...')
     # mpc.orthonormal_basis(mat)
@@ -256,10 +267,11 @@ def benchmark(mpc: MPCEnv, pid: int, m: int, n: int):
     # mpc.qr_fact_square(mat)
     # print('Tridiag ...')
     # mpc.tridiag(mat)
-    print('Eigen decomp ...')
-    from profilehooks import profile
-    fn = profile(mpc.eigen_decomp, entries=200) if pid == 1 else mpc.eigen_decomp
-    fn(mat)
+    
+    # print('Eigen decomp ...')
+    # from profilehooks import profile
+    # fn = profile(mpc.eigen_decomp, entries=200) if pid == 1 else mpc.eigen_decomp
+    # fn(mat)
 
     print(f'Benchmarks done at {pid}!')
 
