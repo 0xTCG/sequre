@@ -1,3 +1,5 @@
+import numpy as np
+
 import param
 import random
 
@@ -20,3 +22,8 @@ def get_temp_path(pid: int, name: str) -> str:
 
 def rand_int(lower_limit: int, upper_limit: int) -> int:
     return random.randint(lower_limit, upper_limit)
+
+
+def bytes_to_arr(bytes_str: str) -> np.ndarray:
+    for elem in bytes_str.split(b'.'):
+        yield int(elem)
