@@ -1,5 +1,7 @@
 import time
 
+import numpy as np
+
 import param
 from custom_types import Zp, Vector, Matrix
 from mpc import MPCEnv
@@ -7,7 +9,7 @@ from param import BASE_P
 
 
 def assert_values(result, expected):
-    assert result == expected, f'Result: {result}. Expected: {expected}'
+    assert np.all(result == expected), f'Result: {result}. Expected: {expected}'
 
 
 def assert_approx(result, expected, error = 10 ** (-5)):
@@ -18,9 +20,20 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
     if mpc is not None and pid is not None:
         if pid != 0:
             assert_values(mpc.lagrange_cache[2][1][1], 3230842732397049013)
-        # revealed_value: Zp = mpc.reveal_sym(Zp(10, BASE_P) if pid == 1 else Zp(7, BASE_P), fid=0)
-        # if pid != 0:
-        #     assert_values(revealed_value, Zp(17, BASE_P))
+        
+        revealed_value: np.ndarray = mpc.reveal_sym(np.array(10) if pid == 1 else np.array(7))
+        if pid != 0:
+            assert_values(revealed_value, 17)
+        
+        revealed_value: np.ndarray = mpc.reveal_sym(np.array([10, 11, 12]) if pid == 1 else np.array([7, 8, 9]))
+        if pid != 0:
+            assert_values(revealed_value, np.array([17, 19, 21]))
+        
+        revealed_value: np.ndarray = mpc.reveal_sym(
+            np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]) if pid == 1
+            else np.array([[10, 11, 12], [13, 14, 15], [16, 17, 18]]))
+        if pid != 0:
+            assert_values(revealed_value, np.array([[11, 13, 15], [17, 19, 21], [23, 25, 27]]))
         
         # x_r, r = mpc.beaver_partition(Zp(10, BASE_P) if pid == 1 else Zp(7, BASE_P), fid=0)
         # if pid == 0:
