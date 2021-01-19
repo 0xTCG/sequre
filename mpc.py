@@ -11,7 +11,7 @@ import numpy as np
 import param
 from c_socket import CSocket
 from connect import connect, open_channel
-from custom_types import TypeOps, zeros, ones
+from custom_types import TypeOps, zeros, ones, random_ndarray
 from utils import bytes_to_arr
 
 Zp = None
@@ -174,8 +174,8 @@ class MPCEnv:
         return True
 
     def setup_prgs(self: 'MPCEnv') -> bool:
-        random.seed()
-        self.prg_states[self.pid] = random.getstate() 
+        np.random.seed()
+        self.prg_states[self.pid] = np.random.get_state() 
         self.import_seed(-1, hash('global'))
         
         for other_pid in set(range(3)) - {self.pid}:
@@ -187,8 +187,9 @@ class MPCEnv:
     
     def import_seed(self: 'MPCEnv', pid: int, seed: int = None):
         seed: int = hash((min(self.pid, pid), max(self.pid, pid))) if seed is None else seed
-        random.seed(seed)
-        self.prg_states[pid] = random.getstate()
+        seed %= (1 << 32)
+        np.random.seed(seed)
+        self.prg_states[pid] = np.random.get_state()
 
     def receive_bool(self: 'MPCEnv', from_pid: int) -> bool:
         return bool(int(self.sockets[from_pid].receive(msg_len=1)))
@@ -236,7 +237,7 @@ class MPCEnv:
         for socket in self.sockets.values():
             socket.close()
   
-    def reveal_sym(self: 'MPCEnv', elem: np.ndarray) -> np.ndarray:
+    def reveal_sym(self: 'MPCEnv', elem: np.ndarray, fid: int = 0) -> np.ndarray:
         if self.pid == 0:
             return elem
         
@@ -252,62 +253,44 @@ class MPCEnv:
             sent_data = self.send_elem(elem, 3 - self.pid)
             assert sent_data == msg_len, f'Sent {sent_data} bytes but expected {msg_len}'
             
-        return elem + received_elem
+        return (elem + received_elem) % self.primes[fid]
     
     def switch_seed(self: 'MPCEnv', pid: int):
-        self.prg_states[self.pid] = random.getstate()
-        random.setstate(self.prg_states[pid])
+        self.prg_states[self.pid] = np.random.get_state()
+        np.random.set_state(self.prg_states[pid])
     
     def restore_seed(self: 'MPCEnv', pid: int):
-        self.prg_states[pid] = random.getstate()
-        random.setstate(self.prg_states[self.pid])
+        self.prg_states[pid] = np.random.get_state()
+        np.random.set_state(self.prg_states[self.pid])
 
-    def rand_elem(self: 'MPCEnv', fid: int) -> Zp:
-        return Zp.randzp(self.primes[fid])
-    
-    def rand_vector(self: 'MPCEnv', size: int, fid: int) -> Vector:
-        return Vector([self.rand_elem(fid) for _ in range(size)])
+    def beaver_partition(self: 'MPCEnv', x: np.ndarray, fid: int) -> tuple:
+        x_: np.ndarray = np.mod(x, self.primes[fid])
 
-    def beaver_partition(self: 'MPCEnv', x: object, fid: int) -> tuple:
-        x_ = x.to_field(self.primes[fid])
+        x_r: np.ndarray = zeros(x_.shape)
+        r: np.ndarray = zeros(x_.shape)
 
-        rand_func = None
-        if isinstance(x, Zp):
-            rand_func = partial(self.rand_elem, fid=fid)
-        elif isinstance(x, Matrix):
-            rand_func = partial(self.rand_mat, m=x_.shape[0], n=x_.shape[1], fid=fid)
-        elif isinstance(x, Vector):
-            rand_func = partial(self.rand_vector, size=len(x_), fid=fid)
-        x_r = Zp(0, self.primes[fid]) if isinstance(x, Zp) else Matrix(*x.get_dims()) if isinstance(x, Matrix) else Vector(
-              [Zp(0, self.primes[fid]) for _ in range(len(x))])
-        r = Zp(0, self.primes[fid]) if isinstance(x, Zp) else Matrix(*x.get_dims()) if isinstance(x, Matrix) else Vector(
-              [Zp(0, self.primes[fid]) for _ in range(len(x))])
         if self.pid == 0:
             self.switch_seed(1)
-            r_1: Zp = rand_func()
+            r_1: np.ndarray = random_ndarray(base=self.primes[fid], shape=x_.shape)
             self.restore_seed(1)
 
             self.switch_seed(2)
-            r_2: Zp = rand_func()
+            r_2: np.ndarray = random_ndarray(base=self.primes[fid], shape=x_.shape)
             self.restore_seed(2)
 
-            r: Zp = r_1 + r_2
+            r: np.ndarray = r_1 + r_2
             r %= self.primes[fid]
         else:
             self.switch_seed(0)
-            r: Zp = rand_func()
+            r: np.ndarray = random_ndarray(base=self.primes[fid], shape=x_.shape)
             self.restore_seed(0)
             r %= self.primes[fid]
             
             x_r = x_ - r
             x_r %= self.primes[fid]
             
-            if isinstance(x, Matrix):  # Temp hack. Will be removed in .seq
-                x_r = self.reveal_sym(Matrix().from_value(x_r), fid=fid)
-            else:
-                x_r = self.reveal_sym(x_r, fid=fid)
+            x_r = self.reveal_sym(x_r, fid=fid)
         
-        x_r %= self.primes[fid]
         return x_r, r
     
     def mul_elem(self: 'MPCEnv', v_1: Vector, v_2: Vector) -> Vector:
