@@ -6,11 +6,16 @@ import math
 from functools import partial
 from copy import deepcopy
 
+import numpy as np
+
 import param
 from c_socket import CSocket
 from connect import connect, open_channel
-from custom_types import Zp, Vector, Matrix, TypeOps
+from custom_types import TypeOps, zeros, ones
 
+Zp = None
+Vector = None
+Matrix = None
 
 class MPCEnv:
     def __init__(self: 'MPCEnv'):
@@ -19,6 +24,7 @@ class MPCEnv:
         self.pid: int = None
         self.pascal_cache: dict = dict()
         self.table_cache: dict = dict()
+        self.table_type_modular: dict = dict()
         self.lagrange_cache: dict = dict()
         self.table_field_index: dict = dict()
         self.primes: dict = {0: param.BASE_P, 1: 31, 2: 17}  # Temp hardcoded. Needs to be calcualted on init.
@@ -43,73 +49,72 @@ class MPCEnv:
     def setup_tables(self: 'MPCEnv'):
         # Lagrange cache
         # Table 0
-        table = Matrix(1, 2, t=int)
+        table = zeros((1, 2))
         if (self.pid > 0):
             table[0][0] = 1
             table[0][1] = 0
 
-        table.type_ = int  # table_type_ZZ[0] = true;
+        self.table_type_modular[0] = True
         self.table_cache[0] = table
         self.table_field_index[0] = 2
 
         # Table 1
         half_len: int = param.NBIT_K // 2
-        table = Matrix(2, half_len + 1, t=int)
-        if (self.pid > 0):
-            for i in range(0, half_len + 1):
-                if (i == 0):
+        table = zeros((2, half_len + 1))
+        if self.pid > 0:
+            for i in range(half_len + 1):
+                if i == 0:
                     table[0][i] = 1
                     table[1][i] = 1
                 else:
                     table[0][i] = table[0][i - 1] * 2
                     table[1][i] = table[1][i - 1] * 4
 
-        table.type_ = int  # table_type_ZZ[1] = true;
+        self.table_type_modular[1] = True
         self.table_cache[1] = table
         self.table_field_index[1] = 1
 
         # Table 2: parameters (intercept, slope) for piecewise-linear approximation
         # of negative log-sigmoid function
-        table = Matrix(2, 64)
-        if (self.pid > 0):
+        table = zeros((2, 64))
+        if self.pid > 0:
             with open('sigmoid_approx.txt') as f:
-                for i in range(0, table.num_cols()):
+                for i in range(table.shape[1]):
                     intercept, slope = f.readline().split()
-                    fp_intercept: Zp = self.double_to_fp(
-                        float(intercept), param.NBIT_K, param.NBIT_F,
-                        fid=0)
-                    fp_slope: Zp = self.double_to_fp(float(slope), param.NBIT_K, param.NBIT_F, fid=0)
+                    fp_intercept: int = self.double_to_fp(
+                        float(intercept), param.NBIT_K, param.NBIT_F, fid=0)
+                    fp_slope: int = self.double_to_fp(float(slope), param.NBIT_K, param.NBIT_F, fid=0)
 
                     table[0][i] = fp_intercept
                     table[1][i] = fp_slope
 
-        table.type_ = Zp  # table_type_ZZ[2] = false;
+
+        self.table_type_modular[2] = False
         self.table_cache[2] = table
         self.table_field_index[2] = 0
 
-        for cid in range(0, len(self.table_cache)):
-            nrow: int = self.table_cache[cid].num_rows()
-            ncol: int = self.table_cache[cid].num_cols()
-            index_by_ZZ: bool = self.table_cache[cid].type_ == int
-            self.lagrange_cache[cid] = Matrix(nrow, (2 if index_by_ZZ else 1) * ncol)
+        for cid in range(len(self.table_cache)):
+            nrow: int = self.table_cache[cid].shape[0]
+            ncol: int = self.table_cache[cid].shape[1]
+            self.lagrange_cache[cid] = zeros((nrow, (2 if self.table_type_modular[cid] else 1) * ncol))
 
-            if (self.pid > 0):
-                for i in range(0, nrow):
-                    x = [0] * ncol * (2 if index_by_ZZ else 1)
-                    y = Vector([Zp(0, base=self.primes[0]) for _ in range(ncol * (2 if index_by_ZZ else 1))])
+            if self.pid > 0:
+                for i in range(nrow):
+                    x = zeros(ncol * (2 if self.table_type_modular[cid] else 1))
+                    y = zeros(ncol * (2 if self.table_type_modular[cid] else 1))
                     
-                    for j in range(0, ncol):
+                    for j in range(ncol):
                         x[j] = j + 1
                         y[j] = self.table_cache[cid][i][j]
-                        if (index_by_ZZ):
-                            x[j + ncol] = x[j] + int(self.primes[self.table_field_index[cid]])
+                        if (self.table_type_modular[cid]):
+                            x[j + ncol] = x[j] + self.primes[self.table_field_index[cid]]
                             y[j + ncol] = self.table_cache[cid][i][j]
                     
-                    self.lagrange_cache[cid][i] = self.lagrange_interp(x, y, fid=0)
+                    self.lagrange_cache[cid][i][:] = self.lagrange_interp(x, y, fid=0)
             
         # End of Lagrange cache
     
-    def lagrange_interp(self: 'MPCEnv', x: Vector, y: Vector, fid: int) -> Vector:
+    def lagrange_interp(self: 'MPCEnv', x: np.ndarray, y: np.ndarray, fid: int) -> np.ndarray:
         n: int = len(y)
 
         inv_table = dict()
@@ -120,12 +125,12 @@ class MPCEnv:
 
                 key: int = abs(x[i] - x[j])
                 if key not in inv_table:
-                    inv_table[key] = Zp(key, base=self.primes[fid]).inv(self.primes[fid])
+                    inv_table[key] = TypeOps.mod_inv(key, self.primes[fid])
         
         # Initialize numer and denom_inv
-        numer = Matrix(n, n, base=self.primes[fid])
-        denom_inv = [1] * n
-        numer[0] = y % self.primes[fid]
+        numer = zeros((n, n))
+        denom_inv = ones(n)
+        numer[0][:] = np.mod(y, self.primes[fid])
 
         for i in range(n):
             for j in range(n):
@@ -133,14 +138,10 @@ class MPCEnv:
                     continue
 
                 for k in range(n - 1, -1, -1):
-                    numer[k][j] = (0 if k == 0 else numer[k - 1][j]) - int(numer[k][j] * x[i])
-                denom_inv[i] *= (1 if x[i] > x[j] else -1) * int(inv_table[abs(x[i] - x[j])])
+                    numer[k][j] = ((0 if k == 0 else int(numer[k - 1][j])) - int(numer[k][j]) * int(x[i])) % self.primes[fid]
+                denom_inv[i] = (int(denom_inv[i]) * (1 if x[i] > x[j] else -1) * int(inv_table[abs(x[i] - x[j])])) % self.primes[fid]
 
-        numer = Vector(
-            [sum(row * denom_inv, Zp(0, base=self.primes[fid]))
-             for row in numer.value])
-
-        return numer
+        return np.sum(numer * denom_inv, axis=1)
     
     def setup_channels(self: 'MPCEnv', pairs: list) -> bool:
         for pair in pairs:
@@ -266,7 +267,7 @@ class MPCEnv:
         if isinstance(x, Zp):
             rand_func = partial(self.rand_elem, fid=fid)
         elif isinstance(x, Matrix):
-            rand_func = partial(self.rand_mat, m=x_.num_rows(), n=x_.num_cols(), fid=fid)
+            rand_func = partial(self.rand_mat, m=x_.shape[0], n=x_.shape[1], fid=fid)
         elif isinstance(x, Vector):
             rand_func = partial(self.rand_vector, size=len(x_), fid=fid)
         x_r = Zp(0, self.primes[fid]) if isinstance(x, Zp) else Matrix(*x.get_dims()) if isinstance(x, Matrix) else Vector(
@@ -346,7 +347,7 @@ class MPCEnv:
                 r_pow = Matrix(pow - 1, n).set_field(self.primes[fid])
                 r_pow[0] = self.mul_elem(r, r)
                 
-                for p in range(1, r_pow.num_rows()):
+                for p in range(1, r_pow.shape[0]):
                     r_pow[p] = self.mul_elem(r_pow[p - 1], r)
                     r_pow[p].set_field(self.primes[fid])
 
@@ -371,7 +372,7 @@ class MPCEnv:
 
                 x_r_pow = Matrix(pow - 1, n).set_field(self.primes[fid])
                 x_r_pow[0] = self.mul_elem(x_r, x_r)
-                for p in range(1, x_r_pow.num_rows()):
+                for p in range(1, x_r_pow.shape[0]):
                     x_r_pow[p] = self.mul_elem(x_r_pow[p - 1], x_r)
                     x_r_pow[p].set_field(self.primes[fid])
 
@@ -404,8 +405,8 @@ class MPCEnv:
     
     def evaluate_poly(self: 'MPCEnv', x: Vector, coeff: Matrix, fid: int) -> Matrix:
         n: int = len(x)
-        npoly: int = coeff.num_rows()
-        deg: int = coeff.num_cols() - 1
+        npoly: int = coeff.shape[0]
+        deg: int = coeff.shape[1] - 1
 
         pows: Matrix = self.powers(x, deg, fid)
 
@@ -444,16 +445,16 @@ class MPCEnv:
         r_1_ = r_1.to_field(self.primes[fid])
         y_r_ = y_r.to_field(self.primes[fid])
         r_2_ = r_2.to_field(self.primes[fid])
-        xy = Matrix(r_1_.num_rows(), r_2_.num_rows()
+        xy = Matrix(r_1_.shape[0], r_2_.shape[0]
                     if isinstance(r_2_.value[0], Zp) or isinstance(r_2_.value[0], int) 
-                    else r_2_.num_cols()).set_field(self.primes[fid])
+                    else r_2_.shape[1]).set_field(self.primes[fid])
         if self.pid == 0:
             r_1_r_2 = self.mul_elem(r_1_, r_2_) if elem_wise else r_1_.mult(r_2_)
             xy += r_1_r_2
         else:
             if elem_wise:
-                for i in range(xy.num_rows()):
-                    for j in range(xy.num_cols()):
+                for i in range(xy.shape[0]):
+                    for j in range(xy.shape[1]):
                         xy[i][j] += x_r_[i][j] * r_2_[i][j]
                         xy[i][j] += y_r_[i][j] * r_1_[i][j]
                         if self.pid == 1:
@@ -484,7 +485,7 @@ class MPCEnv:
             if isinstance(elem, Zp):
                 rand_func = partial(self.rand_elem, fid=fid)
             elif isinstance(elem, Matrix):
-                rand_func = partial(self.rand_mat, m=elem.num_rows(), n=elem.num_cols(), fid=fid)
+                rand_func = partial(self.rand_mat, m=elem.shape[0], n=elem.shape[1], fid=fid)
             elif isinstance(elem, Vector):
                 rand_func = partial(self.rand_vector, size=len(elem), fid=fid)
 
@@ -541,11 +542,11 @@ class MPCEnv:
     
     def fp_to_double(self: 'MPCEnv', a: Matrix, k: int, f: int) -> Matrix:
         base = a[0][0].base
-        b = Matrix(a.num_rows(), a.num_cols(), t=float)
+        b = Matrix(a.shape[0], a.shape[1], t=float)
         twokm1: int = TypeOps.left_shift(1, k - 1)
 
-        for i in range(0, a.num_rows()):
-            for j in range(0, a.num_cols()):
+        for i in range(0, a.shape[0]):
+            for j in range(0, a.shape[1]):
                 x = int(a[i][j])
                 sn = 1
                 if x > twokm1:  # negative number
@@ -588,9 +589,9 @@ class MPCEnv:
         
         return mat_float
 
-    def double_to_fp(self: 'MPCEnv', x: float, k: int, f: int, fid: int) -> Zp:
+    def double_to_fp(self: 'MPCEnv', x: float, k: int, f: int, fid: int) -> int:
         sn: int = 1
-        if (x < 0):
+        if x < 0:
             x = -x
             sn = -sn
 
@@ -606,7 +607,7 @@ class MPCEnv:
                 xf -= int(xf)
                 az_trunc = TypeOps.set_bit(az_trunc, fbit)
         
-        return Zp(az_trunc * sn, base=self.primes[fid])
+        return (az_trunc * sn) % self.primes[fid]
     
     def table_lookup(self: 'MPCEnv', x: Vector, table_id: int, fid: int) -> Matrix:
         return self.evaluate_poly(x, self.lagrange_cache[table_id], fid=fid)
@@ -625,16 +626,16 @@ class MPCEnv:
         r = Matrix()
         r_low = Matrix()
         if (self.pid == 0):
-            r = self.rand_mat_bits(a.num_rows(), a.num_cols(), k + param.NBIT_V, fid=fid)
-            r_low.set_dims(a.num_rows(), a.num_cols())
+            r = self.rand_mat_bits(a.shape[0], a.shape[1], k + param.NBIT_V, fid=fid)
+            r_low.set_dims(a.shape[0], a.shape[1])
             
-            for i in range(0, a.num_rows()):
-                for j in range(0, a.num_cols()):
+            for i in range(0, a.shape[0]):
+                for j in range(0, a.shape[1]):
                     r_low[i][j] = Zp(int(r[i][j]) & ((1 << m) - 1), base=self.primes[fid])
 
             self.switch_seed(1)
-            r_mask = self.rand_mat(a.num_rows(), a.num_cols(), fid=0)
-            r_low_mask = self.rand_mat(a.num_rows(), a.num_cols(), fid=0)
+            r_mask = self.rand_mat(a.shape[0], a.shape[1], fid=0)
+            r_low_mask = self.rand_mat(a.shape[0], a.shape[1], fid=0)
             self.restore_seed(1)
 
             r -= r_mask
@@ -643,21 +644,21 @@ class MPCEnv:
             self.send_elem(Matrix().from_value(r), 2)
             self.send_elem(Matrix().from_value(r_low), 2)
         elif self.pid == 2:
-            r = self.receive_matrix(0, msg_len=TypeOps.get_mat_len(a.num_rows(), a.num_cols()), fid=fid)
-            r_low = self.receive_matrix(0, msg_len=TypeOps.get_mat_len(a.num_rows(), a.num_cols()), fid=fid)
+            r = self.receive_matrix(0, msg_len=TypeOps.get_mat_len(a.shape[0], a.shape[1]), fid=fid)
+            r_low = self.receive_matrix(0, msg_len=TypeOps.get_mat_len(a.shape[0], a.shape[1]), fid=fid)
         else:
             self.switch_seed(0)
-            r = self.rand_mat(a.num_rows(), a.num_cols(), fid=0)
-            r_low = self.rand_mat(a.num_rows(), a.num_cols(), fid=0)
+            r = self.rand_mat(a.shape[0], a.shape[1], fid=0)
+            r_low = self.rand_mat(a.shape[0], a.shape[1], fid=0)
             self.restore_seed(0)
 
-        c = Matrix().from_value(a + r) if self.pid > 0 else Matrix(a.num_rows(), a.num_cols())
+        c = Matrix().from_value(a + r) if self.pid > 0 else Matrix(a.shape[0], a.shape[1])
         c = self.reveal_sym(c, fid=fid)
 
-        c_low = Matrix(a.num_rows(), a.num_cols())
+        c_low = Matrix(a.shape[0], a.shape[1])
         if (self.pid > 0):
-            for i in range(0, a.num_rows()):
-                for j in range(0, a.num_cols()):
+            for i in range(0, a.shape[0]):
+                for j in range(0, a.shape[1]):
                     c_low[i][j] = Zp(int(c[i][j]) & ((1 << m) - 1), base=self.primes[fid])
 
         if (self.pid > 0):
@@ -679,8 +680,8 @@ class MPCEnv:
         return self.lagrange_interp(x, y, fid)
 
     def fan_in_or(self: 'MPCEnv', a: Matrix, fid: int) -> Vector:
-        n: int = a.num_rows()
-        d: int = a.num_cols()
+        n: int = a.shape[0]
+        d: int = a.shape[1]
         a_sum = [0] * n
 
         if self.pid > 0:
@@ -705,7 +706,7 @@ class MPCEnv:
     
     def reshape(self: 'MPCEnv', a: Matrix, nrows: int, ncols: int):
         if self.pid == 0:
-            assert a.num_rows() * a.num_cols() == nrows * ncols
+            assert a.shape[0] * a.shape[1] == nrows * ncols
             a.set_dims(nrows, ncols)
         else:
             a.reshape(nrows, ncols)
@@ -730,13 +731,13 @@ class MPCEnv:
 
         for k in range(nmat):
             if elem_wise:
-                assert (a[k].num_rows() == b[k].num_rows() and
-                        a[k].num_cols() == b[k].num_cols())
+                assert (a[k].shape[0] == b[k].shape[0] and
+                        a[k].shape[1] == b[k].shape[1])
             else:
-                assert a[k].num_cols() == b[k].num_rows()
+                assert a[k].shape[1] == b[k].shape[0]
 
-            out_rows[k] = a[k].num_rows()
-            out_cols[k] = a[k].num_cols() if elem_wise else b[k].num_cols()
+            out_rows[k] = a[k].shape[0]
+            out_cols[k] = a[k].shape[1] if elem_wise else b[k].shape[1]
 
 
         ar, am = self.beaver_partition_bulk(a, fid)
@@ -752,10 +753,10 @@ class MPCEnv:
         return [Matrix().from_value(mult) for mult in mults]
 
     def prefix_or(self: 'MPCEnv', a: Matrix, fid: int) -> Matrix:
-        n: int = a.num_rows()
+        n: int = a.shape[0]
 
         # Find next largest squared integer
-        L: int = int(math.ceil(math.sqrt(a.num_cols())))
+        L: int = int(math.ceil(math.sqrt(a.shape[1])))
         L2: int = L * L
 
         # Zero-pad to L2 bits
@@ -764,10 +765,10 @@ class MPCEnv:
         if self.pid > 0:
             for i in range(n):
                 for j in range(L2):
-                    if j < L2 - a.num_cols():
+                    if j < L2 - a.shape[1]:
                         a_padded[i][j] = 0
                     else:
-                        a_padded[i][j] = a[i][j - L2 + a.num_cols()]
+                        a_padded[i][j] = a[i][j - L2 + a.shape[1]]
 
         self.reshape(a_padded, n * L, L)
 
@@ -824,11 +825,11 @@ class MPCEnv:
 
         s = self.mult_mat_parallel(f, bdot, fid)
 
-        b = Matrix(n, a.num_cols()).set_field(self.primes[fid])
+        b = Matrix(n, a.shape[1]).set_field(self.primes[fid])
         if self.pid > 0:
             for i in range(n):
-                for j in range(a.num_cols()):
-                    j_pad: int = L2 - a.num_cols() + j
+                for j in range(a.shape[1]):
+                    j_pad: int = L2 - a.shape[1] + j
 
                     il: int = j_pad // L
                     jl: int = j_pad - il * L
@@ -1102,11 +1103,11 @@ class MPCEnv:
         return self.less_than_bits_aux(a, b, 0, fid)
     
     def less_than_bits_aux(self: 'MPCEnv', a: Matrix, b: Matrix, public_flag: int, fid: int) -> Vector:
-        assert a.num_rows() == b.num_rows()
-        assert a.num_cols() == b.num_cols()
+        assert a.shape[0] == b.shape[0]
+        assert a.shape[1] == b.shape[1]
 
-        n: int = a.num_rows()
-        L: int = a.num_cols()
+        n: int = a.shape[0]
+        L: int = a.shape[1]
 
         # Calculate XOR
         x = Matrix(n, L).set_field(self.primes[fid])
@@ -1386,9 +1387,9 @@ class MPCEnv:
         return ab.set_field(self.primes[fid])
 
     def qr_fact_square(self: 'MPCEnv', A: Matrix) -> Matrix:
-        assert A.num_rows() == A.num_cols()
+        assert A.shape[0] == A.shape[1]
 
-        n: int = A.num_rows()
+        n: int = A.shape[0]
         R = Matrix(n, n)
         Q = Matrix(n, n)
 
@@ -1399,10 +1400,10 @@ class MPCEnv:
         one: Zp = self.double_to_fp(1, param.NBIT_K, param.NBIT_F, fid=0)
 
         for i in range(n - 1):
-            v = Matrix(1, Ap.num_cols())
+            v = Matrix(1, Ap.shape[1])
             v[0] = self.householder(Ap[0])
 
-            vt = Matrix(Ap.num_cols(), 1)
+            vt = Matrix(Ap.shape[1], 1)
             if self.pid != 0:
                 vt = Matrix().from_value(v.transpose(inplace=False))
             
@@ -1412,7 +1413,7 @@ class MPCEnv:
             if self.pid > 0:
                 P *= -2
                 if self.pid == 1:
-                    for j in range(P.num_cols()):
+                    for j in range(P.shape[1]):
                         P[j][j] += one
             
             B = Matrix(n - i, n - i)
@@ -1453,10 +1454,10 @@ class MPCEnv:
         return Q, R
 
     def tridiag(self: 'MPCEnv', A: Matrix) -> tuple:
-        assert A.num_rows() == A.num_cols()
-        assert A.num_rows() > 2
+        assert A.shape[0] == A.shape[1]
+        assert A.shape[0] > 2
 
-        n: int = A.num_rows()
+        n: int = A.shape[0]
         one: Zp = self.double_to_fp(1, param.NBIT_K, param.NBIT_F, fid=0)
 
         Q = Matrix(n, n)
@@ -1471,9 +1472,9 @@ class MPCEnv:
             Ap = Matrix().from_value(deepcopy(A))
 
         for i in range(n - 2):
-            x = Vector([Zp(0, base=self.primes[0]) for _ in range(Ap.num_cols() - 1)])
+            x = Vector([Zp(0, base=self.primes[0]) for _ in range(Ap.shape[1] - 1)])
             if self.pid > 0:
-                for j in range(Ap.num_cols() - 1):
+                for j in range(Ap.shape[1] - 1):
                     x[j] = Zp(Ap[0][j + 1].value, Ap[0][j + 1].base)
 
             v = Matrix(1, len(x))
@@ -1486,11 +1487,11 @@ class MPCEnv:
             vv = self.mult_mat_parallel([vt], [v], fid=0)[0]
             self.trunc(vv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
-            P = Matrix(Ap.num_cols(), Ap.num_cols())
+            P = Matrix(Ap.shape[1], Ap.shape[1])
             if self.pid > 0:
                 P[0][0] = Zp(one.value, one.base) if self.pid == 1 else Zp(0, one.base)
-                for j in range(1, Ap.num_cols()):
-                    for k in range(1, Ap.num_cols()):
+                for j in range(1, Ap.shape[1]):
+                    for k in range(1, Ap.shape[1]):
                         P[j][k] = vv[j - 1][k - 1] * -2
                         if self.pid == 1 and j == k:
                             P[j][k] += one
@@ -1524,17 +1525,17 @@ class MPCEnv:
                     T[i + 2][i + 1] = Zp(B[2][1].value, B[2][1].base)
                     T[i + 2][i + 2] = Zp(B[2][2].value, B[2][2].base)
 
-            Ap = Matrix(B.num_rows() - 1, B.num_cols() - 1)
+            Ap = Matrix(B.shape[0] - 1, B.shape[1] - 1)
             if self.pid > 0:
-                for j in range(B.num_rows() - 1):
-                    for k in range(B.num_cols() - 1):
+                for j in range(B.shape[0] - 1):
+                    for k in range(B.shape[1] - 1):
                        Ap[j][k] = Zp(B[j + 1][k + 1].value, B[j + 1][k + 1].base)
 
         return T, Q
 
     def eigen_decomp(self: 'MPCEnv', A: Matrix) -> tuple:
-        assert A.num_rows() == A.num_cols()
-        n: int = A.num_rows()
+        assert A.shape[0] == A.shape[1]
+        n: int = A.shape[0]
 
         L = Vector([Zp(0, base=self.primes[0]) for _ in range(n)])
 
@@ -1548,7 +1549,7 @@ class MPCEnv:
             for _ in range(param.ITER_PER_EVAL):
                 shift = Zp(Ap[i][i].value, Ap[i][i].base)
                 if self.pid > 0:
-                    for j in range(Ap.num_cols()):
+                    for j in range(Ap.shape[1]):
                         Ap[j][j] -= shift
 
                 Q, R = self.qr_fact_square(Ap)
@@ -1557,7 +1558,7 @@ class MPCEnv:
                 self.trunc(Ap, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
                 if self.pid > 0:
-                    for j in range(Ap.num_cols()):
+                    for j in range(Ap.shape[1]):
                         Ap[j][j] += shift
 
                 Vsub = Matrix(i + 1, n)
@@ -1586,10 +1587,10 @@ class MPCEnv:
         return V, L
 
     def orthonormal_basis(self: 'MPCEnv', A: Matrix) -> Matrix:
-        assert A.num_cols() >= A.num_rows()
+        assert A.shape[1] >= A.shape[0]
 
-        c: int = A.num_rows()
-        n: int = A.num_cols()
+        c: int = A.shape[0]
+        n: int = A.shape[1]
 
         v_list: list = []
 
@@ -1600,15 +1601,15 @@ class MPCEnv:
         one: Zp = self.double_to_fp(1, param.NBIT_K, param.NBIT_F, fid=0)
 
         for i in range(c):
-            v = Matrix(1, Ap.num_cols())
+            v = Matrix(1, Ap.shape[1])
             v[0] = self.householder(Ap[0])
 
             if self.pid == 0:
-                v_list.append(Vector([Zp(0, base=self.primes[0]) for _ in range(Ap.num_cols())]))
+                v_list.append(Vector([Zp(0, base=self.primes[0]) for _ in range(Ap.shape[1])]))
             else:
                 v_list.append(Vector(v[0].value))
 
-            vt = Matrix(Ap.num_cols(), 1)
+            vt = Matrix(Ap.shape[1], 1)
             if self.pid != 0:
                 vt = v.transpose(inplace=False)
 
@@ -1622,10 +1623,10 @@ class MPCEnv:
                 B *= -2
                 B += Ap
 
-            Ap = Matrix(B.num_rows() - 1, B.num_cols() - 1)
+            Ap = Matrix(B.shape[0] - 1, B.shape[1] - 1)
             if self.pid > 0:
-                for j in range(B.num_rows() - 1):
-                    for k in range(B.num_cols() - 1):
+                for j in range(B.shape[0] - 1):
+                    for k in range(B.shape[1] - 1):
                         Ap[j][k] = Zp(B[j + 1][k + 1].value, B[j + 1][k + 1].base)
 
         Q = Matrix(c, n)
@@ -1639,7 +1640,7 @@ class MPCEnv:
             if self.pid > 0:
                 v[0] = Vector(v_list[i].value)
 
-            vt = Matrix(v.num_cols(), 1)
+            vt = Matrix(v.shape[1], 1)
             if self.pid != 0:
                 vt = v.transpose(inplace=False)
 
@@ -1689,8 +1690,8 @@ class MPCEnv:
     def inner_prod(self: 'MPCEnv', a: Matrix, fid: int) -> Matrix:
         ar, am = self.beaver_partition(a, fid)
 
-        c = Vector([Zp(0, base=param.BASE_P) for _ in range(a.num_rows())])
-        for i in range(a.num_rows()):
+        c = Vector([Zp(0, base=param.BASE_P) for _ in range(a.shape[0])])
+        for i in range(a.shape[0]):
             c[i] = self.beaver_inner_prod(ar[i], am[i], fid)
 
         return self.beaver_reconstruct(c, fid)
@@ -1698,14 +1699,14 @@ class MPCEnv:
     def parallel_logistic_regression(
         self: 'MPCEnv', xr: Matrix, xm: Matrix, vr: Matrix,
         vm: Matrix, yr: Vector, ym: Vector, max_iter: int) -> tuple:
-        n: int = vr.num_cols()
-        p: int = vr.num_rows()
-        c: int = xr.num_rows()
-        assert vm.num_rows() == p
-        assert vm.num_cols() == n
-        assert xm.num_rows() == c
-        assert xm.num_cols() == n
-        assert xr.num_cols() == n
+        n: int = vr.shape[1]
+        p: int = vr.shape[0]
+        c: int = xr.shape[0]
+        assert vm.shape[0] == p
+        assert vm.shape[1] == n
+        assert xm.shape[0] == c
+        assert xm.shape[1] == n
+        assert xr.shape[1] == n
         assert len(yr) == n
         assert len(ym) == n
 
