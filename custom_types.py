@@ -11,6 +11,9 @@ from param import BASE_P, BASE_LEN
 zeros = partial(np.zeros, dtype=np.int64)
 ones = partial(np.ones, dtype=np.int64)
 
+def random_ndarray(base: int, shape: tuple) -> np.ndarray:
+    return np.random.randint(base, size=shape)
+
 
 class TypeOps:
     @staticmethod
