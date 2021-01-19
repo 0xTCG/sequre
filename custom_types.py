@@ -3,7 +3,13 @@ import random
 from functools import partial
 from copy import deepcopy
 
+import numpy as np
+
 from param import BASE_P, BASE_LEN
+
+
+zeros = partial(np.zeros, dtype=np.int64)
+ones = partial(np.ones, dtype=np.int64)
 
 
 class TypeOps:
@@ -47,6 +53,10 @@ class TypeOps:
     @staticmethod
     def switch_pair(t: tuple) -> tuple:
         return t[1], t[0]
+    
+    @staticmethod
+    def mod_inv(value: int, field: int) -> int:
+        return pow(int(value), field - 2, field)
 
 
 class Zp:
