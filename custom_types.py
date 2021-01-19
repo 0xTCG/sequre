@@ -57,6 +57,34 @@ class TypeOps:
     @staticmethod
     def mod_inv(value: int, field: int) -> int:
         return pow(int(value), field - 2, field)
+    
+    @staticmethod
+    def get_bytes_len(arr: np.ndarray) -> int:
+        if arr.ndim == 2:
+            return TypeOps.get_mat_len(*arr.shape)
+        
+        if arr.ndim == 1:
+            return TypeOps.get_vec_len(*arr.shape)
+        
+        if arr.ndim == 0:
+            return BASE_LEN
+        
+        raise ValueError(f'Invalid operand. {arr} has inapt dimension.')
+
+    @staticmethod
+    def to_bytes(arr: np.ndarray) -> str:
+        if arr.ndim > 2:
+            raise ValueError(f'Ivalid dimension of arr to stringify: {arr.dim}')
+        
+        if arr.ndim == 0:
+            base = b'0' * BASE_LEN
+            str_val: str = str(arr)
+            return (base + str_val.encode('utf-8'))[len(str_val):]
+        
+        separator: str = b';' if arr.ndim == 2 else b'.'
+
+        return separator.join([TypeOps.to_bytes(v) for v in arr])
+
 
 
 class Zp:
