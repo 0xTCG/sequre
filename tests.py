@@ -19,7 +19,7 @@ def assert_approx(result, expected, error = 10 ** (-5)):
 def test_all(mpc: MPCEnv = None, pid: int = None):
     if mpc is not None and pid is not None:
         if pid != 0:
-            assert_values(mpc.lagrange_cache[2][1][1], 1452088668690627657)
+            assert_values(mpc.lagrange_cache[2][1][1], 1452088668690628557)
         
         revealed_value: np.ndarray = mpc.reveal_sym(np.array(10) if pid == 1 else np.array(7))
         if pid != 0:
