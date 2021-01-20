@@ -8,9 +8,6 @@ import numpy as np
 from param import BASE_P, BASE_LEN
 
 
-zeros = partial(np.zeros, dtype=np.int64)
-ones = partial(np.ones, dtype=np.int64)
-
 def random_ndarray(base: int, shape: tuple) -> np.ndarray:
     return np.random.randint(base, size=shape)
 
@@ -31,6 +28,10 @@ def mul_mod(x: np.ndarray, y: np.ndarray, field: int) -> np.ndarray:
         broadcast_y //= 2
   
     return np.mod(res, field)
+
+# Numpy overrides
+zeros = partial(np.zeros, dtype=np.int64)
+ones = partial(np.ones, dtype=np.int64)
 
 
 class TypeOps:

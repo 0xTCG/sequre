@@ -89,7 +89,6 @@ class MPCEnv:
                     table[0][i] = fp_intercept
                     table[1][i] = fp_slope
 
-
         self.table_type_modular[2] = False
         self.table_cache[2] = table
         self.table_field_index[2] = 0
@@ -101,7 +100,7 @@ class MPCEnv:
 
             if self.pid > 0:
                 for i in range(nrow):
-                    x = zeros(ncol * (2 if self.table_type_modular[cid] else 1))
+                    x = [0] * (ncol * (2 if self.table_type_modular[cid] else 1))
                     y = zeros(ncol * (2 if self.table_type_modular[cid] else 1))
                     
                     for j in range(ncol):
@@ -142,7 +141,7 @@ class MPCEnv:
                     numer[k][j] = ((0 if k == 0 else int(numer[k - 1][j])) - int(numer[k][j]) * int(x[i])) % self.primes[fid]
                 denom_inv[i] = (int(denom_inv[i]) * (1 if x[i] > x[j] else -1) * int(inv_table[abs(x[i] - x[j])])) % self.primes[fid]
 
-        return np.sum(numer * denom_inv, axis=1)
+        return np.sum(mul_mod(numer, denom_inv, self.primes[fid]), axis=1)
     
     def setup_channels(self: 'MPCEnv', pairs: list) -> bool:
         for pair in pairs:
