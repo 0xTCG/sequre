@@ -301,98 +301,108 @@ class MPCEnv:
     def rand_mat(self: 'MPCEnv', m: int, n: int, fid: int) -> Matrix:
         return Matrix(m, n, randomise=True, base=self.primes[fid])
 
-    def get_pascal_matrix(self: 'MPCEnv', pow: int, fid: int) -> Matrix:
-        if pow not in self.pascal_cache:
-            pascal_matrix: Matrix = self.calculate_pascal_matrix(pow, fid=fid)
-            self.pascal_cache[pow] = pascal_matrix
+    def get_pascal_matrix(self: 'MPCEnv', power: int) -> np.ndarray:
+        if power not in self.pascal_cache:
+            pascal_matrix: np.ndarray = self.calculate_pascal_matrix(power)
+            self.pascal_cache[power] = pascal_matrix
 
-        return self.pascal_cache[pow]
+        return self.pascal_cache[power]
     
-    def calculate_pascal_matrix(self: 'MPCEnv', pow: int, fid: int) -> Matrix:
-        t = Matrix(pow + 1, pow + 1).set_field(self.primes[fid])
+    def calculate_pascal_matrix(self: 'MPCEnv', pow: int) -> np.ndarray:
+        t = zeros((pow + 1, pow + 1))
         for i in range(pow + 1):
             for j in range(pow + 1):
-                if (j > i):
-                    t[i][j] = Zp(0, base=self.primes[fid])
-                elif (j == 0 or j == i):
-                    t[i][j] = Zp(1, base=self.primes[fid])
+                if j > i:
+                    t[i][j] = 0
+                elif j == 0 or j == i:
+                    t[i][j] = 1
                 else:
                     t[i][j] = t[i - 1][j - 1] + t[i - 1][j]
         
         return t
 
-    def powers(self: 'MPCEnv', x: Vector, pow: int, fid: int) -> Matrix:
-        assert pow >= 1
+    def powers(self: 'MPCEnv', x: np.ndarray, power: int, fid: int) -> np.ndarray:
+        assert power >= 1, f'Invalid exponent: {power}'
 
         n: int = len(x)
-        b = Matrix().set_field(self.primes[fid])
+        b: np.ndarray = np.array([], dtype=np.int64)
         
-        if (pow == 1):
-            b.set_dims(2, n, base=self.primes[fid])
-            if (self.pid > 0):
-                if (self.pid == 1):
-                    b[0] += Vector([Zp(1, base=self.primes[fid]) for _ in range(n)])
-                b[1] = x
-        else:  # pow > 1
+        if power == 1:
+            b.resize((2, n))
+            if self.pid > 0:
+                if self.pid == 1:
+                    b[0] += ones(n)
+                b[1][:] = x
+        else:  # power > 1
             x_r, r = self.beaver_partition(x, fid)
 
-            if (self.pid == 0):
-                r_pow = Matrix(pow - 1, n).set_field(self.primes[fid])
-                r_pow[0] = self.mul_elem(r, r)
+            if self.pid == 0:
+                r_pow: np.ndarray = zeros((power - 1, n))
+                r_pow[0][:] = mul_mod(r, r, self.primes[fid])
                 
                 for p in range(1, r_pow.shape[0]):
-                    r_pow[p] = self.mul_elem(r_pow[p - 1], r)
-                    r_pow[p].set_field(self.primes[fid])
+                    r_pow[p][:] = mul_mod(r_pow[p - 1], r, self.primes[fid])
 
                 self.switch_seed(1)
-                r_ = self.rand_mat(pow - 1, n, fid)
+                r_: np.ndarray = random_ndarray(base=self.primes[fid], shape=(power - 1, n))
                 self.restore_seed(1)
 
-                r_pow -= r_
-                r_pow.set_field(self.primes[fid])
+                r_pow = (r_pow - r_) % self.primes[fid]
+                self.send_elem(r_pow, 2)
 
-                self.send_elem(Matrix().from_value(r_pow), 2)
-
-                b.set_dims(pow + 1, n, base=self.primes[fid])
+                b.resize((power + 1, n))
             else:
-                r_pow = Matrix()
-                if (self.pid == 1):
+                r_pow: np.ndarray = None
+                if self.pid == 1:
                     self.switch_seed(0)
-                    r_pow = self.rand_mat(pow - 1, n, fid)
+                    r_pow = random_ndarray(base=self.primes[fid], shape=(power - 1, n))
                     self.restore_seed(0)
                 else:
-                    r_pow = self.receive_matrix(0, msg_len=TypeOps.get_mat_len(pow - 1, n), fid=fid)
+                    r_pow = self.receive_matrix(
+                        0, msg_len=TypeOps.get_mat_len(power - 1, n),
+                        shape=(power - 1, n))
 
-                x_r_pow = Matrix(pow - 1, n).set_field(self.primes[fid])
-                x_r_pow[0] = self.mul_elem(x_r, x_r)
+                x_r_pow: np.ndarray = zeros((power - 1, n))
+                x_r_pow[0][:] = mul_mod(x_r, x_r, self.primes[fid])
+                
                 for p in range(1, x_r_pow.shape[0]):
-                    x_r_pow[p] = self.mul_elem(x_r_pow[p - 1], x_r)
-                    x_r_pow[p].set_field(self.primes[fid])
+                    x_r_pow[p][:] = mul_mod(x_r_pow[p - 1], x_r, self.primes[fid])
 
-                pascal_matrix = self.get_pascal_matrix(pow, fid=0)
+                pascal_matrix: np.ndarray = self.get_pascal_matrix(power)
 
-                b.set_dims(pow + 1, n, base=self.primes[fid])
+                b.resize((power + 1, n))
 
-                if (self.pid == 1):
-                    b[0] += Vector([Zp(1, base=self.primes[fid]) for _ in range(n)])
-                b[1] = x * Vector([Zp(1, base=self.primes[fid]) for _ in range(n)])
+                if self.pid == 1:
+                    b[0][:] = add_mod(b[0], ones(n), self.primes[fid])
+                b[1][:] = x
 
-                for p in range(2, pow + 1):
-                    if (self.pid == 1):
-                        b[p] = Vector(x_r_pow[p - 2])
+                for p in range(2, power + 1):
+                    if self.pid == 1:
+                        b[p][:] = x_r_pow[p - 2]
 
-                    if (p == 2):
-                        b[p] += self.mul_elem(x_r, r) * Vector([pascal_matrix[p][1] for _ in range(n)])
+                    if p == 2:
+                        b[p] = add_mod(
+                            b[p],
+                            mul_mod(mul_mod(x_r, r, self.primes[fid]), pascal_matrix[p][1], self.primes[fid]),
+                            self.primes[fid])
                     else:
-                        b[p] += self.mul_elem(x_r_pow[p - 3], r) * Vector([pascal_matrix[p][1] for _ in range(n)])
+                        b[p] = add_mod(
+                            b[p],
+                            mul_mod(mul_mod(x_r_pow[p - 3], r, self.primes[fid]), pascal_matrix[p][1], self.primes[fid]),
+                            self.primes[fid])
 
                         for j in range(2, p - 1):
-                            b[p] += self.mul_elem(x_r_pow[p - 2 - j], r_pow[j - 2]) * Vector([pascal_matrix[p][j] for _ in range(n)])
+                            b[p] = add_mod(
+                                b[p],
+                                mul_mod(mul_mod(x_r_pow[p - 2 - j], r_pow[j - 2], self.primes[fid]), pascal_matrix[p][j], self.primes[fid]),
+                                self.primes[fid])
                         
-                        b[p] += self.mul_elem(x_r, r_pow[p - 3]) * Vector([pascal_matrix[p][p - 1] for _ in range(n)])
+                        b[p] = add_mod(
+                            b[p],
+                            mul_mod(mul_mod(x_r, r_pow[p - 3], self.primes[fid]), pascal_matrix[p][p - 1], self.primes[fid]),
+                            self.primes[fid])
 
-                    b[p] += r_pow[p - 2]
-        b.set_field(self.primes[fid])
+                    b[p] = add_mod(b[p], r_pow[p - 2], self.primes[fid])
         
         return b
     
