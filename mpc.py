@@ -141,7 +141,14 @@ class MPCEnv:
                     numer[k][j] = ((0 if k == 0 else int(numer[k - 1][j])) - int(numer[k][j]) * int(x[i])) % self.primes[fid]
                 denom_inv[i] = (int(denom_inv[i]) * (1 if x[i] > x[j] else -1) * int(inv_table[abs(x[i] - x[j])])) % self.primes[fid]
 
-        return np.sum(mul_mod(numer, denom_inv, self.primes[fid]), axis=1)
+        numer_dot = mul_mod(numer, denom_inv, self.primes[fid])
+        numer_sum = zeros(n)
+
+        for i in range(n):
+            for e in numer_dot[i]:
+                numer_sum[i] = add_mod(numer_sum[i], e, self.primes[fid])
+
+        return numer_sum
     
     def setup_channels(self: 'MPCEnv', pairs: list) -> bool:
         for pair in pairs:
