@@ -32,7 +32,7 @@ def mul_mod(x: np.ndarray, y: np.ndarray, field: int) -> np.ndarray:
   
     return np.mod(res, field)
 
-print(mul_mod(np.array([9, 9, 3, 4, 5]), np.array([1, 2, 3, 4, 5]), 20))
+
 class TypeOps:
     @staticmethod
     def set_bit(x: int, p: int) -> int:
