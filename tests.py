@@ -3,7 +3,7 @@ import time
 import numpy as np
 
 import param
-from custom_types import TypeOps
+from custom_types import TypeOps, add_mod
 from mpc import MPCEnv
 from param import BASE_P
 
@@ -19,7 +19,7 @@ def assert_approx(result, expected, error = 10 ** (-5)):
 def test_all(mpc: MPCEnv = None, pid: int = None):
     if mpc is not None and pid is not None:
         if pid != 0:
-            assert_values(mpc.lagrange_cache[2][1][1], -3882169039268753383)  # TODO: Fix lagrange calculator.
+            assert_values(mpc.lagrange_cache[2][1][1], 3230842732397049013)  # TODO: Fix lagrange calculator.
         
         revealed_value: np.ndarray = mpc.reveal_sym(np.array(10) if pid == 1 else np.array(7))
         if pid != 0:
@@ -51,7 +51,7 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         else:
             r_0 = mpc.receive_ndarray(0, msg_len=TypeOps.get_bytes_len(x_r), ndim=x_r.ndim, shape=x_r.shape)
             assert_values(r_0, mpc.reveal_sym(r))
-            assert_values((x_r + mpc.reveal_sym(r)) % mpc.primes[0], np.array([13, 15, 17]))
+            assert_values(add_mod(x_r, mpc.reveal_sym(r), mpc.primes[0]), np.array([13, 15, 17]))
         
         x_r, r = mpc.beaver_partition(
             np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]) if pid == 1 else
@@ -62,7 +62,7 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         else:
             r_0 = mpc.receive_ndarray(0, msg_len=TypeOps.get_bytes_len(x_r), ndim=x_r.ndim, shape=x_r.shape)
             assert_values(r_0, mpc.reveal_sym(r))
-            assert_values((x_r + mpc.reveal_sym(r)) % mpc.primes[0], np.array([[11, 13, 15], [17, 19, 21], [23, 25, 27]]))
+            assert_values(add_mod(x_r, mpc.reveal_sym(r), mpc.primes[0]), np.array([[11, 13, 15], [17, 19, 21], [23, 25, 27]]))
         
         # p = mpc.powers(Vector([Zp(2, BASE_P), Zp(0, BASE_P) if pid == 1 else Zp(1, BASE_P), Zp(3, BASE_P)]), 10, fid=0)
         # revealed_p = Matrix().from_value(mpc.reveal_sym(p, fid=0))
