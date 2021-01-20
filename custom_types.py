@@ -100,7 +100,7 @@ class TypeOps:
         
         if arr.ndim == 0:
             base = b'0' * BASE_LEN
-            str_val: str = str(arr)
+            str_val: str = str(arr)  # '{:f}'.format(arr)
             return (base + str_val.encode('utf-8'))[len(str_val):]
         
         separator: str = b';' if arr.ndim == 2 else b'.'
