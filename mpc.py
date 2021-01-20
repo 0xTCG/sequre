@@ -11,7 +11,7 @@ import numpy as np
 import param
 from c_socket import CSocket
 from connect import connect, open_channel
-from custom_types import TypeOps, zeros, ones, random_ndarray
+from custom_types import TypeOps, zeros, ones, random_ndarray, add_mod,  mul_mod
 from utils import bytes_to_arr
 
 Zp = None
@@ -253,7 +253,7 @@ class MPCEnv:
             sent_data = self.send_elem(elem, 3 - self.pid)
             assert sent_data == msg_len, f'Sent {sent_data} bytes but expected {msg_len}'
             
-        return (elem + received_elem) % self.primes[fid]
+        return add_mod(elem, received_elem, self.primes[fid])
     
     def switch_seed(self: 'MPCEnv', pid: int):
         self.prg_states[self.pid] = np.random.get_state()
@@ -278,17 +278,13 @@ class MPCEnv:
             r_2: np.ndarray = random_ndarray(base=self.primes[fid], shape=x_.shape)
             self.restore_seed(2)
 
-            r: np.ndarray = r_1 + r_2
-            r %= self.primes[fid]
+            r: np.ndarray = add_mod(r_1, r_2, self.primes[fid])
         else:
             self.switch_seed(0)
             r: np.ndarray = random_ndarray(base=self.primes[fid], shape=x_.shape)
             self.restore_seed(0)
-            r %= self.primes[fid]
             
-            x_r = x_ - r
-            x_r %= self.primes[fid]
-            
+            x_r = (x_ - r) % self.primes[fid]
             x_r = self.reveal_sym(x_r, fid=fid)
         
         return x_r, r
