@@ -1,6 +1,6 @@
 import random
 
-from functools import partial
+from functools import partial, reduce
 from copy import deepcopy
 
 import numpy as np
@@ -28,6 +28,18 @@ def mul_mod(x: np.ndarray, y: np.ndarray, field: int) -> np.ndarray:
         broadcast_y //= 2
   
     return np.mod(res, field)
+
+def matmul_mod(x: np.ndarray, y: np.ndarray, field: int) -> np.ndarray:
+    assert x.shape[1] == y.shape[0]
+
+    new_mat = zeros((x.shape[0], y.shape[1]))
+
+    for i in range(x.shape[0]):
+        for j in range(y.shape[1]):
+            new_mat[i][j] = reduce(
+                partial(add_mod, field=field), mul_mod(x[i], y.T[j], field), np.array(0, dtype=np.int64))
+    
+    return new_mat
 
 # Numpy overrides
 zeros = partial(np.zeros, dtype=np.int64)
