@@ -14,7 +14,25 @@ ones = partial(np.ones, dtype=np.int64)
 def random_ndarray(base: int, shape: tuple) -> np.ndarray:
     return np.random.randint(base, size=shape)
 
+def add_mod(x: np.ndarray, y: np.ndarray, field: int) -> np.ndarray:
+    return np.mod(x - (-y + field), field)
 
+def mul_mod(x: np.ndarray, y: np.ndarray, field: int) -> np.ndarray: 
+    res: np.ndarray = zeros(shape=x.shape)
+    broadcast_y: np.ndarray = zeros(shape=x.shape)
+    x = np.mod(x, field)
+    broadcast_y[:] = np.broadcast_to(y, x.shape)
+    
+    while np.any(broadcast_y > 0): 
+        indices = np.where(broadcast_y % 2 == 1)
+        res[indices] = add_mod(res[indices], x[indices], field)
+  
+        x = add_mod(x, x, field)
+        broadcast_y //= 2
+  
+    return np.mod(res, field)
+
+print(mul_mod(np.array([9, 9, 3, 4, 5]), np.array([1, 2, 3, 4, 5]), 20))
 class TypeOps:
     @staticmethod
     def set_bit(x: int, p: int) -> int:
