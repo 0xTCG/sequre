@@ -67,17 +67,17 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         p: np.ndarray = mpc.powers(np.array([2, 0 if pid == 1 else 1, 3], dtype=np.int64), 10, fid=0)
         revealed_p: np.ndarray = mpc.reveal_sym(p)
         if pid != 0:
-            assert_values(revealed_p[10], np.array([1048576, 1, 60466176]))
+            assert_values(revealed_p[10], np.array([1048576, 1, 60466176], dtype=np.int64))
         
-        # coeff = Matrix().from_value(Vector([Vector([Zp(1, BASE_P)] * 3), Vector([Zp(2, BASE_P)] * 3), Vector([Zp(3, BASE_P)] * 3)]))
-        # p = mpc.evaluate_poly(Vector([Zp(1, BASE_P), Zp(2, BASE_P), Zp(3, BASE_P)]), coeff, fid=0)
-        # revealed_p = mpc.reveal_sym(p, fid=0)
-        # if pid != 0:
-        #     expected_mat = Vector([
-        #         Vector([Zp(7, BASE_P), Zp(21, BASE_P), Zp(43, BASE_P)]),
-        #         Vector([Zp(14, BASE_P), Zp(42, BASE_P), Zp(86, BASE_P)]),
-        #         Vector([Zp(21, BASE_P), Zp(63, BASE_P), Zp(129, BASE_P)])])
-        #     assert_values(revealed_p, expected_mat)
+        coeff = np.array([[1] * 3, [2] * 3, [3] * 3], dtype=np.int64)
+        p: np.ndarray = mpc.evaluate_poly(np.array([1, 2, 3], dtype=np.int64), coeff, fid=0)
+        revealed_p = mpc.reveal_sym(p)
+        if pid != 0:
+            expected_mat = np.array([
+                [7, 21, 43],
+                [14, 42, 86],
+                [21, 63, 129]], dtype=np.int64)
+            assert_values(revealed_p, expected_mat)
         
         # a: Zp = mpc.double_to_fp(2 if pid == 1 else 1.14, param.NBIT_K, param.NBIT_F, fid=0)
         # b: Zp = mpc.double_to_fp(3 if pid == 1 else 2.95, param.NBIT_K, param.NBIT_F, fid=0)
