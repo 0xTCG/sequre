@@ -11,7 +11,7 @@ import numpy as np
 import param
 from c_socket import CSocket
 from connect import connect, open_channel
-from custom_types import TypeOps, zeros, ones, random_ndarray, add_mod,  mul_mod
+from custom_types import TypeOps, zeros, ones, random_ndarray, add_mod, mul_mod, matmul_mod
 from utils import bytes_to_arr
 
 Zp = None
@@ -406,19 +406,17 @@ class MPCEnv:
         
         return b
     
-    def evaluate_poly(self: 'MPCEnv', x: Vector, coeff: Matrix, fid: int) -> Matrix:
+    def evaluate_poly(self: 'MPCEnv', x: np.ndarray, coeff: np.ndarray, fid: int) -> np.ndarray:
         n: int = len(x)
         npoly: int = coeff.shape[0]
         deg: int = coeff.shape[1] - 1
 
-        pows: Matrix = self.powers(x, deg, fid)
+        pows: np.ndarray = self.powers(x, deg, fid)
 
-        if (self.pid > 0):
-            evaluated_poly = coeff.mult(pows)
-            evaluated_poly.set_field(self.primes[fid])
-            return Matrix().from_value(evaluated_poly)
+        if self.pid > 0:
+            return matmul_mod(coeff, pows, self.primes[fid])
         
-        return Matrix(npoly, n)
+        return zeros((npoly, n))
     
     def add_public(self: 'MPCEnv', x: object, a: object) -> object:
         if self.pid == 1:
