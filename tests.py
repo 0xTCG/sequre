@@ -93,14 +93,12 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         if pid != 0:
             assert_approx(float_a, 8.21)
 
-        # a_mat = Matrix(1, 1)
-        # a_mat[0][0] = a
-        # b_mat = Matrix(1, 1)
-        # b_mat[0][0] = b
-        # d: Matrix = mpc.mult_elem(a_mat, b_mat, fid=0)
-        # mpc.print_fp_elem(d[0][0], fid=0)
+        a_mat = np.array([[int(a)]], dtype=np.int64)
+        b_mat = np.array([[int(b)]], dtype=np.int64)
+        d: np.ndarray = mpc.multiply(a_mat, b_mat, elem_wise=True, fid=0)
+        mpc.print_fp(d, fid=0)
         # mpc.trunc(d, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
-        # float_d = mpc.print_fp_elem(d[0][0], fid=0)
+        # float_d = mpc.print_fp(d, fid=0)
         # if pid != 0:
         #     assert_approx(float_d, 48.8495)
 
