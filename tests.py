@@ -110,29 +110,17 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         if pid != 0:
             assert_values(revealed_p, expected_p)
 
-        # a = Vector([
-        #     mpc.double_to_fp(18, param.NBIT_K, param.NBIT_F, 0),
-        #     mpc.double_to_fp(128, param.NBIT_K, param.NBIT_F, 0),
-        #     mpc.double_to_fp(32, param.NBIT_K, param.NBIT_F, 0),
-        #     mpc.double_to_fp(50, param.NBIT_K, param.NBIT_F, 0)])
-        # b, b_inv = mpc.fp_sqrt(a)
-        # float_b_1 = mpc.print_fp_elem(b[0], fid=0)
-        # float_b_2 = mpc.print_fp_elem(b[1], fid=0)
-        # float_b_3 = mpc.print_fp_elem(b[2], fid=0)
-        # float_b_4 = mpc.print_fp_elem(b[3], fid=0)
-        # float_b_inv_1 = mpc.print_fp_elem(b_inv[0], fid=0)
-        # float_b_inv_2 = mpc.print_fp_elem(b_inv[1], fid=0)
-        # float_b_inv_3 = mpc.print_fp_elem(b_inv[2], fid=0)
-        # float_b_inv_4 = mpc.print_fp_elem(b_inv[3], fid=0)
-        # if pid != 0:
-        #     assert_approx(float_b_1, 6)
-        #     assert_approx(float_b_2, 16)
-        #     assert_approx(float_b_3, 8)
-        #     assert_approx(float_b_4, 10)
-        #     assert_approx(float_b_inv_1, 0.1666666)
-        #     assert_approx(float_b_inv_2, 0.0625)
-        #     assert_approx(float_b_inv_3, 0.125)
-        #     assert_approx(float_b_inv_4, 0.1)
+        a = np.array([
+            mpc.double_to_fp(18, param.NBIT_K, param.NBIT_F, 0),
+            mpc.double_to_fp(128, param.NBIT_K, param.NBIT_F, 0),
+            mpc.double_to_fp(32, param.NBIT_K, param.NBIT_F, 0),
+            mpc.double_to_fp(50, param.NBIT_K, param.NBIT_F, 0)], dtype=np.int64)
+        b, b_inv = mpc.fp_sqrt(a)
+        float_b: np.ndarray = mpc.print_fp(b, fid=0)
+        float_b_inv: np.ndarray = mpc.print_fp(b_inv, fid=0)
+        if pid != 0:
+            assert_approx(float_b, np.array([6, 16, 8, 10]))
+            assert_approx(float_b_inv, np.array([0.1666666, 0.0625, 0.125, 0.1]))
 
         # a = Vector([Zp(7, BASE_P), Zp(256, BASE_P), Zp(99, BASE_P), Zp(50, BASE_P)])
         # b = Vector([Zp(6, BASE_P), Zp(16, BASE_P), Zp(3, BASE_P), Zp(40, BASE_P)])
