@@ -440,7 +440,24 @@ class MPCEnv:
 
         return ab
 
-    def beaver_mult(self: 'MPCEnv', x_r: Matrix, r_1: Matrix,
+    def beaver_mult(
+            self: 'MPCEnv', x_r: np.ndarray, r_1: np.ndarray,
+            y_r: np.ndarray, r_2: np.ndarray, elem_wise: bool, fid: int) -> np.ndarray:
+        xy: np.ndarray = zeros((r_1.shape[0], r_1.shape[1] if elem_wise else r_2.shape[1]))
+        mul_func: callable = partial(mul_mod if elem_wise else matmul_mod, field=self.primes[fid])
+        
+        if self.pid == 0:
+            r_1_r_2 = mul_func(r_1, r_2)
+            xy = add_mod(xy, r_1_r_2, self.primes[fid])
+        else:
+            xy = add_mod(xy, mul_func(x_r, r_2), self.primes[fid])
+            xy = add_mod(xy, mul_func(r_1, y_r), self.primes[fid])
+            if self.pid == 1:
+                xy = add_mod(xy, mul_func(x_r, y_r), self.primes[fid])
+
+        return xy
+
+    def beaver_mult_obsolete(self: 'MPCEnv', x_r: Matrix, r_1: Matrix,
                     y_r: Matrix, r_2: Matrix, elem_wise: bool, fid: int) -> Matrix:
         x_r_ = x_r.to_field(self.primes[fid])
         r_1_ = r_1.to_field(self.primes[fid])
@@ -468,51 +485,44 @@ class MPCEnv:
 
         return xy
 
-    def beaver_mult_elem(self: 'MPCEnv', x_1_r: Matrix, r_1: Matrix, x_2_r: Matrix, r_2: Matrix, fid: int) -> Matrix:
-        return self.beaver_mult(x_1_r, r_1, x_2_r, r_2, True, fid)
-    
-    def beaver_reconstruct(self: 'MPCEnv', elem: object, fid: int) -> Matrix:
-            elem_ = elem.to_field(self.primes[fid])
-            msg_len=elem.get_bytes_len()
-            receive_func = None
-            if isinstance(elem, Zp):
-                receive_func = partial(self.receive_elem, msg_len=msg_len, fid=fid)
-            elif isinstance(elem, Matrix):
-                receive_func = partial(self.receive_matrix, msg_len=msg_len, fid=fid)
-            elif isinstance(elem, Vector):
-                receive_func = partial(self.receive_vector, msg_len=msg_len, fid=fid)
+    def beaver_reconstruct(self: 'MPCEnv', elem: np.ndarray, fid: int) -> np.ndarray:
+            msg_len: int = TypeOps.get_bytes_len(elem)
             
-            rand_func = None
-            if isinstance(elem, Zp):
-                rand_func = partial(self.rand_elem, fid=fid)
-            elif isinstance(elem, Matrix):
-                rand_func = partial(self.rand_mat, m=elem.shape[0], n=elem.shape[1], fid=fid)
-            elif isinstance(elem, Vector):
-                rand_func = partial(self.rand_vector, size=len(elem), fid=fid)
-
             if self.pid == 0:
                 self.switch_seed(1)
-                mask = rand_func()
+                mask: np.ndarray = random_ndarray(base=self.primes[fid], shape=elem.shape)
                 self.restore_seed(1)
-                mask.set_field(self.primes[fid])
 
-                mm = Matrix().from_value(elem_ - mask) if isinstance(elem, Matrix) else elem_ - mask
-                mm.set_field(self.primes[fid])
-                self.send_elem(Matrix().from_value(mm) if isinstance(elem, Matrix) else mm, 2)
+                mm: np.ndarray = np.mod(elem - mask, self.primes[fid])
+                self.send_elem(mm, 2)
+                
                 return mm
             else:
-                rr = None
+                rr: np.ndarray = None
                 if self.pid == 1:
                     self.switch_seed(0)
-                    rr = rand_func()
+                    rr = random_ndarray(base=self.primes[fid], shape=elem.shape)
                     self.restore_seed(0)
                 else:
-                    rr = receive_func(0)
+                    rr = self.receive_ndarray(
+                        from_pid=0,
+                        msg_len=msg_len,
+                        ndim=elem.ndim,
+                        shape=elem.shape)
                     
-                rr.set_field(self.primes[fid])
+                return add_mod(elem, rr, self.primes[fid])
 
-                return (elem_ + rr).set_field(self.primes[fid])
-            
+
+    def multiply(self: 'MPCEnv', a: np.ndarray, b: np.ndarray, elem_wise: bool, fid: int) -> np.ndarray:
+        x_1_r, r_1 = self.beaver_partition(a, fid)
+        x_2_r, r_2 = self.beaver_partition(b, fid)
+        
+        c = self.beaver_mult(x_1_r, r_1, x_2_r, r_2, elem_wise, fid)
+        c = self.beaver_reconstruct(c, fid)
+        
+        return c
+
+
     def mult_elem(self: 'MPCEnv', a: Matrix, b: Matrix, fid: int) -> Matrix:
         x_1_r, r_1 = self.beaver_partition(a, fid)
         x_2_r, r_2 = self.beaver_partition(b, fid)
