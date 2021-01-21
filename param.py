@@ -25,7 +25,7 @@ NBIT_K: int = 40  # 64 bit
 # NBIT_F: int = 45
 NBIT_F: int = 20  # 64 bit
 # NBIT_V: int = 64
-NBIT_V: int = 16  # 64 bit
+NBIT_V: int = 3  # 64 bit
 
 DIV_MAX_N = 100000
 
