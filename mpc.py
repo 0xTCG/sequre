@@ -12,7 +12,7 @@ import param
 from c_socket import CSocket
 from connect import connect, open_channel
 from custom_types import TypeOps, zeros, ones, random_ndarray, add_mod, mul_mod, matmul_mod
-from utils import bytes_to_arr
+from utils import bytes_to_arr, rand_int
 
 Zp = None
 Vector = None
@@ -423,23 +423,6 @@ class MPCEnv:
             return add_mod(x, a, self.primes[fid])
         return x
     
-    def beaver_mult_vec(self: 'MPCEnv', ar: Vector, am: Vector, br: Vector,
-                        bm: Vector, fid: int) -> Vector:
-        # Ugly instance checking will be bypassed with .seq generics
-        ab = (Vector([Zp(0, base=self.primes[fid]) for _ in range(len(am))])
-              if isinstance(am, Vector) else Zp(0, base=self.primes[fid]))
-        if self.pid == 0:
-            ab += self.mul_elem(am, bm)
-        else:
-            ab += ar * bm
-            ab += am * br
-            if self.pid == 1:
-                ab += ar * br
-
-        ab.set_field(self.primes[fid])
-
-        return ab
-
     def beaver_mult(
             self: 'MPCEnv', x_r: np.ndarray, r_1: np.ndarray,
             y_r: np.ndarray, r_2: np.ndarray, elem_wise: bool, fid: int) -> np.ndarray:
@@ -454,34 +437,6 @@ class MPCEnv:
             xy = add_mod(xy, mul_func(r_1, y_r), self.primes[fid])
             if self.pid == 1:
                 xy = add_mod(xy, mul_func(x_r, y_r), self.primes[fid])
-
-        return xy
-
-    def beaver_mult_obsolete(self: 'MPCEnv', x_r: Matrix, r_1: Matrix,
-                    y_r: Matrix, r_2: Matrix, elem_wise: bool, fid: int) -> Matrix:
-        x_r_ = x_r.to_field(self.primes[fid])
-        r_1_ = r_1.to_field(self.primes[fid])
-        y_r_ = y_r.to_field(self.primes[fid])
-        r_2_ = r_2.to_field(self.primes[fid])
-        xy = Matrix(r_1_.shape[0], r_2_.shape[0]
-                    if isinstance(r_2_.value[0], Zp) or isinstance(r_2_.value[0], int) 
-                    else r_2_.shape[1]).set_field(self.primes[fid])
-        if self.pid == 0:
-            r_1_r_2 = self.mul_elem(r_1_, r_2_) if elem_wise else r_1_.mult(r_2_)
-            xy += r_1_r_2
-        else:
-            if elem_wise:
-                for i in range(xy.shape[0]):
-                    for j in range(xy.shape[1]):
-                        xy[i][j] += x_r_[i][j] * r_2_[i][j]
-                        xy[i][j] += y_r_[i][j] * r_1_[i][j]
-                        if self.pid == 1:
-                            xy[i][j] += x_r_[i][j] * y_r_[i][j]
-            else:
-                xy += x_r_.mult(r_2_)
-                xy += r_1_.mult(y_r_)
-                if self.pid == 1:
-                    xy += x_r_.mult(y_r_)
 
         return xy
 
@@ -522,25 +477,6 @@ class MPCEnv:
         
         return c
 
-
-    def mult_elem(self: 'MPCEnv', a: Matrix, b: Matrix, fid: int) -> Matrix:
-        x_1_r, r_1 = self.beaver_partition(a, fid)
-        x_2_r, r_2 = self.beaver_partition(b, fid)
-        
-        c = self.beaver_mult_elem(x_1_r, r_1, x_2_r, r_2, fid)
-        c = self.beaver_reconstruct(c, fid)
-        
-        return c
-    
-    def mult_vec(self: 'MPCEnv', a: Vector, b: Vector, fid: int) -> Vector:
-        x_1_r, r_1 = self.beaver_partition(a, fid)
-        x_2_r, r_2 = self.beaver_partition(b, fid)
-        
-        c = self.beaver_mult_vec(x_1_r, r_1, x_2_r, r_2, fid)
-        c = self.beaver_reconstruct(c, fid)
-
-        return c
-    
     def fp_to_double(self: 'MPCEnv', a: np.ndarray, k: int, f: int, fid: int) -> np.ndarray:
         twokm1: int = TypeOps.left_shift(1, k - 1)
 
@@ -591,66 +527,58 @@ class MPCEnv:
     def table_lookup(self: 'MPCEnv', x: Vector, table_id: int, fid: int) -> Matrix:
         return self.evaluate_poly(x, self.lagrange_cache[table_id], fid=fid)
     
-    def rand_mat_bits(self: 'MPCEnv', num_rows: int, num_cols: int, num_bits: int, fid: int) -> Matrix:
-        # TODO change to int
-        rand_mat = Matrix(num_rows, num_cols)
+    def rand_mat_bits(self: 'MPCEnv', shape: tuple, num_bits: int, fid: int) -> np.ndarray:
+        assert num_bits < 64, f'Number of bits too big for numpy: {num_bits}'
+        return random_ndarray(((1 << num_bits) - 1), shape=shape) % self.primes[fid]
 
-        for i in range(num_rows):
-            for j in range(num_cols):
-                rand_mat[i][j] = Zp(Zp.randzp(base=((1 << num_bits) - 1)).value, base=self.primes[fid])
-
-        return rand_mat
-
-    def trunc(self: 'MPCEnv', a: Matrix, k: int = param.NBIT_K + param.NBIT_F, m: int = param.NBIT_F, fid: int = 0):
-        r = Matrix()
-        r_low = Matrix()
-        if (self.pid == 0):
-            r = self.rand_mat_bits(a.shape[0], a.shape[1], k + param.NBIT_V, fid=fid)
-            r_low.set_dims(a.shape[0], a.shape[1])
+    def trunc(self: 'MPCEnv', a: np.ndarray, k: int = param.NBIT_K + param.NBIT_F, m: int = param.NBIT_F, fid: int = 0):
+        msg_len: int = TypeOps.get_bytes_len(a)
+        
+        if self.pid == 0:
+            r: np.ndarray = self.rand_mat_bits(a.shape, k + param.NBIT_V, fid=fid)
+            r_low: np.ndarray = zeros(a.shape)
             
-            for i in range(0, a.shape[0]):
-                for j in range(0, a.shape[1]):
-                    r_low[i][j] = Zp(int(r[i][j]) & ((1 << m) - 1), base=self.primes[fid])
+            r_low = np.mod(r & ((1 << m) - 1), self.primes[fid])
 
             self.switch_seed(1)
-            r_mask = self.rand_mat(a.shape[0], a.shape[1], fid=0)
-            r_low_mask = self.rand_mat(a.shape[0], a.shape[1], fid=0)
+            r_mask: np.ndarray = random_ndarray(base=self.primes[fid], shape=a.shape)
+            r_low_mask: np.ndarray = random_ndarray(base=self.primes[fid], shape=a.shape)
             self.restore_seed(1)
 
-            r -= r_mask
-            r_low -= r_low_mask
+            r = np.mod(r - r_mask, self.primes[fid])
+            r_low = np.mod(r_low - r_low_mask, self.primes[fid])
 
-            self.send_elem(Matrix().from_value(r), 2)
-            self.send_elem(Matrix().from_value(r_low), 2)
+            self.send_elem(r, 2)
+            self.send_elem(r_low, 2)
         elif self.pid == 2:
-            r = self.receive_matrix(0, msg_len=TypeOps.get_mat_len(a.shape[0], a.shape[1]), fid=fid)
-            r_low = self.receive_matrix(0, msg_len=TypeOps.get_mat_len(a.shape[0], a.shape[1]), fid=fid)
+            r: np.ndarray = self.receive_ndarray(
+                from_pid=0, msg_len=msg_len, ndim=a.ndim, shape=a.shape)
+            r_low: np.ndarray = self.receive_ndarray(
+                from_pid=0, msg_len=msg_len, ndim=a.ndim, shape=a.shape)
         else:
             self.switch_seed(0)
-            r = self.rand_mat(a.shape[0], a.shape[1], fid=0)
-            r_low = self.rand_mat(a.shape[0], a.shape[1], fid=0)
+            r: np.ndarray = random_ndarray(base=self.primes[fid], shape=a.shape)
+            r_low: np.ndarray = random_ndarray(base=self.primes[fid], shape=a.shape)
             self.restore_seed(0)
 
-        c = Matrix().from_value(a + r) if self.pid > 0 else Matrix(a.shape[0], a.shape[1])
+        c = add_mod(a, r, self.primes[fid]) if self.pid > 0 else zeros(a.shape)
         c = self.reveal_sym(c, fid=fid)
 
-        c_low = Matrix(a.shape[0], a.shape[1])
-        if (self.pid > 0):
-            for i in range(0, a.shape[0]):
-                for j in range(0, a.shape[1]):
-                    c_low[i][j] = Zp(int(c[i][j]) & ((1 << m) - 1), base=self.primes[fid])
+        c_low: np.ndarray = zeros(a.shape)
+        if self.pid > 0:
+            c_low = np.mod(c & ((1 << m) - 1), self.primes[fid])
 
-        if (self.pid > 0):
-            a += r_low
-            if (self.pid == 1):
-                a -= c_low
+        if self.pid > 0:
+            a = add_mod(a, r_low, self.primes[fid])
+            if self.pid == 1:
+                a = np.mod(a - c_low, self.primes[fid])
 
             if m not in self.invpow_cache:
-                twoinv = Zp(2, base=self.primes[fid]).inv()
-                twoinvm = twoinv ** m
+                twoinv: int = TypeOps.mod_inv(2, self.primes[fid])
+                twoinvm = math.pow(twoinv, m, self.primes[fid])
                 self.invpow_cache[m] = twoinvm
                 
-            a *= self.invpow_cache[m]
+            a = mul_mod(a, self.invpow_cache[m], self.primes[fid]) 
     
     def lagrange_interp_simple(self: 'MPCEnv', y: Vector, fid: int) -> Vector:
         n: int = len(y)
