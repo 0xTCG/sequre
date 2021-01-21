@@ -418,9 +418,9 @@ class MPCEnv:
         
         return zeros((npoly, n))
     
-    def add_public(self: 'MPCEnv', x: object, a: object) -> object:
+    def add_public(self: 'MPCEnv', x: np.ndarray, a: np.ndarray, fid: int) -> np.ndarray:
         if self.pid == 1:
-            return x + a
+            return add_mod(x, a, self.primes[fid])
         return x
     
     def beaver_mult_vec(self: 'MPCEnv', ar: Vector, am: Vector, br: Vector,
@@ -537,7 +537,7 @@ class MPCEnv:
         sn: np.ndarray = np.where(a > twokm1, -1, 1)
         x: np.ndarray = np.where(a > twokm1, self.primes[fid] - a, a)
         x_trunc: np.ndarray = TypeOps.trunc_elem(x, k - 1)
-        x_int = TypeOps.right_shift(x_trunc, f)
+        x_int: np.ndarray = TypeOps.right_shift(x_trunc, f)
 
         # TODO: consider better ways of doing this?
         x_frac = np.zeros(a.shape)
