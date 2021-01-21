@@ -531,59 +531,27 @@ class MPCEnv:
 
         return c
     
-    def fp_to_double_elem(self: 'MPCEnv', a: Zp, k: int, f: int) -> float:
-        mat = Matrix(1, 1)
-        mat[0][0] = a
-        return self.fp_to_double(mat, k, f)[0][0]
-    
-    def fp_to_double_vec(self: 'MPCEnv', v: Vector, k: int, f: int) -> Vector:
-        mat = Matrix(1, len(v))
-        mat[0] = v
-        return self.fp_to_double(mat, k, f)[0]
-    
-    def fp_to_double(self: 'MPCEnv', a: Matrix, k: int, f: int) -> Matrix:
-        base = a[0][0].base
-        b = Matrix(a.shape[0], a.shape[1], t=float)
+    def fp_to_double(self: 'MPCEnv', a: np.ndarray, k: int, f: int, fid: int) -> np.ndarray:
         twokm1: int = TypeOps.left_shift(1, k - 1)
 
-        for i in range(0, a.shape[0]):
-            for j in range(0, a.shape[1]):
-                x = int(a[i][j])
-                sn = 1
-                if x > twokm1:  # negative number
-                    x = base - x
-                    sn = -1
+        sn: np.ndarray = np.where(a > twokm1, -1, 1)
+        x: np.ndarray = np.where(a > twokm1, self.primes[fid] - a, a)
+        x_trunc: np.ndarray = TypeOps.trunc_elem(x, k - 1)
+        x_int = TypeOps.right_shift(x_trunc, f)
 
-                x_trunc = TypeOps.trunc_elem(x, k - 1)
-                x_int = TypeOps.right_shift(x_trunc, f)
+        # TODO: consider better ways of doing this?
+        x_frac = np.zeros(a.shape)
+        for bi in range(f):
+            x_frac = np.where(TypeOps.bit(x_trunc, bi) > 0, x_frac + 1, x_frac)
+            x_frac /= 2
 
-                # TODO: consider better ways of doing this?
-                x_frac = 0
-                for bi in range(0, f):
-                    if TypeOps.bit(x_trunc, bi) > 0:
-                        x_frac += 1
-                    x_frac /= 2
+        return sn * (x_int + x_frac)
 
-                b[i][j] = sn * (x_int + x_frac)
-        
-        return b
-
-    def print_fp_elem(self: 'MPCEnv', elem: Zp, fid: int) -> float:
+    def print_fp(self: 'MPCEnv', mat: np.ndarray, fid: int) -> np.ndarray:
         if self.pid == 0:
             return None
-        revealed_elem: Zp = self.reveal_sym(elem, fid=fid)
-        elem_float: float = self.fp_to_double_elem(revealed_elem, param.NBIT_K, param.NBIT_F)
-
-        if self.pid == 2:
-            print(f'{self.pid}: {elem_float}')
-        
-        return elem_float
-
-    def print_fp(self: 'MPCEnv', mat: Matrix, fid: int) -> Matrix:
-        if self.pid == 0:
-            return None
-        revealed_mat: Vector = self.reveal_sym(mat, fid=fid)
-        mat_float: Matrix = self.fp_to_double(revealed_mat, param.NBIT_K, param.NBIT_F)
+        revealed_mat: np.ndarray = self.reveal_sym(mat, fid=fid)
+        mat_float: np.ndarray = self.fp_to_double(revealed_mat, param.NBIT_K, param.NBIT_F, fid=fid)
 
         if self.pid == 2:
             print(f'{self.pid}: {mat_float}')

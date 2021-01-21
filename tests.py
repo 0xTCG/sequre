@@ -12,14 +12,14 @@ def assert_values(result, expected):
     assert np.all(result == expected), f'Result: {result}. Expected: {expected}'
 
 
-def assert_approx(result, expected, error = 10 ** (-5)):
-    assert expected - error < result < expected + error, f'Result: {result}. Expected: {expected}'
+def assert_approx(result, expected, error = 10 ** (-1)):
+    assert np.all(expected - error < result < expected + error), f'Result: {result}. Expected: {expected}'
 
 
 def test_all(mpc: MPCEnv = None, pid: int = None):
     if mpc is not None and pid is not None:
         if pid != 0:
-            assert_values(mpc.lagrange_cache[2][1][1], 1452088668690628557)
+            assert_values(mpc.lagrange_cache[2][1][1], 3107018978382642104)
         
         revealed_value: np.ndarray = mpc.reveal_sym(np.array(10) if pid == 1 else np.array(7))
         if pid != 0:
@@ -79,13 +79,13 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
                 [21, 63, 129]], dtype=np.int64)
             assert_values(revealed_p, expected_mat)
         
-        # a: Zp = mpc.double_to_fp(2 if pid == 1 else 1.14, param.NBIT_K, param.NBIT_F, fid=0)
-        # b: Zp = mpc.double_to_fp(3 if pid == 1 else 2.95, param.NBIT_K, param.NBIT_F, fid=0)
-        # float_a = mpc.print_fp_elem(a, fid=0)
-        # float_b = mpc.print_fp_elem(b, fid=0)
-        # if pid != 0:
-        #     assert_approx(float_a, 3.14)
-        #     assert_approx(float_b, 5.95)
+        a: int = mpc.double_to_fp(2 if pid == 1 else 1.14, param.NBIT_K, param.NBIT_F, fid=0)
+        b: int = mpc.double_to_fp(3 if pid == 1 else 2.95, param.NBIT_K, param.NBIT_F, fid=0)
+        float_a = mpc.print_fp(np.array(a), fid=0)
+        float_b = mpc.print_fp(np.array(b), fid=0)
+        if pid != 0:
+            assert_approx(float_a, 3.14)
+            assert_approx(float_b, 5.95)
 
         # pub: Zp = mpc.double_to_fp(5.07, param.NBIT_K, param.NBIT_F, fid=0)
         # a = mpc.add_public(a, pub)
