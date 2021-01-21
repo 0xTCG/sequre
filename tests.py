@@ -87,11 +87,11 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_approx(float_a, 3.14)
             assert_approx(float_b, 5.95)
 
-        # pub: Zp = mpc.double_to_fp(5.07, param.NBIT_K, param.NBIT_F, fid=0)
-        # a = mpc.add_public(a, pub)
-        # float_a = mpc.print_fp_elem(a, fid=0)
-        # if pid != 0:
-        #     assert_approx(float_a, 8.21)
+        pub: int = mpc.double_to_fp(5.07, param.NBIT_K, param.NBIT_F, fid=0)
+        a: np.ndarray = mpc.add_public(np.array(a, dtype=np.int64), np.array(pub, dtype=np.int64), fid=0)
+        float_a = mpc.print_fp(a, fid=0)
+        if pid != 0:
+            assert_approx(float_a, 8.21)
 
         # a_mat = Matrix(1, 1)
         # a_mat[0][0] = a
