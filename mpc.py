@@ -426,17 +426,15 @@ class MPCEnv:
     def beaver_mult(
             self: 'MPCEnv', x_r: np.ndarray, r_1: np.ndarray,
             y_r: np.ndarray, r_2: np.ndarray, elem_wise: bool, fid: int) -> np.ndarray:
-        xy: np.ndarray = zeros((r_1.shape[0], r_1.shape[1] if elem_wise else r_2.shape[1]))
         mul_func: callable = partial(mul_mod if elem_wise else matmul_mod, field=self.primes[fid])
         
         if self.pid == 0:
-            r_1_r_2 = mul_func(r_1, r_2)
-            xy = add_mod(xy, r_1_r_2, self.primes[fid])
-        else:
-            xy = add_mod(xy, mul_func(x_r, r_2), self.primes[fid])
-            xy = add_mod(xy, mul_func(r_1, y_r), self.primes[fid])
-            if self.pid == 1:
-                xy = add_mod(xy, mul_func(x_r, y_r), self.primes[fid])
+            return mul_func(r_1, r_2)
+
+        xy = mul_func(x_r, r_2)
+        xy = add_mod(xy, mul_func(r_1, y_r), self.primes[fid])
+        if self.pid == 1:
+            xy = add_mod(xy, mul_func(x_r, y_r), self.primes[fid])
 
         return xy
 
