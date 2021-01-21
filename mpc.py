@@ -575,10 +575,12 @@ class MPCEnv:
 
             if m not in self.invpow_cache:
                 twoinv: int = TypeOps.mod_inv(2, self.primes[fid])
-                twoinvm = math.pow(twoinv, m, self.primes[fid])
+                twoinvm = pow(twoinv, m, self.primes[fid])
                 self.invpow_cache[m] = twoinvm
                 
-            a = mul_mod(a, self.invpow_cache[m], self.primes[fid]) 
+            a = mul_mod(a, self.invpow_cache[m], self.primes[fid])
+        
+        return a
     
     def lagrange_interp_simple(self: 'MPCEnv', y: Vector, fid: int) -> Vector:
         n: int = len(y)
