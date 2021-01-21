@@ -102,13 +102,13 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         if pid != 0:
             assert_approx(float_d, 48.8495)
 
-        # a = Vector([Zp(9, BASE_P) if pid == 1 else Zp(7, BASE_P), Zp(5, BASE_P) if pid == 1 else Zp(3, BASE_P)])
-        # b = Vector([Zp(4, BASE_P), Zp(1, BASE_P)])
-        # p = mpc.mult_vec(a, b, fid=0)
-        # revealed_p = mpc.reveal_sym(p, fid=0)
-        # expected_p = Vector([Zp(128, BASE_P), Zp(16, BASE_P)])
-        # if pid != 0:
-        #     assert_values(revealed_p, expected_p)
+        a = np.array([9 if pid == 1 else 7, 5 if pid == 1 else 3])
+        b = np.array([4, 1])
+        p = mpc.multiply(a, b, elem_wise=True, fid=0)
+        revealed_p = mpc.reveal_sym(p, fid=0)
+        expected_p = np.array([128, 16])
+        if pid != 0:
+            assert_values(revealed_p, expected_p)
 
         # a = Vector([
         #     mpc.double_to_fp(18, param.NBIT_K, param.NBIT_F, 0),
