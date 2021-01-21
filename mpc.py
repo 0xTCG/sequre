@@ -630,22 +630,21 @@ class MPCEnv:
         return [self.beaver_reconstruct(e, fid) for e in x]
 
     def mult_aux_parallel(self: 'MPCEnv', a: list, b: list, elem_wise: bool, fid: int) -> list:
+        # TODO: Make it parallel by having a and b as ndarrays
         assert len(a) == len(b)
         nmat: int = len(a)
 
-        out_rows = Vector([0] * nmat)
-        out_cols = Vector([0] * nmat)
+        out_rows = zeros(nmat)
+        out_cols = zeros(nmat)
 
         for k in range(nmat):
             if elem_wise:
-                assert (a[k].shape[0] == b[k].shape[0] and
-                        a[k].shape[1] == b[k].shape[1])
+                assert a[k].shape == b[k].shape
             else:
                 assert a[k].shape[1] == b[k].shape[0]
 
             out_rows[k] = a[k].shape[0]
             out_cols[k] = a[k].shape[1] if elem_wise else b[k].shape[1]
-
 
         ar, am = self.beaver_partition_bulk(a, fid)
         br, bm = self.beaver_partition_bulk(b, fid)
@@ -841,18 +840,6 @@ class MPCEnv:
 
         return c
 
-    def trunc_vec(self: 'MPCEnv', v: Vector, k: int = param.NBIT_K + param.NBIT_F, m: int = param.NBIT_F, fid: int = 0):
-        am = Matrix(1, len(v))
-        am[0] = v
-        self.trunc(am, k, m, fid=fid)
-        v.value = am[0].value
-    
-    def trunc_elem(self: 'MPCEnv', elem: Zp, k: int = param.NBIT_K + param.NBIT_F, m: int = param.NBIT_F, fid: int = 0):
-        am = Matrix(1, 1)
-        am[0][0] = elem
-        self.trunc(am, k, m, fid=fid)
-        elem.value = am[0][0].value
-    
     def less_than_bits_public(self: 'MPCEnv', a: Matrix, b_pub: Matrix, fid: int) -> Matrix:
         return self.less_than_bits_aux(a, b_pub, 2, fid)
 
@@ -898,39 +885,39 @@ class MPCEnv:
         
         return r, rbits
 
-    def normalizer_even_exp(self: 'MPCEnv', a: Vector) -> tuple:
+    def normalizer_even_exp(self: 'MPCEnv', a: np.ndarray) -> tuple:
         n: int = len(a)
         fid: int = 1
+        field: int = self.primes[fid]
 
         r, rbits = self.share_random_bits(param.NBIT_K, n, fid)
 
-        e = Vector([Zp(0, base=self.primes[0]) for _ in range(n)]) if self.pid == 0 else a + r
+        e = zeros(n) if self.pid == 0 else add_mod(a, r, field)
         e = self.reveal_sym(e, fid=0)
 
-        ebits = Matrix(n, param.NBIT_K, t=int) if self.pid == 0 else self.num_to_bits(e, param.NBIT_K)
+        ebits: np.ndarray = zeros(
+            (n, param.NBIT_K)) if self.pid == 0 else self.num_to_bits(e, param.NBIT_K)
 
-        c: Matrix = self.less_than_bits_public(rbits, ebits, fid)
+        c: np.ndarray = self.less_than_bits_public(rbits, ebits, fid)
         if self.pid > 0:
-            c = -c
+            c = np.mod(-c, field)
             if self.pid == 1:
-                for i in range(n):
-                    c[i] += 1
-            c.set_field(self.primes[fid])
+                c = add_mod(c, 1, field)
         
-        ep = Matrix(n, param.NBIT_K + 1).set_field(self.primes[fid])
+        ep: np.ndarray = zeros((n, param.NBIT_K + 1))
         if self.pid > 0:
             for i in range(n):
-                ep[i][0] = Zp(c[i].value, base=self.primes[fid])
+                ep[i][0] = c[i]
                 for j in range(1, param.NBIT_K + 1):
-                    ep[i][j] = Zp(
-                        (1 - 2 * ebits[i][j - 1]) * rbits[i][j - 1],
-                        base=self.primes[fid])
+                    temp: np.ndarray = mul_mod(ebits[i][j - 1], 2, field)
+                    ep[i][j] = mul_mod(
+                        np.mod(-add_mod(temp, -1, field), field), rbits[i][j - 1], field) 
                     if self.pid == 1:
-                        ep[i][j] += Zp(ebits[i][j - 1], base=self.primes[fid])
+                        ep[i][j] = add_mod(ep[i][j], ebits[i][j - 1], field)
 
-        E: Matrix = self.prefix_or(ep, fid).to_int()
+        E: np.ndarray = self.prefix_or(ep, fid)
 
-        tpneg = Matrix(n, param.NBIT_K, t=int)
+        tpneg: np.ndarray = zeros((n, param.NBIT_K))
         if self.pid > 0:
             for i in range(n):
                 for j in range(param.NBIT_K):
@@ -1066,26 +1053,32 @@ class MPCEnv:
 
         return Vector([int(c_arr[i][0][0]) if self.pid > 0 else 0 for i in range(n)])
 
-    def fp_sqrt(self: 'MPCEnv', a: Vector) -> tuple:
+    def fp_sqrt(self: 'MPCEnv', a: np.ndarray) -> tuple:
         n: int = len(a)
+        fid: int = 0
+        field: int = self.primes[fid]
 
         if n > param.DIV_MAX_N:
             nbatch: int = math.ceil(n / param.DIV_MAX_N)
-            b = Vector([Zp(0, base=self.primes[0]) for _ in range(n)])
-            b_inv = Vector([Zp(0, base=self.primes[0]) for _ in range(n)])
+            b = zeros(n)
+            b_inv = zeros(n)
+            
             for i in range(nbatch):
                 start: int = param.DIV_MAX_N * i
                 end: int = start + param.DIV_MAX_N
-                if end > n:
-                    end = n
+                if end > n: end = n
                 batch_size: int = end - start
-                a_copy = Vector([Zp(0, base=self.primes[0]) for _ in range(batch_size)])
+                a_copy = zeros(batch_size)
+                
                 for j in range(batch_size):
-                    a_copy[j] = Zp(a[start + j], base=self.primes[0])
+                    a_copy[j] = a[start + j]
+                
                 b_copy, b_inv_copy = self.fp_sqrt(a_copy)
+                
                 for j in range(batch_size):
-                    b[start + j] = Zp(b_copy[j], base=self.primes[0])
-                    b_inv[start + j] = Zp(b_inv_copy[j], base=self.primes[0])
+                    b[start + j] = b_copy[j]
+                    b_inv[start + j] = b_inv_copy[j]
+            
             return b
 
         # TODO: Currently using the same iter as division -- possibly need to update
@@ -1094,53 +1087,52 @@ class MPCEnv:
         # Initial approximation: 1 / sqrt(a_scaled) ~= 2.9581 - 4 * a_scaled + 2 * a_scaled^2
         s, s_sqrt = self.normalizer_even_exp(a)
 
-        a_scaled: Vector = self.mult_vec(a, s, fid=0)
-        self.trunc_vec(a_scaled, param.NBIT_K, param.NBIT_K - param.NBIT_F, fid=0)
+        a_scaled: np.ndarray = self.multiply(a, s, elem_wise=True, fid=fid)
+        a_scaled = self.trunc(a_scaled, param.NBIT_K, param.NBIT_K - param.NBIT_F, fid=fid)
 
-        a_scaled_sq: Vector = self.mult_vec(a_scaled, a_scaled, fid=0)
-        self.trunc_vec(a_scaled_sq, fid=0)
+        a_scaled_sq: np.ndarray = self.multiply(a_scaled, a_scaled, elem_wise=True, fid=fid)
+        a_scaled_sq = self.trunc(a_scaled_sq, fid=fid)
 
-        scaled_est = Vector([Zp(0, base=self.primes[0]) for _ in range(n)])
+        scaled_est = zeros(n)
+        
         if self.pid != 0:
-            scaled_est = a_scaled * (-4) + a_scaled_sq * 2
+            scaled_est = add_mod(
+                mul_mod(-a_scaled, 4, field), add_mod(a_scaled_sq, a_scaled_sq, field), field)
             if self.pid == 1:
-                coeff: Zp = self.double_to_fp(2.9581, param.NBIT_K, param.NBIT_F, fid=0)
-                for i in range(n):
-                    scaled_est[i] += coeff
+                coeff: int = self.double_to_fp(2.9581, param.NBIT_K, param.NBIT_F, fid=0)
+                scaled_est = add_mod(scaled_est, coeff, field)
 
-        h_and_g = [Matrix(1, n) for _ in range(2)]
+        # TODO: Make h_and_g a ndarray
+        h_and_g: list = [zeros((1, n)) for _ in range(2)]
 
-        h_and_g[0][0] = self.mult_vec(scaled_est, s_sqrt, fid=0)
+        h_and_g[0][0][:] = self.multiply(scaled_est, s_sqrt, elem_wise=True, fid=0)
         # Our scaled initial approximation (scaled_est) has bit length <= NBIT_F + 2
         # and s_sqrt is at most NBIT_K/2 bits, so their product is at most NBIT_K/2 +
         # NBIT_F + 2
-        self.trunc(h_and_g[0], param.NBIT_K // 2 + param.NBIT_F + 2,
-                  (param.NBIT_K - param.NBIT_F) // 2 + 1, fid=0)
+        h_and_g[0] = self.trunc(
+            h_and_g[0], param.NBIT_K // 2 + param.NBIT_F + 2, (param.NBIT_K - param.NBIT_F) // 2 + 1, fid=0)
 
-        h_and_g[1][0] = h_and_g[0][0] * 2
-        h_and_g[1][0] = self.mult_vec(h_and_g[1][0], a, fid=0)
-        self.trunc(h_and_g[1], k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F, fid=0)
+        h_and_g[1][0][:] = add_mod(h_and_g[0][0], h_and_g[0][0], field)
+        h_and_g[1][0][:] = self.multiply(h_and_g[1][0], a, elem_wise=True, fid=0)
+        h_and_g[1] = self.trunc(h_and_g[1], k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F, fid=0)
 
-        onepointfive: Zp = self.double_to_fp(1.5, param.NBIT_K, param.NBIT_F, fid=0)
+        onepointfive: int = self.double_to_fp(1.5, param.NBIT_K, param.NBIT_F, fid=0)
 
         for _ in range(niter):
-            h_and_g: list = [Matrix().from_value(h_and_g[0]),
-                             Matrix().from_value(h_and_g[1])]
-            r: Matrix = self.mult_elem(h_and_g[0], h_and_g[1], fid=0)
-            self.trunc(r, k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F, fid=0)
-            r = -r
+            r: np.ndarray = self.multiply(h_and_g[0], h_and_g[1], elem_wise=True, fid=0)
+            r = self.trunc(r, k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F, fid=0)
+            r = np.mod(-r, field)
             if self.pid == 1:
-                for i in range(n):
-                    r[0][i] += onepointfive
+                r[0][:] = add_mod(r[0], onepointfive, field)
 
-            r_dup = [Matrix().from_value(r), Matrix().from_value(r)]
+            r_dup: list = [r, r]
 
             h_and_g: list = self.mult_aux_parallel(h_and_g, r_dup, True, fid=0)
-            # TODO: write a version of Trunc with parallel processing
-            self.trunc(h_and_g[0], k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F, fid=0)
-            self.trunc(h_and_g[1], k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F, fid=0)
+            # TODO: write a version of Trunc with parallel processing (easy with h_and_g as ndarray)
+            h_and_g[0] = self.trunc(h_and_g[0], k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F, fid=0)
+            h_and_g[1] = self.trunc(h_and_g[1], k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F, fid=0)
 
-        b_inv = h_and_g[0][0] * 2
+        b_inv = add_mod(h_and_g[0][0], h_and_g[0][0], field)
         b = h_and_g[1][0]
         
         return b, b_inv
