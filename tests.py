@@ -114,7 +114,8 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         if pid != 0:
             assert_values(p_or, 1599650766643921085)
         
-        ne, ne_sqrt = mpc.normalizer_even_exp(b)
+        ne, ne_sqrt = mpc.normalizer_even_exp(np.array([4, 1]))
+        
         if pid != 0:
             nee_0 = mpc.print_fp(mpc.reveal_sym(ne, 0), 0)
             nee_1 = mpc.print_fp(mpc.reveal_sym(ne_sqrt, 0), 0)
