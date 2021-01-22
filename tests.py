@@ -141,18 +141,33 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         if pid != 0:
             assert_approx(float_d, np.array([1.1666666, 16, 33, 1.25]))
         
-        # a = Vector([
-        #     mpc.double_to_fp(1.5, param.NBIT_K, param.NBIT_F, 0),
-        #     mpc.double_to_fp(0.5, param.NBIT_K, param.NBIT_F, 0),
-        #     mpc.double_to_fp(2.5, param.NBIT_K, param.NBIT_F, 0)])
-        # v: Vector = mpc.householder(a)
-        # float_v_1 = mpc.print_fp_elem(v[0], fid=0)
-        # float_v_2 = mpc.print_fp_elem(v[1], fid=0)
-        # float_v_3 = mpc.print_fp_elem(v[2], fid=0)
-        # if pid != 0:
-        #     assert_approx(float_v_1, 0.86807)
-        #     assert_approx(float_v_2, 0.0973601)
-        #     assert_approx(float_v_3, 0.486801)
+        a = np.array([
+            mpc.double_to_fp(18, param.NBIT_K, param.NBIT_F, 0),
+            mpc.double_to_fp(128, param.NBIT_K, param.NBIT_F, 0),
+            mpc.double_to_fp(32, param.NBIT_K, param.NBIT_F, 0),
+            mpc.double_to_fp(50, param.NBIT_K, param.NBIT_F, 0)], dtype=np.int64)
+        b, b_inv = mpc.fp_sqrt(a)
+        float_b: np.ndarray = mpc.print_fp(b, fid=0)
+        float_b_inv: np.ndarray = mpc.print_fp(b_inv, fid=0)
+        if pid != 0:
+            assert_approx(float_b, np.array([6, 16, 8, 10]))
+            assert_approx(float_b_inv, np.array([0.1666666, 0.0625, 0.125, 0.1]))
+        
+        a = np.array([7, 256, 99, 50])
+        b = np.array([6, 16, 3, 40])
+        d = mpc.fp_div(a, b, fid=0)
+        float_d = mpc.print_fp(d, fid=0)
+        if pid != 0:
+            assert_approx(float_d, np.array([1.1666666, 16, 33, 1.25]))
+        
+        a = np.array([
+            mpc.double_to_fp(1.5, param.NBIT_K, param.NBIT_F, 0),
+            mpc.double_to_fp(0.5, param.NBIT_K, param.NBIT_F, 0),
+            mpc.double_to_fp(2.5, param.NBIT_K, param.NBIT_F, 0)], dtype=np.int64)
+        v: np.ndarray = mpc.householder(a)
+        float_v = mpc.print_fp(v, fid=0)
+        if pid != 0:
+            assert_approx(float_v, np.array([0.86807, 0.0973601, 0.486801]))
         
         # mat = Vector([
         #     Vector([mpc.double_to_fp(4, param.NBIT_K, param.NBIT_F, 0) for _ in range(3)]),
