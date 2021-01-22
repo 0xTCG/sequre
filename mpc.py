@@ -3,7 +3,7 @@ import time
 import random
 import math
 
-from functools import partial
+from functools import partial, reduce
 from copy import deepcopy
 
 import numpy as np
@@ -209,7 +209,7 @@ class MPCEnv:
     def receive_elem(self: 'MPCEnv', from_pid: int, msg_len: int) -> np.ndarray:
         return np.array(int(self.sockets[from_pid].receive(msg_len=msg_len)))
 
-    def receive_vector(self: 'MPCEnv', from_pid: int, msg_len: int, shape: tuple) -> Vector:
+    def receive_vector(self: 'MPCEnv', from_pid: int, msg_len: int, shape: tuple) -> np.ndarray:
         received_vec: np.ndarray = zeros(shape)
 
         for i, elem in enumerate(bytes_to_arr(self.sockets[from_pid].receive(msg_len=msg_len))):
@@ -217,7 +217,7 @@ class MPCEnv:
 
         return received_vec
     
-    def receive_matrix(self: 'MPCEnv', from_pid: int, msg_len: int, shape: tuple) -> Matrix:
+    def receive_matrix(self: 'MPCEnv', from_pid: int, msg_len: int, shape: tuple) -> np.ndarray:
         matrix: np.ndarray = zeros(shape)
         row_values = self.sockets[from_pid].receive(msg_len=msg_len).split(b';')
 
@@ -522,10 +522,10 @@ class MPCEnv:
         
         return (az_trunc * sn) % self.primes[fid]
     
-    def table_lookup(self: 'MPCEnv', x: Vector, table_id: int, fid: int) -> Matrix:
+    def table_lookup(self: 'MPCEnv', x: np.ndarray, table_id: int, fid: int) -> np.ndarray:
         return self.evaluate_poly(x, self.lagrange_cache[table_id], fid=fid)
     
-    def rand_mat_bits(self: 'MPCEnv', shape: tuple, num_bits: int, fid: int) -> np.ndarray:
+    def rand_bits(self: 'MPCEnv', shape: tuple, num_bits: int, fid: int) -> np.ndarray:
         assert num_bits < 64, f'Number of bits too big for numpy: {num_bits}'
         return random_ndarray(((1 << num_bits) - 1), shape=shape) % self.primes[fid]
 
@@ -533,7 +533,7 @@ class MPCEnv:
         msg_len: int = TypeOps.get_bytes_len(a)
         
         if self.pid == 0:
-            r: np.ndarray = self.rand_mat_bits(a.shape, k + param.NBIT_V, fid=fid)
+            r: np.ndarray = self.rand_bits(a.shape, k + param.NBIT_V, fid=fid)
             r_low: np.ndarray = zeros(a.shape)
             
             r_low = np.mod(r & ((1 << m) - 1), self.primes[fid])
@@ -580,35 +580,37 @@ class MPCEnv:
         
         return a
     
-    def lagrange_interp_simple(self: 'MPCEnv', y: Vector, fid: int) -> Vector:
+    def lagrange_interp_simple(self: 'MPCEnv', y: np.ndarray, fid: int) -> np.ndarray:
         n: int = len(y)
-        x = list(range(1, n + 1))
+        x = np.arange(1, n + 1)
 
         return self.lagrange_interp(x, y, fid)
 
-    def fan_in_or(self: 'MPCEnv', a: Matrix, fid: int) -> Vector:
+    def fan_in_or(self: 'MPCEnv', a: np.ndarray, fid: int) -> np.ndarray:
         n: int = a.shape[0]
         d: int = a.shape[1]
         a_sum = [0] * n
 
+        # TODO: Vectorize a_sum calculation below
         if self.pid > 0:
             for i in range(n):
                 a_sum[i] = int(self.pid == 1)
                 for j in range(d):
                     a_sum[i] += int(a[i][j])
-        a_sum = Vector(a_sum).set_field(self.primes[fid])
+        
+        a_sum = np.mod(a_sum ,self.primes[fid])
 
-        coeff = Matrix(1, d + 1, t=int)
+        coeff = zeros((1, d + 1))
 
         key: tuple = (d + 1, fid)
         if key not in self.or_lagrange_cache:
-            y = Vector([int(i != 0) for i in range(d + 1)])
+            y = np.array([int(i != 0) for i in range(d + 1)], dtype=np.int64)
             coeff_param = self.lagrange_interp_simple(y, fid) # OR function
             self.or_lagrange_cache[key] = coeff_param
 
-        coeff[0] = deepcopy(self.or_lagrange_cache[key])
-
+        coeff[0][:] = self.or_lagrange_cache[key]
         bmat = self.evaluate_poly(a_sum, coeff, fid)
+        
         return bmat[0]
     
     def reshape(self: 'MPCEnv', a: Matrix, nrows: int, ncols: int):
@@ -630,7 +632,7 @@ class MPCEnv:
         return [self.beaver_reconstruct(e, fid) for e in x]
 
     def mult_aux_parallel(self: 'MPCEnv', a: list, b: list, elem_wise: bool, fid: int) -> list:
-        # TODO: Make it parallel by having a and b as ndarrays
+        # TODO: Vectorize this method. Make it parallel by having a and b as ndarrays.
         assert len(a) == len(b)
         nmat: int = len(a)
 
@@ -654,11 +656,11 @@ class MPCEnv:
         
         return self.beaver_reconstruct_bulk(c, fid)
 
-    def mult_mat_parallel(self: 'MPCEnv', a: list, b: list, fid: int) -> Vector:
-        mults: list = self.mult_aux_parallel(a, b, False, fid)
-        return [Matrix().from_value(mult) for mult in mults]
+    def mult_mat_parallel(self: 'MPCEnv', a: list, b: list, fid: int) -> list:
+        # TODO: Vectorise/parallelize this method
+        return self.mult_aux_parallel(a, b, False, fid)
 
-    def prefix_or(self: 'MPCEnv', a: Matrix, fid: int) -> Matrix:
+    def prefix_or(self: 'MPCEnv', a: np.ndarray, fid: int) -> np.ndarray:
         n: int = a.shape[0]
 
         # Find next largest squared integer
@@ -666,32 +668,31 @@ class MPCEnv:
         L2: int = L * L
 
         # Zero-pad to L2 bits
-        a_padded = Matrix(n, L2)
+        a_padded: np.ndarray = zeros((n, L2))
         
         if self.pid > 0:
             for i in range(n):
                 for j in range(L2):
-                    if j < L2 - a.shape[1]:
-                        a_padded[i][j] = 0
-                    else:
+                    if j >= L2 - a.shape[1]:
                         a_padded[i][j] = a[i][j - L2 + a.shape[1]]
 
-        self.reshape(a_padded, n * L, L)
+        a_padded = a_padded.reshape((n * L, L))
 
-        x: Vector = self.fan_in_or(a_padded, fid)
+        x: np.ndarray = self.fan_in_or(a_padded, fid)
 
-        xpre = Matrix(n * L, L)
+        xpre: np.ndarray = zeros((n * L, L))
         
         if self.pid > 0:
             for i in range(n):
                 for j in range(L):
                     xpi: int = L * i + j
                     for k in range(L):
-                        xpre[xpi][k] = x[L * i + k] * Zp(int(k <= j), base=self.primes[fid])
+                        xpre[xpi][k] = x[L * i + k] * int(k <= j)
         
-        y: Vector = self.fan_in_or(xpre, fid)
+        y: np.ndarray = self.fan_in_or(xpre, fid)
 
-        f = [Matrix(1, L) for _ in range(n)]
+        # TODO: Make it parallel by using ndarray
+        f: list = [zeros((1, L)) for _ in range(n)]
         if self.pid > 0:
             for i in range(n):
                 for j in range(L):
@@ -699,39 +700,40 @@ class MPCEnv:
                         f[i][0][j] = x[L * i]
                     else:
                         f[i][0][j] = y[L * i + j] - y[L * i + j - 1]
-                f[i].set_field(self.primes[fid])
+                f[i] %= self.primes[fid]
 
-        tmp = [Matrix(L, L) for _ in range(n)]
+        # TODO: Make it parallel by using ndarray
+        tmp: list = [zeros((L, L)) for _ in range(n)]
         if self.pid > 0:
             for i in range(n):
                 for j in range(L):
-                    tmp[i][j] = Vector(a_padded[L * i + j])
-                tmp[i].set_field(self.primes[fid])
+                    tmp[i][j][:] = a_padded[L * i + j]
+                tmp[i] %= self.primes[fid]
 
         c = self.mult_mat_parallel(f, tmp, fid)  # c is a concatenation of n 1-by-L matrices
 
-        cpre = Matrix(n * L, L).set_field(self.primes[fid])
+        cpre: np.ndarray = zeros((n * L, L))
         if self.pid > 0:
             for i in range(n):
                 for j in range(L):
                     cpi: int = L * i + j
                     for k in range(L):
-                        cpre[cpi][k] = c[i][0][k] * Zp(int(k <= j), base=self.primes[fid])
+                        cpre[cpi][k] = c[i][0][k] * int(k <= j)
 
-        bdot_vec: Vector = self.fan_in_or(cpre, fid)
+        bdot_vec: np.ndarray = self.fan_in_or(cpre, fid)
         
-        bdot = [Matrix(1, L).set_field(self.primes[fid]) for _ in range(n)]
+        bdot = [zeros((1, L)) for _ in range(n)]
         if self.pid > 0:
             for i in range(n):
                 for j in range(L):
-                    bdot[i][0][j] = Zp(bdot_vec[L * i + j].value, base=self.primes[fid])
+                    bdot[i][0][j] = bdot_vec[L * i + j]
 
         for i in range(n):
-            f[i].reshape(L, 1)
+            f[i] = f[i].reshape((L, 1))
 
         s = self.mult_mat_parallel(f, bdot, fid)
 
-        b = Matrix(n, a.shape[1]).set_field(self.primes[fid])
+        b = zeros(a.shape)
         if self.pid > 0:
             for i in range(n):
                 for j in range(a.shape[1]):
@@ -740,7 +742,8 @@ class MPCEnv:
                     il: int = j_pad // L
                     jl: int = j_pad - il * L
 
-                    b[i][j] = s[i][il][jl] + y[L * i + il] - f[i][il][0]
+                    b[i][j] = np.mod(
+                        add_mod(s[i][il][jl], y[L * i + il], self.primes[fid]) - f[i][il][0], self.primes[fid])
         
         return b
     
@@ -840,11 +843,11 @@ class MPCEnv:
 
         return c
 
-    def less_than_bits_public(self: 'MPCEnv', a: Matrix, b_pub: Matrix, fid: int) -> Matrix:
+    def less_than_bits_public(self: 'MPCEnv', a: np.ndarray, b_pub: np.ndarray, fid: int) -> np.ndarray:
         return self.less_than_bits_aux(a, b_pub, 2, fid)
 
-    def num_to_bits(self: 'MPCEnv', a: Vector, bitlen: int) -> Vector:
-        b = Matrix(len(a), bitlen, t=int)
+    def num_to_bits(self: 'MPCEnv', a: np.ndarray, bitlen: int) -> np.ndarray:
+        b = zeros((len(a), bitlen))
     
         for i in range(len(a)):
             for j in range(bitlen):
@@ -852,35 +855,31 @@ class MPCEnv:
     
         return b
     
-    def rand_vec_bits(self: 'MPCEnv', n: int, bitlen: int, fid: int) -> Vector:
-        am: Matrix = self.rand_mat_bits(1, n, bitlen, fid=fid)
-        return am[0]
-    
     def share_random_bits(self: 'MPCEnv', k: int, n: int, fid: int) -> tuple:
         if self.pid == 0:
-            r: Vector = self.rand_vec_bits(n, k + param.NBIT_V, fid=fid)
-            rbits: Matrix = self.num_to_bits(r, k)
+            r: np.ndarray = self.rand_bits(n, k + param.NBIT_V, fid=fid)
+            rbits: np.ndarray = self.num_to_bits(r, k)
 
             self.switch_seed(1)
-            r_mask: Vector = self.rand_vector(n, fid)
-            rbits_mask: Matrix = self.rand_mat(n, k, fid).to_int()
+            r_mask: np.ndarray = random_ndarray(self.primes[fid], n)
+            rbits_mask: np.ndarray = random_ndarray(self.primes[fid], (n, k))
             self.restore_seed(1)
 
             r -= r_mask
+            r %= self.primes[fid]
 
             rbits -= rbits_mask
-            rbits.set_field(self.primes[fid])
-            rbits.to_int()
+            rbits %= self.primes[fid]
 
             self.send_elem(r, 2)
-            self.send_elem(Matrix().from_value(rbits), 2)
+            self.send_elem(rbits, 2)
         elif self.pid == 2:
-            r: Vector = self.receive_vector(0, msg_len=TypeOps.get_vec_len(n), fid=fid)
-            rbits: Matrix = self.receive_matrix(0, msg_len=TypeOps.get_mat_len(n, k), fid=fid).to_int()
+            r: np.ndarray = self.receive_vector(0, msg_len=TypeOps.get_vec_len(n), shape=n)
+            rbits: np.ndarray = self.receive_matrix(0, msg_len=TypeOps.get_mat_len(n, k), shape=(n, k))
         else:
             self.switch_seed(0)
-            r: Vector = self.rand_vector(n, fid)
-            rbits: Matrix = self.rand_mat(n, k, fid).to_int()
+            r: np.ndarray = random_ndarray(self.primes[fid], n)
+            rbits: np.ndarray = random_ndarray(self.primes[fid], (n, k))
             self.restore_seed(0)
         
         return r, rbits
@@ -889,10 +888,12 @@ class MPCEnv:
         n: int = len(a)
         fid: int = 1
         field: int = self.primes[fid]
+        add_func = partial(add_mod, field=field)
+        mul_func = partial(mul_mod, field=field)
 
         r, rbits = self.share_random_bits(param.NBIT_K, n, fid)
 
-        e = zeros(n) if self.pid == 0 else add_mod(a, r, field)
+        e = zeros(n) if self.pid == 0 else add_func(a, r)
         e = self.reveal_sym(e, fid=0)
 
         ebits: np.ndarray = zeros(
@@ -902,18 +903,16 @@ class MPCEnv:
         if self.pid > 0:
             c = np.mod(-c, field)
             if self.pid == 1:
-                c = add_mod(c, 1, field)
+                c = add_func(c, 1)
         
         ep: np.ndarray = zeros((n, param.NBIT_K + 1))
         if self.pid > 0:
             for i in range(n):
                 ep[i][0] = c[i]
                 for j in range(1, param.NBIT_K + 1):
-                    temp: np.ndarray = mul_mod(ebits[i][j - 1], 2, field)
-                    ep[i][j] = mul_mod(
-                        np.mod(-add_mod(temp, -1, field), field), rbits[i][j - 1], field) 
+                    ep[i][j] = ((1 - 2 * ebits[i][j - 1]) * rbits[i][j - 1]) % field
                     if self.pid == 1:
-                        ep[i][j] = add_mod(ep[i][j], ebits[i][j - 1], field)
+                        ep[i][j] = add_func(ep[i][j], ebits[i][j - 1])
 
         E: np.ndarray = self.prefix_or(ep, fid)
 
@@ -921,137 +920,116 @@ class MPCEnv:
         if self.pid > 0:
             for i in range(n):
                 for j in range(param.NBIT_K):
-                    tpneg[i][j] = E[i][j] - rbits[i][j] * (1 - ebits[i][j])
-        tpneg.set_field(self.primes[fid]).to_int()
+                    tpneg[i][j] = (int(E[i][j]) - (1 - ebits[i][j]) * rbits[i][j]) % field
         
-        Tneg: Matrix = self.prefix_or(tpneg, fid).to_int()
+        Tneg: np.ndarray = self.prefix_or(tpneg, fid)
         half_len: int = param.NBIT_K // 2
 
-        efir = Matrix(n, param.NBIT_K, t=int)
-        rfir = Matrix(n, param.NBIT_K, t=int)
+        efir: np.ndarray = zeros((n, param.NBIT_K))
+        rfir: np.ndarray = zeros((n, param.NBIT_K))
         if self.pid > 0:
-            efir = self.mul_elem(ebits, Tneg)
-        efir.set_field(self.primes[fid])
-        rfir = self.mult_elem(
-            rbits.set_field(self.primes[fid]),
-            Tneg.set_field(self.primes[fid]), fid)
+            efir = mul_func(ebits, Tneg)
+        rfir = self.multiply(rbits, Tneg, True, fid)
 
-        efir = Matrix().from_value(efir).set_field(self.primes[fid])
-        rfir = Matrix().from_value(rfir).set_field(self.primes[fid])
+        double_flag: np.ndarray = self.less_than_bits(efir, rfir, fid)
 
-        double_flag: Vector = self.less_than_bits(efir, rfir, fid)
+        odd_bits = zeros((n, half_len))
+        even_bits = zeros((n, half_len))
 
-        odd_bits = Matrix(n, half_len, t=int)
-        even_bits = Matrix(n, half_len, t=int)
-        Tneg.to_int()
         if self.pid > 0:
             for i in range(n):
                 for j in range(half_len):
-                    odd_bits[i][j] = (1 - Tneg[i][2 * j + 1]) if self.pid == 1 else -Tneg[i][2 * j + 1]
+                    odd_bits[i][j] = np.mod(1 - Tneg[i][2 * j + 1], field) if self.pid == 1 else np.mod(-Tneg[i][2 * j + 1], field)
                     if ((2 * j + 2) < param.NBIT_K):
-                        even_bits[i][j] = (1 - Tneg[i][2 * j + 2]) if self.pid == 1 else -Tneg[i][2 * j + 2]
+                        even_bits[i][j] = np.mod(1 - Tneg[i][2 * j + 2], field) if self.pid == 1 else np.mod(-Tneg[i][2 * j + 2], field)
                     else:
                         even_bits[i][j] = 0
-        odd_bits.set_field(self.primes[fid]).to_int()
-        even_bits.set_field(self.primes[fid]).to_int()
 
-        odd_bit_sum = Vector([0] * n)
-        even_bit_sum = Vector([0] * n)
+        odd_bit_sum = zeros(n)
+        even_bit_sum = zeros(n)
+        
         for i in range(n):
-            for j in range(half_len):
-                odd_bit_sum[i] += odd_bits[i][j]
-                even_bit_sum[i] += even_bits[i][j]
+            odd_bit_sum[i] = reduce(add_func, odd_bits[i], 0)
+            even_bit_sum[i] = reduce(add_func, even_bits[i], 0)
 
-            if self.pid == 1:
-                odd_bit_sum[i] += 1
-                even_bit_sum[i] += 1
-        odd_bit_sum.set_field(self.primes[fid]).to_int()
-        even_bit_sum.set_field(self.primes[fid]).to_int()
+        if self.pid == 1:
+            odd_bit_sum = add_func(odd_bit_sum, 1)
+            even_bit_sum = add_func(even_bit_sum, 1)
 
         # If double_flag = true, then use odd_bits, otherwise use even_bits
 
-        diff = Vector([0] * n)
+        diff = zeros(n)
         if self.pid != 0:
-            diff: Vector = odd_bit_sum - even_bit_sum
-            diff.set_field(self.primes[fid]).to_int()
+            diff: np.ndarray = np.mod(odd_bit_sum - even_bit_sum, field)
 
-        diff: Vector = self.mult_vec(
-            double_flag.set_field(self.primes[fid]),
-            diff.set_field(self.primes[fid]), fid).to_int()
+        diff = self.multiply(double_flag, diff, True, fid)
         
-        chosen_bit_sum = Vector([0] * n)
+        chosen_bit_sum = zeros(n)
         if self.pid != 0:
-            chosen_bit_sum = even_bit_sum + diff
-            chosen_bit_sum.set_field(self.primes[fid])
+            chosen_bit_sum = add_func(even_bit_sum, diff)
         
-        b_mat: Matrix = self.table_lookup(chosen_bit_sum, 1, fid=0)
+        b_mat: np.ndarray = self.table_lookup(chosen_bit_sum, 1, fid=0)
 
         if self.pid > 0:
-            b_sqrt: Vector = b_mat[0]
-            b: Vector = b_mat[1]
+            b_sqrt: np.ndarray = b_mat[0]
+            b: np.ndarray = b_mat[1]
             return b, b_sqrt
         
-        return Vector([Zp(0, base=self.primes[fid]) for _ in range(n)]), Vector([Zp(0, base=self.primes[fid]) for _ in range(n)])
+        return zeros(n), zeros(n)
 
-    def less_than_bits(self: 'MPCEnv', a: Matrix, b: Matrix, fid: int) -> Vector:
+    def less_than_bits(self: 'MPCEnv', a: np.ndarray, b: np.ndarray, fid: int) -> np.ndarray:
         return self.less_than_bits_aux(a, b, 0, fid)
     
-    def less_than_bits_aux(self: 'MPCEnv', a: Matrix, b: Matrix, public_flag: int, fid: int) -> Vector:
-        assert a.shape[0] == b.shape[0]
-        assert a.shape[1] == b.shape[1]
+    def less_than_bits_aux(self: 'MPCEnv', a: np.ndarray, b: np.ndarray, public_flag: int, fid: int) -> np.ndarray:
+        assert a.shape == b.shape
 
         n: int = a.shape[0]
         L: int = a.shape[1]
+        field: int = self.primes[fid]
+        mul_func = partial(mul_mod, field=field)
+        add_func = partial(add_mod, field=field)
 
         # Calculate XOR
-        x = Matrix(n, L).set_field(self.primes[fid])
+        x = zeros((n, L))
 
         if public_flag == 0:
-            x: Matrix = self.mult_elem(a, b, fid)
+            x: np.ndarray = self.multiply(a, b, True, fid)
             if self.pid > 0:
-                x = a + b - x * Zp(2, base=self.primes[fid])
-                x.set_field(self.primes[fid])
+                x = np.mod(add_func(a, b) - add_func(x, x), field)
         elif self.pid > 0:
-            x = self.mul_elem(a, b)
-            x = a + b - x * 2
+            x = mul_func(a, b)
+            x = np.mod(add_func(a, b) - add_func(x, x), field)
             if self.pid == 2:
-                x -= a if public_flag == 1 else b
-            x.set_field(self.primes[fid])
+                x = np.mod(x - a if public_flag == 1 else b, field)
         
-        f: Matrix = self.prefix_or(x, fid)
+        f: np.ndarray = self.prefix_or(x, fid)
 
         if self.pid > 0:
             for i in range(n):
                 for j in range(L - 1, 0, -1):
-                    f[i][j] -= f[i][j - 1]
-            f.set_field(self.primes[fid])
+                    f[i][j] = (f[i][j] - f[i][j - 1]) % field
         
-        f.to_int()
-
         if public_flag == 2:
-            c = Vector([0] * n)
+            c = zeros(n)
             if self.pid > 0:
-                for i in range(n):
-                    c[i] = 0
-                    for j in range(L):
-                        c[i] += f[i][j] * b[i][j]
-                c.set_field(self.primes[fid]).to_int()
+                fb: np.ndarray = mul_func(f, b)
+                c[i] = reduce(add_func, fb[i], 0)
             
             return c
         
         # TODO: optimize
-        f_arr = [Matrix(1, L).set_field(self.primes[fid]) for _ in range(n)]
-        b_arr = [Matrix(L, 1).set_field(self.primes[fid]) for _ in range(n)]
+        f_arr = [zeros((1, L)) for _ in range(n)]
+        b_arr = [zeros((L, 1)) for _ in range(n)]
 
         if self.pid > 0:
             for i in range(n):
-                f_arr[i][0] = Vector(f[i].set_field(self.primes[fid]))
+                f_arr[i][0][:] = f[i]
                 for j in range(L):
                     b_arr[i][j][0] = b[i][j]
 
         c_arr: list = self.mult_mat_parallel(f_arr, b_arr, fid)
 
-        return Vector([int(c_arr[i][0][0]) if self.pid > 0 else 0 for i in range(n)])
+        return np.array([c_arr[i][0][0] if self.pid > 0 else 0 for i in range(n)], dtype=np.int64)
 
     def fp_sqrt(self: 'MPCEnv', a: np.ndarray) -> tuple:
         n: int = len(a)
