@@ -115,11 +115,9 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_values(p_or, 1599650766643921085)
         
         nee = mpc.normalizer_even_exp(b)
-        print('DEBUG', nee)
-        # nee_0 = mpc.print_fp(mpc.reveal_sym(nee[0], 0), 0)
-        # nee_1 = mpc.print_fp(mpc.reveal_sym(nee[1], 0), 0)
-        # if pid != 0:
-        #     assert_values(nee_0, 32768)
+        if pid != 0:
+            nee_0 = mpc.print_fp(mpc.reveal_sym(nee[0], 0), 0)[0]
+            assert_values(nee_0, 131072)
 
         # a = np.array([
         #     mpc.double_to_fp(18, param.NBIT_K, param.NBIT_F, 0),
