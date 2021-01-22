@@ -851,7 +851,7 @@ class MPCEnv:
     
         for i in range(len(a)):
             for j in range(bitlen):
-                b[i][j] = TypeOps.bit(int(a[i]), bitlen - 1 - j)
+                b[i][j] = int(TypeOps.bit(int(a[i]), bitlen - 1 - j))
     
         return b
     
@@ -901,10 +901,18 @@ class MPCEnv:
         
         c: np.ndarray = self.less_than_bits_public(rbits, ebits, fid)
 
+        if self.pid == 2:
+            print('ebits', ebits)
+            print('rbits', rbits)
+            print('cb', c)
+
         if self.pid > 0:
             c = np.mod(-c, field)
             if self.pid == 1:
                 c = add_func(c, 1)
+        
+        if self.pid == 2:
+            print('c', c)
         
         ep: np.ndarray = zeros((n, param.NBIT_K + 1))
         if self.pid > 0:
@@ -914,8 +922,14 @@ class MPCEnv:
                     ep[i][j] = ((1 - 2 * ebits[i][j - 1]) * rbits[i][j - 1]) % field
                     if self.pid == 1:
                         ep[i][j] = add_func(ep[i][j], ebits[i][j - 1])
+        
+        if self.pid == 2:
+            print('ep', ep)
 
         E: np.ndarray = self.prefix_or(ep, fid)
+
+        if self.pid == 2:
+            print('E', E)
 
         tpneg: np.ndarray = zeros((n, param.NBIT_K))
         if self.pid > 0:
@@ -923,14 +937,24 @@ class MPCEnv:
                 for j in range(param.NBIT_K):
                     tpneg[i][j] = (int(E[i][j]) - (1 - ebits[i][j]) * rbits[i][j]) % field
         
+        if self.pid == 2:
+            print('tpneg', tpneg)
+        
         Tneg: np.ndarray = self.prefix_or(tpneg, fid)
         half_len: int = param.NBIT_K // 2
+
+        if self.pid == 2:
+            print('Tneg', Tneg)
 
         efir: np.ndarray = zeros((n, param.NBIT_K))
         rfir: np.ndarray = zeros((n, param.NBIT_K))
         if self.pid > 0:
             efir = mul_func(ebits, Tneg)
         rfir = self.multiply(rbits, Tneg, True, fid)
+
+        if self.pid == 2:
+            print('efir', efir)
+            print('rfir', rfir)
 
         double_flag: np.ndarray = self.less_than_bits(efir, rfir, fid)
 
@@ -946,6 +970,10 @@ class MPCEnv:
                     else:
                         even_bits[i][j] = 0
 
+        if self.pid == 2:
+            print('odd_bits', odd_bits)
+            print('even_bits', even_bits)
+        
         odd_bit_sum = zeros(n)
         even_bit_sum = zeros(n)
         
