@@ -526,8 +526,13 @@ class MPCEnv:
         return self.evaluate_poly(x, self.lagrange_cache[table_id], fid=fid)
     
     def rand_bits(self: 'MPCEnv', shape: tuple, num_bits: int, fid: int) -> np.ndarray:
-        assert num_bits < 64, f'Number of bits too big for numpy: {num_bits}'
-        return random_ndarray(((1 << num_bits) - 1), shape=shape) % self.primes[fid]
+        upper_limit: int = self.primes[fid] - 1
+        if num_bits > 63:
+            print(f'Warning: Number of bits too big for numpy: {num_bits}')
+        else:
+            upper_limit = (1 << num_bits) - 1
+    
+        return random_ndarray(upper_limit, shape=shape) % self.primes[fid]
 
     def trunc(self: 'MPCEnv', a: np.ndarray, k: int = param.NBIT_K + param.NBIT_F, m: int = param.NBIT_F, fid: int = 0):
         msg_len: int = TypeOps.get_bytes_len(a)
@@ -747,37 +752,43 @@ class MPCEnv:
         
         return b
     
-    def int_to_fp(self: 'MPCEnv', a: int, k: int, f: int, fid: int) -> Zp:
+    def int_to_fp(self: 'MPCEnv', a: int, k: int, f: int, fid: int) -> int:
         sn = 1 if a >= 0 else -1
 
         az_shift: int = TypeOps.left_shift(a, f)
         az_trunc: int = TypeOps.trunc_elem(az_shift, k - 1)
 
-        return Zp(az_trunc * sn, base=self.primes[fid])
+        return (az_trunc * sn) % self.primes[fid]
 
-    def fp_div(self: 'MPCEnv', a: Vector, b: Vector, fid: int) -> Vector:
+    def fp_div(self: 'MPCEnv', a: np.ndarray, b: np.ndarray, fid: int) -> np.ndarray:
         assert len(a) == len(b)
 
         n: int = len(a)
+        field: int = self.primes[fid]
+        add_func = partial(add_mod, field=field)
+        mul_func = partial(mul_mod, field=field)
+        
         if n > param.DIV_MAX_N:
             nbatch: int = math.ceil(n / param.DIV_MAX_N)
-            c = Vector([Zp(0, base=self.primes[fid]) for _ in range(n)])
+            c = zeros(n)
+            
             for i in range(nbatch):
                 start: int = param.DIV_MAX_N * i
                 end: int = start + param.DIV_MAX_N
+                
                 if end > n:
                     end = n
                 batch_size: int = end - start
 
-                a_copy = None
-                b_copy = None
+                a_copy = zeros(batch_size)
+                b_copy = zeros(batch_size)
                 for j in range(batch_size):
-                    a_copy.append(Vector(a[start + j], deep_copy=True))
-                    b_copy.append(Vector(b[start + j], deep_copy=True))
+                    a_copy[j] = a[start + j]
+                    b_copy[j] = b[start + j]
 
-                c_copy: Vector = self.fp_div(a_copy, b_copy, fid=fid)
+                c_copy: np.ndarray = self.fp_div(a_copy, b_copy, fid=fid)
                 for j in range(batch_size):
-                    c[start + j] = Vector(c_copy[j], deep_copy=True)
+                    c[start + j] = c_copy[j]
             return c
 
         niter: int = 2 * math.ceil(math.log2(param.NBIT_K / 3.5)) + 1
@@ -785,63 +796,59 @@ class MPCEnv:
         # Initial approximation: 1 / x_scaled ~= 5.9430 - 10 * x_scaled + 5 * x_scaled^2
         s, _ = self.normalizer_even_exp(b)
 
-        b_scaled: Vector = self.mult_vec(b, s, fid=fid)
+        b_scaled: np.ndarray = self.multiply(b, s, True, fid=fid)
+        b_scaled = self.trunc(b_scaled, param.NBIT_K, param.NBIT_K - param.NBIT_F, fid=fid)
 
-        self.trunc_vec(b_scaled, param.NBIT_K, param.NBIT_K - param.NBIT_F, fid=fid)
+        b_scaled_sq: np.ndarray = self.multiply(b_scaled, b_scaled, True, fid=fid)
+        b_scaled_sq = self.trunc(b_scaled_sq, fid=fid)
 
-        b_scaled_sq: Vector = self.mult_vec(b_scaled, b_scaled, fid=fid)
-        self.trunc_vec(b_scaled_sq, fid=fid)
-
-        scaled_est = Vector([Zp(0, base=self.primes[fid]) for _ in range(n)])
+        scaled_est = zeros(n)
         if self.pid != 0:
-            scaled_est = -b_scaled * Zp(10, base=self.primes[fid]) + b_scaled_sq * Zp(5, base=self.primes[fid])
+            scaled_est = np.mod(
+                mul_func(b_scaled_sq, 5) - mul_func(b_scaled, 10), field)
             if self.pid == 1:
-                coeff: Zp = self.double_to_fp(5.9430, param.NBIT_K, param.NBIT_F, fid=fid)
-                scaled_est += coeff
+                coeff: int = self.double_to_fp(5.9430, param.NBIT_K, param.NBIT_F, fid=fid)
+                scaled_est = add_func(scaled_est, coeff)
 
-        w: Vector = self.mult_vec(scaled_est, s, fid=fid)
+        w: np.ndarray = self.multiply(scaled_est, s, True, fid=fid)
         # scaled_est has bit length <= NBIT_F + 2, and s has bit length <= NBIT_K
         # so the bit length of w is at most NBIT_K + NBIT_F + 2
-        self.trunc_vec(w, param.NBIT_K + param.NBIT_F + 2, param.NBIT_K - param.NBIT_F, fid=fid)
+        w = self.trunc(w, param.NBIT_K + param.NBIT_F + 2, param.NBIT_K - param.NBIT_F, fid=fid)
 
-        x: Vector = self.mult_vec(w, b, fid=fid)
-        self.trunc_vec(x, fid=fid)
+        x: np.ndarray = self.multiply(w, b, True, fid=fid)
+        x = self.trunc(x, fid=fid)
 
-        one: Zp = self.int_to_fp(1, param.NBIT_K, param.NBIT_F, fid=fid)
+        one: int = self.int_to_fp(1, param.NBIT_K, param.NBIT_F, fid=fid)
 
-        x = -x
+        x = np.mod(-x, field)
         if self.pid == 1:
-            for i in range(len(x)):
-                x[i] += one
+            x = add_func(x, one)
         
-        y: Vector = self.mult_vec(a, w, fid=fid)
-        self.trunc_vec(y, fid=fid)
+        y: np.ndarray = self.multiply(a, w, True, fid=fid)
+        y = self.trunc(y, fid=fid)
 
         for _ in range(niter):
             xr, xm = self.beaver_partition(x, fid=fid)
             yr, ym = self.beaver_partition(y, fid=fid)
 
-            xpr = deepcopy(xr)
+            xpr = xr.copy()
             if self.pid > 0:
-                xpr += one
+                xpr = add_func(xpr, one)
 
-            y: Vector = self.beaver_mult_vec(yr, ym, xpr, xm, fid=0)
-            x: Vector = self.beaver_mult_vec(xr, xm, xr, xm, fid=0)
+            y = self.beaver_mult(yr, ym, xpr, xm, True, fid=0)
+            x = self.beaver_mult(xr, xm, xr, xm, True, fid=0)
 
-            x: Vector = self.beaver_reconstruct(x, fid=fid)
-            y: Vector = self.beaver_reconstruct(y, fid=fid)
+            x = self.beaver_reconstruct(x, fid=fid)
+            y = self.beaver_reconstruct(y, fid=fid)
 
-            self.trunc_vec(x, fid=fid)
-            self.trunc_vec(y, fid=fid)
+            x = self.trunc(x, fid=fid)
+            y = self.trunc(y, fid=fid)
 
         if self.pid == 1:
-            for i in range(len(x)):
-                x[i] += one
+            x = add_func(x, one)
             
-        c: Vector = self.mult_vec(y, x, fid=fid)
-        self.trunc_vec(c, fid=fid)
-
-        return c
+        c: np.ndarray = self.multiply(y, x, True, fid=fid)
+        return self.trunc(c, fid=fid)
 
     def less_than_bits_public(self: 'MPCEnv', a: np.ndarray, b_pub: np.ndarray, fid: int) -> np.ndarray:
         return self.less_than_bits_aux(a, b_pub, 2, fid)
@@ -893,7 +900,7 @@ class MPCEnv:
 
         r, rbits = self.share_random_bits(param.NBIT_K, n, fid)
 
-        # Warning: a + r might overflow.
+        # Warning: a + r might overflow in numpy.
         e = zeros(n) if self.pid == 0 else a + r
         e = self.reveal_sym(e, fid=0)
 
