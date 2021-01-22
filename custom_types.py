@@ -9,8 +9,7 @@ from param import BASE_P, BASE_LEN
 
 
 def random_ndarray(base: int, shape: tuple) -> np.ndarray:
-    return zeros(shape) + base - 1
-    # return np.random.randint(base, size=shape)
+    return np.random.randint(base, size=shape)
 
 def add_mod(x: np.ndarray, y: np.ndarray, field: int) -> np.ndarray:
     return np.mod(x - (-y + field), field)
