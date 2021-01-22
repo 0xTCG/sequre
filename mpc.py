@@ -898,12 +898,18 @@ class MPCEnv:
 
         ebits: np.ndarray = zeros(
             (n, param.NBIT_K)) if self.pid == 0 else self.num_to_bits(e, param.NBIT_K)
+        
+        if self.pid == 2:
+            print('ebits', ebits)
 
         c: np.ndarray = self.less_than_bits_public(rbits, ebits, fid)
         if self.pid > 0:
             c = np.mod(-c, field)
             if self.pid == 1:
                 c = add_func(c, 1)
+        
+        if self.pid == 2:
+            print('c', c)
         
         ep: np.ndarray = zeros((n, param.NBIT_K + 1))
         if self.pid > 0:
@@ -916,6 +922,10 @@ class MPCEnv:
 
         E: np.ndarray = self.prefix_or(ep, fid)
 
+        if self.pid == 2:
+            print('ep', ep)
+            print('E', E)
+
         tpneg: np.ndarray = zeros((n, param.NBIT_K))
         if self.pid > 0:
             for i in range(n):
@@ -924,6 +934,10 @@ class MPCEnv:
         
         Tneg: np.ndarray = self.prefix_or(tpneg, fid)
         half_len: int = param.NBIT_K // 2
+
+        if self.pid == 2:
+            print('tpneg', tpneg)
+            print('Tneg', Tneg)
 
         efir: np.ndarray = zeros((n, param.NBIT_K))
         rfir: np.ndarray = zeros((n, param.NBIT_K))
