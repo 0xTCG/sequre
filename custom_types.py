@@ -17,9 +17,9 @@ def add_mod(x: np.ndarray, y: np.ndarray, field: int) -> np.ndarray:
 def mul_mod(x: np.ndarray, y: np.ndarray, field: int) -> np.ndarray: 
     res: np.ndarray = zeros(shape=x.shape)
     broadcast_y: np.ndarray = zeros(shape=x.shape)
-    x = np.mod(x, field)
     broadcast_y[:] = np.broadcast_to(y, x.shape)
     
+    x = np.mod(x, field)
     while np.any(broadcast_y > 0): 
         indices = np.where(broadcast_y % 2 == 1)
         res[indices] = add_mod(res[indices], x[indices], field)
@@ -73,8 +73,8 @@ class TypeOps:
         return elem >> k
     
     @staticmethod
-    def bit(elem: int, k: int) -> int:
-        return int((elem & (1 << k)) != 0)
+    def bit(elem: int, k: int) -> bool:
+        return (elem & (1 << k)) != 0
     
     @staticmethod
     def get_mat_len(m: int, n: int) -> int:
