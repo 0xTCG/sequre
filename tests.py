@@ -109,18 +109,28 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         expected_p = np.array([128, 16])
         if pid != 0:
             assert_values(revealed_p, expected_p)
-
-        a = np.array([
-            mpc.double_to_fp(18, param.NBIT_K, param.NBIT_F, 0),
-            mpc.double_to_fp(128, param.NBIT_K, param.NBIT_F, 0),
-            mpc.double_to_fp(32, param.NBIT_K, param.NBIT_F, 0),
-            mpc.double_to_fp(50, param.NBIT_K, param.NBIT_F, 0)], dtype=np.int64)
-        b, b_inv = mpc.fp_sqrt(a)
-        float_b: np.ndarray = mpc.print_fp(b, fid=0)
-        float_b_inv: np.ndarray = mpc.print_fp(b_inv, fid=0)
+        
+        p_or = mpc.reveal_sym(mpc.prefix_or(a_mat, fid=0), fid=0)
         if pid != 0:
-            assert_approx(float_b, np.array([6, 16, 8, 10]))
-            assert_approx(float_b_inv, np.array([0.1666666, 0.0625, 0.125, 0.1]))
+            assert_values(p_or, 1599650766643921085)
+        
+        nee = mpc.normalizer_even_exp(b)
+        nee_0 = mpc.print_fp(mpc.reveal_sym(nee[0], 0), 0)
+        nee_1 = mpc.print_fp(mpc.reveal_sym(nee[1], 0), 0)
+        # if pid != 0:
+        #     assert_values(nee_0, 32768)
+
+        # a = np.array([
+        #     mpc.double_to_fp(18, param.NBIT_K, param.NBIT_F, 0),
+        #     mpc.double_to_fp(128, param.NBIT_K, param.NBIT_F, 0),
+        #     mpc.double_to_fp(32, param.NBIT_K, param.NBIT_F, 0),
+        #     mpc.double_to_fp(50, param.NBIT_K, param.NBIT_F, 0)], dtype=np.int64)
+        # b, b_inv = mpc.fp_sqrt(a)
+        # float_b: np.ndarray = mpc.print_fp(b, fid=0)
+        # float_b_inv: np.ndarray = mpc.print_fp(b_inv, fid=0)
+        # if pid != 0:
+        #     assert_approx(float_b, np.array([6, 16, 8, 10]))
+        #     assert_approx(float_b_inv, np.array([0.1666666, 0.0625, 0.125, 0.1]))
 
         # a = Vector([Zp(7, BASE_P), Zp(256, BASE_P), Zp(99, BASE_P), Zp(50, BASE_P)])
         # b = Vector([Zp(6, BASE_P), Zp(16, BASE_P), Zp(3, BASE_P), Zp(40, BASE_P)])
