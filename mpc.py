@@ -881,7 +881,7 @@ class MPCEnv:
             self.send_elem(r, 2)
             self.send_elem(rbits, 2)
         elif self.pid == 2:
-            r: np.ndarray = self.receive_vector(0, msg_len=TypeOps.get_vec_len(n), shape=n)
+            r: np.ndarray = self.receive_vector(0, msg_len=TypeOps.get_vec_len(n), shape=(n, ))
             rbits: np.ndarray = self.receive_matrix(0, msg_len=TypeOps.get_mat_len(n, k), shape=(n, k))
         else:
             self.switch_seed(0)
@@ -1126,138 +1126,145 @@ class MPCEnv:
         
         return b, b_inv
     
-    def householder(self: 'MPCEnv', x: Vector) -> Vector:
+    def householder(self: 'MPCEnv', x: np.ndarray) -> np.ndarray:
         n: int = len(x)
-
+        fid: int = 0
+        field: int = self.primes[fid]
+        add_func = partial(add_mod, field=field)
+        mul_func = partial(mul_mod, field=field)
+        
         xr, xm = self.beaver_partition(x, fid=0)
 
-        xdot = Vector([self.beaver_inner_prod(xr, xm, fid=0)])
+        xdot: np.ndarray = self.beaver_inner_prod(xr, xm, fid=0)
+        xdot = np.array([xdot], dtype=np.int64)
         xdot = self.beaver_reconstruct(xdot, fid=0)
-        self.trunc_vec(xdot)
+        xdot = self.trunc(xdot)
 
         xnorm, _ = self.fp_sqrt(xdot)
 
-        x1 = Vector([Zp(x[0].value, base=x[0].base)])
+        x1 = zeros(1)
+        x1sign: np.ndarray = self.is_positive(x1)
 
-        x1sign: Vector = self.is_positive(x1)
-
-        x1sign *= 2
+        x1sign = add_func(x1sign, x1sign)
         if self.pid == 1:
-            x1sign[0] -= 1
+            x1sign[0] = (x1sign[0] - 1) % field
 
-        shift: Vector = self.mult_vec(xnorm, x1sign, fid=0)
+        shift: np.ndarray = self.multiply(xnorm, x1sign, True, fid=0)
 
         sr, sm = self.beaver_partition(shift[0], fid=0)
 
-        dot_shift = self.beaver_mult_vec(xr[0], xm[0], sr, sm, fid=0)
+        xr_0: np.ndarray = np.expand_dims(xr[0], axis=0)
+        xm_0: np.ndarray = np.expand_dims(xm[0], axis=0)
+        dot_shift: np.ndarray = self.beaver_mult(xr_0, xm_0, sr, sm, True, fid=0)
         dot_shift = self.beaver_reconstruct(dot_shift, fid=0)
-        self.trunc_elem(dot_shift, fid=0)
+        dot_shift = self.trunc(dot_shift, fid=0)
 
-        vdot = Vector([Zp(0, base=self.primes[0])])
+        vdot = zeros(1)
         if self.pid > 0:
-            vdot[0] = (xdot[0] + dot_shift) * 2
+            vdot = mul_func(add_func(xdot, dot_shift), 2)
 
         _, vnorm_inv = self.fp_sqrt(vdot)
 
         invr, invm = self.beaver_partition(vnorm_inv[0], fid=0)
 
-        vr = Vector([Zp(0, base=self.primes[0]) for _ in range(n)])
+        vr = zeros(n)
         if self.pid > 0:
-            vr = Vector(xr)
-            vr[0] += sr
-        vm = Vector(xm)
-        vm[0] += sm
+            vr = xr.copy()
+            vr = add_func(vr, sr)
+        vm = xm.copy()
+        vm = add_func(vm, sm)
 
-        v: Vector = self.beaver_mult_vec(vr, vm, invr, invm, fid=0)
-        v: Vector = self.beaver_reconstruct(v, fid=0)
-        self.trunc_vec(v, fid=0)
+        v: np.ndarray = self.beaver_mult(vr, vm, invr, invm, True, fid=0)
+        v = self.beaver_reconstruct(v, fid=0)
+        v = self.trunc(v, fid=0)
 
         return v
     
-    def is_positive(self: 'MPCEnv', a: Vector) -> Vector:
+    def is_positive(self: 'MPCEnv', a: np.ndarray) -> np.ndarray:
         n: int = len(a)
         nbits: int = self.primes_bits[0]
         fid: int = 2
+        field: int = self.primes[fid]
 
-        r = Vector([Zp(0, base=self.primes[0]) for _ in range(n)])
-        r_bits = Matrix(n, nbits, t=int)
+        r: np.ndarray = None
+        r_bits: np.ndarray = None
         if self.pid == 0:
-            r: Vector = self.rand_vector(n, fid=0)
-            r_bits: Matrix = self.num_to_bits(r, nbits)
+            r: np.ndarray = random_ndarray(base=self.primes[0], shape=n)
+            r_bits: np.ndarray = self.num_to_bits(r, nbits)
 
             self.switch_seed(1)
-            r_mask: Vector = self.rand_vector(n, fid=0)
-            r_bits_mask: Matrix = self.rand_mat(n, nbits, fid=fid).to_int()
+            r_mask: np.ndarray = random_ndarray(base=self.primes[0], shape=n)
+            r_bits_mask: np.ndarray = random_ndarray(base=field, shape=(n, nbits))
             self.restore_seed(1)
 
             r -= r_mask
             r_bits -= r_bits_mask
-            r_bits.set_field(field=self.primes[fid])
-            r_bits = Matrix().from_value(r_bits).to_int()
+            r %= self.primes[0]
+            r_bits %= field
 
             self.send_elem(r, 2)
             self.send_elem(r_bits, 2)
         elif self.pid == 2:
-            r: Vector = self.receive_vector(0, msg_len=TypeOps.get_vec_len(n), fid=0)
-            r_bits: Matrix = self.receive_matrix(0, msg_len=TypeOps.get_mat_len(n, nbits), fid=fid).to_int()
+            r: Vector = self.receive_vector(0, msg_len=TypeOps.get_vec_len(n), shape=n)
+            r_bits: Matrix = self.receive_matrix(0, msg_len=TypeOps.get_mat_len(n, nbits), shape=(n, nbits))
         else:
             self.switch_seed(0)
-            r: Vector = self.rand_vector(n, fid=0)
-            r_bits: Matrix = self.rand_mat(n, nbits, fid=fid).to_int()
+            r: np.ndarray = random_ndarray(base=self.primes[0], shape=n)
+            r_bits: np.ndarray = random_ndarray(base=field, shape=(n, nbits))
             self.restore_seed(0)
 
-        c = Vector([Zp(0, base=self.primes[0])])
+        c: np.ndarray = zeros(1)
         if self.pid != 0:
-            c = a * 2 + r
+            c = add_mod(add_mod(a, a, self.primes[0]), r, self.primes[0])
 
         c = self.reveal_sym(c, fid=0)
 
-        c_bits = Matrix(n, nbits, t=int)
+        c_bits = zeros((n, nbits))
         if self.pid != 0:
             c_bits = self.num_to_bits(c, nbits)
 
         # Incorrect result if r = 0, which happens with probaility 1 / BASE_P
-        no_overflow: Vector = self.less_than_bits_public(r_bits, c_bits, fid=fid)
+        no_overflow: np.ndarray = self.less_than_bits_public(r_bits, c_bits, fid=fid)
 
-        c_xor_r = Vector([0] * n)
+        c_xor_r = zeros(n)
         if self.pid > 0:
+            # Warning: Overflow might occur below in numpy.
             for i in range(n):
                 c_xor_r[i] = r_bits[i][nbits - 1] - 2 * c_bits[i][nbits - 1] * r_bits[i][nbits - 1]
                 if self.pid == 1:
                     c_xor_r[i] += c_bits[i][nbits - 1]
-            c_xor_r.set_field(self.primes[fid]).to_int()
+            c_xor_r %= field
         
-        lsb: Vector = self.mult_vec(c_xor_r, no_overflow, fid).to_int()
+        lsb: np.ndarray = self.multiply(c_xor_r, no_overflow, True, fid)
         if self.pid > 0:
-            lsb *= 2
-            for i in range(n):
-                lsb[i] -= no_overflow[i] + c_xor_r[i]
-                if self.pid == 1:
-                    lsb[i] += 1
-            lsb.set_field(self.primes[fid]).to_int()
+            lsb = add_mod(lsb, lsb, field)
+            lsb = add_mod(lsb - no_overflow, c_xor_r, field)
+            if self.pid == 1:
+                lsb = add_mod(lsb, 1, field)
 
         # 0, 1 -> 1, 2
         if self.pid == 1:
-            for i in range(n):
-                lsb[i] += 1
+            lsb = add_mod(lsb, 1, field)
         
-        lsb.set_field(self.primes[fid])
-        b_mat: Matrix = self.table_lookup(lsb, 0, fid=0)
+        b_mat: np.ndarray = self.table_lookup(lsb, 0, fid=0)
 
         return b_mat[0]
     
-    def beaver_inner_prod(self: 'MPCEnv', ar: Vector, am: Vector, fid: int) -> Zp:
-        ab = Zp(0, self.primes[fid])
+    def beaver_inner_prod(self: 'MPCEnv', ar: Vector, am: Vector, fid: int) -> int:
+        mul_func = partial(mul_mod, field=self.primes[fid])
+        add_func = partial(add_mod, field=self.primes[fid])
         
-        for i in range(len(ar)):
-            if self.pid == 0:
-                ab += am[i] * am[i]
-            else:
-                ab += ar[i] * am[i] * 2
-                if self.pid == 1:
-                    ab += ar[i] * ar[i]
+        ab: np.ndarray = None
+        if self.pid == 0:
+            ab = mul_func(am, am)
+        else:
+            temp: np.ndarray = mul_func(ar, am)
+            ab = add_func(temp, temp)
+            
+            if self.pid == 1:
+                ab = add_func(ab, mul_func(ar, ar))
 
-        return ab.set_field(self.primes[fid])
+        return reduce(add_func, ab, 0)
     
     def beaver_inner_prod_pair(
             self: 'MPCEnv', ar: Vector, am: Vector, br: Vector, bm: Vector, fid: int) -> Zp:
