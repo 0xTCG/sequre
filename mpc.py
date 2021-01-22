@@ -899,17 +899,12 @@ class MPCEnv:
         ebits: np.ndarray = zeros(
             (n, param.NBIT_K)) if self.pid == 0 else self.num_to_bits(e, param.NBIT_K)
         
-        if self.pid == 2:
-            print('ebits', ebits)
-
         c: np.ndarray = self.less_than_bits_public(rbits, ebits, fid)
+
         if self.pid > 0:
             c = np.mod(-c, field)
             if self.pid == 1:
                 c = add_func(c, 1)
-        
-        if self.pid == 2:
-            print('c', c)
         
         ep: np.ndarray = zeros((n, param.NBIT_K + 1))
         if self.pid > 0:
@@ -922,10 +917,6 @@ class MPCEnv:
 
         E: np.ndarray = self.prefix_or(ep, fid)
 
-        if self.pid == 2:
-            print('ep', ep)
-            print('E', E)
-
         tpneg: np.ndarray = zeros((n, param.NBIT_K))
         if self.pid > 0:
             for i in range(n):
@@ -934,10 +925,6 @@ class MPCEnv:
         
         Tneg: np.ndarray = self.prefix_or(tpneg, fid)
         half_len: int = param.NBIT_K // 2
-
-        if self.pid == 2:
-            print('tpneg', tpneg)
-            print('Tneg', Tneg)
 
         efir: np.ndarray = zeros((n, param.NBIT_K))
         rfir: np.ndarray = zeros((n, param.NBIT_K))
@@ -969,7 +956,7 @@ class MPCEnv:
         if self.pid == 1:
             odd_bit_sum = add_func(odd_bit_sum, 1)
             even_bit_sum = add_func(even_bit_sum, 1)
-
+        
         # If double_flag = true, then use odd_bits, otherwise use even_bits
 
         diff = zeros(n)
@@ -1014,7 +1001,7 @@ class MPCEnv:
             x = mul_func(a, b)
             x = np.mod(add_func(a, b) - add_func(x, x), field)
             if self.pid == 2:
-                x = np.mod(x - a if public_flag == 1 else b, field)
+                x = np.mod(x - (a if public_flag == 1 else b), field)
         
         f: np.ndarray = self.prefix_or(x, fid)
 
@@ -1027,7 +1014,9 @@ class MPCEnv:
             c = zeros(n)
             if self.pid > 0:
                 fb: np.ndarray = mul_func(f, b)
-                c[i] = reduce(add_func, fb[i], 0)
+                # TODO: Implemenput np.sum over axis=1 of c here.
+                for i in range(n):
+                    c[i] = reduce(add_func, fb[i], 0)
             
             return c
         
@@ -1042,7 +1031,7 @@ class MPCEnv:
                     b_arr[i][j][0] = b[i][j]
 
         c_arr: list = self.mult_mat_parallel(f_arr, b_arr, fid)
-
+        
         return np.array([c_arr[i][0][0] if self.pid > 0 else 0 for i in range(n)], dtype=np.int64)
 
     def fp_sqrt(self: 'MPCEnv', a: np.ndarray) -> tuple:
