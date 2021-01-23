@@ -1135,23 +1135,44 @@ class MPCEnv:
         
         xr, xm = self.beaver_partition(x, fid=0)
 
+        if self.pid == 2:
+            print('HH beaver', xr)
+
         xdot: np.ndarray = self.beaver_inner_prod(xr, xm, fid=0)
         xdot = np.array([xdot], dtype=np.int64)
         xdot = self.beaver_reconstruct(xdot, fid=0)
         xdot = self.trunc(xdot)
 
+        if self.pid == 2:
+            print('HH beaver', xdot)
+
         xnorm, _ = self.fp_sqrt(xdot)
 
-        x1 = zeros(1)
+        if self.pid == 2:
+            print('HH xnorm', xnorm)
+
+        x1 = np.array([x[0]], dtype=np.int64)
         x1sign: np.ndarray = self.is_positive(x1)
+
+        if self.pid == 2:
+            print('HH x1sign', x1sign)
 
         x1sign = add_func(x1sign, x1sign)
         if self.pid == 1:
             x1sign[0] = (x1sign[0] - 1) % field
 
+        if self.pid == 2:
+            print('HH x1sign 2', x1sign)
+
         shift: np.ndarray = self.multiply(xnorm, x1sign, True, fid=0)
 
+        if self.pid == 2:
+            print('HH shift', shift)
+
         sr, sm = self.beaver_partition(shift[0], fid=0)
+
+        if self.pid == 2:
+            print('HH shift beaver', sr)
 
         xr_0: np.ndarray = np.expand_dims(xr[0], axis=0)
         xm_0: np.ndarray = np.expand_dims(xm[0], axis=0)
@@ -1159,13 +1180,25 @@ class MPCEnv:
         dot_shift = self.beaver_reconstruct(dot_shift, fid=0)
         dot_shift = self.trunc(dot_shift, fid=0)
 
+        if self.pid == 2:
+            print('HH dotshift', dot_shift)
+
         vdot = zeros(1)
         if self.pid > 0:
             vdot = mul_func(add_func(xdot, dot_shift), 2)
 
+        if self.pid == 2:
+            print('HH dots', vdot, xdot, dot_shift)
+
         _, vnorm_inv = self.fp_sqrt(vdot)
 
+        if self.pid == 2:
+            print('HH vnorm_inv', vnorm_inv)
+
         invr, invm = self.beaver_partition(vnorm_inv[0], fid=0)
+
+        if self.pid == 2:
+            print('HH invr invm', invr, invm)
 
         vr = zeros(n)
         if self.pid > 0:
@@ -1174,9 +1207,15 @@ class MPCEnv:
         vm = xm.copy()
         vm = add_func(vm, sm)
 
+        if self.pid == 2:
+            print('HH vm', vm)
+
         v: np.ndarray = self.beaver_mult(vr, vm, invr, invm, True, fid=0)
         v = self.beaver_reconstruct(v, fid=0)
         v = self.trunc(v, fid=0)
+
+        if self.pid == 2:
+            print('HH v', v)
 
         return v
     
@@ -1238,9 +1277,10 @@ class MPCEnv:
         lsb: np.ndarray = self.multiply(c_xor_r, no_overflow, True, fid)
         if self.pid > 0:
             lsb = add_mod(lsb, lsb, field)
-            lsb = add_mod(lsb - no_overflow, c_xor_r, field)
+            lsb -= add_mod(no_overflow, c_xor_r, field)
             if self.pid == 1:
                 lsb = add_mod(lsb, 1, field)
+        lsb %= field
 
         # 0, 1 -> 1, 2
         if self.pid == 1:
