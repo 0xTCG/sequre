@@ -1319,8 +1319,7 @@ class MPCEnv:
             else:
                 Qsub = zeros((n - i, n))
                 if self.pid > 0:
-                    for j in range(n - i):
-                        Qsub[j] = Q[j + i]
+                    Qsub[:n - i] = Q[i: n]
 
                 left: list = [P, Ap]
                 right: list = [Qsub, P]
@@ -1331,20 +1330,14 @@ class MPCEnv:
                 prod[1] = self.trunc(prod[1], param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
                 if self.pid > 0:
-                    for j in range(n - i):
-                        Q[j + i] = prod[0][j]
+                    Q[i:n] = prod[0][:n - i]
                     B = prod[1]
             
             Ap = zeros((n - i - 1, n - i - 1))
             if self.pid > 0:
-                for j in range(n - i):
-                    R[i + j][i] = B[j][0]
-                if i == n - 2:
-                    R[n - 1][n - 1] = B[1][1]
-
-                for j in range(n - i - 1):
-                    for k in range(n - i - 1):
-                        Ap[j][k] = B[j + 1][k + 1]
+                R[i:n, i] = B[:n-i, 0]
+                if i == n - 2: R[n - 1][n - 1] = B[1][1]
+                Ap[:n - i - 1, :n - i - 1] = B[1:n - i, 1:n - i]
             
         return Q, R
 
