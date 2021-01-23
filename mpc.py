@@ -1348,83 +1348,70 @@ class MPCEnv:
             
         return Q, R
 
-    def tridiag(self: 'MPCEnv', A: Matrix) -> tuple:
+    def tridiag(self: 'MPCEnv', A: np.ndarray) -> tuple:
         assert A.shape[0] == A.shape[1]
         assert A.shape[0] > 2
 
         n: int = A.shape[0]
-        one: Zp = self.double_to_fp(1, param.NBIT_K, param.NBIT_F, fid=0)
+        one: int = self.double_to_fp(1, param.NBIT_K, param.NBIT_F, fid=0)
+        add_func = partial(add_mod, field=self.primes[0])
 
-        Q = Matrix(n, n)
-        T = Matrix(n, n)
+        Q = zeros((n, n))
+        T = zeros((n, n))
         if self.pid > 0:
             if self.pid == 1:
                 for i in range(n):
-                    Q[i][i] = Zp(one.value, one.base)
+                    np.fill_diagonal(Q, one)
 
-        Ap = Matrix(n, n)
+        Ap = zeros((n, n))
         if self.pid != 0:
-            Ap = Matrix().from_value(deepcopy(A))
+            Ap = A
 
         for i in range(n - 2):
-            x = Vector([Zp(0, base=self.primes[0]) for _ in range(Ap.shape[1] - 1)])
+            x = zeros((n - 1))
             if self.pid > 0:
-                for j in range(Ap.shape[1] - 1):
-                    x[j] = Zp(Ap[0][j + 1].value, Ap[0][j + 1].base)
+                x[:n - 1] = Ap[0][1:]
 
-            v = Matrix(1, len(x))
-            v[0] = self.householder(x)
+            v = np.expand_dims(self.householder(x), axis=0)
+            vt = v.T
 
-            vt = Matrix(len(x), 1)
-            if self.pid != 0:
-                vt = Matrix().from_value(v.transpose(inplace=False))
+            vv: np.ndarray = self.multiply(vt, v, False, fid=0)
+            vv = self.trunc(vv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
-            vv = self.mult_mat_parallel([vt], [v], fid=0)[0]
-            self.trunc(vv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
-
-            P = Matrix(Ap.shape[1], Ap.shape[1])
+            P = zeros(Ap.shape)
             if self.pid > 0:
-                P[0][0] = Zp(one.value, one.base) if self.pid == 1 else Zp(0, one.base)
-                for j in range(1, Ap.shape[1]):
-                    for k in range(1, Ap.shape[1]):
-                        P[j][k] = vv[j - 1][k - 1] * -2
-                        if self.pid == 1 and j == k:
-                            P[j][k] += one
+                P[1:n, 1:n] = np.mod(-add_func(vv[0:n-1, 0:n-1], vv[0:n-1, 0:n-1]), self.primes[0])
+                if self.pid == 1:
+                    np.fill_diagonal(P, add_func(P.diagonal(), one))
 
             # TODO: parallelize? (minor improvement)
-            PAp = self.mult_mat_parallel([P], [Ap], fid=0)[0]
-            self.trunc(PAp, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
-            B = self.mult_mat_parallel([PAp], [P], fid=0)[0]
-            self.trunc(B, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+            PAp: np.ndarray = self.multiply(P, Ap, False, fid=0)
+            PAp = self.trunc(PAp, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+            B = self.multiply(PAp, P, False, fid=0)
+            B = self.trunc(B, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
-            Qsub = Matrix(n, n - i)
+            Qsub = zeros((n, n - i))
             if self.pid > 0:
-                for j in range(n):
-                    for k in range(n - i):
-                        Qsub[j][k] = Zp(Q[j][k + i].value, Q[j][k + i].base)
+                Qsub[:, :n - i] = Q[:, i:n]
 
-            Qsub = self.mult_mat_parallel([Qsub], [P], fid=0)[0]
-            self.trunc(Qsub, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+            Qsub: np.ndarray = self.multiply(Qsub, P, False, fid=0)
+            Qsub = self.trunc(Qsub, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
             if self.pid > 0:
-                for j in range(n):
-                    for k in range(n - i):
-                        Q[j][k + i] = Zp(Qsub[j][k].value, Qsub[j][k].base)
+                Q[:, i:n] = Qsub[:, :n - i]
 
             if self.pid > 0:
-                T[i][i] = Zp(B[0][0].value, B[0][0].base)
-                T[i + 1][i] = Zp(B[1][0].value, B[1][0].base)
-                T[i][i + 1] = Zp(B[0][1].value, B[0][1].base)
+                T[i][i] = B[0][0]
+                T[i + 1][i] = B[1][0]
+                T[i][i + 1] = B[0][1]
                 if i == n - 3:
-                    T[i + 1][i + 1] = Zp(B[1][1].value, B[1][1].base)
-                    T[i + 1][i + 2] = Zp(B[1][2].value, B[1][2].base)
-                    T[i + 2][i + 1] = Zp(B[2][1].value, B[2][1].base)
-                    T[i + 2][i + 2] = Zp(B[2][2].value, B[2][2].base)
+                    T[i + 1][i + 1] = B[1][1]
+                    T[i + 1][i + 2] = B[1][2]
+                    T[i + 2][i + 1] = B[2][1]
+                    T[i + 2][i + 2] = B[2][2]
 
-            Ap = Matrix(B.shape[0] - 1, B.shape[1] - 1)
+            Ap = zeros((n - 1, n - 1))
             if self.pid > 0:
-                for j in range(B.shape[0] - 1):
-                    for k in range(B.shape[1] - 1):
-                       Ap[j][k] = Zp(B[j + 1][k + 1].value, B[j + 1][k + 1].base)
+                Ap[:n - 1, :n - 1] = B[1:, 1:]
 
         return T, Q
 
