@@ -3,7 +3,7 @@ import time
 import numpy as np
 
 import param
-from custom_types import TypeOps, add_mod
+from custom_types import TypeOps, add_mod, mul_mod
 from mpc import MPCEnv
 from param import BASE_P
 
@@ -119,8 +119,8 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         if pid != 0:
             nee_0 = mpc.print_fp(mpc.reveal_sym(ne, 0), 0)
             nee_1 = mpc.print_fp(mpc.reveal_sym(ne_sqrt, 0), 0)
-            # assert_values(nee_0, np.array([32768, 0]))
-            # assert_values(nee_1, np.array([0.25, 1]))
+            assert_values(nee_0, np.array([32768, 0]))
+            assert_values(nee_1, np.array([0.25, 1]))
 
         a = np.array([
             mpc.double_to_fp(18, param.NBIT_K, param.NBIT_F, 0),
@@ -271,10 +271,21 @@ def benchmark(mpc: MPCEnv, pid: int, m: int, n: int):
     # mpc.tridiag(mat)
     
     print('Eigen decomp ...')
-    from profilehooks import profile
-    fn = profile(mpc.eigen_decomp, entries=200) if pid == 2 else mpc.eigen_decomp
-    fn(mat)
-    # mpc.eigen_decomp(mat)
+    # from profilehooks import profile
+    # fn = profile(mpc.eigen_decomp, entries=200) if pid == 2 else mpc.eigen_decomp
+    # fn(mat)
+
+    coeff = np.arange(1000000, dtype=np.int64).reshape((1000, 1000))
+    # x = np.arange(100, dtype=np.int64)
+
+    from line_profiler import LineProfiler
+    lp = LineProfiler()
+    fn = lp(mul_mod) if pid == 2 else mul_mod
+    # fn(mat)
+    fn(coeff, coeff, BASE_P)
+    if pid == 2:
+        lp.print_stats()
+    
 
     print(f'Benchmarks done at {pid}!')
 
