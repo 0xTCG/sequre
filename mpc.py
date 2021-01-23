@@ -1415,56 +1415,48 @@ class MPCEnv:
 
         return T, Q
 
-    def eigen_decomp(self: 'MPCEnv', A: Matrix) -> tuple:
+    def eigen_decomp(self: 'MPCEnv', A: np.ndarray) -> tuple:
         assert A.shape[0] == A.shape[1]
         n: int = A.shape[0]
+        add_func = partial(add_mod, field=self.primes[0])
 
-        L = Vector([Zp(0, base=self.primes[0]) for _ in range(n)])
+        L = zeros(n)
 
         Ap, Q = self.tridiag(A)
-
-        V = Matrix(n, n)
-        if self.pid != 0:
-            V = Q.transpose(inplace=False)
+        V: np.ndarray = Q.T
 
         for i in range(n - 1, 0, -1):
             for _ in range(param.ITER_PER_EVAL):
-                shift = Zp(Ap[i][i].value, Ap[i][i].base)
+                shift = Ap[i][i]
                 if self.pid > 0:
-                    for j in range(Ap.shape[1]):
-                        Ap[j][j] -= shift
+                    np.fill_diagonal(Ap, np.mod(Ap.diagonal() - shift, self.primes[0]))
 
                 Q, R = self.qr_fact_square(Ap)
 
-                Ap = self.mult_mat_parallel([Q], [R], fid=0)[0]
-                self.trunc(Ap, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+                Ap = self.multiply(Q, R, False, fid=0)
+                Ap = self.trunc(Ap, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
                 if self.pid > 0:
-                    for j in range(Ap.shape[1]):
-                        Ap[j][j] += shift
+                    np.fill_diagonal(Ap, add_func(Ap.diagonal(), shift))
 
-                Vsub = Matrix(i + 1, n)
+                Vsub = zeros((i + 1, n))
                 if self.pid > 0:
-                    for j in range(i + 1):
-                        Vsub[j] = Vector(V[j].value)
+                    Vsub[:i + 1] = V[:i + 1]
 
-                Vsub = self.mult_mat_parallel([Q], [Vsub], fid=0)[0]
-                self.trunc(Vsub, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+                Vsub = self.multiply(Q, Vsub, False, fid=0)
+                Vsub = self.trunc(Vsub, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
                 if self.pid > 0:
-                    for j in range(i + 1):
-                        V[j] = Vector(Vsub[j].value)
+                    V[:i + 1] = Vsub[:i + 1]
 
-            L[i] = Zp(Ap[i][i].value, Ap[i][i].base)
+            L[i] = Ap[i][i]
             if i == 1:
-                L[0] = Zp(Ap[0][0].value, Ap[0][0].base)
+                L[0] = Ap[0][0]
 
-            Ap_copy: Matrix = deepcopy(Ap)
-            Ap = Matrix(i, i)
+            Ap_copy: np.ndarray = Ap.copy()
+            Ap = zeros((i, i))
             if self.pid > 0:
-                for j in range(i):
-                    for k in range(i):
-                        Ap[j][k] = Ap_copy[j][k]
+                Ap = Ap_copy[:i, :i]
         
         return V, L
 
