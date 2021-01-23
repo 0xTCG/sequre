@@ -21,11 +21,11 @@ def mul_mod(x: np.ndarray, y: np.ndarray, field: int) -> np.ndarray:
     
     x = np.mod(x, field)
     while np.any(broadcast_y > 0): 
-        indices = np.where(broadcast_y % 2 == 1)
+        indices = np.where((broadcast_y & 1) == 1)
         res[indices] = add_mod(res[indices], x[indices], field)
   
         x = add_mod(x, x, field)
-        broadcast_y //= 2
+        broadcast_y >>= 1
   
     return np.mod(res, field)
 

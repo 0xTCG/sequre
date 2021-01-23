@@ -325,10 +325,9 @@ class MPCEnv:
         assert power >= 1, f'Invalid exponent: {power}'
 
         n: int = len(x)
-        b: np.ndarray = np.array([], dtype=np.int64)
+        b: np.ndarray = zeros((power + 1, n))
         
         if power == 1:
-            b.resize((2, n), refcheck=False)
             if self.pid > 0:
                 if self.pid == 1:
                     b[0] += ones(n)
@@ -349,8 +348,6 @@ class MPCEnv:
 
                 r_pow = (r_pow - r_) % self.primes[fid]
                 self.send_elem(r_pow, 2)
-
-                b.resize((power + 1, n), refcheck=False)
             else:
                 r_pow: np.ndarray = None
                 if self.pid == 1:
@@ -369,8 +366,6 @@ class MPCEnv:
                     x_r_pow[p][:] = mul_mod(x_r_pow[p - 1], x_r, self.primes[fid])
 
                 pascal_matrix: np.ndarray = self.get_pascal_matrix(power)
-
-                b.resize((power + 1, n), refcheck=False)
 
                 if self.pid == 1:
                     b[0][:] = add_mod(b[0], ones(n), self.primes[fid])
@@ -1074,6 +1069,7 @@ class MPCEnv:
         niter: int = 2 * math.ceil(math.log2((param.NBIT_K) / 3.5))
 
         # Initial approximation: 1 / sqrt(a_scaled) ~= 2.9581 - 4 * a_scaled + 2 * a_scaled^2
+        # Bottleneck
         s, s_sqrt = self.normalizer_even_exp(a)
 
         a_scaled: np.ndarray = self.multiply(a, s, elem_wise=True, fid=fid)
@@ -1140,6 +1136,7 @@ class MPCEnv:
         xdot = self.beaver_reconstruct(xdot, fid=0)
         xdot = self.trunc(xdot)
 
+        # Bottleneck
         xnorm, _ = self.fp_sqrt(xdot)
 
         x1 = np.array([x[0]], dtype=np.int64)
@@ -1163,6 +1160,7 @@ class MPCEnv:
         if self.pid > 0:
             vdot = mul_func(add_func(xdot, dot_shift), 2)
 
+        # Bottleneck
         _, vnorm_inv = self.fp_sqrt(vdot)
 
         invr, invm = self.beaver_partition(vnorm_inv[0], fid=0)
