@@ -260,11 +260,7 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
 def benchmark(mpc: MPCEnv, pid: int, m: int, n: int):
     import random, math
     
-    # mat = Vector([
-    #     Vector(
-    #         [Zp(0, base=BASE_P) for j in range(n)])
-    #         for i in range(m)])
-    # mat = Matrix().from_value(mat)
+    mat: np.ndarray = np.arange(m * n).reshape(m, n)
     
     # print('Orthonormal basis ...')
     # mpc.orthonormal_basis(mat)
@@ -273,10 +269,10 @@ def benchmark(mpc: MPCEnv, pid: int, m: int, n: int):
     # print('Tridiag ...')
     # mpc.tridiag(mat)
     
-    # print('Eigen decomp ...')
-    # from profilehooks import profile
-    # fn = profile(mpc.eigen_decomp, entries=200) if pid == 1 else mpc.eigen_decomp
-    # fn(mat)
+    print('Eigen decomp ...')
+    from profilehooks import profile
+    fn = profile(mpc.eigen_decomp, entries=200) if pid == 1 else mpc.eigen_decomp
+    fn(mat)
 
     print(f'Benchmarks done at {pid}!')
 
