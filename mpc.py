@@ -328,7 +328,7 @@ class MPCEnv:
         b: np.ndarray = np.array([], dtype=np.int64)
         
         if power == 1:
-            b.resize((2, n))
+            b.resize((2, n), refcheck=False)
             if self.pid > 0:
                 if self.pid == 1:
                     b[0] += ones(n)
@@ -350,7 +350,7 @@ class MPCEnv:
                 r_pow = (r_pow - r_) % self.primes[fid]
                 self.send_elem(r_pow, 2)
 
-                b.resize((power + 1, n))
+                b.resize((power + 1, n), refcheck=False)
             else:
                 r_pow: np.ndarray = None
                 if self.pid == 1:
@@ -370,7 +370,7 @@ class MPCEnv:
 
                 pascal_matrix: np.ndarray = self.get_pascal_matrix(power)
 
-                b.resize((power + 1, n))
+                b.resize((power + 1, n), refcheck=False)
 
                 if self.pid == 1:
                     b[0][:] = add_mod(b[0], ones(n), self.primes[fid])
@@ -1368,9 +1368,9 @@ class MPCEnv:
             Ap = A
 
         for i in range(n - 2):
-            x = zeros((n - 1))
+            x = zeros((Ap.shape[1] - 1))
             if self.pid > 0:
-                x[:n - 1] = Ap[0][1:]
+                x[:Ap.shape[1] - 1] = Ap[0][1:Ap.shape[1]]
 
             v = np.expand_dims(self.householder(x), axis=0)
             vt = v.T
@@ -1380,7 +1380,9 @@ class MPCEnv:
 
             P = zeros(Ap.shape)
             if self.pid > 0:
-                P[1:n, 1:n] = np.mod(-add_func(vv[0:n-1, 0:n-1], vv[0:n-1, 0:n-1]), self.primes[0])
+                cols_no = Ap.shape[1]
+                P[1:cols_no, 1:cols_no] = np.mod(
+                    -add_func(vv[0:cols_no-1, 0:cols_no-1], vv[0:cols_no-1, 0:cols_no-1]), self.primes[0])
                 if self.pid == 1:
                     np.fill_diagonal(P, add_func(P.diagonal(), one))
 
@@ -1409,9 +1411,9 @@ class MPCEnv:
                     T[i + 2][i + 1] = B[2][1]
                     T[i + 2][i + 2] = B[2][2]
 
-            Ap = zeros((n - 1, n - 1))
+            Ap = zeros((B.shape[0] - 1, B.shape[1] - 1))
             if self.pid > 0:
-                Ap[:n - 1, :n - 1] = B[1:, 1:]
+                Ap[:B.shape[0] - 1, :B.shape[1] - 1] = B[1:B.shape[0], 1:B.shape[1]]
 
         return T, Q
 
