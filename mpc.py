@@ -1282,43 +1282,42 @@ class MPCEnv:
 
         return ab.set_field(self.primes[fid])
 
-    def qr_fact_square(self: 'MPCEnv', A: Matrix) -> Matrix:
+    def qr_fact_square(self: 'MPCEnv', A: np.ndarray) -> np.ndarray:
         assert A.shape[0] == A.shape[1]
 
         n: int = A.shape[0]
-        R = Matrix(n, n)
-        Q = Matrix(n, n)
+        fid: int = 0
+        field: int = self.primes[fid]
+        add_func = partial(add_mod, field=field)
 
-        Ap = Matrix(n, n)
+        R = zeros((n, n))
+        Q = zeros((n, n))
+
+        Ap = zeros((n, n))
         if self.pid != 0:
-            Ap = deepcopy(A)
+            Ap = A
 
-        one: Zp = self.double_to_fp(1, param.NBIT_K, param.NBIT_F, fid=0)
+        one: int = self.double_to_fp(1, param.NBIT_K, param.NBIT_F, fid=0)
 
         for i in range(n - 1):
-            v = Matrix(1, Ap.shape[1])
-            v[0] = self.householder(Ap[0])
-
-            vt = Matrix(Ap.shape[1], 1)
-            if self.pid != 0:
-                vt = Matrix().from_value(v.transpose(inplace=False))
+            v = np.expand_dims(self.householder(Ap[0]), axis=0)
+            vt = v.T
             
-            P = self.mult_mat_parallel([vt], [v], fid=0)[0]
-            self.trunc(P, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+            P: np.ndarray = self.multiply(vt, v, False, fid=0)
+            P = self.trunc(P, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
             if self.pid > 0:
-                P *= -2
+                P = np.mod(-add_func(P, P), self.primes[0])
                 if self.pid == 1:
-                    for j in range(P.shape[1]):
-                        P[j][j] += one
+                    np.fill_diagonal(P, add_func(P.diagonal(), one))
             
-            B = Matrix(n - i, n - i)
+            B = zeros((n - i, n - i))
             if i == 0:
-                Q = deepcopy(P)
-                B = self.mult_mat_parallel([Ap], [P], fid=0)[0]
-                self.trunc(B, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+                Q = P
+                B = self.multiply(Ap, P, False, fid=0)
+                B = self.trunc(B, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
             else:
-                Qsub = Matrix(n - i, n)
+                Qsub = zeros((n - i, n))
                 if self.pid > 0:
                     for j in range(n - i):
                         Qsub[j] = Q[j + i]
@@ -1328,24 +1327,24 @@ class MPCEnv:
 
                 prod: list = self.mult_mat_parallel(left, right, fid=0)
                 # TODO: parallelize Trunc
-                self.trunc(prod[0], param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
-                self.trunc(prod[1], param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+                prod[0] = self.trunc(prod[0], param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+                prod[1] = self.trunc(prod[1], param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
                 if self.pid > 0:
                     for j in range(n - i):
-                        Q[j + i] = Vector(prod[0][j].value)
-                    B = deepcopy(prod[1])
+                        Q[j + i] = prod[0][j]
+                    B = prod[1]
             
-            Ap = Matrix(n - i - 1, n - i - 1)
+            Ap = zeros((n - i - 1, n - i - 1))
             if self.pid > 0:
                 for j in range(n - i):
-                    R[i + j][i] = Zp(B[j][0].value, B[j][0].base)
+                    R[i + j][i] = B[j][0]
                 if i == n - 2:
-                    R[n - 1][n - 1] = Zp(B[1][1].value, B[1][1].base)
+                    R[n - 1][n - 1] = B[1][1]
 
                 for j in range(n - i - 1):
                     for k in range(n - i - 1):
-                        Ap[j][k] = Zp(B[j + 1][k + 1].value, B[j + 1][k + 1].base)
+                        Ap[j][k] = B[j + 1][k + 1]
             
         return Q, R
 
