@@ -134,12 +134,12 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_approx(float_b, np.array([6, 16, 8, 10]))
             assert_approx(float_b_inv, np.array([0.1666666, 0.0625, 0.125, 0.1]))
 
-        # a = np.array([7, 256, 99, 50])
-        # b = np.array([6, 16, 3, 40])
-        # d = mpc.fp_div(a, b, fid=0)
-        # float_d = mpc.print_fp(d, fid=0)
-        # if pid != 0:
-        #     assert_approx(float_d, np.array([1.1666666, 16, 33, 1.25]))
+        a = np.array([7, 256, 99, 50])
+        b = np.array([6, 16, 3, 40])
+        d = mpc.fp_div(a, b, fid=0)
+        float_d = mpc.print_fp(d, fid=0)
+        if pid != 0:
+            assert_approx(float_d, np.array([1.1666666, 16, 33, 1.25]))
         
         a = np.array([
             mpc.double_to_fp(18, param.NBIT_K, param.NBIT_F, 0),
@@ -153,12 +153,12 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_approx(float_b, np.array([6, 16, 8, 10]))
             assert_approx(float_b_inv, np.array([0.1666666, 0.0625, 0.125, 0.1]))
         
-        # a = np.array([7, 256, 99, 50])
-        # b = np.array([6, 16, 3, 40])
-        # d = mpc.fp_div(a, b, fid=0)
-        # float_d = mpc.print_fp(d, fid=0)
-        # if pid != 0:
-        #     assert_approx(float_d, np.array([1.1666666, 16, 33, 1.25]))
+        a = np.array([7, 256, 99, 50])
+        b = np.array([6, 16, 3, 40])
+        d = mpc.fp_div(a, b, fid=0)
+        float_d = mpc.print_fp(d, fid=0)
+        if pid != 0:
+            assert_approx(float_d, np.array([1.1666666, 16, 33, 1.25]))
         
         a = np.array([
             mpc.double_to_fp(1.5, param.NBIT_K, param.NBIT_F, 0),
@@ -169,25 +169,24 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         if pid != 0:
             assert_approx(float_v, np.array([0.86807, 0.0973601, 0.486801]))
         
-        # mat = Vector([
-        #     Vector([mpc.double_to_fp(4, param.NBIT_K, param.NBIT_F, 0) for _ in range(3)]),
-        #     Vector([mpc.double_to_fp(4.5, param.NBIT_K, param.NBIT_F, 0) for _ in range(3)]),
-        #     Vector([mpc.double_to_fp(5.5, param.NBIT_K, param.NBIT_F, 0) for _ in range(3)])])
-        # mat = Matrix().from_value(mat)
-        # q, r = mpc.qr_fact_square(mat)
-        # result_q = mpc.print_fp(q, fid=0)
-        # result_r = mpc.print_fp(r, fid=0)
-        # expected_q = Vector([
-        #     Vector([-0.57735, -0.57735, -0.57735]),
-        #     Vector([-0.57735, 0.788675, -0.211325]),
-        #     Vector([-0.57735, -0.211325, 0.788675])])
-        # expected_r = Vector([
-        #     Vector([-13.85640, 0, 0]),
-        #     Vector([-15.58846, 0, 0]),
-        #     Vector([-19.05255, 0, 0])])
-        # if pid != 0:
-        #     assert_approx(result_q, expected_q)
-        #     assert_approx(result_r, expected_r)
+        mat = np.array([
+            [mpc.double_to_fp(4, param.NBIT_K, param.NBIT_F, 0) for _ in range(3)],
+            [mpc.double_to_fp(4.5, param.NBIT_K, param.NBIT_F, 0) for _ in range(3)],
+            [mpc.double_to_fp(5.5, param.NBIT_K, param.NBIT_F, 0) for _ in range(3)]], dtype=np.int64)
+        q, r = mpc.qr_fact_square(mat)
+        result_q = mpc.print_fp(q, fid=0)
+        result_r = mpc.print_fp(r, fid=0)
+        expected_q = np.array([
+            [-0.57735, -0.57735, -0.57735],
+            [-0.57735, 0.788675, -0.211325],
+            [-0.57735, -0.211325, 0.788675]])
+        expected_r = np.array([
+            [-13.85640, 0, 0],
+            [-15.58846, 0, 0],
+            [-19.05255, 0, 0]])
+        if pid != 0:
+            assert_approx(result_q, expected_q)
+            assert_approx(result_r, expected_r)
         
         # mat = Vector([
         #     Vector([mpc.double_to_fp(4, param.NBIT_K, param.NBIT_F, 0),
