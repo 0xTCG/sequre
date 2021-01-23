@@ -188,30 +188,30 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_approx(result_q, expected_q)
             assert_approx(result_r, expected_r)
         
-        # mat = Vector([
-        #     Vector([mpc.double_to_fp(4, param.NBIT_K, param.NBIT_F, 0),
-        #             mpc.double_to_fp(3, param.NBIT_K, param.NBIT_F, 0),
-        #             mpc.double_to_fp(2.5, param.NBIT_K, param.NBIT_F, 0)]),
-        #     Vector([mpc.double_to_fp(0.5, param.NBIT_K, param.NBIT_F, 0),
-        #             mpc.double_to_fp(4.5, param.NBIT_K, param.NBIT_F, 0),
-        #             mpc.double_to_fp(1.5, param.NBIT_K, param.NBIT_F, 0)]),
-        #     Vector([mpc.double_to_fp(5.5, param.NBIT_K, param.NBIT_F, 0),
-        #             mpc.double_to_fp(2, param.NBIT_K, param.NBIT_F, 0),
-        #             mpc.double_to_fp(1, param.NBIT_K, param.NBIT_F, 0)])])
-        # t, q = mpc.tridiag(mat)
-        # result_t = mpc.print_fp(t, fid=0)
-        # result_q = mpc.print_fp(q, fid=0)
-        # expected_t = Vector([
-        #     Vector([8, -7.81025, 0]),
-        #     Vector([-7.81025, 9.57377, 3.31148]),
-        #     Vector([0, 2.31148, 1.42623])])
-        # expected_q = Vector([
-        #     Vector([1, 0, 0]),
-        #     Vector([0, -0.768221, -0.640184]),
-        #     Vector([0, -0.640184, 0.768221])])
-        # if pid != 0:
-        #     assert_approx(result_t, expected_t)
-        #     assert_approx(result_q, expected_q)
+        mat = np.array([
+            [mpc.double_to_fp(4, param.NBIT_K, param.NBIT_F, 0),
+             mpc.double_to_fp(3, param.NBIT_K, param.NBIT_F, 0),
+             mpc.double_to_fp(2.5, param.NBIT_K, param.NBIT_F, 0)],
+            [mpc.double_to_fp(0.5, param.NBIT_K, param.NBIT_F, 0),
+             mpc.double_to_fp(4.5, param.NBIT_K, param.NBIT_F, 0),
+             mpc.double_to_fp(1.5, param.NBIT_K, param.NBIT_F, 0)],
+            [mpc.double_to_fp(5.5, param.NBIT_K, param.NBIT_F, 0),
+             mpc.double_to_fp(2, param.NBIT_K, param.NBIT_F, 0),
+             mpc.double_to_fp(1, param.NBIT_K, param.NBIT_F, 0)]], dtype=np.int64)
+        t, q = mpc.tridiag(mat)
+        result_t = mpc.print_fp(t, fid=0)
+        result_q = mpc.print_fp(q, fid=0)
+        expected_t = np.array([
+            [8, -7.81025, 0],
+            [-7.81025, 9.57377, 3.31148],
+            [0, 2.31148, 1.42623]])
+        expected_q = np.array([
+            [1, 0, 0],
+            [0, -0.768221, -0.640184],
+            [0, -0.640184, 0.768221]])
+        if pid != 0:
+            assert_approx(result_t, expected_t)
+            assert_approx(result_q, expected_q)
         
         # mat = Vector([
         #     Vector([mpc.double_to_fp(4, param.NBIT_K, param.NBIT_F, 0),
