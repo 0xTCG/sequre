@@ -110,7 +110,7 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         if pid != 0:
             assert_values(revealed_p, expected_p)
         
-        p_or = mpc.comms.reveal_sym(mpc.prefix_or(a_mat, fid=0))
+        p_or = mpc.comms.reveal_sym(mpc.boolean.prefix_or(a_mat))
         if pid != 0:
             assert_values(p_or, 1599650766643921085)
         
