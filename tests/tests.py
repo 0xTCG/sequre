@@ -2,10 +2,10 @@ import time
 
 import numpy as np
 
-import param
-from custom_types import TypeOps, add_mod, mul_mod
-from mpc import MPCEnv
-from param import BASE_P
+import utils.param as param
+from utils.custom_types import add_mod, mul_mod
+from utils.type_ops import TypeOps
+from mpc.mpc import MPCEnv
 
 
 def assert_values(result, expected):
@@ -21,15 +21,15 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         if pid != 0:
             assert_values(mpc.lagrange_cache[2][1][1], 3107018978382642104)
         
-        revealed_value: np.ndarray = mpc.reveal_sym(np.array(10) if pid == 1 else np.array(7))
+        revealed_value: np.ndarray = mpc.comms.reveal_sym(np.array(10) if pid == 1 else np.array(7))
         if pid != 0:
             assert_values(revealed_value, 17)
         
-        revealed_value: np.ndarray = mpc.reveal_sym(np.array([10, 11, 12]) if pid == 1 else np.array([7, 8, 9]))
+        revealed_value: np.ndarray = mpc.comms.reveal_sym(np.array([10, 11, 12]) if pid == 1 else np.array([7, 8, 9]))
         if pid != 0:
             assert_values(revealed_value, np.array([17, 19, 21]))
         
-        revealed_value: np.ndarray = mpc.reveal_sym(
+        revealed_value: np.ndarray = mpc.comms.reveal_sym(
             np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]) if pid == 1
             else np.array([[10, 11, 12], [13, 14, 15], [16, 17, 18]]))
         if pid != 0:
@@ -37,41 +37,41 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         
         x_r, r = mpc.beaver_partition(np.array(10) if pid == 1 else np.array(7), fid=0)
         if pid == 0:
-            mpc.send_elem(r, 1)
-            mpc.send_elem(r, 2)
+            mpc.comms.send_elem(r, 1)
+            mpc.comms.send_elem(r, 2)
         else:
-            r_0 = mpc.receive_ndarray(0, msg_len=TypeOps.get_bytes_len(x_r), ndim=x_r.ndim, shape=x_r.shape)
-            assert_values(r_0, mpc.reveal_sym(r))
-            assert_values((x_r + mpc.reveal_sym(r)) % mpc.primes[0], np.array(17))
+            r_0 = mpc.comms.receive_ndarray(0, msg_len=TypeOps.get_bytes_len(x_r), ndim=x_r.ndim, shape=x_r.shape)
+            assert_values(r_0, mpc.comms.reveal_sym(r))
+            assert_values((x_r + mpc.comms.reveal_sym(r)) % mpc.primes[0], np.array(17))
         
         x_r, r = mpc.beaver_partition(np.array([10, 11, 12]) if pid == 1 else np.array([3, 4, 5]), fid=0)
         if pid == 0:
-            mpc.send_elem(r, 1)
-            mpc.send_elem(r, 2)
+            mpc.comms.send_elem(r, 1)
+            mpc.comms.send_elem(r, 2)
         else:
-            r_0 = mpc.receive_ndarray(0, msg_len=TypeOps.get_bytes_len(x_r), ndim=x_r.ndim, shape=x_r.shape)
-            assert_values(r_0, mpc.reveal_sym(r))
-            assert_values(add_mod(x_r, mpc.reveal_sym(r), mpc.primes[0]), np.array([13, 15, 17]))
+            r_0 = mpc.comms.receive_ndarray(0, msg_len=TypeOps.get_bytes_len(x_r), ndim=x_r.ndim, shape=x_r.shape)
+            assert_values(r_0, mpc.comms.reveal_sym(r))
+            assert_values(add_mod(x_r, mpc.comms.reveal_sym(r), mpc.primes[0]), np.array([13, 15, 17]))
         
         x_r, r = mpc.beaver_partition(
             np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]) if pid == 1 else
             np.array([[10, 11, 12], [13, 14, 15], [16, 17, 18]]), fid=0)
         if pid == 0:
-            mpc.send_elem(r, 1)
-            mpc.send_elem(r, 2)
+            mpc.comms.send_elem(r, 1)
+            mpc.comms.send_elem(r, 2)
         else:
-            r_0 = mpc.receive_ndarray(0, msg_len=TypeOps.get_bytes_len(x_r), ndim=x_r.ndim, shape=x_r.shape)
-            assert_values(r_0, mpc.reveal_sym(r))
-            assert_values(add_mod(x_r, mpc.reveal_sym(r), mpc.primes[0]), np.array([[11, 13, 15], [17, 19, 21], [23, 25, 27]]))
+            r_0 = mpc.comms.receive_ndarray(0, msg_len=TypeOps.get_bytes_len(x_r), ndim=x_r.ndim, shape=x_r.shape)
+            assert_values(r_0, mpc.comms.reveal_sym(r))
+            assert_values(add_mod(x_r, mpc.comms.reveal_sym(r), mpc.primes[0]), np.array([[11, 13, 15], [17, 19, 21], [23, 25, 27]]))
         
         p: np.ndarray = mpc.powers(np.array([2, 0 if pid == 1 else 1, 3], dtype=np.int64), 10, fid=0)
-        revealed_p: np.ndarray = mpc.reveal_sym(p)
+        revealed_p: np.ndarray = mpc.comms.reveal_sym(p)
         if pid != 0:
             assert_values(revealed_p[10], np.array([1048576, 1, 60466176], dtype=np.int64))
         
         coeff = np.array([[1] * 3, [2] * 3, [3] * 3], dtype=np.int64)
         p: np.ndarray = mpc.evaluate_poly(np.array([1, 2, 3], dtype=np.int64), coeff, fid=0)
-        revealed_p = mpc.reveal_sym(p)
+        revealed_p = mpc.comms.reveal_sym(p)
         if pid != 0:
             expected_mat = np.array([
                 [7, 21, 43],
@@ -105,20 +105,20 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         a = np.array([9 if pid == 1 else 7, 5 if pid == 1 else 3])
         b = np.array([4, 1])
         p = mpc.multiply(a, b, elem_wise=True, fid=0)
-        revealed_p = mpc.reveal_sym(p, fid=0)
+        revealed_p = mpc.comms.reveal_sym(p)
         expected_p = np.array([128, 16])
         if pid != 0:
             assert_values(revealed_p, expected_p)
         
-        p_or = mpc.reveal_sym(mpc.prefix_or(a_mat, fid=0), fid=0)
+        p_or = mpc.comms.reveal_sym(mpc.prefix_or(a_mat, fid=0))
         if pid != 0:
             assert_values(p_or, 1599650766643921085)
         
         ne, ne_sqrt = mpc.normalizer_even_exp(np.array([4, 1]))
         
         if pid != 0:
-            nee_0 = mpc.print_fp(mpc.reveal_sym(ne, 0), 0)
-            nee_1 = mpc.print_fp(mpc.reveal_sym(ne_sqrt, 0), 0)
+            nee_0 = mpc.print_fp(mpc.comms.reveal_sym(ne), 0)
+            nee_1 = mpc.print_fp(mpc.comms.reveal_sym(ne_sqrt), 0)
             assert_values(nee_0, np.array([32768, 0]))
             assert_values(nee_1, np.array([0.25, 1]))
 
@@ -282,7 +282,7 @@ def benchmark(mpc: MPCEnv, pid: int, m: int, n: int):
     lp = LineProfiler()
     fn = lp(mul_mod) if pid == 2 else mul_mod
     # fn(mat)
-    fn(coeff, coeff, BASE_P)
+    fn(coeff, coeff, param.BASE_P)
     if pid == 2:
         lp.print_stats()
     
