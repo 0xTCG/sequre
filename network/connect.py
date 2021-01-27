@@ -1,8 +1,8 @@
 import time
 
-import param
-from c_socket import CSocket
-from utils import get_address
+import utils.param as param
+from network.c_socket import CSocket
+from utils.utils import get_address
 
 
 RETRY_CONNECT: int = 100
