@@ -12,15 +12,13 @@ import utils.param as param
 
 from mpc.prg import PRG
 from mpc.comms import Comms
+from mpc.arithmetic import Arithmetic
 from network.c_socket import CSocket
 from network.connect import connect, open_channel
-from utils.custom_types import zeros, ones, random_ndarray, add_mod, mul_mod, matmul_mod
+from utils.custom_types import zeros, ones, add_mod, mul_mod, matmul_mod
 from utils.type_ops import TypeOps
-from utils.utils import bytes_to_arr, rand_int
+from utils.utils import bytes_to_arr, rand_int, random_ndarray
 
-Zp = None
-Vector = None
-Matrix = None
 
 class MPCEnv:
     def __init__(self: 'MPCEnv', pid: int):
@@ -39,6 +37,12 @@ class MPCEnv:
 
         self.comms = Comms(self.pid)
         self.prg = PRG(self.pid)
+        self.arithmetic = Arithmetic(
+            pid=self.pid,
+            prg=self.prg,
+            comms=self.comms)
+
+
         self.setup_tables()
     
     def setup_tables(self: 'MPCEnv'):
@@ -144,32 +148,6 @@ class MPCEnv:
 
         return numer_sum
  
-    def beaver_partition(self: 'MPCEnv', x: np.ndarray, fid: int) -> tuple:
-        x_: np.ndarray = np.mod(x, self.primes[fid])
-
-        x_r: np.ndarray = zeros(x_.shape)
-        r: np.ndarray = zeros(x_.shape)
-
-        if self.pid == 0:
-            self.prg.switch_seed(1)
-            r_1: np.ndarray = random_ndarray(base=self.primes[fid], shape=x_.shape)
-            self.prg.restore_seed(1)
-
-            self.prg.switch_seed(2)
-            r_2: np.ndarray = random_ndarray(base=self.primes[fid], shape=x_.shape)
-            self.prg.restore_seed(2)
-
-            r: np.ndarray = add_mod(r_1, r_2, self.primes[fid])
-        else:
-            self.prg.switch_seed(0)
-            r: np.ndarray = random_ndarray(base=self.primes[fid], shape=x_.shape)
-            self.prg.restore_seed(0)
-            
-            x_r = (x_ - r) % self.primes[fid]
-            x_r = self.comms.reveal_sym(x_r, field=self.primes[fid])
-        
-        return x_r, r
-    
     def get_pascal_matrix(self: 'MPCEnv', power: int) -> np.ndarray:
         if power not in self.pascal_cache:
             pascal_matrix: np.ndarray = self.calculate_pascal_matrix(power)
@@ -202,7 +180,7 @@ class MPCEnv:
                     b[0] += ones(n)
                 b[1][:] = x
         else:  # power > 1
-            x_r, r = self.beaver_partition(x, fid)
+            x_r, r = self.arithmetic.beaver_partition(x, field=self.primes[fid])
 
             if self.pid == 0:
                 r_pow: np.ndarray = zeros((power - 1, n))
@@ -282,62 +260,6 @@ class MPCEnv:
         
         return zeros((npoly, n))
     
-    def add_public(self: 'MPCEnv', x: np.ndarray, a: np.ndarray, fid: int) -> np.ndarray:
-        if self.pid == 1:
-            return add_mod(x, a, self.primes[fid])
-        return x
-    
-    def beaver_mult(
-            self: 'MPCEnv', x_r: np.ndarray, r_1: np.ndarray,
-            y_r: np.ndarray, r_2: np.ndarray, elem_wise: bool, fid: int) -> np.ndarray:
-        mul_func: callable = partial(mul_mod if elem_wise else matmul_mod, field=self.primes[fid])
-        
-        if self.pid == 0:
-            return mul_func(r_1, r_2)
-
-        xy = mul_func(x_r, r_2)
-        xy = add_mod(xy, mul_func(r_1, y_r), self.primes[fid])
-        if self.pid == 1:
-            xy = add_mod(xy, mul_func(x_r, y_r), self.primes[fid])
-
-        return xy
-
-    def beaver_reconstruct(self: 'MPCEnv', elem: np.ndarray, fid: int) -> np.ndarray:
-            msg_len: int = TypeOps.get_bytes_len(elem)
-            
-            if self.pid == 0:
-                self.prg.switch_seed(1)
-                mask: np.ndarray = random_ndarray(base=self.primes[fid], shape=elem.shape)
-                self.prg.restore_seed(1)
-
-                mm: np.ndarray = np.mod(elem - mask, self.primes[fid])
-                self.comms.send_elem(mm, 2)
-                
-                return mm
-            else:
-                rr: np.ndarray = None
-                if self.pid == 1:
-                    self.prg.switch_seed(0)
-                    rr = random_ndarray(base=self.primes[fid], shape=elem.shape)
-                    self.prg.restore_seed(0)
-                else:
-                    rr = self.comms.receive_ndarray(
-                        from_pid=0,
-                        msg_len=msg_len,
-                        ndim=elem.ndim,
-                        shape=elem.shape)
-                    
-                return add_mod(elem, rr, self.primes[fid])
-
-    def multiply(self: 'MPCEnv', a: np.ndarray, b: np.ndarray, elem_wise: bool, fid: int) -> np.ndarray:
-        x_1_r, r_1 = self.beaver_partition(a, fid)
-        x_2_r, r_2 = self.beaver_partition(b, fid)
-        
-        c = self.beaver_mult(x_1_r, r_1, x_2_r, r_2, elem_wise, fid)
-        c = self.beaver_reconstruct(c, fid)
-        
-        return c
-
     def fp_to_double(self: 'MPCEnv', a: np.ndarray, k: int, f: int, fid: int) -> np.ndarray:
         twokm1: int = TypeOps.left_shift(1, k - 1)
 
@@ -481,53 +403,6 @@ class MPCEnv:
         
         return bmat[0]
     
-    def reshape(self: 'MPCEnv', a: Matrix, nrows: int, ncols: int):
-        if self.pid == 0:
-            assert a.shape[0] * a.shape[1] == nrows * ncols
-            a.set_dims(nrows, ncols)
-        else:
-            a.reshape(nrows, ncols)
-
-    def beaver_partition_bulk(self: 'Matrix', x: list, fid: int) -> tuple:
-        # TODO: Do this in parallel
-        partitions = [self.beaver_partition(e, fid) for e in x]
-        x_r = [p[0] for p in partitions]
-        r = [p[1] for p in partitions]
-        return x_r, r
-    
-    def beaver_reconstruct_bulk(self: 'Matrix', x: list, fid: int) -> tuple:
-        # TODO: Do this in parallel
-        return [self.beaver_reconstruct(e, fid) for e in x]
-
-    def mult_aux_parallel(self: 'MPCEnv', a: list, b: list, elem_wise: bool, fid: int) -> list:
-        # TODO: Vectorize this method. Make it parallel by having a and b as ndarrays.
-        assert len(a) == len(b)
-        nmat: int = len(a)
-
-        out_rows = zeros(nmat)
-        out_cols = zeros(nmat)
-
-        for k in range(nmat):
-            if elem_wise:
-                assert a[k].shape == b[k].shape
-            else:
-                assert a[k].shape[1] == b[k].shape[0]
-
-            out_rows[k] = a[k].shape[0]
-            out_cols[k] = a[k].shape[1] if elem_wise else b[k].shape[1]
-
-        ar, am = self.beaver_partition_bulk(a, fid)
-        br, bm = self.beaver_partition_bulk(b, fid)
-
-        c = [self.beaver_mult(ar[k], am[k], br[k], bm[k], elem_wise, fid)
-             for k in range(nmat)]
-        
-        return self.beaver_reconstruct_bulk(c, fid)
-
-    def mult_mat_parallel(self: 'MPCEnv', a: list, b: list, fid: int) -> list:
-        # TODO: Vectorise/parallelize this method
-        return self.mult_aux_parallel(a, b, False, fid)
-
     def prefix_or(self: 'MPCEnv', a: np.ndarray, fid: int) -> np.ndarray:
         n: int = a.shape[0]
 
@@ -578,7 +453,7 @@ class MPCEnv:
                     tmp[i][j][:] = a_padded[L * i + j]
                 tmp[i] %= self.primes[fid]
 
-        c = self.mult_mat_parallel(f, tmp, fid)  # c is a concatenation of n 1-by-L matrices
+        c = self.arithmetic.mult_mat_parallel(f, tmp, self.primes[fid])  # c is a concatenation of n 1-by-L matrices
 
         cpre: np.ndarray = zeros((n * L, L))
         if self.pid > 0:
@@ -599,7 +474,7 @@ class MPCEnv:
         for i in range(n):
             f[i] = f[i].reshape((L, 1))
 
-        s = self.mult_mat_parallel(f, bdot, fid)
+        s = self.arithmetic.mult_mat_parallel(f, bdot, self.primes[fid])
 
         b = zeros(a.shape)
         if self.pid > 0:
@@ -659,10 +534,10 @@ class MPCEnv:
         # Initial approximation: 1 / x_scaled ~= 5.9430 - 10 * x_scaled + 5 * x_scaled^2
         s, _ = self.normalizer_even_exp(b)
 
-        b_scaled: np.ndarray = self.multiply(b, s, True, fid=fid)
+        b_scaled: np.ndarray = self.arithmetic.multiply(b, s, True, field=self.primes[fid])
         b_scaled = self.trunc(b_scaled, param.NBIT_K, param.NBIT_K - param.NBIT_F, fid=fid)
 
-        b_scaled_sq: np.ndarray = self.multiply(b_scaled, b_scaled, True, fid=fid)
+        b_scaled_sq: np.ndarray = self.arithmetic.multiply(b_scaled, b_scaled, True, field=self.primes[fid])
         b_scaled_sq = self.trunc(b_scaled_sq, fid=fid)
 
         scaled_est = zeros(n)
@@ -673,12 +548,12 @@ class MPCEnv:
                 coeff: int = self.double_to_fp(5.9430, param.NBIT_K, param.NBIT_F, fid=fid)
                 scaled_est = add_func(scaled_est, coeff)
 
-        w: np.ndarray = self.multiply(scaled_est, s, True, fid=fid)
+        w: np.ndarray = self.arithmetic.multiply(scaled_est, s, True, field=self.primes[fid])
         # scaled_est has bit length <= NBIT_F + 2, and s has bit length <= NBIT_K
         # so the bit length of w is at most NBIT_K + NBIT_F + 2
         w = self.trunc(w, param.NBIT_K + param.NBIT_F + 2, param.NBIT_K - param.NBIT_F, fid=fid)
 
-        x: np.ndarray = self.multiply(w, b, True, fid=fid)
+        x: np.ndarray = self.arithmetic.multiply(w, b, True, field=self.primes[fid])
         x = self.trunc(x, fid=fid)
 
         one: int = self.int_to_fp(1, param.NBIT_K, param.NBIT_F, fid=fid)
@@ -687,22 +562,22 @@ class MPCEnv:
         if self.pid == 1:
             x = add_func(x, one)
         
-        y: np.ndarray = self.multiply(a, w, True, fid=fid)
+        y: np.ndarray = self.arithmetic.multiply(a, w, True, field=self.primes[fid])
         y = self.trunc(y, fid=fid)
 
         for _ in range(niter):
-            xr, xm = self.beaver_partition(x, fid=fid)
-            yr, ym = self.beaver_partition(y, fid=fid)
+            xr, xm = self.arithmetic.beaver_partition(x, field=self.primes[fid])
+            yr, ym = self.arithmetic.beaver_partition(y, field=self.primes[fid])
 
             xpr = xr.copy()
             if self.pid > 0:
                 xpr = add_func(xpr, one)
 
-            y = self.beaver_mult(yr, ym, xpr, xm, True, fid=0)
-            x = self.beaver_mult(xr, xm, xr, xm, True, fid=0)
+            y = self.arithmetic.beaver_mult(yr, ym, xpr, xm, True)
+            x = self.arithmetic.beaver_mult(xr, xm, xr, xm, True)
 
-            x = self.beaver_reconstruct(x, fid=fid)
-            y = self.beaver_reconstruct(y, fid=fid)
+            x = self.arithmetic.beaver_reconstruct(x, field=self.primes[fid])
+            y = self.arithmetic.beaver_reconstruct(y, field=self.primes[fid])
 
             x = self.trunc(x, fid=fid)
             y = self.trunc(y, fid=fid)
@@ -710,7 +585,7 @@ class MPCEnv:
         if self.pid == 1:
             x = add_func(x, one)
             
-        c: np.ndarray = self.multiply(y, x, True, fid=fid)
+        c: np.ndarray = self.arithmetic.multiply(y, x, True, field=self.primes[fid])
         return self.trunc(c, fid=fid)
 
     def less_than_bits_public(self: 'MPCEnv', a: np.ndarray, b_pub: np.ndarray, fid: int) -> np.ndarray:
@@ -801,7 +676,7 @@ class MPCEnv:
         rfir: np.ndarray = zeros((n, param.NBIT_K))
         if self.pid > 0:
             efir = mul_func(ebits, Tneg)
-        rfir = self.multiply(rbits, Tneg, True, fid)
+        rfir = self.arithmetic.multiply(rbits, Tneg, True, self.primes[fid])
 
         double_flag: np.ndarray = self.less_than_bits(efir, rfir, fid)
 
@@ -834,7 +709,7 @@ class MPCEnv:
         if self.pid != 0:
             diff: np.ndarray = np.mod(odd_bit_sum - even_bit_sum, field)
 
-        diff = self.multiply(double_flag, diff, True, fid)
+        diff = self.arithmetic.multiply(double_flag, diff, True, self.primes[fid])
         
         chosen_bit_sum = zeros(n)
         if self.pid != 0:
@@ -865,7 +740,7 @@ class MPCEnv:
         x = zeros((n, L))
 
         if public_flag == 0:
-            x: np.ndarray = self.multiply(a, b, True, fid)
+            x: np.ndarray = self.arithmetic.multiply(a, b, True, self.primes[fid])
             if self.pid > 0:
                 x = np.mod(add_func(a, b) - add_func(x, x), field)
         elif self.pid > 0:
@@ -901,7 +776,7 @@ class MPCEnv:
                 for j in range(L):
                     b_arr[i][j][0] = b[i][j]
 
-        c_arr: list = self.mult_mat_parallel(f_arr, b_arr, fid)
+        c_arr: list = self.arithmetic.mult_mat_parallel(f_arr, b_arr, self.primes[fid])
         
         return np.array([c_arr[i][0][0] if self.pid > 0 else 0 for i in range(n)], dtype=np.int64)
 
@@ -940,10 +815,10 @@ class MPCEnv:
         # Bottleneck
         s, s_sqrt = self.normalizer_even_exp(a)
 
-        a_scaled: np.ndarray = self.multiply(a, s, elem_wise=True, fid=fid)
+        a_scaled: np.ndarray = self.arithmetic.multiply(a, s, elem_wise=True, field=self.primes[fid])
         a_scaled = self.trunc(a_scaled, param.NBIT_K, param.NBIT_K - param.NBIT_F, fid=fid)
 
-        a_scaled_sq: np.ndarray = self.multiply(a_scaled, a_scaled, elem_wise=True, fid=fid)
+        a_scaled_sq: np.ndarray = self.arithmetic.multiply(a_scaled, a_scaled, elem_wise=True, field=self.primes[fid])
         a_scaled_sq = self.trunc(a_scaled_sq, fid=fid)
 
         scaled_est = zeros(n)
@@ -958,7 +833,7 @@ class MPCEnv:
         # TODO: Make h_and_g a ndarray
         h_and_g: list = [zeros((1, n)) for _ in range(2)]
 
-        h_and_g[0][0][:] = self.multiply(scaled_est, s_sqrt, elem_wise=True, fid=0)
+        h_and_g[0][0][:] = self.arithmetic.multiply(scaled_est, s_sqrt, elem_wise=True)
         # Our scaled initial approximation (scaled_est) has bit length <= NBIT_F + 2
         # and s_sqrt is at most NBIT_K/2 bits, so their product is at most NBIT_K/2 +
         # NBIT_F + 2
@@ -966,13 +841,13 @@ class MPCEnv:
             h_and_g[0], param.NBIT_K // 2 + param.NBIT_F + 2, (param.NBIT_K - param.NBIT_F) // 2 + 1, fid=0)
 
         h_and_g[1][0][:] = add_mod(h_and_g[0][0], h_and_g[0][0], field)
-        h_and_g[1][0][:] = self.multiply(h_and_g[1][0], a, elem_wise=True, fid=0)
+        h_and_g[1][0][:] = self.arithmetic.multiply(h_and_g[1][0], a, elem_wise=True)
         h_and_g[1] = self.trunc(h_and_g[1], k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F, fid=0)
 
         onepointfive: int = self.double_to_fp(1.5, param.NBIT_K, param.NBIT_F, fid=0)
 
         for _ in range(niter):
-            r: np.ndarray = self.multiply(h_and_g[0], h_and_g[1], elem_wise=True, fid=0)
+            r: np.ndarray = self.arithmetic.multiply(h_and_g[0], h_and_g[1], elem_wise=True)
             r = self.trunc(r, k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F, fid=0)
             r = np.mod(-r, field)
             if self.pid == 1:
@@ -980,7 +855,7 @@ class MPCEnv:
 
             r_dup: list = [r, r]
 
-            h_and_g: list = self.mult_aux_parallel(h_and_g, r_dup, True, fid=0)
+            h_and_g: list = self.arithmetic.mult_aux_parallel(h_and_g, r_dup, True)
             # TODO: write a version of Trunc with parallel processing (easy with h_and_g as ndarray)
             h_and_g[0] = self.trunc(h_and_g[0], k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F, fid=0)
             h_and_g[1] = self.trunc(h_and_g[1], k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F, fid=0)
@@ -997,11 +872,11 @@ class MPCEnv:
         add_func = partial(add_mod, field=field)
         mul_func = partial(mul_mod, field=field)
         
-        xr, xm = self.beaver_partition(x, fid=0)
+        xr, xm = self.arithmetic.beaver_partition(x)
 
-        xdot: np.ndarray = self.beaver_inner_prod(xr, xm, fid=0)
+        xdot: np.ndarray = self.arithmetic.beaver_inner_prod(xr, xm)
         xdot = np.array([xdot], dtype=np.int64)
-        xdot = self.beaver_reconstruct(xdot, fid=0)
+        xdot = self.arithmetic.beaver_reconstruct(xdot)
         xdot = self.trunc(xdot)
 
         # Bottleneck
@@ -1014,14 +889,14 @@ class MPCEnv:
         if self.pid == 1:
             x1sign[0] = (x1sign[0] - 1) % field
 
-        shift: np.ndarray = self.multiply(xnorm, x1sign, True, fid=0)
+        shift: np.ndarray = self.arithmetic.multiply(xnorm, x1sign, True)
 
-        sr, sm = self.beaver_partition(shift[0], fid=0)
+        sr, sm = self.arithmetic.beaver_partition(shift[0])
 
         xr_0: np.ndarray = np.expand_dims(xr[0], axis=0)
         xm_0: np.ndarray = np.expand_dims(xm[0], axis=0)
-        dot_shift: np.ndarray = self.beaver_mult(xr_0, xm_0, sr, sm, True, fid=0)
-        dot_shift = self.beaver_reconstruct(dot_shift, fid=0)
+        dot_shift: np.ndarray = self.arithmetic.beaver_mult(xr_0, xm_0, sr, sm, True)
+        dot_shift = self.arithmetic.beaver_reconstruct(dot_shift)
         dot_shift = self.trunc(dot_shift, fid=0)
 
         vdot = zeros(1)
@@ -1031,7 +906,7 @@ class MPCEnv:
         # Bottleneck
         _, vnorm_inv = self.fp_sqrt(vdot)
 
-        invr, invm = self.beaver_partition(vnorm_inv[0], fid=0)
+        invr, invm = self.arithmetic.beaver_partition(vnorm_inv[0])
 
         vr = zeros(n)
         if self.pid > 0:
@@ -1040,8 +915,8 @@ class MPCEnv:
         vm = xm.copy()
         vm[0] = add_func(vm[0], sm)
 
-        v: np.ndarray = self.beaver_mult(vr, vm, invr, invm, True, fid=0)
-        v = self.beaver_reconstruct(v, fid=0)
+        v: np.ndarray = self.arithmetic.beaver_mult(vr, vm, invr, invm, True)
+        v = self.arithmetic.beaver_reconstruct(v)
         v = self.trunc(v, fid=0)
 
         return v
@@ -1071,8 +946,8 @@ class MPCEnv:
             self.comms.send_elem(r, 2)
             self.comms.send_elem(r_bits, 2)
         elif self.pid == 2:
-            r: Vector = self.comms.receive_vector(0, msg_len=TypeOps.get_vec_len(n), shape=n)
-            r_bits: Matrix = self.comms.receive_matrix(0, msg_len=TypeOps.get_mat_len(n, nbits), shape=(n, nbits))
+            r: np.ndarray = self.comms.receive_vector(0, msg_len=TypeOps.get_vec_len(n), shape=n)
+            r_bits: np.ndarray = self.comms.receive_matrix(0, msg_len=TypeOps.get_mat_len(n, nbits), shape=(n, nbits))
         else:
             self.prg.switch_seed(0)
             r: np.ndarray = random_ndarray(base=self.primes[0], shape=n)
@@ -1101,7 +976,7 @@ class MPCEnv:
                     c_xor_r[i] += c_bits[i][nbits - 1]
             c_xor_r %= field
         
-        lsb: np.ndarray = self.multiply(c_xor_r, no_overflow, True, fid)
+        lsb: np.ndarray = self.arithmetic.multiply(c_xor_r, no_overflow, True, self.primes[fid])
         if self.pid > 0:
             lsb = add_mod(lsb, lsb, field)
             lsb -= add_mod(no_overflow, c_xor_r, field)
@@ -1117,37 +992,6 @@ class MPCEnv:
 
         return b_mat[0]
     
-    def beaver_inner_prod(self: 'MPCEnv', ar: np.ndarray, am: np.ndarray, fid: int) -> int:
-        mul_func = partial(mul_mod, field=self.primes[fid])
-        add_func = partial(add_mod, field=self.primes[fid])
-        
-        ab: np.ndarray = None
-        if self.pid == 0:
-            ab = mul_func(am, am)
-        else:
-            temp: np.ndarray = mul_func(ar, am)
-            ab = add_func(temp, temp)
-            
-            if self.pid == 1:
-                ab = add_func(ab, mul_func(ar, ar))
-
-        return reduce(add_func, ab, 0)
-    
-    def beaver_inner_prod_pair(
-            self: 'MPCEnv', ar: Vector, am: Vector, br: Vector, bm: Vector, fid: int) -> Zp:
-        ab = Zp(0, self.primes[fid])
-        
-        for i in range(len(ar)):
-            if self.pid == 0:
-                ab += am[i] * bm[i]
-            else:
-                ab += ar[i] * bm[i]
-                ab += br[i] * am[i]
-                if self.pid == 1:
-                    ab += ar[i] * br[i]
-
-        return ab.set_field(self.primes[fid])
-
     def qr_fact_square(self: 'MPCEnv', A: np.ndarray) -> np.ndarray:
         assert A.shape[0] == A.shape[1]
 
@@ -1169,7 +1013,7 @@ class MPCEnv:
             v = np.expand_dims(self.householder(Ap[0]), axis=0)
             vt = v.T
             
-            P: np.ndarray = self.multiply(vt, v, False, fid=0)
+            P: np.ndarray = self.arithmetic.multiply(vt, v, False)
             P = self.trunc(P, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
             if self.pid > 0:
@@ -1180,7 +1024,7 @@ class MPCEnv:
             B = zeros((n - i, n - i))
             if i == 0:
                 Q = P
-                B = self.multiply(Ap, P, False, fid=0)
+                B = self.arithmetic.multiply(Ap, P, False)
                 B = self.trunc(B, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
             else:
                 Qsub = zeros((n - i, n))
@@ -1190,7 +1034,7 @@ class MPCEnv:
                 left: list = [P, Ap]
                 right: list = [Qsub, P]
 
-                prod: list = self.mult_mat_parallel(left, right, fid=0)
+                prod: list = self.arithmetic.mult_mat_parallel(left, right)
                 # TODO: parallelize Trunc
                 prod[0] = self.trunc(prod[0], param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
                 prod[1] = self.trunc(prod[1], param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
@@ -1234,7 +1078,7 @@ class MPCEnv:
             v = np.expand_dims(self.householder(x), axis=0)
             vt = v.T
 
-            vv: np.ndarray = self.multiply(vt, v, False, fid=0)
+            vv: np.ndarray = self.arithmetic.multiply(vt, v, False)
             vv = self.trunc(vv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
             P = zeros(Ap.shape)
@@ -1246,16 +1090,16 @@ class MPCEnv:
                     np.fill_diagonal(P, add_func(P.diagonal(), one))
 
             # TODO: parallelize? (minor improvement)
-            PAp: np.ndarray = self.multiply(P, Ap, False, fid=0)
+            PAp: np.ndarray = self.arithmetic.multiply(P, Ap, False)
             PAp = self.trunc(PAp, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
-            B = self.multiply(PAp, P, False, fid=0)
+            B = self.arithmetic.multiply(PAp, P, False)
             B = self.trunc(B, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
             Qsub = zeros((n, n - i))
             if self.pid > 0:
                 Qsub[:, :n - i] = Q[:, i:n]
 
-            Qsub: np.ndarray = self.multiply(Qsub, P, False, fid=0)
+            Qsub: np.ndarray = self.arithmetic.multiply(Qsub, P, False)
             Qsub = self.trunc(Qsub, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
             if self.pid > 0:
                 Q[:, i:n] = Qsub[:, :n - i]
@@ -1294,7 +1138,7 @@ class MPCEnv:
 
                 Q, R = self.qr_fact_square(Ap)
 
-                Ap = self.multiply(Q, R, False, fid=0)
+                Ap = self.arithmetic.multiply(Q, R, False)
                 Ap = self.trunc(Ap, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
                 if self.pid > 0:
@@ -1304,7 +1148,7 @@ class MPCEnv:
                 if self.pid > 0:
                     Vsub[:i + 1] = V[:i + 1]
 
-                Vsub = self.multiply(Q, Vsub, False, fid=0)
+                Vsub = self.arithmetic.multiply(Q, Vsub, False)
                 Vsub = self.trunc(Vsub, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
                 if self.pid > 0:
@@ -1321,112 +1165,91 @@ class MPCEnv:
         
         return V, L
 
-    def orthonormal_basis(self: 'MPCEnv', A: Matrix) -> Matrix:
+    def orthonormal_basis(self: 'MPCEnv', A: np.ndarray) -> np.ndarray:
         assert A.shape[1] >= A.shape[0]
+        add_func: callable = partial(add_mod, field=self.primes[0])
 
         c: int = A.shape[0]
         n: int = A.shape[1]
 
+        # TODO: Make v_list an ndarray
         v_list: list = []
 
-        Ap = Matrix(c, n)
+        Ap = zeros((c, n))
         if self.pid != 0:
-            Ap = Matrix().from_value(deepcopy(A))
+            # TODO: Remove copy
+            Ap = A.copy()
 
-        one: Zp = self.double_to_fp(1, param.NBIT_K, param.NBIT_F, fid=0)
+        one: int = self.double_to_fp(1, param.NBIT_K, param.NBIT_F, fid=0)
 
         for i in range(c):
-            v = Matrix(1, Ap.shape[1])
+            v = zeros((1, Ap.shape[1]))
             v[0] = self.householder(Ap[0])
 
             if self.pid == 0:
-                v_list.append(Vector([Zp(0, base=self.primes[0]) for _ in range(Ap.shape[1])]))
+                v_list.append(zeros(Ap.shape[1]))
             else:
-                v_list.append(Vector(v[0].value))
+                v_list.append(v[0])
 
-            vt = Matrix(Ap.shape[1], 1)
+            vt = zeros((Ap.shape[1], 1))
             if self.pid != 0:
-                vt = v.transpose(inplace=False)
+                vt = v.T
 
-            Apv = self.mult_mat_parallel([Ap], [vt], fid=0)[0]
-            self.trunc(Apv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+            Apv = self.arithmetic.multiply(Ap, vt, False)
+            Apv = self.trunc(Apv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
-            B = self.mult_mat_parallel([Apv], [v], fid=0)[0]
-            self.trunc(B, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+            B = self.arithmetic.multiply(Apv, v, False)
+            B = self.trunc(B, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
             if self.pid > 0:
-                B *= -2
-                B += Ap
+                B = np.mod(-B, self.primes[0])
+                B = add_func(B, B)
+                B = add_func(B, Ap)
 
-            Ap = Matrix(B.shape[0] - 1, B.shape[1] - 1)
+            Ap = zeros((B.shape[0] - 1, B.shape[1] - 1))
             if self.pid > 0:
+                # TODO: Vectorize
                 for j in range(B.shape[0] - 1):
                     for k in range(B.shape[1] - 1):
-                        Ap[j][k] = Zp(B[j + 1][k + 1].value, B[j + 1][k + 1].base)
+                        Ap[j][k] = B[j + 1][k + 1]
 
-        Q = Matrix(c, n)
+        Q = zeros((c, n))
         if self.pid > 0:
             if self.pid == 1:
+                # TODO: Vectorize
                 for i in range(c):
-                    Q[i][i] = Zp(one.value, one.base)
+                    Q[i][i] = one
 
+        # TODO: Vectorize
         for i in range(c - 1, -1, -1):
-            v = Matrix(1, len(v_list[i]))
+            v = zeros((1, len(v_list[i])))
             if self.pid > 0:
-                v[0] = Vector(v_list[i].value)
+                v[0] = v_list[i]
 
-            vt = Matrix(v.shape[1], 1)
+            vt = zeros((v.shape[1], 1))
             if self.pid != 0:
-                vt = v.transpose(inplace=False)
+                vt = v.T
 
-            Qsub = Matrix(c, n - i)
+            Qsub = zeros((c, n - i))
             if self.pid > 0:
+                # TODO: Vectorize
                 for j in range(c):
                     for k in range(n - i):
-                        Qsub[j][k] = Zp(Q[j][k + i].value, Q[j][k + i].base)
+                        Qsub[j][k] = Q[j][k + i]
 
-            Qv = self.mult_mat_parallel([Qsub], [vt], fid=0)[0]
-            self.trunc(Qv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+            Qv = self.arithmetic.multiply(Qsub, vt, False)
+            Qv = self.trunc(Qv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
 
-            Qvv = self.mult_mat_parallel([Qv], [v], fid=0)[0]
-            self.trunc(Qvv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
+            Qvv = self.arithmetic.multiply(Qv, v, False)
+            Qvv = self.trunc(Qvv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
             if self.pid > 0:
-                Qvv *= -2
+                Qvv = np.mod(-Qvv, self.primes[0])
+                Qvv = add_func(Qvv, Qvv)
 
             if self.pid > 0:
+                # TODO: Vectorize
                 for j in range(c):
                     for k in range(n - i):
-                        Q[j][k + i] += Qvv[j][k]
+                        Q[j][k + i] = add_func(Q[j][k + i], Qvv[j][k])
 
         return Q
-
-    def read_matrix(self: 'MPCEnv', f, nrows: int, ncols: int, fid: int) -> Matrix:
-        a = list()
-        
-        for _ in range(nrows):
-            a.append(self.read_vector(f, ncols, fid))
-        
-        return Matrix().from_value(Vector(a))
-    
-    def read_vector(self: 'MPCEnv', f, n: int, fid: int) -> Matrix:
-        a: list = list()
-        
-        for _ in range(n):
-            a.append(Zp(int(f.read(self.primes_bytes[0])), base=self.primes[fid]))
-        
-        return Vector(a)
-
-    def filter(self: 'MPCEnv', v: Vector, mask: Vector) -> Vector:
-        return Vector([e for i, e in enumerate(v.value) if mask[i].value == 1])
-    
-    def filter_rows(self: 'MPCEnv', mat: Matrix, mask: Vector) -> Matrix:
-        return Matrix().from_value(self.filter(mat, mask))
-    
-    def inner_prod(self: 'MPCEnv', a: Matrix, fid: int) -> Matrix:
-        ar, am = self.beaver_partition(a, fid)
-
-        c = Vector([Zp(0, base=param.BASE_P) for _ in range(a.shape[0])])
-        for i in range(a.shape[0]):
-            c[i] = self.beaver_inner_prod(ar[i], am[i], fid)
-
-        return self.beaver_reconstruct(c, fid)
