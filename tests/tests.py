@@ -35,7 +35,7 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
         if pid != 0:
             assert_values(revealed_value, np.array([[11, 13, 15], [17, 19, 21], [23, 25, 27]]))
         
-        x_r, r = mpc.beaver_partition(np.array(10) if pid == 1 else np.array(7), fid=0)
+        x_r, r = mpc.arithmetic.beaver_partition(np.array(10) if pid == 1 else np.array(7))
         if pid == 0:
             mpc.comms.send_elem(r, 1)
             mpc.comms.send_elem(r, 2)
@@ -44,7 +44,7 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_values(r_0, mpc.comms.reveal_sym(r))
             assert_values((x_r + mpc.comms.reveal_sym(r)) % mpc.primes[0], np.array(17))
         
-        x_r, r = mpc.beaver_partition(np.array([10, 11, 12]) if pid == 1 else np.array([3, 4, 5]), fid=0)
+        x_r, r = mpc.arithmetic.beaver_partition(np.array([10, 11, 12]) if pid == 1 else np.array([3, 4, 5]))
         if pid == 0:
             mpc.comms.send_elem(r, 1)
             mpc.comms.send_elem(r, 2)
@@ -53,9 +53,9 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_values(r_0, mpc.comms.reveal_sym(r))
             assert_values(add_mod(x_r, mpc.comms.reveal_sym(r), mpc.primes[0]), np.array([13, 15, 17]))
         
-        x_r, r = mpc.beaver_partition(
+        x_r, r = mpc.arithmetic.beaver_partition(
             np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]) if pid == 1 else
-            np.array([[10, 11, 12], [13, 14, 15], [16, 17, 18]]), fid=0)
+            np.array([[10, 11, 12], [13, 14, 15], [16, 17, 18]]))
         if pid == 0:
             mpc.comms.send_elem(r, 1)
             mpc.comms.send_elem(r, 2)
@@ -88,14 +88,14 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_approx(float_b, 5.95)
 
         pub: int = mpc.double_to_fp(5.07, param.NBIT_K, param.NBIT_F, fid=0)
-        a: np.ndarray = mpc.add_public(np.array(a, dtype=np.int64), np.array(pub, dtype=np.int64), fid=0)
+        a: np.ndarray = mpc.arithmetic.add_public(np.array(a, dtype=np.int64), np.array(pub, dtype=np.int64))
         float_a = mpc.print_fp(a, fid=0)
         if pid != 0:
             assert_approx(float_a, 8.21)
 
         a_mat = np.array([[int(a)]], dtype=np.int64)
         b_mat = np.array([[int(b)]], dtype=np.int64)
-        d: np.ndarray = mpc.multiply(a_mat, b_mat, elem_wise=True, fid=0)
+        d: np.ndarray = mpc.arithmetic.multiply(a_mat, b_mat, elem_wise=True)
         mpc.print_fp(d, fid=0)
         d = mpc.trunc(d, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
         float_d = mpc.print_fp(d, fid=0)
@@ -104,7 +104,7 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
 
         a = np.array([9 if pid == 1 else 7, 5 if pid == 1 else 3])
         b = np.array([4, 1])
-        p = mpc.multiply(a, b, elem_wise=True, fid=0)
+        p = mpc.arithmetic.multiply(a, b, elem_wise=True)
         revealed_p = mpc.comms.reveal_sym(p)
         expected_p = np.array([128, 16])
         if pid != 0:
