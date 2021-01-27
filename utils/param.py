@@ -37,10 +37,11 @@ NUM_SNPS = 1000
 NUM_COVS: int = 10
 NUM_DIM_TO_REMOVE = 5
 
-NUM_OVERSAMPLE = 10
+NUM_OVERSAMPLE: int = 10
 NUM_POWER_ITER: int = 5
 
-SNP_POS_FILE = "test_data/pos.txt"
+SNP_POS_FILE: int = "test_data/pos.txt"
+SIGMOID_APPROX_PATH: str = 'data/sigmoid_approx.txt'
 
 IMISS_UB: float = 0.05
 GMISS_UB: float = 0.1
