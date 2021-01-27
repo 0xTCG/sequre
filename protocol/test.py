@@ -1,4 +1,4 @@
-from mpc.mpc import MPCEnv
+from mpc.mpc_env import MPCEnv
 from tests.tests import test_all, benchmark
 
 
