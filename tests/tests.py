@@ -5,7 +5,7 @@ import numpy as np
 import utils.param as param
 from utils.custom_types import add_mod, mul_mod
 from utils.type_ops import TypeOps
-from mpc.mpc import MPCEnv
+from mpc.mpc_env import MPCEnv
 
 
 def assert_values(result, expected):
