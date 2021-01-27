@@ -8,6 +8,10 @@ import numpy as np
 from utils.param import BASE_P, BASE_LEN
 
 
+def random_ndarray(base: int, shape: tuple) -> np.ndarray:
+    return np.random.randint(base, size=shape)
+
+
 # Numpy overrides
 zeros = partial(np.zeros, dtype=np.int64)
 ones = partial(np.ones, dtype=np.int64)
@@ -15,8 +19,6 @@ ones = partial(np.ones, dtype=np.int64)
 
 # Temp modular arithmetic wrappers (add_mod, mul_mod and matmul_mod)
 def add_mod(x: np.ndarray, y: np.ndarray, field: int) -> np.ndarray:
-    assert field in {BASE_P, 31, 17}
-    
     return np.mod(x - (-y + field), field)
 
 
