@@ -97,7 +97,7 @@ class Comms:
             assert sent_data == msg_len, f'Sent {sent_data} bytes but expected {msg_len}'
             
         return add_mod(elem, received_elem, field)
-    
+
     def clean_up(self: 'Comms'):
         for socket in self.sockets.values():
             socket.close()
