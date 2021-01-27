@@ -13,6 +13,7 @@ import utils.param as param
 from mpc.prg import PRG
 from mpc.comms import Comms
 from mpc.arithmetic import Arithmetic
+from mpc.polynomial import Polynomial
 from network.c_socket import CSocket
 from network.connect import connect, open_channel
 from utils.custom_types import zeros, ones, add_mod, mul_mod, matmul_mod
@@ -23,307 +24,42 @@ from utils.utils import bytes_to_arr, rand_int, random_ndarray
 class MPCEnv:
     def __init__(self: 'MPCEnv', pid: int):
         self.pid: int = None
-        self.pascal_cache: dict = dict()
-        self.table_cache: dict = dict()
-        self.table_type_modular: dict = dict()
-        self.lagrange_cache: dict = dict()
-        self.table_field_index: dict = dict()
         self.primes: dict = {0: param.BASE_P, 1: 31, 2: 17}  # Temp hardcoded. Needs to be calcualted on init.
         self.primes_bits: dict = {k: math.ceil(math.log2(v)) for k, v in self.primes.items()}
         self.primes_bytes: dict = {k: (v + 7) // 8 for k, v in self.primes_bits.items()}
         self.invpow_cache: dict = dict()
         self.or_lagrange_cache: dict = dict()
-        self.pid = pid
 
+        self.pid = pid
         self.comms = Comms(self.pid)
         self.prg = PRG(self.pid)
         self.arithmetic = Arithmetic(
             pid=self.pid,
             prg=self.prg,
             comms=self.comms)
-
-
-        self.setup_tables()
-    
-    def setup_tables(self: 'MPCEnv'):
-        # Lagrange cache
-        # Table 0
-        table = zeros((1, 2))
-        if (self.pid > 0):
-            table[0][0] = 1
-            table[0][1] = 0
-
-        self.table_type_modular[0] = True
-        self.table_cache[0] = table
-        self.table_field_index[0] = 2
-
-        # Table 1
-        half_len: int = param.NBIT_K // 2
-        table = zeros((2, half_len + 1))
-        if self.pid > 0:
-            for i in range(half_len + 1):
-                if i == 0:
-                    table[0][i] = 1
-                    table[1][i] = 1
-                else:
-                    table[0][i] = table[0][i - 1] * 2
-                    table[1][i] = table[1][i - 1] * 4
-
-        self.table_type_modular[1] = True
-        self.table_cache[1] = table
-        self.table_field_index[1] = 1
-
-        # Table 2: parameters (intercept, slope) for piecewise-linear approximation
-        # of negative log-sigmoid function
-        table = zeros((2, 64))
-        if self.pid > 0:
-            with open(param.SIGMOID_APPROX_PATH) as f:
-                for i in range(table.shape[1]):
-                    intercept, slope = f.readline().split()
-                    fp_intercept: int = self.double_to_fp(
-                        float(intercept), param.NBIT_K, param.NBIT_F, fid=0)
-                    fp_slope: int = self.double_to_fp(float(slope), param.NBIT_K, param.NBIT_F, fid=0)
-
-                    table[0][i] = fp_intercept
-                    table[1][i] = fp_slope
-
-        self.table_type_modular[2] = False
-        self.table_cache[2] = table
-        self.table_field_index[2] = 0
-
-        for cid in range(len(self.table_cache)):
-            nrow: int = self.table_cache[cid].shape[0]
-            ncol: int = self.table_cache[cid].shape[1]
-            self.lagrange_cache[cid] = zeros((nrow, (2 if self.table_type_modular[cid] else 1) * ncol))
-
-            if self.pid > 0:
-                for i in range(nrow):
-                    x = [0] * (ncol * (2 if self.table_type_modular[cid] else 1))
-                    y = zeros(ncol * (2 if self.table_type_modular[cid] else 1))
-                    
-                    for j in range(ncol):
-                        x[j] = j + 1
-                        y[j] = self.table_cache[cid][i][j]
-                        if (self.table_type_modular[cid]):
-                            x[j + ncol] = x[j] + self.primes[self.table_field_index[cid]]
-                            y[j + ncol] = self.table_cache[cid][i][j]
-                    
-                    self.lagrange_cache[cid][i][:] = self.lagrange_interp(x, y, fid=0)
-            
-        # End of Lagrange cache
-    
-    def lagrange_interp(self: 'MPCEnv', x: np.ndarray, y: np.ndarray, fid: int) -> np.ndarray:
-        n: int = len(y)
-
-        inv_table = dict()
-        for i in range(n):
-            for j in range(n):
-                if i == j:
-                    continue
-
-                key: int = abs(x[i] - x[j])
-                if key not in inv_table:
-                    inv_table[key] = TypeOps.mod_inv(key, self.primes[fid])
-        
-        # Initialize numer and denom_inv
-        numer = zeros((n, n))
-        denom_inv = ones(n)
-        numer[0][:] = np.mod(y, self.primes[fid])
-
-        for i in range(n):
-            for j in range(n):
-                if i == j:
-                    continue
-
-                for k in range(n - 1, -1, -1):
-                    numer[k][j] = ((0 if k == 0 else int(numer[k - 1][j])) - int(numer[k][j]) * int(x[i])) % self.primes[fid]
-                denom_inv[i] = (int(denom_inv[i]) * (1 if x[i] > x[j] else -1) * int(inv_table[abs(x[i] - x[j])])) % self.primes[fid]
-
-        numer_dot = mul_mod(numer, denom_inv, self.primes[fid])
-        numer_sum = zeros(n)
-
-        for i in range(n):
-            for e in numer_dot[i]:
-                numer_sum[i] = add_mod(numer_sum[i], e, self.primes[fid])
-
-        return numer_sum
- 
-    def get_pascal_matrix(self: 'MPCEnv', power: int) -> np.ndarray:
-        if power not in self.pascal_cache:
-            pascal_matrix: np.ndarray = self.calculate_pascal_matrix(power)
-            self.pascal_cache[power] = pascal_matrix
-
-        return self.pascal_cache[power]
-    
-    def calculate_pascal_matrix(self: 'MPCEnv', pow: int) -> np.ndarray:
-        t = zeros((pow + 1, pow + 1))
-        for i in range(pow + 1):
-            for j in range(pow + 1):
-                if j > i:
-                    t[i][j] = 0
-                elif j == 0 or j == i:
-                    t[i][j] = 1
-                else:
-                    t[i][j] = t[i - 1][j - 1] + t[i - 1][j]
-        
-        return t
-
-    def powers(self: 'MPCEnv', x: np.ndarray, power: int, fid: int) -> np.ndarray:
-        assert power >= 1, f'Invalid exponent: {power}'
-
-        n: int = len(x)
-        b: np.ndarray = zeros((power + 1, n))
-        
-        if power == 1:
-            if self.pid > 0:
-                if self.pid == 1:
-                    b[0] += ones(n)
-                b[1][:] = x
-        else:  # power > 1
-            x_r, r = self.arithmetic.beaver_partition(x, field=self.primes[fid])
-
-            if self.pid == 0:
-                r_pow: np.ndarray = zeros((power - 1, n))
-                r_pow[0][:] = mul_mod(r, r, self.primes[fid])
-                
-                for p in range(1, r_pow.shape[0]):
-                    r_pow[p][:] = mul_mod(r_pow[p - 1], r, self.primes[fid])
-
-                self.prg.switch_seed(1)
-                r_: np.ndarray = random_ndarray(base=self.primes[fid], shape=(power - 1, n))
-                self.prg.restore_seed(1)
-
-                r_pow = (r_pow - r_) % self.primes[fid]
-                self.comms.send_elem(r_pow, 2)
-            else:
-                r_pow: np.ndarray = None
-                if self.pid == 1:
-                    self.prg.switch_seed(0)
-                    r_pow = random_ndarray(base=self.primes[fid], shape=(power - 1, n))
-                    self.prg.restore_seed(0)
-                else:
-                    r_pow = self.comms.receive_matrix(
-                        0, msg_len=TypeOps.get_mat_len(power - 1, n),
-                        shape=(power - 1, n))
-
-                x_r_pow: np.ndarray = zeros((power - 1, n))
-                x_r_pow[0][:] = mul_mod(x_r, x_r, self.primes[fid])
-                
-                for p in range(1, x_r_pow.shape[0]):
-                    x_r_pow[p][:] = mul_mod(x_r_pow[p - 1], x_r, self.primes[fid])
-
-                pascal_matrix: np.ndarray = self.get_pascal_matrix(power)
-
-                if self.pid == 1:
-                    b[0][:] = add_mod(b[0], ones(n), self.primes[fid])
-                b[1][:] = x
-
-                for p in range(2, power + 1):
-                    if self.pid == 1:
-                        b[p][:] = x_r_pow[p - 2]
-
-                    if p == 2:
-                        b[p] = add_mod(
-                            b[p],
-                            mul_mod(mul_mod(x_r, r, self.primes[fid]), pascal_matrix[p][1], self.primes[fid]),
-                            self.primes[fid])
-                    else:
-                        b[p] = add_mod(
-                            b[p],
-                            mul_mod(mul_mod(x_r_pow[p - 3], r, self.primes[fid]), pascal_matrix[p][1], self.primes[fid]),
-                            self.primes[fid])
-
-                        for j in range(2, p - 1):
-                            b[p] = add_mod(
-                                b[p],
-                                mul_mod(mul_mod(x_r_pow[p - 2 - j], r_pow[j - 2], self.primes[fid]), pascal_matrix[p][j], self.primes[fid]),
-                                self.primes[fid])
-                        
-                        b[p] = add_mod(
-                            b[p],
-                            mul_mod(mul_mod(x_r, r_pow[p - 3], self.primes[fid]), pascal_matrix[p][p - 1], self.primes[fid]),
-                            self.primes[fid])
-
-                    b[p] = add_mod(b[p], r_pow[p - 2], self.primes[fid])
-        
-        return b
-    
-    def evaluate_poly(self: 'MPCEnv', x: np.ndarray, coeff: np.ndarray, fid: int) -> np.ndarray:
-        n: int = len(x)
-        npoly: int = coeff.shape[0]
-        deg: int = coeff.shape[1] - 1
-
-        pows: np.ndarray = self.powers(x, deg, fid)
-
-        if self.pid > 0:
-            return matmul_mod(coeff, pows, self.primes[fid])
-        
-        return zeros((npoly, n))
-    
-    def fp_to_double(self: 'MPCEnv', a: np.ndarray, k: int, f: int, fid: int) -> np.ndarray:
-        twokm1: int = TypeOps.left_shift(1, k - 1)
-
-        sn: np.ndarray = np.where(a > twokm1, -1, 1)
-        x: np.ndarray = np.where(a > twokm1, self.primes[fid] - a, a)
-        x_trunc: np.ndarray = TypeOps.trunc_elem(x, k - 1)
-        x_int: np.ndarray = TypeOps.right_shift(x_trunc, f)
-
-        # TODO: consider better ways of doing this?
-        x_frac = np.zeros(a.shape)
-        for bi in range(f):
-            x_frac = np.where(TypeOps.bit(x_trunc, bi) > 0, x_frac + 1, x_frac)
-            x_frac /= 2
-
-        return sn * (x_int + x_frac)
+        self.polynomial = Polynomial(
+            pid=self.pid,
+            primes=self.primes,
+            prg=self.prg,
+            comms=self.comms,
+            arithmetic=self.arithmetic)
 
     def print_fp(self: 'MPCEnv', mat: np.ndarray, fid: int) -> np.ndarray:
         if self.pid == 0:
             return None
         revealed_mat: np.ndarray = self.comms.reveal_sym(mat, field=self.primes[fid])
-        mat_float: np.ndarray = self.fp_to_double(revealed_mat, param.NBIT_K, param.NBIT_F, fid=fid)
+        mat_float: np.ndarray = TypeOps.fp_to_double(revealed_mat, param.NBIT_K, param.NBIT_F, field=self.primes[fid])
 
         if self.pid == 2:
             print(f'{self.pid}: {mat_float}')
         
         return mat_float
-
-    def double_to_fp(self: 'MPCEnv', x: float, k: int, f: int, fid: int) -> int:
-        sn: int = 1
-        if x < 0:
-            x = -x
-            sn = -sn
-
-        az: int = int(x)
-
-        az_shift: int = TypeOps.left_shift(az, f)
-        az_trunc: int = TypeOps.trunc_elem(az_shift, k - 1)
-
-        xf: float = x - az  # remainder
-        for fbit in range(f - 1, -1, -1):
-            xf *= 2
-            if (xf >= 1):
-                xf -= int(xf)
-                az_trunc = TypeOps.set_bit(az_trunc, fbit)
-        
-        return (az_trunc * sn) % self.primes[fid]
     
-    def table_lookup(self: 'MPCEnv', x: np.ndarray, table_id: int, fid: int) -> np.ndarray:
-        return self.evaluate_poly(x, self.lagrange_cache[table_id], fid=fid)
-    
-    def rand_bits(self: 'MPCEnv', shape: tuple, num_bits: int, fid: int) -> np.ndarray:
-        upper_limit: int = self.primes[fid] - 1
-        if num_bits > 63:
-            print(f'Warning: Number of bits too big for numpy: {num_bits}')
-        else:
-            upper_limit = (1 << num_bits) - 1
-    
-        return random_ndarray(upper_limit, shape=shape) % self.primes[fid]
-
     def trunc(self: 'MPCEnv', a: np.ndarray, k: int = param.NBIT_K + param.NBIT_F, m: int = param.NBIT_F, fid: int = 0):
         msg_len: int = TypeOps.get_bytes_len(a)
         
         if self.pid == 0:
-            r: np.ndarray = self.rand_bits(a.shape, k + param.NBIT_V, fid=fid)
+            r: np.ndarray = TypeOps.rand_bits(a.shape, k + param.NBIT_V, field=self.primes[fid])
             r_low: np.ndarray = zeros(a.shape)
             
             r_low = np.mod(r & ((1 << m) - 1), self.primes[fid])
@@ -370,12 +106,6 @@ class MPCEnv:
         
         return a
     
-    def lagrange_interp_simple(self: 'MPCEnv', y: np.ndarray, fid: int) -> np.ndarray:
-        n: int = len(y)
-        x = np.arange(1, n + 1)
-
-        return self.lagrange_interp(x, y, fid)
-
     def fan_in_or(self: 'MPCEnv', a: np.ndarray, fid: int) -> np.ndarray:
         n: int = a.shape[0]
         d: int = a.shape[1]
@@ -395,11 +125,11 @@ class MPCEnv:
         key: tuple = (d + 1, fid)
         if key not in self.or_lagrange_cache:
             y = np.array([int(i != 0) for i in range(d + 1)], dtype=np.int64)
-            coeff_param = self.lagrange_interp_simple(y, fid) # OR function
+            coeff_param = self.polynomial.lagrange_interp_simple(y, self.primes[fid]) # OR function
             self.or_lagrange_cache[key] = coeff_param
 
         coeff[0][:] = self.or_lagrange_cache[key]
-        bmat = self.evaluate_poly(a_sum, coeff, fid)
+        bmat = self.polynomial.evaluate_poly(a_sum, coeff, self.primes[fid])
         
         return bmat[0]
     
@@ -545,7 +275,7 @@ class MPCEnv:
             scaled_est = np.mod(
                 mul_func(b_scaled_sq, 5) - mul_func(b_scaled, 10), field)
             if self.pid == 1:
-                coeff: int = self.double_to_fp(5.9430, param.NBIT_K, param.NBIT_F, fid=fid)
+                coeff: int = TypeOps.double_to_fp(5.9430, param.NBIT_K, param.NBIT_F, field=self.primes[fid])
                 scaled_est = add_func(scaled_est, coeff)
 
         w: np.ndarray = self.arithmetic.multiply(scaled_est, s, True, field=self.primes[fid])
@@ -600,9 +330,9 @@ class MPCEnv:
     
         return b
     
-    def share_random_bits(self: 'MPCEnv', k: int, n: int, fid: int) -> tuple:
+    def __share_random_bits(self: 'MPCEnv', k: int, n: int, fid: int) -> tuple:
         if self.pid == 0:
-            r: np.ndarray = self.rand_bits(n, k + param.NBIT_V, fid=fid)
+            r: np.ndarray = TypeOps.rand_bits(n, k + param.NBIT_V, field=self.primes[fid])
             rbits: np.ndarray = self.num_to_bits(r, k)
 
             self.prg.switch_seed(1)
@@ -636,7 +366,7 @@ class MPCEnv:
         add_func = partial(add_mod, field=field)
         mul_func = partial(mul_mod, field=field)
 
-        r, rbits = self.share_random_bits(param.NBIT_K, n, fid)
+        r, rbits = self.__share_random_bits(param.NBIT_K, n, fid)
 
         # Warning: a + r might overflow in numpy.
         e = zeros(n) if self.pid == 0 else a + r
@@ -715,7 +445,7 @@ class MPCEnv:
         if self.pid != 0:
             chosen_bit_sum = add_func(even_bit_sum, diff)
         
-        b_mat: np.ndarray = self.table_lookup(chosen_bit_sum, 1, fid=0)
+        b_mat: np.ndarray = self.polynomial.table_lookup(chosen_bit_sum, 1)
 
         if self.pid > 0:
             b_sqrt: np.ndarray = b_mat[0]
@@ -827,7 +557,7 @@ class MPCEnv:
             scaled_est = add_mod(
                 mul_mod(-a_scaled, 4, field), add_mod(a_scaled_sq, a_scaled_sq, field), field)
             if self.pid == 1:
-                coeff: int = self.double_to_fp(2.9581, param.NBIT_K, param.NBIT_F, fid=0)
+                coeff: int = TypeOps.double_to_fp(2.9581, param.NBIT_K, param.NBIT_F)
                 scaled_est = add_mod(scaled_est, coeff, field)
 
         # TODO: Make h_and_g a ndarray
@@ -844,7 +574,7 @@ class MPCEnv:
         h_and_g[1][0][:] = self.arithmetic.multiply(h_and_g[1][0], a, elem_wise=True)
         h_and_g[1] = self.trunc(h_and_g[1], k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F, fid=0)
 
-        onepointfive: int = self.double_to_fp(1.5, param.NBIT_K, param.NBIT_F, fid=0)
+        onepointfive: int = TypeOps.double_to_fp(1.5, param.NBIT_K, param.NBIT_F)
 
         for _ in range(niter):
             r: np.ndarray = self.arithmetic.multiply(h_and_g[0], h_and_g[1], elem_wise=True)
@@ -988,7 +718,7 @@ class MPCEnv:
         if self.pid == 1:
             lsb = add_mod(lsb, 1, field)
         
-        b_mat: np.ndarray = self.table_lookup(lsb, 0, fid=0)
+        b_mat: np.ndarray = self.polynomial.table_lookup(lsb, 0)
 
         return b_mat[0]
     
@@ -1007,7 +737,7 @@ class MPCEnv:
         if self.pid != 0:
             Ap = A
 
-        one: int = self.double_to_fp(1, param.NBIT_K, param.NBIT_F, fid=0)
+        one: int = TypeOps.double_to_fp(1, param.NBIT_K, param.NBIT_F)
 
         for i in range(n - 1):
             v = np.expand_dims(self.householder(Ap[0]), axis=0)
@@ -1056,7 +786,7 @@ class MPCEnv:
         assert A.shape[0] > 2
 
         n: int = A.shape[0]
-        one: int = self.double_to_fp(1, param.NBIT_K, param.NBIT_F, fid=0)
+        one: int = TypeOps.double_to_fp(1, param.NBIT_K, param.NBIT_F)
         add_func = partial(add_mod, field=self.primes[0])
 
         Q = zeros((n, n))
@@ -1180,7 +910,7 @@ class MPCEnv:
             # TODO: Remove copy
             Ap = A.copy()
 
-        one: int = self.double_to_fp(1, param.NBIT_K, param.NBIT_F, fid=0)
+        one: int = TypeOps.double_to_fp(1, param.NBIT_K, param.NBIT_F)
 
         for i in range(c):
             v = zeros((1, Ap.shape[1]))
