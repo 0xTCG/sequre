@@ -8,20 +8,22 @@ from copy import deepcopy
 
 import numpy as np
 
-import param
-from c_socket import CSocket
-from connect import connect, open_channel
-from custom_types import TypeOps, zeros, ones, random_ndarray, add_mod, mul_mod, matmul_mod
-from utils import bytes_to_arr, rand_int
+import utils.param as param
+
+from mpc.prg import PRG
+from mpc.comms import Comms
+from network.c_socket import CSocket
+from network.connect import connect, open_channel
+from utils.custom_types import zeros, ones, random_ndarray, add_mod, mul_mod, matmul_mod
+from utils.type_ops import TypeOps
+from utils.utils import bytes_to_arr, rand_int
 
 Zp = None
 Vector = None
 Matrix = None
 
 class MPCEnv:
-    def __init__(self: 'MPCEnv'):
-        self.sockets: dict = dict()
-        self.prg_states: dict = dict()
+    def __init__(self: 'MPCEnv', pid: int):
         self.pid: int = None
         self.pascal_cache: dict = dict()
         self.table_cache: dict = dict()
@@ -33,20 +35,12 @@ class MPCEnv:
         self.primes_bytes: dict = {k: (v + 7) // 8 for k, v in self.primes_bits.items()}
         self.invpow_cache: dict = dict()
         self.or_lagrange_cache: dict = dict()
-    
-    def initialize(self: 'MPCEnv', pid: int, pairs: list) -> bool:
         self.pid = pid
 
-        if (not self.setup_channels(pairs)):
-            raise ValueError("MPCEnv::Initialize: failed to initialize communication channels")
-            
-        if (not self.setup_prgs()):
-            raise ValueError("MPCEnv::Initialize: failed to initialize PRGs")
-
+        self.comms = Comms(self.pid)
+        self.prg = PRG(self.pid)
         self.setup_tables()
-
-        return True
-
+    
     def setup_tables(self: 'MPCEnv'):
         # Lagrange cache
         # Table 0
@@ -79,7 +73,7 @@ class MPCEnv:
         # of negative log-sigmoid function
         table = zeros((2, 64))
         if self.pid > 0:
-            with open('sigmoid_approx.txt') as f:
+            with open(param.SIGMOID_APPROX_PATH) as f:
                 for i in range(table.shape[1]):
                     intercept, slope = f.readline().split()
                     fp_intercept: int = self.double_to_fp(
@@ -149,126 +143,7 @@ class MPCEnv:
                 numer_sum[i] = add_mod(numer_sum[i], e, self.primes[fid])
 
         return numer_sum
-    
-    def setup_channels(self: 'MPCEnv', pairs: list) -> bool:
-        for pair in pairs:
-            p_1, p_2 = pair
-
-            if (p_1 != self.pid and p_2 != self.pid):
-                continue
-
-            port: int = 8000
-            if (p_1 == 0 and p_2 == 1):
-                port = param.PORT_P0_P1
-            elif (p_1 == 0 and p_2 == 2):
-                port = param.PORT_P0_P2
-            elif (p_1 == 1 and p_2 == 2):
-                port = param.PORT_P1_P2
-            elif (p_1 == 1 and p_2 == 3):
-                port = param.PORT_P1_P3
-            elif (p_1 == 2 and p_2 == 3):
-                port = param.PORT_P2_P3
-
-            pother: int = p_1 + p_2 - self.pid
-            self.sockets[pother] = CSocket(self.pid)
-
-            if (p_1 == self.pid):
-                open_channel(self.sockets[pother], port)
-            elif (not connect(self.sockets[pother], port)):
-                raise ValueError(f"Failed to connect with P{pother}")
-
-        return True
-
-    def setup_prgs(self: 'MPCEnv') -> bool:
-        np.random.seed()
-        self.prg_states[self.pid] = np.random.get_state() 
-        self.import_seed(-1, hash('global'))
-        
-        for other_pid in set(range(3)) - {self.pid}:
-            self.import_seed(other_pid)
-        
-        self.switch_seed(self.pid)
-
-        return True
-    
-    def import_seed(self: 'MPCEnv', pid: int, seed: int = None):
-        seed: int = hash((min(self.pid, pid), max(self.pid, pid))) if seed is None else seed
-        seed %= (1 << 32)
-        np.random.seed(seed)
-        self.prg_states[pid] = np.random.get_state()
-
-    def receive_bool(self: 'MPCEnv', from_pid: int) -> bool:
-        return bool(int(self.sockets[from_pid].receive(msg_len=1)))
-
-    def send_bool(self: 'MPCEnv', flag: bool, to_pid: int):
-        self.sockets[to_pid].send(str(int(flag)).encode('utf-8'))
-
-    def send_elem(self: 'MPCEnv', elem: np.ndarray, to_pid: int) -> int:
-        return self.sockets[to_pid].send(TypeOps.to_bytes(elem))
-    
-    def receive_elem(self: 'MPCEnv', from_pid: int, msg_len: int) -> np.ndarray:
-        return np.array(int(self.sockets[from_pid].receive(msg_len=msg_len)))
-
-    def receive_vector(self: 'MPCEnv', from_pid: int, msg_len: int, shape: tuple) -> np.ndarray:
-        received_vec: np.ndarray = zeros(shape)
-
-        for i, elem in enumerate(bytes_to_arr(self.sockets[from_pid].receive(msg_len=msg_len))):
-            received_vec[i] = elem
-
-        return received_vec
-    
-    def receive_matrix(self: 'MPCEnv', from_pid: int, msg_len: int, shape: tuple) -> np.ndarray:
-        matrix: np.ndarray = zeros(shape)
-        row_values = self.sockets[from_pid].receive(msg_len=msg_len).split(b';')
-
-        for i, row_value in enumerate(row_values):
-            for j, elem in enumerate(bytes_to_arr(row_value)):
-                matrix[i][j] = elem
-        
-        return matrix
-    
-    def receive_ndarray(self: 'MPCEnv', from_pid: int, msg_len: int, ndim: int, shape: tuple) -> np.ndarray:
-        if ndim == 2:
-            return self.receive_matrix(from_pid, msg_len, shape)
-        
-        if ndim == 1:
-            return self.receive_vector(from_pid, msg_len, shape)
-        
-        if ndim == 0:
-            return self.receive_elem(from_pid, msg_len)
-        
-        raise ValueError(f'Invalid dimension expected: {ndim}. Should be either 0, 1 or 2.')
-
-    def clean_up(self: 'MPCEnv'):
-        for socket in self.sockets.values():
-            socket.close()
-  
-    def reveal_sym(self: 'MPCEnv', elem: np.ndarray, fid: int = 0) -> np.ndarray:
-        if self.pid == 0:
-            return elem
-        
-        msg_len = TypeOps.get_bytes_len(elem)
-
-        received_elem: np.ndarray = None
-        if self.pid == 1:
-            sent_data = self.send_elem(elem, 3 - self.pid)
-            assert sent_data == msg_len, f'Sent {sent_data} bytes but expected {msg_len}'
-            received_elem = self.receive_ndarray(3 - self.pid, msg_len=msg_len, ndim=elem.ndim, shape=elem.shape)
-        else:
-            received_elem = self.receive_ndarray(3 - self.pid, msg_len=msg_len, ndim=elem.ndim, shape=elem.shape)
-            sent_data = self.send_elem(elem, 3 - self.pid)
-            assert sent_data == msg_len, f'Sent {sent_data} bytes but expected {msg_len}'
-            
-        return add_mod(elem, received_elem, self.primes[fid])
-    
-    def switch_seed(self: 'MPCEnv', pid: int):
-        self.prg_states[self.pid] = np.random.get_state()
-        np.random.set_state(self.prg_states[pid])
-    
-    def restore_seed(self: 'MPCEnv', pid: int):
-        self.prg_states[pid] = np.random.get_state()
-        np.random.set_state(self.prg_states[self.pid])
-
+ 
     def beaver_partition(self: 'MPCEnv', x: np.ndarray, fid: int) -> tuple:
         x_: np.ndarray = np.mod(x, self.primes[fid])
 
@@ -276,31 +151,25 @@ class MPCEnv:
         r: np.ndarray = zeros(x_.shape)
 
         if self.pid == 0:
-            self.switch_seed(1)
+            self.prg.switch_seed(1)
             r_1: np.ndarray = random_ndarray(base=self.primes[fid], shape=x_.shape)
-            self.restore_seed(1)
+            self.prg.restore_seed(1)
 
-            self.switch_seed(2)
+            self.prg.switch_seed(2)
             r_2: np.ndarray = random_ndarray(base=self.primes[fid], shape=x_.shape)
-            self.restore_seed(2)
+            self.prg.restore_seed(2)
 
             r: np.ndarray = add_mod(r_1, r_2, self.primes[fid])
         else:
-            self.switch_seed(0)
+            self.prg.switch_seed(0)
             r: np.ndarray = random_ndarray(base=self.primes[fid], shape=x_.shape)
-            self.restore_seed(0)
+            self.prg.restore_seed(0)
             
             x_r = (x_ - r) % self.primes[fid]
-            x_r = self.reveal_sym(x_r, fid=fid)
+            x_r = self.comms.reveal_sym(x_r, field=self.primes[fid])
         
         return x_r, r
     
-    def mul_elem(self: 'MPCEnv', v_1: Vector, v_2: Vector) -> Vector:
-        return v_1 * v_2
-
-    def rand_mat(self: 'MPCEnv', m: int, n: int, fid: int) -> Matrix:
-        return Matrix(m, n, randomise=True, base=self.primes[fid])
-
     def get_pascal_matrix(self: 'MPCEnv', power: int) -> np.ndarray:
         if power not in self.pascal_cache:
             pascal_matrix: np.ndarray = self.calculate_pascal_matrix(power)
@@ -342,20 +211,20 @@ class MPCEnv:
                 for p in range(1, r_pow.shape[0]):
                     r_pow[p][:] = mul_mod(r_pow[p - 1], r, self.primes[fid])
 
-                self.switch_seed(1)
+                self.prg.switch_seed(1)
                 r_: np.ndarray = random_ndarray(base=self.primes[fid], shape=(power - 1, n))
-                self.restore_seed(1)
+                self.prg.restore_seed(1)
 
                 r_pow = (r_pow - r_) % self.primes[fid]
-                self.send_elem(r_pow, 2)
+                self.comms.send_elem(r_pow, 2)
             else:
                 r_pow: np.ndarray = None
                 if self.pid == 1:
-                    self.switch_seed(0)
+                    self.prg.switch_seed(0)
                     r_pow = random_ndarray(base=self.primes[fid], shape=(power - 1, n))
-                    self.restore_seed(0)
+                    self.prg.restore_seed(0)
                 else:
-                    r_pow = self.receive_matrix(
+                    r_pow = self.comms.receive_matrix(
                         0, msg_len=TypeOps.get_mat_len(power - 1, n),
                         shape=(power - 1, n))
 
@@ -437,29 +306,28 @@ class MPCEnv:
             msg_len: int = TypeOps.get_bytes_len(elem)
             
             if self.pid == 0:
-                self.switch_seed(1)
+                self.prg.switch_seed(1)
                 mask: np.ndarray = random_ndarray(base=self.primes[fid], shape=elem.shape)
-                self.restore_seed(1)
+                self.prg.restore_seed(1)
 
                 mm: np.ndarray = np.mod(elem - mask, self.primes[fid])
-                self.send_elem(mm, 2)
+                self.comms.send_elem(mm, 2)
                 
                 return mm
             else:
                 rr: np.ndarray = None
                 if self.pid == 1:
-                    self.switch_seed(0)
+                    self.prg.switch_seed(0)
                     rr = random_ndarray(base=self.primes[fid], shape=elem.shape)
-                    self.restore_seed(0)
+                    self.prg.restore_seed(0)
                 else:
-                    rr = self.receive_ndarray(
+                    rr = self.comms.receive_ndarray(
                         from_pid=0,
                         msg_len=msg_len,
                         ndim=elem.ndim,
                         shape=elem.shape)
                     
                 return add_mod(elem, rr, self.primes[fid])
-
 
     def multiply(self: 'MPCEnv', a: np.ndarray, b: np.ndarray, elem_wise: bool, fid: int) -> np.ndarray:
         x_1_r, r_1 = self.beaver_partition(a, fid)
@@ -489,7 +357,7 @@ class MPCEnv:
     def print_fp(self: 'MPCEnv', mat: np.ndarray, fid: int) -> np.ndarray:
         if self.pid == 0:
             return None
-        revealed_mat: np.ndarray = self.reveal_sym(mat, fid=fid)
+        revealed_mat: np.ndarray = self.comms.reveal_sym(mat, field=self.primes[fid])
         mat_float: np.ndarray = self.fp_to_double(revealed_mat, param.NBIT_K, param.NBIT_F, fid=fid)
 
         if self.pid == 2:
@@ -538,29 +406,29 @@ class MPCEnv:
             
             r_low = np.mod(r & ((1 << m) - 1), self.primes[fid])
 
-            self.switch_seed(1)
+            self.prg.switch_seed(1)
             r_mask: np.ndarray = random_ndarray(base=self.primes[fid], shape=a.shape)
             r_low_mask: np.ndarray = random_ndarray(base=self.primes[fid], shape=a.shape)
-            self.restore_seed(1)
+            self.prg.restore_seed(1)
 
             r = np.mod(r - r_mask, self.primes[fid])
             r_low = np.mod(r_low - r_low_mask, self.primes[fid])
 
-            self.send_elem(r, 2)
-            self.send_elem(r_low, 2)
+            self.comms.send_elem(r, 2)
+            self.comms.send_elem(r_low, 2)
         elif self.pid == 2:
-            r: np.ndarray = self.receive_ndarray(
+            r: np.ndarray = self.comms.receive_ndarray(
                 from_pid=0, msg_len=msg_len, ndim=a.ndim, shape=a.shape)
-            r_low: np.ndarray = self.receive_ndarray(
+            r_low: np.ndarray = self.comms.receive_ndarray(
                 from_pid=0, msg_len=msg_len, ndim=a.ndim, shape=a.shape)
         else:
-            self.switch_seed(0)
+            self.prg.switch_seed(0)
             r: np.ndarray = random_ndarray(base=self.primes[fid], shape=a.shape)
             r_low: np.ndarray = random_ndarray(base=self.primes[fid], shape=a.shape)
-            self.restore_seed(0)
+            self.prg.restore_seed(0)
 
         c = add_mod(a, r, self.primes[fid]) if self.pid > 0 else zeros(a.shape)
-        c = self.reveal_sym(c, fid=fid)
+        c = self.comms.reveal_sym(c, field=self.primes[fid])
 
         c_low: np.ndarray = zeros(a.shape)
         if self.pid > 0:
@@ -862,10 +730,10 @@ class MPCEnv:
             r: np.ndarray = self.rand_bits(n, k + param.NBIT_V, fid=fid)
             rbits: np.ndarray = self.num_to_bits(r, k)
 
-            self.switch_seed(1)
+            self.prg.switch_seed(1)
             r_mask: np.ndarray = random_ndarray(self.primes[fid], n)
             rbits_mask: np.ndarray = random_ndarray(self.primes[fid], (n, k))
-            self.restore_seed(1)
+            self.prg.restore_seed(1)
 
             r -= r_mask
             r %= self.primes[fid]
@@ -873,16 +741,16 @@ class MPCEnv:
             rbits -= rbits_mask
             rbits %= self.primes[fid]
 
-            self.send_elem(r, 2)
-            self.send_elem(rbits, 2)
+            self.comms.send_elem(r, 2)
+            self.comms.send_elem(rbits, 2)
         elif self.pid == 2:
-            r: np.ndarray = self.receive_vector(0, msg_len=TypeOps.get_vec_len(n), shape=(n, ))
-            rbits: np.ndarray = self.receive_matrix(0, msg_len=TypeOps.get_mat_len(n, k), shape=(n, k))
+            r: np.ndarray = self.comms.receive_vector(0, msg_len=TypeOps.get_vec_len(n), shape=(n, ))
+            rbits: np.ndarray = self.comms.receive_matrix(0, msg_len=TypeOps.get_mat_len(n, k), shape=(n, k))
         else:
-            self.switch_seed(0)
+            self.prg.switch_seed(0)
             r: np.ndarray = random_ndarray(self.primes[fid], n)
             rbits: np.ndarray = random_ndarray(self.primes[fid], (n, k))
-            self.restore_seed(0)
+            self.prg.restore_seed(0)
         
         return r, rbits
 
@@ -897,7 +765,7 @@ class MPCEnv:
 
         # Warning: a + r might overflow in numpy.
         e = zeros(n) if self.pid == 0 else a + r
-        e = self.reveal_sym(e, fid=0)
+        e = self.comms.reveal_sym(e, field=self.primes[0])
 
         ebits: np.ndarray = zeros(
             (n, param.NBIT_K)) if self.pid == 0 else self.num_to_bits(e, param.NBIT_K)
@@ -1190,32 +1058,32 @@ class MPCEnv:
             r: np.ndarray = random_ndarray(base=self.primes[0], shape=n)
             r_bits: np.ndarray = self.num_to_bits(r, nbits)
 
-            self.switch_seed(1)
+            self.prg.switch_seed(1)
             r_mask: np.ndarray = random_ndarray(base=self.primes[0], shape=n)
             r_bits_mask: np.ndarray = random_ndarray(base=field, shape=(n, nbits))
-            self.restore_seed(1)
+            self.prg.restore_seed(1)
 
             r -= r_mask
             r_bits -= r_bits_mask
             r %= self.primes[0]
             r_bits %= field
 
-            self.send_elem(r, 2)
-            self.send_elem(r_bits, 2)
+            self.comms.send_elem(r, 2)
+            self.comms.send_elem(r_bits, 2)
         elif self.pid == 2:
-            r: Vector = self.receive_vector(0, msg_len=TypeOps.get_vec_len(n), shape=n)
-            r_bits: Matrix = self.receive_matrix(0, msg_len=TypeOps.get_mat_len(n, nbits), shape=(n, nbits))
+            r: Vector = self.comms.receive_vector(0, msg_len=TypeOps.get_vec_len(n), shape=n)
+            r_bits: Matrix = self.comms.receive_matrix(0, msg_len=TypeOps.get_mat_len(n, nbits), shape=(n, nbits))
         else:
-            self.switch_seed(0)
+            self.prg.switch_seed(0)
             r: np.ndarray = random_ndarray(base=self.primes[0], shape=n)
             r_bits: np.ndarray = random_ndarray(base=field, shape=(n, nbits))
-            self.restore_seed(0)
+            self.prg.restore_seed(0)
 
         c: np.ndarray = zeros(1)
         if self.pid != 0:
             c = add_mod(add_mod(a, a, self.primes[0]), r, self.primes[0])
 
-        c = self.reveal_sym(c, fid=0)
+        c = self.comms.reveal_sym(c, field=self.primes[0])
 
         c_bits = zeros((n, nbits))
         if self.pid != 0:
@@ -1249,7 +1117,7 @@ class MPCEnv:
 
         return b_mat[0]
     
-    def beaver_inner_prod(self: 'MPCEnv', ar: Vector, am: Vector, fid: int) -> int:
+    def beaver_inner_prod(self: 'MPCEnv', ar: np.ndarray, am: np.ndarray, fid: int) -> int:
         mul_func = partial(mul_mod, field=self.primes[fid])
         add_func = partial(add_mod, field=self.primes[fid])
         
@@ -1562,175 +1430,3 @@ class MPCEnv:
             c[i] = self.beaver_inner_prod(ar[i], am[i], fid)
 
         return self.beaver_reconstruct(c, fid)
-
-    def parallel_logistic_regression(
-        self: 'MPCEnv', xr: Matrix, xm: Matrix, vr: Matrix,
-        vm: Matrix, yr: Vector, ym: Vector, max_iter: int) -> tuple:
-        n: int = vr.shape[1]
-        p: int = vr.shape[0]
-        c: int = xr.shape[0]
-        assert vm.shape[0] == p
-        assert vm.shape[1] == n
-        assert xm.shape[0] == c
-        assert xm.shape[1] == n
-        assert xr.shape[1] == n
-        assert len(yr) == n
-        assert len(ym) == n
-
-        b0 = Vector([Zp(0, base=param.BASE_P) for _ in range(c)])
-        bv = Matrix(c, p)
-        bx = Vector([Zp(0, base=param.BASE_P) for _ in range(c)])
-
-        yneg_r = -yr
-        yneg_m = -ym
-        if self.pid > 0:
-            for i in range(n):
-                yneg_r[i] += 1
-
-        yneg = deepcopy(yneg_m)
-        if self.pid == 1:
-            for i in range(n):
-                yneg[i] += yneg_r[i]
-
-        fp_memory: Zp = self.double_to_fp(0.5, param.NBIT_K, param.NBIT_F, fid=0)
-        fp_one: Zp = self.double_to_fp(1, param.NBIT_K, param.NBIT_F, fid=0)
-        eta: float = 0.3
-
-        step0 = Vector([Zp(0, base=param.BASE_P) for _ in range(c)])
-        stepv = Matrix(c, p)
-        stepx = Vector([Zp(0, base=param.BASE_P) for _ in range(c)])
-
-        nbatch: int = 10
-        batch_size: int = (n + nbatch - 1) // nbatch
-
-        for it in range(max_iter):
-            print(f'Logistic regression iteration {it} initialized')
-            batch_index: int = it % nbatch
-            start_ind: int = batch_size * batch_index
-            end_ind: int = start_ind + batch_size
-            if end_ind > n:
-                end_ind = n
-            cur_bsize: int = end_ind - start_ind
-
-            xr_batch = Matrix(c, cur_bsize)
-            xm_batch = Matrix(c, cur_bsize)
-            vr_batch = Matrix(p, cur_bsize)
-            vm_batch = Matrix(p, cur_bsize)
-            yn_batch = Vector([Zp(0, base=param.BASE_P) for _ in range(cur_bsize)])
-            ynr_batch = Vector([Zp(0, base=param.BASE_P) for _ in range(cur_bsize)])
-            ynm_batch = Vector([Zp(0, base=param.BASE_P) for _ in range(cur_bsize)])
-
-            for j in range(c):
-                for i in range(cur_bsize):
-                    xr_batch[j][i].value = xr[j][start_ind + i].value
-                    xm_batch[j][i].value = xm[j][start_ind + i].value
-
-            for j in range(p):
-                for i in range(cur_bsize):
-                    vr_batch[j][i].value = vr[j][start_ind + i].value
-                    vm_batch[j][i].value = vm[j][start_ind + i].value
-
-            for i in range(cur_bsize):
-                yn_batch[i].value = yneg[start_ind + i].value
-                ynr_batch[i].value = yneg_r[start_ind + i].value
-                ynm_batch[i].value = yneg_m[start_ind + i].value
-
-            fp_bsize_inv: Zp = self.double_to_fp(eta * (1 / cur_bsize), param.NBIT_K, param.NBIT_F, fid=0)
-
-            bvr, bvm = self.beaver_partition(bv, fid=0)
-            bxr, bxm = self.beaver_partition(bx, fid=0)
-
-            h: Matrix = self.beaver_mult(bvr, bvm, vr_batch, vm_batch, False, fid=0)
-            for j in range(c):
-                xrvec = xr_batch[j] * fp_one
-                xmvec = xm_batch[j] * fp_one
-                h[j] += self.beaver_mult_vec(xrvec, xmvec, bxr[j], bxm[j], fid=0)
-            h: Matrix = self.beaver_reconstruct(h, fid=0)
-            self.trunc(h, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
-
-            for j in range(c):
-                h[j] += b0[j]
-
-            hvec = Matrix().from_value(h).flatten()
-            _, s_grad_vec = self.neg_log_sigmoid(hvec, fid=0)
-
-            s_grad = Matrix().from_value(Vector([s_grad_vec], deep_copy=True))
-            s_grad.reshape(c, cur_bsize)
-
-            d0 = Vector([Zp(0, base=param.BASE_P) for _ in range(c)])
-            dv = Matrix(c, p)
-            dx = Vector([Zp(0, base=param.BASE_P) for _ in range(c)])
-
-            for j in range(c):
-                s_grad[j] += yn_batch * fp_one
-                d0[j] = sum(s_grad[j], Zp(0, base=param.BASE_P))
-
-            s_grad_r, s_grad_m = self.beaver_partition(s_grad, fid=0)
-
-            for j in range(c):
-                dx[j] = self.beaver_inner_prod_pair(
-                    xr_batch[j], xm_batch[j], s_grad_r[j], s_grad_m[j], fid=0)
-            dx = self.beaver_reconstruct(dx, fid=0)
-
-            vr_batch.transpose(inplace=True)
-            vm_batch.transpose(inplace=True)
-            dv: Matrix = self.beaver_mult(s_grad_r, s_grad_m, vr_batch, vm_batch, False, fid=0)
-            dv: Matrix = self.beaver_reconstruct(dv, fid=0)
-            self.trunc(dv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
-
-            step0: Vector = step0 * fp_memory - d0 * fp_bsize_inv
-            stepv: Matrix = stepv * fp_memory - dv * fp_bsize_inv
-            stepx: Vector = stepx * fp_memory - dx * fp_bsize_inv
-            self.trunc_vec(step0, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
-            self.trunc(stepv, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
-            self.trunc_vec(stepx, param.NBIT_K + param.NBIT_F, param.NBIT_F, fid=0)
-
-            b0: Vector = b0 + step0
-            bv: Matrix = Matrix().from_value(bv + stepv)
-            bx: Vector = bx + stepx
-    
-        return b0, bv, bx
-
-    def neg_log_sigmoid(self: 'MPCEnv', a: Vector, fid: int) -> tuple:
-        n: int = len(a)
-        depth: int = 6
-        step: float = 4
-        cur: Vector = deepcopy(a)
-        a_ind = Vector([Zp(0, base=self.primes[fid]) for _ in range(len(a))])
-
-        for i in range(depth):
-            cur_sign: Vector = self.is_positive(cur)
-            index_step = Zp(1 << (depth - 1 - i), base=self.primes[fid])
-
-            for j in range(n):
-                a_ind[j] += cur_sign[j] * index_step
-
-            cur_sign *= 2
-            if self.pid == 1:
-                for j in range(n):
-                    cur_sign[j] -= 1
-
-            step_fp: Zp = self.double_to_fp(
-                step, param.NBIT_K, param.NBIT_F, fid=fid)
-
-            for j in range(n):
-                cur[j] -= step_fp * cur_sign[j]
-
-            step //= 2
-
-        if self.pid == 1:
-            for j in range(n):
-                a_ind[j] += 1
-
-        params: Matrix = self.table_lookup(a_ind, 2, fid=0)
-
-        b: Vector = self.mult_vec(params[1], a, fid=fid)
-        self.trunc_vec(b)
-
-        if self.pid > 0:
-            for j in range(n):
-                b[j] += params[0][j]
-
-        b_grad = deepcopy(params[1])
-
-        return b, b_grad
