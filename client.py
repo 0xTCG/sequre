@@ -5,7 +5,7 @@ import os
 from functools import partial
 
 import utils.param as param
-from mpc.mpc import MPCEnv
+from mpc.mpc_env import MPCEnv
 from utils.utils import get_address
 
 from protocol.test import test_protocol
