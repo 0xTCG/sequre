@@ -2,6 +2,9 @@ import numpy as np
 
 import utils.param as param
 
+from utils.utils import random_ndarray
+from utils.custom_types import zeros
+
 
 class TypeOps:
     @staticmethod
@@ -75,3 +78,61 @@ class TypeOps:
         separator: str = b';' if arr.ndim == 2 else b'.'
 
         return separator.join([TypeOps.to_bytes(v) for v in arr])
+    
+    @staticmethod
+    def rand_bits(shape: tuple, num_bits: int, field: int) -> np.ndarray:
+        upper_limit: int = field - 1
+        if num_bits > 63:
+            print(f'Warning: Number of bits too big for numpy: {num_bits}')
+        else:
+            upper_limit = (1 << num_bits) - 1
+    
+        return random_ndarray(upper_limit, shape=shape) % field
+    
+    @staticmethod
+    def num_to_bits(a: np.ndarray, bitlen: int) -> np.ndarray:
+        b = zeros((len(a), bitlen))
+    
+        for i in range(len(a)):
+            for j in range(bitlen):
+                b[i][j] = int(TypeOps.bit(int(a[i]), bitlen - 1 - j))
+    
+        return b
+
+    @staticmethod
+    def fp_to_double(a: np.ndarray, k: int, f: int, field: int) -> np.ndarray:
+        twokm1: int = TypeOps.left_shift(1, k - 1)
+
+        sn: np.ndarray = np.where(a > twokm1, -1, 1)
+        x: np.ndarray = np.where(a > twokm1, field - a, a)
+        x_trunc: np.ndarray = TypeOps.trunc_elem(x, k - 1)
+        x_int: np.ndarray = TypeOps.right_shift(x_trunc, f)
+
+        # TODO: consider better ways of doing this?
+        x_frac = np.zeros(a.shape)
+        for bi in range(f):
+            x_frac = np.where(TypeOps.bit(x_trunc, bi) > 0, x_frac + 1, x_frac)
+            x_frac /= 2
+
+        return sn * (x_int + x_frac)
+
+    @staticmethod
+    def double_to_fp(x: float, k: int, f: int, field: int) -> int:
+        sn: int = 1
+        if x < 0:
+            x = -x
+            sn = -sn
+
+        az: int = int(x)
+
+        az_shift: int = TypeOps.left_shift(az, f)
+        az_trunc: int = TypeOps.trunc_elem(az_shift, k - 1)
+
+        xf: float = x - az  # remainder
+        for fbit in range(f - 1, -1, -1):
+            xf *= 2
+            if (xf >= 1):
+                xf -= int(xf)
+                az_trunc = TypeOps.set_bit(az_trunc, fbit)
+        
+        return (az_trunc * sn) % field
