@@ -1,7 +1,8 @@
+import random
+
 import numpy as np
 
-import param
-import random
+import utils.param as param
 
 
 def get_address(port: int) -> str:
