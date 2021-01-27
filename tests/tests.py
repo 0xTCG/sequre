@@ -19,7 +19,7 @@ def assert_approx(result, expected, error = 10 ** (-1)):
 def test_all(mpc: MPCEnv = None, pid: int = None):
     if mpc is not None and pid is not None:
         if pid != 0:
-            assert_values(mpc.lagrange_cache[2][1][1], 3107018978382642104)
+            assert_values(mpc.polynomial.lagrange_cache[2][1][1], 3107018978382642104)
         
         revealed_value: np.ndarray = mpc.comms.reveal_sym(np.array(10) if pid == 1 else np.array(7))
         if pid != 0:
@@ -64,13 +64,13 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_values(r_0, mpc.comms.reveal_sym(r))
             assert_values(add_mod(x_r, mpc.comms.reveal_sym(r), mpc.primes[0]), np.array([[11, 13, 15], [17, 19, 21], [23, 25, 27]]))
         
-        p: np.ndarray = mpc.powers(np.array([2, 0 if pid == 1 else 1, 3], dtype=np.int64), 10, fid=0)
+        p: np.ndarray = mpc.polynomial.powers(np.array([2, 0 if pid == 1 else 1, 3], dtype=np.int64), 10)
         revealed_p: np.ndarray = mpc.comms.reveal_sym(p)
         if pid != 0:
             assert_values(revealed_p[10], np.array([1048576, 1, 60466176], dtype=np.int64))
         
         coeff = np.array([[1] * 3, [2] * 3, [3] * 3], dtype=np.int64)
-        p: np.ndarray = mpc.evaluate_poly(np.array([1, 2, 3], dtype=np.int64), coeff, fid=0)
+        p: np.ndarray = mpc.polynomial.evaluate_poly(np.array([1, 2, 3], dtype=np.int64), coeff)
         revealed_p = mpc.comms.reveal_sym(p)
         if pid != 0:
             expected_mat = np.array([
@@ -79,15 +79,15 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
                 [21, 63, 129]], dtype=np.int64)
             assert_values(revealed_p, expected_mat)
         
-        a: int = mpc.double_to_fp(2 if pid == 1 else 1.14, param.NBIT_K, param.NBIT_F, fid=0)
-        b: int = mpc.double_to_fp(3 if pid == 1 else 2.95, param.NBIT_K, param.NBIT_F, fid=0)
+        a: int = TypeOps.double_to_fp(2 if pid == 1 else 1.14, param.NBIT_K, param.NBIT_F)
+        b: int = TypeOps.double_to_fp(3 if pid == 1 else 2.95, param.NBIT_K, param.NBIT_F)
         float_a = mpc.print_fp(np.array(a), fid=0)
         float_b = mpc.print_fp(np.array(b), fid=0)
         if pid != 0:
             assert_approx(float_a, 3.14)
             assert_approx(float_b, 5.95)
 
-        pub: int = mpc.double_to_fp(5.07, param.NBIT_K, param.NBIT_F, fid=0)
+        pub: int = TypeOps.double_to_fp(5.07, param.NBIT_K, param.NBIT_F)
         a: np.ndarray = mpc.arithmetic.add_public(np.array(a, dtype=np.int64), np.array(pub, dtype=np.int64))
         float_a = mpc.print_fp(a, fid=0)
         if pid != 0:
@@ -123,10 +123,10 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_values(nee_1, np.array([0.25, 1]))
 
         a = np.array([
-            mpc.double_to_fp(18, param.NBIT_K, param.NBIT_F, 0),
-            mpc.double_to_fp(128, param.NBIT_K, param.NBIT_F, 0),
-            mpc.double_to_fp(32, param.NBIT_K, param.NBIT_F, 0),
-            mpc.double_to_fp(50, param.NBIT_K, param.NBIT_F, 0)], dtype=np.int64)
+            TypeOps.double_to_fp(18, param.NBIT_K, param.NBIT_F),
+            TypeOps.double_to_fp(128, param.NBIT_K, param.NBIT_F),
+            TypeOps.double_to_fp(32, param.NBIT_K, param.NBIT_F),
+            TypeOps.double_to_fp(50, param.NBIT_K, param.NBIT_F)], dtype=np.int64)
         b, b_inv = mpc.fp_sqrt(a)
         float_b: np.ndarray = mpc.print_fp(b, fid=0)
         float_b_inv: np.ndarray = mpc.print_fp(b_inv, fid=0)
@@ -142,10 +142,10 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_approx(float_d, np.array([1.1666666, 16, 33, 1.25]))
         
         a = np.array([
-            mpc.double_to_fp(18, param.NBIT_K, param.NBIT_F, 0),
-            mpc.double_to_fp(128, param.NBIT_K, param.NBIT_F, 0),
-            mpc.double_to_fp(32, param.NBIT_K, param.NBIT_F, 0),
-            mpc.double_to_fp(50, param.NBIT_K, param.NBIT_F, 0)], dtype=np.int64)
+            TypeOps.double_to_fp(18, param.NBIT_K, param.NBIT_F),
+            TypeOps.double_to_fp(128, param.NBIT_K, param.NBIT_F),
+            TypeOps.double_to_fp(32, param.NBIT_K, param.NBIT_F),
+            TypeOps.double_to_fp(50, param.NBIT_K, param.NBIT_F)], dtype=np.int64)
         b, b_inv = mpc.fp_sqrt(a)
         float_b: np.ndarray = mpc.print_fp(b, fid=0)
         float_b_inv: np.ndarray = mpc.print_fp(b_inv, fid=0)
@@ -161,18 +161,18 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_approx(float_d, np.array([1.1666666, 16, 33, 1.25]))
         
         a = np.array([
-            mpc.double_to_fp(1.5, param.NBIT_K, param.NBIT_F, 0),
-            mpc.double_to_fp(0.5, param.NBIT_K, param.NBIT_F, 0),
-            mpc.double_to_fp(2.5, param.NBIT_K, param.NBIT_F, 0)], dtype=np.int64)
+            TypeOps.double_to_fp(1.5, param.NBIT_K, param.NBIT_F),
+            TypeOps.double_to_fp(0.5, param.NBIT_K, param.NBIT_F),
+            TypeOps.double_to_fp(2.5, param.NBIT_K, param.NBIT_F)], dtype=np.int64)
         v: np.ndarray = mpc.householder(a)
         float_v = mpc.print_fp(v, fid=0)
         if pid != 0:
             assert_approx(float_v, np.array([0.86807, 0.0973601, 0.486801]))
         
         mat = np.array([
-            [mpc.double_to_fp(4, param.NBIT_K, param.NBIT_F, 0) for _ in range(3)],
-            [mpc.double_to_fp(4.5, param.NBIT_K, param.NBIT_F, 0) for _ in range(3)],
-            [mpc.double_to_fp(5.5, param.NBIT_K, param.NBIT_F, 0) for _ in range(3)]], dtype=np.int64)
+            [TypeOps.double_to_fp(4, param.NBIT_K, param.NBIT_F) for _ in range(3)],
+            [TypeOps.double_to_fp(4.5, param.NBIT_K, param.NBIT_F) for _ in range(3)],
+            [TypeOps.double_to_fp(5.5, param.NBIT_K, param.NBIT_F) for _ in range(3)]], dtype=np.int64)
         q, r = mpc.qr_fact_square(mat)
         result_q = mpc.print_fp(q, fid=0)
         result_r = mpc.print_fp(r, fid=0)
@@ -189,15 +189,15 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_approx(result_r, expected_r)
         
         mat = np.array([
-            [mpc.double_to_fp(4, param.NBIT_K, param.NBIT_F, 0),
-             mpc.double_to_fp(3, param.NBIT_K, param.NBIT_F, 0),
-             mpc.double_to_fp(2.5, param.NBIT_K, param.NBIT_F, 0)],
-            [mpc.double_to_fp(0.5, param.NBIT_K, param.NBIT_F, 0),
-             mpc.double_to_fp(4.5, param.NBIT_K, param.NBIT_F, 0),
-             mpc.double_to_fp(1.5, param.NBIT_K, param.NBIT_F, 0)],
-            [mpc.double_to_fp(5.5, param.NBIT_K, param.NBIT_F, 0),
-             mpc.double_to_fp(2, param.NBIT_K, param.NBIT_F, 0),
-             mpc.double_to_fp(1, param.NBIT_K, param.NBIT_F, 0)]], dtype=np.int64)
+            [TypeOps.double_to_fp(4, param.NBIT_K, param.NBIT_F),
+             TypeOps.double_to_fp(3, param.NBIT_K, param.NBIT_F),
+             TypeOps.double_to_fp(2.5, param.NBIT_K, param.NBIT_F)],
+            [TypeOps.double_to_fp(0.5, param.NBIT_K, param.NBIT_F),
+             TypeOps.double_to_fp(4.5, param.NBIT_K, param.NBIT_F),
+             TypeOps.double_to_fp(1.5, param.NBIT_K, param.NBIT_F)],
+            [TypeOps.double_to_fp(5.5, param.NBIT_K, param.NBIT_F),
+             TypeOps.double_to_fp(2, param.NBIT_K, param.NBIT_F),
+             TypeOps.double_to_fp(1, param.NBIT_K, param.NBIT_F)]], dtype=np.int64)
         t, q = mpc.tridiag(mat)
         result_t = mpc.print_fp(t, fid=0)
         result_q = mpc.print_fp(q, fid=0)
@@ -214,15 +214,15 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_approx(result_q, expected_q)
         
         mat = np.array([
-            [mpc.double_to_fp(4, param.NBIT_K, param.NBIT_F, 0),
-             mpc.double_to_fp(3, param.NBIT_K, param.NBIT_F, 0),
-             mpc.double_to_fp(2.5, param.NBIT_K, param.NBIT_F, 0)],
-            [mpc.double_to_fp(0.5, param.NBIT_K, param.NBIT_F, 0),
-             mpc.double_to_fp(4.5, param.NBIT_K, param.NBIT_F, 0),
-             mpc.double_to_fp(1.5, param.NBIT_K, param.NBIT_F, 0)],
-            [mpc.double_to_fp(5.5, param.NBIT_K, param.NBIT_F, 0),
-             mpc.double_to_fp(2, param.NBIT_K, param.NBIT_F, 0),
-             mpc.double_to_fp(1, param.NBIT_K, param.NBIT_F, 0)]], dtype=np.int64)
+            [TypeOps.double_to_fp(4, param.NBIT_K, param.NBIT_F),
+             TypeOps.double_to_fp(3, param.NBIT_K, param.NBIT_F),
+             TypeOps.double_to_fp(2.5, param.NBIT_K, param.NBIT_F)],
+            [TypeOps.double_to_fp(0.5, param.NBIT_K, param.NBIT_F),
+             TypeOps.double_to_fp(4.5, param.NBIT_K, param.NBIT_F),
+             TypeOps.double_to_fp(1.5, param.NBIT_K, param.NBIT_F)],
+            [TypeOps.double_to_fp(5.5, param.NBIT_K, param.NBIT_F),
+             TypeOps.double_to_fp(2, param.NBIT_K, param.NBIT_F),
+             TypeOps.double_to_fp(1, param.NBIT_K, param.NBIT_F)]], dtype=np.int64)
         v, l = mpc.eigen_decomp(mat)
         result_v = mpc.print_fp(v, fid=0)
         result_l = mpc.print_fp(l, fid=0)
@@ -236,15 +236,15 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_approx(result_l, expected_l)
         
         # mat = Vector([
-        #     Vector([mpc.double_to_fp(4, param.NBIT_K, param.NBIT_F, 0),
-        #             mpc.double_to_fp(3, param.NBIT_K, param.NBIT_F, 0),
-        #             mpc.double_to_fp(2.5, param.NBIT_K, param.NBIT_F, 0)]),
-        #     Vector([mpc.double_to_fp(0.5, param.NBIT_K, param.NBIT_F, 0),
-        #             mpc.double_to_fp(4.5, param.NBIT_K, param.NBIT_F, 0),
-        #             mpc.double_to_fp(1.5, param.NBIT_K, param.NBIT_F, 0)]),
-        #     Vector([mpc.double_to_fp(5.5, param.NBIT_K, param.NBIT_F, 0),
-        #             mpc.double_to_fp(2, param.NBIT_K, param.NBIT_F, 0),
-        #             mpc.double_to_fp(1, param.NBIT_K, param.NBIT_F, 0)])])
+        #     Vector([TypeOps.double_to_fp(4, param.NBIT_K, param.NBIT_F),
+        #             TypeOps.double_to_fp(3, param.NBIT_K, param.NBIT_F),
+        #             TypeOps.double_to_fp(2.5, param.NBIT_K, param.NBIT_F)]),
+        #     Vector([TypeOps.double_to_fp(0.5, param.NBIT_K, param.NBIT_F),
+        #             TypeOps.double_to_fp(4.5, param.NBIT_K, param.NBIT_F),
+        #             TypeOps.double_to_fp(1.5, param.NBIT_K, param.NBIT_F)]),
+        #     Vector([TypeOps.double_to_fp(5.5, param.NBIT_K, param.NBIT_F),
+        #             TypeOps.double_to_fp(2, param.NBIT_K, param.NBIT_F),
+        #             TypeOps.double_to_fp(1, param.NBIT_K, param.NBIT_F)])])
         # q = mpc.orthonormal_basis(mat)
         # result_q = mpc.print_fp(q, fid=0)
         # expected_q = Vector([
