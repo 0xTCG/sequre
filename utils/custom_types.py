@@ -8,10 +8,6 @@ import numpy as np
 from utils.param import BASE_P, BASE_LEN
 
 
-def random_ndarray(base: int, shape: tuple) -> np.ndarray:
-    return np.random.randint(base, size=shape)
-
-
 # Numpy overrides
 zeros = partial(np.zeros, dtype=np.int64)
 ones = partial(np.ones, dtype=np.int64)
