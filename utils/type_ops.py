@@ -3,6 +3,7 @@ import numpy as np
 import utils.param as param
 
 from utils.utils import random_ndarray
+from utils.custom_types import zeros
 
 
 class TypeOps:
@@ -125,3 +126,13 @@ class TypeOps:
             upper_limit = (1 << num_bits) - 1
     
         return random_ndarray(upper_limit, shape=shape) % field
+    
+    @staticmethod
+    def num_to_bits(a: np.ndarray, bitlen: int) -> np.ndarray:
+        b = zeros((len(a), bitlen))
+    
+        for i in range(len(a)):
+            for j in range(bitlen):
+                b[i][j] = int(TypeOps.bit(int(a[i]), bitlen - 1 - j))
+    
+        return b
