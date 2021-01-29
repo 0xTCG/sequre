@@ -250,7 +250,7 @@ class LinAlg:
         
         return V, L
 
-    def orthonormal_basis(self: 'MPCEnv', A: np.ndarray) -> np.ndarray:
+    def orthonormal_basis(self: 'MPCEnv', A: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
         assert A.shape[1] >= A.shape[0]
         add_func: callable = partial(add_mod, field=field)
 
@@ -262,8 +262,7 @@ class LinAlg:
 
         Ap = zeros((c, n))
         if self.pid != 0:
-            # TODO: Remove copy
-            Ap = A.copy()
+            Ap = A
 
         one: int = TypeOps.double_to_fp(1, param.NBIT_K, param.NBIT_F)
 
@@ -293,19 +292,13 @@ class LinAlg:
 
             Ap = zeros((B.shape[0] - 1, B.shape[1] - 1))
             if self.pid > 0:
-                # TODO: Vectorize
-                for j in range(B.shape[0] - 1):
-                    for k in range(B.shape[1] - 1):
-                        Ap[j][k] = B[j + 1][k + 1]
+                Ap[:B.shape[0] - 1, :B.shape[1] - 1] = B[1:, 1:]
 
         Q = zeros((c, n))
         if self.pid > 0:
             if self.pid == 1:
-                # TODO: Vectorize
-                for i in range(c):
-                    Q[i][i] = one
+                np.fill_diagonal(Q, one)
 
-        # TODO: Vectorize
         for i in range(c - 1, -1, -1):
             v = zeros((1, len(v_list[i])))
             if self.pid > 0:
@@ -317,7 +310,6 @@ class LinAlg:
 
             Qsub = zeros((c, n - i))
             if self.pid > 0:
-                # TODO: Vectorize
                 for j in range(c):
                     for k in range(n - i):
                         Qsub[j][k] = Q[j][k + i]
@@ -332,7 +324,6 @@ class LinAlg:
                 Qvv = add_func(Qvv, Qvv)
 
             if self.pid > 0:
-                # TODO: Vectorize
                 for j in range(c):
                     for k in range(n - i):
                         Q[j][k + i] = add_func(Q[j][k + i], Qvv[j][k])
