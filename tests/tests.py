@@ -235,24 +235,24 @@ def test_all(mpc: MPCEnv = None, pid: int = None):
             assert_approx(result_v, expected_v)
             assert_approx(result_l, expected_l)
         
-        # mat = Vector([
-        #     Vector([TypeOps.double_to_fp(4, param.NBIT_K, param.NBIT_F),
-        #             TypeOps.double_to_fp(3, param.NBIT_K, param.NBIT_F),
-        #             TypeOps.double_to_fp(2.5, param.NBIT_K, param.NBIT_F)]),
-        #     Vector([TypeOps.double_to_fp(0.5, param.NBIT_K, param.NBIT_F),
-        #             TypeOps.double_to_fp(4.5, param.NBIT_K, param.NBIT_F),
-        #             TypeOps.double_to_fp(1.5, param.NBIT_K, param.NBIT_F)]),
-        #     Vector([TypeOps.double_to_fp(5.5, param.NBIT_K, param.NBIT_F),
-        #             TypeOps.double_to_fp(2, param.NBIT_K, param.NBIT_F),
-        #             TypeOps.double_to_fp(1, param.NBIT_K, param.NBIT_F)])])
-        # q = mpc.orthonormal_basis(mat)
-        # result_q = mpc.fp.print_fp(q)
-        # expected_q = Vector([
-        #     Vector([-0.715542, -0.536656, -0.447214]),
-        #     Vector([0.595097, -0.803563, 0.0121201]),
-        #     Vector([0.365868, 0.257463, -0.894345])])
-        # if pid != 0:
-        #     assert_approx(result_q, expected_q)
+        mat = np.array([
+            [TypeOps.double_to_fp(4, param.NBIT_K, param.NBIT_F),
+             TypeOps.double_to_fp(3, param.NBIT_K, param.NBIT_F),
+             TypeOps.double_to_fp(2.5, param.NBIT_K, param.NBIT_F)],
+            [TypeOps.double_to_fp(0.5, param.NBIT_K, param.NBIT_F),
+             TypeOps.double_to_fp(4.5, param.NBIT_K, param.NBIT_F),
+             TypeOps.double_to_fp(1.5, param.NBIT_K, param.NBIT_F)],
+            [TypeOps.double_to_fp(5.5, param.NBIT_K, param.NBIT_F),
+             TypeOps.double_to_fp(2, param.NBIT_K, param.NBIT_F),
+             TypeOps.double_to_fp(1, param.NBIT_K, param.NBIT_F)]])
+        q = mpc.lin_alg.orthonormal_basis(mat)
+        result_q = mpc.fp.print_fp(q)
+        expected_q = np.array([
+            [-0.715542, -0.536656, -0.447214],
+            [0.595097, -0.803563, 0.0121201],
+            [0.365868, 0.257463, -0.894345]])
+        if pid != 0:
+            assert_approx(result_q, expected_q)
 
     print(f'All tests passed at {pid}!')
 
