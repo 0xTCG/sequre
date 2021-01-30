@@ -13,8 +13,8 @@ from utils.custom_types import add_mod, mul_mod, zeros
 from utils.type_ops import TypeOps
 
 
-class LinAlg:
-    def __init__(self: 'LinAlg', pid: int, primes: dict, arithmetic: Arithmetic, boolean: Boolean, fp: FP):
+class MPSLinAlg:
+    def __init__(self: 'MPSLinAlg', pid: int, primes: dict, arithmetic: Arithmetic, boolean: Boolean, fp: FP):
         self.pid = pid
         self.primes = primes
         self.arithmetic = arithmetic
@@ -25,7 +25,7 @@ class LinAlg:
         self.primes_bytes: dict = {k: (v + 7) // 8 for k, v in self.primes_bits.items()}
 
 
-    def householder(self: 'MPCEnv', x: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
+    def householder(self: 'MPSLinAlg', x: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
         n: int = len(x)
         add_func = partial(add_mod, field=field)
         mul_func = partial(mul_mod, field=field)
@@ -79,7 +79,7 @@ class LinAlg:
 
         return v
     
-    def qr_fact_square(self: 'MPCEnv', A: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
+    def qr_fact_square(self: 'MPSLinAlg', A: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
         assert A.shape[0] == A.shape[1]
 
         n: int = A.shape[0]
@@ -136,7 +136,7 @@ class LinAlg:
             
         return Q, R
 
-    def tridiag(self: 'MPCEnv', A: np.ndarray, field: int = param.BASE_P) -> tuple:
+    def tridiag(self: 'MPSLinAlg', A: np.ndarray, field: int = param.BASE_P) -> tuple:
         assert A.shape[0] == A.shape[1]
         assert A.shape[0] > 2
 
@@ -205,7 +205,7 @@ class LinAlg:
 
         return T, Q
 
-    def eigen_decomp(self: 'MPCEnv', A: np.ndarray, field: int = param.BASE_P) -> tuple:
+    def eigen_decomp(self: 'MPSLinAlg', A: np.ndarray, field: int = param.BASE_P) -> tuple:
         assert A.shape[0] == A.shape[1]
         n: int = A.shape[0]
         add_func = partial(add_mod, field=field)
@@ -250,7 +250,7 @@ class LinAlg:
         
         return V, L
 
-    def orthonormal_basis(self: 'MPCEnv', A: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
+    def orthonormal_basis(self: 'MPSLinAlg', A: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
         assert A.shape[1] >= A.shape[0]
         add_func: callable = partial(add_mod, field=field)
 

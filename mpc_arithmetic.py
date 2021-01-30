@@ -10,19 +10,19 @@ from utils.custom_types import zeros, add_mod, mul_mod, matmul_mod
 from utils.utils import random_ndarray
 from utils.type_ops import TypeOps
 
-class Arithmetic:
-    def __init__(self: 'Arithmetic', pid: int, prg: PRG, comms: Comms):
+class MPCArithmetic:
+    def __init__(self: 'MPCArithmetic', pid: int, prg: PRG, comms: Comms):
         self.pid = pid
         self.prg = prg
         self.comms = comms
 
-    def add_public(self: 'Arithmetic', x: np.ndarray, a: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
+    def add_public(self: 'MPCArithmetic', x: np.ndarray, a: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
         if self.pid == 1:
             return add_mod(x, a, field)
         return x
     
     def beaver_mult(
-            self: 'Arithmetic', x_r: np.ndarray, r_1: np.ndarray,
+            self: 'MPCArithmetic', x_r: np.ndarray, r_1: np.ndarray,
             y_r: np.ndarray, r_2: np.ndarray, elem_wise: bool, field: int = param.BASE_P) -> np.ndarray:
         mul_func: callable = partial(mul_mod if elem_wise else matmul_mod, field=field)
         
@@ -36,7 +36,7 @@ class Arithmetic:
 
         return xy
 
-    def beaver_reconstruct(self: 'Arithmetic', elem: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
+    def beaver_reconstruct(self: 'MPCArithmetic', elem: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
             msg_len: int = TypeOps.get_bytes_len(elem)
             
             if self.pid == 0:
@@ -63,7 +63,7 @@ class Arithmetic:
                     
                 return add_mod(elem, rr, field)
 
-    def multiply(self: 'Arithmetic', a: np.ndarray, b: np.ndarray, elem_wise: bool, field: int = param.BASE_P) -> np.ndarray:
+    def multiply(self: 'MPCArithmetic', a: np.ndarray, b: np.ndarray, elem_wise: bool, field: int = param.BASE_P) -> np.ndarray:
         x_1_r, r_1 = self.beaver_partition(a, field)
         x_2_r, r_2 = self.beaver_partition(b, field)
         
@@ -73,7 +73,7 @@ class Arithmetic:
         return c
 
     
-    def beaver_partition(self: 'Arithmetic', x: np.ndarray, field: int = param.BASE_P) -> tuple:
+    def beaver_partition(self: 'MPCArithmetic', x: np.ndarray, field: int = param.BASE_P) -> tuple:
         x_: np.ndarray = np.mod(x, field)
 
         x_r: np.ndarray = zeros(x_.shape)
@@ -99,18 +99,18 @@ class Arithmetic:
         
         return x_r, r
     
-    def beaver_partition_bulk(self: 'Arithmetic', x: list, field: int = param.BASE_P) -> tuple:
+    def beaver_partition_bulk(self: 'MPCArithmetic', x: list, field: int = param.BASE_P) -> tuple:
         # TODO: Do this in parallel
         partitions = [self.beaver_partition(e, field) for e in x]
         x_r = [p[0] for p in partitions]
         r = [p[1] for p in partitions]
         return x_r, r
     
-    def beaver_reconstruct_bulk(self: 'Arithmetic', x: list, field: int = param.BASE_P) -> tuple:
+    def beaver_reconstruct_bulk(self: 'MPCArithmetic', x: list, field: int = param.BASE_P) -> tuple:
         # TODO: Do this in parallel
         return [self.beaver_reconstruct(e, field) for e in x]
 
-    def mult_aux_parallel(self: 'Arithmetic', a: list, b: list, elem_wise: bool, field: int = param.BASE_P) -> list:
+    def mult_aux_parallel(self: 'MPCArithmetic', a: list, b: list, elem_wise: bool, field: int = param.BASE_P) -> list:
         # TODO: Vectorize this method. Make it parallel by having a and b as ndarrays.
         assert len(a) == len(b)
         nmat: int = len(a)
@@ -135,7 +135,7 @@ class Arithmetic:
         
         return self.beaver_reconstruct_bulk(c, field)
 
-    def mult_mat_parallel(self: 'Arithmetic', a: list, b: list, field: int = param.BASE_P) -> list:
+    def mult_mat_parallel(self: 'MPCArithmetic', a: list, b: list, field: int = param.BASE_P) -> list:
         # TODO: Vectorise/parallelize this method
         return self.mult_aux_parallel(a, b, False, field)
     
