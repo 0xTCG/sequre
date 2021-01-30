@@ -15,8 +15,8 @@ from utils.utils import random_ndarray
 from utils.type_ops import TypeOps
 
 
-class Boolean:
-    def __init__(self: 'Boolean', pid: int, prg: PRG, comms: Comms, arithmetic: Arithmetic, polynomial: Polynomial):
+class MPCBoolean:
+    def __init__(self: 'MPCBoolean', pid: int, prg: PRG, comms: Comms, arithmetic: Arithmetic, polynomial: Polynomial):
         self.pid = pid
         self.prg = prg
         self.comms = comms
@@ -25,7 +25,7 @@ class Boolean:
 
         self.or_lagrange_cache: dict = dict()
     
-    def fan_in_or(self: 'Boolean', a: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
+    def fan_in_or(self: 'MPCBoolean', a: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
         n: int = a.shape[0]
         d: int = a.shape[1]
         a_sum = [0] * n
@@ -52,7 +52,7 @@ class Boolean:
         
         return bmat[0]
     
-    def prefix_or(self: 'Boolean', a: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
+    def prefix_or(self: 'MPCBoolean', a: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
         n: int = a.shape[0]
 
         # Find next largest squared integer
@@ -139,7 +139,7 @@ class Boolean:
         
         return b
     
-    def less_than_bits_public(self: 'Boolean', a: np.ndarray, b_pub: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
+    def less_than_bits_public(self: 'MPCBoolean', a: np.ndarray, b_pub: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
         return self.less_than_bits_aux(a, b_pub, 2, field)
 
     def less_than_bits(self: 'MPCEnv', a: np.ndarray, b: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
@@ -198,7 +198,7 @@ class Boolean:
         
         return np.array([c_arr[i][0][0] if self.pid > 0 else 0 for i in range(n)], dtype=np.int64)
     
-    def is_positive(self: 'Boolean', a: np.ndarray, nbits: int, field: int) -> np.ndarray:
+    def is_positive(self: 'MPCBoolean', a: np.ndarray, nbits: int, field: int) -> np.ndarray:
         n: int = len(a)
 
         r: np.ndarray = None

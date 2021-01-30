@@ -1,8 +1,8 @@
 import numpy as np
 
 
-class PRG:
-    def __init__(self: 'PRG', pid: int):
+class MPCPRG:
+    def __init__(self: 'MPCPRG', pid: int):
         self.pid = pid
         self.prg_states: dict = dict()
 
@@ -15,16 +15,16 @@ class PRG:
         
         self.switch_seed(self.pid)
 
-    def import_seed(self: 'PRG', pid: int, seed: int = None):
+    def import_seed(self: 'MPCPRG', pid: int, seed: int = None):
         seed: int = hash((min(self.pid, pid), max(self.pid, pid))) if seed is None else seed
         seed %= (1 << 32)
         np.random.seed(seed)
         self.prg_states[pid] = np.random.get_state()
         
-    def switch_seed(self: 'PRG', pid: int):
+    def switch_seed(self: 'MPCPRG', pid: int):
         self.prg_states[self.pid] = np.random.get_state()
         np.random.set_state(self.prg_states[pid])
     
-    def restore_seed(self: 'PRG', pid: int):
+    def restore_seed(self: 'MPCPRG', pid: int):
         self.prg_states[pid] = np.random.get_state()
         np.random.set_state(self.prg_states[self.pid])
