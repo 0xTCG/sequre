@@ -10,8 +10,8 @@ from utils.type_ops import TypeOps
 from utils.utils import random_ndarray
 
 
-class Polynomial:
-    def __init__(self: 'Polynomial', pid: int, primes: dict, prg: PRG, comms: Comms, arithmetic: Arithmetic):
+class MPCPolynomial:
+    def __init__(self: 'MPCPolynomial', pid: int, primes: dict, prg: PRG, comms: Comms, arithmetic: Arithmetic):
         self.pid = pid
         self.primes = primes
         self.prg = prg
@@ -26,16 +26,16 @@ class Polynomial:
 
         self.__setup_tables()
     
-    def lagrange_interp_simple(self: 'Polynomial', y: np.ndarray, field: int) -> np.ndarray:
+    def lagrange_interp_simple(self: 'MPCPolynomial', y: np.ndarray, field: int) -> np.ndarray:
         n: int = len(y)
         x = np.arange(1, n + 1)
 
         return self.lagrange_interp(x, y, field)
 
-    def table_lookup(self: 'Polynomial', x: np.ndarray, table_id: int, field: int = param.BASE_P) -> np.ndarray:
+    def table_lookup(self: 'MPCPolynomial', x: np.ndarray, table_id: int, field: int = param.BASE_P) -> np.ndarray:
         return self.evaluate_poly(x, self.lagrange_cache[table_id], field=field)
     
-    def lagrange_interp(self: 'Polynomial', x: np.ndarray, y: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
+    def lagrange_interp(self: 'MPCPolynomial', x: np.ndarray, y: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
         n: int = len(y)
 
         inv_table = dict()
@@ -71,14 +71,14 @@ class Polynomial:
 
         return numer_sum
  
-    def get_pascal_matrix(self: 'Polynomial', power: int) -> np.ndarray:
+    def get_pascal_matrix(self: 'MPCPolynomial', power: int) -> np.ndarray:
         if power not in self.pascal_cache:
             pascal_matrix: np.ndarray = self.calculate_pascal_matrix(power)
             self.pascal_cache[power] = pascal_matrix
 
         return self.pascal_cache[power]
     
-    def calculate_pascal_matrix(self: 'Polynomial', pow: int) -> np.ndarray:
+    def calculate_pascal_matrix(self: 'MPCPolynomial', pow: int) -> np.ndarray:
         t = zeros((pow + 1, pow + 1))
         for i in range(pow + 1):
             for j in range(pow + 1):
@@ -91,7 +91,7 @@ class Polynomial:
         
         return t
 
-    def powers(self: 'Polynomial', x: np.ndarray, power: int, field: int = param.BASE_P) -> np.ndarray:
+    def powers(self: 'MPCPolynomial', x: np.ndarray, power: int, field: int = param.BASE_P) -> np.ndarray:
         assert power >= 1, f'Invalid exponent: {power}'
 
         n: int = len(x)
@@ -171,7 +171,7 @@ class Polynomial:
         
         return b
     
-    def evaluate_poly(self: 'Polynomial', x: np.ndarray, coeff: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
+    def evaluate_poly(self: 'MPCPolynomial', x: np.ndarray, coeff: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
         n: int = len(x)
         npoly: int = coeff.shape[0]
         deg: int = coeff.shape[1] - 1
@@ -183,7 +183,7 @@ class Polynomial:
         
         return zeros((npoly, n))
     
-    def __setup_tables(self: 'Polynomial'):
+    def __setup_tables(self: 'MPCPolynomial'):
         # Table 0
         table = zeros((1, 2))
         if (self.pid > 0):

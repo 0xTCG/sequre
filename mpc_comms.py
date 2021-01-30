@@ -8,8 +8,8 @@ from utils.type_ops import TypeOps
 from utils.custom_types import zeros, add_mod
 from utils.utils import bytes_to_arr
 
-class Comms:
-    def __init__(self: 'Comms', pid: int):
+class MPCComms:
+    def __init__(self: 'MPCComms', pid: int):
         self.pid = pid
         self.sockets: dict = dict()
 
@@ -38,19 +38,19 @@ class Comms:
                 elif (not connect(self.sockets[pother], port)):
                     raise ValueError(f"Failed to connect with P{pother}")
 
-    def receive_bool(self: 'Comms', from_pid: int) -> bool:
+    def receive_bool(self: 'MPCComms', from_pid: int) -> bool:
         return bool(int(self.sockets[from_pid].receive(msg_len=1)))
 
-    def send_bool(self: 'Comms', flag: bool, to_pid: int):
+    def send_bool(self: 'MPCComms', flag: bool, to_pid: int):
         self.sockets[to_pid].send(str(int(flag)).encode('utf-8'))
 
-    def send_elem(self: 'Comms', elem: np.ndarray, to_pid: int) -> int:
+    def send_elem(self: 'MPCComms', elem: np.ndarray, to_pid: int) -> int:
         return self.sockets[to_pid].send(TypeOps.to_bytes(elem))
     
-    def receive_elem(self: 'Comms', from_pid: int, msg_len: int) -> np.ndarray:
+    def receive_elem(self: 'MPCComms', from_pid: int, msg_len: int) -> np.ndarray:
         return np.array(int(self.sockets[from_pid].receive(msg_len=msg_len)))
 
-    def receive_vector(self: 'Comms', from_pid: int, msg_len: int, shape: tuple) -> np.ndarray:
+    def receive_vector(self: 'MPCComms', from_pid: int, msg_len: int, shape: tuple) -> np.ndarray:
         received_vec: np.ndarray = zeros(shape)
 
         for i, elem in enumerate(bytes_to_arr(self.sockets[from_pid].receive(msg_len=msg_len))):
@@ -58,7 +58,7 @@ class Comms:
 
         return received_vec
     
-    def receive_matrix(self: 'Comms', from_pid: int, msg_len: int, shape: tuple) -> np.ndarray:
+    def receive_matrix(self: 'MPCComms', from_pid: int, msg_len: int, shape: tuple) -> np.ndarray:
         matrix: np.ndarray = zeros(shape)
         row_values = self.sockets[from_pid].receive(msg_len=msg_len).split(b';')
 
@@ -68,7 +68,7 @@ class Comms:
         
         return matrix
     
-    def receive_ndarray(self: 'Comms', from_pid: int, msg_len: int, ndim: int, shape: tuple) -> np.ndarray:
+    def receive_ndarray(self: 'MPCComms', from_pid: int, msg_len: int, ndim: int, shape: tuple) -> np.ndarray:
         if ndim == 2:
             return self.receive_matrix(from_pid, msg_len, shape)
         
@@ -80,7 +80,7 @@ class Comms:
         
         raise ValueError(f'Invalid dimension expected: {ndim}. Should be either 0, 1 or 2.')
   
-    def reveal_sym(self: 'Comms', elem: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
+    def reveal_sym(self: 'MPCComms', elem: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
         if self.pid == 0:
             return elem
         
@@ -98,6 +98,6 @@ class Comms:
             
         return add_mod(elem, received_elem, field)
     
-    def clean_up(self: 'Comms'):
+    def clean_up(self: 'MPCComms'):
         for socket in self.sockets.values():
             socket.close()

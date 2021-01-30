@@ -16,8 +16,8 @@ from utils.custom_types import zeros, add_mod, mul_mod
 from utils.utils import random_ndarray
 
 
-class FP:
-    def __init__(self: 'FP', pid: int, primes: dict, prg: PRG, comms: Comms,
+class MPCFP:
+    def __init__(self: 'MPCFP', pid: int, primes: dict, prg: PRG, comms: Comms,
                  arithmetic: Arithmetic, polynomial: Polynomial, boolean: Boolean):
         self.pid = pid
         self.primes = primes
@@ -29,7 +29,7 @@ class FP:
 
         self.invpow_cache: dict = dict()
     
-    def print_fp(self: 'FP', mat: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
+    def print_fp(self: 'MPCFP', mat: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
         if self.pid == 0:
             return None
         
@@ -41,7 +41,7 @@ class FP:
         
         return mat_float
     
-    def trunc(self: 'FP', a: np.ndarray, k: int = param.NBIT_K + param.NBIT_F, m: int = param.NBIT_F, field: int = param.BASE_P):
+    def trunc(self: 'MPCFP', a: np.ndarray, k: int = param.NBIT_K + param.NBIT_F, m: int = param.NBIT_F, field: int = param.BASE_P):
         msg_len: int = TypeOps.get_bytes_len(a)
         
         if self.pid == 0:
@@ -92,7 +92,7 @@ class FP:
         
         return a
         
-    def int_to_fp(self: 'FP', a: int, k: int, f: int, field: int = param.BASE_P) -> int:
+    def int_to_fp(self: 'MPCFP', a: int, k: int, f: int, field: int = param.BASE_P) -> int:
         sn = 1 if a >= 0 else -1
 
         az_shift: int = TypeOps.left_shift(a, f)
@@ -100,7 +100,7 @@ class FP:
 
         return (az_trunc * sn) % field
 
-    def fp_div(self: 'FP', a: np.ndarray, b: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
+    def fp_div(self: 'MPCFP', a: np.ndarray, b: np.ndarray, field: int = param.BASE_P) -> np.ndarray:
         assert len(a) == len(b)
 
         n: int = len(a)
@@ -189,7 +189,7 @@ class FP:
         c: np.ndarray = self.arithmetic.multiply(y, x, True, field=field)
         return self.trunc(c, field=field)
 
-    def normalizer_even_exp(self: 'FP', a: np.ndarray, field: int) -> tuple:
+    def normalizer_even_exp(self: 'MPCFP', a: np.ndarray, field: int) -> tuple:
         n: int = len(a)
         add_func = partial(add_mod, field=field)
         mul_func = partial(mul_mod, field=field)
@@ -283,7 +283,7 @@ class FP:
         
         return zeros(n), zeros(n)
 
-    def fp_sqrt(self: 'FP', a: np.ndarray, field: int = param.BASE_P) -> tuple:
+    def fp_sqrt(self: 'MPCFP', a: np.ndarray, field: int = param.BASE_P) -> tuple:
         n: int = len(a)
 
         if n > param.DIV_MAX_N:
@@ -366,7 +366,7 @@ class FP:
         
         return b, b_inv
     
-    def __share_random_bits(self: 'FP', k: int, n: int, field: int = param.BASE_P) -> tuple:
+    def __share_random_bits(self: 'MPCFP', k: int, n: int, field: int = param.BASE_P) -> tuple:
         if self.pid == 0:
             r: np.ndarray = TypeOps.rand_bits(n, k + param.NBIT_V, field=field)
             rbits: np.ndarray = TypeOps.num_to_bits(r, k)
