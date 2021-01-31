@@ -1,1 +1,1 @@
-# sequre-haris
+# pysequre
