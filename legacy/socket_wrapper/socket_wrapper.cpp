@@ -32,10 +32,9 @@ int wrapped_send(int sd, char * buffer) {
     return send(sd, buffer, sizeof(buffer), 0);
 }
 
-const char * wrapped_recv(int sd, int buffer_length) {
+std::string wrapped_recv(int sd, int buffer_length) {
     char buffer[buffer_length];
     recv(sd, buffer, sizeof(buffer), 0);
     std::string s(buffer);
-    const char * r = s.c_str();
-    return r;
+    return s;
 }
