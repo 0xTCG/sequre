@@ -1,1 +1,1 @@
-# numsequre
+# pysequre
