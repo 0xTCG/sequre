@@ -1,0 +1,380 @@
+import math
+
+import utils.param as param
+
+from mpc_prg import MPCPRG
+from mpc_comms import MPCComms
+from mpc_arithmetic import MPCArithmetic
+from mpc_polynomial import MPCPolynomial
+from mpc_boolean import MPCBoolean
+from utils.type_ops import TypeOps
+from utils.utils import rand_mat, rand_vec
+
+
+class MPCFP[TP]:
+    pid: int
+    primes: dict[int, TP]
+    prg: MPCPRG
+    comms: MPCComms[TP]
+    arithmetic: MPCArithmetic[TP]
+    polynomial: MPCPolynomial[TP]
+    boolean: MPCBoolean[TP]
+    invpow_cache: dict[int, TP]
+
+    def __init__(self: MPCFP[TP], pid: int, primes: dict[int, TP], prg: MPCPRG, comms: MPCComms[TP],
+                 arithmetic: MPCArithmetic[TP], polynomial: MPCPolynomial[TP], boolean: MPCBoolean[TP]):
+        self.pid = pid
+        self.primes = primes
+        self.prg = prg
+        self.comms = comms
+        self.arithmetic = arithmetic
+        self.polynomial = polynomial
+        self.boolean = boolean
+
+        self.invpow_cache = dict[int, TP]()
+    
+    def print_fp(self: MPCFP[TP], mat: list[list[TP]], field: TP = param.BASE_P) -> list[list[float]]:
+        if self.pid == 0:
+            return list[list[float]]()
+        
+        revealed_mat: list[list[TP]] = self.comms.reveal_matrix(mat, field=field)
+        mat_float: list[list[float]] = TypeOps.fp_to_double(revealed_mat, param.NBIT_K, param.NBIT_F, field=field)
+
+        if self.pid == 2:
+            print(f'{self.pid}: {mat_float}')
+        
+        return mat_float
+    
+    def trunc(self: MPCFP[TP], a: list[list[TP]], k: int = param.NBIT_K + param.NBIT_F, m: int = param.NBIT_F, field: TP = param.BASE_P) -> list[list[TP]]:
+        shape: list[int] = a.shape()
+        
+        r = list[list[TP]](shape[0])
+        r_low = list[list[TP]](shape[0])
+        if self.pid == 0:
+            r: list[list[TP]] = TypeOps.rand_bits(shape, k + param.NBIT_V, field=field)
+            r_low: list[list[TP]] = (r & ((1 << m) - 1)) % field
+
+            self.prg.switch_seed(1)
+            r_mask: list[list[TP]] = rand_mat(shape, field)
+            r_low_mask: list[list[TP]] = rand_mat(shape, field)
+            self.prg.restore_seed(1)
+
+            r = (r - r_mask) % field
+            r_low = (r_low - r_low_mask) % field
+
+            self.comms.send_data(r, 2)
+            self.comms.send_data(r_low, 2)
+        elif self.pid == 2:
+            r: list[list[TP]] = self.comms.receive_matrix(0, shape)
+            r_low: list[list[TP]] = self.comms.receive_matrix(0, shape)
+        else:
+            self.prg.switch_seed(0)
+            r: list[list[TP]] = rand_mat(shape, field)
+            r_low: list[list[TP]] = rand_mat(shape, field)
+            self.prg.restore_seed(0)
+
+        c = (a + r) % field if self.pid > 0 else [[TP(0) for _ in range(shape[1])] for _ in range(shape[0])]
+        c = self.comms.reveal_matrix(c, field=field)
+
+        c_low: list[list[TP]] = (c & ((1 << m) - 1)) % field if self.pid > 0 else [[TP(0) for _ in range(shape[1])] for _ in range(shape[0])]
+
+        if self.pid > 0:
+            a = (a + r_low) % field
+            if self.pid == 1:
+                a = (a - c_low) % field
+
+            if m not in self.invpow_cache:
+                twoinv: TP = TypeOps.mod_inv(2, field)
+                twoinvm: TP = TypeOps.mod_pow(twoinv, m, field)
+                self.invpow_cache[m] = twoinvm
+                
+            a = (a * self.invpow_cache[m]) % field
+        
+        return a
+        
+    def int_to_fp(self: MPCFP[TP], a: int, k: int, f: int, field: TP = param.BASE_P) -> TP:
+        sn: int = 1 if a >= 0 else -1
+
+        az_shift = TP(a << f)
+        az_trunc: TP = az_shift & ((1 << (k - 1)) - 1)
+
+        return (az_trunc * sn) % field
+
+    def fp_div(self: MPCFP[TP], a: list[TP], b: list[TP], field: TP = param.BASE_P) -> list[TP]:
+        assert len(a) == len(b)
+
+        n: int = len(a)
+        
+        if n > param.DIV_MAX_N:
+            nbatch: int = math.ceil(n / param.DIV_MAX_N)
+            c = [TP(0) for _ in range(n)]
+            
+            for i in range(nbatch):
+                start: int = param.DIV_MAX_N * i
+                end: int = start + param.DIV_MAX_N
+                
+                if end > n:
+                    end = n
+                batch_size: int = end - start
+
+                a_copy = [TP(0) for _ in range(batch_size)]
+                b_copy = [TP(0) for _ in range(batch_size)]
+                for j in range(batch_size):
+                    a_copy[j] = a[start + j]
+                    b_copy[j] = b[start + j]
+
+                c_copy: list[TP] = self.fp_div(a_copy, b_copy, field=field)
+                for j in range(batch_size):
+                    c[start + j] = c_copy[j]
+            return c
+
+        niter: int = 2 * math.ceil(math.log2(param.NBIT_K / 3.5)) + 1
+
+        # Initial approximation: 1 / x_scaled ~= 5.9430 - 10 * x_scaled + 5 * x_scaled^2
+        s, _ = self.normalizer_even_exp(b, self.primes[1])
+
+        b_scaled: list[TP] = self.arithmetic.multiply_vec(b, s, field=field)
+        b_scaled = self.trunc_vec(b_scaled, param.NBIT_K, param.NBIT_K - param.NBIT_F, field=field)
+
+        b_scaled_sq: list[TP] = self.arithmetic.multiply_vec(b_scaled, b_scaled, field=field)
+        b_scaled_sq = self.trunc_vec(b_scaled_sq, field=field)
+
+        scaled_est = (((b_scaled_sq * 5) % field) - (b_scaled * 10) % field) % field if self.pid != 0 else [TP(0) for _ in range(n)]
+        if self.pid == 1:
+            coeff: int = TypeOps.double_to_fp(5.9430, param.NBIT_K, param.NBIT_F, field=field)
+            scaled_est = (scaled_est + coeff) % field
+
+        w: list[TP] = self.arithmetic.multiply_vec(scaled_est, s, field=field)
+        # scaled_est has bit length <= NBIT_F + 2, and s has bit length <= NBIT_K
+        # so the bit length of w is at most NBIT_K + NBIT_F + 2
+        w = self.trunc_vec(w, param.NBIT_K + param.NBIT_F + 2, param.NBIT_K - param.NBIT_F, field=field)
+
+        x: list[TP] = self.arithmetic.multiply_vec(w, b, field=field)
+        x = self.trunc_vec(x, field=field)
+
+        one: TP = self.int_to_fp(1, param.NBIT_K, param.NBIT_F, field=field)
+
+        x *= -1
+        if self.pid == 1:
+            x = (x + one) % field
+        
+        y: list[TP] = self.arithmetic.multiply_vec(a, w, field=field)
+        y = self.trunc_vec(y, field=field)
+
+        for _ in range(niter):
+            xr, xm = self.arithmetic.beaver_partition_vec(x, field=field)
+            yr, ym = self.arithmetic.beaver_partition_vec(y, field=field)
+
+            xpr = copy(xr)
+            if self.pid > 0:
+                xpr = (xpr + one) % field
+
+            y = self.arithmetic.beaver_mult(yr, ym, xpr, xm)
+            x = self.arithmetic.beaver_mult(xr, xm, xr, xm)
+
+            x = self.arithmetic.beaver_reconstruct_vec(x, field=field)
+            y = self.arithmetic.beaver_reconstruct_vec(y, field=field)
+
+            x = self.trunc_vec(x, field=field)
+            y = self.trunc_vec(y, field=field)
+
+        if self.pid == 1:
+            x = (x + one) % field
+            
+        c: list[TP] = self.arithmetic.multiply_vec(y, x, field=field)
+        return self.trunc_vec(c, field=field)
+
+    def normalizer_even_exp(self: MPCFP[TP], a: list[TP], field: TP) -> tuple[list[TP], list[TP]]:
+        n: int = len(a)
+
+        r, rbits = self.__share_random_bits(param.NBIT_K, n, field)
+
+        e: list[int] = [0 for _ in range(n)] if self.pid == 0 else a + r
+        e = self.comms.reveal_vector(e, field=self.primes[0])
+        
+        ebits: list[list[int]] = [[0 for _ in range(param.NBIT_K)] for _ in range(n)] if self.pid == 0 else TypeOps.num_to_bits(e, param.NBIT_K)
+        c: list[TP] = self.boolean.less_than_bits_public(rbits, ebits, field)
+
+        if self.pid > 0:
+            c = -c
+            if self.pid == 1:
+                c = (c + 1) % field
+        
+        ep: list[list[TP]] = [[TP(0) for _ in range(param.NBIT_K + 1)] for _ in range(n)]
+        if self.pid > 0:
+            for i in range(n):
+                ep[i][0] = c[i]
+                for j in range(1, param.NBIT_K + 1):
+                    ep[i][j] = ((1 - 2 * ebits[i][j - 1]) * rbits[i][j - 1]) % field
+                    if self.pid == 1:
+                        ep[i][j] = (ep[i][j] + ebits[i][j - 1]) % field
+        
+        E: list[list[TP]] = self.boolean.prefix_or(ep, field)
+
+        tpneg = list[list[TP]](n)  # zeros((n, param.NBIT_K))
+        if self.pid > 0:
+            for i in range(n):
+                row = list[TP](param.NBIT_K)
+                for j in range(param.NBIT_K):
+                    row.append((E[i][j] - (1 - ebits[i][j]) * rbits[i][j]) % field)
+                tpneg.append(row)
+        else:
+            for _ in range(n):
+                tpneg.append([TP(0) for _ in range(param.NBIT_K)])
+        
+        Tneg: list[list[TP]] = self.boolean.prefix_or(tpneg, field)
+        half_len: int = param.NBIT_K // 2
+
+        efir = (ebits * Tneg) % field if self.pid > 0 else [[TP(0) for _ in range(param.NBIT_K)] for _ in range(n)]
+        rfir = self.arithmetic.multiply_mat(rbits, Tneg, field)
+
+        double_flag: list[TP] = self.boolean.less_than_bits(efir, rfir, field)
+
+        odd_bits = list[list[TP]](n)  # zeros((n, half_len))
+        even_bits = list[list[TP]](n) # zeros((n, half_len))
+
+        if self.pid > 0:
+            for i in range(n):
+                odd_row = list[TP](half_len)
+                even_row = list[TP](half_len)
+                for j in range(half_len):
+                    odd_row.append((1 - Tneg[i][2 * j + 1]) % field if self.pid == 1 else -Tneg[i][2 * j + 1])
+                    even_row.append(0 if (2 * j + 2) >= param.NBIT_K else (1 - Tneg[i][2 * j + 2]) % field if self.pid == 1 else -Tneg[i][2 * j + 2])
+                odd_bits.append(odd_row)
+                even_bits.append(even_row)
+        else:
+            for i in range(n):
+                odd_bits.append([TP(0) for _ in range(half_len)])
+                even_bits.append([TP(0) for _ in range(half_len)])
+
+        odd_bit_sum: list[TP] = [TP(0) for _ in range(n)]
+        even_bit_sum: list[TP] = [TP(0) for _ in range(n)]
+        
+        for i in range(n):
+            for e in odd_bits[i]:
+                odd_bit_sum[i] += e
+            for e in even_bits[i]:
+                even_bit_sum[i] += e
+
+        if self.pid == 1:
+            odd_bit_sum = (odd_bit_sum + 1) % field
+            even_bit_sum = (even_bit_sum + 1) % field
+        
+        # If double_flag = true, then use odd_bits, otherwise use even_bits
+
+        diff: list[TP] = (odd_bit_sum - even_bit_sum) % field if self.pid != 0 else [TP(0) for _ in range(n)]
+        diff = self.arithmetic.multiply_vec(double_flag, diff, field)
+        chosen_bit_sum: list[TP] = (even_bit_sum + diff) % field if self.pid != 0 else [TP(0) for _ in range(n)]
+        b_mat: list[list[TP]] = self.polynomial.table_lookup(chosen_bit_sum, 1)
+
+        if self.pid > 0:
+            b_sqrt: list[TP] = b_mat[0]
+            b: list[TP] = b_mat[1]
+            return b, b_sqrt
+        
+        return [TP(0) for _ in range(n)], [TP(0) for _ in range(n)]
+
+    def fp_sqrt(self: MPCFP[TP], a: list[TP], field: TP = param.BASE_P) -> tuple[list[TP], list[TP]]:
+        n: int = len(a)
+
+        if n > param.DIV_MAX_N:
+            nbatch: int = math.ceil(n / param.DIV_MAX_N)
+            b = [TP(0) for _ in range(n)]
+            b_inv = [TP(0) for _ in range(n)]
+            
+            for i in range(nbatch):
+                start: int = param.DIV_MAX_N * i
+                end: int = start + param.DIV_MAX_N
+                if end > n: end = n
+                batch_size: int = end - start
+                a_copy = [TP(0) for _ in range(batch_size)]
+                
+                for j in range(batch_size):
+                    a_copy[j] = a[start + j]
+                
+                b_copy, b_inv_copy = self.fp_sqrt(a_copy)
+                
+                for j in range(batch_size):
+                    b[start + j] = b_copy[j]
+                    b_inv[start + j] = b_inv_copy[j]
+            
+            return b
+
+        # TODO: Currently using the same iter as division -- possibly need to update
+        niter: int = 2 * math.ceil(math.log2((param.NBIT_K) / 3.5))
+
+        # Initial approximation: 1 / sqrt(a_scaled) ~= 2.9581 - 4 * a_scaled + 2 * a_scaled^2
+        # Bottleneck
+        s, s_sqrt = self.normalizer_even_exp(a, self.primes[1])
+
+        a_scaled: list[TP] = self.arithmetic.multiply_vec(a, s, field=field)
+        a_scaled = self.trunc_vec(a_scaled, param.NBIT_K, param.NBIT_K - param.NBIT_F, field=field)
+
+        a_scaled_sq: list[TP] = self.arithmetic.multiply_vec(a_scaled, a_scaled, elem_wise=True, field=field)
+        a_scaled_sq = self.trunc_vec(a_scaled_sq, field=field)
+
+        scaled_est = (((-a_scaled * 4) % field) + (a_scaled_sq + a_scaled_sq) % field) % field if self.pid != 0 else [TP(0) for _ in range(n)]
+        
+        if self.pid == 1:
+            coeff: int = TypeOps.double_to_fp(2.9581, param.NBIT_K, param.NBIT_F)
+            scaled_est = (scaled_est + coeff) % field
+
+        h: list[list[TP]] = self.arithmetic.multiply_vec(scaled_est, s_sqrt)
+        # Our scaled initial approximation (scaled_est) has bit length <= NBIT_F + 2
+        # and s_sqrt is at most NBIT_K/2 bits, so their product is at most NBIT_K/2 +
+        # NBIT_F + 2
+        h = self.trunc_vec(h, param.NBIT_K // 2 + param.NBIT_F + 2, (param.NBIT_K - param.NBIT_F) // 2 + 1)
+
+        g: list[list[TP]] = (h + h) % field
+        g = self.arithmetic.multiply_vec(g, a)
+        g = self.trunc_vec(g, k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F)
+
+        onepointfive: TP = TypeOps.double_to_fp(1.5, param.NBIT_K, param.NBIT_F)
+
+        for _ in range(niter):
+            r: list[TP] = self.arithmetic.multiply_vec(h, g)
+            r = self.trunc_vec(r, k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F)
+            r = -r
+            if self.pid == 1:
+                r = (r + onepointfive) % field
+
+            # TODO: Do h and g in parallel
+            h = self.arithmetic.multiply_vec(h, r)
+            g = self.arithmetic.multiply_vec(g, r)
+            h = self.trunc_vec(h, k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F)
+            g = self.trunc_vec(g, k = param.NBIT_K + param.NBIT_F, m = param.NBIT_F)
+
+        b_inv = (h + h) % field
+        b = g
+        
+        return b, b_inv
+    
+    def __share_random_bits(self: MPCFP[TP], k: int, n: int, field: TP = param.BASE_P) -> tuple[list[TP], list[list[TP]]]:
+        if self.pid == 0:
+            r: list[TP] = TypeOps.rand_bits_vec(n, k + param.NBIT_V, field=field)
+            rbits: list[list[TP]] = TypeOps.num_to_bits(r, k)
+
+            self.prg.switch_seed(1)
+            r_mask: list[TP] = rand_vec(n, field)
+            rbits_mask: list[list[TP]] = rand_mat([n, k], field)
+            self.prg.restore_seed(1)
+
+            r -= r_mask
+            r %= field
+
+            rbits -= rbits_mask
+            rbits %= field
+
+            self.comms.send_data(r, 2)
+            self.comms.send_data(rbits, 2)
+            return r, rbits
+        elif self.pid == 2:
+            r: list[TP] = self.comms.receive_vector(0, n)
+            rbits: list[list[TP]] = self.comms.receive_matrix(0, [n, k])
+            return r, rbits
+        else:
+            self.prg.switch_seed(0)
+            r: list[TP] = rand_vec(n, field)
+            rbits: list[list[TP]] = rand_mat([n, k], field)
+            self.prg.restore_seed(0)
+            return r, rbits
