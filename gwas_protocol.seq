@@ -1,17 +1,33 @@
 import os
 
-import param
+import utils.param as param
 
 from mpc_env import MPCEnv
 from utils.type_ops import TypeOps
-from utils.utils import get_cache_path, get_output_path, get_temp_path, rand_int
+from utils.utils import \
+    get_cache_path, \
+    get_output_path, \
+    get_temp_path, \
+    rand_int, \
+    rand_vec, \
+    rand_mat, \
+    read_vector_from_cache, \
+    read_matrix_from_cache, \
+    write_to_cache, \
+    beaver_write_to_cache, \
+    beaver_read_from_cache, \
+    file_exists
 
 
-def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
+def gwas_protocol[TP](mpc: MPCEnv[TP], test_run: bool = False) -> bool:
     n0: int = param.NUM_INDS
     m0: int = param.NUM_SNPS
     k: int = param.NUM_DIM_TO_REMOVE
     kp: int = k + param.NUM_OVERSAMPLE
+    prime_bytes: int = mpc.boolean.primes_bytes[0]
+
+    temp_vec = list[TP]()
+    temp_mat = list[list[TP]]()
 
     # Read in SNP list
     snp_pos = [TP(0) for _ in range(m0)]  # Vector([0] * m0)
@@ -19,11 +35,11 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
     with open(param.SNP_POS_FILE) as f:
         for i, line in zip(range(m0), f):
             chrom, pos = line.split()
-            snp_pos[i] = int(chrom) * 1e9 + int(pos)
+            snp_pos[i] = int(chrom) * int(1e9) + int(pos)
 
     # Useful constants
     two = TP(2)  # Zp(2, base=param.BASE_P)
-    twoinv = TypeOps.mod_inv(two)
+    twoinv = TypeOps.mod_inv(two, param.BASE_P)
     fp_one = TypeOps.double_to_fp(1.0, param.NBIT_K, param.NBIT_F)
 
     pheno = [TP(0) for _ in range(n0)]  # Vector([TP(0)  # Zp(0, base=param.BASE_P) for _ in range(n0)])
@@ -32,8 +48,8 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
     print("Initial data sharing results found")
 
     with open(get_cache_path(mpc.pid, "input_pheno_cov")) as f:
-        pheno = read_vector(f, n0)
-        cov = read_matrix(f, n0, param.NUM_COVS)
+        pheno = read_vector_from_cache[TP](f, n0, prime_bytes)
+        cov = read_matrix_from_cache[TP](f, n0, param.NUM_COVS, prime_bytes)
 
     print("Phenotypes and covariates loaded")
 
@@ -46,7 +62,7 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
     else:
         history: bool = False
         if mpc.pid == 2:
-            history = os.path.exists(get_output_path(mpc.pid, "gkeep1"))
+            history = file_exists(get_output_path(mpc.pid, "gkeep1"))
             mpc.comms.send_bool(history, 0)
             mpc.comms.send_bool(history, 1)
         else:
@@ -57,22 +73,22 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
             print("Using locus missing rate filter from a previous run")
         
             if mpc.pid == 2:
-                with open(get_output_path(mpc.pid, "gkeep1")):
+                with open(get_output_path(mpc.pid, "gkeep1")) as f:
                     for i, line in zip(range(m0), f):
                         gkeep1[i] = TP(line)  # Zp(TP(next(f)), base=param.BASE_P)
 
-                mpc.comms.send_data(gkeep1, 0)
-                mpc.comms.send_data(gkeep1, 1)
+                mpc.comms.send_data(gkeep1, 0, param.SIZE_OF_U * m0)
+                mpc.comms.send_data(gkeep1, 1, param.SIZE_OF_U * m0)
             else:
-                gkeep1 = mpc.comms.receive_vector(2, msg_len=TypeOps.get_vec_len(m0), fid=0)
+                gkeep1 = mpc.comms.receive_vector(2, m0)
         else:
             gmiss = [TP(0) for _ in range(m0)]  # Vector([TP(0)  # Zp(0, base=param.BASE_P) for _ in range(m0)])
             
-            if os.path.exists(get_cache_path(mpc.pid, "gmiss")):
+            if file_exists(get_cache_path(mpc.pid, "gmiss")):
                 print("Locus missing rate cache found")
 
                 with open(get_cache_path(mpc.pid, "gmiss")) as f:
-                    gmiss = read_vector(f, m0)
+                    gmiss = read_vector_from_cache[TP](f, m0, prime_bytes)
             else:
                 print("Taking a pass to calculate locus missing rates:")
 
@@ -83,15 +99,16 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
                         bsize: int = n0 // 10
 
                         for i in range(n0):
+                            miss = [TP(0) for _ in range(m0)]
                             # Load stored Beaver partition
                             mpc.prg.switch_seed(10)
-                            tmp_mat = rand_mat([3, m0])  # Matrix(3, m0, randomise=True)  # g_mask
+                            tmp_mat = rand_mat([3, m0], param.BASE_P)  # Matrix(3, m0, randomise=True)  # g_mask
                             miss_mask = rand_vec(m0, param.BASE_P)
                             mpc.prg.restore_seed(10)
 
                             if mpc.pid == 2:
-                                skip_data(f, 3, m0)
-                                miss = read_vector(f, m0)
+                                f.read(prime_bytes * 3 * m0)  # skip data
+                                miss = read_vector_from_cache[TP](f, m0, prime_bytes)
 
                             # Recover secret shares from Beaver partition
                             if mpc.pid == 1:
@@ -104,7 +121,7 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
 
 
                 with open(get_cache_path(mpc.pid, "gmiss")) as f:
-                    write_to_file(gmiss, f)
+                    write_to_cache(f, gmiss)
 
                 print("Wrote results to cache")
 
@@ -112,23 +129,23 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
 
             gmiss_ub = TP(n0 * param.GMISS_UB) % param.BASE_P  # Zp(n0 * param.GMISS_UB, base=param.BASE_P)
             gkeep1 = mpc.boolean.less_than_public(gmiss, gmiss_ub)
-            gkeep1 = mpc.comms.reveal_sym(gkeep1)
+            gkeep1 = mpc.comms.reveal_vector(gkeep1)
 
             if mpc.pid == 2:
-                mpc.comms.send_data(gkeep1, 0)
+                mpc.comms.send_data(gkeep1, 0, param.SIZE_OF_U * m0)
             elif mpc.pid == 0:
-                gkeep1 = mpc.comms.receive_vector(2, TypeOps.get_vec_len(m0))
+                gkeep1 = mpc.comms.receive_vector(2, m0)
 
             if mpc.pid == 2:
                 with open(get_output_path(mpc.pid, "gkeep1"), 'w') as f:
-                    for i in range(gkeep1.length()):
+                    for i in range(len(gkeep1)):
                         f.write(f'{gkeep1[i]}\n')
 
     m1: int = sum(gkeep1)  # Zp(0, base=param.BASE_P)).value
     print("n0:", n0, ",", "m1:", m1)
 
     print("Filtering SNP position vector")
-    snp_pos = mpc.filter(snp_pos, gkeep1)
+    snp_pos = [snp_pos[i] for i in range(len(snp_pos)) if gkeep1[i]]
 
     ikeep = [TP(0) for _ in range(n0)]  # Vector([TP(0)  # Zp(0, base=param.BASE_P) for _ in range(n0)])
 
@@ -139,7 +156,7 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
     else:
         history: bool = False
         if mpc.pid == 2:
-            history = os.path.exists(get_output_path(mpc.pid, "ikeep"))
+            history = file_exists(get_output_path(mpc.pid, "ikeep"))
             mpc.comms.send_bool(history, 0)
             mpc.comms.send_bool(history, 1)
         else:
@@ -154,20 +171,20 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
                     for i, line in zip(range(n0), f):
                         ikeep[i] = TP(line)  # Zp(TP(next(f)), base=param.BASE_P)
 
-                mpc.comms.send_data(ikeep, 0)
-                mpc.comms.send_data(ikeep, 1)
+                mpc.comms.send_data(ikeep, 0, param.SIZE_OF_U * n0)
+                mpc.comms.send_data(ikeep, 1, param.SIZE_OF_U * n0)
             else:
-                receive_vector(ikeep, 2, TypeOps.get_vec_len(n0))
+                ikeep = mpc.comms.receive_vector(2, n0)
         else:
             imiss = [TP(0) for _ in range(n0)]  # Vector([TP(0)  # Zp(0, param.BASE_P) for _ in range(n0)])
             ihet = [TP(0) for _ in range(n0)]  # Vector([TP(0)  # Zp(0, param.BASE_P) for _ in range(n0)])
 
-            if os.path.exists(get_cache_path(mpc.pid, "imiss_ihet")):
+            if file_exists(get_cache_path(mpc.pid, "imiss_ihet")):
                 print("Individual missing rate and het rate cache found")
 
                 with open(get_cache_path(mpc.pid, "imiss_ihet")) as f:
-                    imiss = read_vector(f, n0)
-                    ihet = read_vector(f, n0)
+                    imiss = read_vector_from_cache[TP](f, n0, prime_bytes)
+                    ihet = read_vector_from_cache[TP](f, n0, prime_bytes)
             else:
                 print("Taking a pass to calculate individual missing rates and het rates:")
 
@@ -177,15 +194,17 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
                         bsize: int = n0 // 10
 
                         for i in range(n0):
+                            g = [[TP(0) for _ in range(m0)] for _ in range(3)]
+                            miss = [TP(0) for _ in range(m0)]
                             # Load stored Beaver partition
                             mpc.prg.switch_seed(10)
-                            g_mask = rand_mat([3, m0])
-                            miss_mask = rand_vec(m0)
+                            g_mask = rand_mat([3, m0], param.BASE_P)
+                            miss_mask = rand_vec(m0, param.BASE_P)
                             mpc.prg.restore_seed(10)
 
                             if mpc.pid == 2:
-                                g: Matrix = read_matrix(f, 3, m0)
-                                miss = read_vector(f, m0)
+                                g = read_matrix_from_cache[TP](f, 3, m0, prime_bytes)
+                                miss = read_vector_from_cache[TP](f, m0, prime_bytes)
 
                             # Recover secret shares from Beaver partition
                             if mpc.pid == 1:
@@ -202,8 +221,8 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
                                     ihet[i] += g[1][j]
 
                 with open(get_cache_path(mpc.pid, "imiss_ihet")) as f:
-                    write_to_file(imiss, f)
-                    write_to_file(ihet, f)
+                    write_to_cache(f, imiss)
+                    write_to_cache(f, ihet)
 
                 print("Wrote results to cache")
 
@@ -236,30 +255,30 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
 
             het_filt = mpc.boolean.less_than(ihet, ihet_ub)
             tmp_vec = mpc.boolean.not_less_than(ihet, ihet_lb)
-            het_filt = mpc.arithmetic.mult_vec(het_filt, tmp_vec)
+            het_filt = mpc.arithmetic.multiply_vec(het_filt, tmp_vec)
 
-            ikeep = mpc.arithmetic.mult_vec(ikeep, het_filt)
+            ikeep = mpc.arithmetic.multiply_vec(ikeep, het_filt)
 
             # Reveal samples to be filtered
-            mpc.comms.reveal_sym(ikeep)
+            mpc.comms.reveal_vector(ikeep)
 
             if mpc.pid == 2:
                 mpc.comms.send_data(ikeep, 0, n0 * param.SIZE_OF_U)
             elif mpc.pid == 0:
-                mpc.comms.receive_vector(ikeep, 2, n0)
+                ikeep = mpc.comms.receive_vector(2, n0)
 
             if mpc.pid == 2:
                 with open(get_output_path(mpc.pid, "ikeep"), 'w') as f:
-                    for i in range(ikeep.length()):
+                    for i in range(len(ikeep)):
                         f.write(f'{ikeep[i]}\n')
 
-    n1: int = int(sum(ikeep, TP(0)))  # Zp(0, base=param.BASE_P)))
+    n1: int = sum(ikeep)
 
     print("Filtering phenotypes and covariates")
     pheno = [pheno[i] for i in range(len(pheno)) if gkeep1[i]]
     cov = [cov[i] for i in range(len(cov)) if ikeep[i]]
 
-    ctrl = TypeOps.flip_bit(pheno)
+    ctrl = mpc.boolean.flip_bit(pheno)
 
     ctrl, ctrl_mask = mpc.arithmetic.beaver_partition_vec(ctrl)
 
@@ -270,15 +289,15 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
     g_count_ctrl = [[TP(0) for _ in range(m1)] for _ in range(3)]  # Matrix(3, m1)
     n1_ctrl = TP(0)  # Zp(0, param.BASE_P)
 
-    if (os.path.exists(get_cache_path(mpc.pid, "geno_stats"))):
+    if (file_exists(get_cache_path(mpc.pid, "geno_stats"))):
         print("Genotype statistics cache found")
 
         with open(get_cache_path(mpc.pid, "geno_stats")) as f:
-            gmiss = read_vector(f, m1)
-            gmiss_ctrl = read_vector(f, m1)
-            dosage_sum = read_vector(f, m1)
-            dosage_sum_ctrl = read_vector(f, m1)
-            g_count_ctrl: Matrix = read_matrix(f, 3, m1)
+            gmiss = read_vector_from_cache[TP](f, m1, prime_bytes)
+            gmiss_ctrl = read_vector_from_cache[TP](f, m1, prime_bytes)
+            dosage_sum = read_vector_from_cache[TP](f, m1, prime_bytes)
+            dosage_sum_ctrl = read_vector_from_cache[TP](f, m1, prime_bytes)
+            g_count_ctrl: Matrix = read_matrix_from_cache[TP](f, 3, m1, prime_bytes)
             n1_ctrl = TP(next(f))  # Zp(TP(next(f)), param.BASE_P)
     else:
         print("Taking a pass to calculate genotype statistics:")
@@ -319,103 +338,103 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
 
                 while (ikeep[ind] != 1):
                     if mpc.pid > 0:
-                        skip_data(f, 3, m0)
-                        skip_data(f, m0)
+                        f.read(mpc.boolean.primes_bytes[0] * 3 * m0)  # skip_data(f, 3, m0)
+                        f.read(mpc.boolean.primes_bytes[0] * m0)  # skip_data(f, m0)
 
                         mpc.prg.switch_seed(10)
-                        g0_mask = rand_mat([3, m0])  # Matrix(3, m0, randomise=True)
-                        miss0_mask = rand_vec(m0)
+                        g0_mask = rand_mat([3, m0], param.BASE_P)  # Matrix(3, m0, randomise=True)
+                        miss0_mask = rand_vec(m0, param.BASE_P)
                         mpc.prg.restore_seed(10)
                     else:
                         for p in range(1, 3):
                             mpc.prg.switch_seed(10 + p)
-                            g0_mask = rand_mat([3, m0])  # Matrix(3, m0, randomise=True)
-                            miss0_mask = rand_vec(m0)
+                            g0_mask = rand_mat([3, m0], param.BASE_P)  # Matrix(3, m0, randomise=True)
+                            miss0_mask = rand_vec(m0, param.BASE_P)
                             mpc.prg.restore_seed(10 + p)
 
                     ind += 1
 
                 if mpc.pid > 0:
-                    g0: Matrix = read_matrix(f, 3, m0)
-                    miss0 = read_vector(f, m0)
+                    g0: Matrix = read_matrix_from_cache[TP](f, 3, m0, prime_bytes)
+                    miss0 = read_vector_from_cache[TP](f, m0, prime_bytes)
 
                     mpc.prg.switch_seed(10)
-                    g0_mask = rand_mat([3, m0])  # Matrix(3, m0, randomise=True)
-                    miss0_mask = rand_vec(m0)
+                    g0_mask = rand_mat([3, m0], param.BASE_P)  # Matrix(3, m0, randomise=True)
+                    miss0_mask = rand_vec(m0, param.BASE_P)
                     mpc.prg.restore_seed(10)
                 else:
                     for p in range(1, 3):
                         mpc.prg.switch_seed(10 + p)
-                        tmp_mat = rand_mat([3, m0])  # Matrix(3, m0, randomise=True)
-                        tmp_vec = rand_vec(m0)
+                        tmp_mat = rand_mat([3, m0], param.BASE_P)  # Matrix(3, m0, randomise=True)
+                        tmp_vec = rand_vec(m0, param.BASE_P)
                         mpc.prg.restore_seed(10 + p)
 
                         g0_mask += tmp_mat
                         miss0_mask += tmp_vec
             
 
-            # Filter out loci that failed missing rate filter
-            ind2: int = 0
-            for j in range(m0):
-                if gkeep1[j] == 1:
+                # Filter out loci that failed missing rate filter
+                ind2: int = 0
+                for j in range(m0):
+                    if gkeep1[j] == 1:
+                        for k in range(3):
+                            g[k][i % bsize][ind2] = copy(g0[k][j])
+                            g_mask[k][i % bsize][ind2] = copy(g0_mask[k][j])
+                        miss[i % bsize][ind2] = copy(miss0[j])
+                        miss_mask[i % bsize][ind2] = copy(miss0_mask[j])
+                        ind2 += 1
+
+                dosage[i % bsize] = g[1][i % bsize] + g[2][i % bsize] * 2
+                dosage_mask[i % bsize] = g_mask[1][i % bsize] + g_mask[2][i % bsize] * 2
+
+                ctrl_vec[i % bsize] = copy(ctrl[i])
+                ctrl_mask_vec[i % bsize] = copy(ctrl_mask[i])
+
+                # Update running sums
+                if mpc.pid > 0:
+                    n1_ctrl += ctrl_mask[i]
+                    gmiss += miss_mask[i % bsize]
+                    dosage_sum += dosage_mask[i % bsize]
+
+                    if mpc.pid == 1:
+                        n1_ctrl += ctrl[i]
+                        gmiss += miss[i % bsize]
+                        dosage_sum += dosage[i % bsize]
+
+                if (i % bsize == bsize - 1 or i == n1 - 1):
+                    if i % bsize < bsize - 1:
+                        new_bsize: int = (i % bsize) + 1
+
+                        for k in range(3):
+                            g[k] = g[k].pad(new_bsize, m1)
+                            g_mask[k] = g_mask[k].pad(new_bsize, m1)
+
+                        dosage = dosage.pad(new_bsize, m1)
+                        dosage_mask = dosage_mask.pad(new_bsize, m1)
+                        miss = miss.pad(new_bsize, m1)
+                        miss_mask = miss_mask.pad(new_bsize, m1)
+                        ctrl_vec = ctrl_vec.pad_vec(new_bsize)  # set_length(new_bsize)
+                        ctrl_mask_vec = ctrl_mask_vec.pad_vec(new_bsize)
+
+                    gmiss_ctrl = mpc.arithmetic.beaver_mult_vec(
+                        ctrl_vec, ctrl_mask_vec, miss, miss_mask)
+                    dosage_sum_ctrl = mpc.arithmetic.beaver_mult_vec(
+                        ctrl_vec, ctrl_mask_vec, dosage, dosage_mask)
                     for k in range(3):
-                        g[k][i % bsize][ind2] = copy(g0[k][j])
-                        g_mask[k][i % bsize][ind2] = copy(g0_mask[k][j])
-                    miss[i % bsize][ind2] = copy(miss0[j])
-                    miss_mask[i % bsize][ind2] = copy(miss0_mask[j])
-                    ind2 += 1
-
-            dosage[i % bsize] = g[1][i % bsize] + g[2][i % bsize] * 2
-            dosage_mask[i % bsize] = g_mask[1][i % bsize] + g_mask[2][i % bsize] * 2
-
-            ctrl_vec[i % bsize] = copy(ctrl[i])
-            ctrl_mask_vec[i % bsize] = copy(ctrl_mask[i])
-
-            # Update running sums
-            if mpc.pid > 0:
-                n1_ctrl += ctrl_mask[i]
-                gmiss += miss_mask[i % bsize]
-                dosage_sum += dosage_mask[i % bsize]
-
-                if mpc.pid == 1:
-                    n1_ctrl += ctrl[i]
-                    gmiss += miss[i % bsize]
-                    dosage_sum += dosage[i % bsize]
-
-            if (i % bsize == bsize - 1 or i == n1 - 1):
-                if i % bsize < bsize - 1:
-                    new_bsize: int = (i % bsize) + 1
-
-                    for k in range(3):
-                        g[k] = g[k].pad(new_bsize, m1)
-                        g_mask[k] = g_mask[k].pad(new_bsize, m1)
-
-                    dosage = dosage.pad(new_bsize, m1)
-                    dosage_mask = dosage_mask.pad(new_bsize, m1)
-                    miss = miss.pad(new_bsize, m1)
-                    miss_mask = miss_mask.pad(new_bsize, m1)
-                    ctrl_vec = ctrl_vec.pad(new_bsize)  # set_length(new_bsize)
-                    ctrl_mask_vec = ctrl_mask_vec.pad(new_bsize)
-
-                gmiss_ctrl = mpc.arithmetic.beaver_mult_vec(
-                    ctrl_vec, ctrl_mask_vec, miss, miss_mask)
-                dosage_sum_ctrl = mpc.arithmetic.beaver_mult_vec(
-                    ctrl_vec, ctrl_mask_vec, dosage, dosage_mask)
-                for k in range(3):
-                    g_count_ctrl[k] = mpc.arithmetic.beaver_mult_vec(ctrl_vec, ctrl_mask_vec, g[k], g_mask[k])
+                        g_count_ctrl[k] = mpc.arithmetic.beaver_mult_vec(ctrl_vec, ctrl_mask_vec, g[k], g_mask[k])
 
         gmiss_ctrl = mpc.arithmetic.beaver_reconstruct_vec(gmiss_ctrl)
         dosage_sum_ctrl = mpc.arithmetic.beaver_reconstruct_vec(dosage_sum_ctrl)
-        g_count_ctrl = mpc.arithmetic.beaver_reconstruct_vec(g_count_ctrl)
+        g_count_ctrl = mpc.arithmetic.beaver_reconstruct_mat(g_count_ctrl)
 
         # Write to cache
         with open(get_cache_path(mpc.pid, "geno_stats")) as f:
-            write_to_file(gmiss, f)
-            write_to_file(gmiss_ctrl, f)
-            write_to_file(dosage_sum, f)
-            write_to_file(dosage_sum_ctrl, f)
-            write_to_file(g_count_ctrl, f)
-            write_to_file(n1_ctrl, f)
+            write_to_cache(f, gmiss)
+            write_to_cache(f, gmiss_ctrl)
+            write_to_cache(f, dosage_sum)
+            write_to_cache(f, dosage_sum_ctrl)
+            write_to_cache(f, g_count_ctrl)
+            write_to_cache(f, [n1_ctrl])
 
             print("Wrote results to cache")
 
@@ -437,34 +456,35 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
 
     print("Calculating MAFs ... ")
     dosage_tot_len = len(dosage_tot)
-    dosage_tot_ctrl_len = len(dosage_tot_ctrl_len)
+    dosage_tot_ctrl_len = len(dosage_tot_ctrl)
     maf = [TP(0) for _ in range(dosage_tot_len)]  # Vector()
     maf_ctrl = [TP(0) for _ in range(dosage_tot_ctrl_len)]  # Vector()
-    if (os.path.exists(get_cache_path(mpc.pid, "maf"))):
+    if (file_exists(get_cache_path(mpc.pid, "maf"))):
         print("maf cache found")
         with open(get_cache_path(mpc.pid, "maf")) as f:
-            maf = read_vector(f, dosage_tot_len)
-            maf_ctrl = read_vector(f, dosage_tot_ctrl_len)
+            maf = read_vector_from_cache[TP](f, dosage_tot_len, prime_bytes)
+            maf_ctrl = read_vector_from_cache[TP](f, dosage_tot_ctrl_len, prime_bytes)
     else:
         maf = mpc.fp.fp_div(dosage_sum, dosage_tot)
         maf_ctrl = mpc.fp.fp_div(dosage_sum_ctrl, dosage_tot_ctrl)
 
         with open(get_cache_path(mpc.pid, "maf"), 'wb') as f:
-            write_to_file(maf, f)
-            write_to_file(maf_ctrl, f)
+            write_to_cache(f, maf)
+            write_to_cache(f, maf_ctrl)
     print("done. ")
 
     Maf = [TP(0) for _ in range(m1)]  # Vector()  # MAJOR allele freq
     maf_ctrl = [TP(0) for _ in range(m1)]  # Vector()
+    Maf_ctrl = [TP(0) for _ in range(m1)]  # Vector()
     if mpc.pid > 0:
         Maf = -maf
         Maf_ctrl = -maf_ctrl
-        Maf = mpc.arithmetic.add_public(Maf, fp_one)
-        Maf_ctrl = mpc.arithmetic.add_public(Maf_ctrl, fp_one)
+        Maf = mpc.arithmetic.add_public_scalar(Maf, fp_one)
+        Maf_ctrl = mpc.arithmetic.add_public_scalar(Maf_ctrl, fp_one)
 
     # Variance based on Bernoulli distribution over each allele
-    g_var_bern = mpc.arithmetic.mult_vec(maf, Maf)
-    g_var_bern = mpc.trunc_vec(g_var_bern)
+    g_var_bern = mpc.arithmetic.multiply_vec(maf, Maf)
+    g_var_bern = mpc.fp.trunc_vec(g_var_bern)
 
     gkeep2 = [TP(0) for _ in range(m1)]  # Vector([TP(0)  # Zp(0, param.BASE_P) for _ in range(m1)])
 
@@ -475,7 +495,7 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
     else:
         history: bool = False
         if mpc.pid == 2:
-            history = os.path.exists(get_output_path(mpc.pid, "gkeep2"))
+            history = file_exists(get_output_path(mpc.pid, "gkeep2"))
             mpc.comms.send_bool(history, 0)
             mpc.comms.send_bool(history, 1)
         else:
@@ -493,11 +513,11 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
                 mpc.comms.send_data(gkeep2, 0, m1 * param.SIZE_OF_U)
                 mpc.comms.send_data(gkeep2, 1, m1 * param.SIZE_OF_U)
             else:
-                mpc.comms.receive_vector(gkeep2, 2, m1)
+                gkeep2 = mpc.comms.receive_vector(2, m1)
         else:
             gkeep2 = mpc.boolean.less_than_public(maf, maf_ub)
             tmp_vec = mpc.boolean.not_less_than_public(maf, maf_lb)
-            gkeep2 = mpc.arithmetic.mult_vec(gkeep2, tmp_vec)
+            gkeep2 = mpc.arithmetic.multiply_vec(gkeep2, tmp_vec)
 
             print("Locus Hardy-Weinberg equilibrium (HWE) filter ... ")
             hwe_ub = TypeOps.double_to_fp(param.HWE_UB, param.NBIT_K, param.NBIT_F)  # p < 1e-7
@@ -505,56 +525,56 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
             # Calculate expected genotype distribution in control group
             g_exp_ctrl = [[TP(0) for _ in range(m1)] for _ in range(3)]  # Matrix(3, m1)
 
-            g_exp_ctrl[0] = mpc.arithmetic.mult_vec(Maf_ctrl, Maf_ctrl)
-            g_exp_ctrl[1] = mpc.arithmetic.mult_vec(Maf_ctrl, maf_ctrl)
+            g_exp_ctrl[0] = mpc.arithmetic.multiply_vec(Maf_ctrl, Maf_ctrl)
+            g_exp_ctrl[1] = mpc.arithmetic.multiply_vec(Maf_ctrl, maf_ctrl)
             if mpc.pid > 0:
                 g_exp_ctrl[1] *= 2
-            g_exp_ctrl[2] = mpc.arithmetic.mult_vec(maf_ctrl, maf_ctrl)
+            g_exp_ctrl[2] = mpc.arithmetic.multiply_vec(maf_ctrl, maf_ctrl)
 
             for i in range(3):
-                g_exp_ctrl[i] = mpc.arithmetic.mult_vec(g_exp_ctrl[i], dosage_tot_ctrl)
+                g_exp_ctrl[i] = mpc.arithmetic.multiply_vec(g_exp_ctrl[i], dosage_tot_ctrl)
 
-        g_exp_ctrl *= twoinv  # dosage_tot_ctrl is twice the # individuals we actually want
-        g_exp_ctrl = mpc.trunc(g_exp_ctrl, k=param.NBIT_K + param.NBIT_F, m=param.NBIT_F)
+            g_exp_ctrl *= twoinv  # dosage_tot_ctrl is twice the # individuals we actually want
+            g_exp_ctrl = mpc.fp.trunc(g_exp_ctrl, k=param.NBIT_K + param.NBIT_F, m=param.NBIT_F)
 
-        print("\tCalculated expected genotype counts, ")
+            print("\tCalculated expected genotype counts, ")
 
-        hwe_chisq = [TP(0) for _ in range(m1)]  # Vector([TP(0)  # Zp(0, param.BASE_P) for _ in range(m1)])
+            hwe_chisq = [TP(0) for _ in range(m1)]  # Vector([TP(0)  # Zp(0, param.BASE_P) for _ in range(m1)])
 
-        if (os.path.exists(get_cache_path(mpc.pid, "hwe"))):
-            print("HWE cache found")
-            with open(get_cache_path(mpc.pid, "hwe")) as f:
-                hwe_chisq = read_vector(f, m1)
-        else:
-            for i in range(3):
-                diff = [TP(0) for _ in range(m1)]
-                if mpc.pid > 0:
-                    diff = g_count_ctrl[i] * fp_one - g_exp_ctrl[i]
+            if (file_exists(get_cache_path(mpc.pid, "hwe"))):
+                print("HWE cache found")
+                with open(get_cache_path(mpc.pid, "hwe")) as f:
+                    hwe_chisq = read_vector_from_cache[TP](f, m1, prime_bytes)
+            else:
+                for i in range(3):
+                    diff = [TP(0) for _ in range(m1)]
+                    if mpc.pid > 0:
+                        diff = g_count_ctrl[i] * fp_one - g_exp_ctrl[i]
 
-                diff = mpc.arithmetic.mult_vec(diff, diff)
-                diff = mpc.trunc_vec(diff)
+                    diff = mpc.arithmetic.multiply_vec(diff, diff)
+                    diff = mpc.fp.trunc_vec(diff)
 
-                tmp_vec = mpc.fp.fp_div(diff, g_exp_ctrl[i])
-                hwe_chisq += tmp_vec
+                    tmp_vec = mpc.fp.fp_div(diff, g_exp_ctrl[i])
+                    hwe_chisq += tmp_vec
 
-            with open(get_cache_path(mpc.pid, "hwe"), 'wb') as f:
-                write_to_file(hwe_chisq, f)
+                with open(get_cache_path(mpc.pid, "hwe"), 'wb') as f:
+                    write_to_cache(f, hwe_chisq)
 
-        hwe_filt = mpc.boolean.less_than_public(hwe_chisq, hwe_ub)
-        gkeep2 = mpc.arithmetic.mult_vec(gkeep2, hwe_filt)
+            hwe_filt = mpc.boolean.less_than_public(hwe_chisq, hwe_ub)
+            gkeep2 = mpc.arithmetic.multiply_vec(gkeep2, hwe_filt)
 
-        # Reveal which SNPs to discard 
-        mpc.comms.reveal_sym(gkeep2)
-            
-        if mpc.pid == 2:
-            mpc.comms.send_data(gkeep2, 0, m1 * param.SIZE_OF_U)
-        elif mpc.pid == 0:
-            gkeep2 = mpc.comms.receive_vector(2, m1)
+            # Reveal which SNPs to discard 
+            mpc.comms.reveal_vector(gkeep2)
+                
+            if mpc.pid == 2:
+                mpc.comms.send_data(gkeep2, 0, m1 * param.SIZE_OF_U)
+            elif mpc.pid == 0:
+                gkeep2 = mpc.comms.receive_vector(2, m1)
 
-        if mpc.pid == 2:
-            with open(get_output_path(mpc.pid, "gkeep2"), 'w') as f:
-                for i in range(len(gkeep2)):
-                    f.write(f'{gkeep2[i]}\n')
+            if mpc.pid == 2:
+                with open(get_output_path(mpc.pid, "gkeep2"), 'w') as f:
+                    for i in range(len(gkeep2)):
+                        f.write(f'{gkeep2[i]}\n')
 
     m2: int = int(sum(gkeep2))
     print("n1: ", n1, ", ", "m2: ", m2)
@@ -565,19 +585,19 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
     snp_pos = [snp_pos[i] for i in range(len(snp_pos)) if gkeep2[i]]
 
     g_std_bern_inv = [TP(0) for _ in range(len(g_var_bern))]
-    if (os.path.exists(get_cache_path(mpc.pid, "stdinv_bern"))):
+    if (file_exists(get_cache_path(mpc.pid, "stdinv_bern"))):
         print("Genotype standard deviation cache found")
 
         with open(get_cache_path(mpc.pid, "stdinv_bern")) as f:
-            g_std_bern_inv = read_vector(f, len(g_var_bern))
+            g_std_bern_inv = read_vector_from_cache[TP](f, len(g_var_bern), prime_bytes)
 
     else:
         print("Calculating genotype standard deviations (inverse)")
 
-        tmp_vec = mpc.fp_sqrt(g_std_bern_inv, g_var_bern)
+        _, g_std_bern_inv = mpc.fp.fp_sqrt(g_var_bern)
 
         with open(get_cache_path(mpc.pid, "stdinv_bern"), 'wb') as f:
-            write_to_file(g_std_bern_inv, f)
+            write_to_cache(f, g_std_bern_inv)
 
     g_mean = [TP(0) for _ in range(m2)]  # Vector([TP(0)  # Zp(0, param.BASE_P) for _ in range(m2)])
     if mpc.pid > 0:
@@ -585,7 +605,7 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
 
     print("Starting population stratification analysis")
 
-    selected: list = [0] * m2  # 1 selected, 0 unselected, -1 TBD
+    selected: list[int] = [0 for _ in range(m2)]  # 1 selected, 0 unselected, -1 TBD
 
     for i in range(m2):
         selected[i] = -1
@@ -608,7 +628,7 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
     print("SNP selection complete: ", m3, " / ", m2, " selected")
 
     # Cache the reduced G for PCA
-    if (os.path.exists(get_cache_path(mpc.pid, "pca_input"))):
+    if (file_exists(get_cache_path(mpc.pid, "pca_input"))):
         print("pca_input cache found")
     else:
         gkeep3: list[bool] = [False for _ in range(m0)]
@@ -650,28 +670,28 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
 
                     while ikeep[ind] != 1:
                         if mpc.pid > 0:
-                            skip_data(f_geno, 3, m0)
-                            skip_data(f_geno, m0)
+                            f_geno.read(mpc.boolean.primes_bytes[0] * 3 * m0)  # skip_data(f_geno, 3, m0)
+                            f_geno.read(mpc.boolean.primes_bytes[0] * m0)  # skip_data(f_geno, m0)
 
                             mpc.prg.switch_seed(10)
-                            g0_mask = rand_mat([3, m0])  # Matrix(3, m0, randomise=True)
-                            miss0_mask = rand_vec(m0)
+                            g0_mask = rand_mat([3, m0], param.BASE_P)  # Matrix(3, m0, randomise=True)
+                            miss0_mask = rand_vec(m0, param.BASE_P)
                             mpc.prg.restore_seed(10)
                         else:
                             for p in range(1, 3):
                                 mpc.prg.switch_seed(10 + p)
-                                g0_mask = rand_mat([3, m0])  # Matrix(3, m0, randomise=True)
-                                miss0_mask = rand_vec(m0)
+                                g0_mask = rand_mat([3, m0], param.BASE_P)  # Matrix(3, m0, randomise=True)
+                                miss0_mask = rand_vec(m0, param.BASE_P)
                                 mpc.prg.restore_seed(10 + p)
                         ind += 1
 
                     if mpc.pid > 0:
-                        g0 = read_matrix(f_geno, 3, m0)
-                        miss0 = read_matrix(f_geno, m0)
+                        g0 = read_matrix_from_cache[TP](f_geno, 3, m0, prime_bytes)
+                        miss0 = read_vector_from_cache[TP](f_geno, m0, prime_bytes)
 
                         mpc.prg.switch_seed(10)
-                        g0_mask = rand_mat([3, m0])  # Matrix(3, m0, randomise=True)
-                        miss0_mask = rand_vec(m0)
+                        g0_mask = rand_mat([3, m0], param.BASE_P)  # Matrix(3, m0, randomise=True)
+                        miss0_mask = rand_vec(m0, param.BASE_P)
                         mpc.prg.restore_seed(10)
                     else:
                         g0 = [[TP(0) for _ in range(m0)] for _ in range(3)]  # Matrix(3, m0)
@@ -681,8 +701,8 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
 
                         for p in range(3):
                             mpc.prg.switch_seed(10 + p)
-                            tmp_mat = rand_mat([3, m0])  # Matrix(3, m0, randomise=True)
-                            tmp_vec = rand_vec(m0)
+                            tmp_mat = rand_mat([3, m0], param.BASE_P)  # Matrix(3, m0, randomise=True)
+                            tmp_vec = rand_vec(m0, param.BASE_P)
                             mpc.prg.restore_seed(10 + p)
 
                             g0_mask += tmp_mat
@@ -706,26 +726,26 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
                     dosage = g[1] + g[2] * 2
                     dosage_mask = g_mask[1] + g_mask[2] * 2
 
-                    beaver_write_to_file(dosage, dosage_mask, f_pca)
-                    beaver_write_to_file(miss, miss_mask, f_pca)
+                    # beaver_write_to_cache(dosage, dosage_mask, f_pca)
+                    # beaver_write_to_cache(miss, miss_mask, f_pca)
 
     g_mean_pca = [g_mean[i] for i in range(len(g_mean)) if selected[i]]
     g_stdinv_pca = [g_std_bern_inv[i] for i in range(len(g_std_bern_inv)) if selected[i]]
 
-    g_mean_pca_mask = mpc.arithmetic.beaver_partition(g_mean_pca)
-    g_stdinv_pca_mask = mpc.arithmetic.beaver_partition(g_stdinv_pca)
+    g_mean_pca, g_mean_pca_mask = mpc.arithmetic.beaver_partition_vec(g_mean_pca)
+    g_stdinv_pca, g_stdinv_pca_mask = mpc.arithmetic.beaver_partition_vec(g_stdinv_pca)
 
     # Pass 2: Random sketch
     Y_cur = [[TP(0) for _ in range(m3)] for _ in range(kp)]  # Matrix(kp, m3)
 
-    if (os.path.exists(get_cache_path(mpc.pid, "sketch"))):
+    if (file_exists(get_cache_path(mpc.pid, "sketch"))):
         print("sketch cache found")
         with open(get_cache_path(mpc.pid, "sketch")) as f:
             kp = TP(next(f))
-            Y_cur = read_matrix(f, kp, m3)
+            Y_cur = read_matrix_from_cache[TP](f, kp, m3, prime_bytes)
     else:
         Y_cur_adj = [[TP(0) for _ in range(m3)] for _ in range(kp)]  # Matrix(kp, m3)
-        bucket_count: list = [0] * kp
+        bucket_count: list[int] = [0 for _ in range(kp)]
 
         with open(get_cache_path(mpc.pid, "pca_input")) as f:
             for cur in range(n1):
@@ -735,11 +755,11 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
                 rand_sign = rand_int(0, 1) * 2 - 1
                 mpc.prg.restore_seed(-1)
 
-                g, g_mask = beaver_read_from_file(f, m3)
-                miss, miss_mask = beaver_read_from_file(f, m3)
+                g, g_mask = beaver_read_from_cache[TP](f, m3)
+                miss, miss_mask = beaver_read_from_cache[TP](f, m3)
 
                 # Flip miss bits so it points to places where g_mean should be subtracted
-                TypeOps.beaver_flip_bit(miss, miss_mask)
+                mpc.boolean.beaver_flip_bit(miss, miss_mask)
 
                 # Update running sum
                 if mpc.pid > 0:
@@ -750,7 +770,7 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
                 # Update adjustment factor
                 miss *= rand_sign
                 miss_mask *= rand_sign
-                Y_cur_adj[bucket_index] = mpc.arithmetic.beaver_mult[list[size_u]](
+                Y_cur_adj[bucket_index] = mpc.arithmetic.beaver_mult[list[TP]](
                     miss, miss_mask, g_mean_pca, g_mean_pca_mask)
 
                 bucket_count[bucket_index] += 1
@@ -764,18 +784,18 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
         empty_slot: int = 0
         for i in range(kp):
             if bucket_count[i] > 0:
-                fp_count_inv: Zp = TypeOps.double_to_fp(
+                fp_count_inv = TypeOps.double_to_fp(
                     1 / bucket_count[i], param.NBIT_K, param.NBIT_F)
                 Y_cur[empty_slot] = Y_cur[i] * fp_count_inv
                 empty_slot += 1
         kp = empty_slot
         Y_cur = Y_cur.pad(kp, m3)
-        Y_cur = mpc.trunc(Y_cur)
+        Y_cur = mpc.fp.trunc(Y_cur)
 
         with open(get_cache_path(mpc.pid, "sketch"), 'wb') as f:
-            f.write(bytes([kp]))
+            write_to_cache(f, [kp])
             if mpc.pid > 0:
-                write_to_file(Y_cur, f)
+                write_to_cache(f, Y_cur)
 
     Y_cur, Y_cur_mask = mpc.arithmetic.beaver_partition_mat(Y_cur)
 
@@ -783,10 +803,10 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
 
     gQ = [[TP(0) for _ in range(kp)] for _ in range(n1)]
 
-    if (os.path.exists(get_cache_path(mpc.pid, "piter"))):
+    if (file_exists(get_cache_path(mpc.pid, "piter"))):
         print("piter cache found")
         with open(get_cache_path(mpc.pid, "piter")) as f:
-            gQ = read_from_file(f, n1, kp)
+            gQ = read_matrix_from_cache[TP](f, n1, kp, prime_bytes)
     else:
         # Divide by standard deviation
         Y = [[TP(0) for _ in range(m3)] for _ in range(kp)]  # Matrix(kp, m3)
@@ -795,7 +815,7 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
             Y[i] = mpc.arithmetic.beaver_mult(Y_cur[i], Y_cur_mask[i], g_stdinv_pca, g_stdinv_pca_mask)
 
         Y = mpc.arithmetic.beaver_reconstruct_mat(Y)
-        Y = mpc.trunc(Y)
+        Y = mpc.fp.trunc(Y)
 
         # Calculate orthonormal bases of Y
         Q = mpc.lin_alg.orthonormal_basis(Y)
@@ -803,31 +823,31 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
         # Power iteration
         for pit in range(param.NUM_POWER_ITER + 1):
             # This section is ran before each iteration AND once after all iterations
-            Q, Q_mask = mpc.arithmetic.beaver_partition(Q)
+            Q, Q_mask = mpc.arithmetic.beaver_partition_mat(Q)
 
             # Normalize Q by standard deviations
             Q_scaled = [[TP(0) for _ in range(m3)] for _ in range(kp)]  # Matrix(kp, m3)
             for i in range(kp):
-                Q_scaled[i] = mpc.arithmetic.beaver_mult_vec(Q[i], Q_mask[i], g_stdinv_pca, g_stdinv_pca_mask)
+                Q_scaled[i] = mpc.arithmetic.beaver_mult(Q[i], Q_mask[i], g_stdinv_pca, g_stdinv_pca_mask)
 
-            Q_scaled = mpc.arithmetic.beaver_reconstruct(Q_scaled)
-            Q_scaled = mpc.trunc(Q_scaled)
+            Q_scaled = mpc.arithmetic.beaver_reconstruct_mat(Q_scaled)
+            Q_scaled = mpc.fp.trunc(Q_scaled)
 
-            Q_scaled, Q_scaled_mask = mpc.arithmetic.beaver_partition(Q_scaled)
+            Q_scaled, Q_scaled_mask = mpc.arithmetic.beaver_partition_mat(Q_scaled)
 
             # Pre-multiply with g_mean to simplify calculation of centering matrix
             Q_scaled_gmean = [[TP(0) for _ in range(m3)] for _ in range(kp)]  # Matrix(kp, m3)
             for i in range(kp):
-                Q_scaled_gmean[i] = mpc.arithmetic.beaver_mult_vec(
+                Q_scaled_gmean[i] = mpc.arithmetic.beaver_mult(
                     Q_scaled[i], Q_scaled_mask[i], g_mean_pca, g_mean_pca_mask)
-            Q_scaled_gmean = mpc.arithmetic.beaver_reconstruct(Q_scaled_gmean)
-            Q_scaled_gmean = mpc.trunc(Q_scaled_gmean)
+            Q_scaled_gmean = mpc.arithmetic.beaver_reconstruct_mat(Q_scaled_gmean)
+            Q_scaled_gmean = mpc.fp.trunc(Q_scaled_gmean)
 
             Q_scaled = Q_scaled.transpose()  # m3-by-kp
             # transpose(, Q_scaled_mask); # m3-by-kp, unlike mpc.Transpose, P0 also transposes
             Q_scaled_mask = Q_scaled_mask.transpose()
             Q_scaled_gmean = Q_scaled_gmean.transpose()  # m3-by-kp
-            Q_scaled_gmean, Q_scaled_gmean_mask = mpc.arithmetic.beaver_partition(Q_scaled_gmean)
+            Q_scaled_gmean, Q_scaled_gmean_mask = mpc.arithmetic.beaver_partition_mat(Q_scaled_gmean)
 
             bsize: int = param.PITER_BATCH_SIZE
 
@@ -842,9 +862,9 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
 
             with open(get_cache_path(mpc.pid, "pca_input")) as f:
                 for cur in range(n1):
-                    g[cur % bsize] = beaver_read_from_file(g_mask[cur % bsize], f, m3)
-                    miss[cur % bsize] = beaver_read_from_file(miss_mask[cur % bsize], f, m3)
-                    beaver_flip_bit(miss[cur % bsize], miss_mask[cur % bsize])
+                    g[cur % bsize], g_mask[cur % bsize] = beaver_read_from_cache[TP](f, m3)
+                    miss[cur % bsize], miss_mask[cur % bsize] = beaver_read_from_cache[TP](f, m3)
+                    mpc.boolean.beaver_flip_bit(miss[cur % bsize], miss_mask[cur % bsize])
 
                     if cur % bsize == bsize - 1:
                         tmp_mat = [[TP(0) for _ in range(kp)] for _ in range(bsize)]  # Matrix(bsize, kp)
@@ -901,9 +921,9 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
             # Pass 2
             with open(get_cache_path(mpc.pid, "pca_input")) as f:
                 for cur in range(n1):
-                    g[cur % bsize] = beaver_read_from_file(g_mask[cur % bsize], f, m3)
-                    miss[cur % bsize] = beaver_read_from_file(miss_mask[cur % bsize], f, m3)
-                    beaver_flip_bit(miss[cur % bsize], miss_mask[cur % bsize])
+                    g[cur % bsize], g_mask[cur % bsize] = beaver_read_from_cache[TP](f, m3)
+                    miss[cur % bsize], miss_mask[cur % bsize] = beaver_read_from_cache[TP](f, m3)
+                    mpc.boolean.beaver_flip_bit(miss[cur % bsize], miss_mask[cur % bsize])
 
                     Qsub[cur % bsize] = Q[cur]
                     Qsub_mask[cur % bsize] = Q_mask[cur]
@@ -943,7 +963,7 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
                 gQ_adj_gmean[i] = mpc.arithmetic.beaver_mult(
                     gQ_adj[i], gQ_adj_mask[i], g_mean_pca, g_mean_pca_mask)
             gQ_adj_gmean = mpc.arithmetic.beaver_reconstruct_mat(gQ_adj_gmean)
-            gQ_adj_gmean = mpc.trunc(gQ_adj_gmean)
+            gQ_adj_gmean = mpc.fp.trunc(gQ_adj_gmean)
 
             if mpc.pid > 0:
                 gQ -= gQ_adj_gmean
@@ -954,13 +974,13 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
             for i in range(kp):
                 gQ_scaled[i] = mpc.arithmetic.beaver_mult(gQ[i], gQ_mask[i], g_stdinv_pca, g_stdinv_pca_mask)
             gQ_scaled = mpc.arithmetic.beaver_reconstruct_mat(gQ_scaled)
-            gQ_scaled = mpc.trunc(gQ_scaled)
+            gQ_scaled = mpc.fp.trunc(gQ_scaled)
 
             Q = mpc.lin_alg.orthonormal_basis(gQ_scaled)
 
         with open(get_cache_path(mpc.pid, "piter")) as f:
             if mpc.pid > 0:
-                write_to_file(gQ, f)
+                write_to_cache(f, gQ)
 
     print("Power iteration complete")
 
@@ -970,14 +990,14 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
     V = [[TP(0) for _ in range(n1)] for _ in range(k)]  # Matrix(k, n1)
 
     # Eigendecomposition
-    if (os.path.exists(get_cache_path(mpc.pid, "eigen"))):
+    if (file_exists(get_cache_path(mpc.pid, "eigen"))):
         print("eigen cache found")
         with open(get_cache_path(mpc.pid, "eigen")) as f:
-            V = read_from_file(f, k, n1)
+            V = read_matrix_from_cache[TP](f, k, n1, prime_bytes)
     else:
         fp_m2_inv = TypeOps.double_to_fp(1 / m2, param.NBIT_K, param.NBIT_F)
         Z *= fp_m2_inv
-        Z = mpc.trunc(Z)
+        Z = mpc.fp.trunc(Z)
 
         Z = Z.transpose() # kp-by-n1
 
@@ -986,9 +1006,10 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
         # Form covariance matrix
         Z_gram = [[TP(0) for _ in range(kp)] for _ in range(kp)]  # Matrix(kp, kp)
         for i in range(kp):
-            Z_gram[i] = mpc.arithmetic.beaver_mult(Z, Z_mask, Z[i], Z_mask[i])
+            # TODO: Change below to: Z_gram[i] = mpc.arithmetic.beaver_mult_rev(Z, Z_mask, Z[i], Z_mask[i])
+            Z_gram[i] = mpc.arithmetic.beaver_mult(Z[i], Z_mask[i], Z[i], Z_mask[i])
         Z_gram = mpc.arithmetic.beaver_reconstruct_mat(Z_gram)
-        Z_gram = mpc.trunc(Z_gram)
+        Z_gram = mpc.fp.trunc(Z_gram)
 
         print("Constructed reduced eigenvalue problem")
 
@@ -996,7 +1017,7 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
 
         # Select top eigenvectors and eigenvalues
         U = U.pad(k, kp)
-        L = L.pad(k)
+        L = L.pad_vec(k)
 
         print("Selected K eigenvectors")
         # Recover singular vectors
@@ -1004,11 +1025,11 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
 
         V = mpc.arithmetic.beaver_mult(U, U_mask, Z, Z_mask)
         V = mpc.arithmetic.beaver_reconstruct_mat(V)
-        V = mpc.trunc(V)
+        V = mpc.fp.trunc(V)
 
         with open(get_cache_path(mpc.pid, "eigen")) as f:
             if mpc.pid > 0:
-                write_to_file(V, f)
+                write_to_cache(f, V)
 
     # Concatenate covariate matrix and jointly orthogonalize
     cov = cov.transpose()
@@ -1025,13 +1046,14 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
 
     pheno, pheno_mask = mpc.arithmetic.beaver_partition_vec(pheno)
 
-    Vp = mpc.arithmetic.beaver_mult_vec(V, V_mask, pheno, pheno_mask)
-    Vp = mpc.arithmetic.beaver_reconstruct_mat(Vp)
-    Vp, Vp_mask = mpc.arithmetic.beaver_partition_mat(Vp)
+    # TODO: Fix. Vp = mpc.arithmetic.beaver_mult(V, V_mask, pheno, pheno_mask)
+    Vp = mpc.arithmetic.beaver_mult(V[0], V_mask[0], pheno, pheno_mask)
+    Vp = mpc.arithmetic.beaver_reconstruct_vec(Vp)
+    Vp, Vp_mask = mpc.arithmetic.beaver_partition_vec(Vp)
     
-    VVp = mpc.arithmetic.beaver_mult_mat(Vp, Vp_mask, V, V_mask)
+    VVp = mpc.arithmetic.beaver_mult_vec(Vp, Vp_mask, V, V_mask)
     VVp = mpc.arithmetic.beaver_reconstruct_vec(VVp)
-    VVp = mpc.trunc_vec(VVp)
+    VVp = mpc.fp.trunc_vec(VVp)
 
     VVp, VVp_mask = mpc.arithmetic.beaver_partition_vec(VVp)
 
@@ -1047,13 +1069,13 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
             V_sum[i] += V[i][j]
             V_sum_mask[i] += V_mask[i][j]
 
-    u = mpc.arithmetic.beaver_mult_mat(V_sum, V_sum_mask, V, V_mask)
+    u = mpc.arithmetic.beaver_mult_vec(V_sum, V_sum_mask, V, V_mask)
     u = mpc.arithmetic.beaver_reconstruct_vec(u)
-    u = mpc.trunc_vec(u)
+    u = mpc.fp.trunc_vec(u)
     if mpc.pid > 0:
         u *= -1
-        u = mpc.arithmetic.add_public(u, fp_one)
-    u, u_mask = mpc.arithmetic.beaver_partition(u)
+        u = mpc.arithmetic.add_public_scalar(u, fp_one)
+    u, u_mask = mpc.arithmetic.beaver_partition_vec(u)
 
     print("Allocating sx, sxx, sxp, B ... ")
 
@@ -1064,13 +1086,13 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
 
     print("done.")
 
-    if (os.path.exists(get_cache_path(mpc.pid, "gwas_stats"))):
+    if (file_exists(get_cache_path(mpc.pid, "gwas_stats"))):
         print("GWAS statistics cache found")
         with open(get_cache_path(mpc.pid, "gwas_stats")) as f:
-            sx = read_from_file(f, m2)
-            sxx = read_from_file(f, m2)
-            sxp = read_from_file(f, m2)
-            B = read_from_file(f, k + param.NUM_COVS, m2)
+            sx = read_vector_from_cache[TP](f, m2, prime_bytes)
+            sxx = read_vector_from_cache[TP](f, m2, prime_bytes)
+            sxp = read_vector_from_cache[TP](f, m2, prime_bytes)
+            B = read_matrix_from_cache[TP](f, k + param.NUM_COVS, m2, prime_bytes)
     else:
         with open(get_cache_path(mpc.pid, "input_geno")) as f:
             if mpc.pid > 0:
@@ -1114,30 +1136,35 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
             for cur in range(n1):
                 ind += 1
 
+                g0 = [[TP(0) for _ in range(m0)] for _ in range(3)]
+                g0_mask = [[TP(0) for _ in range(m0)] for _ in range(3)]
+                miss0 = [TP(0) for _ in range(m0)]
+                miss0_mask = [TP(0) for _ in range(m0)]
+
                 while ikeep[ind] != 1:
                     if mpc.pid > 0:
-                        skip_data(f, 3, m0)  # g
-                        skip_data(f, m0)  # miss
+                        f.read(mpc.boolean.primes_bytes[0] * 3 * m0)  # skip_data(f, 3, m0)  # g
+                        f.read(mpc.boolean.primes_bytes[0] * m0)  # skip_data(f, m0)  # miss
 
                         mpc.prg.switch_seed(10)
-                        g0_mask = rand_mat([3, m0])  # Matrix(3, m0, randomise=True)
-                        miss0_mask = rand_vec(m0)
+                        g0_mask = rand_mat([3, m0], param.BASE_P)  # Matrix(3, m0, randomise=True)
+                        miss0_mask = rand_vec(m0, param.BASE_P)
                         mpc.prg.restore_seed(10)
                     else:
                         for p in range(1, 3):
                             mpc.prg.switch_seed(10 + p)
-                            g0_mask = rand_mat([3, m0])  # Matrix(3, m0, randomise=True)
-                            miss0_mask = rand_vec(m0)
+                            g0_mask = rand_mat([3, m0], param.BASE_P)  # Matrix(3, m0, randomise=True)
+                            miss0_mask = rand_vec(m0, param.BASE_P)
                             mpc.prg.restore_seed(10 + p)
                     ind += 1
 
                 if mpc.pid > 0:
-                    g0 = read_from_file(f, 3, m0)  # g
-                    miss0 = read_from_file(f, m0)  # miss
+                    g0 = read_matrix_from_cache[TP](f, 3, m0, prime_bytes)  # g
+                    miss0 = read_vector_from_cache[TP](f, m0, prime_bytes)  # miss
 
                     mpc.prg.switch_seed(10)
-                    g0_mask = rand_mat([3, m0])  # Matrix(3, m0, randomise=True)
-                    miss0_mask = rand_vec(m0)
+                    g0_mask = rand_mat([3, m0], param.BASE_P)  # Matrix(3, m0, randomise=True)
+                    miss0_mask = rand_vec(m0, param.BASE_P)
                     mpc.prg.restore_seed(10)
                 else:
                     g0 = [[TP(0) for _ in range(m0)] for _ in range(3)]  # Matrix(3, m0)
@@ -1147,8 +1174,8 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
 
                     for p in range(1 ,3):
                         mpc.prg.switch_seed(10 + p)
-                        tmp_mat = rand_mat([3, m0])  # Matrix(3, m0, randomise=True)
-                        tmp_vec = rand_vec(m0)
+                        tmp_mat = rand_mat([3, m0], param.BASE_P)  # Matrix(3, m0, randomise=True)
+                        tmp_vec = rand_vec(m0, param.BASE_P)
                         mpc.prg.restore_seed(10 + p)
 
                         g0_mask += tmp_mat
@@ -1170,76 +1197,76 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
                         miss_mask[ind2] = miss0_mask[j]
                         ind2 += 1
 
-            dosage[cur % bsize] = g[1] + g[2] * 2
-            dosage_mask[cur % bsize] = g_mask[1] + g_mask[2] * 2
+                dosage[cur % bsize] = g[1] + g[2] * 2
+                dosage_mask[cur % bsize] = g_mask[1] + g_mask[2] * 2
 
-            u_vec[cur % bsize] = u[cur]
-            u_mask_vec[cur % bsize] = u_mask[cur]
-            p_hat_vec[cur % bsize] = p_hat[cur]
-            p_hat_mask_vec[cur % bsize] = p_hat_mask[cur]
+                u_vec[cur % bsize] = u[cur]
+                u_mask_vec[cur % bsize] = u_mask[cur]
+                p_hat_vec[cur % bsize] = p_hat[cur]
+                p_hat_mask_vec[cur % bsize] = p_hat_mask[cur]
 
-            V_sub[cur % bsize] = V[cur]
-            V_mask_sub[cur % bsize] = V_mask[cur]
+                V_sub[cur % bsize] = V[cur]
+                V_mask_sub[cur % bsize] = V_mask[cur]
 
-            if cur % bsize == bsize - 1:
-                sx = mpc.arithmetic.beaver_mult(u_vec, u_mask_vec, dosage, dosage_mask)
-                sxp = mpc.arithmetic.beaver_mult(p_hat_vec, p_hat_mask_vec, dosage, dosage_mask)
+                if cur % bsize == bsize - 1:
+                    sx = mpc.arithmetic.beaver_mult_vec(u_vec, u_mask_vec, dosage, dosage_mask)
+                    sxp = mpc.arithmetic.beaver_mult_vec(p_hat_vec, p_hat_mask_vec, dosage, dosage_mask)
 
-                sxx_tmp: Matrix = mpc.arithmetic.beaver_mult(dosage, dosage_mask, dosage, dosage_mask)
-                for b in range(bsize):
+                    sxx_tmp = mpc.arithmetic.beaver_mult(dosage, dosage_mask, dosage, dosage_mask)
+                    for b in range(bsize):
+                        sxx += sxx_tmp[b]
+
+                    V_sub = V_sub.transpose()  # (k + NUM_COVS)-by-bsize
+                    V_mask_sub = V_mask_sub.transpose()
+                    B = mpc.arithmetic.beaver_mult(V_sub, V_mask_sub, dosage, dosage_mask)
+
+                    dosage = [[TP(0) for _ in range(m2)] for _ in range(bsize)]  # Matrix(bsize, m2)
+                    dosage_mask = [[TP(0) for _ in range(m2)] for _ in range(bsize)]  # Matrix(bsize, m2)
+                    V_sub = [[TP(0) for _ in range(k + param.NUM_COVS)] for _ in range(bsize)]  # Matrix(bsize, k + param.NUM_COVS)
+                    V_mask_sub = [[TP(0) for _ in range(k + param.NUM_COVS)] for _ in range(bsize)]  # Matrix(bsize, k + param.NUM_COVS)
+
+            remainder: int = n1 % bsize
+            if remainder > 0:
+                dosage = dosage.pad(remainder, m2)
+                dosage_mask = dosage_mask.pad(remainder, m2)
+                u_vec = u_vec.pad_vec(remainder)
+                u_mask_vec = u_mask_vec.pad_vec(remainder)
+                p_hat_vec = p_hat_vec.pad_vec(remainder)
+                p_hat_mask_vec = p_hat_mask_vec.pad_vec(remainder)
+                V_sub = V_sub.pad(remainder, k + param.NUM_COVS)
+                V_mask_sub = V_mask_sub.pad(remainder, k + param.NUM_COVS)
+
+                sx = mpc.arithmetic.beaver_mult_vec(u_vec, u_mask_vec, dosage, dosage_mask)
+                sxp = mpc.arithmetic.beaver_mult_vec(p_hat_vec, p_hat_mask_vec, dosage, dosage_mask)
+
+                sxx_tmp = mpc.arithmetic.beaver_mult(dosage, dosage_mask, dosage, dosage_mask)
+                for b in range(remainder):
                     sxx += sxx_tmp[b]
 
-                V_sub = V_sub.transpose()  # (k + NUM_COVS)-by-bsize
+                V_sub = V_sub.transpose()  # (k + NUM_COVS)-by-remainder
                 V_mask_sub = V_mask_sub.transpose()
+
                 B = mpc.arithmetic.beaver_mult(V_sub, V_mask_sub, dosage, dosage_mask)
 
-                dosage = [[TP(0) for _ in range(m2)] for _ in range(bsize)]  # Matrix(bsize, m2)
-                dosage_mask = [[TP(0) for _ in range(m2)] for _ in range(bsize)]  # Matrix(bsize, m2)
-                V_sub = [[TP(0) for _ in range(k + param.NUM_COVS)] for _ in range(bsize)]  # Matrix(bsize, k + param.NUM_COVS)
-                V_mask_sub = [[TP(0) for _ in range(k + param.NUM_COVS)] for _ in range(bsize)]  # Matrix(bsize, k + param.NUM_COVS)
+            sx = mpc.arithmetic.beaver_reconstruct_vec(sx)
+            sxp = mpc.arithmetic.beaver_reconstruct_vec(sxp)
+            sxx = mpc.arithmetic.beaver_reconstruct_vec(sxx)
+            B = mpc.arithmetic.beaver_reconstruct_mat(B)
+            sxx *= fp_one
+            sxx %= mpc.primes[0]
 
-        remainder: int = n1 % bsize
-        if remainder > 0:
-            dosage = dosage.pad(remainder, m2)
-            dosage_mask = dosage_mask.pad(remainder, m2)
-            u_vec = u_vec.pad(remainder)
-            u_mask_vec = u_mask_vec.pad(remainder)
-            p_hat_vec = p_hat_vec.pad(remainder)
-            p_hat_mask_vec = p_hat_mask_vec.pad(remainder)
-            V_sub = V_sub.pad(remainder, k + param.NUM_COVS)
-            V_mask_sub = V_mask_sub.pad(remainder, k + param.NUM_COVS)
+            with open(get_cache_path(mpc.pid, "gwas_stats"), 'wb') as f:
+                write_to_cache(f, sx)
+                write_to_cache(f, sxx)
+                write_to_cache(f, sxp)
+                write_to_cache(f, B)
 
-            sx = mpc.arithmetic.beaver_mult(u_vec, u_mask_vec, dosage, dosage_mask)
-            sxp = mpc.arithmetic.beaver_mult(p_hat_vec, p_hat_mask_vec, dosage, dosage_mask)
-
-            sxx_tmp = mpc.arithmetic.beaver_mult(dosage, dosage_mask, dosage, dosage_mask)
-            for b in range(remainder):
-                sxx += sxx_tmp[b]
-
-            V_sub = V_sub.transpose()  # (k + NUM_COVS)-by-remainder
-            V_mask_sub = V_mask_sub.transpose()
-
-            B = mpc.arithmetic.beaver_mult(V_sub, V_mask_sub, dosage, dosage_mask)
-
-        sx = mpc.arithmetic.beaver_reconstruct_vec(sx)
-        sxp = mpc.arithmetic.beaver_reconstruct_vec(sxp)
-        sxx = mpc.arithmetic.beaver_reconstruct_mat(sxx)
-        B = mpc.arithmetic.beaver_reconstruct_mat(B)
-        sxx *= fp_one
-        sxx %= mpc.primes[0]
-
-        with open(get_cache_path(mpc.pid, "gwas_stats"), 'wb') as f:
-            write_to_file(sx, f)
-            write_to_file(sxx, f)
-            write_to_file(sxp, f)
-            write_to_file(B, f)
-
-        print("Wrote results to cache")
+            print("Wrote results to cache")
 
     B = B.transpose()  # m2-by-(k + param.NUM_COVS)
 
     BB = mpc.arithmetic.inner_prod(B)  # m2
-    BB = mpc.trunc(BB)
+    BB = mpc.fp.trunc_vec(BB)
     if mpc.pid > 0:
         sxx -= BB
     sxx %= mpc.primes[0]
@@ -1262,18 +1289,18 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
     sx %= mpc.primes[0]
     sp %= mpc.primes[0]
 
-    sx = mpc.trunc_vec(sx)
-    sp = mpc.trunc_elem(sp)
-    spp = mpc.trunc_elem(spp)
+    sx = mpc.fp.trunc_vec(sx)
+    sp = mpc.fp.trunc_vec([sp])[0]
+    spp = mpc.fp.trunc_vec([spp])[0]
 
-    sx_mask = mpc.arithmetic.beaver_partition_elem(sx)
-    sp_mask = mpc.arithmetic.beaver_partition_elem(sp)
+    sx, sx_mask = mpc.arithmetic.beaver_partition_vec(sx)
+    sp, sp_mask = mpc.arithmetic.beaver_partition_elem(sp)
 
     sp2 = TP(0)  # Zp(0, param.BASE_P)
     spsx = [TP(0) for _ in range(m2)]  # Vector([TP(0)  # Zp(0, param.BASE_P) for _ in range(m2)])
     sx2 = [TP(0) for _ in range(m2)]  # Vector([TP(0)  # Zp(0, param.BASE_P) for _ in range(m2)])
 
-    spsx = mpc.arithmetic.beaver_mult(sx, sx_mask, sp, sp_mask)
+    spsx = mpc.arithmetic.beaver_mult_scalar(sx, sx_mask, sp, sp_mask)
     sp2 = mpc.arithmetic.beaver_mult(sp, sp_mask, sp, sp_mask)
     sx2 = mpc.arithmetic.beaver_mult(sx, sx_mask, sx, sx_mask)
 
@@ -1288,9 +1315,9 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
     sp2 %= mpc.primes[0]
     sx2 %= mpc.primes[0]
 
-    spsx = mpc.trunc_vec(spsx)
-    sp2 = mpc.trunc_elem(sp2)
-    sx2 = mpc.trunc_vec(sx2)
+    spsx = mpc.fp.trunc_vec(spsx)
+    sp2 = mpc.fp.trunc_vec([sp2])[0]
+    sx2 = mpc.fp.trunc_vec(sx2)
 
     numer = [TP(0) for _ in range(m2)]  # Vector([TP(0)  # Zp(0, param.BASE_P) for _ in range(m2)])
     denom = [TP(0) for _ in range(m2 + 1)]  # Vector([TP(0)  # Zp(0, param.BASE_P) for _ in range(m2 + 1)])
@@ -1303,30 +1330,31 @@ def gwas_protocol[TP](mpc: MPCEnv[TP]) -> bool:
     denom %= mpc.primes[0]
 
     denom1_sqrt_inv = [TP(0) for _ in range(len(denom))]  # Vector()
-    if (os.path.exists(get_cache_path(mpc.pid, "denom_inv"))):
+    if (file_exists(get_cache_path(mpc.pid, "denom_inv"))):
         print("denom_inv cache found")
         with open(get_cache_path(mpc.pid, "denom_inv")) as f:
-            denom1_sqrt_inv = read_from_file(f, len(denom))
+            denom1_sqrt_inv = read_vector_from_cache[TP](f, len(denom), prime_bytes)
     else:
         _, denom1_sqrt_inv = mpc.fp.fp_sqrt(denom)
 
         with open(get_cache_path(mpc.pid, "denom_inv"), 'wb') as f:
             if mpc.pid > 0:
-               write_to_file(denom1_sqrt_inv, f)
+               write_to_cache(f, denom1_sqrt_inv)
 
     denom2_sqrt_inv = denom1_sqrt_inv[m2]  # p term
-    denom1_sqrt_inv = denom1_sqrt_inv.pad(m2)  # truncate
+    denom1_sqrt_inv = denom1_sqrt_inv.pad_vec(m2)  # truncate
 
     z = mpc.arithmetic.multiply_vec(numer, denom1_sqrt_inv)
-    z = mpc.trunc_vec(z)
+    z = mpc.fp.trunc_vec(z)
 
     z *= denom2_sqrt_inv
-    z = mpc.trunc_vec(z)
+    z %= mpc.primes[0]
+    z = mpc.fp.trunc_vec(z)
 
     print("Association statistics calculated")
-    z = mpc.comms.reveal_sym(z)
+    z = mpc.comms.reveal_vector(z)
     if mpc.pid == 2:
-        z_double = mpc.fp_to_double_vec(z, param.NBIT_K, param.NBIT_F)
+        z_double = TypeOps.fp_to_double_vec(z, param.NBIT_K, param.NBIT_F)
         with open(get_output_path(mpc.pid, "assoc"), 'w') as f:
             for i in range(len(z_double)):
                 f.write(f'{z_double[i]}\n')
