@@ -1,0 +1,99 @@
+import utils.param as param
+
+from mpc_prg import MPCPRG
+from mpc_comms import MPCComms
+from mpc_arithmetic import MPCArithmetic
+from mpc_polynomial import MPCPolynomial
+
+from utils.utils import cartesian, rand_vec
+
+
+class MPCOptimizations:
+    pid: int
+    primes: dict[int, param.size_u]
+    prg: MPCPRG
+    comms: MPCComms
+    arithmetic: MPCArithmetic
+    polynomial: MPCPolynomial
+
+    def __init__(self: MPCOptimizations, pid: int, primes: dict[int, param.size_u],
+                 prg: MPCPRG, comms: MPCComms, arithmetic: MPCArithmetic,
+                 polynomial: MPCPolynomial):
+        self.pid = pid
+        self.primes = primes
+        self.prg = prg
+        self.comms = comms
+        self.arithmetic = arithmetic
+        self.polynomial = polynomial
+
+    def evalp(self, x, coefs, exps, field):
+        result = 0
+        for coef, exp in zip(coefs, exps):
+            result += x.powers(exp, field) * coef
+        
+        return result
+
+    def secure_evalp(self, x, coefs, exps, field):
+        masks = self.__get_masks(exps)
+        masks_no = len(masks)
+        x_r, r = self.arithmetic.beaver_partition_vec(x)
+        r_masks = list(masks_no)
+        
+        if self.pid == 0:
+            for mask in masks: r_masks.append(r.powers(mask, field))
+
+            self.prg.switch_seed(1)
+            r_ = rand_vec(masks_no, field)
+            self.prg.restore_seed(1)
+
+            r_masks = (r_masks - r_) % field
+            self.comms.send_data(r_masks, 2, masks_no * param.SIZE_OF_U)
+
+            return self.evalp(r, coefs, exps, field)
+        
+        if self.pid == 1:
+            self.prg.switch_seed(0)
+            r_masks = rand_vec(masks_no, field)
+            self.prg.restore_seed(0)
+        else:
+            r_masks = self.comms.receive_vector(0, masks_no)
+        
+        coef_masks = [0 for _ in range(masks_no)]
+        
+        pascal_matrix = self.polynomial.get_pascal_matrix(
+            max([e for e in t for t in exps]))
+        for coef, exp_term in zip(coefs, exps):
+            power_expansions = list()
+            for i, power in enumerate(exp_term):
+                power_expansions.append(
+                    [x_r[i] ** p for p in range(power, -1, -1)] *
+                    pascal_matrix[power][:power + 1])
+            
+            for i, mask in enumerate(masks):
+                mults = 1
+                for j, m in enumerate(mask): mults *= power_expansions[j][m]
+                coef_masks[i] += mults * coef
+
+        result = self.evalp(x_r, coefs, exps, field) if self.pid == 1 else 0
+        for i in range(masks_no): result += r_masks[i] * coef_masks[i]
+
+        return result
+    
+    def generate_masks(self, exp_term):
+        if len(exp_term) == 1:
+            return exp_term[0]
+
+        expansion = cartesian(exp_term[-2], exp_term[-1])
+        new_exp_term = exp_term[:-2]
+        new_exp_term.append(expansion)
+        
+        return self.generate_masks(new_exp_term)
+
+    def __get_masks(self, exps):
+        masks = set()
+        for exp_term in exps:
+            exp_term_ranges = [[str(e) for e in range(i)] for i in exp_term]
+            for mask in self.generate_masks(exp_term_ranges):
+                masks.add(mask)
+        return sorted(list(masks))[1:-1]
+    
