@@ -1,1 +1,1 @@
-# pysequre
+# Sequre DSL
