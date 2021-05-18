@@ -1,8 +1,9 @@
 import utils.param as param
 
+from utils.utils import shapeof
+
 from mpc_prg import MPCPRG
 from mpc_comms import MPCComms
-from utils.utils import rand_vec, rand_mat, rand_int, rand_value
 
 
 class MPCArithmetic[TP]:
@@ -15,17 +16,136 @@ class MPCArithmetic[TP]:
         self.prg = prg
         self.comms = comms
     
-    def beaver_partition(self, value, field):
-        if isinstance(value, TP):
-            return self.beaver_partition_elem(value, field)
-        elif isinstance(value, list[TP]):
-            return self.beaver_partition_vec(value, field)
-        elif isinstance(value, list[list[TP]]):
-            return self.beaver_partition_mat(value, field)
+    def add_public(self, x, a, field = param.BASE_P):
+        if self.pid == 1:
+            return (x + a) % field
+        return x
+    
+    def multiply(self, a, b, field = param.BASE_P):
+        x_1_r, r_1 = self.__beaver_partition(a, field)
+        x_2_r, r_2 = self.__beaver_partition(b, field)
         
-        raise TypeError(f"Invalid type for {value}")
+        c = self.__beaver_mult(x_1_r, r_1, x_2_r, r_2, field)
+        c = self.__beaver_reconstruct(c, field)
+        
+        return c
 
-    def beaver_reconstruct(self, value, field = param.BASE_P):
+    def multiply_matmul(self, a, b, field = param.BASE_P):
+        x_1_r, r_1 = self.__beaver_partition(a, field)
+        x_2_r, r_2 = self.__beaver_partition(b, field)
+        
+        c = self.__beaver_matmul(x_1_r, r_1, x_2_r, r_2, field)
+        c = self.__beaver_reconstruct(c, field)
+        
+        return c
+    
+    def beaver_inner_prod(self, ar: list[TP], am: list[TP], field: TP = param.BASE_P) -> TP:
+        ab = ((am * am) % field) if self.pid == 0 else (((ar * am) % field) * 2) % field
+        if self.pid == 1:
+            ab = (ab + (ar * ar) % field) % field
+
+        cum_sum = TP(0)
+        for e in ab: cum_sum = (cum_sum + e) % field
+
+        return cum_sum
+    
+    def inner_prod(self, a: list[list[TP]], field: TP = param.BASE_P) -> list[TP]:
+        ar, am = self.__beaver_partition(a, field)
+        n = len(a)
+
+        c = list[TP](n)
+        for i in range(n): c.append(self.beaver_inner_prod(ar[i], am[i], field))
+
+        return self.__beaver_reconstruct(c, field)
+    
+    def __beaver_partition_mat_bulk(self, x: list[list[list[TP]]], field: TP = param.BASE_P) -> tuple[list[list[list[TP]]], list[list[list[TP]]]]:
+        # TODO: Deprecate this method
+        # TODO: Do this in parallel
+        partitions = [self.__beaver_partition(e, field) for e in x]
+        x_r = [p[0] for p in partitions]
+        r = [p[1] for p in partitions]
+        return x_r, r
+    
+    def __beaver_reconstruct_mat_bulk(self, x: list[list[list[TP]]], field: TP = param.BASE_P) -> list[list[list[TP]]]:
+        # TODO: Deprecate this method
+        # TODO: Do this in parallel
+        return [self.__beaver_reconstruct(e, field) for e in x]
+
+    def multiply_bulk(self, a: list[list[list[TP]]], b: list[list[list[TP]]], field: TP = param.BASE_P) -> list[list[list[TP]]]:
+        # TODO: Deprecate this method
+        # TODO: Vectorize this method. Make it parallel by having a and b as ndarrays.
+        nmat = len(a)
+
+        # TODO: Remove this check
+        # for k in range(nmat):
+        #     assert a[k].shape() == b[k].shape()
+
+        ar, am = self.__beaver_partition_mat_bulk(a, field)
+        br, bm = self.__beaver_partition_mat_bulk(b, field)
+
+        c = [self.__beaver_mult(ar[k], am[k], br[k], bm[k], field)
+             for k in range(nmat)]
+        
+        return self.__beaver_reconstruct_mat_bulk(c, field)
+    
+    def multiply_mat_bulk(self, a: list[list[list[TP]]], b: list[list[list[TP]]], field: TP = param.BASE_P) -> list[list[list[TP]]]:
+        # TODO: Deprecate this method
+        # TODO: Vectorize/parallelize this method. Make it parallel by having a and b as ndarrays.
+        nmat = len(a)
+
+        # TODO: Remove this check
+        # for k in range(nmat):
+        #     assert a[k].shape()[1] == b[k].shape()[0]
+
+        ar, am = self.__beaver_partition_mat_bulk(a, field)
+        br, bm = self.__beaver_partition_mat_bulk(b, field)
+
+        c = [self.__beaver_matmul(ar[k], am[k], br[k], bm[k], field)
+             for k in range(nmat)]
+            
+        return self.__beaver_reconstruct_mat_bulk(c, field)
+    
+    def beaver_inner_prod_pair(
+            self, ar: list[TP], am: list[TP], br: list[TP], bm: list[TP], field: TP = param.BASE_P) -> TP:
+        # TODO: Deprecate this method
+        ab = TP(0)
+        
+        for i in range(len(ar)):
+            if self.pid == 0:
+                ab += am[i] * bm[i]
+            else:
+                ab += ar[i] * bm[i]
+                ab %= field
+                ab += br[i] * am[i]
+                ab %= field
+                if self.pid == 1:
+                    ab += ar[i] * br[i]
+
+        return ab % field
+    
+    def __beaver_partition(self, value, field = param.BASE_P):
+        if self.pid == 0:
+            self.prg.switch_seed(1)
+            r_1 = value.rand(field)
+            self.prg.restore_seed(1)
+
+            self.prg.switch_seed(2)
+            r_2 = value.rand(field)
+            self.prg.restore_seed(2)
+
+            r = (r_1 + r_2) % field
+            return value.zeros(), r
+        else:
+            self.prg.switch_seed(0)
+            r = value.rand(field)
+            self.prg.restore_seed(0)
+            
+            x_r = (value - r) % field
+            x_r = self.comms.reveal(x_r, field)
+
+            return x_r, r
+
+    def __beaver_reconstruct(self, value, field = param.BASE_P):
         if self.pid == 0:
             self.prg.switch_seed(1)
             mask = value.rand(field)
@@ -42,288 +162,9 @@ class MPCArithmetic[TP]:
             
             return (value + rr) % field
         else:
-            rr = self.comms.receive(0)
+            rr = self.comms.receive(0, shapeof(value))
                 
             return (value + rr) % field
-    
-    def multiply(self, a, b, field = param.BASE_P):
-        if isinstance(a, TP):
-            return self.multiply_elem(a, b, field)
-        elif isinstance(a, list[TP]):
-            return self.multiply_vec(a, b, field)
-        elif isinstance(a, list[list[TP]]):
-            return self.multiply_mat(a, b, field)
-        
-        raise TypeError(f"Invalid type for {a}")
-
-    def add_public(self, x, a, field = param.BASE_P):
-        if self.pid == 1:
-            return (x + a) % field
-        return x
-
-    # def beaver_reconstruct_elem(self, value, field = param.BASE_P):
-    #         if self.pid == 0:
-    #             self.prg.switch_seed(1)
-    #             mask = rand_value(field, value.shape())
-    #             self.prg.restore_seed(1)
-
-    #             mm = (value - mask) % field
-    #             self.comms.send(mm, 2)
-                
-    #             return mm
-    #         elif self.pid == 1:
-    #             self.prg.switch_seed(0)
-    #             rr = rand_value(field, value.shape())
-    #             self.prg.restore_seed(0)
-                
-    #             return (value + rr) % field
-    #         else:
-    #             rr = self.comms.receive(0)
-                    
-    #             return (value + rr) % field
-
-    # def beaver_reconstruct_vec(self: MPCArithmetic[TP], vec: list[TP], field: TP = param.BASE_P) -> list[TP]:
-    #         if self.pid == 0:
-    #             self.prg.switch_seed(1)
-    #             mask = rand_vec(len(vec), field)
-    #             self.prg.restore_seed(1)
-
-    #             mm = (vec - mask) % field
-    #             self.comms.send(mm, 2)
-                
-    #             return mm
-    #         elif self.pid == 1:
-    #             self.prg.switch_seed(0)
-    #             rr = rand_vec(len(vec), field)
-    #             self.prg.restore_seed(0)
-                
-    #             return (vec + rr) % field
-    #         else:
-    #             rr = self.comms.receive(0, len(vec))
-                    
-    #             return (vec + rr) % field
-    
-    # def beaver_reconstruct_mat(self: MPCArithmetic[TP], mat: list[list[TP]], field: TP = param.BASE_P) -> list[list[TP]]:
-    #         shape = mat.shape()
-            
-    #         if self.pid == 0:
-    #             self.prg.switch_seed(1)
-    #             mask = rand_mat(shape, field)
-    #             self.prg.restore_seed(1)
-
-    #             mm = (mat - mask) % field
-    #             self.comms.send(mm, 2)
-                
-    #             return mm
-    #         elif self.pid == 1:
-    #             self.prg.switch_seed(0)
-    #             rr = rand_mat(shape, field)
-    #             self.prg.restore_seed(0)
-                
-    #             return (mat + rr) % field
-    #         else:
-    #             rr = self.comms.receive(0, shape)
-                    
-    #             return (mat + rr) % field
-    
-    def beaver_partition_elem(self: MPCArithmetic[TP], x: TP, field: TP = param.BASE_P) -> tuple[TP, TP]:
-        x_ = x % field
-        x_r = TP(0)
-
-        if self.pid == 0:
-            self.prg.switch_seed(1)
-            r_1 = TP(rand_int(field))
-            self.prg.restore_seed(1)
-
-            self.prg.switch_seed(2)
-            r_2 = TP(rand_int(field))
-            self.prg.restore_seed(2)
-
-            r = (r_1 + r_2) % field
-            return x_r, r
-        else:
-            self.prg.switch_seed(0)
-            r = TP(rand_int(field))
-            self.prg.restore_seed(0)
-            
-            x_r = (x_ - r) % field
-            x_r = self.comms.reveal(x_r, field=field)
-
-            return x_r, r
-    
-    def beaver_partition_vec(self: MPCArithmetic[TP], x: list[TP], field: TP = param.BASE_P) -> tuple[list[TP], list[TP]]:
-        x_ = x % field
-        x_len = len(x_)
-
-        if self.pid == 0:
-            self.prg.switch_seed(1)
-            r_1 = rand_vec(x_len, field)
-            self.prg.restore_seed(1)
-
-            self.prg.switch_seed(2)
-            r_2 = rand_vec(x_len, field)
-            self.prg.restore_seed(2)
-
-            r = (r_1 + r_2) % field
-            return [TP(0) for _ in range(x_len)], r
-        else:
-            self.prg.switch_seed(0)
-            r = rand_vec(x_len, field)
-            self.prg.restore_seed(0)
-            
-            x_r = (x_ - r) % field
-            x_r = self.comms.reveal(x_r, field=field)
-        
-            return x_r, r
-
-    def beaver_partition_mat(self: MPCArithmetic[TP], x: list[list[TP]], field: TP = param.BASE_P) -> tuple[list[list[TP]], list[list[TP]]]:
-        x_ = x % field
-        shape = x_.shape()
-
-        if self.pid == 0:
-            self.prg.switch_seed(1)
-            r_1 = rand_mat(shape, field)
-            self.prg.restore_seed(1)
-
-            self.prg.switch_seed(2)
-            r_2 = rand_mat(shape, field)
-            self.prg.restore_seed(2)
-
-            r = (r_1 + r_2) % field
-            return [[TP(0) for _ in range(shape[1])] for _ in range(shape[0])], r
-        else:
-            self.prg.switch_seed(0)
-            r = rand_mat(shape, field)
-            self.prg.restore_seed(0)
-            
-            x_r = (x_ - r) % field
-            x_r = self.comms.reveal(x_r, field=field)
-        
-            return x_r, r
-    
-    def multiply_elem(self: MPCArithmetic[TP], a: TP, b: TP, field: TP = param.BASE_P) -> TP:
-        x_1_r, r_1 = self.beaver_partition_elem(a, field)
-        x_2_r, r_2 = self.beaver_partition_elem(b, field)
-        
-        c = self.__beaver_mult(x_1_r, r_1, x_2_r, r_2, field)
-        c = self.beaver_reconstruct(c, field)
-        
-        return c
-
-    def multiply_vec(self: MPCArithmetic[TP], a: list[TP], b: list[TP], field: TP = param.BASE_P) -> list[TP]:
-        x_1_r, r_1 = self.beaver_partition_vec(a, field)
-        x_2_r, r_2 = self.beaver_partition_vec(b, field)
-        
-        c = self.__beaver_mult(x_1_r, r_1, x_2_r, r_2, field)
-        c = self.beaver_reconstruct(c, field)
-        
-        return c
-    
-    def multiply_vec_scalar(self: MPCArithmetic[TP], a: list[TP], b: TP, field: TP = param.BASE_P) -> list[TP]:
-        x_1_r, r_1 = self.beaver_partition_vec(a, field)
-        x_2_r, r_2 = self.beaver_partition_elem(b, field)
-        
-        c = self.__beaver_mult(x_1_r, r_1, x_2_r, r_2, field)
-        c = self.beaver_reconstruct(c, field)
-        
-        return c
-
-    def multiply_mat(self: MPCArithmetic[TP], a: list[list[TP]], b: list[list[TP]], field: TP = param.BASE_P) -> list[list[TP]]:
-        x_1_r, r_1 = self.beaver_partition_mat(a, field)
-        x_2_r, r_2 = self.beaver_partition_mat(b, field)
-
-        c = self.__beaver_mult(x_1_r, r_1, x_2_r, r_2, field)
-        c = self.beaver_reconstruct(c, field)
-
-        return c
-    
-    def multiply_matmul(self: MPCArithmetic[TP], a: list[list[TP]], b: list[list[TP]], field: TP = param.BASE_P) -> list[list[TP]]:
-        x_1_r, r_1 = self.beaver_partition_mat(a, field)
-        x_2_r, r_2 = self.beaver_partition_mat(b, field)
-        
-        c = self.__beaver_matmul(x_1_r, r_1, x_2_r, r_2, field)
-        c = self.beaver_reconstruct(c, field)
-        
-        return c
-    
-    def beaver_partition_mat_bulk(self: MPCArithmetic[TP], x: list[list[list[TP]]], field: TP = param.BASE_P) -> tuple[list[list[list[TP]]], list[list[list[TP]]]]:
-        # TODO: Do this in parallel
-        partitions = [self.beaver_partition_mat(e, field) for e in x]
-        x_r = [p[0] for p in partitions]
-        r = [p[1] for p in partitions]
-        return x_r, r
-    
-    def beaver_reconstruct_mat_bulk(self: MPCArithmetic[TP], x: list[list[list[TP]]], field: TP = param.BASE_P) -> list[list[list[TP]]]:
-        # TODO: Do this in parallel
-        return [self.beaver_reconstruct(e, field) for e in x]
-
-    def multiply_bulk(self: MPCArithmetic[TP], a: list[list[list[TP]]], b: list[list[list[TP]]], field: TP = param.BASE_P) -> list[list[list[TP]]]:
-        # TODO: Vectorize this method. Make it parallel by having a and b as ndarrays.
-        nmat = len(a)
-
-        # TODO: Remove this check
-        # for k in range(nmat):
-        #     assert a[k].shape() == b[k].shape()
-
-        ar, am = self.beaver_partition_mat_bulk(a, field)
-        br, bm = self.beaver_partition_mat_bulk(b, field)
-
-        c = [self.__beaver_mult(ar[k], am[k], br[k], bm[k], field)
-             for k in range(nmat)]
-        
-        return self.beaver_reconstruct_mat_bulk(c, field)
-    
-    def multiply_mat_bulk(self: MPCArithmetic[TP], a: list[list[list[TP]]], b: list[list[list[TP]]], field: TP = param.BASE_P) -> list[list[list[TP]]]:
-        # TODO: Vectorize/parallelize this method. Make it parallel by having a and b as ndarrays.
-        nmat = len(a)
-
-        # TODO: Remove this check
-        # for k in range(nmat):
-        #     assert a[k].shape()[1] == b[k].shape()[0]
-
-        ar, am = self.beaver_partition_mat_bulk(a, field)
-        br, bm = self.beaver_partition_mat_bulk(b, field)
-
-        c = [self.__beaver_matmul(ar[k], am[k], br[k], bm[k], field)
-             for k in range(nmat)]
-            
-        return self.beaver_reconstruct_mat_bulk(c, field)
-
-    def beaver_inner_prod(self: MPCArithmetic[TP], ar: list[TP], am: list[TP], field: TP = param.BASE_P) -> TP:
-        ab = ((am * am) % field) if self.pid == 0 else (((ar * am) % field) * 2) % field
-        if self.pid == 1:
-            ab = (ab + (ar * ar) % field) % field
-
-        cum_sum = TP(0)
-        for e in ab: cum_sum = (cum_sum + e) % field
-
-        return cum_sum
-    
-    def beaver_inner_prod_pair(
-            self: MPCArithmetic[TP], ar: list[TP], am: list[TP], br: list[TP], bm: list[TP], field: TP = param.BASE_P) -> TP:
-        ab = TP(0)
-        
-        for i in range(len(ar)):
-            if self.pid == 0:
-                ab += am[i] * bm[i]
-            else:
-                ab += ar[i] * bm[i]
-                ab %= field
-                ab += br[i] * am[i]
-                ab %= field
-                if self.pid == 1:
-                    ab += ar[i] * br[i]
-
-        return ab % field
-    
-    def inner_prod(self: MPCArithmetic[TP], a: list[list[TP]], field: TP = param.BASE_P) -> list[TP]:
-        ar, am = self.beaver_partition_mat(a, field)
-        n = len(a)
-
-        c = list[TP](n)
-        for i in range(n): c.append(self.beaver_inner_prod(ar[i], am[i], field))
-
-        return self.beaver_reconstruct(c, field)
     
     def __beaver_mult(self, x_r, r_1, y_r, r_2, field = param.BASE_P):
         if self.pid == 0:
