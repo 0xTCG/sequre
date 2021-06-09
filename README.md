@@ -1,4 +1,4 @@
-# Sequre DSL
+# Sequre Framework
 
 ## Meaningful ETAs
 - Coding preliminary done: 22.8.2021
