@@ -28,6 +28,11 @@ def open_input_files(mpc, test_run):
             open(miss_mask_path))
 
 
+def reset_files(*files):
+    for file in files:
+        file.seek(0, 0)
+
+
 def read_snps():
     snp_pos = []
     with open(SNP_POS_FILE) as f:
@@ -73,11 +78,11 @@ def read_matrix(mpc, f, f_mask, imask, jmask, rows, cols, offset, multiplicity =
     batch_size = 0
     i = offset
     while batch_size < rows:
-        if imask.share[i]: batch_size += 1
+        if imask[i]: batch_size += 1
         for m in range(multiplicity):
             x_r = read_vec[size_u](f, cols)
             r = read_vec[size_u](f_mask, cols)
-            if imask.share[i]:
+            if imask[i]:
                 x_r = [x_r[j] for j in range(len(jmask)) if jmask[j]]
                 r = [r[j] for j in range(len(jmask)) if jmask[j]]
                 r_mats[m].append(r)
@@ -90,13 +95,39 @@ def read_matrix(mpc, f, f_mask, imask, jmask, rows, cols, offset, multiplicity =
         share_mats[i].zeros(), list[list[list[size_u]]](), False, False, False) for i in range(multiplicity)]
 
     return svs
-        
+
+
+def locus_distance_filter(snp_pos):
+    selected = [0 for _ in range(len(snp_pos))]  # 1 selected, 0 unselected, -1 TBD
+
+    prev = -1
+    for i in range(len(selected)):
+        if (prev < 0) or (snp_pos.share[i] - prev > LD_DIST_THRES):
+            selected[i] = 1
+            prev = int(snp_pos.share[i])
+    
+    return selected
+
+
+@sequre_beaver
+def load_dosage(mpc, f_geno, f_geno_mask, f_miss, f_miss_mask,
+                imask, jmask, rows, cols):
+    g = read_matrix(
+        mpc, f_geno, f_geno_mask, imask, jmask,
+        rows, cols, 0, 3)
+    miss = read_matrix(
+        mpc, f_miss, f_miss_mask, imask, jmask,
+        rows, cols, 0)[0]
+    dosage = g[1] + g[2] * 2
+
+    return g, miss, dosage
+
 
 @sequre_beaver
 def quality_control(
         mpc, snp_pos, pheno, cov, f_geno,
         f_miss, f_geno_mask, f_miss_mask):
-    gkeep1 = snp_pos.ones()
+    gkeep1 = snp_pos.raw_ones()
     if not SKIP_QC:
         # n = len(snp_pos)
         # gmiss = snp_pos.zeros()
@@ -106,12 +137,11 @@ def quality_control(
 
     snp_pos = snp_pos.filter(gkeep1)
     print(f"1st QC filtering done at CP{mpc.pid}. "
-          f"Number of selected individuals: {NUM_INDS}. "
-          f"Number of selected SNPs: {int(gkeep1.sum())}.")
-    f_miss.seek(0, 0)
-    f_miss_mask.seek(0, 0)
+          f"Number of selected individuals: {len(pheno)}. "
+          f"Number of selected SNPs: {len(snp_pos)}.")
+    reset_files(f_miss, f_miss_mask)
 
-    ikeep = pheno.ones()
+    ikeep = pheno.raw_ones()
     if not SKIP_QC:
         # m = int(gkeep1.sum())
         # imiss = gkeep1.zeros()
@@ -137,25 +167,18 @@ def quality_control(
     pheno = pheno.filter(ikeep)
     cov = cov.filter(ikeep)
     print(f"2nd QC filtering done at CP{mpc.pid}. "
-          f"Number of selected individuals: {int(ikeep.sum())}. "
-          f"Number of selected SNPs: {int(gkeep1.sum())}.")
-    f_geno.seek(0, 0)
-    f_miss.seek(0, 0)
-    f_geno_mask.seek(0, 0)
-    f_miss_mask.seek(0, 0)
+          f"Number of selected individuals: {len(pheno)}. "
+          f"Number of selected SNPs: {len(snp_pos)}.")
+    reset_files(f_geno, f_geno_mask, f_miss, f_miss_mask)
     
     ctrl = 1 - pheno
 
     n1_ctrl = int(ctrl.sum())
     g_count_ctrl = snp_pos.zeros()
     
-    g = read_matrix(
-        mpc, f_geno, f_geno_mask, ikeep, gkeep1,
-        int(ikeep.sum()), len(gkeep1), 0, 3)
-    miss = read_matrix(
-        mpc, f_miss, f_miss_mask, ikeep, gkeep1,
-        int(ikeep.sum()), len(gkeep1), 0)[0]
-    dosage = g[1] + g[2] * 2
+    g, miss, dosage = load_dosage(
+        mpc, f_geno, f_geno_mask, f_miss, f_miss_mask,
+        ikeep, gkeep1, len(pheno), len(gkeep1))
 
     gmiss = miss.sum()
     dosage_sum = dosage.sum()
@@ -168,7 +191,7 @@ def quality_control(
     # maf_ctrl = dosage_sum_ctrl / dosage_tot_ctrl
     # Maf_ctrl = 1 - maf_ctrl
 
-    gkeep2 = snp_pos.ones()
+    gkeep2 = snp_pos.raw_ones()
     if not SKIP_QC:
         # g_exp_ctrl = SecureValue[list[list[size_u]]]([[], [], []])
         # g_exp_ctrl[0] = Maf_ctrl * Maf_ctrl
@@ -188,214 +211,87 @@ def quality_control(
     snp_pos = snp_pos.filter(gkeep2)
     print(f"3nd QC filtering done at CP{mpc.pid}. "
           f"Number of selected individuals: "
-          f"{int(ikeep.sum())}. Number of selected SNPs: {int(sum(gkeep2))}.")
-    f_geno.seek(0, 0)
-    f_miss.seek(0, 0)
-    f_geno_mask.seek(0, 0)
-    f_miss_mask.seek(0, 0)
+          f"{len(pheno)}. Number of selected SNPs: {len(snp_pos)}.")
+    reset_files(f_geno, f_geno_mask, f_miss, f_miss_mask)
 
     g_std_bern_inv = 1 / mpc.sqrt(g_var_bern)
     g_mean = maf * 2
 
-    return snp_pos, pheno, cov, g_mean, g_std_bern_inv
+    return (snp_pos, pheno, cov, g_mean,
+            g_std_bern_inv, ikeep, gkeep1, gkeep2)
 
 
 @sequre_beaver
-def gwas_protocol(mpc, test_run):
+def pca(mpc, snp_pos, cov, g_mean, g_std_bern_inv,
+        f_geno, f_geno_mask, f_miss, f_miss_mask,
+        ikeep, gkeep1, gkeep2):
+    selected = locus_distance_filter(snp_pos)
+
+    # At this point "selected" contains the SNP filter for PCA, shared across all parties
+    selected_snps_count = sum(selected)
+    gkeep3 = [bool(e) for e in gkeep1]
+
+    ind = 0
+    for j in range(NUM_SNPS):
+        if gkeep3[j]:
+            gkeep3[j] = (gkeep2[ind] == 1)
+            ind += 1
+
+    ind = 0
+    for j in range(NUM_SNPS):
+        if gkeep3[j]:
+            gkeep3[j] = (selected[ind] == 1)
+            ind += 1
+
+    _, pca_miss_mat, pca_g_mat = load_dosage(
+        mpc, f_geno, f_geno_mask, f_miss, f_miss_mask,
+        ikeep, gkeep3, len(cov), NUM_SNPS)
+    reset_files(f_geno, f_geno_mask, f_miss, f_miss_mask)
+
+    g_mean_pca = g_mean.filter(selected)
+    g_stdinv_pca = g_std_bern_inv.filter(selected)
+    print(f"PCA filtering done at CP{mpc.pid}. "
+        f"Number of selected individuals: "
+        f"{len(cov)}. Number of selected SNPs: {selected_snps_count}.")
+
+    # Pass 2: Random sketch
     kp = NUM_DIM_TO_REDUCE_TO + NUM_OVERSAMPLE
+    Y_cur = SecureValue.zeros(kp, selected_snps_count)
+    Y_cur_adj = SecureValue.zeros(kp, selected_snps_count)
+    bucket_count = [0 for _ in range(kp)]
 
-    (f_pheno, f_cov, f_geno, f_miss,
-     f_geno_mask, f_miss_mask) = open_input_files(mpc, test_run)
-    snp_pos, pheno, cov = read_labels(f_pheno, f_cov)
+    for cur in range(len(cov)):
+        # mpc.prg.switch_seed(-1)
+        bucket_index = cur % kp  # __rand_int(kp + 1) - 1
+        rand_sign = (cur % 2) * 2 - 1  # (__rand_int(3) - 1) * 2 - 1
+        # mpc.prg.restore_seed(-1)
 
-    snp_pos, pheno, cov, g_mean, g_std_bern_inv = quality_control(mpc,
-        snp_pos, pheno, cov, f_geno, f_miss, f_geno_mask, f_miss_mask)
+        # TODO: Remove copy and explicit variables
+        g = pca_g_mat[cur].copy()
+        miss = pca_miss_mat[cur].copy()
+        # Flip miss bits so it points to places where g_mean should be subtracted
+        miss = (1 - miss) * rand_sign
+        # Update running sum
+        Y_cur[bucket_index] += g * rand_sign
+        # Update adjustment factor
+        Y_cur_adj[bucket_index] = miss * g_mean_pca
+        bucket_count[bucket_index] += 1
 
-    # print(f"Starting population stratification analysis for {m2} elements")
+    # Subtract the adjustment factor
+    Y_cur = Y_cur.to_fp() - Y_cur_adj
 
-    # selected = [-1 for _ in range(m2)]  # 1 selected, 0 unselected, -1 TBD
-    # dist_thres = LD_DIST_THRES
-
-    # prev = -1
-    # for i in range(m2):
-    #     selected[i] = 0
-    #     if (prev < 0) or (snp_pos[i] - prev > dist_thres):
-    #         selected[i] = 1
-    #         prev = snp_pos[i]
-
-    # # At this point "selected" contains the SNP filter for PCA, shared across all parties
-    # m3 = 0
-    # for i in range(len(selected)):
-    #     if selected[i] == 1:
-    #         m3 += 1
-
-    # print("SNP selection complete: ", m3, " / ", m2, " selected")
-
-    # pca_g_mat = []
-    # pca_g_mask_mat = []
-    # pca_miss_mat = []
-    # pca_miss_mask_mat = []
-    # # Cache the reduced G for PCA
-    # if (file_exists("pca_input")):
-    #     raise NotImplementedError()
-    # else:
-    #     gkeep3 = [False for _ in range(NUM_SNPS)]
-    #     for j in range(NUM_SNPS):
-    #         gkeep3[j] = (gkeep1[j] == 1)
-
-    #     ind = 0
-    #     for j in range(NUM_SNPS):
-    #         if gkeep3[j]:
-    #             gkeep3[j] = (gkeep2[ind] == 1)
-    #             ind += 1
-
-    #     ind = 0
-    #     for j in range(NUM_SNPS):
-    #         if gkeep3[j]:
-    #             gkeep3[j] = (selected[ind] == 1)
-    #             ind += 1
-
-    #     f_geno = open(geno_path)
-    #     f_miss = open(miss_path)
-    #     f_geno_mask = open(geno_mask_path)
-    #     f_miss_mask = open(miss_mask_path)
-        
-    #     bsize: int = n1 // 10
-
-    #     ind = -1
-    #     for i in range(n1):
-    #         ind += 1
-
-    #         g0 = [[TP(0) for _ in range(NUM_SNPS)] for _ in range(3)]  # Matrix()
-    #         g0_mask = [[TP(0) for _ in range(NUM_SNPS)] for _ in range(3)]  # Matrix()
-    #         miss0 = [TP(0) for _ in range(NUM_SNPS)]  # Vector()
-    #         miss0_mask = [TP(0) for _ in range(NUM_SNPS)]  # Vector()
-
-    #         while ikeep[ind] != 1:
-    #             raise NotImplementedError()
-    #             # if mpc.pid > 0:
-    #             #     f_geno.read(mpc.boolean.primes_bytes[0] * 3 * NUM_SNPS)  # skip_data(f_geno, 3, NUM_SNPS)
-    #             #     f_geno.read(mpc.boolean.primes_bytes[0] * NUM_SNPS)  # skip_data(f_geno, NUM_SNPS)
-
-    #             #     mpc.prg.switch_seed(10)
-    #             #     g0_mask = rand_mat([3, NUM_SNPS], BASE_P)  # Matrix(3, NUM_SNPS, randomise=True)
-    #             #     miss0_mask = rand_vec(NUM_SNPS, BASE_P)
-    #             #     mpc.prg.restore_seed(10)
-    #             # else:
-    #             #     for p in range(1, 3):
-    #             #         mpc.prg.switch_seed(10 + p)
-    #             #         g0_mask = rand_mat([3, NUM_SNPS], BASE_P)  # Matrix(3, NUM_SNPS, randomise=True)
-    #             #         miss0_mask = rand_vec(NUM_SNPS, BASE_P)
-    #             #         mpc.prg.restore_seed(10 + p)
-    #             # ind += 1
-
-    #         if mpc.pid > 0:
-    #             g0 = read_matrix[TP](f_geno, 3, NUM_SNPS)
-    #             miss0 = read_vector[TP](f_miss, NUM_SNPS)
-    #         g0_mask = read_matrix[TP](f_geno_mask, 3, NUM_SNPS)
-    #         miss0_mask = read_vector[TP](f_miss_mask, NUM_SNPS)
-
-    #         # Filter out loci that failed missing rate filter
-    #         g = [[TP(0) for _ in range(NUM_SNPS)] for _ in range(3)]  # Matrix(3, m3)
-    #         g_mask = [[TP(0) for _ in range(NUM_SNPS)] for _ in range(3)]  # Matrix(3, m3)
-    #         miss = [TP(0) for _ in range(NUM_SNPS)]  # Vector([TP(0)  # Zp(0, BASE_P) for _ in range(m3)])
-    #         miss_mask = [TP(0) for _ in range(NUM_SNPS)]  # Vector([TP(0)  # Zp(0, BASE_P) for _ in range(m3)])
-    #         ind2: int = 0
-    #         for j in range(NUM_SNPS):
-    #             if gkeep3[j]:
-    #                 for k in range(3):
-    #                     g[k][ind2] = g0[k][j]
-    #                     g_mask[k][ind2] = g0_mask[k][j]
-    #                 miss[ind2] = miss0[j]
-    #                 miss_mask[ind2] = miss0_mask[j]
-    #                 ind2 += 1
-
-    #         dosage = (g[1] + (g[2] * 2) % BASE_P) % BASE_P
-    #         dosage_mask = (g_mask[1] + (g_mask[2] * 2) % BASE_P) % BASE_P
-
-    #         pca_g_mat.append(dosage)
-    #         pca_g_mask_mat.append(dosage_mask)
-    #         pca_miss_mat.append(miss)
-    #         pca_miss_mask_mat.append(miss_mask)
-
-    #     f_geno.close()
-    #     f_miss.close()
-    #     f_geno_mask.close()
-    #     f_miss_mask.close()
-
-    # g_mean_pca = [g_mean[i] for i in range(len(g_mean)) if selected[i]]
-    # g_stdinv_pca = [g_std_bern_inv[i] for i in range(len(g_std_bern_inv)) if selected[i]]
-
-    # g_mean_pca, g_mean_pca_mask = mpc.arithmetic.__beaver_partition(g_mean_pca)
-    # g_stdinv_pca, g_stdinv_pca_mask = mpc.arithmetic.__beaver_partition(g_stdinv_pca)
+    # Get rid of empty buckets and normalize nonempty ones
+    empty_slot = 0
+    for i in range(kp):
+        if bucket_count[i] > 0:
+            Y_cur[empty_slot] = Y_cur[i] / bucket_count[i]
+            empty_slot += 1
     
-    # # Pass 2: Random sketch
-    # Y_cur = [[TP(0) for _ in range(m3)] for _ in range(kp)]  # Matrix(kp, m3)
+    kp = empty_slot
+    Y_cur = Y_cur.pad(kp, selected_snps_count)
 
-    # if (file_exists("sketch")):
-    #     # print("sketch cache found")
-    #     # with open(get_cache_path(mpc.pid, "sketch")) as f:
-    #     #     kp = TP(next(f))
-    #     #     Y_cur = read_matrix_from_cache[TP](f, kp, m3, prime_bytes)
-    #     raise NotImplementedError()
-    # else:
-    #     Y_cur_adj = [[TP(0) for _ in range(m3)] for _ in range(kp)]  # Matrix(kp, m3)
-    #     bucket_count = [0 for _ in range(kp)]
-
-    #     for cur in range(n1):
-    #         # Count sketch (use global PRG)
-    #         mpc.prg.switch_seed(-1)
-    #         bucket_index = __rand_int(kp + 1) - 1
-    #         rand_sign = (__rand_int(3) - 1) * 2 - 1
-    #         mpc.prg.restore_seed(-1)
-
-    #         g = pca_g_mat[cur].copy()
-    #         g_mask = pca_g_mask_mat[cur].copy()
-    #         miss = pca_miss_mat[cur].copy()
-    #         miss_mask = pca_miss_mask_mat[cur].copy()
-
-    #         # Flip miss bits so it points to places where g_mean should be subtracted
-    #         mpc.boolean.beaver_flip_bit(miss, miss_mask)
-
-    #         # Update running sum
-    #         if mpc.pid > 0:
-    #             Y_cur[bucket_index] += g_mask * rand_sign
-    #             if mpc.pid == 1:
-    #                 Y_cur[bucket_index] += g * rand_sign
-    #         Y_cur %= BASE_P
-
-    #         # Update adjustment factor
-    #         miss *= rand_sign
-    #         miss_mask *= rand_sign
-    #         Y_cur_adj[bucket_index] = mpc.arithmetic.__beaver_mult(
-    #             miss, miss_mask, g_mean_pca, g_mean_pca_mask)
-
-    #         bucket_count[bucket_index] += 1
-
-    #     # Subtract the adjustment factor
-    #     Y_cur_adj = mpc.arithmetic.__beaver_reconstruct(Y_cur_adj)
-    #     if mpc.pid > 0:
-    #         Y_cur = Y_cur * fp_one - Y_cur_adj
-    #         Y_cur %= BASE_P
-        
-    #     # Get rid of empty buckets and normalize nonempty ones
-    #     empty_slot = 0
-    #     for i in range(kp):
-    #         if bucket_count[i] > 0:
-    #             fp_count_inv = TypeOps.double_to_fp(
-    #                 1.0 / bucket_count[i], NBIT_K, NBIT_F)
-    #             Y_cur[empty_slot] = (Y_cur[i] * fp_count_inv) % BASE_P
-    #             empty_slot += 1
-    #     kp = empty_slot
-    #     Y_cur = Y_cur.pad(kp, m3)
-    #     Y_cur = mpc.fp.trunc(Y_cur)
-
-    #     # with open(get_cache_path(mpc.pid, "sketch"), 'wb') as f:
-    #     #     write_to_cache(f, [kp])
-    #     #     if mpc.pid > 0:
-    #     #         write_to_cache(f, Y_cur)
-    
-    # Y_cur, Y_cur_mask = mpc.arithmetic.__beaver_partition(Y_cur)
+    mpc.fp.print_fp(Y_cur.share)
+    raise NotImplementedError()
 
     # print(f"Initial sketch obtained, starting power iteration (num iter = {NUM_POWER_ITER})")
 
@@ -651,6 +547,22 @@ def gwas_protocol(mpc, test_run):
     # V, V_mask = mpc.arithmetic.__beaver_partition(V)
 
     # print("Bases for top singular vectors and covariates calculated")
+
+
+@sequre_beaver
+def gwas_protocol(mpc, test_run):
+    (f_pheno, f_cov, f_geno, f_miss,
+     f_geno_mask, f_miss_mask) = open_input_files(mpc, test_run)
+    snp_pos, pheno, cov = read_labels(f_pheno, f_cov)
+
+    (snp_pos, pheno, cov, g_mean, g_std_bern_inv,
+    ikeep, gkeep1, gkeep2) = quality_control(
+        mpc, snp_pos, pheno, cov,
+        f_geno, f_miss, f_geno_mask, f_miss_mask)
+
+    pca(mpc, snp_pos, cov, g_mean, g_std_bern_inv,
+        f_geno, f_geno_mask, f_miss, f_miss_mask,
+        ikeep, gkeep1, gkeep2)
 
     # # Pass 4: Calculate GWAS statistics */
     # pheno, pheno_mask = mpc.arithmetic.__beaver_partition(pheno)
