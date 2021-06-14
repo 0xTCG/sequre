@@ -7,7 +7,7 @@
 
 See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&sort=due_date&state=open) for more details.
 
-## Stats
+## Preliminary statistics
 
 ### GWAS
 |        | Net workload | Partitions | Reconstructs | Truncations |  LOC  |
