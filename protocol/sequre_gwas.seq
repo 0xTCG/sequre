@@ -1,0 +1,350 @@
+from sequre import sequre_beaver
+
+from ..utils.param import *
+from ..utils.io import read_vector as read_vec, read_matrix as read_mat
+from ..utils.custom_types import SecureValue
+
+from ..stdlib.lin_alg import orthonormal_basis, eigen_decomp
+
+
+
+def open_input_files(mpc, test_run):
+    pheno_path = (f"tests/data/input/gwas_pheno_shares_{mpc.pid}.txt" if test_run else
+                  f"{GWAS_DATA_PATH}/__pheno_shares_{mpc.pid}.txt")
+    cov_path = (f"tests/data/input/gwas_cov_shares_{mpc.pid}.txt" if test_run else
+                f"{GWAS_DATA_PATH}/__cov_shares_{mpc.pid}.txt")
+    geno_path = (f"tests/data/input/gwas_geno_x_r.txt" if test_run else
+                 f"{GWAS_DATA_PATH}/__geno_x_r.txt")
+    geno_mask_path = (f"tests/data/input/gwas_geno_r_{mpc.pid}.txt" if test_run else
+                      f"{GWAS_DATA_PATH}/__geno_r_{mpc.pid}.txt")
+    miss_path = (f"tests/data/input/gwas_miss_x_r.txt" if test_run else
+                 f"{GWAS_DATA_PATH}/__miss_x_r.txt")
+    miss_mask_path = (f"tests/data/input/gwas_miss_r_{mpc.pid}.txt" if test_run else 
+                      f"{GWAS_DATA_PATH}/__miss_r_{mpc.pid}.txt")
+    
+    return (open(pheno_path),
+            open(cov_path),
+            open(geno_path),
+            open(miss_path),
+            open(geno_mask_path),
+            open(miss_mask_path))
+
+
+def reset_files(*files):
+    for file in files:
+        file.seek(0, 0)
+
+
+def read_snps():
+    snp_pos = []
+    with open(SNP_POS_FILE) as f:
+        for _, line in zip(range(NUM_SNPS), f):
+            chrom, pos = line.split()
+            snp_pos.append(size_u(int(chrom.strip()) * 10 ** 9 + int(pos.strip())))
+    
+    return SecureValue[list[size_u]](
+        snp_pos, snp_pos, snp_pos.zeros(), snp_pos.zeros(),
+        snp_pos.zeros(), list[list[size_u]](), False, True, False)
+
+
+def read_labels(mpc, f_pheno, f_cov):
+    pheno = read_vec[size_u](f_pheno, NUM_INDS)
+    cov = read_mat[size_u](f_cov, NUM_INDS, NUM_COVS)
+    pheno_x_r, pheno_r = mpc.arithmetic.__beaver_partition(pheno)
+    cov_x_r, cov_r = mpc.arithmetic.__beaver_partition(cov)
+
+    return (
+        read_snps(),
+        SecureValue[list[size_u]](
+            pheno, pheno_x_r, pheno_r, list[size_u](),
+            list[size_u](), list[list[size_u]](), False, False, False),
+        SecureValue[list[list[size_u]]](
+            cov, cov_x_r, cov_r, list[list[size_u]](),
+            list[list[size_u]](), list[list[list[size_u]]](), False, False, False))
+
+
+def read_vector(mpc, f, f_mask, n):
+    x_r = read_vec[size_u](f, n)
+    r = read_vec[size_u](f_mask, n)
+    share = (x_r + r) if mpc.pid == 2 else r
+
+    return SecureValue[list[size_u]](
+        share, x_r, r, x_r.zeros(),
+        x_r.zeros(), list[list[size_u]](),
+        False, False, False)
+
+
+def read_matrix(mpc, f, f_mask, imask, jmask, rows, cols, offset, multiplicity = 1):
+    share_mats = [list[list[size_u]](rows * multiplicity) for _ in range(multiplicity)]
+    x_r_mats = [list[list[size_u]](rows * multiplicity) for _ in range(multiplicity)]
+    r_mats = [list[list[size_u]](rows * multiplicity) for _ in range(multiplicity)]
+    
+    batch_size = 0
+    i = offset
+    while batch_size < rows:
+        if imask[i]: batch_size += 1
+        for m in range(multiplicity):
+            x_r = read_vec[size_u](f, cols)
+            r = read_vec[size_u](f_mask, cols)
+            if imask[i]:
+                x_r = [x_r[j] for j in range(len(jmask)) if jmask[j]]
+                r = [r[j] for j in range(len(jmask)) if jmask[j]]
+                r_mats[m].append(r)
+                x_r_mats[m].append(x_r)
+                share_mats[m].append((x_r + r) if mpc.pid == 2 else r)
+        i += 1
+    
+    svs = [SecureValue[list[list[size_u]]](
+        share_mats[i], x_r_mats[i], r_mats[i], share_mats[i].zeros(),
+        share_mats[i].zeros(), list[list[list[size_u]]](), False, False, False) for i in range(multiplicity)]
+
+    return svs
+
+
+def locus_distance_filter(snp_pos):
+    selected = [0 for _ in range(len(snp_pos))]  # 1 selected, 0 unselected, -1 TBD
+
+    prev = -1
+    for i in range(len(selected)):
+        if (prev < 0) or (snp_pos.share[i] - prev > LD_DIST_THRES):
+            selected[i] = 1
+            prev = int(snp_pos.share[i])
+    
+    return selected
+
+
+@sequre_beaver
+def load_dosage(mpc, f_geno, f_geno_mask, f_miss, f_miss_mask,
+                imask, jmask, rows, cols):
+    g = read_matrix(
+        mpc, f_geno, f_geno_mask, imask, jmask,
+        rows, cols, 0, 3)
+    miss = read_matrix(
+        mpc, f_miss, f_miss_mask, imask, jmask,
+        rows, cols, 0)[0]
+    dosage = g[1] + g[2] * 2
+
+    return g, miss, dosage
+
+
+@sequre_beaver
+def quality_control(
+        mpc, snp_pos, pheno, cov, f_geno,
+        f_miss, f_geno_mask, f_miss_mask):
+    gkeep1 = snp_pos.raw_ones()
+    if not SKIP_QC:
+        # n = len(snp_pos)
+        # gmiss = snp_pos.zeros()
+        # for _ in range(n): gmiss = gmiss + read_vector(mpc, f_miss, f_miss_mask, n)
+        # gkeep1 = mpc.broadcast(gmiss < (n * GMISS_UB))
+        raise NotImplementedError()
+
+    snp_pos = snp_pos.filter(gkeep1)
+    print(f"1st QC filtering done at CP{mpc.pid}. "
+          f"Number of selected individuals: {len(pheno)}. "
+          f"Number of selected SNPs: {len(snp_pos)}.")
+    reset_files(f_miss, f_miss_mask)
+
+    ikeep = pheno.raw_ones()
+    if not SKIP_QC:
+        # m = int(gkeep1.sum())
+        # imiss = gkeep1.zeros()
+        # ihet = gkeep1.zeros()
+
+        # for i in range(len(ikeep)):
+        #     g = read_matrix(mpc, f_geno, f_geno_mask, ikeep, gkeep1.ones(), 3, len(gkeep1), i * 3, 3)
+        #     miss = read_vector(mpc, f_miss, f_miss_mask, len(gkeep1))
+
+        #     for j, gk in enumerate(gkeep1):
+        #         if gk:
+        #             imiss[i] += miss[j]
+        #             ihet[i] += g[1][j]
+
+        # m1_obs = m - imiss
+        # ihet = ihet.to_fp()
+        # ikeep = mpc.broadcast(
+        #     (imiss < (m * IMISS_UB)) *
+        #     (ihet < (m1_obs * HET_UB)) *
+        #     (ihet > (m1_obs * HET_LB)))
+        raise NotImplementedError()
+
+    pheno = pheno.filter(ikeep)
+    cov = cov.filter(ikeep)
+    print(f"2nd QC filtering done at CP{mpc.pid}. "
+          f"Number of selected individuals: {len(pheno)}. "
+          f"Number of selected SNPs: {len(snp_pos)}.")
+    reset_files(f_geno, f_geno_mask, f_miss, f_miss_mask)
+    
+    ctrl = 1 - pheno
+
+    # n1_ctrl = int(ctrl.sum())
+    # g_count_ctrl = snp_pos.zeros()
+    
+    g, miss, dosage = load_dosage(
+        mpc, f_geno, f_geno_mask, f_miss, f_miss_mask,
+        ikeep, gkeep1, len(pheno), len(gkeep1))
+
+    gmiss = miss.sum()
+    dosage_sum = dosage.sum()
+    # gmiss_ctrl = ctrl * miss
+    # dosage_sum_ctrl = ctrl * dosage
+    # for k in range(3): g_count_ctrl = g_count_ctrl + ctrl * g[k]
+    
+    # dosage_tot_ctrl = (n1_ctrl - gmiss_ctrl) * 2
+    maf = dosage_sum / ((len(pheno) - gmiss) * 2)
+    # maf_ctrl = dosage_sum_ctrl / dosage_tot_ctrl
+    # Maf_ctrl = 1 - maf_ctrl
+
+    gkeep2 = snp_pos.raw_ones()
+    if not SKIP_QC:
+        # g_exp_ctrl = SecureValue[list[list[size_u]]]([[], [], []])
+        # g_exp_ctrl[0] = Maf_ctrl * Maf_ctrl
+        # g_exp_ctrl[1] = Maf_ctrl * maf_ctrl * 2
+        # g_exp_ctrl[2] = maf_ctrl * maf_ctrl
+
+        # g_exp_ctrl = g_exp_ctrl * dosage_tot_ctrl / 2
+        # hwe_chisq = (((g_count_ctrl.to_fp() - g_exp_ctrl) ** 2) / g_exp_ctrl).sum()
+        # gkeep2 = mpc.broadcast(
+        #     (maf < MAF_UB) *
+        #     (maf > MAF_LB) *
+        #     (hwe_chisq < HWE_UB))
+        raise NotImplementedError()
+
+    g_var_bern = (maf * (1 - maf)).filter(gkeep2)
+    maf = maf.filter(gkeep2)
+    snp_pos = snp_pos.filter(gkeep2)
+    print(f"3rd QC filtering done at CP{mpc.pid}. "
+          f"Number of selected individuals: "
+          f"{len(pheno)}. Number of selected SNPs: {len(snp_pos)}.")
+    reset_files(f_geno, f_geno_mask, f_miss, f_miss_mask)
+
+    g_std_bern_inv = 1 / mpc.sqrt(g_var_bern)
+    g_mean = maf * 2
+
+    return (snp_pos, pheno, cov, g_mean,
+            g_std_bern_inv, ikeep, gkeep1, gkeep2)
+
+
+@sequre_beaver
+def pca(mpc, snp_pos, cov, g_mean, g_std_bern_inv,
+        f_geno, f_geno_mask, f_miss, f_miss_mask,
+        ikeep, gkeep1, gkeep2):
+    selected = locus_distance_filter(snp_pos)
+
+    # At this point "selected" contains the SNP filter for PCA, shared across all parties
+    selected_snps_count = sum(selected)
+    gkeep3 = [bool(e) for e in gkeep1]
+
+    ind = 0
+    for j in range(NUM_SNPS):
+        if gkeep3[j]:
+            gkeep3[j] = (gkeep2[ind] == 1)
+            ind += 1
+
+    ind = 0
+    for j in range(NUM_SNPS):
+        if gkeep3[j]:
+            gkeep3[j] = (selected[ind] == 1)
+            ind += 1
+
+    _, pca_miss_mat, pca_g_mat = load_dosage(
+        mpc, f_geno, f_geno_mask, f_miss, f_miss_mask,
+        ikeep, gkeep3, len(cov), NUM_SNPS)
+    reset_files(f_geno, f_geno_mask, f_miss, f_miss_mask)
+
+    g_mean_pca = g_mean.filter(selected)
+    g_stdinv_pca = g_std_bern_inv.filter(selected)
+    print(f"PCA filtering done at CP{mpc.pid}. "
+        f"Number of selected individuals: "
+        f"{len(cov)}. Number of selected SNPs: {selected_snps_count}.")
+
+    # Pass 2: Random sketch
+    kp = NUM_DIM_TO_REDUCE_TO + NUM_OVERSAMPLE
+    Y_cur = SecureValue.zeros(kp, selected_snps_count)
+    Y_cur_adj = SecureValue.zeros(kp, selected_snps_count)
+    bucket_count = [0 for _ in range(kp)]
+
+    for cur in range(len(cov)):
+        # mpc.prg.switch_seed(-1)
+        bucket_index = cur % kp  # __rand_int(kp + 1) - 1
+        rand_sign = (cur % 2) * 2 - 1  # (__rand_int(3) - 1) * 2 - 1
+        # mpc.prg.restore_seed(-1)
+
+        # Flip miss bits so it points to places where g_mean should be subtracted
+        miss = (1 - pca_miss_mat[cur]) * rand_sign
+        # Update running sum
+        Y_cur[bucket_index] += pca_g_mat[cur] * rand_sign
+        # Update adjustment factor
+        Y_cur_adj[bucket_index] += miss * g_mean_pca
+        bucket_count[bucket_index] += 1
+
+    # Subtract the adjustment factor
+    Y_cur = Y_cur.to_fp() - Y_cur_adj
+
+    # Get rid of empty buckets and normalize nonempty ones. Loop will be removed after #49 is fixed.
+    for i, bc in enumerate(bucket_count): Y_cur[i] = Y_cur[i] / bc
+    Y_cur.filter(bucket_count)
+    kp = len(Y_cur)
+
+    print(f"Initial sketch obtained, starting power iteration (num iter = {NUM_POWER_ITER})")
+    Q = orthonormal_basis(mpc, Y_cur * g_stdinv_pca)
+    pca_hit_mat = 1 - pca_miss_mat
+
+    for pit in range(NUM_POWER_ITER + 1):
+        Q_scaled = Q * g_stdinv_pca
+        Q_scaled_gmean = Q_scaled * g_mean_pca
+
+        Q = mpc.matmul(pca_g_mat, Q_scaled.T) - mpc.matmul(pca_hit_mat, Q_scaled_gmean.T)
+        if pit == NUM_POWER_ITER: break
+
+        ortho_Q = orthonormal_basis(mpc, Q.T)
+        Q = orthonormal_basis(mpc,
+            (mpc.matmul(ortho_Q, pca_g_mat) - mpc.matmul(ortho_Q, pca_hit_mat)
+             * g_mean_pca) * g_stdinv_pca)
+        print(f"Iter {pit + 1}. complete at CP{mpc.pid}.")
+
+    print(f"Power iteration complete at CP{mpc.pid}.")
+
+    Z = Q.T / len(snp_pos)
+    U = eigen_decomp(mpc, mpc.matmul(Z, Z.T), ITER_PER_EVAL)[0][:NUM_DIM_TO_REDUCE_TO, :kp]
+    V = orthonormal_basis(mpc, mpc.matmul(U, Z).extend(cov.T.to_fp()))
+
+    print(f"Selected {NUM_DIM_TO_REDUCE_TO} eigenvectors at CP{mpc.pid}.")
+    return V, pca_g_mat
+
+
+@sequre_beaver
+def cochran_armitage(mpc, V, pheno, dosage):
+    p_hat = pheno.expand_dims().to_fp() - mpc.matmul(pheno.expand_dims(), V.T, V)
+    sp = p_hat.T.sum()[0]
+    sx = mpc.matmul((1 - mpc.matmul(V.T.sum().expand_dims(), V)), dosage)[0]
+    B = mpc.dot(mpc.matmul(V, dosage))
+    spp = mpc.dot(p_hat[0])
+    sxp = mpc.matmul(p_hat, dosage)[0]
+    sxx = (dosage * dosage).sum().to_fp()
+    norm_sp = sp / len(pheno)
+    numer = sxp - sx * norm_sp
+    denom = (sxx - B - sx * sx / len(pheno)) * (spp - sp * norm_sp)
+
+    assoc = numer / mpc.sqrt(denom)
+
+    print(f"Computed associations at CP{mpc.pid}.")
+    return assoc
+
+
+@sequre_beaver
+def gwas_protocol(mpc, test_run):
+    (f_pheno, f_cov, f_geno, f_miss,
+     f_geno_mask, f_miss_mask) = open_input_files(mpc, test_run)
+    snp_pos, pheno, cov = read_labels(mpc, f_pheno, f_cov)
+
+    (snp_pos, pheno, cov, g_mean, g_std_bern_inv,
+    ikeep, gkeep1, gkeep2) = quality_control(
+        mpc, snp_pos, pheno, cov,
+        f_geno, f_miss, f_geno_mask, f_miss_mask)
+
+    V, dosage = pca(mpc, snp_pos, cov, g_mean, g_std_bern_inv,
+                    f_geno, f_geno_mask, f_miss, f_miss_mask,
+                    ikeep, gkeep1, gkeep2)
+    
+    return cochran_armitage(mpc, V, pheno, dosage)
