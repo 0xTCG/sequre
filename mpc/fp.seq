@@ -16,6 +16,7 @@ from C import usleep(int) -> int
 class MPCFP[TP]:
     # TODO: Make all methods algebraic structure agnostic
     pid: int
+    truncations: int
     primes: dict[int, TP]
     prg: MPCPRG
     comms: MPCComms[TP]
@@ -38,49 +39,51 @@ class MPCFP[TP]:
         self.invpow_cache = dict[int, TP]()
 
         self.debug = False
-    
-    def print_fp(self, value, field = BASE_P):
-        if self.pid == 0:
-            return value.zeros_float()
-        
-        revealed_value = self.comms.reveal(value, field=field)
-        value_float = TypeOps.fp_to_double(revealed_value, NBIT_K, NBIT_F, field=field)
+        self.reset_stats()
 
-        if self.pid == 2:
-            print(f'{self.pid}: {value_float}')
-        
-        return value_float
+    def print_stats(self):
+        print(f"Truncations: {self.truncations}. At CP{self.pid}")
+    
+    def reset_stats(self):
+        self.truncations = 0
     
     def trunc(self, a, k = NBIT_K + NBIT_F, m = NBIT_F, field = BASE_P):
+        self.truncations += 1
+        
         shape = shapeof(a)
         
         r = a.zeros()
         r_low = a.zeros()
-        if self.pid == 0:
-            # r = TypeOps.rand_bits(shape, k + NBIT_V, field=field)
-            # r = rand_mat(shape, field)
+        
+        if False:  # TODO Resolve #46 and remove this if clause (I.e. reveal the code within it and delete the elif self.pid != 2: block)
+            if self.pid == 0:
+                # r = TypeOps.rand_bits(shape, k + NBIT_V, field=field)
+                # r = rand_mat(shape, field)
+                r = ((r + 1) << (k + NBIT_V)) - 1
+                r_low = (r & ((1 << m) - 1)) % field
+
+                self.prg.switch_seed(1)
+                r_mask = r.rand(field)
+                r_low_mask = r_low.rand(field)
+                self.prg.restore_seed(1)
+
+                r = (r - r_mask) % field
+                r_low = (r_low - r_low_mask) % field
+
+                self.comms.send(r, 2)
+                self.comms.send(r_low, 2)
+            elif self.pid == 2:
+                r = self.comms.receive(0, shape)
+                r_low = self.comms.receive(0, shape)
+            else:
+                self.prg.switch_seed(0)
+                r = a.rand(field)
+                r_low = a.rand(field)
+                self.prg.restore_seed(0)
+        elif self.pid != 2:
             r = ((r + 1) << (k + NBIT_V)) - 1
             r_low = (r & ((1 << m) - 1)) % field
-
-            self.prg.switch_seed(1)
-            r_mask = r.rand(field)
-            r_low_mask = r_low.rand(field)
-            self.prg.restore_seed(1)
-
-            r = (r - r_mask) % field
-            r_low = (r_low - r_low_mask) % field
-
-            self.comms.send(r, 2)
-            self.comms.send(r_low, 2)
-        elif self.pid == 2:
-            r = self.comms.receive(0, shape)
-            r_low = self.comms.receive(0, shape)
-        else:
-            self.prg.switch_seed(0)
-            r = a.rand(field)
-            r_low = a.rand(field)
-            self.prg.restore_seed(0)
-
+        
         c = (a + r) % field if self.pid > 0 else a.zeros()
         c = self.comms.reveal(c, field=field)
 
@@ -99,16 +102,21 @@ class MPCFP[TP]:
             a = (a * self.invpow_cache[m]) % field
         
         return a
-        
-    def int_to_fp(self: MPCFP[TP], a: int, k: int, f: int, field: TP = BASE_P) -> TP:
-        sn: int = 1 if a >= 0 else -1
 
-        az_shift = TP(a << f)
-        az_trunc: TP = az_shift & ((1 << (k - 1)) - 1)
+    def fp_div(self, a, b, field = BASE_P):
+        if isinstance(a, size_u):
+            return self.__fp_div([a], [b], field)[0]
+        else:
+            return self.__fp_div(a, b, field)
 
-        return (az_trunc * sn) % field
+    def fp_sqrt(self, a, field = BASE_P):
+        if isinstance(a, size_u):
+            sr, srinv = self.__fp_sqrt([a], field)
+            return sr[0], srinv[0]
+        else:
+            return self.__fp_sqrt(a, field)
 
-    def fp_div(self: MPCFP[TP], a: list[TP], b: list[TP], field: TP = BASE_P) -> list[TP]:
+    def __fp_div(self: MPCFP[TP], a: list[TP], b: list[TP], field: TP = BASE_P) -> list[TP]:
         assert len(a) == len(b)
 
         n: int = len(a)
@@ -131,7 +139,7 @@ class MPCFP[TP]:
                     a_copy[j] = a[start + j]
                     b_copy[j] = b[start + j]
 
-                c_copy: list[TP] = self.fp_div(a_copy, b_copy, field=field)
+                c_copy: list[TP] = self.__fp_div(a_copy, b_copy, field=field)
                 for j in range(batch_size):
                     c[start + j] = c_copy[j]
             return c
@@ -140,7 +148,7 @@ class MPCFP[TP]:
 
         # Initial approximation: 1 / x_scaled ~= 5.9430 - 10 * x_scaled + 5 * x_scaled^2
         
-        s, _ = self.normalizer_even_exp(b, self.primes[1])
+        s, _ = self.__normalizer_even_exp(b, self.primes[1])
 
         b_scaled: list[TP] = self.arithmetic.multiply(b, s, field=field)
         b_scaled = self.trunc(b_scaled, NBIT_K, NBIT_K - NBIT_F, field=field)
@@ -161,7 +169,7 @@ class MPCFP[TP]:
         x: list[TP] = self.arithmetic.multiply(w, b, field=field)
         x = self.trunc(x, field=field)
 
-        one: TP = self.int_to_fp(1, NBIT_K, NBIT_F, field=field)
+        one: TP = TypeOps.int_to_fp(1, NBIT_K, NBIT_F, field=field)
 
         x *= -1
         if self.pid == 1:
@@ -191,7 +199,116 @@ class MPCFP[TP]:
         c: list[TP] = self.arithmetic.multiply(y, x, field=field)
         return self.trunc(c, field=field)
 
-    def normalizer_even_exp(self: MPCFP[TP], a: list[TP], field: TP) -> tuple[list[TP], list[TP]]:
+    def __fp_sqrt(self: MPCFP[TP], a: list[TP], field: TP = BASE_P) -> tuple[list[TP], list[TP]]:
+        n = len(a)
+
+        if n > DIV_MAX_N:
+            nbatch = int(math.ceil(n / DIV_MAX_N))
+            b = [TP(0) for _ in range(n)]
+            b_inv = [TP(0) for _ in range(n)]
+            
+            for i in range(nbatch):
+                start = DIV_MAX_N * i
+                end = start + DIV_MAX_N
+                if end > n: end = n
+                batch_size = end - start
+                a_copy = [TP(0) for _ in range(batch_size)]
+                
+                for j in range(batch_size):
+                    a_copy[j] = a[start + j]
+                
+                b_copy, b_inv_copy = self.__fp_sqrt(a_copy)
+                
+                for j in range(batch_size):
+                    b[start + j] = b_copy[j]
+                    b_inv[start + j] = b_inv_copy[j]
+            
+            return b, b_inv
+
+        # TODO: Currently using the same iter as division -- possibly need to update
+        niter = int(2 * math.ceil(math.log2((NBIT_K) / 3.5)))
+
+        # Initial approximation: 1 / sqrt(a_scaled) ~= 2.9581 - 4 * a_scaled + 2 * a_scaled^2
+        # Bottleneck
+        s, s_sqrt = self.__normalizer_even_exp(a, self.primes[1])
+
+        a_scaled = self.arithmetic.multiply(a, s, field=field)
+        a_scaled = self.trunc(a_scaled, NBIT_K, NBIT_K - NBIT_F, field=field)
+
+        a_scaled_sq = self.arithmetic.multiply(a_scaled, a_scaled, field=field)
+        a_scaled_sq = self.trunc(a_scaled_sq, field=field)
+
+        scaled_est = (((-a_scaled * 4) % field) + (a_scaled_sq + a_scaled_sq) % field) % field if self.pid != 0 else [TP(0) for _ in range(n)]
+        
+        if self.pid == 1:
+            coeff = TypeOps.double_to_fp(2.9581, NBIT_K, NBIT_F)
+            scaled_est = (scaled_est + coeff) % field
+        
+        h = self.arithmetic.multiply(scaled_est, s_sqrt)
+        # Our scaled initial approximation (scaled_est) has bit length <= NBIT_F + 2
+        # and s_sqrt is at most NBIT_K/2 bits, so their product is at most NBIT_K/2 +
+        # NBIT_F + 2
+        h = self.trunc(h, NBIT_K // 2 + NBIT_F + 2, (NBIT_K - NBIT_F) // 2 + 1)
+
+        g = (h + h) % field
+        g = self.arithmetic.multiply(g, a)
+        g = self.trunc(g, k = NBIT_K + NBIT_F, m = NBIT_F)
+
+        onepointfive: TP = TypeOps.double_to_fp(1.5, NBIT_K, NBIT_F)
+
+        for _ in range(niter):
+            r = self.arithmetic.multiply(h, g)
+            r = self.trunc(r, k = NBIT_K + NBIT_F, m = NBIT_F)
+            r = (-r) % field
+            if self.pid == 1:
+                r = (r + onepointfive) % field
+
+            # TODO: Do h and g in parallel
+            h = self.arithmetic.multiply(h, r)
+            g = self.arithmetic.multiply(g, r)
+            h = self.trunc(h, k = NBIT_K + NBIT_F, m = NBIT_F)
+            g = self.trunc(g, k = NBIT_K + NBIT_F, m = NBIT_F)
+        
+        b_inv = (h + h) % field
+        b = g
+
+        return b, b_inv
+    
+    def __share_random_bits(self: MPCFP[TP], k: int, n: int, field: TP = BASE_P) -> tuple[list[TP], list[list[TP]]]:
+        r = [TP(1) for _ in range(n)]
+        rbits = [[TP(0) for _ in range(k)] for _ in range(n)]
+        if self.pid == 0:
+            # r = TypeOps.rand_bits_vec(n, k + NBIT_V, field=field)
+            # r = rand_vec(n, field)
+            r = (r << (k + NBIT_V)) - 1
+            rbits = TypeOps.num_to_bits(r, k)
+
+            self.prg.switch_seed(1)
+            r_mask = r.rand(field)
+            rbits_mask = rbits.rand(field)
+            self.prg.restore_seed(1)
+
+            r -= r_mask
+            r %= field
+
+            rbits -= rbits_mask
+            rbits %= field
+
+            self.comms.send(r, 2)
+            self.comms.send(rbits, 2)
+            return r, rbits
+        elif self.pid == 2:
+            r = self.comms.receive(0, n)
+            rbits = self.comms.receive(0, [n, k])
+            return r, rbits
+        else:
+            self.prg.switch_seed(0)
+            r = r.rand(field)
+            rbits = rbits.rand(field)
+            self.prg.restore_seed(0)
+            return r, rbits
+
+    def __normalizer_even_exp(self: MPCFP[TP], a: list[TP], field: TP) -> tuple[list[TP], list[TP]]:
         n: int = len(a)
 
         r, rbits = self.__share_random_bits(NBIT_K, n, field)
@@ -284,112 +401,3 @@ class MPCFP[TP]:
             return b, b_sqrt
         
         return [TP(0) for _ in range(n)], [TP(0) for _ in range(n)]
-
-    def fp_sqrt(self: MPCFP[TP], a: list[TP], field: TP = BASE_P) -> tuple[list[TP], list[TP]]:
-        n = len(a)
-
-        if n > DIV_MAX_N:
-            nbatch = int(math.ceil(n / DIV_MAX_N))
-            b = [TP(0) for _ in range(n)]
-            b_inv = [TP(0) for _ in range(n)]
-            
-            for i in range(nbatch):
-                start = DIV_MAX_N * i
-                end = start + DIV_MAX_N
-                if end > n: end = n
-                batch_size = end - start
-                a_copy = [TP(0) for _ in range(batch_size)]
-                
-                for j in range(batch_size):
-                    a_copy[j] = a[start + j]
-                
-                b_copy, b_inv_copy = self.fp_sqrt(a_copy)
-                
-                for j in range(batch_size):
-                    b[start + j] = b_copy[j]
-                    b_inv[start + j] = b_inv_copy[j]
-            
-            return b, b_inv
-
-        # TODO: Currently using the same iter as division -- possibly need to update
-        niter = int(2 * math.ceil(math.log2((NBIT_K) / 3.5)))
-
-        # Initial approximation: 1 / sqrt(a_scaled) ~= 2.9581 - 4 * a_scaled + 2 * a_scaled^2
-        # Bottleneck
-        s, s_sqrt = self.normalizer_even_exp(a, self.primes[1])
-
-        a_scaled = self.arithmetic.multiply(a, s, field=field)
-        a_scaled = self.trunc(a_scaled, NBIT_K, NBIT_K - NBIT_F, field=field)
-
-        a_scaled_sq = self.arithmetic.multiply(a_scaled, a_scaled, field=field)
-        a_scaled_sq = self.trunc(a_scaled_sq, field=field)
-
-        scaled_est = (((-a_scaled * 4) % field) + (a_scaled_sq + a_scaled_sq) % field) % field if self.pid != 0 else [TP(0) for _ in range(n)]
-        
-        if self.pid == 1:
-            coeff = TypeOps.double_to_fp(2.9581, NBIT_K, NBIT_F)
-            scaled_est = (scaled_est + coeff) % field
-        
-        h = self.arithmetic.multiply(scaled_est, s_sqrt)
-        # Our scaled initial approximation (scaled_est) has bit length <= NBIT_F + 2
-        # and s_sqrt is at most NBIT_K/2 bits, so their product is at most NBIT_K/2 +
-        # NBIT_F + 2
-        h = self.trunc(h, NBIT_K // 2 + NBIT_F + 2, (NBIT_K - NBIT_F) // 2 + 1)
-
-        g = (h + h) % field
-        g = self.arithmetic.multiply(g, a)
-        g = self.trunc(g, k = NBIT_K + NBIT_F, m = NBIT_F)
-
-        onepointfive: TP = TypeOps.double_to_fp(1.5, NBIT_K, NBIT_F)
-
-        for _ in range(niter):
-            r = self.arithmetic.multiply(h, g)
-            r = self.trunc(r, k = NBIT_K + NBIT_F, m = NBIT_F)
-            r = (-r) % field
-            if self.pid == 1:
-                r = (r + onepointfive) % field
-
-            # TODO: Do h and g in parallel
-            h = self.arithmetic.multiply(h, r)
-            g = self.arithmetic.multiply(g, r)
-            h = self.trunc(h, k = NBIT_K + NBIT_F, m = NBIT_F)
-            g = self.trunc(g, k = NBIT_K + NBIT_F, m = NBIT_F)
-        
-        b_inv = (h + h) % field
-        b = g
-
-        return b, b_inv
-    
-    def __share_random_bits(self: MPCFP[TP], k: int, n: int, field: TP = BASE_P) -> tuple[list[TP], list[list[TP]]]:
-        r = [TP(1) for _ in range(n)]
-        rbits = [[TP(0) for _ in range(k)] for _ in range(n)]
-        if self.pid == 0:
-            # r = TypeOps.rand_bits_vec(n, k + NBIT_V, field=field)
-            # r = rand_vec(n, field)
-            r = (r << (k + NBIT_V)) - 1
-            rbits = TypeOps.num_to_bits(r, k)
-
-            self.prg.switch_seed(1)
-            r_mask = r.rand(field)
-            rbits_mask = rbits.rand(field)
-            self.prg.restore_seed(1)
-
-            r -= r_mask
-            r %= field
-
-            rbits -= rbits_mask
-            rbits %= field
-
-            self.comms.send(r, 2)
-            self.comms.send(rbits, 2)
-            return r, rbits
-        elif self.pid == 2:
-            r = self.comms.receive(0, n)
-            rbits = self.comms.receive(0, [n, k])
-            return r, rbits
-        else:
-            self.prg.switch_seed(0)
-            r = r.rand(field)
-            rbits = rbits.rand(field)
-            self.prg.restore_seed(0)
-            return r, rbits
