@@ -13,8 +13,8 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 |        | Net workload | Partitions | Reconstructs | Truncations |  LOC  |
 |:------:|:------------:|:----------:|:------------:|:-----------:|:-----:|
 |   C++  |      n/a     |     n/a    |      n/a     |     n/a     |  ~500 |
-|   Seq  |    ~556 MB   |   1309020  |     569190   |    392230   |  ~250 |
-| Sequre |    ~509 MB   |   1308864  |     569190   |    392230   | ~1000 |
+|   Seq  |    ~556 MB   |   1309020  |     569190   |    392230   |  ~300 |
+| Sequre |    ~509 MB   |   1308864  |     569190   |    392230   |  ~80  |
 
 ### GWAS
 |        | Net workload | Partitions | Reconstructs | Truncations |  LOC  |
