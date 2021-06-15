@@ -28,6 +28,7 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 
 - Number of individuals: 1000
 - SNPs count: 1000
+- Covs count: 10
 
 |        | Net workload | Partitions | Reconstructs | Truncations |  LOC  |
 |:------:|:------------:|:----------:|:------------:|:-----------:|:-----:|
