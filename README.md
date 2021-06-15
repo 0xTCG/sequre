@@ -10,6 +10,14 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 ## Preliminary statistics
 
 ### Stdandard MPC library
+
+- These are cummulative statistics for computing altogether:
+  - QR factorization
+  - Tridiagonalization
+  - Eigen decomposition
+  - Orthonormal basis calculation
+- Input matrix size: 50x50
+
 |        | Net workload | Partitions | Reconstructs | Truncations |  LOC  |
 |:------:|:------------:|:----------:|:------------:|:-----------:|:-----:|
 |   C++  |      n/a     |     n/a    |      n/a     |     n/a     |  ~500 |
@@ -17,6 +25,10 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 | Sequre |    ~509 MB   |   1308864  |     569190   |    392230   |  ~80  |
 
 ### GWAS
+
+- Number of individuals: 1000
+- SNPs count: 1000
+
 |        | Net workload | Partitions | Reconstructs | Truncations |  LOC  |
 |:------:|:------------:|:----------:|:------------:|:-----------:|:-----:|
 |   C++  |      n/a     |     n/a    |      n/a     |     n/a     | ~2000 |
