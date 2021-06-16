@@ -9,7 +9,7 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 
 ## Preliminary statistics
 
-### Stdandard MPC library
+### Standard MPC library
 
 - These are cummulative statistics for computing altogether:
   - QR factorization
