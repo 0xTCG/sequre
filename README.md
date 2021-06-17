@@ -18,11 +18,11 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
   - Orthonormal basis calculation
 - Input matrix size: 50x50
 
-|        | Net workload | Partitions | Reconstructs | Truncations |  LOC  |
-|:------:|:------------:|:----------:|:------------:|:-----------:|:-----:|
-|   C++  |      n/a     |     n/a    |      n/a     |     n/a     |  ~500 |
-|   Seq  |    ~556 MB   |   1309020  |     569190   |    392230   |  ~300 |
-| Sequre |    ~503 MB   |   967584   |     569190   |    392230   |  ~80  |
+|        | Net workload | Partitions | Reconstructs | Truncations |  LOC  | Runtime (s) |
+|:------:|:------------:|:----------:|:------------:|:-----------:|:-----:|:-----------:|
+|   C++  |      n/a     |     n/a    |      n/a     |     n/a     |  ~500 |     n/a     |
+|   Seq  |    ~278 MB   |   1309020  |     569190   |    392230   |  ~300 |     ~102    |
+| Sequre |    ~251 MB   |   967584   |     569190   |    392230   |  ~80  |     ~94     |
 
 ### GWAS
 
@@ -30,8 +30,8 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 - SNPs count: 1000
 - Covs count: 10
 
-|        | Net workload | Partitions | Reconstructs | Truncations |  LOC  |
-|:------:|:------------:|:----------:|:------------:|:-----------:|:-----:|
-|   C++  |      n/a     |     n/a    |      n/a     |     n/a     | ~2000 |
-|   Seq  |    ~200 MB   |   149662   |     68702    |    28813    | ~1000 |
-| Sequre |    ~191 MB   |   124605   |     69689    |    28822    |  ~250 |
+|        | Net workload | Partitions | Reconstructs | Truncations |  LOC  | Runtime (s) |
+|:------:|:------------:|:----------:|:------------:|:-----------:|:-----:|:-----------:|
+|   C++  |      n/a     |     n/a    |      n/a     |     n/a     | ~2000 |     n/a     |
+|   Seq  |    ~100 MB   |   149662   |     68702    |    28813    | ~1000 |     ~70     |
+| Sequre |    ~96 MB    |   124605   |     69689    |    28822    |  ~250 |     ~80     |
