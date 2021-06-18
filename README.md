@@ -21,8 +21,8 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 |        | Net workload | Partitions | Reconstructs | Truncations |  LOC  | Runtime (s) |
 |:------:|:------------:|:----------:|:------------:|:-----------:|:-----:|:-----------:|
 |   C++  |      n/a     |     n/a    |      n/a     |     n/a     |  ~500 |     n/a     |
-|   Seq  |    ~273 MB   |   1309020  |     569190   |    392230   |  ~300 |     ~102    |
-| Sequre |    ~247 MB   |   967584   |     569190   |    392230   |  ~80  |     ~91     |
+|   Seq  |    ~219 MB   |   1309020  |     569190   |    392230   |  ~300 |     ~94     |
+| Sequre |    ~193 MB   |   967584   |     569190   |    392230   |  ~80  |     ~88     |
 
 ### GWAS
 
@@ -33,5 +33,5 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 |        | Net workload | Partitions | Reconstructs | Truncations |  LOC  | Runtime (s) |
 |:------:|:------------:|:----------:|:------------:|:-----------:|:-----:|:-----------:|
 |   C++  |      n/a     |     n/a    |      n/a     |     n/a     | ~2000 |     n/a     |
-|   Seq  |    ~99 MB    |   149662   |     68702    |    28813    | ~1000 |     ~70     |
-| Sequre |    ~95 MB    |   124605   |     69689    |    28822    |  ~250 |     ~80     |
+|   Seq  |    ~83 MB    |   149662   |     68702    |    28813    | ~1000 |     ~70     |
+| Sequre |    ~79 MB    |   124605   |     69689    |    28822    |  ~250 |     ~80     |
