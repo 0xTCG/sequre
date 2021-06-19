@@ -9,7 +9,7 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 
 ## Preliminary statistics
 
-### Stdandard MPC library
+### Standard MPC library
 
 - These are cummulative statistics for computing altogether:
   - QR factorization
@@ -18,11 +18,11 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
   - Orthonormal basis calculation
 - Input matrix size: 50x50
 
-|        | Net workload | Partitions | Reconstructs | Truncations |  LOC  |
-|:------:|:------------:|:----------:|:------------:|:-----------:|:-----:|
-|   C++  |      n/a     |     n/a    |      n/a     |     n/a     |  ~500 |
-|   Seq  |    ~556 MB   |   1309020  |     569190   |    392230   |  ~300 |
-| Sequre |    ~509 MB   |   1308864  |     569190   |    392230   |  ~80  |
+|        | Net workload | Partitions | Reconstructs | Truncations |  LOC  | Runtime (s) |
+|:------:|:------------:|:----------:|:------------:|:-----------:|:-----:|:-----------:|
+|   C++  |    ~243 MB   |   1094924  |    462142    |    392230   |  ~500 |     ~62     |
+|   Seq  |    ~219 MB   |   1309020  |    569190    |    392230   |  ~300 |     ~94     |
+| Sequre |    ~193 MB   |   967584   |    569190    |    392230   |  ~80  |     ~88     |
 
 ### GWAS
 
@@ -30,8 +30,8 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 - SNPs count: 1000
 - Covs count: 10
 
-|        | Net workload | Partitions | Reconstructs | Truncations |  LOC  |
-|:------:|:------------:|:----------:|:------------:|:-----------:|:-----:|
-|   C++  |      n/a     |     n/a    |      n/a     |     n/a     | ~2000 |
-|   Seq  |    ~200 MB   |   149662   |     68702    |    28813    | ~1000 |
-| Sequre |    ~192 MB   |   149391   |     69689    |    28822    |  ~250 |
+|        | Net workload | Partitions | Reconstructs | Truncations |  LOC  | Runtime (s) |
+|:------:|:------------:|:----------:|:------------:|:-----------:|:-----:|:-----------:|
+|   C++  |    ~85 MB    |   80717    |     34232    |    28837    | ~2000 |     ~60     |
+|   Seq  |    ~83 MB    |   149662   |     68702    |    28813    | ~1000 |     ~70     |
+| Sequre |    ~79 MB    |   124599   |     69689    |    28822    |  ~250 |     ~80     |
