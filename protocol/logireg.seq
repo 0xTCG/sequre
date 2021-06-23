@@ -43,6 +43,7 @@ def neg_log_sigmoid[TP](mpc: MPCEnv[TP], a: list[TP], field: TP) -> tuple[list[T
 
     if mpc.pid > 0:
         b += params[0]
+        b %= field
 
     b_grad = copy(params[1])
 
@@ -90,7 +91,7 @@ def parallel_logistic_regression[TP](
     batch_size: int = (n + nbatch - 1) // nbatch
 
     for it in range(max_iter):
-        print(f'Logistic regression iteration {it} initialized')
+        print(f'Logistic regression iteration {it} initialized at CP{mpc.pid}')
         batch_index: int = it % nbatch
         start_ind: int = batch_size * batch_index
         end_ind: int = start_ind + batch_size
@@ -128,8 +129,9 @@ def parallel_logistic_regression[TP](
 
         h = mpc.arithmetic.__beaver_matmul(bvr, bvm, vr_batch, vm_batch)
         for j in range(c):
-            xrvec = xr_batch[j] * fp_one
-            xmvec = xm_batch[j] * fp_one
+            xrvec = (xr_batch[j] * fp_one) % BASE_P
+            xmvec = (xm_batch[j] * fp_one) % BASE_P
+            xvec = (xmvec + (xrvec if mpc.pid == 1 else xrvec.zeros())) % BASE_P
             h[j] += mpc.arithmetic.__beaver_mult(xrvec, xmvec, bxr[j], bxm[j])
         h = mpc.arithmetic.__beaver_reconstruct(h)
         h = mpc.fp.trunc(h, NBIT_K + NBIT_F, NBIT_F)
@@ -138,10 +140,10 @@ def parallel_logistic_regression[TP](
             h[j] += b0[j]
         h %= field
 
-        hvec = [e for row in h for e in row]  # Matrix().from_value(h).flatten()
+        hvec = [e for row in h for e in row]
         _, s_grad_vec = neg_log_sigmoid[TP](mpc, hvec, field)
 
-        s_grad = [copy(s_grad_vec)]  # Matrix().from_value([TP(0) for _ in range(c)]  # Vector([s_grad_vec], deep_copy=True))
+        s_grad = [copy(s_grad_vec)]
         s_grad = s_grad.reshape([c, cur_bsize])
 
         d0 = [TP(0) for _ in range(c)]  # Vector([Zp(0, base=BASE_P) for _ in range(c)])
@@ -149,8 +151,10 @@ def parallel_logistic_regression[TP](
         dx = [TP(0) for _ in range(c)]  # Vector([Zp(0, base=BASE_P) for _ in range(c)])
 
         for j in range(c):
-            s_grad[j] += (yn_batch * fp_one)
-            d0[j] = sum(s_grad[j])
+            s_grad[j] += (yn_batch * fp_one) % BASE_P
+            d0[j] = sum(s_grad[j]) % BASE_P
+        s_grad %= BASE_P
+        d0 %= BASE_P
 
         s_grad_r, s_grad_m = mpc.arithmetic.__beaver_partition(s_grad)
 
@@ -161,16 +165,13 @@ def parallel_logistic_regression[TP](
 
         vr_batch = vr_batch.transpose()
         vm_batch = vm_batch.transpose()
-        dv = mpc.arithmetic.__beaver_mult(s_grad_r, s_grad_m, vr_batch, vm_batch)
+        dv = mpc.arithmetic.__beaver_matmul(s_grad_r, s_grad_m, vr_batch, vm_batch)
         dv = mpc.arithmetic.__beaver_reconstruct(dv)
         dv = mpc.fp.trunc(dv, NBIT_K + NBIT_F, NBIT_F)
 
-        step0 = step0 * fp_memory - d0 * fp_bsize_inv
-        stepv = stepv * fp_memory - dv * fp_bsize_inv
-        stepx = stepx * fp_memory - dx * fp_bsize_inv
-        step0 %= field
-        stepv %= field
-        stepx %= field
+        step0 = ((step0 * fp_memory) % field - (d0 * fp_bsize_inv) % field) % field
+        stepv = ((stepv * fp_memory) % field - (dv * fp_bsize_inv) % field) % field
+        stepx = ((stepx * fp_memory) % field - (dx * fp_bsize_inv) % field) % field
         step0 = mpc.fp.trunc(step0, NBIT_K + NBIT_F, NBIT_F)
         stepv = mpc.fp.trunc(stepv, NBIT_K + NBIT_F, NBIT_F)
         stepx = mpc.fp.trunc(stepx, NBIT_K + NBIT_F, NBIT_F)
@@ -288,11 +289,11 @@ def logireg_protocol[TP](mpc: MPCEnv[TP], test_run: bool = True):
     fp_denom = TypeOps.double_to_fp(1.0 / len(V[0]), NBIT_K, NBIT_F)
 
     for i in range(len(V_mean)):
-        V_mean[i] = sum(V[i]) * fp_denom
+        V_mean[i] = (sum(V[i]) % BASE_P) * fp_denom
     V_mean %= field
     V_mean = mpc.fp.trunc(V_mean)
     for i in range(len(V)):
-        V[i] -= V_mean
+        V[i] -= V_mean[i]
     V %= field
 
     V_var = mpc.arithmetic.inner_prod(V)
@@ -340,11 +341,11 @@ def logireg_protocol[TP](mpc: MPCEnv[TP], test_run: bool = True):
             g0 = read_matrix[TP](f_geno, 3, m0)
         g0_mask = read_matrix[TP](f_geno_mask, 3, m0)
 
-        g = [[TP(0) for _ in range(m0)] for _ in range(3)]
-        g_mask = [[TP(0) for _ in range(m0)] for _ in range(3)]
+        g = [[TP(0) for _ in range(ntop)] for _ in range(3)]
+        g_mask = [[TP(0) for _ in range(ntop)] for _ in range(3)]
         ind2: int = 0
         for j in range(m0):
-            if gkeep3[j]:
+            if gkeep[j]:
                 for k in range(3):
                     g[k][ind2] = g0[k][j]
                     g_mask[k][ind2] = g0_mask[k][j]
@@ -357,11 +358,12 @@ def logireg_protocol[TP](mpc: MPCEnv[TP], test_run: bool = True):
 
     # TODO: Implement data shuffling. (See original implementation)
 
+    X = X.transpose()
+    X_mask = X_mask.transpose()
     V, V_mask = mpc.arithmetic.__beaver_partition(V)
     pheno, pheno_mask = mpc.arithmetic.__beaver_partition(pheno)
 
     b = parallel_logistic_regression(mpc, X, X_mask, V, V_mask, pheno, pheno_mask, 1)
-    bx = mpc.comms.print_fp(b[2])
 
     f_pheno.close()
     f_cov.close()
@@ -372,4 +374,4 @@ def logireg_protocol[TP](mpc: MPCEnv[TP], test_run: bool = True):
     f_gkeep2.close()
     f_ikeep.close()
 
-    return b
+    return b[2]
