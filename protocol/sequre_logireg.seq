@@ -2,12 +2,28 @@ from ..utils.param import *
 from ..utils.custom_types import SecureValue
 from ..utils.type_ops import TypeOps
 from ..utils.io import read_vector, read_matrix
+from ..utils.utils import zeros
 
 from ..mpc.env import MPCEnv
 from ..stdlib.lin_alg import orthonormal_basis
 from sequre_gwas import read_labels, load_dosage
 
 from sequre import *
+
+
+def sq(x):
+    # TODO: #35 Remove this method after #35 is resolved
+    return x ** 2
+
+
+def half(x):
+    # TODO: #35 Remove this method after #35 is resolved
+    return x / 2
+
+
+def get_norm(eta, cur_bsize):
+    # TODO: #35 Remove this method after #35 is resolved
+    return eta / cur_bsize
 
 
 def open_input_files(mpc, test_run):
@@ -62,13 +78,14 @@ def neg_log_sigmoid(mpc, a):
     depth = 6
     step = 4.0
     a_ind = a_vec.zeros()
+    a_ind.fp = False
 
     for i in range(depth):
-        a_sign = a > 0
+        a_sign = a_vec > 0
         a_ind = a_ind + a_sign * (1 << (depth - 1 - i))
-        a = a - (a_sign * 2 - 1) * step
-        step //= 2
-
+        a_vec = a_vec - (a_sign * 2 - 1) * step
+        step = half(step)
+    
     a_ind = a_ind + 1
     return table_lookup(mpc, a_ind)[1].expand_dims().reshape(a.shape())
 
@@ -80,9 +97,9 @@ def parallel_logistic_regression(mpc, x, v, y, max_iter):
     nbatch = 10
     batch_size = (n + nbatch - 1) // nbatch
 
-    b0 = x.T[0].zeros()
-    bv = mpc.matmul(x, v.T).zeros()
-    bx = x.T[0].zeros()
+    b0 = x.T[0].zeros().to_fp()
+    bv = SecureValue(zeros[int_t](len(x), len(v))).to_fp()
+    bx = b0.zeros()
     y_neg = 1 - y
 
     step0 = b0.zeros()
@@ -101,17 +118,19 @@ def parallel_logistic_regression(mpc, x, v, y, max_iter):
         v_batch = v[:, start_ind:start_ind + cur_bsize]
         y_neg_batch = y_neg[start_ind:start_ind + cur_bsize]
         
-        s_grad = neg_log_sigmoid(
-            mpc, mpc.matmul(bv, v_batch) + x.to_fp() * bx + b0)
-        s_grad = s_grad + y_neg_batch.to_fp()
-
+        h = (mpc.matmul(bv, v_batch) + x_batch.to_fp() * bx).broadcast_add(b0)
+        s_grad = neg_log_sigmoid(mpc, h)
+        for i in range(len(s_grad)):
+            s_grad[i] = s_grad[i] + y_neg_batch.to_fp()
+        
         d0 = s_grad.T.sum()
-        dx = mpc.dot(x_batch, s_grad)
+        dx = mpc.dot(x_batch.T, s_grad.T)
         dv = mpc.matmul(s_grad, v_batch.T)
 
-        step0 = step0 * 0.5 - d0 * eta / cur_bsize
-        stepv = stepv * 0.5 - dv * eta / cur_bsize
-        stepx = stepx * 0.5 - dx * eta / cur_bsize
+        norm = get_norm(eta, cur_bsize)
+        step0 = step0 * 0.5 - d0 * norm
+        stepv = stepv * 0.5 - dv * norm
+        stepx = stepx * 0.5 - dx * norm
 
         b0 = b0 + step0
         bv = bv + stepv
@@ -126,9 +145,7 @@ def logireg_protocol(mpc, test_run = True):
      f_miss, f_miss_mask, f_eigen, f_gkeep1,
      f_gkeep2, f_ikeep, f_assoc) = open_input_files(mpc, test_run)     
     
-    # TODO: Implemend threading. (See original implementation of this protocol)
     ntop = 100
-
     _, pheno, cov = read_labels(mpc, f_pheno, f_cov)
     gkeep1 = read_vector[int](f_gkeep1, NUM_SNPS)
     ikeep = read_vector[int](f_ikeep, NUM_INDS)
@@ -137,7 +154,7 @@ def logireg_protocol(mpc, test_run = True):
     m2 = sum(gkeep2)
     cavec = list[tuple[int, float]](m2)
     for i, line in zip(range(m2), f_assoc):
-        cavec.append((i, float(line) ** 2))
+        cavec.append((i, sq(float(line))))
     cavec.sort(key=TypeOps.switch_pair[int, float], reverse=True)
     gkeep3 = [0 for _ in range(m2)]
     for i in range(ntop):
@@ -150,8 +167,9 @@ def logireg_protocol(mpc, test_run = True):
     V.fp = True
 
     V = orthonormal_basis(mpc, V.extend(cov.T.to_fp()))
-    V = V - V.T.sum() / len(V[0])
-    V = V / mpc.sqrt(mpc.dot(V) / len(V[0]))
+    V = V.broadcast_add(-(V.T.sum() / len(V[0])))
+    stdinv = 1 / mpc.sqrt(mpc.dot(V.T) / len(V[0]))
+    V = (V.T * stdinv).T
 
     gkeep = [(gkeep1[j] == 1) for j in range(NUM_SNPS)]
 
@@ -171,7 +189,4 @@ def logireg_protocol(mpc, test_run = True):
         mpc, f_geno, f_geno_mask, f_miss, f_miss_mask,
         ikeep, gkeep, ntop, NUM_SNPS)[2]
 
-    # TODO: Implement data shuffling. (See original implementation)
-
-    b = parallel_logistic_regression(mpc, X, V, pheno, 1)
-    return b[2]
+    return parallel_logistic_regression(mpc, X.T, V, pheno, 1)[2]
