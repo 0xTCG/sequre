@@ -35,3 +35,16 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 |   C++  |    ~85 MB    |   80717    |     34232    |    28837    | ~2000 |     ~60     |
 |   Seq  |    ~83 MB    |   149662   |     68702    |    28813    | ~1000 |     ~70     |
 | Sequre |    ~79 MB    |   124599   |     69689    |    28822    |  ~250 |     ~80     |
+
+### Logistic regression
+
+- Number of individuals: 1000
+- SNPs count: 1000
+- Covs count: 10
+- Number of iterations: 5
+
+|        | Net workload | Partitions | Reconstructs | Truncations |  LOC  | Runtime (s) |
+|:------:|:------------:|:----------:|:------------:|:-----------:|:-----:|:-----------:|
+|   C++  |    ~48 MB    |    3095    |     1283     |     1007    |  ~600 |    ~114     |
+|   Seq  |    ~47 MB    |   1203713  |    601592    |     1002    |  ~350 |    ~104     |
+| Sequre |     n/a      |    n/a     |      n/a     |     n/a     |  n/a  |     n/a     |
