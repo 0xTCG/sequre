@@ -1,41 +1,35 @@
 from ..utils.param import *
 from ..utils.type_ops import TypeOps
-from ..utils.utils import \
-    get_cache_path, \
-    get_output_path, \
-    get_temp_path, \
-    read_vector_from_cache, \
-    read_matrix_from_cache
+from ..utils.io import read_vector, read_matrix
 
 from ..mpc.env import MPCEnv
 
 
-def neg_log_sigmoid[TP](mpc: MPCEnv[TP], a: list[TP], field: TP) -> tuple[list[TP], list[TP]]:
+def neg_log_sigmoid[TP](mpc: MPCEnv[TP], a: list[TP], field: TP) -> list[TP]:
     n: int = len(a)
     depth: int = 6
     step: float = 4.0
-    cur = copy(a)
     a_ind = [TP(0) for _ in range(n)]
 
     for i in range(depth):
-        cur_sign = mpc.boolean.is_positive(cur)
+        a_sign = mpc.boolean.is_positive(a)
         index_step = TP(1 << (depth - 1 - i)) % field
 
-        a_ind += (cur_sign * index_step)
+        a_ind += (a_sign * index_step)
         a_ind %= field
 
-        cur_sign *= 2
+        a_sign *= 2
         if mpc.pid == 1:
-            cur_sign -= 1
-        cur_sign %= field
+            a_sign -= 1
+        a_sign %= field
 
         step_fp = TypeOps.double_to_fp(
             step, NBIT_K, NBIT_F, field)
 
-        cur -= cur_sign * step_fp
-        cur %= field
+        a -= a_sign * step_fp
+        a %= field
 
-        step //= 2
+        step /= 2
 
     if mpc.pid == 1:
         a_ind += 1
@@ -43,15 +37,14 @@ def neg_log_sigmoid[TP](mpc: MPCEnv[TP], a: list[TP], field: TP) -> tuple[list[T
 
     params = mpc.polynomial.table_lookup(a_ind, 2)
 
-    b = mpc.arithmetic.multiply(params[1], a, field)
-    b = mpc.fp.trunc(b)
+    # b = mpc.arithmetic.multiply(params[1], a, field)
+    # b = mpc.fp.trunc(b)
 
-    if mpc.pid > 0:
-        b += params[0]
+    # if mpc.pid > 0:
+    #     b += params[0]
+    #     b %= field
 
-    b_grad = copy(params[1])
-
-    return b, b_grad
+    return params[1]
 
 
 def parallel_logistic_regression[TP](
@@ -79,9 +72,7 @@ def parallel_logistic_regression[TP](
         yneg_r += 1
         yneg_r %= field
 
-    yneg = copy(yneg_m)
-    if mpc.pid == 1:
-        yneg += yneg_r
+    yneg = yneg_m + (yneg_r if mpc.pid == 1 else yneg_r.zeros())
 
     fp_memory = TypeOps.double_to_fp(0.5, NBIT_K, NBIT_F)
     fp_one = TypeOps.double_to_fp(1.0, NBIT_K, NBIT_F)
@@ -95,7 +86,7 @@ def parallel_logistic_regression[TP](
     batch_size: int = (n + nbatch - 1) // nbatch
 
     for it in range(max_iter):
-        print(f'Logistic regression iteration {it} initialized')
+        print(f'Logistic regression iteration {it} initialized at CP{mpc.pid}')
         batch_index: int = it % nbatch
         start_ind: int = batch_size * batch_index
         end_ind: int = start_ind + batch_size
@@ -133,8 +124,8 @@ def parallel_logistic_regression[TP](
 
         h = mpc.arithmetic.__beaver_matmul(bvr, bvm, vr_batch, vm_batch)
         for j in range(c):
-            xrvec = xr_batch[j] * fp_one
-            xmvec = xm_batch[j] * fp_one
+            xrvec = (xr_batch[j] * fp_one) % BASE_P
+            xmvec = (xm_batch[j] * fp_one) % BASE_P
             h[j] += mpc.arithmetic.__beaver_mult(xrvec, xmvec, bxr[j], bxm[j])
         h = mpc.arithmetic.__beaver_reconstruct(h)
         h = mpc.fp.trunc(h, NBIT_K + NBIT_F, NBIT_F)
@@ -143,19 +134,18 @@ def parallel_logistic_regression[TP](
             h[j] += b0[j]
         h %= field
 
-        hvec = [e for row in h for e in row]  # Matrix().from_value(h).flatten()
-        _, s_grad_vec = neg_log_sigmoid[TP](mpc, hvec, field)
-
-        s_grad = [copy(s_grad_vec)]  # Matrix().from_value([TP(0) for _ in range(c)]  # Vector([s_grad_vec], deep_copy=True))
-        s_grad = s_grad.reshape([c, cur_bsize])
+        s_grad_vec = neg_log_sigmoid[TP](mpc, h.flatten(), field)
+        s_grad = [s_grad_vec].reshape([c, cur_bsize])
 
         d0 = [TP(0) for _ in range(c)]  # Vector([Zp(0, base=BASE_P) for _ in range(c)])
         dv = [[TP(0) for _ in range(p)] for _ in range(c)]  # Matrix(c, p)
         dx = [TP(0) for _ in range(c)]  # Vector([Zp(0, base=BASE_P) for _ in range(c)])
 
         for j in range(c):
-            s_grad[j] += (yn_batch * fp_one)
-            d0[j] = sum(s_grad[j])
+            s_grad[j] += (yn_batch * fp_one) % BASE_P
+            d0[j] = sum(s_grad[j]) % BASE_P
+        s_grad %= BASE_P
+        d0 %= BASE_P
 
         s_grad_r, s_grad_m = mpc.arithmetic.__beaver_partition(s_grad)
 
@@ -166,16 +156,13 @@ def parallel_logistic_regression[TP](
 
         vr_batch = vr_batch.transpose()
         vm_batch = vm_batch.transpose()
-        dv = mpc.arithmetic.__beaver_mult(s_grad_r, s_grad_m, vr_batch, vm_batch)
+        dv = mpc.arithmetic.__beaver_matmul(s_grad_r, s_grad_m, vr_batch, vm_batch)
         dv = mpc.arithmetic.__beaver_reconstruct(dv)
         dv = mpc.fp.trunc(dv, NBIT_K + NBIT_F, NBIT_F)
 
-        step0 = step0 * fp_memory - d0 * fp_bsize_inv
-        stepv = stepv * fp_memory - dv * fp_bsize_inv
-        stepx = stepx * fp_memory - dx * fp_bsize_inv
-        step0 %= field
-        stepv %= field
-        stepx %= field
+        step0 = ((step0 * fp_memory) % field - (d0 * fp_bsize_inv) % field) % field
+        stepv = ((stepv * fp_memory) % field - (dv * fp_bsize_inv) % field) % field
+        stepx = ((stepx * fp_memory) % field - (dx * fp_bsize_inv) % field) % field
         step0 = mpc.fp.trunc(step0, NBIT_K + NBIT_F, NBIT_F)
         stepv = mpc.fp.trunc(stepv, NBIT_K + NBIT_F, NBIT_F)
         stepx = mpc.fp.trunc(stepx, NBIT_K + NBIT_F, NBIT_F)
@@ -191,160 +178,113 @@ def parallel_logistic_regression[TP](
     return b0, bv, bx
 
 
-def logireg_protocol[TP](mpc: MPCEnv[TP], test_run: bool = True) -> bool:
+def logireg_protocol[TP](mpc: MPCEnv[TP], test_run: bool = True):
+    pheno_path = (f"tests/data/input/gwas_pheno_shares_{mpc.pid}.txt" if test_run else
+                  f"{GWAS_DATA_PATH}/__pheno_shares_{mpc.pid}.txt")
+    cov_path = (f"tests/data/input/gwas_cov_shares_{mpc.pid}.txt" if test_run else
+                f"{GWAS_DATA_PATH}/__cov_shares_{mpc.pid}.txt")
+    geno_path = (f"tests/data/input/gwas_geno_x_r.txt" if test_run else
+                 f"{GWAS_DATA_PATH}/__geno_x_r.txt")
+    geno_mask_path = (f"tests/data/input/gwas_geno_r_{mpc.pid}.txt" if test_run else
+                      f"{GWAS_DATA_PATH}/__geno_r_{mpc.pid}.txt")
+    eigen_path = (f"tests/data/input/logireg_eigen_shares_{mpc.pid}.txt" if test_run else
+                  f"{LOGIREG_DATA_PATH}/__eigen_shares_{mpc.pid}.txt")
+    gkeep1_path = (f"tests/data/input/logireg_gkeep1.txt" if test_run else
+                   f"{LOGIREG_DATA_PATH}/__gkeep1.txt")
+    gkeep2_path = (f"tests/data/input/logireg_gkeep2.txt" if test_run else
+                   f"{LOGIREG_DATA_PATH}/__gkeep2.txt")
+    ikeep_path = (f"tests/data/input/logireg_ikeep.txt" if test_run else
+                  f"{LOGIREG_DATA_PATH}/__ikeep.txt")
+    assoc_path = (f"tests/data/input/logireg_assoc.txt" if test_run else
+                  f"{LOGIREG_DATA_PATH}/__assoc.txt")
+    
     # TODO: Implemend threading. (See original implementation of this protocol)
     ntop: int = 100
 
-    n0: int = NUM_INDS
-    m0: int = NUM_SNPS
-    k: int = NUM_DIM_TO_REMOVE
+    n0 = NUM_INDS
+    m0 = NUM_SNPS
+    k = NUM_DIM_TO_REDUCE_TO
     field: TP = BASE_P
 
     # Shared variables
-    ind: int = 0
-
+    ind = 0
     fp_one = TypeOps.double_to_fp(1.0, NBIT_K, NBIT_F)
-
-    pheno: list[TP] = [TP(0) for _ in range(n0)]  # Vector([Zp(0, BASE_P) for _ in range(n0)])
-    cov: list[list[TP]] = [[TP(0) for _ in range(NUM_COVS)] for _ in range(n0)]  # Matrix(n0, NUM_COVS)
-
-    # if not test_run:
-    #     if (not os.path.exists(get_cache_path(mpc.pid, 'input_geno')) or
-    #         not os.path.exists(get_cache_path(mpc.pid, 'input_pheno_cov'))):
-    #         print('Initial data sharing results not found:')
-    #         print(f'\t{get_cache_path(mpc.pid, "input_geno")}')
-    #         print(f'\t{get_cache_path(mpc.pid, "input_pheno_cov")}')
-    #         return False
 
     print('Initial data sharing results found')
 
-    if not test_run:
-        with open(get_cache_path(mpc.pid, 'input_geno'), 'rb') as f:
-            pheno = read_vector_from_cache[TP](f, n0, mpc.boolean.primes_bytes[0])
-            cov = read_matrix_from_cache[TP](f, n0, NUM_COVS, mpc.boolean.primes_bytes[0])
-    else:
-        with open(get_temp_path(mpc.pid, 'input_pheno_cov')) as f:
-            pheno = list[TP](n0)
-            cov = list[list[TP]](n0)
-            for _ in range(n0):
-                pheno.append(TP(next(f)))
-            for _ in range(n0):
-                cov_row = list[TP](NUM_COVS)
-                for _ in range(NUM_COVS):
-                    cov_row.append(TP(next(f)))
-                cov.append(cov_row)
+    f_pheno = open(pheno_path)
+    f_cov = open(cov_path)
+    f_geno = open(geno_path)
+    f_geno_mask = open(geno_mask_path)
+    f_eigen = open(eigen_path)
+    f_gkeep1 = open(gkeep1_path)
+    f_gkeep2 = open(gkeep2_path)
+    f_ikeep = open(ikeep_path)
+    
+    pheno = read_vector[TP](f_pheno, n0)
+    cov = read_matrix[TP](f_cov, n0, NUM_COVS)
 
     print('Phenotypes and covariates loaded')
-
-    gkeep1 = [TP(0) for _ in range(m0)]  # Vector([Zp(0, base=BASE_P) for _ in range(m0)])
-
     print('Using locus missing rate filter from a previous run')
 
-    if mpc.pid == 2:
-        with open(get_output_path(mpc.pid, 'gkeep1')) as f:
-            for i, line in zip(range(m0), f):
-                gkeep1[i] = TP(line)
-        mpc.comms.send(gkeep1, 0)
-        mpc.comms.send(gkeep1, 1)
-    else:
-        gkeep1 = mpc.comms.receive(2, m0)
-
-    m1: int = int(sum(gkeep1))
-
-    ikeep = [TP(0) for _ in range(n0)]  # Vector([Zp(0, base=BASE_P) for _ in range(n0)])
+    gkeep1 = read_vector[int](f_gkeep1, m0)
+    m1 = sum(gkeep1)
 
     print('Using individual missing rate/het rate filters from a previous run')
 
-    if mpc.pid == 2:
-        with open(get_output_path(mpc.pid, 'ikeep')) as f:
-            ikeep = [TP(e) for e in f]  # Vector([Zp(int(e), base=BASE_P) for e in lines])
-        mpc.comms.send(ikeep, 0)
-        mpc.comms.send(ikeep, 1)
-    else:
-        ikeep = mpc.comms.receive(2, n0)
+    ikeep = read_vector[int](f_ikeep, n0)
+    n1 = sum(ikeep)
 
-    n1: int = int(sum(ikeep) % field)
     print(f'n1: {n1}, m1: {m1}')
-
     print('Filtering phenotypes and covariates')
+    
     pheno = [e for i, e in enumerate(pheno) if ikeep[i]]
     cov = [row for i, row in enumerate(cov) if ikeep[i]]
 
-    gkeep2 = [TP(0) for _ in range(m1)]  # Vector([Zp(0, base=BASE_P) for _ in range(m1)])
-
     print('Using MAF/HWE filters from a previous run')
 
-    if mpc.pid == 2:
-        with open(get_output_path(mpc.pid, 'gkeep2')) as f:
-            for i in range(m1):
-                gkeep2[i] = TP(next(f))
-        mpc.comms.send(gkeep2, 0)
-        mpc.comms.send(gkeep2, 1)
-    else:
-        gkeep2 = mpc.comms.receive(2, m1)
-
-    m2: int = int(sum(gkeep2) % field)
+    gkeep2 = read_vector[int](f_gkeep2, m0)
+    m2 = sum(gkeep2)
     print(f'n1: {n1}, m2: {m2}')
 
     print('Using CA statistics from a previous run')
 
-    gkeep3 = [TP(0) for _ in range(m2)]  # Vector([Zp(0, base=BASE_P) for _ in range(m2)])
+    cavec = list[tuple[int, float]](m2)
+    with open(assoc_path) as f:
+        for i, line in zip(range(m2), f):
+            cavec.append((i, float(line) ** 2))
 
-    if mpc.pid == 2:
-        cavec = list[tuple[int, float]](m2)
-        with open(get_output_path(mpc.pid, 'assoc')) as f:
-            for i, line in zip(range(m2), f):
-                val = float(line)
-                cavec.append((i, val * val))
+    cavec.sort(key=TypeOps.switch_pair[int, float], reverse=True)
 
-        cavec.sort(key=TypeOps.switch_pair[int, float], reverse=True)
+    print(f'Selected top {ntop} candidates')
+    print(f'Top 5 CA stats: {cavec[:5]}')
 
-        print(f'Selected top {ntop} candidates')
-        print(f'Top 5 CA stats: {cavec[:5]}')
+    gkeep3 = [0 for _ in range(m2)]
+    for i in range(ntop):
+        gkeep3[cavec[i][0]] = 1
 
-        for i in range(ntop):
-            gkeep3[cavec[i][0]] = TP(1)
-
-        mpc.comms.send(gkeep3, 0)
-        mpc.comms.send(gkeep3, 1)
-    else:
-        gkeep3 = mpc.comms.receive(2, (m2))
-
-    V: list[list[TP]] = [[TP(0) for _ in range(n1)] for _ in range(k)]  # Matrix(k, n1)
-
-    print('Using eigenvectors from a previous run')
-    if not test_run:
-        with open(get_cache_path(mpc.pid, 'eigen')) as f:
-            V = read_matrix_from_cache[TP](f, k, n1, mpc.boolean.primes_bytes[0])
-    else:
-        with open(get_temp_path(mpc.pid, 'eigen')) as f:
-            V = list[list[TP]](k)
-            for _ in range(k):
-                V_row = list[TP](n1)
-                for _ in range(n1):
-                    V_row.append(TP(next(f)))
-                V.append(V_row)
+    V = read_matrix[TP](f_eigen, k, n1)
 
     # Concatenate covariate matrix and jointly orthogonalize
     cov = cov.transpose()
-    V: list[list[TP]] = V.pad(k + NUM_COVS, n1)
+    V = V.pad(k + NUM_COVS, n1)
     if mpc.pid > 0:
         for i in range(NUM_COVS):
             V[k + i] = cov[i] * fp_one
     V %= field
 
     print('Finding orthonormal basis for ', NUM_COVS, n1)
-    V: list[list[TP]] = mpc.lin_alg.orthonormal_basis(V)
+    V = mpc.lin_alg.orthonormal_basis(V)
 
     V_mean = [TP(0) for _ in range(len(V))]  # Vector([Zp(0, base=BASE_P) for _ in range(V.num_rows())])
     fp_denom = TypeOps.double_to_fp(1.0 / len(V[0]), NBIT_K, NBIT_F)
 
     for i in range(len(V_mean)):
-        V_mean[i] = sum(V[i]) * fp_denom
+        V_mean[i] = (sum(V[i]) % BASE_P) * fp_denom
     V_mean %= field
     V_mean = mpc.fp.trunc(V_mean)
     for i in range(len(V)):
-        V[i] -= V_mean
+        V[i] -= V_mean[i]
     V %= field
 
     V_var = mpc.arithmetic.inner_prod(V)
@@ -360,8 +300,10 @@ def logireg_protocol[TP](mpc: MPCEnv[TP], test_run: bool = True) -> bool:
         V[i] = mpc.arithmetic.multiply(V[i], V_stdinv[i])
     V = mpc.fp.trunc(V, k=NBIT_K + NBIT_F, m=NBIT_F)
 
-    gkeep: list[bool] = [(gkeep1[j] == 1) for j in range(m0)]
+    gkeep = [(gkeep1[j] == 1) for j in range(m0)]
 
+    X = []
+    X_mask = []
     ind: int = 0
     for j in range(m0):
         if gkeep[j]:
@@ -373,46 +315,54 @@ def logireg_protocol[TP](mpc: MPCEnv[TP], test_run: bool = True) -> bool:
         if gkeep[j]:
             gkeep[j] = (gkeep3[ind] == 1)
             ind += 1
+    
+    ind = -1
+    for i in range(n1):
+        ind += 1
 
-    # if not os.path.exists(get_cache_path(mpc.pid, 'logi_input')):
-    #     raise NotImplementedError(
-    #         'At this point, logi_input is expected in cache.\n'
-    #         'TODO: Haris. Make it cache agnostic. (See original implementation)')
+        g0 = [[TP(0) for _ in range(m0)] for _ in range(3)]  # Matrix()
+        g0_mask = [[TP(0) for _ in range(m0)] for _ in range(3)]  # Matrix()
+        miss0 = [TP(0) for _ in range(m0)]  # Vector()
+        miss0_mask = [TP(0) for _ in range(m0)]  # Vector()
 
-    X = list[list[TP]](ntop)
-    X_mask = list[list[TP]](ntop)
-    print('logi_input cache found')
-    if not test_run:
-        print('Warning! Not implemented: beaver_read_from_file!')
-        # with open(get_cache_path(mpc.pid, 'logi_input'), 'br') as f:
-        #     X, X_mask = beaver_read_from_file[TP](f, ntop, n1)
-    else:
-        with open(get_temp_path(mpc.pid, 'logi_input')) as f:
-            for _ in range(ntop):
-                x_row = list[TP](n1)
-                for _ in range(n1):
-                    x_row.append(TP(next(f)))
-                X.append(x_row)
-            for _ in range(ntop):
-                x_mask_row = list[TP](n1)
-                for _ in range(n1):
-                    x_mask_row.append(TP(next(f)))
-                X_mask.append(x_mask_row)
+        while ikeep[ind] != 1:
+            raise NotImplementedError()
+
+        if mpc.pid > 0:
+            g0 = read_matrix[TP](f_geno, 3, m0)
+        g0_mask = read_matrix[TP](f_geno_mask, 3, m0)
+
+        g = [[TP(0) for _ in range(ntop)] for _ in range(3)]
+        g_mask = [[TP(0) for _ in range(ntop)] for _ in range(3)]
+        ind2: int = 0
+        for j in range(m0):
+            if gkeep[j]:
+                for k in range(3):
+                    g[k][ind2] = g0[k][j]
+                    g_mask[k][ind2] = g0_mask[k][j]
+                ind2 += 1
+
+        dosage = (g[1] + (g[2] * 2) % BASE_P) % BASE_P
+        dosage_mask = (g_mask[1] + (g_mask[2] * 2) % BASE_P) % BASE_P
+        X.append(dosage)
+        X_mask.append(dosage_mask)
 
     # TODO: Implement data shuffling. (See original implementation)
 
+    X = X.transpose()
+    X_mask = X_mask.transpose()
     V, V_mask = mpc.arithmetic.__beaver_partition(V)
     pheno, pheno_mask = mpc.arithmetic.__beaver_partition(pheno)
 
-    b = parallel_logistic_regression(mpc, X, X_mask, V, V_mask, pheno, pheno_mask, 1)
+    b = parallel_logistic_regression(mpc, X, X_mask, V, V_mask, pheno, pheno_mask, LOGIREG_ITER)
 
-    bx = mpc.comms.reveal(b[2])
-    if mpc.pid == 2:
-        bx_double = TypeOps.fp_to_double(bx, NBIT_K, NBIT_F)
-        output_path: str = get_output_path(mpc.pid, 'logi_coeff')
-        # with open(output_path, 'w') as f:
-        #     for num in bx_double:
-        #         f.write(f'{str(num)}\n')
-        print(f'Result written to {output_path}')
+    f_pheno.close()
+    f_cov.close()
+    f_geno.close()
+    f_geno_mask.close()
+    f_eigen.close()
+    f_gkeep1.close()
+    f_gkeep2.close()
+    f_ikeep.close()
 
-    return True
+    return b[2]
