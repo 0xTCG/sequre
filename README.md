@@ -32,9 +32,9 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 
 |        | Net workload | Partitions | Reconstructs | Truncations |  LOC  | Runtime (s) |
 |:------:|:------------:|:----------:|:------------:|:-----------:|:-----:|:-----------:|
-|   C++  |    ~85 MB    |   80717    |     34232    |    28837    | ~2000 |     ~60     |
-|   Seq  |    ~83 MB    |   149662   |     68702    |    28813    | ~1000 |     ~70     |
-| Sequre |    ~79 MB    |   124599   |     69689    |    28822    |  ~250 |     ~80     |
+|   C++  |    ~85 MB    |   80717    |     34232    |    28837    | ~2000 |     ~64     |
+|   Seq  |    ~83 MB    |   149662   |     68702    |    28813    | ~1000 |     ~65     |
+| Sequre |    ~79 MB    |   124599   |     69689    |    28822    |  ~250 |     ~60     |
 
 ### Logistic regression
 
