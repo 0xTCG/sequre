@@ -4,7 +4,7 @@ export CXX=clang++
 git clone https://github.com/HarisSmajlovic/seq.git
 cd seq
 git checkout feature/sequre
-./scripts/deps.sh 2
+./scripts/deps.sh 4
 cd ..
 
 if [[ "$OSTYPE" == "linux-gnu"* ]]; then
