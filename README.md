@@ -48,3 +48,19 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 |   C++  |    ~48 MB    |    3095    |     1283     |     1007    |  ~600 |    ~114     |
 |   Seq  |    ~47 MB    |   1203713  |    601592    |     1002    |  ~350 |     ~65     |
 | Sequre |    ~47 MB    |   1202841  |    601583    |     1028    |  ~100 |     ~65     |
+
+### Vanilla neural net for DTI inference
+
+- Number of features: 100
+- Number of target classes: 2
+- Number of hidden layers: 2
+- Dropout: 0
+- Hidden layer size: 250
+- Epochs: 200
+
+|        | Net workload | Partitions | Reconstructs | Truncations |  LOC  | Runtime (s) |
+|:------:|:------------:|:----------:|:------------:|:-----------:|:-----:|:-----------:|
+| PySyft |      n/a     |     n/a    |      n/a     |      n/a    |   n/a |     n/a     |
+|   C++  |   ~4.28 GB   |    50900   |     15450    |      850    |  ~430 |    ~387     |
+|   Seq  |      n/a     |     n/a    |      n/a     |      n/a    |   n/a |     n/a     |
+| Sequre |      n/a     |     n/a    |      n/a     |      n/a    |   n/a |     n/a     |
