@@ -1,0 +1,248 @@
+def initialize_model(mpc):
+    W = []
+    dW = []
+    vW = []
+    b = []
+    db = []
+    vb = []
+
+    for l in range(N_HIDDEN + 1):
+        W_layer = []
+        b_layer = []
+
+        if (N_HIDDEN == 0 and l >= 1):
+            break
+        elif (N_HIDDEN == 0 and l == 0):
+            W_layer = zeros(FEATURE_RANK, N_CLASSES - 1)
+            b_layer = zeros(N_CLASSES - 1)
+        elif (l == 0):
+            W_layer = zeros(FEATURE_RANK, N_NEURONS)
+            b_layer = zeros(N_NEURONS)
+        elif (l == N_HIDDEN):
+            W_layer = zeros(N_NEURONS, N_CLASSES - 1)
+            b_layer = zeros(N_CLASSES - 1)
+        else:
+            W_layer = zeros(N_NEURONS, N_NEURONS)
+            b_layer = zeros(N_NEURONS)
+    
+        dW_layer = zeros(W_layer.shape())
+        vW_layer = zeros(W_layer.shape())
+    
+        db_layer = zeros(len(b_layer))
+        vb_layer = zeros(len(b_layer))
+
+        rows, cols = W_layer.shape()
+        if mpc.pid == 2:
+            for i in range(rows):
+              for j in range(cols):
+                  noise = gaussian_random()
+                  W_layer[i][j] = double_to_fp(noise)
+            
+            mpc.prg.switch_seed(1)
+            W_r = W_layer.random()
+            b_r = b_layer.random()
+            mpc.prg.restore_seed(1)
+            W_layer -= W_r
+            b_layer -= b_r
+            W_layer %= BASE_P
+            b_layer %= BASE_P
+      
+        elif mpc.pid == 1:
+            mpc.prg.switch_seed(2)
+            W_r = W_layer.random()
+            b_r = b_layer.random()
+            mpc.prg.restore_seed(2)
+            W_layer = W_r
+            b_layer = b_r
+    
+        W.append(W_layer)
+        dW.append(dW_layer)
+        vW.append(vW_layer)
+        b.append(b_layer)
+        db.append(db_layer)
+        vb.append(vb_layer)
+     
+    return W, dW, vW, b, db, vb
+
+
+def gradient_descent(mpc, X, y, W, b, dW, db, vW, vb, act, relus, epoch):
+    if mpc.pid == 2: print(f"Epoch: {epoch}/{}")
+  
+    # Forward pass
+    for l in range(N_HIDDEN):
+        activation = mpc.arithmetic.multiply_matmul(X, W[l]) if l == 0 else mpc.arithmetic.multiply_matmul(act[l-1], W[l])
+        activation = mpc.fp.trunc(activation)
+
+        # Add bias term
+        for i in range(len(activation)):
+            activation[i] += b[l]
+
+        # Apply ReLU non-linearity
+        relu = mpc.boolean.is_positive(activation)
+        after_relu = mpc.arithmetic.multiply(activation, relu)
+
+        # TODO: #110 Implement dropout.
+
+        act.push_back(after_relu)
+        relus.push_back(relu)
+  
+    # Calculate scores
+    scores = mpc.arithmetic.multiply_matmul(X, W[-1]) if N_HIDDEN == 0 else mpc.arithmetic.multiply_matmul(act, W[-1])
+    scores = mpc.fp.trunc(scores)
+
+    # Add bias term
+    for i in range(len(scores)):
+        scores[i] += b[-1]
+
+    if (LOSS == "hinge"):
+        # Scale y to be -1 or 1
+        y *= 2
+        y %= BASE_P
+
+        rows, cols = y.shape()
+        if mpc.pid == 2:
+            for i in range(rows):
+                for j in range(cols):
+                    y[i][j] -= double_to_fp(1.0)
+                    y[i][j] %= BASE_P
+
+        # Compute 1 - y * scores
+        y *= -1
+        y %= BASE_P
+        mod_scores = mpc.arithmetic.multiply(y, scores)
+        mod_scores = mpc.fp.trunc(mod_scores)
+
+        rows, cols = mod_scores.shape()
+        if mpc.pid == 2:
+            for i in range(rows):
+                for j in range(cols):
+                    mod_scores[i][j] += double_to_fp(1.0)
+
+        # Compute hinge loss and derivative
+        hinge = mpc.boolean.is_positive(mod_scores)
+        dscores = mpc.arithmetic.multiply(y, hinge)
+    else:
+        dscores = scores - y
+  
+    norm_examples = double_to_fp(1.0 / len(X))
+    dscores *= norm_examples
+    dscores = mpc.fp.trunc(dscores)
+
+    # Back propagation
+    dhidden = dscores
+    for l in range(N_HIDDEN, -1, -1):
+        # Compute derivative of weights
+        X_T = X.transpose() if l == 0 else act.pop().transpose()
+        dW[l] = mpc.arithmetic.multiply_matmul(X_T, dhidden)
+        dW[l] = mpc.fp.trunc(dW[l])
+      
+        # Add regularization term to weights
+        reg = W[l] * double_to_fp(REG)
+        reg = mpc.fp.trunc(reg)
+        dW[l] += reg
+        dW[l] %= BASE_P
+
+        # Compute derivative of biases
+        db[l] = b[l].zeros()
+        for i in range(len(dhidden)):
+            db[l] += dhidden[i]
+
+        if l > 0:
+            # Compute backpropagated activations. */
+            W_T = W[l].transpose()
+            dhidden_new = mpc.multiply_matmul(dhidden, W_T)
+            dhidden_new = mpc.fp.trunc(dhidden_new)
+
+            # Apply derivative of ReLU. */
+            dhidden = mpc.multiply(dhidden_new, relus.pop())
+
+    assert len(act) == 0
+    assert len(relus) == 0
+
+    # Update the model using Nesterov momentum
+    # Compute constants that update various parameters
+    momentum = double_to_fp(MOMENTUM)
+    increased_momentum = double_to_fp(MOMENTUM + 1)
+    learn_rate = double_to_fp(LEARN_RATE)
+
+    for l in range(N_HIDDEN + 1):
+        # Update the weights
+        vW_prev = vW[l]
+        vW[l] = momentum * vW[l] - learn_rate * dW[l]
+        vW[l] = mpc.fp.trunc(vW[l])
+        W_update = -momentum * vW_prev + increased_momentum * vW[l]
+        W_update = mpc.fp.trunc(W_update)
+        W[l] += W_update
+        W[l] %= BASE_P
+
+        # Update the biases
+        vb_prev = vb[l]
+        vb[l] = momentum * vb[l] - learn_rate * db[l]
+        vb[l] = mpc.fp.trunc(vb[l])
+        b_update = -momentum * vb_prev + increased_momentum * vb[l]
+        b_update = mpc.fp.trunc(b_update)
+        b[l] += b_update
+        b[l] %= BASE_P
+
+
+def load_X_y(mpc):
+    if mpc.pid == 0:
+        return
+    
+    fx = open(f'features_P{mpc.pid}.txt')
+    fy = open(f'labels_P{mpc.pid}.txt')
+    X = read_matrix(fx, X_shape)
+    y = read_matrix(fy, y_shape)
+    fx.close()
+    fy.close()
+      
+    return X, y
+
+
+def model_update(mpc, X, y, W, b, dW, db, vW, vb, act, relus):
+  # Round down number of batches in file
+  batches_in_file = len(X) / BATCH_SIZE
+  X_batch = zeros(BATCH_SIZE, len(X[0]))
+  y_batch = zeros(BATCH_SIZE, len(y[0]))
+  random_idx = list(range(len(X)))
+  random.shuffle(random_idx)
+  epoch = 0
+
+  for i in range(batches_in_file):
+      # Scan matrix (pre-shuffled) to get batch
+      base_j = i * BATCH_SIZE
+      for j in range(base_j, min(base_j + BATCH_SIZE, len(X))):
+          X_batch[j - base_j] = X[random_idx[j]]
+          y_batch[j - base_j] = y[random_idx[j]]
+        
+          # Do one round of mini-batch gradient descent
+          gradient_descent(
+              mpc, X_batch, y_batch,
+              W, b, dW, db, vW, vb, act, relus,
+              epoch)
+
+          # Update reference to training epoch
+          epoch += 1
+
+          if epoch >= MAX_EPOCHS: break
+
+
+def dti_protocol(mpc):
+    # Initialize model and data structures
+    print("Initializing model.")
+    W, b, dW, db, vW, vb = initialize_model(mpc)
+    act = []
+    relus = []
+
+    # Initialize data matrices
+    X, y = load_X_y(mpc)
+    # Do gradient descent over multiple training epochs
+    model_update(mpc, X, y, W, b, dW, db, vW, vb, act, relus)
+
+    if pid > 0:
+        with open(f'W{l}_P{mpc.pid}.txt', 'w') as fw, open(f'b{l}_P{mpc.pid}.txt', 'w') as fb:
+            for l in range(N_HIDDEN + 1):
+                W_out = fp_to_double(W[l])
+                fw.write(f'{W_out}\n')
+                b_out = fp_to_double(b[l])
+                fb.write(f'{b_out}\n')
