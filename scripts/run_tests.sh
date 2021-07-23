@@ -14,7 +14,11 @@ fi
 cp $CP_OPTIONS dsl/* seq/stdlib/sequre/
 
 echo "Compiling tests ..."
-seq/build/seqc run -release client.seq test
+if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    /usr/bin/time -v seq/build/seqc run -release client.seq test
+elif [[ "$OSTYPE" == "darwin"* ]]; then
+    seq/build/seqc run -release client.seq test
+fi
 
 echo "Cleaning up sockets ..."
 find  . -name 'sock.*' -exec rm {} \;
