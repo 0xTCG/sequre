@@ -62,5 +62,5 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 |:------:|:------------:|:----------:|:------------:|:-----------:|:-----:|:-----------:|
 | PySyft |      n/a     |     n/a    |      n/a     |      n/a    |  n/a  |     n/a     |
 |   C++  |    ~353 MB   |    10180   |     3090     |      170    |  ~430 |     ~45     |
-|   Seq  |      n/a     |     n/a    |      n/a     |      n/a    |  n/a  |     n/a     |
+|   Seq  |    ~291 MB   |   208180   |    102090    |      150    |  ~260 |     ~90     |
 | Sequre |      n/a     |     n/a    |      n/a     |      n/a    |  n/a  |     n/a     |
