@@ -61,6 +61,6 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 |        | Net workload | Partitions | Reconstructs | Truncations |  LOC  | Runtime (s) |
 |:------:|:------------:|:----------:|:------------:|:-----------:|:-----:|:-----------:|
 | PySyft |      n/a     |     n/a    |      n/a     |      n/a    |   n/a |     n/a     |
-|   C++  |   ~4.28 GB   |    50900   |     15450    |      850    |  ~430 |    ~387     |
+|   C++  |   ~1.72 GB   |    50900   |     15450    |      850    |  ~430 |    ~214     |
 |   Seq  |      n/a     |     n/a    |      n/a     |      n/a    |   n/a |     n/a     |
 | Sequre |      n/a     |     n/a    |      n/a     |      n/a    |   n/a |     n/a     |
