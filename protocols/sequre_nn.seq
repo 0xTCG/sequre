@@ -1,13 +1,14 @@
 import random
 
 from sequre.utils.param import \
-    BASE_P, N_HIDDEN, FEATURE_RANK, N_CLASSES, N_NEURONS, \
+    N_HIDDEN, FEATURE_RANK, N_CLASSES, N_NEURONS, \
     LOSS, REG, MOMENTUM, LEARN_RATE, NN_BATCH_SIZE, MAX_EPOCHS, \
     NN_DATA_PATH, N_FILE_BATCH, int_t
-from sequre.utils.utils import zeros, zeros_vec
 from sequre.utils.io import read_matrix
-from sequre.types.utils import double_to_fp, fp_to_double
+from sequre.types.utils import fp_to_double
+from sequre.types.secure_container import SecureContainer as Secont
 from sequre.attributes import sequre_beaver
+from sequre.stdlib.internal import Internal as sq
 
 
 def open_input_files(mpc, test_run):
@@ -21,18 +22,17 @@ def open_input_files(mpc, test_run):
 
 def load_X_y(mpc, X_shape, y_shape, test_run):
     if mpc.pid == 0:
-        return zeros(X_shape[0], X_shape[1]), zeros(y_shape[0], y_shape[1])
+        return Secont.zeros(X_shape[0], X_shape[1]), Secont.zeros(y_shape[0], y_shape[1])
     
     fx, fy = open_input_files(mpc, test_run)
-    X = read_matrix[int_t](fx, X_shape[0], X_shape[1])
-    y = read_matrix[int_t](fy, y_shape[0], y_shape[1])
+    X = Secont(read_matrix[int_t](fx, X_shape[0], X_shape[1]))
+    y = Secont(read_matrix[int_t](fy, y_shape[0], y_shape[1]))
     fx.close()
     fy.close()
       
     return X, y
 
 
-@sequre_beaver
 def initialize_model(mpc):
     W = []
     dW = []
@@ -42,54 +42,30 @@ def initialize_model(mpc):
     vb = []
 
     for l in range(N_HIDDEN + 1):
-        W_layer = []
-        b_layer = []
-
         if (N_HIDDEN == 0 and l >= 1):
             break
-        elif (N_HIDDEN == 0 and l == 0):
-            W_layer = zeros(FEATURE_RANK, N_CLASSES - 1)
-            b_layer = zeros_vec(N_CLASSES - 1)
+        
+        W_layer_shape = (N_NEURONS, N_NEURONS)
+        b_layer_len = N_NEURONS
+
+        if (N_HIDDEN == 0 and l == 0):
+            W_layer_shape = (FEATURE_RANK, N_CLASSES - 1)
+            b_layer_len = N_CLASSES - 1
         elif (l == 0):
-            W_layer = zeros(FEATURE_RANK, N_NEURONS)
-            b_layer = zeros_vec(N_NEURONS)
+            W_layer_shape = (FEATURE_RANK, N_NEURONS)
         elif (l == N_HIDDEN):
-            W_layer = zeros(N_NEURONS, N_CLASSES - 1)
-            b_layer = zeros_vec(N_CLASSES - 1)
-        else:
-            W_layer = zeros(N_NEURONS, N_NEURONS)
-            b_layer = zeros_vec(N_NEURONS)
-    
+            W_layer_shape = (N_NEURONS, N_CLASSES - 1)
+            b_layer_len = N_CLASSES - 1
+            
+        W_layer = sq.dist(mpc, W_layer_shape, 'normal', (0.0, 0.01))
+        b_layer = Secont.zeros(b_layer_len)
+        
         dW_layer = W_layer.zeros()
         vW_layer = W_layer.zeros()
     
         db_layer = b_layer.zeros()
         vb_layer = b_layer.zeros()
 
-        rows, cols = W_layer.shape()
-        if mpc.pid == 2:
-            for i in range(rows):
-                for j in range(cols):
-                    noise = random.gauss(0.0, 0.01)
-                    W_layer[i][j] = double_to_fp(noise)
-            
-            mpc.prg.switch_seed(1)
-            W_r = W_layer.rand(BASE_P)
-            b_r = b_layer.rand(BASE_P)
-            mpc.prg.restore_seed(1)
-            W_layer -= W_r
-            b_layer -= b_r
-            W_layer %= BASE_P
-            b_layer %= BASE_P
-      
-        elif mpc.pid == 1:
-            mpc.prg.switch_seed(2)
-            W_r = W_layer.rand(BASE_P)
-            b_r = b_layer.rand(BASE_P)
-            mpc.prg.restore_seed(2)
-            W_layer = W_r
-            b_layer = b_r
-    
         W.append(W_layer)
         dW.append(dW_layer)
         vW.append(vW_layer)
@@ -100,152 +76,72 @@ def initialize_model(mpc):
     return W, dW, vW, b, db, vb
 
 
+@sequre_beaver
 def gradient_descent(mpc, X, y, W, b, dW, db, vW, vb):
     act = []
     relus = []
     
     # Forward pass
     for l in range(N_HIDDEN):
-        activation = mpc.arithmetic.multiply_matmul(X if l == 0 else act[l-1], W[l])
-        activation = mpc.fp.trunc(activation)
-
-        # Add bias term
-        for i in range(len(activation)):
-            activation[i] += b[l]
-            activation[i] %= BASE_P
-
+        activation = sq.matmul(mpc, (X if l == 0 else act[l - 1]), W[l]) + b[l]
         # Apply ReLU non-linearity
-        relu = mpc.boolean.is_positive(activation)
-        after_relu = mpc.arithmetic.multiply(activation, relu)
+        relu = activation > 0
+        after_relu = activation * relu
 
         # TODO: #110 Implement dropout.
 
         act.append(after_relu)
         relus.append(relu)
   
-    # Calculate scores
-    scores = mpc.arithmetic.multiply_matmul(X if N_HIDDEN == 0 else act[-1], W[-1])
-    scores = mpc.fp.trunc(scores)
-
-    # Add bias term
-    for i in range(len(scores)):
-        scores[i] += b[-1]
-        scores[i] %= BASE_P
+    # Calculate scores and add bias term
+    scores = sq.matmul(mpc, (X if N_HIDDEN == 0 else act[-1]), W[-1]) + b[-1]
 
     dscores = y.zeros()
-    mod_scores = y.zeros()
     if (LOSS == "hinge"):
-        # Scale y to be -1 or 1
-        y *= 2
-        y %= BASE_P
-
-        rows, cols = y.shape()
-        if mpc.pid == 2:
-            for i in range(rows):
-                for j in range(cols):
-                    y[i][j] -= double_to_fp(1.0)
-                    y[i][j] %= BASE_P
-
-        # Compute 1 - y * scores
-        y *= -1
-        y %= BASE_P
-        mod_scores = mpc.arithmetic.multiply(y, scores)
-        mod_scores = mpc.fp.trunc(mod_scores)
-
-        rows, cols = mod_scores.shape()
-        if mpc.pid == 2:
-            for i in range(rows):
-                for j in range(cols):
-                    mod_scores[i][j] += double_to_fp(1.0)
-                    mod_scores[i][j] %= BASE_P
-
-        # Compute hinge loss and derivative
-        hinge = mpc.boolean.is_positive(mod_scores)
-        dscores = mpc.arithmetic.multiply(y, hinge)
+        y = y * 2 - 1
+        dscores = y * ((1 - y * scores) > 0)
     else:
         dscores = scores - y
-        dscores %= BASE_P
-    
-    norm_examples = double_to_fp(1.0 / len(X))
-    dscores = (dscores * norm_examples) % BASE_P
-    dscores = mpc.fp.trunc(dscores)
+    dscores = dscores / len(X)
 
     # Back propagation
     dhidden = dscores
     for l in range(N_HIDDEN, -1, -1):
         # Compute derivative of weights
-        X_T = X.transpose() if l == 0 else act.pop().transpose()
-        dW[l] = mpc.arithmetic.multiply_matmul(X_T, dhidden)
-        dW[l] = mpc.fp.trunc(dW[l])
-      
+        dW[l] = sq.matmul(mpc, X.T if l == 0 else act.pop().T, dhidden)
         # Add regularization term to weights
-        if REG != 0.0:
-            reg = (W[l] * double_to_fp(REG)) % BASE_P
-            reg = mpc.fp.trunc(reg)
-            dW[l] += reg
-            dW[l] %= BASE_P
-
+        if REG != 0.0: dW[l] = dW[l] + W[l] * REG
         # Compute derivative of biases
-        db[l] = b[l].zeros()
-        for i in range(len(dhidden)):
-            db[l] += dhidden[i]
-            db[l] %= BASE_P
-
-        if l > 0:
-            # Compute backpropagated activations
-            W_T = W[l].transpose()
-            dhidden_new = mpc.arithmetic.multiply_matmul(dhidden, W_T)
-            dhidden_new = mpc.fp.trunc(dhidden_new)
-
-            # Apply derivative of ReLU
-            dhidden = mpc.arithmetic.multiply(dhidden_new, relus.pop())
+        db[l] = dhidden.sum()
+        # Compute backpropagated activations and apply derivative of ReLU
+        if l > 0: dhidden = sq.matmul(mpc, dhidden, W[l].T) * relus.pop()
 
     assert len(act) == 0
     assert len(relus) == 0
 
     # Update the model using Nesterov momentum
     # Compute constants that update various parameters
-    momentum = double_to_fp(MOMENTUM)
-    increased_momentum = double_to_fp(MOMENTUM + 1)
-    learn_rate = double_to_fp(LEARN_RATE)
-
     for l in range(N_HIDDEN + 1):
         # Update the weights
         vW_prev = vW[l].copy()
-        vW[l] = (((vW[l] * momentum) % BASE_P) - ((dW[l] * learn_rate) % BASE_P)) % BASE_P
-        vW[l] = mpc.fp.trunc(vW[l])
-        W_update = (((vW_prev * (-momentum)) % BASE_P) + ((vW[l] * increased_momentum) % BASE_P)) % BASE_P
-        W_update = mpc.fp.trunc(W_update)
-        W[l] += W_update
-        W[l] %= BASE_P
-
+        vW[l] = vW[l] * MOMENTUM - dW[l] * LEARN_RATE
+        W[l] = W[l] + vW[l] * (MOMENTUM + 1) - vW_prev * MOMENTUM
         # Update the biases
         vb_prev = vb[l].copy()
-        vb[l] = (((vb[l] * momentum) % BASE_P) - ((db[l] * learn_rate) % BASE_P)) % BASE_P
-        vb[l] = mpc.fp.trunc(vb[l])
-        b_update = (((vb_prev * (-momentum)) % BASE_P) + ((vb[l] * increased_momentum) % BASE_P)) % BASE_P
-        b_update = mpc.fp.trunc(b_update)
-        b[l] += b_update
-        b[l] %= BASE_P
+        vb[l] = vb[l] * MOMENTUM - db[l] * LEARN_RATE
+        b[l] = b[l] + vb[l] * (MOMENTUM + 1) - vb_prev * MOMENTUM
 
 
 def train_model(mpc, X, y, W, b, dW, db, vW, vb):    
     # Round down number of batches in file
     batches_in_file = len(X) // NN_BATCH_SIZE
-    X_batch = zeros(NN_BATCH_SIZE, len(X[0]))
-    y_batch = zeros(NN_BATCH_SIZE, len(y[0]))
-    random_idx = list(range(len(X)))
     epoch = 0
 
     while True:
         # TODO: #113 Fix the shuffle bug
-        # random.shuffle(random_idx)
         for i in range(batches_in_file):
-            # Scan matrix (pre-shuffled) to get batch
-            base_j = i * NN_BATCH_SIZE
-            for j in range(base_j, min(base_j + NN_BATCH_SIZE, len(X))):
-                X_batch[j - base_j] = X[random_idx[j]]
-                y_batch[j - base_j] = y[random_idx[j]]
+            X_batch = X[i * NN_BATCH_SIZE : (i + 1) * NN_BATCH_SIZE]
+            y_batch = y[i * NN_BATCH_SIZE : (i + 1) * NN_BATCH_SIZE]
             
             # Do one round of mini-batch gradient descent
             if mpc.pid == 2: print(f"Epoch: {epoch}/{MAX_EPOCHS}")
@@ -273,10 +169,10 @@ def neural_net_protocol(mpc, test_run):
         for l in range(N_HIDDEN + 1):
             with open(f'data/nn_models/__W{l}_P{mpc.pid}.txt', 'w') as fw, \
                  open(f'data/nn_models/__b{l}_P{mpc.pid}.txt', 'w') as fb:
-                W_out_revealed = mpc.comms.reveal(W[l])
+                W_out_revealed = mpc.comms.reveal(W[l].share)
                 W_out = fp_to_double(W_out_revealed)
                 fw.write(f'{W_out}\n')
-                b_out_revealed = mpc.comms.reveal(b[l])
+                b_out_revealed = mpc.comms.reveal(b[l].share)
                 b_out = fp_to_double(b_out_revealed)
                 fb.write(f'{b_out}\n')
     
