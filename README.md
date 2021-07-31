@@ -60,7 +60,7 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 
 |        | Net workload |  LOC  | Runtime (s) |
 |:------:|:------------:|:-----:|:-----------:|
-| PySyft |      n/a     |  n/a  |     n/a     |
+| PySyft |    ~685 MB   |  ~190 |     ~95     |
 |   C++  |    ~353 MB   |  ~430 |     ~95     |
 |   Seq  |    ~291 MB   |  ~260 |     ~90     |
 | Sequre |    ~246 MB   |  ~150 |     ~90     |
