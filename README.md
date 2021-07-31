@@ -1,9 +1,6 @@
 # Sequre Framework
 
 ## Meaningful ETAs
-- Coding preliminary done: 22.8.2021
-- Paper written: 26.9.2021
-- First release (v0.0.1): 10.10.2021
 
 See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&sort=due_date&state=open) for more details.
 
@@ -47,8 +44,8 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 
 |        | Partitions | Reconstructions | Truncations |
 |:------:|:----------:|:---------------:|:-----------:|
-|   Seq  |   149662   |      68702      |   28813     |
-| Sequre |   124599   |      69689      |   28822     |
+|   Seq  |   167711   |      77729      |   28837     |
+| Sequre |   142644   |      78721      |   28846     |
 
 ### Logistic regression
 
@@ -61,7 +58,7 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 |:------:|:--------------:|:-----:|:-----------:|
 |   C++  |     ~48 MB     |  ~600 |    ~114     |
 |   Seq  |     ~47 MB     |  ~350 |     ~65     |
-| Sequre |     ~47 MB     |  ~100 |     ~65     |
+| Sequre |     ~47 MB     |  ~100 |     ~57     |
 
 #### Internal stats
 
@@ -83,12 +80,12 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 |:------:|:--------------:|:-----:|:-----------:|
 | PySyft |    ~685 MB     |  ~190 |     ~95     |
 |   C++  |    ~353 MB     |  ~430 |     ~95     |
-|   Seq  |    ~291 MB     |  ~260 |     ~90     |
+|   Seq  |    ~286 MB     |  ~260 |     ~90     |
 | Sequre |    ~246 MB     |  ~150 |     ~90     |
 
 #### Internal stats
 
 |        | Partitions | Reconstructions | Truncations |
 |:------:|:----------:|:---------------:|:-----------:|
-|   Seq  |   n/a      |      n/a        |    n/a      |
-| Sequre |   n/a      |      n/a        |    n/a      |
+|   Seq  |   208180   |      102090     |     150     |
+| Sequre |   208120   |      102090     |     246     |
