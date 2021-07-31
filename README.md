@@ -2,7 +2,7 @@
 
 ## Meaningful ETAs
 
-See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&sort=due_date&state=open) for more details.
+See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=asc&sort=due_date&state=open) for more details.
 
 ## Preliminary statistics
 
