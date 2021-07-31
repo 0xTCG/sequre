@@ -17,9 +17,9 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 
 |        | Online bw (MB) |  LOC  | Runtime (s) |
 |:------:|:--------------:|:-----:|:-----------:|
-|   C++  |     ~243 MB    |  ~500 |     ~69     |
-|   Seq  |     ~219 MB    |  ~300 |     ~67     |
-| Sequre |     ~193 MB    |  ~80  |     ~61     |
+|   C++  |      ~243      |  ~500 |     ~69     |
+|   Seq  |      ~219      |  ~300 |     ~67     |
+| Sequre |      ~193      |  ~80  |     ~61     |
 
 #### Internal stats
 
@@ -36,9 +36,9 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 
 |        | Online bw (MB) |  LOC  | Runtime (s) |
 |:------:|:--------------:|:-----:|:-----------:|
-|   C++  |     ~85 MB     | ~2000 |     ~64     |
-|   Seq  |     ~83 MB     | ~1000 |     ~58     |
-| Sequre |     ~79 MB     |  ~250 |     ~56     |
+|   C++  |       ~85      | ~2000 |     ~64     |
+|   Seq  |       ~83      | ~1000 |     ~58     |
+| Sequre |       ~79      |  ~250 |     ~56     |
 
 #### Internal stats
 
@@ -56,9 +56,9 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 
 |        | Online bw (MB) |  LOC  | Runtime (s) |
 |:------:|:--------------:|:-----:|:-----------:|
-|   C++  |     ~48 MB     |  ~600 |    ~114     |
-|   Seq  |     ~47 MB     |  ~350 |     ~65     |
-| Sequre |     ~47 MB     |  ~100 |     ~57     |
+|   C++  |       ~48      |  ~600 |    ~114     |
+|   Seq  |       ~47      |  ~350 |     ~65     |
+| Sequre |       ~47      |  ~100 |     ~57     |
 
 #### Internal stats
 
@@ -78,14 +78,14 @@ See [milestones](https://github.com/0xTCG/sequre-dsl/milestones?direction=desc&s
 
 |        | Online bw (MB) |  LOC  | Runtime (s) |
 |:------:|:--------------:|:-----:|:-----------:|
-| PySyft |    ~685 MB     |  ~190 |     ~95     |
-|   C++  |    ~353 MB     |  ~430 |     ~95     |
-|   Seq  |    ~286 MB     |  ~260 |     ~90     |
-| Sequre |    ~246 MB     |  ~150 |     ~90     |
+| PySyft |      ~685      |  ~190 |     ~95     |
+|   C++  |      ~353      |  ~430 |     ~95     |
+|   Seq  |      ~286      |  ~260 |     ~90     |
+| Sequre |      ~258      |  ~150 |     ~90     |
 
 #### Internal stats
 
 |        | Partitions | Reconstructions | Truncations |
 |:------:|:----------:|:---------------:|:-----------:|
 |   Seq  |   208180   |      102090     |     150     |
-| Sequre |   208120   |      102090     |     246     |
+| Sequre |   208120   |      102090     |     150     |
