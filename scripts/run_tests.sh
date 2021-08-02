@@ -15,9 +15,9 @@ cp $CP_OPTIONS dsl/* seq/stdlib/sequre/
 
 echo "Compiling tests ..."
 if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    /usr/bin/time -v seq/build/seqc run -release client.seq test-all
+    /usr/bin/time -v seq/build/seqc run -release client.seq test-$1
 elif [[ "$OSTYPE" == "darwin"* ]]; then
-    seq/build/seqc run -release client.seq test-all
+    seq/build/seqc run -release client.seq test-$1
 fi
 
 echo "Cleaning up sockets ..."
