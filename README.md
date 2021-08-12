@@ -15,11 +15,13 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
   - Orthonormal basis calculation
 - Input matrix size: 50x50
 
-|        | Online bw (MB) |  LOC  | Runtime (s) |
-|:------:|:--------------:|:-----:|:-----------:|
-|   C++  |      ~243      |  ~500 |     ~69     |
-|   Seq  |      ~219      |  ~300 |     ~67     |
-| Sequre |      ~193      |  ~80  |     ~61     |
+|                | Offline bw (MB) | Online bw (MB) |  LOC  | Runtime (s) |
+|:--------------:|:---------------:|:--------------:|:-----:|:-----------:|
+|   C++ (field)  |       n/a       |      ~243      |  ~500 |     ~69     |
+|   Seq (field)  |      ~286       |      ~219      |  ~300 |     ~67     |
+| Sequre (field) |      ~286       |      ~193      |  ~80  |     ~61     |
+|   Seq (ring)   |       n/a       |       n/a      |  n/a  |     n/a     |
+| Sequre (ring)  |       n/a       |       n/a      |  n/a  |     n/a     |
 
 #### Internal stats
 
@@ -34,11 +36,13 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 - SNPs count: 1000
 - Covs count: 10
 
-|        | Online bw (MB) |  LOC  | Runtime (s) |
-|:------:|:--------------:|:-----:|:-----------:|
-|   C++  |       ~85      | ~2000 |     ~64     |
-|   Seq  |       ~83      | ~1000 |     ~58     |
-| Sequre |       ~79      |  ~250 |     ~56     |
+|                | Offline bw (MB) | Online bw (MB) |  LOC  | Runtime (s) |
+|:--------------:|:---------------:|:--------------:|:-----:|:-----------:|
+|   C++ (field)  |       n/a       |      ~85       | ~2000 |     ~64     |
+|   Seq (field)  |       ~115      |      ~83       | ~1000 |     ~58     |
+| Sequre (field) |       ~131      |      ~79       |  ~250 |     ~56     |
+|   Seq (ring)   |       n/a       |       n/a      |  n/a  |     n/a     |
+| Sequre (ring)  |       n/a       |       n/a      |  n/a  |     n/a     |
 
 #### Internal stats
 
@@ -54,11 +58,13 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 - Covs count: 10
 - Number of iterations: 5
 
-|        | Online bw (MB) |  LOC  | Runtime (s) |
-|:------:|:--------------:|:-----:|:-----------:|
-|   C++  |       ~48      |  ~600 |    ~114     |
-|   Seq  |       ~47      |  ~350 |     ~65     |
-| Sequre |       ~47      |  ~100 |     ~57     |
+|                | Offline bw (MB) | Online bw (MB) |  LOC  | Runtime (s) |
+|:--------------:|:---------------:|:--------------:|:-----:|:-----------:|
+|   C++ (field)  |       n/a       |      ~48       |  ~600 |    ~114     |
+|   Seq (field)  |      ~133       |      ~47       |  ~350 |     ~57     |
+| Sequre (field) |      ~135       |      ~47       |  ~100 |     ~57     |
+|   Seq (ring)   |       n/a       |       n/a      |  n/a  |     n/a     |
+| Sequre (ring)  |       n/a       |       n/a      |  n/a  |     n/a     |
 
 #### Internal stats
 
@@ -76,12 +82,14 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 - Hidden layer size: 100
 - Epochs: 10
 
-|        | Online bw (MB) |  LOC  | Runtime (s) |
-|:------:|:--------------:|:-----:|:-----------:|
-| PySyft |      ~685      |  ~190 |     ~95     |
-|   C++  |      ~353      |  ~430 |     ~95     |
-|   Seq  |      ~286      |  ~260 |     ~90     |
-| Sequre |      ~258      |  ~150 |     ~90     |
+|                | Offline bw (MB) | Online bw (MB) |  LOC  | Runtime (s) |
+|:--------------:|:---------------:|:--------------:|:-----:|:-----------:|
+| PySyft (field) |        0        |      ~685      |  ~190 |     ~95     |
+|   C++ (field)  |       n/a       |      ~353      |  ~430 |     ~95     |
+|   Seq (field)  |      ~406       |      ~286      |  ~260 |     ~90     |
+| Sequre (field) |       n/a       |      ~258      |  ~150 |     ~90     |
+|   Seq (ring)   |       n/a       |       n/a      |  n/a  |     n/a     |
+| Sequre (ring)  |       n/a       |       n/a      |  n/a  |     n/a     |
 
 #### Internal stats
 
