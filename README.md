@@ -87,7 +87,7 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 | PySyft (field) |        0        |      ~685      |  ~190 |     ~95     |
 |   C++ (field)  |       n/a       |      ~353      |  ~430 |     ~95     |
 |   Seq (field)  |      ~406       |      ~286      |  ~260 |     ~90     |
-| Sequre (field) |       n/a       |      ~258      |  ~150 |     ~90     |
+| Sequre (field) |      ~406       |      ~258      |  ~150 |     ~89     |
 |   Seq (ring)   |       n/a       |       n/a      |  n/a  |     n/a     |
 | Sequre (ring)  |       n/a       |       n/a      |  n/a  |     n/a     |
 
