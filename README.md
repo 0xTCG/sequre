@@ -20,7 +20,7 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 |   C++ (field)  |       n/a       |      ~243      |  ~500 |     ~69     |
 |   Seq (field)  |      ~286       |      ~219      |  ~300 |     ~67     |
 | Sequre (field) |      ~286       |      ~193      |  ~80  |     ~61     |
-|   Seq (ring)   |       n/a       |       n/a      |  n/a  |     n/a     |
+|   Seq (ring)   |      ~286       |      ~219      |  ~300 |     ~39     |
 | Sequre (ring)  |       n/a       |       n/a      |  n/a  |     n/a     |
 
 #### Internal stats
@@ -41,7 +41,7 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 |   C++ (field)  |       n/a       |      ~85       | ~2000 |     ~64     |
 |   Seq (field)  |       ~115      |      ~83       | ~1000 |     ~58     |
 | Sequre (field) |       ~131      |      ~79       |  ~250 |     ~56     |
-|   Seq (ring)   |       ~115      |      ~83       |  ~250 |     ~14     |
+|   Seq (ring)   |       ~115      |      ~83       | ~1000 |     ~14     |
 | Sequre (ring)  |       n/a       |       n/a      |  n/a  |     n/a     |
 
 #### Internal stats
@@ -63,7 +63,7 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 |   C++ (field)  |       n/a       |      ~48       |  ~600 |    ~114     |
 |   Seq (field)  |      ~133       |      ~47       |  ~350 |     ~57     |
 | Sequre (field) |      ~135       |      ~47       |  ~100 |     ~57     |
-|   Seq (ring)   |       n/a       |       n/a      |  n/a  |     n/a     |
+|   Seq (ring)   |      ~133       |      ~47       |  ~350 |     ~54     |
 | Sequre (ring)  |       n/a       |       n/a      |  n/a  |     n/a     |
 
 #### Internal stats
