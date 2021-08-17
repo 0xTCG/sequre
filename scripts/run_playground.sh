@@ -14,7 +14,7 @@ fi
 cp $CP_OPTIONS dsl/* seq/stdlib/sequre/
 
 echo "Compiling playground ..."
-GC_INITIAL_HEAP_SIZE=1024000000 seq/build/seqc run -release client.seq test-all --test-run
+GC_INITIAL_HEAP_SIZE=1024000000 seq/build/seqc run -release client.seq test-all --test-run $1
 
 echo "Cleaning up sockets ..."
 find  . -name 'sock.*' -exec rm {} \;
