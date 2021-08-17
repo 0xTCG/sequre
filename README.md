@@ -41,7 +41,7 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 |   C++ (field)  |       n/a       |      ~85       | ~2000 |     ~64     |
 |   Seq (field)  |       ~115      |      ~83       | ~1000 |     ~58     |
 | Sequre (field) |       ~131      |      ~79       |  ~250 |     ~56     |
-|   Seq (ring)   |       n/a       |       n/a      |  n/a  |     n/a     |
+|   Seq (ring)   |       ~115      |      ~83       |  ~250 |     ~14     |
 | Sequre (ring)  |       n/a       |       n/a      |  n/a  |     n/a     |
 
 #### Internal stats
