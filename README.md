@@ -23,15 +23,13 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 |   Seq  |      ~286       |      ~219      |  ~300 |
 | Sequre |      ~286       |      ~193      |  ~80  |
 
-#### Performance stats
+#### Runtime stats (seconds)
 
-|                | Runtime (s) |
-|:--------------:|:-----------:|
-|   C++ (field)  |     ~69     |
-|   Seq (field)  |     ~67     |
-| Sequre (field) |     ~61     |
-|   Seq (ring)   |     ~39     |
-| Sequre (ring)  |     ~35     |
+|        | On field | On ring |
+|:------:|:--------:|:-------:|
+|   C++  |   ~69    |   n/a   |
+|   Seq  |   ~67    |   ~39   |
+| Sequre |   ~61    |   ~35   |
 
 #### Internal stats
 
@@ -54,15 +52,13 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 |   Seq  |       ~115      |      ~83       | ~1000 |
 | Sequre |       ~131      |      ~79       |  ~250 |
 
-#### Performance stats
+#### Runtime stats (seconds)
 
-|                | Runtime (s) |
-|:--------------:|:-----------:|
-|   C++ (field)  |     ~64     |
-|   Seq (field)  |     ~58     |
-| Sequre (field) |     ~56     |
-|   Seq (ring)   |     ~14     |
-| Sequre (ring)  |     ~12     |
+|        | On field | On ring |
+|:------:|:--------:|:-------:|
+|   C++  |   ~64    |   n/a   |
+|   Seq  |   ~58    |   ~14   |
+| Sequre |   ~56    |   ~12   |
 
 #### Internal stats
 
@@ -86,15 +82,13 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 |   Seq  |      ~133       |      ~47       |  ~350 |
 | Sequre |      ~135       |      ~47       |  ~100 |
 
-#### Performance stats
+#### Runtime stats (seconds)
 
-|                | Runtime (s) |
-|:--------------:|:-----------:|
-|   C++ (field)  |    ~114     |
-|   Seq (field)  |     ~57     |
-| Sequre (field) |     ~57     |
-|   Seq (ring)   |     ~54     |
-| Sequre (ring)  |     ~53     |
+|        | On field | On ring |
+|:------:|:--------:|:-------:|
+|   C++  |   ~114   |   n/a   |
+|   Seq  |   ~57    |   ~54   |
+| Sequre |   ~57    |   ~53   |
 
 #### Internal stats
 
@@ -121,16 +115,14 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 |   Seq  |      ~406       |      ~286      |  ~260 |
 | Sequre |      ~406       |      ~258      |  ~150 |
 
-#### Performance stats
+#### Runtime stats (seconds)
 
-|                | Runtime (s) |
-|:--------------:|:-----------:|
-| PySyft (field) |     ~95     |
-|   C++ (field)  |     ~95     |
-|   Seq (field)  |     ~90     |
-| Sequre (field) |     ~89     |
-|   Seq (ring)   |     ~21     |
-| Sequre (ring)  |     ~20     |
+|        | On field | On ring |
+|:------:|:--------:|:-------:|
+| PySyft |   n/a    |   ~95   |
+|   C++  |   ~95    |   n/a   |
+|   Seq  |   ~90    |   ~21   |
+| Sequre |   ~89    |   ~20   |
 
 #### Internal stats
 
