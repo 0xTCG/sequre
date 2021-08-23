@@ -28,8 +28,8 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 |        | On field | On ring |
 |:------:|:--------:|:-------:|
 |   C++  |   ~69    |   n/a   |
-|   Seq  |   ~59    |   ~38   |
-| Sequre |   ~55    |   ~34   |
+|   Seq  |   ~54    |   ~38   |
+| Sequre |   ~49    |   ~34   |
 
 #### Internal stats
 
@@ -57,8 +57,8 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 |        | On field | On ring |
 |:------:|:--------:|:-------:|
 |   C++  |   ~64    |   n/a   |
-|   Seq  |   ~50    |   ~13   |
-| Sequre |   ~48    |   ~11   |
+|   Seq  |   ~39    |   ~12   |
+| Sequre |   ~37    |   ~11   |
 
 #### Internal stats
 
@@ -87,8 +87,8 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 |        | On field | On ring |
 |:------:|:--------:|:-------:|
 |   C++  |   ~114   |   n/a   |
-|   Seq  |   ~49    |   ~48   |
-| Sequre |   ~49    |   ~48   |
+|   Seq  |   ~46    |   ~46   |
+| Sequre |   ~47    |   ~47   |
 
 #### Internal stats
 
@@ -121,8 +121,8 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 |:------:|:--------:|:-------:|
 | PySyft |   n/a    |   ~95   |
 |   C++  |   ~95    |   n/a   |
-|   Seq  |   ~78    |   ~19   |
-| Sequre |   ~77    |   ~18   |
+|   Seq  |   ~62    |   ~20   |
+| Sequre |   ~60    |   ~18   |
 
 #### Internal stats
 
