@@ -9,6 +9,7 @@ from fp import fp_div, fp_sqrt
 
 
 TP = int_t
+NO_CACHE = False
 
 
 class Internal:
@@ -17,11 +18,7 @@ class Internal:
         r = list[TP](len(x_))
 
         for sn in x_:
-            if not sn.is_partitioned():
-                sn.set_partitions(
-                    mpc.arithmetic.__beaver_partition(sn.share, sn.modulus))
-            
-            x_r_, r_ = sn.get_partitions()
+            x_r_, r_ = sn.get_partitions(mpc)
             x_r.append(x_r_)
             r.append(r_)
 
@@ -102,20 +99,28 @@ class Internal:
             return sv
 
     def secure_mult_no_cache(mpc, x_, y_):
-        assert x_.modulus == y_.modulus
-        modulus = x_.modulus
-        x = x_.share
-        y = y_.share
+        if isinstance(y_, float):
+            y_fp = double_to_fp(y_, x_.modulus)
+            sv = x_ * y_fp
+            # TODO: #117 Implement clever joint truncations pattern matcher
+            if x_.is_fp(): sv = sv.trunc(mpc.fp)
+            sv.fp = True
+            return sv
+        else:
+            assert x_.modulus == y_.modulus
+            modulus = x_.modulus
+            x = x_.share
+            y = y_.share
 
-        c = mpc.arithmetic.multiply(x, y, modulus)
+            c = mpc.arithmetic.multiply(x, y, modulus)
 
-        if x_.is_fp() and x_.is_fp():
-            c = mpc.fp.trunc(c, modulus)
+            if x_.is_fp() and y_.is_fp():
+                c = mpc.fp.trunc(c, modulus)
 
-        sv = SharedTensor[typeof(c)](c, modulus)
-        sv.fp = x_.is_fp() or y_.is_fp()
+            sv = SharedTensor[typeof(c)](c, modulus)
+            sv.fp = x_.is_fp() or y_.is_fp()
 
-        return sv
+            return sv
 
     def secure_pow(mpc, x_, p):
         modulus = x_.modulus
@@ -125,11 +130,10 @@ class Internal:
             return Internal.secure_pow_no_cache(mpc, x_, p)
 
         if p >= len(x_.pows):
-            if not x_.is_partitioned():
-                x_.set_partitions(mpc.arithmetic.__beaver_partition(x_.share, modulus))
+            x_r, r = x_.get_partitions(mpc)
 
             pows = mpc.polynomial.powers_cached(
-                x_.x_r, x_.r, p, modulus)
+                x_r, r, p, modulus)
             for i in range(len(x_.pows), len(pows)):
                 x_.pows.append(pows[i])
         
@@ -158,7 +162,9 @@ class Internal:
         # TODO: #26 Currently does not work for complex algebraic structures.
         # Resolve issue #26 and change code below in order to fix this.
         if isinstance(y, float):
-            return (x.to_fp() * double_to_fp(1.0 / y, x.modulus)).trunc(mpc.fp)
+            sv = x * double_to_fp(1.0 / y, x.modulus)
+            if x.is_fp(): sv = sv.trunc(mpc.fp)
+            return sv
         elif isinstance(y, int) or isinstance(y, TP):
             denom = double_to_fp(1.0 / y, x.modulus) if x.is_fp() else mod_inv(y, x.modulus)
             sv = x * denom
@@ -167,7 +173,7 @@ class Internal:
         else:
             # TODO: Efficiently calculate beaver partitions of sv here
             return fp_div(mpc, x, y)
-
+    
     def secure_gt(mpc, x, y):
         # TODO: #26 Currently does not work for complex algebraic structures.
         # Resolve issue #26 and change code below in order to fix this.
@@ -225,15 +231,13 @@ class Internal:
         else:
             assert x.modulus == y.modulus
             modulus = x.modulus
-            if not x.is_partitioned():
-                x.set_partitions(mpc.arithmetic.__beaver_partition(x.share, modulus))
-
-            x_1_r, r_1 = x.get_partitions()
+            
+            x_1_r, r_1 = x.get_partitions(mpc)
             x_2_r, r_2 = mpc.arithmetic.__beaver_partition(y.sqrt_inv, modulus)
             
             c = mpc.arithmetic.__beaver_mult(x_1_r, r_1, x_2_r, r_2, modulus)
             c = mpc.arithmetic.__beaver_reconstruct(c, modulus)
-            c = mpc.fp.trunc(c, modulus)
+            if x.is_fp(): c = mpc.fp.trunc(c, modulus)
             
             sv = SharedTensor[typeof(c)](c, modulus)
             sv.fp = True
@@ -246,16 +250,23 @@ class Internal:
             return sv
 
     def secure_sqrt_inv_no_cache(mpc, x, y):
-        assert x.modulus == y.modulus
-        modulus = x.modulus
-
         # TODO: #26 Currently does not work for complex algebraic structures.
         sqrt_inv = fp_sqrt(mpc, y)[1].share
+        
+        if isinstance(x, int):
+            sv = SharedTensor[typeof(sqrt_inv)](sqrt_inv, y.modulus)
+            sv.fp = True
+            return sv * x
+        else:
+            assert x.modulus == y.modulus
+            modulus = x.modulus
 
-        result = mpc.arithmetic.multiply(x.share, sqrt_inv, modulus)
-        result = mpc.fp.trunc(result, modulus)
-
-        return SharedTensor[typeof(result)](result, modulus)
+            result = mpc.arithmetic.multiply(x.share, sqrt_inv, modulus)
+            if x.is_fp(): result = mpc.fp.trunc(result, modulus)
+            sv = SharedTensor[typeof(result)](result, modulus)
+            sv.fp = True
+            
+            return sv
 
     def secure_reveal(mpc, e):
         modulus = e.modulus
@@ -273,13 +284,8 @@ class Internal:
         assert x.modulus == y.modulus
         modulus = x.modulus
 
-        if not x.is_partitioned():
-            x.set_partitions(mpc.arithmetic.__beaver_partition(x.share, modulus))
-        if not y.is_partitioned():
-            y.set_partitions(mpc.arithmetic.__beaver_partition(y.share, modulus))
-        
-        x_1_r, r_1 = x.get_partitions()
-        x_2_r, r_2 = y.get_partitions()
+        x_1_r, r_1 = x.get_partitions(mpc, force=NO_CACHE)
+        x_2_r, r_2 = y.get_partitions(mpc, force=NO_CACHE)
 
         c = mpc.arithmetic.__beaver_dot_prod(x_1_r, r_1, x_2_r, r_2, modulus)
         c = mpc.arithmetic.__beaver_reconstruct(c, modulus)
@@ -304,8 +310,8 @@ class Internal:
         assert x.modulus == y.modulus
         modulus = x.modulus
 
-        x_1_r, r_1 = x.get_partitions(mpc)
-        x_2_r, r_2 = y.get_partitions(mpc)
+        x_1_r, r_1 = x.get_partitions(mpc, force=NO_CACHE)
+        x_2_r, r_2 = y.get_partitions(mpc, force=NO_CACHE)
 
         c = mpc.arithmetic.__beaver_matmul(x_1_r, r_1, x_2_r, r_2, modulus)
         c = mpc.arithmetic.__beaver_reconstruct(c, modulus)
@@ -337,7 +343,7 @@ class Internal:
     def sqrt(mpc, x):
         # TODO: #26 Currently does not work for complex algebraic structures.
         # Resolve issue #26 and change code below in order to fix this.
-        if not x.sqrt:
+        if not x.sqrt or NO_CACHE:
             s, sinv = fp_sqrt(mpc, x)
             x.sqrt, x.sqrt_inv = s.share, sinv.share
         
@@ -345,9 +351,6 @@ class Internal:
         sv.fp = True
         # TODO: #23 Efficiently calculate beaver partitions of sv here
         return sv
-
-    def sqrt_no_cache(mpc, x):
-        return fp_sqrt(mpc, x)[0]
 
     def broadcast(mpc, value):
         value.share = mpc.comms.broadcast(value.share, value.modulus)
