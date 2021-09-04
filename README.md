@@ -17,11 +17,12 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 
 #### Performance stats
 
-|        | Offline bw (MB) | Online bw (MB) |  LOC  | Field runtime (s) | Ring runtime (s) |
-|:------:|:---------------:|:--------------:|:-----:|:-----------------:|:----------------:|
-|   C++  |       n/a       |      ~243      |  ~500 |        ~69        |        n/a       |
-|   Seq  |      ~286       |      ~219      |  ~300 |        ~54        |        ~38       |
-| Sequre |      ~286       |      ~193      |  ~80  |        ~49        |        ~34       |
+|                 | Offline bw (MB) | Online bw (MB) |  LOC  | Field runtime (s) | Ring runtime (s) |
+|:---------------:|:---------------:|:--------------:|:-----:|:-----------------:|:----------------:|
+| Sequre (no opt) |      ~286       |      ~221      |  ~80  |        ~64        |        ~39       |
+|       C++       |       n/a       |      ~243      |  ~500 |        ~69        |        n/a       |
+|       Seq       |      ~286       |      ~219      |  ~300 |        ~53        |        ~38       |
+|     Sequre      |      ~286       |      ~193      |  ~80  |        ~49        |        ~34       |
 
 #### Internal stats
 
@@ -38,11 +39,12 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 
 #### Performance stats
 
-|        | Offline bw (MB) | Online bw (MB) |  LOC  | Field runtime (s) | Ring runtime (s) |
-|:------:|:---------------:|:--------------:|:-----:|:-----------------:|:----------------:|
-|   C++  |       n/a       |      ~85       | ~2000 |        ~64        |        n/a       |
-|   Seq  |       ~115      |      ~83       | ~1000 |        ~39        |        ~12       |
-| Sequre |       ~131      |      ~79       |  ~250 |        ~37        |        ~11       |
+|                 | Offline bw (MB) | Online bw (MB) |  LOC  | Field runtime (s) | Ring runtime (s) |
+|:---------------:|:---------------:|:--------------:|:-----:|:-----------------:|:----------------:|
+| Sequre (no opt) |       ~131      |      ~523      |  ~250 |        ~87        |        ~21       |
+|       C++       |       n/a       |      ~85       | ~2000 |        ~64        |        n/a       |
+|       Seq       |       ~115      |      ~83       | ~1000 |        ~39        |        ~12       |
+|     Sequre      |       ~131      |      ~79       |  ~250 |        ~37        |        ~11       |
 
 #### Internal stats
 
@@ -60,11 +62,12 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 
 #### Performance stats
 
-|        | Offline bw (MB) | Online bw (MB) |  LOC  | Field runtime (s) | Ring runtime (s) |
-|:------:|:---------------:|:--------------:|:-----:|:-----------------:|:----------------:|
-|   C++  |       n/a       |      ~48       |  ~600 |        ~114       |        n/a       |
-|   Seq  |      ~133       |      ~47       |  ~350 |        ~46        |        ~46       |
-| Sequre |      ~135       |      ~47       |  ~100 |        ~47        |        ~47       |
+|                 | Offline bw (MB) | Online bw (MB) |  LOC  | Field runtime (s) | Ring runtime (s) |
+|:---------------:|:---------------:|:--------------:|:-----:|:-----------------:|:----------------:|
+| Sequre (no opt) |      ~135       |      ~49       |  ~100 |        ~59        |        ~58       |
+|       C++       |       n/a       |      ~48       |  ~600 |        ~114       |        n/a       |
+|       Seq       |      ~133       |      ~47       |  ~350 |        ~46        |        ~46       |
+|     Sequre      |      ~135       |      ~47       |  ~100 |        ~47        |        ~47       |
 
 #### Internal stats
 
@@ -84,12 +87,13 @@ See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=
 
 #### Performance stats
 
-|        | Offline bw (MB) | Online bw (MB) |  LOC  | Field runtime (s) | Ring runtime (s) |
-|:------:|:---------------:|:--------------:|:-----:|:-----------------:|:----------------:|
-| PySyft |        0        |      ~685      |  ~190 |         n/a       |         ~95      |
-|   C++  |       n/a       |      ~353      |  ~430 |         ~95       |         n/a      |
-|   Seq  |      ~406       |      ~286      |  ~260 |         ~62       |         ~20      |
-| Sequre |      ~406       |      ~258      |  ~150 |         ~60       |         ~18      |
+|                 | Offline bw (MB) | Online bw (MB) |  LOC  | Field runtime (s) | Ring runtime (s) |
+|:---------------:|:---------------:|:--------------:|:-----:|:-----------------:|:----------------:|
+| Sequre (no opt) |      ~672       |      ~419      |  ~150 |         ~140      |         ~35      |
+|      PySyft     |        0        |      ~685      |  ~190 |         n/a       |         ~95      |
+|       C++       |       n/a       |      ~353      |  ~430 |         ~95       |         n/a      |
+|       Seq       |      ~406       |      ~286      |  ~260 |         ~62       |         ~20      |
+|     Sequre      |      ~406       |      ~258      |  ~150 |         ~60       |         ~18      |
 
 #### Internal stats
 
