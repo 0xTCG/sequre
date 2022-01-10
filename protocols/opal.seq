@@ -1,9 +1,11 @@
 from bio.fasta import FASTA
 from bio.kmer import Kmer
+from sequre.stdlib.logireg import logireg, predict
 from sequre.types.shared_tensor import SharedTensor as Stensor
 from sequre.stdlib.internal import Internal as sq
 from sequre.stdlib.builtin import argmax
 from sequre.utils.utils import zeros, zeros_vec
+from sequre.types.utils import double_to_fp
 from sequre.types.builtin import *
 from sequre.attributes import *
 import random
@@ -48,27 +50,47 @@ def gen_features(pattern_getters, sequence):
     return features
 
 
-def centroid_skms(frag_generator, taxid_path, patterns_path):
-    # Read in the pattern file
+def skms(frag_generator, patterns, dico):
+    for sequence, label in frag_generator:
+        feature_list = gen_features(patterns, sequence)
+        feature_list.extend(gen_features(patterns, ~sequence))
+        yield dico[label], feature_list
+
+
+def get_patterns_and_dico(patterns_path, taxid_path):
     patterns = []
     with open(patterns_path, 'r') as pattern_file:
         for pattern in pattern_file:
             patterns.append([int(e) for e in pattern.split()])
-
+    
     labels = list(int(label.strip()) for label in open(taxid_path, 'r'))
     labels_set = set(labels)
     dico = {v: i for i, v in enumerate(labels_set)}
 
+    return patterns, dico, labels_set
+
+
+def centroid_skms(frag_generator, taxid_path, patterns_path):
+    # Read in the pattern file
+    patterns, dico, labels_set = get_patterns_and_dico(patterns_path, taxid_path)
+
     all_features = zeros[int](len(labels_set), patterns.shape()[0] * 2)
     features_count = zeros_vec[int](len(labels_set))
-
-    for sequence, label in frag_generator:
-        feature_list = gen_features(patterns, sequence)
-        feature_list.extend(gen_features(patterns, ~sequence))
-        all_features[dico[label]] += [hmap(feature) for feature in feature_list]
-        features_count[dico[label]] += 1
+    
+    for label, feature_list in skms(frag_generator, patterns, dico):
+        all_features[label] += [hmap(feature) for feature in feature_list]
+        features_count[label] += 1
     
     return all_features // features_count, {v: k for k, v in dico.items()}
+
+
+def share_centroids(mpc, frag_generator, taxid_path, patterns_path, modulus):
+    centroid_skm, dico = centroid_skms(
+        frag_generator=frag_generator,
+        taxid_path=taxid_path,
+        patterns_path=patterns_path)
+    
+    return Stensor(mpc.comms.share(centroid_skm.to_int_t(), modulus), modulus), dico
 
 
 def share_data(mpc, input_path, taxid_path, patterns_path, target_coverage, modulus):
@@ -77,13 +99,59 @@ def share_data(mpc, input_path, taxid_path, patterns_path, target_coverage, modu
     New mean will be sum_i(M_i \cdot c_i) / sum_i(c_i)
     where for i-th client, M_i is the mean and c_i is the count of features per label.
     '''
+    patterns, dico, _ = get_patterns_and_dico(patterns_path, taxid_path)
     frag_generator = drawfrag(input_path, taxid_path, target_coverage)
-    centroid_skm, dico = centroid_skms(
-        frag_generator=frag_generator,
-        taxid_path=taxid_path,
-        patterns_path=patterns_path)
+
+    X_positive = []
+    y_positive = []
+    X_negative = []
+    y_negative = []
+    count_positives = 0
+    count_negatives = 0
+
+    for label, features in skms(frag_generator, patterns, dico):
+        if int(label) == 1:
+            count_positives += 1
+            X_positive.append(features)
+            y_positive.append(1)
+        else:
+            count_negatives += 1
+            X_negative.append(features)
+            y_negative.append(-1)
+
+    assert count_positives > 0
+    assert count_negatives > 0
+    assert count_negatives > count_positives
     
-    return Stensor(mpc.comms.share(centroid_skm.to_int_t(), modulus), modulus), dico
+    neg_data = list(zip(X_negative, y_negative))
+    test_element = neg_data[0]
+    random.shuffle(neg_data)
+    assert neg_data[0] != test_element
+    neg_data = neg_data[:count_positives]
+
+    data = list(zip(X_positive, y_positive))
+    for e in neg_data: data.append(e)
+    test_element = data[0]
+    random.shuffle(data)
+    assert data[0] != test_element
+
+    X = []
+    y = []
+    for features, label in data:
+        hashed_features = [hmap(feature) for feature in features]
+        hashed_features.append(1)
+        assert hashed_features[-1] == 1
+        X.append(hashed_features)
+        y.append(label)
+    
+    sv_x = Stensor(mpc.comms.share(X.to_int_t(), modulus), modulus)
+    sv_x.fp = True
+    sv_x.get_partitions(mpc)
+    sv_y = Stensor(mpc.comms.share(y.to_int_t(), modulus), modulus)
+    sv_y.fp = True
+    sv_y.get_partitions(mpc)
+
+    return sv_x, sv_y, dico
 
 
 def load_test_features(mpc, input_path, patterns_path, modulus):
@@ -100,17 +168,13 @@ def load_test_features(mpc, input_path, patterns_path, modulus):
         feature_list.extend(gen_features(patterns, ~record.seq))
         all_features.append([hmap(feature) for feature in feature_list])
     
-    return Stensor(mpc.comms.share(all_features.to_int_t(), modulus), modulus)
+    sv = Stensor(mpc.comms.share(all_features.to_int_t(), modulus), modulus)
+    sv.fp = True
+
+    return sv
 
 
-def opal_protocol(mpc, test_run, modulus):
-    # TODO: Make the params configurable
-    input_path = 'data/opal/A1.train.fasta'
-    taxid_path = 'data/opal/A1.train.taxid'
-    patterns_path = 'data/opal/patterns.txt'
-    test_input_path = 'data/opal/test.fragments.fasta'
-    target_coverage = 5 # 0.5
-    
+def opal_via_lsh(mpc, input_path, taxid_path, patterns_path, target_coverage, test_input_path, modulus):    
     # Data sharing should be done apriori in a real-world scenario
     if mpc.pid == 2: print('Sharing data ...')
     bins_centroids, dico = share_data(
@@ -141,3 +205,53 @@ def opal_protocol(mpc, test_run, modulus):
         predictions[i] = argmax(mpc, sq.dot(mpc, bins_centroids))
     
     return predictions, dico
+
+def opal_via_logireg(mpc, input_path, taxid_path, patterns_path, target_coverage, test_input_path, modulus):
+    # Data sharing should be done apriori in a real-world scenario
+    if mpc.pid == 2: print('Sharing data ...')
+    X, y, dico = share_data(
+        mpc=mpc,
+        input_path=input_path,
+        taxid_path=taxid_path,
+        patterns_path=patterns_path,
+        target_coverage=target_coverage,
+        modulus=modulus)
+    relu_alpha = 0.1  # Stensor(mpc.comms.share(double_to_fp(0.1, modulus), modulus), modulus)
+    relu_beta = 0.1  # Stensor(mpc.comms.share(double_to_fp(0.1, modulus), modulus), modulus)
+    step_size = 0.01  # Stensor(mpc.comms.share(double_to_fp(0.01, modulus), modulus), modulus)
+    # relu_alpha.fp = True
+    # relu_beta.fp = True
+    # step_size.fp = True
+    
+    if mpc.pid == 2: print(f'Training model ... Input size: {X.shape()}')
+    
+    logireg_weights = logireg(
+        mpc=mpc,
+        X=X,
+        y=y,
+        eta=step_size,
+        epochs=10,
+        relu_alpha=relu_alpha,
+        relu_beta=relu_beta)
+    
+    # Test features should be shared in apriori in a real-world scenario
+    if mpc.pid == 2: print('Loading test features ...')
+    test_features = load_test_features(
+        mpc=mpc,
+        input_path=test_input_path,
+        patterns_path=patterns_path,
+        modulus=modulus)
+
+    if mpc.pid == 2: print('Calculating predictions ...')
+    return predict(mpc, test_features, logireg_weights, relu_alpha, relu_beta), dico
+
+
+def opal_protocol(mpc, test_run, modulus):
+    # TODO: Make the params configurable
+    input_path = 'data/opal/A1.train.fasta'
+    taxid_path = 'data/opal/A1.train.taxid'
+    patterns_path = 'data/opal/patterns.txt'
+    test_input_path = 'data/opal/test.fragments.fasta'
+    target_coverage = 0.1
+
+    return opal_via_logireg(mpc, input_path, taxid_path, patterns_path, target_coverage, test_input_path, modulus)
