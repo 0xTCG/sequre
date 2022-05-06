@@ -11,19 +11,31 @@ RANK = {
     'T': 4
 }
 
+SEQAN_HASH_SEEDS = [
+    13572355802537770549u,  # 2**64 / (e/2)
+    13043817825332782213u,  # 2**64 / sqrt(2)
+    10650232656628343401u,  # 2**64 / sqrt(3)
+    16499269484942379435u,  # 2**64 / (sqrt(5)/2)
+    4893150838803335377u    # 2**64 / (3*pi/5)
+]
+
 class FilterConfig:
     ibf: list[int]
     map: dict[int, int]
     rel_cutoff: float
     abs_cutoff: float
     bin_count: int
+    hash_count: int
+    bin_size: u64
 
-    def __init__(self, ibf_path, map_path, rel_cutoff, abs_cutoff, bin_count):
+    def __init__(self, ibf_path, map_path, rel_cutoff, abs_cutoff, bin_count, hash_count):
         self.ibf = FilterConfig.load_ibf(ibf_path, bin_count)
         self.map = FilterConfig.load_map(map_path)
         self.rel_cutoff = rel_cutoff
         self.abs_cutoff = abs_cutoff
         self.bin_count = bin_count
+        self.hash_count = hash_count
+        self.bin_size = u64(len(self.ibf))
     
     def load_ibf(ibf_path, bin_count):
         bytes_per_bin = (bin_count + 7) // 8
@@ -40,6 +52,7 @@ class FilterConfig:
                 
                 next_value <<= 8
                 next_value += ord(next_byte)
+                bytes_count += 1
                 
                 if bytes_count == bytes_per_bin:
                     ibf.append(next_value)
@@ -55,7 +68,7 @@ class FilterConfig:
             count = 0
             for line in f:
                 target = line.strip()
-                map_dict[int(target)] = count
+                map_dict[count] = int(target)
                 count += 1
         
         return map_dict
@@ -113,9 +126,9 @@ def seqan_ungapped_kmer_hash(seq):
     for kmer in seq.kmers(1, k=19):
         yield _seqan_kmer_hash(kmer)
 
-def seqan_ungapped_minimizer_hash(seq):  # Seed taken from official SeqAn documentation for minimiser_hash
+def seqan_ungapped_minimizer_hash(seq):
     window_size = 0
-    seed=0x8F3F73B5CF1C9ADE
+    seed=0x8F3F73B5CF1C9ADE  # Seed taken from official SeqAn documentation for minimiser_hash
     
     for window in seq.split(window_size, 1):
         kmers = list(window.kmers(1, k=19))
@@ -136,15 +149,16 @@ def seqan_ungapped_minimizer_hash(seq):  # Seed taken from official SeqAn docume
 def get_hashes(seq, window_size, offset):
     if window_size > 0:
         # minimizers
-        hashes_f = seqan_ungapped_minimizer_hash(seq)
-        return hashes_f, hashes_f
+        # hashes_f = seqan_ungapped_minimizer_hash(seq)
+        # return hashes_f, hashes_f
+        raise NotImplementedError('Offset not implemented')
 
     if offset > 1:
         # offset
         raise NotImplementedError('Offset not implemented')
     
     # kmer
-    return seqan_ungapped_kmer_hash(seq), seqan_ungapped_kmer_hash(~seq) 
+    return list(seqan_ungapped_kmer_hash(seq)), list(seqan_ungapped_kmer_hash(~seq))
 
 def get_threshold_filter(hierarchy_config, kmers, max_kmer_count_read, kmer_size, offset):
     threshold_filter = 0
@@ -168,7 +182,7 @@ def filter_matches(read_name, matches, threshold_filter):
     return read_out
 
 def bit_decompose(bin_query, number_of_bits):
-    return [int(bin_query & (1 << i)) for i in range(number_of_bits)]
+    return [int(bool(bin_query & (1 << i))) for i in range(number_of_bits)]
 
 def transpose(mat):
     rows, cols = len(mat), len(mat[0])
@@ -182,8 +196,26 @@ def transpose(mat):
 
     return new_mat
 
-def bulk_count(ibf, hashes_f, bin_count):
-    bin_queries = transpose([bit_decompose(ibf[hash_f], bin_count) for hash_f in hashes_f])
+def seqan_ibf_hash(value, seed, bin_size):
+    hash_shift = 47u  # Hardcoded for now: the number of leading zeros in bin_size
+    value *= seed
+    assert hash_shift < 64u
+    value ^= value >> hash_shift  # XOR and shift higher bits into lower bits
+    value *= 11400714819323198485u  # = 2^64 / golden_ration, to expand h to 64 bit range
+    value %= bin_size
+    # value *= 64  # Hardcoded for now: the number of technical bins
+    return int(value)
+
+def query_ibf(ibf, hash_f, ibf_hash_count, ibf_bin_size):
+    query_result = -1
+
+    for i in range(ibf_hash_count):
+        query_result &= ibf[seqan_ibf_hash(u64(hash_f), SEQAN_HASH_SEEDS[i], ibf_bin_size)]
+    
+    return query_result
+
+def bulk_count(ibf, hashes_f, bin_count, ibf_hash_count, ibf_bin_size):
+    bin_queries = transpose([bit_decompose(query_ibf(ibf, hash_f, ibf_hash_count, ibf_bin_size), bin_count) for hash_f in hashes_f])
     return [sum(row) for row in bin_queries]
 
 def classify(
@@ -209,15 +241,21 @@ def classify(
             # Count hashes from first pair
             hashes_f, hashes_r = get_hashes(
                 read.read,
-                hierarchy_config["kmer_size"],
+                hierarchy_config["window_size"],
                 hierarchy_config["offset"])
             kmers = len(read.read) - hierarchy_config["kmer_size"] + 1
 
             # For each filter in the hierarchy
             for filter_config in filters_configs:
                 # count matches
-                counts_f = bulk_count(filter_config.ibf, hashes_f, filter_config.bin_count)
-                counts_r = bulk_count(filter_config.ibf, hashes_r, filter_config.bin_count)
+                counts_f = bulk_count(
+                    filter_config.ibf, hashes_f,
+                    filter_config.bin_count, filter_config.hash_count,
+                    filter_config.bin_size)
+                counts_r = bulk_count(
+                    filter_config.ibf, hashes_r,
+                    filter_config.bin_count, filter_config.hash_count,
+                    filter_config.bin_size)
 
                 # Calculate threshold for cutoff (keep matches above)
                 threshold_cutoff = 0.0
@@ -229,7 +267,7 @@ def classify(
                         filter_config.abs_cutoff,
                         hierarchy_config["kmer_size"],
                         hierarchy_config["offset"],)
-
+                            
                 # select matches based on threshold cutoff
                 max_kmer_count_read = select_matches(
                     matches, counts_f, counts_r, filter_config.map, threshold_cutoff, max_kmer_count_read)
@@ -256,7 +294,6 @@ def classify(
             # read classified, continue to the next
             continue;
 
-        # not classified
         unclassified_reads.append(read)
 
     return classified_reads, unclassified_reads
@@ -303,7 +340,11 @@ parsed_hierarchy = {
     }
 
 filter_config = FilterConfig(
-    "data/ganon/ibf.bin", "data/ganon/ibf_map.txt", 0.25, 0.0, 63)
+    ibf_path="data/ganon/ibf.bin",
+    map_path="data/ganon/ibf_map.txt",
+    rel_cutoff=0.25,
+    abs_cutoff=0.0,
+    bin_count=63,
+    hash_count=3)
 
 run(parsed_hierarchy, [filter_config], 'data/ganon/bac.sim.1.fq')
-print('Done')
