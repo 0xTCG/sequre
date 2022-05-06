@@ -1,0 +1,309 @@
+import math
+
+from bio.fastq import FASTQ
+
+
+RANK = {
+    'A': 0,
+    'C': 1,
+    'G': 2,
+    'N': 3,
+    'T': 4
+}
+
+class FilterConfig:
+    ibf: list[int]
+    map: dict[int, int]
+    rel_cutoff: float
+    abs_cutoff: float
+    bin_count: int
+
+    def __init__(self, ibf_path, map_path, rel_cutoff, abs_cutoff, bin_count):
+        self.ibf = FilterConfig.load_ibf(ibf_path, bin_count)
+        self.map = FilterConfig.load_map(map_path)
+        self.rel_cutoff = rel_cutoff
+        self.abs_cutoff = abs_cutoff
+        self.bin_count = bin_count
+    
+    def load_ibf(ibf_path, bin_count):
+        bytes_per_bin = (bin_count + 7) // 8
+        bytes_count = 0
+        next_value = 0
+        ibf = []
+        
+        with open(ibf_path, 'rb') as f:
+            while True:
+                next_byte = f.read(1)
+                
+                if not next_byte:
+                    break
+                
+                next_value <<= 8
+                next_value += ord(next_byte)
+                
+                if bytes_count == bytes_per_bin:
+                    ibf.append(next_value)
+                    bytes_count = 0
+                    next_value = 0
+
+        return ibf
+
+    def load_map(map_path):
+        map_dict = {}
+        
+        with open(map_path) as f:
+            count = 0
+            for line in f:
+                target = line.strip()
+                map_dict[int(target)] = count
+                count += 1
+        
+        return map_dict
+
+class ReadOut:
+    read_name: str
+    matches: list[tuple[int, int]]
+
+    def __init__(self, read_name):
+        self.read_name = read_name
+        self.matches = list[tuple[int, int]]()
+
+def threshold_abs(kmers, e, k, o):
+    return int(math.ceil(kmers - ( e * k ) / o)) if (kmers * o > e * k) else 0
+
+def threshold_rel(kmers, p):
+    return int(math.ceil(kmers * p))
+
+def get_abs_error(kmers, k, o, count):
+    return int(math.ceil(o * (-count + kmers) / k))
+
+def select_matches(matches, counts_f, counts_r, filter_map, threshold_cutoff, max_kmer_count_read):
+    # reset low threshold_cutoff to just one kmer (0 would match everywhere)
+    if threshold_cutoff == 0:
+        threshold_cutoff = 1
+
+    # for each bin
+    # for ( uint32_t bin_n = 0; bin_n < filter.ibf.noOfBins; ++bin_n )
+    # loop in map structure to avoid extra validations when map.size() < filter.ibf.noOfBins when ibf is updated and
+    # sequences removed also avoid the error of spurius results from empty bins (bug reported)
+    for bin_n, target in filter_map.items():
+        # if kmer count is higher than threshold_cutoff
+        if counts_f[bin_n] >= threshold_cutoff or counts_r[bin_n] >= threshold_cutoff:
+            # get best matching strand
+            max_kmer_count_bin = max(counts_f[bin_n], counts_r[bin_n])
+            # keep only the best match target/read when same targets are split in several bins
+            if target not in matches or max_kmer_count_bin > matches[target]:
+                # store match to target
+                matches[target] = max_kmer_count_bin;
+                if max_kmer_count_bin > max_kmer_count_read:
+                    max_kmer_count_read = max_kmer_count_bin
+    
+    return max_kmer_count_read
+
+def _seqan_kmer_hash(kmer, sigma=5):  # sigma is the size of the alphabeth -- 5 in case of SeqAn's IBF (A,C,G,N,T)
+    hash_value = 0
+
+    for nucleotide in str(kmer):
+        hash_value *= sigma
+        hash_value += RANK[nucleotide]
+    
+    return hash_value
+
+def seqan_ungapped_kmer_hash(seq):
+    for kmer in seq.kmers(1, k=19):
+        yield _seqan_kmer_hash(kmer)
+
+def seqan_ungapped_minimizer_hash(seq):  # Seed taken from official SeqAn documentation for minimiser_hash
+    window_size = 0
+    seed=0x8F3F73B5CF1C9ADE
+    
+    for window in seq.split(window_size, 1):
+        kmers = list(window.kmers(1, k=19))
+        kmers.extend(list((~window).kmers(1, k=19)))
+
+        hashes = [_seqan_kmer_hash(kmer) for kmer in kmers]
+        hashes_pertubed = [hash ^ seed for hash in hashes]
+
+        min_hash_idx = 0
+        min_hash_pertubed = hashes_pertubed[0]
+        for i, hash_pertubed in enumerate(hashes_pertubed):
+            if hash_pertubed < min_hash_pertubed:
+                min_hash_idx = i
+                min_hash_pertubed = hashes_pertubed[i]
+        
+        yield hashes[min_hash_idx]
+
+def get_hashes(seq, window_size, offset):
+    if window_size > 0:
+        # minimizers
+        hashes_f = seqan_ungapped_minimizer_hash(seq)
+        return hashes_f, hashes_f
+
+    if offset > 1:
+        # offset
+        raise NotImplementedError('Offset not implemented')
+    
+    # kmer
+    return seqan_ungapped_kmer_hash(seq), seqan_ungapped_kmer_hash(~seq) 
+
+def get_threshold_filter(hierarchy_config, kmers, max_kmer_count_read, kmer_size, offset):
+    threshold_filter = 0
+    if hierarchy_config["rel_filter"] >= 0:
+        threshold_filter = max_kmer_count_read - threshold_rel(max_kmer_count_read, hierarchy_config["rel_filter"])
+    elif hierarchy_config["abs_filter"] >= 0:
+        # get maximum possible number of errors of best match + abs_filter
+        max_error_threshold = get_abs_error( kmers, kmer_size, offset, max_kmer_count_read ) + hierarchy_config["abs_filter"]
+        # get min kmer count necesary to achieve the calculated number of errors
+        threshold_filter = threshold_abs( kmers, max_error_threshold, kmer_size, offset)
+
+    return threshold_filter
+
+def filter_matches(read_name, matches, threshold_filter):
+    read_out = ReadOut(read_name)
+    
+    for target, kmer_count in matches.items():
+        if kmer_count >= threshold_filter:
+            read_out.matches.append((target, kmer_count))
+
+    return read_out
+
+def bit_decompose(bin_query, number_of_bits):
+    return [int(bin_query & (1 << i)) for i in range(number_of_bits)]
+
+def transpose(mat):
+    rows, cols = len(mat), len(mat[0])
+    new_mat = list[list[int]](cols)
+
+    for i in range(cols):
+        row = list[int](rows)
+        for j in range(rows):
+            row.append(mat[j][i])
+        new_mat.append(row)
+
+    return new_mat
+
+def bulk_count(ibf, hashes_f, bin_count):
+    bin_queries = transpose([bit_decompose(ibf[hash_f], bin_count) for hash_f in hashes_f])
+    return [sum(row) for row in bin_queries]
+
+def classify(
+        reads_generator,
+        filters_configs,
+        hierarchy_config):
+    # get max from kmer/window size
+    wk_size = hierarchy_config["window_size"] if hierarchy_config["window_size"] > 0 else hierarchy_config["kmer_size"]
+
+    matches: dict[int, int] = {}
+    classified_reads = []
+    unclassified_reads = []
+
+    for read in reads_generator:
+        # read lenghts
+        read_len = len(read.read)
+
+        # hash count
+        kmers = 0
+        # Best scoring kmer count
+        max_kmer_count_read = 0
+        if read_len >= wk_size:
+            # Count hashes from first pair
+            hashes_f, hashes_r = get_hashes(
+                read.read,
+                hierarchy_config["kmer_size"],
+                hierarchy_config["offset"])
+            kmers = len(read.read) - hierarchy_config["kmer_size"] + 1
+
+            # For each filter in the hierarchy
+            for filter_config in filters_configs:
+                # count matches
+                counts_f = bulk_count(filter_config.ibf, hashes_f, filter_config.bin_count)
+                counts_r = bulk_count(filter_config.ibf, hashes_r, filter_config.bin_count)
+
+                # Calculate threshold for cutoff (keep matches above)
+                threshold_cutoff = 0.0
+                if filter_config.rel_cutoff >= 0:
+                    threshold_cutoff = threshold_rel(kmers, filter_config.rel_cutoff)
+                elif filter_config.abs_cutoff >= 0:
+                    threshold_cutoff = threshold_abs(
+                        kmers,
+                        filter_config.abs_cutoff,
+                        hierarchy_config["kmer_size"],
+                        hierarchy_config["offset"],)
+
+                # select matches based on threshold cutoff
+                max_kmer_count_read = select_matches(
+                    matches, counts_f, counts_r, filter_config.map, threshold_cutoff, max_kmer_count_read)
+
+        # if read got valid matches (above cutoff)
+        if max_kmer_count_read > 0:
+            # Calculate threshold for filtering (keep matches above)
+            threshold_filter = get_threshold_filter(
+                hierarchy_config,
+                kmers,
+                max_kmer_count_read,
+                hierarchy_config["kmer_size"],
+                hierarchy_config["offset"])
+
+            # Filter matches
+            read_out = filter_matches(
+                read.name,
+                matches,
+                threshold_filter)
+
+            if read_out.matches:
+                classified_reads.append(read_out)
+
+            # read classified, continue to the next
+            continue;
+
+        # not classified
+        unclassified_reads.append(read)
+
+    return classified_reads, unclassified_reads
+
+def output_report(classified_reads, hierarchy_label):
+    print(f'Level {hierarchy_label}:')
+    for read_out in classified_reads:
+        print(f'\tMatches for read {read_out.read_name}:')
+        for match_tuple in read_out.matches:
+            print(f'\t\t{match_tuple}')
+
+def __fastq_record_generator(input_fasta):
+    for record in FASTQ(input_fasta):
+        yield record
+
+def run(parsed_hierarchy, filters_configs, input_fasta):
+    # Classify reads iteractively for each hierarchy level
+    hierarchy_id = 0
+    unclassified_reads = []
+
+    for hierarchy_label, hierarchy_config in parsed_hierarchy.items():
+        hierarchy_id += 1
+
+        reads_generator = iter(unclassified_reads) if unclassified_reads else __fastq_record_generator(input_fasta)
+
+        # Parallelize
+        classified_reads, unclassified_reads = classify(
+            reads_generator,
+            filters_configs,
+            hierarchy_config)
+            
+        # write reports
+        output_report(classified_reads, hierarchy_label)
+
+
+parsed_hierarchy = {
+    "level_1": {
+            "window_size": 0,
+            "kmer_size": 19,
+            "offset": 1,
+            "rel_filter": 1,
+            "abs_filter": 0,
+        }
+    }
+
+filter_config = FilterConfig(
+    "data/ganon/ibf.bin", "data/ganon/ibf_map.txt", 0.25, 0.0, 63)
+
+run(parsed_hierarchy, [filter_config], 'data/ganon/bac.sim.1.fq')
+print('Done')
