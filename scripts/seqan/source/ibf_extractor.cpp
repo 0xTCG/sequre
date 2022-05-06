@@ -36,7 +36,7 @@ int main()
         return 0;
     }
 
-    seqan3::debug_stream  << "\n" << filter.bin_size() << " " << filter.bin_count() << " " << filter.bit_size();
+    seqan3::debug_stream  << "\n" << filter.bin_size() << " " << filter.bin_count() << " " << filter.bit_size() << " " << filter.hash_function_count();
         
     return 0;
 }
