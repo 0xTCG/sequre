@@ -1,0 +1,176 @@
+from sequre.types.builtin import *
+from sequre.attributes import sequre_beaver
+from sequre.utils.param import *
+from sequre.stdlib.builtin import max as secure_max, argmax as secure_argmax
+from sequre.types.shared_tensor import SharedTensor as Stensor
+
+from seq_ganon import SEQAN_HASH_SEEDS, FilterConfig, threshold_abs, threshold_rel, get_hashes, get_threshold_filter, filter_matches, seqan_ibf_hash, output_report, __fastq_record_generator
+
+DELIMITER_PRIME = 127  # Hardcoded for now. The smallest prime that is larger than the max kmer count in all reads.
+
+@sequre_beaver
+def select_matches(mpc, counts_f, counts_r, threshold_cutoff, max_kmer_count_read, bin_idx):
+    max_kmer_counts = secure_max(mpc, counts_f, counts_r)
+    max_kmer_counts = max_kmer_counts * (max_kmer_counts > threshold_cutoff)
+    temp_bin_idx, max_kmer_count = secure_argmax(mpc, max_kmer_counts)
+
+    max_kmer_count_read = secure_max(mpc, max_kmer_count, max_kmer_count_read)
+    kmer_count_updated = (max_kmer_count_read == max_kmer_count)
+    bin_idx = kmer_count_updated * temp_bin_idx + (-kmer_count_updated + 1) * bin_idx
+
+    return max_kmer_count_read, bin_idx
+
+
+def one_hash_ibf_query(ibf, shared_hashes, modulus):
+    query_results = []
+    
+    for i in range(len(shared_hashes)):
+        dot_sum = typeof(modulus)(0)
+        queried_ibf = [sh * ibf_val for sh , ibf_val in zip(shared_hashes[i], ibf)]
+        for e in queried_ibf: dot_sum = (dot_sum + e) % modulus
+        query_results.append(dot_sum)
+    
+    return query_results
+
+@sequre_beaver
+def bulk_count(mpc, ibf, hashes_f, bin_count, ibf_hash_count, ibf_bin_size, modulus):
+    queries_per_hash = []
+    
+    for i in range(ibf_hash_count):
+        ibf_hashes = []
+
+        for kmer_int in hashes_f:
+            ibf_hashes_row = [int_t(0) for _ in range(int(ibf_bin_size))]
+            ibf_hashes_row[seqan_ibf_hash(kmer_int, SEQAN_HASH_SEEDS[i], ibf_bin_size)] = int_t(1)
+            ibf_hashes.append(ibf_hashes_row)
+    
+        shared_ibf_hashes = mpc.comms.share(ibf_hashes, modulus)
+        queries_per_hash.append(Stensor[list[int_t]](one_hash_ibf_query(ibf, shared_ibf_hashes, modulus), modulus))
+    
+    decomposed_bits = queries_per_hash[0].to_bits(mpc, bin_count, DELIMITER_PRIME)
+
+    for query in queries_per_hash[1:]:
+        decomposed_bits = decomposed_bits * query.to_bits(mpc, bin_count, DELIMITER_PRIME)
+
+    return decomposed_bits.sum()
+
+
+def classify(
+        mpc,
+        reads_generator,
+        filters_configs,
+        hierarchy_config,
+        modulus):
+
+    # get max from kmer/window size
+    wk_size = hierarchy_config["window_size"] if hierarchy_config["window_size"] > 0 else hierarchy_config["kmer_size"]
+
+    classified_reads = []
+    unclassified_reads = []
+    reads_count = 0
+
+    for read in reads_generator:
+        reads_count += 1
+        if mpc.pid == 2: print(f'Processing read {reads_count} ...')
+
+        # read lenghts
+        read_len = len(read.read)
+        matches: dict[int, int] = {}
+
+        # hash count
+        kmers = 0
+        # Best scoring kmer count
+        max_kmer_count_read = Stensor[int_t](0, int_t(DELIMITER_PRIME))
+        bin_idx = Stensor[int_t](0, int_t(DELIMITER_PRIME))
+        if read_len >= wk_size:
+            # Count hashes from first pair
+            hashes_f, hashes_r = get_hashes(
+                read.read,
+                hierarchy_config["window_size"],
+                hierarchy_config["offset"],
+                hierarchy_config["alphabet_size"])
+            kmers = len(read.read) - hierarchy_config["kmer_size"] + 1
+
+            # For each filter in the hierarchy
+            for filter_config in filters_configs:
+                # count matches
+                counts_f = bulk_count(
+                    mpc, filter_config.ibf, hashes_f,
+                    filter_config.bin_count, filter_config.hash_count,
+                    filter_config.bin_size, modulus)
+                counts_r = bulk_count(
+                    mpc, filter_config.ibf, hashes_r,
+                    filter_config.bin_count, filter_config.hash_count,
+                    filter_config.bin_size, modulus)
+                
+                # Calculate threshold for cutoff (keep matches above)
+                threshold_cutoff = 0
+                if filter_config.rel_cutoff >= 0:
+                    threshold_cutoff = threshold_rel(kmers, filter_config.rel_cutoff)
+                elif filter_config.abs_cutoff >= 0:
+                    threshold_cutoff = threshold_abs(
+                        kmers,
+                        filter_config.abs_cutoff,
+                        hierarchy_config["kmer_size"],
+                        hierarchy_config["offset"],)
+                if threshold_cutoff == 0:
+                    threshold_cutoff = 1
+                
+                # select matches based on threshold cutoff
+                max_kmer_count_read, bin_idx = select_matches(
+                    mpc, counts_f, counts_r, threshold_cutoff, max_kmer_count_read, bin_idx)
+
+        max_kmer_count_revealed = int(max_kmer_count_read.print(mpc))
+        bin_idx_revealed = int(bin_idx.print(mpc))
+
+        # if read got valid matches (above cutoff)
+        if max_kmer_count_revealed > 0:
+            # Calculate threshold for filtering (keep matches above)
+            threshold_filter = get_threshold_filter(
+                hierarchy_config,
+                kmers,
+                max_kmer_count_revealed,
+                hierarchy_config["kmer_size"],
+                hierarchy_config["offset"])
+            
+            matches[bin_idx_revealed] = max_kmer_count_revealed
+
+            # Filter matches
+            read_out = filter_matches(
+                read.name,
+                matches,
+                threshold_filter)
+
+            if read_out.matches:
+                classified_reads.append(read_out)
+
+            # read classified, continue to the next
+            continue;
+
+        unclassified_reads.append(read)
+
+    return classified_reads, unclassified_reads
+
+
+def ganon_classification(mpc, parsed_hierarchy, filters_configs, input_fasta, modulus):
+    # Classify reads iteractively for each hierarchy level
+    hierarchy_id = 0
+    unclassified_reads = []
+
+    for hierarchy_label, hierarchy_config in parsed_hierarchy.items():
+        hierarchy_id += 1
+
+        reads_generator = iter(unclassified_reads) if unclassified_reads else __fastq_record_generator(input_fasta)
+
+        # Parallelize
+        classified_reads, unclassified_reads = classify(
+            mpc,
+            reads_generator,
+            filters_configs,
+            hierarchy_config,
+            modulus)
+            
+        # write reports
+        output_report(classified_reads, hierarchy_label)
+
+        return classified_reads
