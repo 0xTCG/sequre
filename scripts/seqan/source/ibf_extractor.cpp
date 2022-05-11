@@ -8,7 +8,7 @@
 int main()
 {
     seqan3::interleaved_bloom_filter<> filter;
-    std::ifstream              is( "../source/sample_bacteria.ibf", std::ios::binary );
+    std::ifstream              is( "../source/opal_dataset.ibf", std::ios::binary );
     cereal::BinaryInputArchive archive( is );
     archive( filter );
 
