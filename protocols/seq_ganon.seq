@@ -1,28 +1,9 @@
 import math
 
 from bio.fastq import FASTQ
-from bio.kmer import Kmer
+from bio.fasta import FASTA
 
-
-RANK = {
-    'A': 0,
-    'C': 1,
-    'G': 2,
-    'N': 3,
-    'T': 4
-}
-
-SEQAN_HASH_SEEDS = [
-    13572355802537770549u,  # 2**64 / (e/2)
-    13043817825332782213u,  # 2**64 / sqrt(2)
-    10650232656628343401u,  # 2**64 / sqrt(3)
-    16499269484942379435u,  # 2**64 / (sqrt(5)/2)
-    4893150838803335377u    # 2**64 / (3*pi/5)
-]
-
-
-def bit_decompose(value, number_of_bits):
-    return [int(bool(value & (1 << i))) for i in range(number_of_bits)]
+from utils.seqan import load_ibf, seqan_ungapped_kmer_encode, bulk_count
 
 
 class FilterConfig:
@@ -37,40 +18,13 @@ class FilterConfig:
     bin_size: u64
 
     def __init__(self, ibf_path, map_path, rel_cutoff, abs_cutoff, bin_count, hash_count):
-        self.technical_bin_count = ((bin_count + 63) // 64) * 64
-        self.ibf, self.ibf_decomposed = self.load_ibf(ibf_path, bin_count)
+        self.ibf, self.ibf_decomposed, self.technical_bin_count = load_ibf(ibf_path, bin_count)
         self.map = FilterConfig.load_map(map_path)
         self.rel_cutoff = rel_cutoff
         self.abs_cutoff = abs_cutoff
         self.bin_count = bin_count
         self.hash_count = hash_count
         self.bin_size = u64(len(self.ibf))
-    
-    def load_ibf(self, ibf_path, bin_count):
-        bytes_per_bin = (bin_count + 7) // 8
-        bytes_count = 0
-        next_value = 0
-        ibf = []
-        ibf_decomposed = []
-        
-        with open(ibf_path, 'rb') as f:
-            while True:
-                next_byte = f.read(1)
-                
-                if not next_byte:
-                    break
-                
-                next_value <<= 8
-                next_value += ord(next_byte)
-                bytes_count += 1
-                
-                if bytes_count == bytes_per_bin:
-                    ibf.append(next_value)
-                    ibf_decomposed.append(bit_decompose(next_value, self.technical_bin_count))
-                    bytes_count = 0
-                    next_value = 0
-
-        return ibf, ibf_decomposed
 
     def load_map(map_path):
         map_dict = {}
@@ -124,43 +78,7 @@ def select_matches(matches, counts_f, counts_r, filter_map, threshold_cutoff, ma
     
     return max_kmer_count_read
 
-def _seqan_kmer_hash(kmer, sigma):
-    if sigma == 4:
-        return u64(int(kmer.as_int()))
-    
-    hash_value = 0
-
-    for nucleotide in str(kmer):
-        hash_value *= sigma
-        hash_value += RANK[nucleotide]
-    
-    return u64(hash_value)
-
-def seqan_ungapped_kmer_hash(seq, sigma):
-    for kmer in seq.kmers[Kmer[19]](1):
-        yield _seqan_kmer_hash(kmer, sigma)
-
-def seqan_ungapped_minimizer_hash(seq, sigma):
-    window_size = 0
-    seed=0x8F3F73B5CF1C9ADE  # Seed taken from official SeqAn documentation for minimiser_hash
-    
-    for window in seq.split(window_size, 1):
-        kmers = list(window.kmers(1, k=19))
-        kmers.extend(list((~window).kmers(1, k=19)))
-
-        hashes = [_seqan_kmer_hash(kmer, sigma) for kmer in kmers]
-        hashes_pertubed = [hash ^ seed for hash in hashes]
-
-        min_hash_idx = 0
-        min_hash_pertubed = hashes_pertubed[0]
-        for i, hash_pertubed in enumerate(hashes_pertubed):
-            if hash_pertubed < min_hash_pertubed:
-                min_hash_idx = i
-                min_hash_pertubed = hashes_pertubed[i]
-        
-        yield hashes[min_hash_idx]
-
-def get_hashes(seq, window_size, offset, sigma):
+def get_kmer_encodings(seq, window_size, offset, sigma):
     if window_size > 0:
         # minimizers
         # hashes_f = seqan_ungapped_minimizer_hash(seq, sigma)
@@ -172,7 +90,7 @@ def get_hashes(seq, window_size, offset, sigma):
         raise NotImplementedError('Offset not implemented')
     
     # kmer
-    return list(seqan_ungapped_kmer_hash(seq, sigma)), list(seqan_ungapped_kmer_hash(~seq, sigma))
+    return list(seqan_ungapped_kmer_encode(seq, sigma)), list(seqan_ungapped_kmer_encode(~seq, sigma))
 
 def get_threshold_filter(hierarchy_config, kmers, max_kmer_count_read, kmer_size, offset):
     threshold_filter = 0
@@ -195,39 +113,6 @@ def filter_matches(read_name, matches, threshold_filter):
 
     return read_out
 
-def transpose(mat):
-    rows, cols = len(mat), len(mat[0])
-    new_mat = list[list[int]](cols)
-
-    for i in range(cols):
-        row = list[int](rows)
-        for j in range(rows):
-            row.append(mat[j][i])
-        new_mat.append(row)
-
-    return new_mat
-
-def seqan_ibf_hash(value, seed, bin_size):
-    hash_shift = 47u  # Hardcoded for now: the number of leading zeros in bin_size
-    value *= seed
-    assert hash_shift < 64u
-    value ^= value >> hash_shift  # XOR and shift higher bits into lower bits
-    value *= 11400714819323198485u  # = 2^64 / golden_ration, to expand h to 64 bit range
-    value %= bin_size
-    return int(value)
-
-def query_ibf(ibf, hash_f, ibf_hash_count, ibf_bin_size):
-    query_result = -1
-
-    for i in range(ibf_hash_count):
-        query_result &= ibf[seqan_ibf_hash(hash_f, SEQAN_HASH_SEEDS[i], ibf_bin_size)]
-    
-    return query_result
-
-def bulk_count(ibf, hashes_f, bin_count, ibf_hash_count, ibf_bin_size):
-    bin_queries = transpose([bit_decompose(query_ibf(ibf, hash_f, ibf_hash_count, ibf_bin_size), bin_count) for hash_f in hashes_f])
-    return [sum(row) for row in bin_queries]
-
 def classify(
         reads_generator,
         filters_configs,
@@ -239,8 +124,9 @@ def classify(
     unclassified_reads = []
 
     for read in reads_generator:
+        sequence = read.read  # Switch for FASTA/Q
         # read lenghts
-        read_len = len(read.read)
+        read_len = len(sequence)
         matches: dict[int, int] = {}
 
         # hash count
@@ -249,22 +135,22 @@ def classify(
         max_kmer_count_read = 0
         if read_len >= wk_size:
             # Count hashes from first pair
-            hashes_f, hashes_r = get_hashes(
-                read.read,
+            kmer_enc, kmer_enc_rev_comp = get_kmer_encodings(
+                sequence,
                 hierarchy_config["window_size"],
                 hierarchy_config["offset"],
                 hierarchy_config["alphabet_size"])
-            kmers = len(read.read) - hierarchy_config["kmer_size"] + 1
+            kmers = len(sequence) - hierarchy_config["kmer_size"] + 1
 
             # For each filter in the hierarchy
             for filter_config in filters_configs:
                 # count matches
                 counts_f = bulk_count(
-                    filter_config.ibf, hashes_f,
+                    filter_config.ibf, kmer_enc,
                     filter_config.bin_count, filter_config.hash_count,
                     filter_config.bin_size)
                 counts_r = bulk_count(
-                    filter_config.ibf, hashes_r,
+                    filter_config.ibf, kmer_enc_rev_comp,
                     filter_config.bin_count, filter_config.hash_count,
                     filter_config.bin_size)
 
@@ -317,7 +203,7 @@ def output_report(classified_reads, hierarchy_label):
             print(f'\t\t{match_tuple}')
 
 def __fastq_record_generator(input_fasta):
-    for record in FASTQ(input_fasta):
+    for record in FASTQ(input_fasta):  # FASTA(input_fasta, fai=False):
         yield record
 
 def run(parsed_hierarchy, filters_configs, input_fasta):
