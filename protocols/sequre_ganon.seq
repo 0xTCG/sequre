@@ -3,10 +3,16 @@ from sequre.attributes import sequre_beaver
 from sequre.utils.param import *
 from sequre.stdlib.builtin import max as secure_max
 from sequre.types.shared_tensor import SharedTensor as Stensor
+from sequre.mpc.collections import oblivious_get
 
-from seq_ganon import SEQAN_HASH_SEEDS, FilterConfig, threshold_abs, threshold_rel, get_hashes, get_threshold_filter, filter_matches, seqan_ibf_hash, output_report, __fastq_record_generator
+from seq_ganon import FilterConfig, threshold_abs, threshold_rel, get_kmer_encodings, get_threshold_filter, filter_matches, output_report, __fastq_record_generator
+from utils.seqan import SEQAN_HASH_SEEDS, seqan_ibf_hash
+
+import time, math
+
 
 DELIMITER_PRIME = 127  # Hardcoded for now. The smallest prime that is larger than the max kmer count in all reads.
+
 
 @sequre_beaver
 def select_matches(mpc, counts_f, counts_r, threshold_cutoff, modulus):
@@ -29,34 +35,89 @@ def one_hash_ibf_query(ibf, shared_hashes, modulus):
     return query_results
 
 @sequre_beaver
-def bulk_count(mpc, ibf, hashes_f, bin_count, ibf_hash_count, ibf_bin_size, modulus):
+def bulk_count_one_hot(mpc, ibf, kmer_encodings, bin_count, ibf_hash_count, ibf_bin_size, modulus, debug):
     queries_per_hash = []
     
+    s1 = time.time()
     for i in range(ibf_hash_count):
         ibf_hashes = []
 
-        for kmer_int in hashes_f:
+        s = time.time()
+        for kmer_int in kmer_encodings:
             ibf_hashes_row = [int_t(0) for _ in range(int(ibf_bin_size))]
             ibf_hashes_row[seqan_ibf_hash(kmer_int, SEQAN_HASH_SEEDS[i], ibf_bin_size)] = int_t(1)
             ibf_hashes.append(ibf_hashes_row)
-    
+        e = time.time()
+        if mpc.pid == 2 and debug: print(f'Populating hashes done in: {e - s}s')
+        
+        s = time.time()
         shared_ibf_hashes = mpc.comms.share(ibf_hashes, modulus)
+        e = time.time()
+        if mpc.pid == 2 and debug: print(f'Sharing hashes done in: {e - s}s')
+        
+        s = time.time()
         queries_per_hash.append(Stensor[list[int_t]](one_hash_ibf_query(ibf, shared_ibf_hashes, modulus), modulus))
+        e = time.time()
+        if mpc.pid == 2 and debug: print(f'IBF query done in: {e - s}s')
+    e1 = time.time()
+    if mpc.pid == 2 and debug: print(f'Matching hashes against IBF done in: {e1 - s1}s')
+    s = time.time()
+
+    decomposed_bits = queries_per_hash[0].to_bits(mpc, bin_count, DELIMITER_PRIME)
+
+    for query in queries_per_hash[1:]:
+        decomposed_bits = decomposed_bits * query.to_bits(mpc, bin_count, DELIMITER_PRIME)
+    
+    e = time.time()
+    if mpc.pid == 2 and debug: print(f'Merging IBF queries done in: {e - s}s')
+
+    return decomposed_bits.sum()
+
+
+@sequre_beaver
+def bulk_count_oblivious(mpc, ibf, kmer_encodings, bin_count, ibf_hash_count, ibf_bin_size, modulus, debug):
+    s = time.time()
+    
+    ibf_hashes = [
+        [seqan_ibf_hash(kmer_int, SEQAN_HASH_SEEDS[i], ibf_bin_size) for i in range(ibf_hash_count)]
+        for kmer_int in kmer_encodings]
+    
+    e = time.time()
+    if mpc.pid == 2 and debug: print(f'Computing IBF hashes done in: {e - s}s')
+    s = time.time()
+    
+    shared_ibf_hashes = mpc.comms.share(ibf_hashes.to_int_t(), modulus).transpose()  # (hash_count x kmer_count)
+
+    e = time.time()
+    if mpc.pid == 2 and debug: print(f'Sharing IBF hashes done in: {e - s}s')
+    s = time.time()
+
+    queries_per_hash = []
+    for hash_row in shared_ibf_hashes:
+        query_per_hash = oblivious_get(mpc, hash_row, int(math.ceil(math.log2(float(int(ibf_bin_size))))), ibf, int(modulus), modulus).to_int_t().flatten()
+        queries_per_hash.append(Stensor[list[int_t]](query_per_hash, modulus))
+    
+    e = time.time()
+    if mpc.pid == 2 and debug: print(f'Oblivious getter done in: {e - s}s')
+    s = time.time()
     
     decomposed_bits = queries_per_hash[0].to_bits(mpc, bin_count, DELIMITER_PRIME)
 
     for query in queries_per_hash[1:]:
         decomposed_bits = decomposed_bits * query.to_bits(mpc, bin_count, DELIMITER_PRIME)
-
+    
+    e = time.time()
+    if mpc.pid == 2 and debug: print(f'Merging bits done in: {e - s}s')
+    
     return decomposed_bits.sum()
-
 
 def classify(
         mpc,
         reads_generator,
         filters_configs,
         hierarchy_config,
-        modulus):
+        modulus,
+        debug = False):
 
     # get max from kmer/window size
     wk_size = hierarchy_config["window_size"] if hierarchy_config["window_size"] > 0 else hierarchy_config["kmer_size"]
@@ -66,11 +127,12 @@ def classify(
     reads_count = 0
 
     for read in reads_generator:
+        sequence = read.read  # FASTA/Q toggle
         reads_count += 1
         if mpc.pid == 2: print(f'Processing read {reads_count} ...')
 
         # read lenghts
-        read_len = len(read.read)
+        read_len = len(sequence)
         matches: dict[int, int] = {}
 
         # hash count
@@ -78,24 +140,27 @@ def classify(
         # Best scoring kmer count
         if read_len >= wk_size:
             # Count hashes from first pair
-            hashes_f, hashes_r = get_hashes(
-                read.read,
+            kmer_enc, kmer_enc_rev_comp = get_kmer_encodings(
+                sequence,
                 hierarchy_config["window_size"],
                 hierarchy_config["offset"],
                 hierarchy_config["alphabet_size"])
-            kmers = len(read.read) - hierarchy_config["kmer_size"] + 1
+            kmers = len(sequence) - hierarchy_config["kmer_size"] + 1
 
             # For each filter in the hierarchy
             for filter_config in filters_configs:
+                s = time.time()
                 # count matches
-                counts_f = bulk_count(
-                    mpc, filter_config.ibf, hashes_f,
+                counts_f = bulk_count_one_hot(
+                    mpc, filter_config.ibf, kmer_enc,
                     filter_config.bin_count, filter_config.hash_count,
-                    filter_config.bin_size, modulus)
-                counts_r = bulk_count(
-                    mpc, filter_config.ibf, hashes_r,
+                    filter_config.bin_size, modulus, debug)
+                counts_r = bulk_count_one_hot(
+                    mpc, filter_config.ibf, kmer_enc_rev_comp,
                     filter_config.bin_count, filter_config.hash_count,
-                    filter_config.bin_size, modulus)
+                    filter_config.bin_size, modulus, debug)
+                e = time.time()
+                if mpc.pid == 2 and debug: print(f'Counting kmers done in {e - s}s')
                 
                 # Calculate threshold for cutoff (keep matches above)
                 threshold_cutoff = 0
@@ -113,6 +178,9 @@ def classify(
                 # select matches based on threshold cutoff
                 selected_kmer_counts = select_matches(
                     mpc, counts_f, counts_r, threshold_cutoff, modulus)
+                
+                s = time.time()
+                if mpc.pid == 2 and debug: print(f'Selecting matches done in {s - e}s')
 
                 selected_kmer_counts_revealed = selected_kmer_counts.print(mpc).to_int() % DELIMITER_PRIME
 
