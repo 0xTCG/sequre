@@ -14,7 +14,11 @@ fi
 cp $CP_OPTIONS dsl/* seq/stdlib/sequre/
 
 echo "Compiling playground ..."
-GC_INITIAL_HEAP_SIZE=6144000000 seq/build/seqc run -release client.seq test-all --test-run $1
+if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    GC_INITIAL_HEAP_SIZE=7144000000 /usr/bin/time -v seq/build/seqc run -release client.seq test-all --test-run $1
+elif [[ "$OSTYPE" == "darwin"* ]]; then
+    GC_INITIAL_HEAP_SIZE=7144000000 seq/build/seqc run -release client.seq test-all --test-run $1
+fi
 
 echo "Cleaning up sockets ..."
 find  . -name 'sock.*' -exec rm {} \;
