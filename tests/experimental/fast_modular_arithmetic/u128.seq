@@ -1,0 +1,186 @@
+"""
+Two versions of fast modular multiplication for fixed modulus: (2 ** 127) - 1 using u128 integers.
+
+Addapted and performance engineered based on the ideas from:
+https://graphics.stanford.edu/~seander/bithacks.html#ModulusDivision
+"""
+
+
+@llvm
+def _add_overflow(a: u64, b: u64) -> tuple[u64, UInt[1]]:
+    declare {i64, i1} @llvm.uadd.with.overflow.i64(i64 %a, i64 %b)
+    %res = call {i64, i1} @llvm.uadd.with.overflow.i64(i64 %a, i64 %b)
+    ret {i64, i1} %res
+
+def _add_w_overflow(a: u64, b: u64) -> tuple[u64, u64]:
+    s, overflow = _add_overflow(a, b)
+    return s, u64(overflow)
+
+
+@extend
+class UInt[N]:
+    @llvm
+    def __new__(other: UInt[64]) -> UInt[N]:
+        %0 = zext i{=N//2} %other to i{=N}
+        ret i{=N} %0
+    @llvm
+    def __new__(other: UInt[1]) -> UInt[N]:
+        %0 = zext i1 %other to i{=N}
+        ret i{=N} %0
+    @llvm
+    def trunc(self: UInt[N]) -> UInt[N // 2]:
+        %0 = trunc i{=N} %self to i{=N//2}
+        ret i{=N//2} %0
+    def __str__(self: UInt[N]) -> str:
+        self_cp = self
+        int_str = ''
+        while self_cp:
+            remainder = 0
+            quotient = UInt[N](0)
+            # Euclidean division
+            for bit_idx in range(127, -1, -1):
+                mask = int((self_cp & (UInt[N](1) << UInt[N](bit_idx))) != UInt[N](0))
+                remainder = (remainder << 1) + mask
+                if remainder >= 10:
+                    quotient = (quotient << UInt[N](1)) + UInt[N](1)
+                    remainder -= 10
+                else: quotient = quotient << UInt[N](1)
+            int_str = str(remainder) + int_str
+            self_cp = quotient
+        return int_str if int_str else '0'
+
+
+u128 = UInt[128]
+MODULUS = (u128(1) << u128(127)) - u128(1)
+MASK = u128(int(u64(-1)))
+
+
+def split_lo_hi(a: u128):
+    a_lo = a & MASK
+    a_hi = a >> u128(64)
+    return a_hi, a_lo
+
+
+def modular_mult_128_1(a: u128, b: u128) -> u128:
+    """ 
+    This method produces the following result: (a * b) % (2 ** 127 - 1)
+
+    Version 1:
+    Using LLVMs overflow singnaling intrinsics on top of u64 integers.
+    """
+    
+    a_hi, a_lo = split_lo_hi(a)
+    b_hi, b_lo = split_lo_hi(b)
+
+    h00, r0 = split_lo_hi(a_lo * b_lo)
+    h01, l01 = split_lo_hi(a_lo * b_hi)
+    h10, l10 = split_lo_hi(b_lo * a_hi)
+    h11, l11 = split_lo_hi(a_hi * b_hi)
+
+    h00_int = h00.trunc()
+    l01_int = l01.trunc()
+    h01_int = h01.trunc()
+    l10_int = l10.trunc()
+    h10_int = h10.trunc()
+    l11_int = l11.trunc()
+    h11_int = h11.trunc()
+
+    m = r0
+
+    # First shift
+    s, overflow_1 = _add_w_overflow(h00_int, l01_int)
+    s, overflow_2 = _add_w_overflow(s, l10_int)
+    s_msb = s >> u64(63)
+    m |= (u128(s) << u128(65)) >> u128(1)
+
+    # Second shift
+    overflow = overflow_1 + overflow_2
+    s, overflow_1 = _add_w_overflow(h01_int, h10_int)
+    s, overflow_2 = _add_w_overflow(s, l11_int)
+    s, overflow_3 = _add_w_overflow(s, overflow)
+    addendum_lo = ((u128(s) << u128(1)) | u128(s_msb))
+
+    # Intermediate shift
+    overflow = overflow_1 + overflow_2 + overflow_3
+    # Note: No need to worry about overflow in the addition below
+    #  if a and b are ensured to be less than ((2 ** 127) - 1)
+    s = h11_int + overflow
+    addendum_hi = u128(s) << u128(65)
+    m += (addendum_hi | addendum_lo)
+
+    # Final shift
+    m = (m & MODULUS) + (m >> u128(127))
+
+    return u128(0) if m == MODULUS else m
+
+
+def modular_mult_128_2(a: u128, b: u128) -> u128:
+    """ 
+    This method produces the following result: (a * b) % (2 ** 127 - 1)
+    
+    Version 2:
+    Working directly on top of u128 integers.
+    """
+    
+    a_hi, a_lo = split_lo_hi(a)
+    b_hi, b_lo = split_lo_hi(b)
+
+    h00, r0 = split_lo_hi(a_lo * b_lo)
+    h01, l01 = split_lo_hi(a_lo * b_hi)
+    h10, l10 = split_lo_hi(b_lo * a_hi)
+    h11, l11 = split_lo_hi(a_hi * b_hi)
+
+    m = r0
+
+    # First shift
+    s = (h00 + l01 + l10)
+    overflow = s >> u128(64)
+    s_shift = s << u128(64)
+    s_msb = s_shift >> u128(127)
+    m |= (s_shift << u128(1)) >> u128(1)
+
+    # Second shift
+    s = (h01 + h10 + l11 + overflow)
+    s_shift = (s << u128(64)) >> u128(63)
+    addendum_lo = s_shift | s_msb
+    
+    # Intermediate shift
+    # Note: No need to worry about overflow in the addition below
+    #  if a and b are ensured to be less than ((2 ** 127) - 1)
+    h11 += (s >> u128(64))  # Adding previous overflow
+    addendum_hi = h11 << u128(65)
+    m += (addendum_hi | addendum_lo)
+    
+    # Final shift
+    m = (m & MODULUS) + (m >> u128(127))
+
+    return u128(0) if m == MODULUS else m
+
+
+import random
+import time
+
+
+for i in range(10000000):
+    a = random.randbelow_intn[u128](MODULUS, 127)
+    b = random.randbelow_intn[u128](MODULUS, 127)
+    m1 = modular_mult_128_1(a, b)
+    m2 = modular_mult_128_2(a, b)
+    assert m1 == m2, f"Modular multiplications differ for {a} and {b}:\n\t{m1} != {m2}"
+
+
+s = time.time()
+for i in range(10000000):
+    a = random.randbelow_intn[u128](MODULUS, 127)
+    b = random.randbelow_intn[u128](MODULUS, 127)
+    modular_mult_128_1(a, b) + modular_mult_128_1(a, b)
+e = time.time()
+print f"Modular mult 128 v1 done in {e - s}s"
+
+s = time.time()
+for i in range(10000000):
+    a = random.randbelow_intn[u128](MODULUS, 127)
+    b = random.randbelow_intn[u128](MODULUS, 127)
+    modular_mult_128_2(a, b) + modular_mult_128_2(a, b)
+e = time.time()
+print f"Modular mult 128 v2 done in {e - s}s"
