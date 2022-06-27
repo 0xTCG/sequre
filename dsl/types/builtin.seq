@@ -2,10 +2,13 @@ from ..utils.param import \
     int_t, MOD_CONST, FIELD_SIZE, RING_SIZE, RING_MASK, \
     SECOND_FIELD_SIZE, SECOND_MOD_CONST, THIRD_FIELD_SIZE, \
     THIRD_MOD_CONST, MODULUS_OPT, MATRIX_OPT, MODULUS_BITS, IS_MERSENNE_FIELD
-from ..utils.utils import __rand_int, __rand_vec, __rand_mat, __rand_bits, __rand_vec_bits, __rand_mat_bits
-from ..utils.primitives import mod_pow, strassen
+from ..utils.utils import __rand_int, __rand_vec, __rand_mat, \
+    __rand_bits, __rand_vec_bits, __rand_mat_bits
+from ..utils.primitives import mod_pow
 from shared_tensor import SharedTensor
 from utils import double_to_fp
+
+from ..experimental.fast_modular_arithmetic.u128 import modular_mult_u128u128_v1, modular_mult_u128u64_v1
 
 
 @tuple
@@ -106,6 +109,8 @@ class int:
         %17 = sub i64 %field_size, %16
         %18 = select i1 %1, i64 %17, i64 %16
         ret i64 %18
+    def neg_mod(self: int, modulus: int) -> int:
+        return modulus - self
     def add_mod(self: int, other: int, modulus: int) -> int:
         return (self + other) % modulus
     def sub_mod(self: int, other: int, modulus: int) -> int:
@@ -148,10 +153,6 @@ class int:
 
 @extend
 class UInt[N]:
-    @llvm
-    def __new__(other: UInt[128]) -> UInt[N]:
-        %0 = zext i{=N//2} %other to i{=N}
-        ret i{=N} %0
     @llvm
     def __new__(other: bool) -> UInt[N]:
         %0 = zext i8 %other to i{=N}
@@ -279,6 +280,14 @@ class UInt[N]:
             int_str = str(remainder) + int_str
             self_cp = quotient
         return int_str if int_str else '0'
+    @llvm
+    def trunc(self: UInt[N]) -> UInt[N // 2]:
+        %0 = trunc i{=N} %self to i{=N//2}
+        ret i{=N//2} %0
+    @llvm
+    def ext(self: UInt[N]) -> UInt[N * 2]:
+        %0 = zext i{=N} %self to i{=N*2}
+        ret i{=N*2} %0
     def neg_mod(self, modulus) -> UInt[N]:
         return self.fixed_value(modulus) - self
     def add_mod(self, other, modulus) -> UInt[N]:
@@ -286,11 +295,25 @@ class UInt[N]:
     def sub_mod(self, other, modulus) -> UInt[N]:
         return (self + modulus - other) % modulus
     def mul_mod(self, other, modulus) -> UInt[N]:
-        return (self * other) % modulus
+        if modulus == RING_SIZE: return (self * other) & RING_MASK
+        if modulus == FIELD_SIZE:
+            if isinstance(other, UInt[N]): return modular_mult_u128u128_v1(self, other)
+            if isinstance(other, int): return modular_mult_u128u64_v1(self, u64(other))
+            raise TypeError(f"Invalid type of a factor in modular multiplication: {modulus}")
+        assert self == int(self)
+        assert other == int(other)
+        assert modulus == int(modulus)
+        return UInt[N]((int(self) * int(other)) % int(modulus))
     def pow_mod(self, other, modulus) -> UInt[N]:
-        return (self ** other) % modulus
+        return mod_pow(self, other, modulus)
     def lsh_mod(self: UInt[N], other: int, modulus) -> UInt[N]:
-        return (self << other) % modulus
+        assert other <= 127, f'Cannot left shift more than the length of modulus: 127'
+        if modulus == RING_SIZE: return (self << other) & RING_MASK
+        if modulus == FIELD_SIZE:
+            s = (self << other) & FIELD_SIZE
+            s += self >> (127 - other)
+            return (s & FIELD_SIZE) + (s >> 127)
+        raise ValueError(f"Invalid modulus for modular multiplication: {modulus}")
     def to_bytes(self: UInt[N]):
         for _ in range(1): yield self
     def elem_count(self: UInt[N]) -> int:
@@ -721,26 +744,59 @@ class list[T]:
 
         return True
     
-    def neg_mod(self, modulus) -> list[T]:
-        return self.fixed_value(modulus) - self
+    def neg_mod(self: list[T], modulus) -> list[T]:
+        l = list[T](len(self))
+        for s in self: l.append(s.neg_mod(modulus))
+        return l
 
-    def add_mod(self, other, modulus) -> list[T]:
-        return (self + other) % modulus
+    def add_mod(self: list[T], other, modulus) -> list[T]:
+        l = list[T](len(self))
+        if isinstance(other, T):
+            for s in self: l.append(s.add_mod(other, modulus))
+        elif isinstance(other, list):
+            for s, o in zip(self, other): l.append(s.add_mod(o, modulus))
+        else:
+            for s in self: l.append(s.add_mod(other, modulus))
+        return l
     
-    def sub_mod(self, other, modulus) -> list[T]:
-        return (self + modulus - other) % modulus
+    def sub_mod(self: list[T], other, modulus) -> list[T]:
+        l = list[T](len(self))
+        if isinstance(other, T):
+            for s in self: l.append(s.sub_mod(other, modulus))
+        elif isinstance(other, list):
+            for s, o in zip(self, other): l.append(s.sub_mod(o, modulus))
+        else:
+            for s in self: l.append(s.sub_mod(other, modulus))
+        return l
     
-    def pow_mod(self, other, modulus) -> list[T]:
-        return (self ** other) % modulus
+    def pow_mod(self: list[T], other, modulus) -> list[T]:
+        l = list[T](len(self))
+        for s in self: l.append(s.pow_mod(other, modulus))
+        return l
 
-    def mul_mod(self, other, modulus) -> list[T]:
-        return (self * other) % modulus
+    def mul_mod(self: list[T], other, modulus) -> list[T]:
+        l = list[T](len(self))
+        if isinstance(other, T):
+            for s in self: l.append(s.mul_mod(other, modulus))
+        elif isinstance(other, list):
+            for s, o in zip(self, other): l.append(s.mul_mod(o, modulus))
+        else:
+            for s in self: l.append(s.mul_mod(other, modulus))
+        return l
     
-    def lsh_mod(self, other: int, modulus) -> list[T]:
-        return (self << other) % modulus
+    def lsh_mod(self: list[T], other: int, modulus) -> list[T]:
+        l = list[T](len(self))
+        for s in self: l.append(s.lsh_mod(other, modulus))
+        return l
     
     def broadcast_add_mod(self: list[T], other, modulus) -> list[T]:
-        return self.broadcast_add(other) % modulus
+        l = list[list[int_t]](len(self))
+        self_shape = self.shape()
+        if self_shape[1] != len(other):
+            raise ValueError(f"Unsupported dimensions. Trying to add shapes {self_shape} and [{len(other)},]")
+
+        for s in self: l.append(s.add_mod(other, modulus))
+        return l
     
     def numpy_eq(self: list[T], other: list[T]) -> list[T]:
         #TODO: Make this a native __eq__ of list
