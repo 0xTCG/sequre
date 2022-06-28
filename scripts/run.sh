@@ -3,7 +3,7 @@
 echo "Cleaning up sockets ..."
 find  . -name 'sock.*' -exec rm {} \;
 
-echo "Copying DSL to Seq ..."
+echo "Setting up Sequre ..."
 
 if [[ "$OSTYPE" == "linux-gnu"* ]]; then
     export CP_OPTIONS=-ruf
@@ -13,11 +13,11 @@ fi
 
 cp $CP_OPTIONS dsl/* seq/stdlib/sequre/
 
-echo "Compiling playground ..."
+echo "Compiling $2 ..."
 if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    GC_INITIAL_HEAP_SIZE=8144000000 /usr/bin/time -v seq/build/seqc run -release client.seq test-all --test-run $1
+    GC_INITIAL_HEAP_SIZE=8144000000 /usr/bin/time -v seq/build/seqc run -$1 client.seq run-$2 $3
 elif [[ "$OSTYPE" == "darwin"* ]]; then
-    GC_INITIAL_HEAP_SIZE=8144000000 seq/build/seqc run -release client.seq test-all --test-run $1
+    GC_INITIAL_HEAP_SIZE=8144000000 seq/build/seqc run -$1 client.seq run-$2 $3
 fi
 
 echo "Cleaning up sockets ..."
