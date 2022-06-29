@@ -1,10 +1,13 @@
 from bio.fasta import FASTA
 from bio.kmer import Kmer
-from sequre.stdlib.linear_svm import linear_svm, predict
+from sequre.stdlib.logireg import logireg, predict
 from sequre.types.shared_tensor import SharedTensor as Stensor
+from sequre.stdlib.internal import Internal as sq
+from sequre.stdlib.builtin import argmax
+from sequre.utils.utils import zeros, zeros_vec
+from sequre.types.utils import double_to_fp
 from sequre.types.builtin import *
 from sequre.attributes import *
-from utils.param import OPAL_COVERAGE
 
 import random
 import time
@@ -15,7 +18,7 @@ ACGT = {c: i for i, c in enumerate('ACGT')}
 
 def hmap(feature):
     value = 0
-    for c in feature: value = (value << 2) | ACGT[c]
+    for c in feature: value = value * 4 + ACGT[c]
     return value
 
 
@@ -67,70 +70,27 @@ def get_patterns_and_dico(patterns_path, taxid_path):
     return patterns, dico, labels_set
 
 
+def centroid_skms(frag_generator, taxid_path, patterns_path):
+    # Read in the pattern file
+    patterns, dico, labels_set = get_patterns_and_dico(patterns_path, taxid_path)
+
+    all_features = zeros[int](len(labels_set), patterns.shape()[0] * 2)
+    features_count = zeros_vec[int](len(labels_set))
+    
+    for label, feature_list in skms(frag_generator, patterns, dico):
+        all_features[label] += [hmap(feature) for feature in feature_list]
+        features_count[label] += 1
+    
+    return all_features // features_count, {v: k for k, v in dico.items()}
+
+
 def share_data(mpc, input_path, taxid_path, patterns_path, target_coverage, modulus):
     '''
     Can be extended for multiple clients.
     New mean will be sum_i(M_i \cdot c_i) / sum_i(c_i)
     where for i-th client, M_i is the mean and c_i is the count of features per label.
     '''
-    s = time.time()
-    patterns, dico, _ = get_patterns_and_dico(patterns_path, taxid_path)
-    frag_generator = drawfrag(input_path, taxid_path, target_coverage)
-
-    X_positive = []
-    y_positive = []
-    X_negative = []
-    y_negative = []
-    count_positives = 0
-    count_negatives = 0
-
-    for label, features in skms(frag_generator, patterns, dico):
-        if int(label) == 1:
-            count_positives += 1
-            X_positive.append(features)
-            y_positive.append(1)
-        else:
-            count_negatives += 1
-            X_negative.append(features)
-            y_negative.append(-1)
-
-    if DEBUG:
-        assert count_positives > 0
-        assert count_negatives > 0
-        assert count_negatives > count_positives
-    
-    neg_data = list(zip(X_negative, y_negative))
-    test_element = neg_data[0]
-    random.shuffle(neg_data)
-    if DEBUG: assert neg_data[0] != test_element
-    neg_data = neg_data[:count_positives]
-
-    data = list(zip(X_positive, y_positive))
-    for e in neg_data: data.append(e)
-    test_element = data[0]
-    random.shuffle(data)
-    if DEBUG: assert data[0] != test_element
-
-    X = []
-    y = []
-    for features, label in data:
-        hashed_features = [hmap(feature) for feature in features]
-        hashed_features.append(1)
-        if DEBUG: assert hashed_features[-1] == 1
-        X.append(hashed_features)
-        y.append(label)
-    
-    e = time.time()
-    print(f'Preprocessing time took {e - s}s at CP{mpc.pid}')
-
-    sv_x = Stensor(mpc.comms.share(X.to_int_t(), modulus), modulus)
-    sv_x.fp = True
-    sv_x.get_partitions(mpc)
-    sv_y = Stensor(mpc.comms.share(y.to_int_t(), modulus), modulus)
-    sv_y.fp = True
-    sv_y.get_partitions(mpc)
-
-    return sv_x, sv_y, dico
+    raise NotImplementedError()
 
 
 def load_test_features(mpc, input_path, patterns_path, modulus):
@@ -153,31 +113,45 @@ def load_test_features(mpc, input_path, patterns_path, modulus):
     return sv
 
 
-def opal_protocol(mpc, test_run, modulus):
-    # TODO: Make the params configurable
-    tests_path = 'tests/' if test_run else ''
-    input_path = f'{tests_path}data/opal/A1.train.fasta'
-    taxid_path = f'{tests_path}data/opal/A1.train.taxid'
-    patterns_path = f'{tests_path}data/opal/patterns.txt'
-    test_input_path = f'{tests_path}data/opal/test.fragments.fasta'
-
+def opal_via_lsh(mpc, input_path, taxid_path, patterns_path, target_coverage, test_input_path, modulus):    
     # Data sharing should be done apriori in a real-world scenario
-    if mpc.pid == 2: print('Sharing Opal data ...')
-    X, y, dico = share_data(
-        mpc=mpc, input_path=input_path, taxid_path=taxid_path,
-        patterns_path=patterns_path, target_coverage=OPAL_COVERAGE,
+    if mpc.pid == 2: print('Sharing data ...')
+    bins_centroids, dico = share_data(
+        mpc=mpc,
+        input_path=input_path,
+        taxid_path=taxid_path,
+        patterns_path=patterns_path,
+        target_coverage=target_coverage,
         modulus=modulus)
-
-    if mpc.pid == 2: print(f'Training linear SVM ... Input size: {X.shape()}')
-    weights = linear_svm(
-        mpc=mpc, X=X, y=y, eta=0.01, epochs=10,
-        relu_alpha=0.1, relu_beta=0.1)
-
+    
     # Test features should be shared in apriori in a real-world scenario
     if mpc.pid == 2: print('Loading test features ...')
     test_features = load_test_features(
-        mpc=mpc, input_path=test_input_path,
-        patterns_path=patterns_path, modulus=modulus)
+        mpc=mpc,
+        input_path=test_input_path,
+        patterns_path=patterns_path,
+        modulus=modulus)
 
-    if mpc.pid == 2: print(f'Calculating predictions ... Input size: {test_features.shape()}. Weights size: {len(weights)}')
-    return predict(mpc, test_features, weights, 0.1, 0.1), dico
+    if mpc.pid == 2: print('Calculating predictions ...')
+    predictions = Stensor.zeros(len(test_features), modulus=modulus)
+    
+    for i, test_features_vec in enumerate(test_features):
+        if i % 500 == 0: print(f'{i}/{len(test_features)}')
+        target_bin_centroids = bins_centroids.zeros()
+        for i in range(len(target_bin_centroids)):
+            target_bin_centroids[i] = bins_centroids[i] - test_features_vec
+
+        predictions[i] = argmax(mpc, sq.dot(mpc, bins_centroids))
+    
+    return predictions, dico
+
+
+def opal_protocol(mpc, test_run, modulus):
+    # TODO: Make the params configurable
+    input_path = 'data/opal/A1.train.fasta'
+    taxid_path = 'data/opal/A1.train.taxid'
+    patterns_path = 'data/opal/patterns.txt'
+    test_input_path = 'data/opal/test.fragments.fasta'
+    target_coverage = 0.1
+
+    return opal_via_lsh(mpc, input_path, taxid_path, patterns_path, target_coverage, test_input_path, modulus)
