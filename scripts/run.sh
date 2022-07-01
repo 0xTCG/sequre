@@ -20,9 +20,9 @@ fi
 
 echo "Compiling $2 ..."
 if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    GC_INITIAL_HEAP_SIZE=8144000000 /usr/bin/time -v seq/build/seqc run -$1 client.seq run-$2 ${*:3}
+    GC_INITIAL_HEAP_SIZE=8589934592 /usr/bin/time -v seq/build/seqc run -$1 client.seq run-$2 ${*:3}
 elif [[ "$OSTYPE" == "darwin"* ]]; then
-    GC_INITIAL_HEAP_SIZE=8144000000 seq/build/seqc run -$1 client.seq run-$2 ${*:3}
+    GC_INITIAL_HEAP_SIZE=8589934592 seq/build/seqc run -$1 client.seq run-$2 ${*:3}
 fi
 
 echo "Cleaning up sockets ..."
