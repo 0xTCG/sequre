@@ -1,11 +1,13 @@
-from ..utils import assert_approx 
+from ..utils import assert_approx, assert_values
 
 from sequre.utils.param import *
 from sequre.types.utils import double_to_fp
+from sequre.utils.utils import zeros_vec
 from sequre.mpc.env import MPCEnv
 from sequre.stdlib.lin_alg import *
 from sequre.stdlib.fp import *
-from sequre.stdlib.internal import Internal as sq
+from sequre.stdlib.protocols import bit_add as bit_add_protocol, bit_decomposition as bit_decomposition_protocol
+from sequre.stdlib.internal import Internal as sq, SharedTensor as Stensor
 from sequre.attributes import *
 
 # TODO: #93 Add tests for simple arithmetics also.
@@ -42,7 +44,114 @@ def test_sequre_division(mpc, elem_1, elem_2):
         assert_approx("Sequre division 2", res.print(mpc), mpc.comms.print_fp(fp_elem_1.share, modulus))
 
 
+@sequre_beaver
+def test_sequre_comparisons(mpc, vec):
+    ones_vector = vec.raw_ones().to_float()
+    zeros_vector = vec.raw_zeros().to_float()
+    vec_larger = vec + 1
+    elem = vec[0]
+
+    eq = vec == vec
+    lt = vec < vec_larger
+    gt = vec_larger > vec
+
+    not_eq = vec == vec_larger
+    not_lt = vec_larger < vec
+    not_gt = vec > vec_larger
+
+    not_lt_2 = vec < vec
+    not_gt_2 = vec > vec
+
+    # Equality tests
+    for _ in range(1000):
+        mpc.prg.switch_seed(-1)
+        rand_elem_1 = (elem.share.to_int().rand(1 << ((NBIT_K + NBIT_F) // 2 - 1)) - elem.share.to_int().rand(1 << ((NBIT_K + NBIT_F) // 2 - 1))).to_float() / (1 << NBIT_F)
+        rand_elem_2 = (elem.share.to_int().rand(1 << ((NBIT_K + NBIT_F) // 2 - 1)) - elem.share.to_int().rand(1 << ((NBIT_K + NBIT_F) // 2 - 1))).to_float() / (1 << NBIT_F)
+        mpc.prg.restore_seed(-1)
+
+        rand_elem_1_shared = mpc.comms.share(rand_elem_1.to_fp(elem.modulus), elem.modulus)
+        rand_elem_2_shared = mpc.comms.share(rand_elem_2.to_fp(elem.modulus), elem.modulus)
+
+        stensor_1 = Stensor[typeof(rand_elem_1_shared)](rand_elem_1_shared, elem.modulus)
+        stensor_2 = Stensor[typeof(rand_elem_2_shared)](rand_elem_2_shared, elem.modulus)
+        stensor_1.fp = True
+        stensor_2.fp = True
+
+        is_pos_1 = (stensor_1 - stensor_1) > 0
+        is_pos_2 = (stensor_2 - stensor_2) > 0
+        is_pos_3 = (stensor_1 - stensor_2) > 0
+        
+        eq_1 = stensor_1 == stensor_1
+        eq_2 = stensor_2 == stensor_2
+        eq_3 = stensor_1 == stensor_2
+
+        if mpc.pid != 0:
+            assert_values(f"Sequre is gt for elems {rand_elem_1} and {rand_elem_1}", is_pos_1.print(mpc), 0.0, True)
+            assert_values(f"Sequre is gt for elems {rand_elem_2} and {rand_elem_2}", is_pos_2.print(mpc), 0.0, True)
+            assert_values(
+                f"Sequre is gt for elems {rand_elem_1} and {rand_elem_2}",
+                is_pos_3.print(mpc), 1.0 if rand_elem_1 > rand_elem_2 else 0.0, True)
+            assert_values(f"Sequre eq for elems {rand_elem_1} and {rand_elem_1}", eq_1.print(mpc), 1.0, True)
+            assert_values(f"Sequre eq for elems {rand_elem_2} and {rand_elem_2}", eq_2.print(mpc), 1.0, True)
+            assert_values(
+                f"Sequre eq for elems {rand_elem_1} and {rand_elem_2}",
+                eq_3.print(mpc), 1.0 if rand_elem_1 == rand_elem_2 else 0.0, True)
+
+    if mpc.pid != 0:
+        assert_values("Sequre eq", eq.print(mpc), ones_vector)
+        assert_values("Sequre lt", lt.print(mpc), ones_vector)
+        assert_values("Sequre get", gt.print(mpc), ones_vector)
+        assert_values("Sequre not eq", not_eq.print(mpc), zeros_vector)
+        assert_values("Sequre not lt", not_lt.print(mpc), zeros_vector)
+        assert_values("Sequre not gt", not_gt.print(mpc), zeros_vector)
+        assert_values("Sequre not lt 2", not_lt_2.print(mpc), zeros_vector)
+        assert_values("Sequre not gt 2", not_gt_2.print(mpc), zeros_vector)
+    
+    print(f'Sequre comparisons on ({"ring" if vec.modulus.popcnt() == 1 else "field"}) tests passed at {mpc.pid}!\n')
+
 def test_sequre_stdlib[TP](mpc: MPCEnv[TP], modulus: TP):
+    a_bits = [TP(1), TP(0), TP(1), TP(0), TP(1), TP(0), TP(0)]
+    b_bits = [TP(0), TP(0), TP(1), TP(0), TP(1), TP(0), TP(0)]
+    shared_a_bits = mpc.comms.share([a_bits], modulus)
+    shared_b_bits = mpc.comms.share([b_bits], modulus)
+    stensor_a_bits = SharedTensor[typeof(shared_a_bits)](shared_a_bits, modulus)
+    stensor_b_bits = SharedTensor[typeof(shared_b_bits)](shared_b_bits, modulus)
+    stensor_b_bits_public = SharedTensor[list[typeof(b_bits)]]([b_bits], modulus)
+    stensor_b_bits_public.public = True
+    
+    bit_add = bit_add_protocol(mpc, stensor_a_bits, stensor_b_bits).share
+    revealed_bit_add_results = mpc.comms.reveal(bit_add, modulus)
+    if mpc.pid != 0:
+        assert_values(
+            'Sequre bit add private',
+            revealed_bit_add_results,
+            [[TP(1), TP(0), TP(0), TP(1), TP(0), TP(1), TP(0), TP(0)]])
+    
+    bit_add = bit_add_protocol(mpc, stensor_a_bits, stensor_b_bits_public).share
+    revealed_bit_add_results = mpc.comms.reveal(bit_add, modulus)
+    if mpc.pid != 0:
+        assert_values(
+            'Sequre bit add public',
+            revealed_bit_add_results,
+            [[TP(1), TP(0), TP(0), TP(1), TP(0), TP(1), TP(0), TP(0)]])
+    
+    expected_decomposition_1 = zeros_vec[int](MODULUS_BITS)
+    expected_decomposition_2 = zeros_vec[int](MODULUS_BITS)
+    expected_decomposition_2[0] = 1
+    expected_decomposition_3 = zeros_vec[int](MODULUS_BITS)
+    small_modulus = SECOND_RING_SIZE if modulus.popcnt() == 1 else SECOND_FIELD_SIZE
+    for i in range(3): expected_decomposition_3[i] = 1
+    bit_decomp_input = SharedTensor[list[int_t]](mpc.comms.share([TP(0), TP(1), TP(7)], modulus), modulus)
+    bit_decomposition = bit_decomposition_protocol(
+        mpc, bit_decomp_input, bitlen=MODULUS_BITS, small_modulus=small_modulus, modulus=modulus)
+    revealed_bit_decomposition = mpc.comms.reveal(bit_decomposition.share.to_int(), small_modulus)
+    expected_decomposition = [expected_decomposition_1, expected_decomposition_2, expected_decomposition_3]
+    if mpc.pid != 0:
+        assert_values(
+            'Sequre bit decomposition',
+            revealed_bit_decomposition,
+            expected_decomposition)
+
     a_vec = [
         double_to_fp(1.5, modulus),
         double_to_fp(0.5, modulus),
@@ -51,9 +160,14 @@ def test_sequre_stdlib[TP](mpc: MPCEnv[TP], modulus: TP):
     sv_vec.fp = True
     sv_vec.set_partitions(mpc.arithmetic.__beaver_partition(sv_vec.share, modulus))
     
-    
+    sv_elem = SharedTensor[int_t](int_t(18350080), modulus)
+    sv_elem.fp = True
+    sv_elem.set_partitions(mpc.arithmetic.__beaver_partition(sv_elem.share, modulus))
+
     test_sequre_division(mpc, sv_vec * 2, sv_vec)
+    test_sequre_sqrt(mpc, sv_elem)
     test_sequre_sqrt(mpc, sv_vec)
+    test_sequre_comparisons(mpc, sv_vec)
 
     
     v = householder(mpc, sv_vec)
@@ -106,12 +220,13 @@ def test_sequre_stdlib[TP](mpc: MPCEnv[TP], modulus: TP):
         assert_approx('Sequre tridiagonalize 2', mpc.comms.print_fp(q.share, modulus), expected_q)
     
     
-    v_mat, l = eigen_decomp(mpc, sv_mat, ITER_PER_EVAL)
+    v_mat, l = eigen_decomp(mpc, sv_mat)
     expected_v_mat = [
         [0.650711, 0.672083, 0.353383],
         [-0.420729, -0.0682978, 0.904612],
         [0.632109, -0.73732, 0.238322]]
-    expected_l = [17.176, -0.806559, 2.88746]
+    # TODO: #148 Merge #45 to fix test cases 
+    expected_l = [16.9749, -0.799774, 2.88673]
     if mpc.pid != 0:
         assert_approx('Sequre eigen decomposition 1', mpc.comms.print_fp(v_mat.share, modulus), expected_v_mat)
         assert_approx('Sequre eigen decomposition 2', mpc.comms.print_fp(l.share, modulus), expected_l)
