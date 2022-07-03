@@ -1,6 +1,7 @@
 import math
 
 from ..utils.param import *
+from ..utils.utils import zeros
 from ..types.utils import num_to_bits
 
 from prg import MPCPRG
@@ -53,6 +54,86 @@ class MPCBoolean[TP]:
             self.or_lagrange_cache_small[key] = lagrange_list
         else:
             raise TypeError(f"Invalid type {key}")
+    
+    def carries(self, a_bits, b_bits, public, modulus):
+        """
+        Computes the carry-overs when adding the two provided secret-shared bit representations.
+        See chapter 6.3 in
+            Unconditionally Secure Constant-Rounds MPC for Equality, Comparison, Bits and Exponentiation
+            by Damgard et al.
+        """
+        s = a_bits.mul_mod(b_bits, modulus) if public else self.arithmetic.multiply(a_bits, b_bits, modulus)
+        intermediate_s = self.arithmetic.add_public(a_bits, b_bits, modulus) if public else a_bits.add_mod(b_bits, modulus)
+        p = intermediate_s.sub_mod(s.lsh_mod(1, modulus), modulus)
+        k = self.arithmetic.add_public(s.add_mod(p, modulus).neg_mod(modulus), 1, modulus)
+
+        return self.__prefix_carry(s, p, k, modulus)
+    
+    def bit_add(self, a_bits, b_bits, public, modulus):
+        """
+        Performs the bitwise addition of the inputs -- the secret-shared bit-decompositions.
+        See chapter 6.2 in
+            Unconditionally Secure Constant-Rounds MPC for Equality, Comparison, Bits and Exponentiation
+            by Damgard et al.
+        """
+        c = self.carries(a_bits, b_bits, public, modulus)
+        c_t = c.transpose()
+        s_1 = self.arithmetic.add_public(a_bits, b_bits, modulus) if public else a_bits.add_mod(b_bits, modulus)
+        d_t = s_1.sub_mod(c.lsh_mod(1, modulus), modulus).transpose()
+        d_t[1:] = d_t[1:].add_mod(c_t[:-1], modulus)
+        add_1 = [row[0] for row in a_bits]
+        add_2 = [row[0] for row in b_bits]
+        s_2 = self.arithmetic.add_public(add_1, add_2, modulus) if public else add_1.add_mod(add_2, modulus)
+        d_t[0] = s_2.sub_mod(c_t[0].lsh_mod(1, modulus), modulus)
+        d_t.append(c_t[-1])
+
+        return d_t.transpose()
+    
+    def bit_decomposition(self, a, bitlen, small_modulus, modulus):
+        """
+        Secure bit decomposition algorithm.
+        See chapter 3 in
+            Unconditionally Secure Constant-Rounds MPC for Equality, Comparison, Bits and Exponentiation
+            by Damgard et al.
+        """
+        if DEBUG:
+            assert bitlen <= MODULUS_BITS, "Cannot cut off more bits than the size of field"
+
+        r, rbits = self.__share_random_bits(MODULUS_BITS, 0, len(a), True, small_modulus, modulus)
+        
+        c = self.comms.reveal(a.sub_mod(r, modulus), modulus)
+        cbits = num_to_bits(c, MODULUS_BITS, True)
+
+        dbits = self.bit_add(rbits, cbits, public=True, modulus=small_modulus)
+
+        field_bits = num_to_bits([modulus], MODULUS_BITS + 1, True)
+        field_bits_spanned = [field_bits[0] for _ in range(len(a))]
+
+        q = self.flip_bit(self.less_than_bits_public(
+            list(reversed(dbits.transpose())).transpose(),
+            list(reversed(field_bits_spanned.transpose())).transpose(), small_modulus), small_modulus)
+        fbits = num_to_bits([((TP(1) << MODULUS_BITS) - modulus)], MODULUS_BITS + 1, True)
+        fbits_spanned = [fbits[0] for _ in range(len(a))]
+
+        for i in range(len(fbits_spanned)): fbits_spanned[i] = fbits_spanned[i].mul_mod(q[i], small_modulus)
+
+        hbits = self.bit_add(dbits, fbits_spanned, public=False, modulus=small_modulus)
+        cutoff = MODULUS_BITS - bitlen
+        
+        return hbits.transpose()[:-2 - cutoff].transpose()
+    
+    def demultiplexer(self, bits_matrix, modulus):
+        demuxi = []
+        rows, bits_len = bits_matrix.shape()
+
+        mask_list = list(range(1 << bits_len))
+        bits_pair = [self.flip_bit(bits_matrix, modulus), bits_matrix]
+
+        for i in range(rows):
+            demuxi.append(
+                self.__demux(bits_pair, mask_list, i, bits_len, modulus))
+        
+        return demuxi
 
     def fan_in_or(self, a, modulus):
         n, d = a.shape()
@@ -63,10 +144,8 @@ class MPCBoolean[TP]:
             for i in range(n):
                 a_sum[i] = typeof(modulus)(self.pid == 1)
                 for j in range(d):
-                    a_sum[i] += a[i][j]
+                    a_sum[i] = a_sum[i].add_mod(a[i][j], modulus)
         
-        a_sum %= modulus
-
         key: tuple[int, typeof(modulus)] = (d + 1, modulus)
         if not self.in_lagrange_cache(key):
             y = [typeof(modulus)(i != 0) for i in range(d + 1)]
@@ -103,14 +182,14 @@ class MPCBoolean[TP]:
         a_padded = a_padded.reshape([n * L, L])
         
         x = self.fan_in_or(a_padded, modulus)        
-        xpre = [[typeof(modulus)(0) for _ in range(L)] for _ in range(n * L)]  # zeros((n * L, L))
+        xpre = [[typeof(modulus)(0) for _ in range(L)] for _ in range(n * L)]
         
         if self.pid > 0:
             for i in range(n):
                 for j in range(L):
                     xpi: int = L * i + j
                     for k in range(L):
-                        xpre[xpi][k] = x[L * i + k] * int(k <= j)
+                        xpre[xpi][k] = x[L * i + k].mul_mod(int(k <= j), modulus)
         
         y = self.fan_in_or(xpre, modulus)
 
@@ -122,8 +201,7 @@ class MPCBoolean[TP]:
                     if j == 0:
                         f[i][0][j] = x[L * i]
                     else:
-                        f[i][0][j] = y[L * i + j] - y[L * i + j - 1]
-                f[i] %= modulus
+                        f[i][0][j] = y[L * i + j].sub_mod(y[L * i + j - 1], modulus)
 
         # TODO: #16 Make it parallel
         tmp = [[[typeof(modulus)(0) for _ in range(L)] for _ in range(L)] for _ in range(n)]
@@ -131,7 +209,6 @@ class MPCBoolean[TP]:
             for i in range(n):
                 for j in range(L):
                     tmp[i][j][:] = a_padded[L * i + j]
-                tmp[i] %= modulus
 
         c = self.arithmetic.multiply_mat_bulk(f, tmp, modulus)  # c is a concatenation of n 1-by-L matrices
 
@@ -141,7 +218,7 @@ class MPCBoolean[TP]:
                 for j in range(L):
                     cpi: int = L * i + j
                     for k in range(L):
-                        cpre[cpi][k] = c[i][0][k] * int(k <= j)
+                        cpre[cpi][k] = c[i][0][k].mul_mod(int(k <= j), modulus)
         
         bdot_vec = self.fan_in_or(cpre, modulus)
 
@@ -166,7 +243,7 @@ class MPCBoolean[TP]:
                     il: int = j_pad // L
                     jl: int = j_pad - il * L
 
-                    row.append(((s[i][il][jl] + y[L * i + il]) % modulus - f[i][il][0]) % modulus)
+                    row.append(s[i][il][jl].add_mod(y[L * i + il], modulus).sub_mod(f[i][il][0], modulus))
                 b.append(row)
         else:
             for i in range(n):
@@ -174,6 +251,20 @@ class MPCBoolean[TP]:
 
         return b
     
+    def fan_in_and(self, a, modulus):
+        """
+        We combine De Morgan identities with fan-in-or to compute fan-in-and:
+            fan_in_and(a) = neg(fan_in_or(neg(a)))
+        """
+        return self.flip_bit(self.fan_in_or(self.flip_bit(a, modulus), modulus), modulus)
+    
+    def prefix_and(self, a, modulus):
+        """
+        We combine De Morgan identities with prefix-or to compute prefix-and:
+            prefix_and(a) = neg(prefix_or(neg(a)))
+        """
+        return self.flip_bit(self.prefix_or(self.flip_bit(a, modulus), modulus), modulus)
+
     def less_than_bits_public(self, a, b_pub, modulus):
         return self.less_than_bits_aux(a, b_pub, 2, modulus)
 
@@ -181,7 +272,8 @@ class MPCBoolean[TP]:
         return self.less_than_bits_aux(a, b, 0, modulus)
     
     def less_than_bits_aux(self, a, b, public_flag, modulus):
-        assert a.shape() == b.shape(), f"Unaligned bits shapes at CP{self.pid}: {a.shape()} and {b.shape()}"
+        if DEBUG:
+            assert a.shape() == b.shape(), f"Unaligned bits shapes at CP{self.pid}: {a.shape()} and {b.shape()}"
 
         n, L = a.shape()
 
@@ -192,27 +284,27 @@ class MPCBoolean[TP]:
         if public_flag == 0:
             x = self.arithmetic.multiply(a, b, modulus)
             if self.pid > 0:
-                x = ((a + b) % modulus - (x + x) % modulus) % modulus
+                x = a.add_mod(b, modulus).sub_mod(x.lsh_mod(1, modulus), modulus)
         elif self.pid > 0:
-            x = (a * b) % modulus
-            x = ((a + b) % modulus - (x + x) % modulus) % modulus
+            x = a.mul_mod(b, modulus)
+            x = a.add_mod(b, modulus).sub_mod(x.lsh_mod(1, modulus), modulus)
             if self.pid == 2:
-                x = (x - (a if public_flag == 1 else b)) % modulus
+                x = x.sub_mod(a if public_flag == 1 else b, modulus)
 
         f = self.prefix_or(x, modulus)
 
         if self.pid > 0:
             for i in range(n):
                 for j in range(L - 1, 0, -1):
-                    f[i][j] = (f[i][j] - f[i][j - 1]) % modulus
+                    f[i][j] = f[i][j].sub_mod(f[i][j - 1], modulus)
         
         if public_flag == 2:
             c = [typeof(modulus)(0) for _ in range(n)]  # zeros(n)
             if self.pid > 0:
-                fb: list[list[typeof(modulus)]] = (f * b) % modulus
+                fb: list[list[typeof(modulus)]] = f.mul_mod(b, modulus)
                 for i in range(n):
                     for e in fb[i]:
-                        c[i] = (c[i] + e) % modulus
+                        c[i] = c[i].add_mod(e, modulus)
             
             return c
 
@@ -235,16 +327,6 @@ class MPCBoolean[TP]:
             return self.arithmetic.field_to_ring(
                 self.__is_positive(a, FIELD_SIZE))
         return self.__is_positive(a, modulus)
-    
-    def __is_positive(self, a, modulus):
-        if isinstance(a, int_t):
-            return self.__is_positive_aux([a], modulus)[0]
-        elif isinstance(a, list[int_t]):
-            return self.__is_positive_aux(a, modulus)
-        elif isinstance(a, list[list[int_t]]):
-            return [self.__is_positive_aux(row, modulus) for row in a]
-        else:
-            raise TypeError(f'Invalid type of {a}')
     
     def less_than_public(self, a, bpub, modulus):
         if isinstance(a, int_t):
@@ -327,19 +409,25 @@ class MPCBoolean[TP]:
             raise TypeError(f'Invalid type of {a}')
     
     def flip_bit(self, a, modulus):
-        b = a.zeros() if self.pid == 0 else -a
-        if self.pid == 1: b += 1
-
-        return b % modulus
+        b = a.neg_mod(modulus) if self.pid != 0 else a.zeros()
+        return self.arithmetic.add_public(b, 1, modulus)
     
     def beaver_flip_bit(self, a, a_mask, modulus):
         if self.pid > 0:
-            a *= -1
-            for i in range(len(a)): a[i] += 1
-        a_mask *= -1
-        a %= modulus
-        a_mask %= modulus
+            a = a.neg_mod(modulus)
+            for i in range(len(a)): a[i] = a[i].add_mod(1, modulus)
+        a_mask = a_mask.neg_mod(modulus)
 
+    def __is_positive(self, a, modulus):
+        if isinstance(a, int_t):
+            return self.__is_positive_aux([a], modulus)[0]
+        elif isinstance(a, list[int_t]):
+            return self.__is_positive_aux(a, modulus)
+        elif isinstance(a, list[list[int_t]]):
+            return [self.__is_positive_aux(row, modulus) for row in a]
+        else:
+            raise TypeError(f'Invalid type of {a}')
+    
     def __is_positive_aux(self, a, modulus):
         n = len(a)
         nbits = self.primes_bits[0]
@@ -349,17 +437,15 @@ class MPCBoolean[TP]:
         r_bits = [[typeof(small_modulus)(0) for _ in range(nbits)] for _ in range(n)]
         if self.pid == 0:
             r = a.rand(modulus)
-            r_bits = num_to_bits[typeof(small_modulus)](r, nbits)
+            r_bits = num_to_bits(r, nbits)
 
             self.prg.switch_seed(1)
             r_mask = r.rand(modulus)
             r_bits_mask = r_bits.rand(small_modulus)
             self.prg.restore_seed(1)
 
-            r -= r_mask
-            r_bits -= r_bits_mask
-            r %= modulus
-            r_bits %= small_modulus
+            r = r.sub_mod(r_mask, modulus)
+            r_bits = r_bits.sub_mod(r_bits_mask, small_modulus)
 
             self.comms.send(r, 2)
             self.comms.send(r_bits, 2)
@@ -372,50 +458,45 @@ class MPCBoolean[TP]:
             r_bits = r_bits.rand(small_modulus)
             self.prg.restore_seed(0)
 
-        c = (((a + a) % modulus) + r) % modulus if self.pid != 0 else [TP(0)]
+        c = a.lsh_mod(1, modulus).add_mod(r, modulus) if self.pid != 0 else [TP(0)]
         c = self.comms.reveal(c, modulus=modulus)
 
-        c_bits = num_to_bits[typeof(small_modulus)](c, nbits) if self.pid != 0 else [[typeof(small_modulus)(0) for _ in range(nbits)] for _ in range(n)]  # zeros((n, nbits))
+        c_bits = num_to_bits(c, nbits) if self.pid != 0 else [[typeof(small_modulus)(0) for _ in range(nbits)] for _ in range(n)]  # zeros((n, nbits))
 
         # Incorrect result if r = 0, which happens with probaility 1 / modulus
         no_overflow = self.less_than_bits_public(r_bits, c_bits, modulus=small_modulus)
 
-        c_xor_r = list[typeof(small_modulus)](n)  # zeros(n)
+        c_xor_r = list[typeof(small_modulus)](n)
         if self.pid > 0:
-            # Warning: Overflow might occur below.
             for i in range(n):
-                v = r_bits[i][nbits - 1] - typeof(small_modulus)(2) * c_bits[i][nbits - 1] * r_bits[i][nbits - 1]
-                if self.pid == 1:
-                    v += c_bits[i][nbits - 1]
+                v = r_bits[i][nbits - 1].sub_mod(c_bits[i][nbits - 1].lsh_mod(1, small_modulus).mul_mod(r_bits[i][nbits - 1], small_modulus), small_modulus)
+                if self.pid == 1: v = v.add_mod(c_bits[i][nbits - 1], small_modulus)
                 c_xor_r.append(v)
-            c_xor_r %= small_modulus
         else:
             for _ in range(n):
                 c_xor_r.append(typeof(small_modulus)(0))
         
         lsb = self.arithmetic.multiply(c_xor_r, no_overflow, small_modulus)
         if self.pid > 0:
-            lsb = (lsb + lsb) % small_modulus
-            lsb -= (no_overflow + c_xor_r) % small_modulus
-            if self.pid == 1:
-                lsb = (lsb + 1) % small_modulus
-        lsb %= small_modulus
+            lsb = lsb.lsh_mod(1, small_modulus)
+            lsb = lsb.sub_mod(no_overflow.add_mod(c_xor_r, small_modulus), small_modulus)
+            if self.pid == 1: lsb = lsb.add_mod(1, small_modulus)
 
         # 0, 1 -> 1, 2
         if self.pid == 1:
-            lsb = (lsb + 1) % small_modulus
+            lsb = lsb.add_mod(1, small_modulus)
         
         b_mat = self.polynomial.table_lookup([TP(e) for e in lsb], 0, modulus)
 
         return b_mat[0]
 
     def __less_than_public(self, a, bpub, modulus):
-        b_a = self.arithmetic.add_public(-a, bpub, modulus) if self.pid != 0 else a.zeros()
+        b_a = self.arithmetic.add_public(a.neg_mod(modulus), bpub, modulus) if self.pid != 0 else a.zeros()
 
         return self.is_positive(b_a, modulus)
     
     def __less_than(self, a, b, modulus):
-        b_a = ((b - a) % modulus) if self.pid != 0 else a.zeros()
+        b_a = b.sub_mod(a, modulus) if self.pid != 0 else a.zeros()
 
         return self.is_positive(b_a, modulus)
 
@@ -437,7 +518,7 @@ class MPCBoolean[TP]:
         return self.is_positive(a_b, modulus)
     
     def __greater_than(self, a, b, modulus):
-        a_b = ((a - b) % modulus) if self.pid != 0 else a.zeros()
+        a_b = a.sub_mod(b, modulus) if self.pid != 0 else a.zeros()
 
         return self.is_positive(a_b, modulus)
 
@@ -452,3 +533,84 @@ class MPCBoolean[TP]:
         c = self.flip_bit(c, modulus)
 
         return c
+    
+    def __spk_convolve(self, e_1, s, p_r, r_p, k, modulus):
+        """
+        Carry set/propagate/bit convolution of the two (s, p, k) triplets.
+        (s_1, p_1, k_1) ˚ (s_2, p_2, k_2) = (s_2 + p_2 * s_1, p_2 * p_1, k_2 + p_2 * k_1)
+        See chapter 6.3 in
+            Unconditionally Secure Constant-Rounds MPC for Equality, Comparison, Bits and Exponentiation
+            by Damgard et al.
+        """
+        e_1_r, r_e_1 = self.arithmetic.__beaver_partition(e_1, modulus)
+        propagate = self.arithmetic.__beaver_mult(e_1_r, r_e_1, p_r, r_p, modulus)
+        propagate = self.arithmetic.__beaver_reconstruct(propagate, modulus)
+        
+        propagate[0] = propagate[0].add_mod(s, modulus)
+        propagate[2] = propagate[2].add_mod(k, modulus)
+
+        return propagate
+    
+    def __prefix_carry(self, s, p, k, modulus):
+        """
+        TODO: #143 Solution bellow is can be improved.
+        See chapters 6.1 and 6.4 in
+            Unconditionally Secure Constant-Rounds MPC for Equality, Comparison, Bits and Exponentiation
+            by Damgard et al.
+        """
+        s_t = s.transpose()
+        p_t = p.transpose()
+        k_t = k.transpose()
+
+        p_t_r, r_p_t = self.arithmetic.__beaver_partition(p_t, modulus)
+        
+        prefix_convolutions = [[s_t[0], p_t[0], k_t[0]]]
+        
+        for i in range(len(s_t) - 1):
+            prefix_convolutions.append(
+                self.__spk_convolve(
+                    prefix_convolutions[-1],
+                    s_t[i + 1], p_t_r[i + 1], r_p_t[i + 1], k_t[i + 1],
+                    modulus))
+        
+        return [e[0] for e in prefix_convolutions].transpose()
+
+    def __demux(self, bits_pair, mask_list, idx, bits_len, modulus):
+        resolved_bits = zeros[typeof(modulus)](len(mask_list), bits_len)
+
+        for i in range(len(mask_list)):
+            for j in range(bits_len):
+                resolved_bits[i][j] = bits_pair[int((mask_list[i] & (1 << j)) != 0)][idx][j]
+        
+        return self.fan_in_and(resolved_bits, modulus)
+    
+    def __share_random_bits(
+            self, k: int, padding: int, n: int, little_endian: bool, small_modulus: int, large_modulus: TP) -> tuple[list[TP], list[list[int]]]:
+        r = [TP(0) for _ in range(n)]
+        rbits = [[0 for _ in range(k)] for _ in range(n)]
+        
+        if self.pid == 0:
+            r = r.rand_bits(k + padding)
+            rbits = num_to_bits(r, k, little_endian)
+
+            self.prg.switch_seed(1)
+            r_mask = r.rand(large_modulus)
+            rbits_mask = rbits.rand(small_modulus)
+            self.prg.restore_seed(1)
+
+            r = r.sub_mod(r_mask, large_modulus)
+            rbits = rbits.sub_mod(rbits_mask, small_modulus)
+
+            self.comms.send(r, 2)
+            self.comms.send(rbits, 2)
+            return r, rbits
+        elif self.pid == 2:
+            r = self.comms.receive[TP](0, n)
+            rbits = self.comms.receive[int](0, [n, k])
+            return r, rbits
+        else:
+            self.prg.switch_seed(0)
+            r = r.rand(large_modulus)
+            rbits = rbits.rand(small_modulus)
+            self.prg.restore_seed(0)
+            return r, rbits
