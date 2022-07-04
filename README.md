@@ -4,7 +4,7 @@
 
 ## Running the example
 
-The `example` folder contains the running example of a typical multiparty computation use-case in Sequre. It implements a secure variant of [PlassClass](https://github.com/Shamir-Lab/PlasClass)---a binary classification tool for distinguishing whether a sequence
+The [example](example) folder contains the running example of a typical multiparty computation use-case in Sequre. It implements a secure variant of [PlassClass](https://github.com/Shamir-Lab/PlasClass)---a binary classification tool for distinguishing whether a sequence
 originates from a plasmid sequence or a chromosomal segment.
 
 Folder structure:
