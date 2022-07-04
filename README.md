@@ -1,103 +1,68 @@
-# Sequre Framework
+# Sequre
 
-## Meaningful ETAs
+## Running the example
 
-See [milestones](https://github.com/0xTCG/sequre-framework/milestones?direction=asc&sort=due_date&state=open) for more details.
+The `example` folder contains the running example of a typical multiparty computation use-case in Sequre. It implements a secure variant of [Plassclass](https://github.com/Shamir-Lab/PlasClass)---a binary classification tool for distinguishing whether a sequence
+originates from a plasmid sequence or a chromosomal segment.
 
-## Preliminary statistics
+Folder structure:
+- `client.seq` - Local (offline) source code executed by each client (data owner) locally. It contains a data processing step, followed by a secret sharing routine that initiates secure computing on the servers.
+- `server.seq` - Online source code executed by each untrusted computing party. It contains data pooling routine that gathers the secret-shared data from the clients and executes secure training of a linear support vector machine on top of it.
 
-### Standard MPC library
+### Localhost run
 
-- These are cummulative statistics for computing altogether:
-  - QR factorization
-  - Tridiagonalization
-  - Eigen decomposition
-  - Orthonormal basis calculation
-- Input matrix size: 50x50
+To run the example locally, execute `server.seq` in a separate terminal for each computing party `<pid>`:
+```
+./sequre example/server.seq <pid>
+```
 
-#### Performance stats
+Finally, initiate the secret sharing of the data and, consequentially, secure training on top of it by running the client's code:
 
-|                 | Offline bw (MB) | Online bw (MB) |  LOC  | Field runtime (s) | Ring runtime (s) |
-|:---------------:|:---------------:|:--------------:|:-----:|:-----------------:|:----------------:|
-| Sequre (no opt) |      ~286       |      ~221      |  ~80  |        ~64        |        ~39       |
-|       C++       |       n/a       |      ~243      |  ~500 |        ~69        |        n/a       |
-|       Seq       |      ~286       |      ~219      |  ~300 |        ~53        |        ~38       |
-|     Sequre      |      ~286       |      ~193      |  ~80  |        ~49        |        ~34       |
+```
+./sequre example/client.seq
+```
 
-#### Internal stats
+Example (condensed into a single terminal for simplicity):
+```
+./sequre example/server.seq 0 & \
+./sequre example/server.seq 1 & \
+./sequre example/server.seq 2 & \
+./sequre example/client.seq
+```
 
-|        | Partitions | Reconstructions | Truncations |
-|:------:|:----------:|:---------------:|:-----------:|
-|   Seq  |  1309020   |      569190     |   392230    |
-| Sequre |   967584   |      569190     |   392230    |
+### Online run
 
-### GWAS
+To run the same procedure on multiple machines, reconfigure the network within Sequre's [settings file](dsl/settings.seq).
 
-- Number of individuals: 1000
-- SNPs count: 1000
-- Covs count: 10
+Example (the addresses fictional):
+```
+""" Module containing IP configs """
+# IPs
+TRUSTED_DEALER = '8.8.8.8'  # localhost
+COMPUTING_PARTIES = [
+    '9.9.9.9',  # First computing party
+    '10.10.10.10'  # Second computing party
+    ]
+```
 
-#### Performance stats
+Then at `8.8.8.8` run
+```
+./sequre example/server.seq 0
+```
 
-|                 | Offline bw (MB) | Online bw (MB) |  LOC  | Field runtime (s) | Ring runtime (s) |
-|:---------------:|:---------------:|:--------------:|:-----:|:-----------------:|:----------------:|
-| Sequre (no opt) |       ~131      |      ~523      |  ~250 |        ~87        |        ~21       |
-|       C++       |       n/a       |      ~85       | ~2000 |        ~64        |        n/a       |
-|       Seq       |       ~115      |      ~83       | ~1000 |        ~39        |        ~12       |
-|     Sequre      |       ~131      |      ~79       |  ~250 |        ~37        |        ~11       |
+At `9.9.9.9` run:
+```
+./sequre example/server.seq 1
+```
 
-#### Internal stats
+At `10.10.10.10` run:
+```
+./sequre example/server.seq 2
+```
 
-|        | Partitions | Reconstructions | Truncations |
-|:------:|:----------:|:---------------:|:-----------:|
-|   Seq  |   167711   |      77729      |   28837     |
-| Sequre |   142644   |      78721      |   28846     |
+And finally, at your client's machine, run:
+```
+./sequre example/client.seq
+```
 
-### Logistic regression
-
-- Number of individuals: 1000
-- SNPs count: 1000
-- Covs count: 10
-- Number of iterations: 5
-
-#### Performance stats
-
-|                 | Offline bw (MB) | Online bw (MB) |  LOC  | Field runtime (s) | Ring runtime (s) |
-|:---------------:|:---------------:|:--------------:|:-----:|:-----------------:|:----------------:|
-| Sequre (no opt) |      ~135       |      ~49       |  ~100 |        ~59        |        ~58       |
-|       C++       |       n/a       |      ~48       |  ~600 |        ~114       |        n/a       |
-|       Seq       |      ~133       |      ~47       |  ~350 |        ~46        |        ~46       |
-|     Sequre      |      ~135       |      ~47       |  ~100 |        ~47        |        ~47       |
-
-#### Internal stats
-
-|        | Partitions | Reconstructions | Truncations |
-|:------:|:----------:|:---------------:|:-----------:|
-|   Seq  |   1203713  |      601592     |    1002     |
-| Sequre |   1202841  |      601583     |    1028     |
-
-### Vanilla neural net for DTI inference
-
-- Number of features: 6903
-- Number of target classes: 2
-- Number of hidden layers: 1
-- Dropout: 0
-- Hidden layer size: 100
-- Epochs: 10
-
-#### Performance stats
-
-|                 | Offline bw (MB) | Online bw (MB) |  LOC  | Field runtime (s) | Ring runtime (s) |
-|:---------------:|:---------------:|:--------------:|:-----:|:-----------------:|:----------------:|
-| Sequre (no opt) |      ~672       |      ~419      |  ~150 |         ~140      |         ~35      |
-|      PySyft     |        0        |      ~685      |  ~190 |         n/a       |         ~95      |
-|       C++       |       n/a       |      ~353      |  ~430 |         ~95       |         n/a      |
-|       Seq       |      ~406       |      ~286      |  ~260 |         ~62       |         ~20      |
-|     Sequre      |      ~406       |      ~258      |  ~150 |         ~60       |         ~18      |
-
-#### Internal stats
-
-|        | Partitions | Reconstructions | Truncations |
-|:------:|:----------:|:---------------:|:-----------:|
-|   Seq  |   208180   |      102090     |     150     |
-| Sequre |   208120   |      102090     |     150     |
+Make sure to have the same network settings (IP addresses) set at each computing party, including the client.
