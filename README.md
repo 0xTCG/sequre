@@ -1,5 +1,7 @@
 # Sequre
 
+## Quick start
+
 ## Running the example
 
 The `example` folder contains the running example of a typical multiparty computation use-case in Sequre. It implements a secure variant of [Plassclass](https://github.com/Shamir-Lab/PlasClass)---a binary classification tool for distinguishing whether a sequence
@@ -33,9 +35,9 @@ Example (condensed into a single terminal for simplicity):
 
 ### Online run
 
-To run the same procedure on multiple machines, reconfigure the network within Sequre's [settings file](dsl/settings.seq).
+To run the same procedure on multiple machines, [install](#quick-start) Sequre and reconfigure the network within Sequre's [settings file](dsl/settings.seq) at each machine separatelly.
 
-Example (the addresses fictional):
+Example network configuration at `dsl/settings.seq` (the addresses are fictional):
 ```python
 # IPs
 TRUSTED_DEALER = '8.8.8.8'  # localhost
@@ -66,3 +68,10 @@ And finally, at your client's machine, run:
 ```
 
 **Note:** Make sure to have the same network settings (IP addresses) set at each computing party, including the client.
+
+
+## Running tests
+
+## Running benchmarks
+
+## Licence
