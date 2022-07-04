@@ -35,7 +35,7 @@ Example (condensed into a single terminal for simplicity):
 
 ### Online run
 
-To run the same procedure on multiple machines, [install](#quick-start) Sequre and reconfigure the network within Sequre's [settings file](dsl/settings.seq) at each machine separately.
+To run the same procedure on multiple machines, [install Sequre](#quick-start) and reconfigure the network within Sequre's [settings file](dsl/settings.seq) at each machine separately.
 
 Example network configuration (`dsl/settings.seq` --- the addresses are fictional):
 ```python
