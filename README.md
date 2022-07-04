@@ -8,7 +8,7 @@ The `example` folder contains the running example of a typical multiparty comput
 originates from a plasmid sequence or a chromosomal segment.
 
 Folder structure:
-- `client.seq` - Local (offline) source code executed by each client (data owner) locally. It contains a data processing step, followed by a secret sharing routine that initiates secure computing on the servers.
+- `client.seq` - Local source code executed by each client (data owner) locally. It contains a data processing step, followed by a secret sharing routine that initiates secure computing on the servers.
 - `server.seq` - Online source code executed by each untrusted computing party. It contains a data pooling routine that gathers the secret-shared data from the clients and conducts secure training of a linear support vector machine on top of it.
 
 ### Localhost run
