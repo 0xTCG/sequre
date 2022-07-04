@@ -9,7 +9,7 @@ originates from a plasmid sequence or a chromosomal segment.
 
 Folder structure:
 - `client.seq` - Local (offline) source code executed by each client (data owner) locally. It contains a data processing step, followed by a secret sharing routine that initiates secure computing on the servers.
-- `server.seq` - Online source code executed by each untrusted computing party. It contains data pooling routine that gathers the secret-shared data from the clients and executes secure training of a linear support vector machine on top of it.
+- `server.seq` - Online source code executed by each untrusted computing party. It contains a data pooling routine that gathers the secret-shared data from the clients and conducts secure training of a linear support vector machine on top of it.
 
 ### Localhost run
 
@@ -35,7 +35,7 @@ Example (condensed into a single terminal for simplicity):
 
 ### Online run
 
-To run the same procedure on multiple machines, [install](#quick-start) Sequre and reconfigure the network within Sequre's [settings file](dsl/settings.seq) at each machine separatelly.
+To run the same procedure on multiple machines, [install](#quick-start) Sequre and reconfigure the network within Sequre's [settings file](dsl/settings.seq) at each machine separately.
 
 Example network configuration (`dsl/settings.seq` --- the addresses are fictional):
 ```python
@@ -67,7 +67,7 @@ And finally, at your client's machine, run:
 ./sequre example/client.seq
 ```
 
-**Note:** Make sure to have the same network settings (IP addresses) set at each computing party, including the client.
+**Note:** Make sure to set the same network settings (IP addresses) at each computing party, including the client.
 
 
 ## Running tests
