@@ -1,7 +1,7 @@
 from sequre.attributes import *
 
 from sequre.utils.param import int_t
-from sequre.utils.io import read_vector as read_vec, read_matrix as read_mat
+from sequre.utils.io import read_filtered_vector, read_filtered_matrix, read_vector, read_matrix, reset_files
 from sequre.types.shared_tensor import SharedTensor
 
 from sequre.stdlib.internal import Internal as sq
@@ -25,11 +25,6 @@ def open_input_files(mpc, test_run):
             open(miss_mask_path))
 
 
-def reset_files(*files):
-    for file in files:
-        file.seek(0, 0)
-
-
 def read_snps(test_run, modulus):
     snp_pos = []
     with open(SNP_POS_TEST_FILE if test_run else SNP_POS_FILE) as f:
@@ -43,8 +38,8 @@ def read_snps(test_run, modulus):
 
 
 def read_labels(mpc, f_pheno, f_cov, test_run, modulus):
-    pheno = read_vec[int_t](f_pheno, NUM_INDS)
-    cov = read_mat[int_t](f_cov, NUM_INDS, NUM_COVS)
+    pheno = read_vector[int_t](f_pheno, NUM_INDS)
+    cov = read_matrix[int_t](f_cov, NUM_INDS, NUM_COVS)
     pheno_x_r, pheno_r = mpc.arithmetic.__beaver_partition(pheno, modulus)
     cov_x_r, cov_r = mpc.arithmetic.__beaver_partition(cov, modulus)
 
@@ -56,43 +51,6 @@ def read_labels(mpc, f_pheno, f_cov, test_run, modulus):
         SharedTensor[list[list[int_t]]](
             cov, cov_x_r, cov_r, modulus, list[list[int_t]](),
             list[list[int_t]](), False, False, False))
-
-
-def read_vector(mpc, f, f_mask, n, modulus):
-    x_r = read_vec[int_t](f, n)
-    r = read_vec[int_t](f_mask, n)
-    share = x_r.add_mod(r, modulus) if mpc.pid == 2 else r
-
-    return SharedTensor[list[int_t]](
-        share, x_r, r, modulus, x_r.zeros(),
-        x_r.zeros(), False, False, False)
-
-
-def read_matrix(mpc, f, f_mask, imask, jmask, rows, cols, offset, multiplicity, modulus):
-    share_mats = [list[list[int_t]](rows * multiplicity) for _ in range(multiplicity)]
-    x_r_mats = [list[list[int_t]](rows * multiplicity) for _ in range(multiplicity)]
-    r_mats = [list[list[int_t]](rows * multiplicity) for _ in range(multiplicity)]
-    
-    batch_size = 0
-    i = offset
-    while batch_size < rows:
-        if imask[i]: batch_size += 1
-        for m in range(multiplicity):
-            x_r = read_vec[int_t](f, cols)
-            r = read_vec[int_t](f_mask, cols)
-            if imask[i]:
-                x_r = [x_r[j] for j in range(len(jmask)) if jmask[j]]
-                r = [r[j] for j in range(len(jmask)) if jmask[j]]
-                r_mats[m].append(r)
-                x_r_mats[m].append(x_r)
-                share_mats[m].append(x_r.add_mod(r, modulus) if mpc.pid == 2 else r)
-        i += 1
-    
-    svs = [SharedTensor[list[list[int_t]]](
-        share_mats[i], x_r_mats[i], r_mats[i], modulus, share_mats[i].zeros(),
-        share_mats[i].zeros(), False, False, False) for i in range(multiplicity)]
-
-    return svs
 
 
 def locus_distance_filter(snp_pos):
@@ -110,10 +68,10 @@ def locus_distance_filter(snp_pos):
 @sequre_beaver
 def load_dosage(mpc, f_geno, f_geno_mask, f_miss, f_miss_mask,
                 imask, jmask, rows, cols, modulus):
-    g = read_matrix(
+    g = read_filtered_matrix(
         mpc, f_geno, f_geno_mask, imask, jmask,
         rows, cols, 0, 3, modulus)
-    miss = read_matrix(
+    miss = read_filtered_matrix(
         mpc, f_miss, f_miss_mask, imask, jmask,
         rows, cols, 0, 1, modulus)[0]
     dosage = g[1] + g[2] * 2
@@ -130,7 +88,7 @@ def quality_control(
     if not SKIP_QC:
         n = len(snp_pos)
         gmiss = snp_pos.zeros()
-        for _ in range(n): gmiss = gmiss + read_vector(mpc, f_miss, f_miss_mask, n, modulus)
+        for _ in range(n): gmiss = gmiss + read_filtered_vector(mpc, f_miss, f_miss_mask, n, modulus)
         gkeep1 = sq.broadcast(mpc, gmiss < (n * GMISS_UB)).share
 
     snp_pos = snp_pos.filter(gkeep1)
@@ -309,14 +267,12 @@ def cochran_armitage(mpc, V, pheno, dosage):
     p_hat = pheno.expand_dims().to_fp() - sq.matmul(mpc, pheno.expand_dims(), V.T, V)
     sp = p_hat.T.sum()[0]
     sx = sq.matmul(mpc, (1 - sq.matmul(mpc, V.T.sum().expand_dims(), V)), dosage)[0]
-    B = sq.dot(mpc, sq.matmul(mpc, V, dosage))
     spp = sq.dot(mpc, p_hat[0])
     sxp = sq.matmul(mpc, p_hat, dosage)[0]
     sxx = (dosage * dosage).sum().to_fp()
     norm_sp = sp / len(pheno)
     numer = sxp - sx * norm_sp
-    denom = (sxx - B - sx * sx / len(pheno)) * (spp - sp * norm_sp)
-
+    denom = (sxx - sq.dot(mpc, sq.matmul(mpc, V, dosage)) - sx * sx / len(pheno)) * (spp - sp * norm_sp)
     assoc = numer / sq.sqrt(mpc, denom)
 
     print(f"Computed associations at CP{mpc.pid}.")
