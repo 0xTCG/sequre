@@ -12,18 +12,18 @@ Folder structure:
 ### Localhost run
 
 To run the example locally, execute `server.seq` in a separate terminal for each computing party `<pid>`:
-```
+```bash
 ./sequre example/server.seq <pid>
 ```
 
 Finally, initiate the secret sharing of the data and, consequentially, secure training on top of it by running the client's code:
 
-```
+```bash
 ./sequre example/client.seq
 ```
 
 Example (condensed into a single terminal for simplicity):
-```
+```bash
 ./sequre example/server.seq 0 & \
 ./sequre example/server.seq 1 & \
 ./sequre example/server.seq 2 & \
@@ -36,8 +36,7 @@ Example (condensed into a single terminal for simplicity):
 To run the same procedure on multiple machines, reconfigure the network within Sequre's [settings file](dsl/settings.seq).
 
 Example (the addresses fictional):
-```
-""" Module containing IP configs """
+```python
 # IPs
 TRUSTED_DEALER = '8.8.8.8'  # localhost
 COMPUTING_PARTIES = [
@@ -47,22 +46,22 @@ COMPUTING_PARTIES = [
 ```
 
 Then at `8.8.8.8` run
-```
+```bash
 ./sequre example/server.seq 0
 ```
 
 At `9.9.9.9` run:
-```
+```bash
 ./sequre example/server.seq 1
 ```
 
 At `10.10.10.10` run:
-```
+```bash
 ./sequre example/server.seq 2
 ```
 
 And finally, at your client's machine, run:
-```
+```bash
 ./sequre example/client.seq
 ```
 
