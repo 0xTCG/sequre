@@ -29,7 +29,7 @@ Example (condensed into a single terminal for simplicity):
 ./sequre example/server.seq 2 & \
 ./sequre example/client.seq
 ```
-**Note:** Expect obfuscated output if running in a single terminal. Each party will output the results into the same terminal.
+**Note:** Expect obfuscated output (and possibly some minor warning messages) if running in a single terminal. Each party will output the results into the same terminal.
 
 ### Online run
 
