@@ -3,7 +3,7 @@
 The following license governs the use of Sequre in academic and educational environments. Commercial use requires a commercial license from [Exaloop](https://exaloop.io).
 
 # ACADEMIC PUBLIC LICENSE
-_Written by [Andras Varga](https://omnetpp.org/intro/license) (license text is in public domain) and adjusted by Haris Smajlović._
+_Written by [Andras Varga](https://omnetpp.org/intro/license) (license text is in public domain)._
 
 ## Preamble
 > This license contains the terms and conditions of using Sequre in noncommercial settings: at academic institutions for teaching and research use, and at non-profit research organizations. You will find that this license provides noncommercial users of Sequre with rights that are similar to the well-known GNU General Public License, yet it retains the possibility for Sequre authors to financially support the development by selling commercial licenses. In fact, if you intend to use Sequre in a “for-profit” environment, where research is conducted to develop or enhance a product, is used in a commercial service offering, or when a commercial company uses Sequre to participate in a research project (for example government-funded or EU-funded research projects), then you need to obtain a commercial license for Sequre. In that case, please contact the Author to inquire about commercial licenses.
