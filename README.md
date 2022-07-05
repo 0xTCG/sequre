@@ -40,10 +40,10 @@ To run the same procedure on multiple machines, [install Sequre](#quick-start) a
 Example network configuration (`dsl/settings.seq` --- the IP addresses are fictional):
 ```python
 # IPs
-TRUSTED_DEALER = '8.8.8.8'  # localhost
+TRUSTED_DEALER = '8.8.8.8'  # CP0
 COMPUTING_PARTIES = [
-    '9.9.9.9',  # First computing party
-    '10.10.10.10'  # Second computing party
+    '9.9.9.9',  # First computing party (CP1)
+    '10.10.10.10'  # Second computing party (CP2)
     ]
 ```
 
