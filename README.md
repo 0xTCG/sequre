@@ -101,6 +101,6 @@ And finally, at your client's machine, run:
 
 ## Running benchmarks
 
-## Licence
+## License
 
 Sequre is published under the [academic public license](LICENSE.md).
