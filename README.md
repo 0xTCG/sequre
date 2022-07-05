@@ -29,6 +29,8 @@ This run will execute the code in a local, single machine, environment over inte
 
 ## Run instructions
 
+TODO
+
 ## Running the example
 
 The [example](example) folder contains the running example of a typical multiparty computation use-case in Sequre. It implements a secure variant of [PlassClass](https://github.com/Shamir-Lab/PlasClass)---a binary classification tool for distinguishing whether a genomic sequence
@@ -99,7 +101,11 @@ And finally, at your client's machine, run:
 
 ## Running tests
 
+TODO
+
 ## Running benchmarks
+
+TODO
 
 ## License
 
