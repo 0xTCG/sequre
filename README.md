@@ -2,6 +2,33 @@
 
 ## Quick start
 
+### Install
+
+Sequre can **only** be built from source at the moment.
+To install Sequre, first clone the repository:
+```bash
+git clone git@github.com:0xTCG/sequre.git && cd sequre
+```
+And then run the install script:
+```bash
+scripts/install.sh
+```
+This will:
+- Clone and install a version of [Seq](https://github.com/seq-lang/seq) that contains Sequre-related intermediate representation (IR) transformations.
+- Build the source of both Seq and Sequre.
+
+### Test run
+
+Execute
+```bash
+scripts/run release playground --local
+```
+to run the sample code from [playground.seq](playground.seq) that contains the benchmarks from [Hastings _et al._](https://github.com/MPC-SoK/frameworks).
+
+This run will execute the code in a local, single machine, environment over inter-process communication channels (AF_UNIX). For running the codebase in a different environment, see [run instructions](#run-instructions).
+
+## Run instructions
+
 ## Running the example
 
 The [example](example) folder contains the running example of a typical multiparty computation use-case in Sequre. It implements a secure variant of [PlassClass](https://github.com/Shamir-Lab/PlasClass)---a binary classification tool for distinguishing whether a genomic sequence
