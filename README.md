@@ -37,7 +37,7 @@ Example (condensed into a single terminal for simplicity):
 
 To run the same procedure on multiple machines, [install Sequre](#quick-start) and reconfigure the network within Sequre's [settings file](dsl/settings.seq) at each machine separately.
 
-Example network configuration (`dsl/settings.seq` --- the addresses are fictional):
+Example network configuration (`dsl/settings.seq` --- the IP addresses are fictional):
 ```python
 # IPs
 TRUSTED_DEALER = '8.8.8.8'  # localhost
