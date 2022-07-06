@@ -43,24 +43,6 @@ Client run command:
 
 See the [example](#running-the-example) for a sample run at the `localhost`.
 
-<!-- ### Configuring the network
-
-Sequre operates in two network modes:
-- Local: using the inter-process communication (AF_UNIX) sockets.
-- Online: using the TCP (AF_INET) sockets.
-
-If using the online mode, make sure to configure the network within Sequre's [settings file](dsl/settings.seq) at each machine separately.
-
-Example network configuration (`dsl/settings.seq` --- the IP addresses are fictional):
-```python
-# IPs
-TRUSTED_DEALER = '8.8.8.8'  # CP0
-COMPUTING_PARTIES = [
-    '9.9.9.9',  # First computing party (CP1)
-    '10.10.10.10'  # Second computing party (CP2)
-    ]
-``` -->
-
 ## Running the example
 
 The [example](example) folder contains the running example of a typical multiparty computation use-case in Sequre. It implements a secure variant of [PlassClass](https://github.com/Shamir-Lab/PlasClass)---a binary classification tool for distinguishing whether a genomic sequence
@@ -128,11 +110,31 @@ And finally, at your client's machine, run:
 
 **Note:** Make sure to set the same network settings (IP addresses) at each computing party, including the client.
 
-## Running playground
 
-TODO
+## Sequre's network config
 
-<!-- For running [tests](#running-tests), [benchmarks](#running-benchmarks), and [playground](playground.seq)---where you can experiment with Sequre, we recommend using the `scripts/run.sh` script:
+Sequre can operate in two network modes:
+- Local: using the inter-process communication (AF_UNIX) sockets.
+- Online: using the TCP (AF_INET) sockets.
+
+If using the online mode, make sure to configure the network within Sequre's [settings file](dsl/settings.seq) at each machine separately.
+
+Example network configuration (`dsl/settings.seq` --- the IP addresses are fictional):
+```python
+# IPs
+TRUSTED_DEALER = '8.8.8.8'  # CP0
+COMPUTING_PARTIES = [
+    '9.9.9.9',  # First computing party (CP1)
+    '10.10.10.10'  # Second computing party (CP2)
+    ]
+```
+
+**Note:** `./sequre` command operates only in an online setup at the moment.
+
+
+## Running playground, tests, and benchmarks
+
+For running [tests](#running-tests), [benchmarks](#running-benchmarks), and [playground](#running-playground), we recommend using the `scripts/run.sh` script:
 ```bash
 srcipts/run.sh <program> [<pid>] [--local] [--use-ring] [--unit]
 ```
@@ -141,15 +143,55 @@ where:
 - `<pid>` is optional ID of computing party if the run is [online](#configuring-the-network).
 - `--local` flag triggers the [local](#configuring-the-network) run, intead of online, using the inter-process communication instead of TCP. **Note:** `<pid>` is ignored if the `--local` flag is present.
 - `--use-ring` flag coerces usage of $2^k$ rings. The default is $Z_p$ field. **Note:** `--use-ring` is ignored while running tests. Tests are executed on both rings and fields.
-- `--unit` flag restricts the tests to unit test only. By default, both unit and end-to-end tests of applications (GWAS, DTI, Opal, and Ganon) are executed. -->
+- `--unit` flag restricts the tests to unit test only. By default, both unit and end-to-end tests of applications (GWAS, DTI, Opal, and Ganon) are executed.
 
-## Running tests
+**Note:** Each run bellow is executed in a local setup. Online run is also possible. See [example](#online-run) above for a step-by-step guide and/or [Sequre's network config](#sequres-network-config) for details. Just make sure **NOT** to use `./sequre` command in that case. Use the `sripts/run.sh` instead at each separate computing party `<pid>`:
+```bash
+srcipts/run.sh <program> <pid>
+```
 
-TODO
+### Running playground
 
-## Running benchmarks
+[Playground](playground.seq) contains the three MPC benchmarks from [Hastings _et al._](https://github.com/MPC-SoK/frameworks).
+Use it to quickly explore Sequre and its features.
 
-TODO
+Example:
+```bash
+scripts/run.sh playground --local --use-ring
+```
+
+### Running tests
+
+To run all [unit tests](tests/unit_tests) execute (in a single-machine enironment):
+```bash
+scripts/run.sh tests --unit --local
+```
+
+Drop the `--local` flag to include the end-to-end tests of genome-wide association study, drug-target interaction inference, and mentagenomic classifiers as well:
+```bash
+scripts/run.sh tests --unit
+```
+
+### Running benchmarks
+
+To benchmark all applications run:
+```bash
+scripts/run.sh benchmarks --local
+```
+
+Include `--use-ring` flag to re-run all benchmarks on rings instead of fields:
+```bash
+scripts/run.sh benchmarks --local --use-ring
+```
+
+This will benchmark the following applications in Sequre:
+- Sequre's linear algebra subroutines
+- Genome-wide association study on top of a toy dataset from [Cho _et al._](https://github.com/hhcho/secure-gwas).
+- Drug-target inference on top of a reduced STITCH dataset from [Hie _et al._](https://github.com/brianhie/secure-dti).
+- Opal (metagenomic binning) with 0.1x and 15x coverage of the complete Opal dataset from [Yu _et al._](https://github.com/yunwilliamyu/opal)
+- Ganon (metagenomic binning) on top of the complete Opal dataset from [Yu _et al._](https://github.com/yunwilliamyu/opal)
+
+Benchmark results should be stored in the [results](results) folder upon the run completion.
 
 ## License
 
