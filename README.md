@@ -1,4 +1,6 @@
-# Sequre
+# Sequre - a high-performance framework for secure multiparty computation in bioinformatics
+
+Sequre is an end-to-end, statically compiled, Pythonic framework for building secure multiparty computation pipelines in bioinformatics.
 
 ## Quick start
 
@@ -166,10 +168,12 @@ scripts/run.sh playground --local --use-ring
 
 ### Running tests
 
-To run all [unit tests](tests/unit_tests) execute (in a single-machine enironment):
+To run all [unit tests](tests/unit_tests) execute:
 ```bash
 scripts/run.sh tests --unit --local
 ```
+
+This will execute all unit tests [locally](#sequres-network-config), on a single machine.
 
 Drop the `--local` flag to include the end-to-end tests of genome-wide association study, drug-target interaction inference, and mentagenomic classifiers as well:
 ```bash
