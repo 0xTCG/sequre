@@ -29,7 +29,37 @@ This run will execute the code in a local, single machine, environment over inte
 
 ## Run instructions
 
-TODO
+Use `./sequre` script to execute Sequre both on server and client end.
+
+Server run command (`<pid>` denotes the ID of the computing party: 0, 1, 2, 3, ...):
+```bash
+./sequre foo.seq <pid>
+```
+
+Client run command:
+```bash
+./sequre bar.seq
+```
+
+See the [example](#running-the-example) for a sample run at the `localhost` or online.
+
+<!-- ### Configuring the network
+
+Sequre operates in two network modes:
+- Local: using the inter-process communication (AF_UNIX) sockets.
+- Online: using the TCP (AF_INET) sockets.
+
+If using the online mode, make sure to configure the network within Sequre's [settings file](dsl/settings.seq) at each machine separately.
+
+Example network configuration (`dsl/settings.seq` --- the IP addresses are fictional):
+```python
+# IPs
+TRUSTED_DEALER = '8.8.8.8'  # CP0
+COMPUTING_PARTIES = [
+    '9.9.9.9',  # First computing party (CP1)
+    '10.10.10.10'  # Second computing party (CP2)
+    ]
+``` -->
 
 ## Running the example
 
@@ -42,7 +72,7 @@ Folder structure:
 
 ### Localhost run
 
-To run the example locally, execute `server.seq` in a separate terminal for each computing party `<pid>`:
+To run the example locally, execute `example/server.seq` in a separate terminal for each computing party `<pid>`:
 ```bash
 ./sequre example/server.seq <pid>
 ```
@@ -98,6 +128,20 @@ And finally, at your client's machine, run:
 
 **Note:** Make sure to set the same network settings (IP addresses) at each computing party, including the client.
 
+## Running playground
+
+TODO
+
+<!-- For running [tests](#running-tests), [benchmarks](#running-benchmarks), and [playground](playground.seq)---where you can experiment with Sequre, we recommend using the `scripts/run.sh` script:
+```bash
+srcipts/run.sh <program> [<pid>] [--local] [--use-ring] [--unit]
+```
+where:
+- `<program>` is either `tests`, `benchmarks`, or `playground`.
+- `<pid>` is optional ID of computing party if the run is [online](#configuring-the-network).
+- `--local` flag triggers the [local](#configuring-the-network) run, intead of online, using the inter-process communication instead of TCP. **Note:** `<pid>` is ignored if the `--local` flag is present.
+- `--use-ring` flag coerces usage of $2^k$ rings. The default is $Z_p$ field. **Note:** `--use-ring` is ignored while running tests. Tests are executed on both rings and fields.
+- `--unit` flag restricts the tests to unit test only. By default, both unit and end-to-end tests of applications (GWAS, DTI, Opal, and Ganon) are executed. -->
 
 ## Running tests
 
