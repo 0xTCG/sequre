@@ -147,7 +147,7 @@ where:
 
 **Note:** Each run bellow is executed in a local setup. Online run is also possible. See [example](#online-run) above for a step-by-step guide and/or [Sequre's network config](#sequres-network-config) for details.
 
-Example invocation of unit tests in an online network environment at three computing parties: (use multiple terminals for clear output)
+Example invocation of unit tests in a `localhost` in an online network environment: (use multiple terminals for clear output)
 ```bash
 srcipts/run.sh tests --unit 0 & \
 srcipts/run.sh tests --unit 1 & \
