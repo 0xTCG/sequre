@@ -41,18 +41,7 @@ Client run command:
 ./sequre bar.seq
 ```
 
-See the [example](#running-the-example) for a sample run at the `localhost`.
-    
-For running [tests](#running-tests), [benchmarks](#running-benchmarks), and [playground](playground.seq)---where you can easily experiment with Sequre, we recommend using the `scripts/run.sh` script:
-```bash
-srcipts/run.sh <program> [<pid>] [--local] [--use-ring] [--unit]
-```
-where:
-- `<program>` is either `tests`, `benchmarks`, or `playground`.
-- `<pid>` is optional ID of computing party if the run is [online](#configuring-the-network).
-- `--local` flag triggers the [local](#configuring-the-network) run, intead of online, using the inter-process communication instead of TCP. **Note:** `<pid>` is ignored if the `--local` flag is present.
-- `--use-ring` flag coerces usage of $2^k$ rings. The default is $Z_p$ field. **Note:** `--use-ring` is ignored while running tests. Tests are executed on both rings and fields.
-- `--unit` flag restricts the tests to unit test only. By default, both unit and end-to-end tests of applications (GWAS, DTI, Opal, and Ganon) are executed.
+See the [example](#running-the-example) for a sample run at the `localhost` or online.
 
 ### Configuring the network
 
@@ -139,6 +128,20 @@ And finally, at your client's machine, run:
 
 **Note:** Make sure to set the same network settings (IP addresses) at each computing party, including the client.
 
+## Running playground
+
+TODO
+
+<!-- For running [tests](#running-tests), [benchmarks](#running-benchmarks), and [playground](playground.seq)---where you can experiment with Sequre, we recommend using the `scripts/run.sh` script:
+```bash
+srcipts/run.sh <program> [<pid>] [--local] [--use-ring] [--unit]
+```
+where:
+- `<program>` is either `tests`, `benchmarks`, or `playground`.
+- `<pid>` is optional ID of computing party if the run is [online](#configuring-the-network).
+- `--local` flag triggers the [local](#configuring-the-network) run, intead of online, using the inter-process communication instead of TCP. **Note:** `<pid>` is ignored if the `--local` flag is present.
+- `--use-ring` flag coerces usage of $2^k$ rings. The default is $Z_p$ field. **Note:** `--use-ring` is ignored while running tests. Tests are executed on both rings and fields.
+- `--unit` flag restricts the tests to unit test only. By default, both unit and end-to-end tests of applications (GWAS, DTI, Opal, and Ganon) are executed. -->
 
 ## Running tests
 
