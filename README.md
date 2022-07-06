@@ -159,7 +159,7 @@ srcipts/run.sh tests --unit 2
 [Playground](playground.seq) contains the three MPC benchmarks from [Hastings _et al._](https://github.com/MPC-SoK/frameworks).
 Use it to quickly explore Sequre and its features.
 
-Example:
+Example invocation:
 ```bash
 scripts/run.sh playground --local --use-ring
 ```
