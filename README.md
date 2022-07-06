@@ -41,7 +41,7 @@ Client run command:
 ./sequre bar.seq
 ```
 
-See the [example](#running-the-example) for a sample run at the `localhost` or online.
+See the [example](#running-the-example) for a sample run at the `localhost`.
 
 <!-- ### Configuring the network
 
