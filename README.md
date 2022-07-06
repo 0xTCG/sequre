@@ -140,8 +140,8 @@ srcipts/run.sh <program> [<pid>] [--local] [--use-ring] [--unit]
 ```
 where:
 - `<program>` is either `tests`, `benchmarks`, or `playground`.
-- `<pid>` is optional ID of computing party if the run is [online](#configuring-the-network).
-- `--local` flag triggers the [local](#configuring-the-network) run, intead of online, using the inter-process communication instead of TCP. **Note:** `<pid>` is ignored if the `--local` flag is present.
+- `<pid>` is optional ID of computing party if the run is [online](#sequres-network-config).
+- `--local` flag triggers the [local](#sequres-network-config) run, intead of online, using the inter-process communication instead of TCP. **Note:** `<pid>` is ignored if the `--local` flag is present.
 - `--use-ring` flag coerces usage of $2^k$ rings. The default is $Z_p$ field. **Note:** `--use-ring` is ignored while running tests. Tests are executed on both rings and fields.
 - `--unit` flag restricts the tests to unit test only. By default, both unit and end-to-end tests of applications (GWAS, DTI, Opal, and Ganon) are executed.
 
