@@ -15,7 +15,7 @@ scripts/install.sh
 ```
 This will:
 - Clone and install a version of [Seq](https://github.com/seq-lang/seq) that contains Sequre-related intermediate representation (IR) transformations.
-- Build the source of both Seq and Sequre.
+- Build the source for both Seq and Sequre.
 
 ### Test run
 
