@@ -175,7 +175,7 @@ scripts/run.sh tests --unit --local
 
 This will execute all unit tests [locally](#sequres-network-config), on a single machine.
 
-Drop the `--unit` flag to include the end-to-end tests of genome-wide association study, drug-target interaction inference, and mentagenomic classifiers as well:
+Drop the `--unit` flag to include the end-to-end tests for genome-wide association study, drug-target interaction inference, and metagenomic classifiers as well:
 ```bash
 scripts/run.sh tests --local
 ```
