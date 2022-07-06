@@ -31,7 +31,7 @@ This run will execute the code in a local, single machine, environment over inte
 
 Use `./sequre` script to execute Sequre both on server and client end.
 
-Server run command (`<pid>` denotes the ID of the computing party: 0, 1, 2, 3, ...):
+Server run command: _(`<pid>` denotes the ID of the computing party: 0, 1, 2, 3, ...)_
 ```bash
 ./sequre foo.seq <pid>
 ```
