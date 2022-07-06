@@ -43,7 +43,7 @@ Client run command:
 
 See the [example](#running-the-example) for a sample run at the `localhost` or online.
 
-### Configuring the network
+<!-- ### Configuring the network
 
 Sequre operates in two network modes:
 - Local: using the inter-process communication (AF_UNIX) sockets.
@@ -59,7 +59,7 @@ COMPUTING_PARTIES = [
     '9.9.9.9',  # First computing party (CP1)
     '10.10.10.10'  # Second computing party (CP2)
     ]
-```
+``` -->
 
 ## Running the example
 
