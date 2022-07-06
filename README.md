@@ -21,7 +21,7 @@ This will:
 
 Execute
 ```bash
-scripts/run.sh release playground --local
+scripts/run.sh playground --local
 ```
 to run the sample code from [playground.seq](playground.seq) that contains the benchmarks from [Hastings _et al._](https://github.com/MPC-SoK/frameworks).
 
