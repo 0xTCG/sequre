@@ -199,7 +199,7 @@ This will benchmark the following applications in Sequre:
 - Opal (metagenomic binning) with 0.1x and 15x coverage of the complete Opal dataset from [Yu _et al._](https://github.com/yunwilliamyu/opal)
 - Ganon (metagenomic binning) on top of the complete Opal dataset from [Yu _et al._](https://github.com/yunwilliamyu/opal)
 
-Benchmark results should be stored in the [results](results) folder upon the run completion.
+Benchmark results are stored in the [results](results) folder.
 
 ## License
 
