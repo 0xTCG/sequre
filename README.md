@@ -1,6 +1,6 @@
 # Sequre
 
-Sequre is an end-to-end, statically compiled and performance engineered, Pythonic framework for building efficient secure multiparty computation pipelines in bioinformatics.
+Sequre is an end-to-end, statically compiled and performance engineered, Pythonic framework for building efficient secure multiparty computation (MPC) pipelines in bioinformatics.
 
 ## Quick start
 
