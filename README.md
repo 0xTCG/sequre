@@ -1,4 +1,4 @@
-# Sequre - a high-performance framework for secure multiparty computation in bioinformatics
+# Sequre
 
 Sequre is an end-to-end, statically compiled and performance engineered, Pythonic framework for building efficient secure multiparty computation pipelines in bioinformatics.
 
