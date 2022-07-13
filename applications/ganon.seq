@@ -1,127 +1,61 @@
 from sequre.types.builtin import *
 from sequre.attributes import sequre_beaver
 from sequre.utils.param import *
-from sequre.stdlib.builtin import max as secure_max
 from sequre.types.shared_tensor import SharedTensor as Stensor
-from sequre.mpc.collections import oblivious_get
 from sequre.stdlib.protocols import bit_decomposition
 
-from offline.ganon import offline_ganon, FilterConfig, threshold_abs, threshold_rel, get_kmer_encodings, get_threshold_filter, filter_matches, output_report, __fastq_record_generator
+from offline.ganon import offline_ganon, FilterConfig, threshold_abs, \
+    threshold_rel, get_kmer_encodings, get_threshold_filter, \
+        filter_matches, output_report, __fastq_record_generator, select_matches
 from offline.seqan import SEQAN_HASH_SEEDS, seqan_ibf_hash
 
-import time, math
 
 
 DELIMITER_PRIME = 127  # MUST BE A MERSENNE PRIME. Hardcoded for now. The smallest prime that is larger than the max kmer count in all reads.
 
 
-@sequre_beaver
-def select_matches(mpc, counts_f, counts_r, threshold_cutoff, modulus):
-    counts_f.modulus = modulus
-    counts_r.modulus = modulus
-    max_kmer_counts = secure_max(mpc, (counts_f + DELIMITER_PRIME).to_fp(), (counts_r + DELIMITER_PRIME).to_fp())
-
-    return max_kmer_counts * (max_kmer_counts > (threshold_cutoff + 2 * DELIMITER_PRIME))
-
-
 def one_hash_ibf_query(ibf, shared_hashes, modulus):
     query_results = []
     
-    for i in range(len(shared_hashes)):
+    for shared_one_hot_hash in shared_hashes:
         dot_sum = typeof(modulus)(0)
-        queried_ibf = [sh.mul_mod(ibf_val.ext(), modulus) for sh , ibf_val in zip(shared_hashes[i], ibf)]
-        for e in queried_ibf: dot_sum = dot_sum.add_mod(e, modulus)
+        for sh, ibf_val in zip(shared_one_hot_hash, ibf):
+            dot_sum = dot_sum.add_mod(sh.mul_mod(ibf_val.ext(), modulus), modulus)
         query_results.append(dot_sum)
     
     return query_results
 
+
 @sequre_beaver
-def bulk_count_one_hot(mpc, ibf, kmer_encodings, bin_count, ibf_hash_count, ibf_bin_size, hash_shift, modulus, debug):
+def bulk_count_one_hot(mpc, ibf, kmer_encodings, technical_bin_count, bin_count, ibf_hash_count, hash_shift, modulus):
     queries_per_hash = []
     small_modulus = DELIMITER_PRIME + int(modulus.popcnt() == 1)
 
-    s1 = time.time()
     for i in range(ibf_hash_count):
         ibf_hashes = []
 
-        s = time.time()
         for kmer_int in kmer_encodings:
-            ibf_hashes_row = [int_t(0) for _ in range(int(ibf_bin_size))]
-            ibf_hashes_row[seqan_ibf_hash(kmer_int, SEQAN_HASH_SEEDS[i], ibf_bin_size, hash_shift)] = int_t(1)
+            ibf_hashes_row = [int_t(0) for _ in range(len(ibf))]
+            ibf_hashes_row[seqan_ibf_hash(kmer_int, SEQAN_HASH_SEEDS[i], u64(len(ibf)), hash_shift)] = int_t(1)
             ibf_hashes.append(ibf_hashes_row)
-        e = time.time()
-        if mpc.pid == 2 and debug: print(f'Populating hashes done in: {e - s}s')
         
-        s = time.time()
         shared_ibf_hashes = mpc.comms.share(ibf_hashes, modulus)
-        e = time.time()
-        if mpc.pid == 2 and debug: print(f'Sharing hashes done in: {e - s}s')
-        
-        s = time.time()
         queries_per_hash.append(Stensor[list[int_t]](one_hash_ibf_query(ibf, shared_ibf_hashes, modulus), modulus))
-        e = time.time()
-        if mpc.pid == 2 and debug: print(f'IBF query done in: {e - s}s')
-    e1 = time.time()
-    if mpc.pid == 2 and debug: print(f'Matching hashes against IBF done in: {e1 - s1}s')
-    s = time.time()
 
-    decomposed_bits = bit_decomposition(mpc, queries_per_hash[0], bin_count, small_modulus, modulus)
+    decomposed_bits = bit_decomposition(mpc, queries_per_hash[0], technical_bin_count, small_modulus, modulus)
 
     for query in queries_per_hash[1:]:
-        decomposed_bits = decomposed_bits * bit_decomposition(mpc, query, bin_count, small_modulus, modulus)
+        decomposed_bits = decomposed_bits * bit_decomposition(mpc, query, technical_bin_count, small_modulus, modulus)
     
-    e = time.time()
-    if mpc.pid == 2 and debug: print(f'Merging IBF queries done in: {e - s}s')
+    return decomposed_bits.sum()[technical_bin_count - bin_count:].reverse()
 
-    return decomposed_bits.sum()
-
-
-@sequre_beaver
-def bulk_count_oblivious(mpc, ibf, kmer_encodings, bin_count, ibf_hash_count, ibf_bin_size, modulus, debug):
-    small_modulus = DELIMITER_PRIME + int(modulus.popcnt() == 1)
-    s = time.time()
-    
-    ibf_hashes = [
-        [seqan_ibf_hash(kmer_int, SEQAN_HASH_SEEDS[i], ibf_bin_size) for i in range(ibf_hash_count)]
-        for kmer_int in kmer_encodings]
-    
-    e = time.time()
-    if mpc.pid == 2 and debug: print(f'Computing IBF hashes done in: {e - s}s')
-    s = time.time()
-    
-    shared_ibf_hashes = mpc.comms.share(ibf_hashes.to_int_t(), modulus).transpose()  # (hash_count x kmer_count)
-
-    e = time.time()
-    if mpc.pid == 2 and debug: print(f'Sharing IBF hashes done in: {e - s}s')
-    s = time.time()
-
-    queries_per_hash = []
-    for hash_row in shared_ibf_hashes:
-        query_per_hash = oblivious_get(mpc, hash_row, int(math.ceil(math.log2(float(int(ibf_bin_size))))), ibf, int(modulus), modulus).to_int_t().flatten()
-        queries_per_hash.append(Stensor[list[int_t]](query_per_hash, modulus))
-    
-    e = time.time()
-    if mpc.pid == 2 and debug: print(f'Oblivious getter done in: {e - s}s')
-    s = time.time()
-    
-    decomposed_bits = bit_decomposition(mpc, queries_per_hash[0], bin_count, small_modulus, modulus)
-
-    for query in queries_per_hash[1:]:
-        decomposed_bits = decomposed_bits * bit_decomposition(mpc, query, bin_count, small_modulus, modulus)
-    
-    e = time.time()
-    if mpc.pid == 2 and debug: print(f'Merging bits done in: {e - s}s')
-    
-    return decomposed_bits.sum()
 
 def classify(
         mpc,
         reads_generator,
         filters_configs,
         hierarchy_config,
-        modulus,
-        reads_limit,
-        debug):
+        modulus):
 
     # get max from kmer/window size
     wk_size = hierarchy_config["window_size"] if hierarchy_config["window_size"] > 0 else hierarchy_config["kmer_size"]
@@ -130,9 +64,9 @@ def classify(
     unclassified_reads = []
     reads_count = 0
 
-    for i, read in enumerate(reads_generator):
-        if i == reads_limit: break;
+    for read in reads_generator:
         sequence = read.seq  # FASTA/Q toggle
+        assert len(sequence) < DELIMITER_PRIME + int(modulus.popcnt() == 1) + wk_size, f"Sequre Ganon cannot operate on reads longer than {DELIMITER_PRIME} + k-mer size."  # TODO: Enable Sequre Ganon to work on longer reads
         reads_count += 1
         if mpc.pid == 2: print(f'Processing read {reads_count} ...')
 
@@ -143,6 +77,7 @@ def classify(
         # hash count
         kmers = 0
         # Best scoring kmer count
+        max_kmer_count_read = 0
         if read_len >= wk_size:
             # Count hashes from first pair
             kmer_enc, kmer_enc_rev_comp = get_kmer_encodings(
@@ -154,21 +89,21 @@ def classify(
 
             # For each filter in the hierarchy
             for filter_config in filters_configs:
-                s = time.time()
                 # count matches
                 counts_f = bulk_count_one_hot(
                     mpc, filter_config.ibf, kmer_enc,
+                    filter_config.technical_bin_count,
                     filter_config.bin_count, filter_config.hash_count,
-                    filter_config.bin_size,
-                    filter_config.hash_shift, modulus, debug)
+                    filter_config.hash_shift, modulus)
                 counts_r = bulk_count_one_hot(
                     mpc, filter_config.ibf, kmer_enc_rev_comp,
+                    filter_config.technical_bin_count,
                     filter_config.bin_count, filter_config.hash_count,
-                    filter_config.bin_size,
-                    filter_config.hash_shift, modulus, debug)
-                e = time.time()
-                if mpc.pid == 2 and debug: print(f'Counting kmers done in {e - s}s')
-                
+                    filter_config.hash_shift, modulus)
+
+                counts_f_rev = counts_f.print(mpc).to_int()
+                counts_r_rev = counts_r.print(mpc).to_int()
+
                 # Calculate threshold for cutoff (keep matches above)
                 threshold_cutoff = 0
                 if filter_config.rel_cutoff >= 0:
@@ -183,28 +118,19 @@ def classify(
                     threshold_cutoff = 1
                 
                 # select matches based on threshold cutoff
-                selected_kmer_counts = select_matches(
-                    mpc, counts_f, counts_r, threshold_cutoff, modulus)
+                max_kmer_count_read = select_matches(
+                    matches, counts_f_rev, counts_r_rev, filter_config.map, threshold_cutoff, max_kmer_count_read)
                 
-                s = time.time()
-                if mpc.pid == 2 and debug: print(f'Selecting matches done in {s - e}s')
-
-                selected_kmer_counts_revealed = selected_kmer_counts.print(mpc).to_int() % DELIMITER_PRIME
-
-                for bin_idx, selected_kmer_count in enumerate(selected_kmer_counts_revealed):
-                    matches[filter_config.map[bin_idx]] = selected_kmer_count
-
-        max_kmer_count_per_read = max(matches.values())
-
-        if max_kmer_count_per_read > 0:
+        # if read got valid matches (above cutoff)
+        if max_kmer_count_read > 0:
             # Calculate threshold for filtering (keep matches above)
             threshold_filter = get_threshold_filter(
                 hierarchy_config,
                 kmers,
-                max_kmer_count_per_read,
+                max_kmer_count_read,
                 hierarchy_config["kmer_size"],
                 hierarchy_config["offset"])
-    
+
             # Filter matches
             read_out = filter_matches(
                 read.name,
@@ -222,7 +148,7 @@ def classify(
     return classified_reads, unclassified_reads
 
 
-def sequre_ganon(mpc, parsed_hierarchy, filters_configs, input_fasta, modulus, debug = False, output_file_path = '', reads_limit = 1):
+def sequre_ganon(mpc, parsed_hierarchy, filters_configs, input_fasta, modulus):
     # Classify reads iteractively for each hierarchy level
     hierarchy_id = 0
     unclassified_reads = []
@@ -239,12 +165,10 @@ def sequre_ganon(mpc, parsed_hierarchy, filters_configs, input_fasta, modulus, d
             reads_generator,
             filters_configs,
             hierarchy_config,
-            modulus,
-            reads_limit,
-            debug)
+            modulus)
             
         # write reports
-        output_report(classified_reads, hierarchy_label, output_file_path)
+        output_report(classified_reads, hierarchy_label)
         for readout in classified_reads:
             target, count = max_by_key(readout.matches, key=lambda x: x[1])
             filtered_matches.append([readout.read_name, str(target), str(count)])
