@@ -4,10 +4,10 @@ from sequre.utils.param import *
 from sequre.types.shared_tensor import SharedTensor as Stensor
 from sequre.stdlib.protocols import bit_decomposition
 
-from offline.ganon import offline_ganon, FilterConfig, threshold_abs, \
+from offline.ganon import FilterConfig, threshold_abs, \
     threshold_rel, get_kmer_encodings, get_threshold_filter, \
         filter_matches, output_report, __fastq_record_generator, select_matches
-from offline.seqan import SEQAN_HASH_SEEDS, seqan_ibf_hash
+from offline.seqan import SEQAN_HASH_SEEDS, seqan_ibf_hash, bulk_count
 
 
 
@@ -47,7 +47,7 @@ def bulk_count_one_hot(mpc, ibf, kmer_encodings, technical_bin_count, bin_count,
     for query in queries_per_hash[1:]:
         decomposed_bits = decomposed_bits * bit_decomposition(mpc, query, technical_bin_count, small_modulus, modulus)
     
-    return decomposed_bits.sum()[technical_bin_count - bin_count:].reverse()
+    return decomposed_bits.sum()[technical_bin_count - bin_count:].reverse().print(mpc).to_int()
 
 
 def classify(
@@ -55,7 +55,8 @@ def classify(
         reads_generator,
         filters_configs,
         hierarchy_config,
-        modulus):
+        modulus,
+        offline):
 
     # get max from kmer/window size
     wk_size = hierarchy_config["window_size"] if hierarchy_config["window_size"] > 0 else hierarchy_config["kmer_size"]
@@ -66,7 +67,8 @@ def classify(
 
     for read in reads_generator:
         sequence = read.seq  # FASTA/Q toggle
-        assert len(sequence) < DELIMITER_PRIME + int(modulus.popcnt() == 1) + wk_size, f"Sequre Ganon cannot operate on reads longer than {DELIMITER_PRIME} + k-mer size."  # TODO: Enable Sequre Ganon to work on longer reads
+        if not offline:
+            assert len(sequence) < DELIMITER_PRIME + int(modulus.popcnt() == 1) + wk_size, f"Sequre Ganon cannot operate on reads longer than {DELIMITER_PRIME} + k-mer size."  # TODO: Enable Sequre Ganon to work on longer reads
         reads_count += 1
         if mpc.pid == 2: print(f'Processing read {reads_count} ...')
 
@@ -86,23 +88,24 @@ def classify(
                 hierarchy_config["offset"],
                 hierarchy_config["alphabet_size"])
             kmers = len(sequence) - hierarchy_config["kmer_size"] + 1
-
+            
             # For each filter in the hierarchy
             for filter_config in filters_configs:
                 # count matches
-                counts_f = bulk_count_one_hot(
-                    mpc, filter_config.ibf, kmer_enc,
-                    filter_config.technical_bin_count,
-                    filter_config.bin_count, filter_config.hash_count,
-                    filter_config.hash_shift, modulus)
-                counts_r = bulk_count_one_hot(
-                    mpc, filter_config.ibf, kmer_enc_rev_comp,
-                    filter_config.technical_bin_count,
-                    filter_config.bin_count, filter_config.hash_count,
-                    filter_config.hash_shift, modulus)
-
-                counts_f_rev = counts_f.print(mpc).to_int()
-                counts_r_rev = counts_r.print(mpc).to_int()
+                counts_f = bulk_count(
+                    filter_config.ibf, kmer_enc,
+                    filter_config.bin_count, filter_config.hash_count) if offline else bulk_count_one_hot(
+                        mpc, filter_config.ibf, kmer_enc,
+                        filter_config.technical_bin_count,
+                        filter_config.bin_count, filter_config.hash_count,
+                        filter_config.hash_shift, modulus)
+                counts_r = bulk_count(
+                    filter_config.ibf, kmer_enc_rev_comp,
+                    filter_config.bin_count, filter_config.hash_count) if offline else bulk_count_one_hot(
+                        mpc, filter_config.ibf, kmer_enc_rev_comp,
+                        filter_config.technical_bin_count,
+                        filter_config.bin_count, filter_config.hash_count,
+                        filter_config.hash_shift, modulus)
 
                 # Calculate threshold for cutoff (keep matches above)
                 threshold_cutoff = 0
@@ -119,7 +122,7 @@ def classify(
                 
                 # select matches based on threshold cutoff
                 max_kmer_count_read = select_matches(
-                    matches, counts_f_rev, counts_r_rev, filter_config.map, threshold_cutoff, max_kmer_count_read)
+                    matches, counts_f, counts_r, filter_config.map, threshold_cutoff, max_kmer_count_read)
                 
         # if read got valid matches (above cutoff)
         if max_kmer_count_read > 0:
@@ -148,7 +151,7 @@ def classify(
     return classified_reads, unclassified_reads
 
 
-def sequre_ganon(mpc, parsed_hierarchy, filters_configs, input_fasta, modulus):
+def ganon(mpc, parsed_hierarchy, filters_configs, input_fasta, modulus, offline):
     # Classify reads iteractively for each hierarchy level
     hierarchy_id = 0
     unclassified_reads = []
@@ -165,12 +168,21 @@ def sequre_ganon(mpc, parsed_hierarchy, filters_configs, input_fasta, modulus):
             reads_generator,
             filters_configs,
             hierarchy_config,
-            modulus)
+            modulus,
+            offline)
             
-        # write reports
+        # Output reports
         output_report(classified_reads, hierarchy_label)
         for readout in classified_reads:
             target, count = max_by_key(readout.matches, key=lambda x: x[1])
             filtered_matches.append([readout.read_name, str(target), str(count)])
     
     return filtered_matches
+
+
+def offline_ganon(mpc, parsed_hierarchy, filters_configs, input_fasta):
+    return ganon(mpc, parsed_hierarchy, filters_configs, input_fasta, int_t(0), True)
+
+
+def sequre_ganon(mpc, parsed_hierarchy, filters_configs, input_fasta, modulus):
+    return ganon(mpc, parsed_hierarchy, filters_configs, input_fasta, modulus, False)
