@@ -1,0 +1,248 @@
+"""
+Fast modular multiplication for fixed modulus: (2 ** 174) - 3 using u192 integers.
+
+We used the fact that m = x % (2 ** p - s) can be computed as:
+    mask = (1 << p) - 1
+    m = (x & mask) + ((x >> p) * s)
+    while m > mask: m = (m & mask) + ((m >> p) * s)
+    if m >= d: m = m - d
+
+If you find an edge-case to the computation above, please let me know at hsmajlovic at uvic dot ca.
+"""
+
+
+RUN_TESTS = True
+
+
+@llvm
+def _add_overflow(a: u64, b: u64) -> tuple[u64, UInt[1]]:
+    declare {i64, i1} @llvm.uadd.with.overflow.i64(i64 %a, i64 %b)
+    %res = call {i64, i1} @llvm.uadd.with.overflow.i64(i64 %a, i64 %b)
+    ret {i64, i1} %res
+
+
+def _add_w_overflow(a: u64, b: u64) -> tuple[u64, u64]:
+    s, overflow = _add_overflow(a, b)
+    return s, u64(overflow)
+
+
+@extend
+class UInt[N]:
+    @llvm
+    def __new__(other: UInt[64]) -> UInt[N]:
+        %0 = zext i{=N//2} %other to i{=N}
+        ret i{=N} %0
+    @llvm
+    def __new__(other: UInt[1]) -> UInt[N]:
+        %0 = zext i1 %other to i{=N}
+        ret i{=N} %0
+    @llvm
+    def trunc_to_64(self: UInt[N]) -> u64:
+        %0 = trunc i{=N} %self to i64
+        ret i64 %0
+    @llvm
+    def ext(self: UInt[N]) -> UInt[N * 2]:
+        %0 = zext i{=N} %self to i{=N*2}
+        ret i{=N*2} %0
+    @llvm
+    def trunc_to_128(self: UInt[N]) -> UInt[128]:
+        %0 = trunc i{=N} %self to i128
+        ret i128 %0
+    @llvm
+    def ext_to_192(self: UInt[N]) -> UInt[192]:
+        %0 = zext i{=N} %self to i192
+        ret i192 %0
+    def __str__(self: UInt[N]) -> str:
+        self_cp = self
+        int_str = ''
+        while self_cp:
+            remainder = 0
+            quotient = UInt[N](0)
+            # Euclidean division
+            for bit_idx in range(174, -1, -1):
+                mask = int((self_cp & (UInt[N](1) << UInt[N](bit_idx))) != UInt[N](0))
+                remainder = (remainder << 1) + mask
+                if remainder >= 10:
+                    quotient = (quotient << UInt[N](1)) + UInt[N](1)
+                    remainder -= 10
+                else: quotient = quotient << UInt[N](1)
+            int_str = str(remainder) + int_str
+            self_cp = quotient
+        return int_str if int_str else '0'
+
+
+u128 = UInt[128]
+u192 = UInt[192]
+MODULUS = (u192(1) << u192(174)) - u192(3)
+MASK_MOD = (u192(1) << u192(174)) - u192(1)
+MASK_128 = u128(int(u64(-1)))
+MASK_192 = u192(int(u64(-1)))
+
+
+def split_lo_hi(a: u128):
+    a_lo = a & MASK_128
+    a_hi = a >> u128(64)
+    return a_hi, a_lo
+
+
+def split_lo_mi_hi(a: u192):
+    a_lo = (a & MASK_192).trunc_to_128()
+    a_hi, a_mi = split_lo_hi((a >> u192(64)).trunc_to_128())
+    return a_hi, a_mi, a_lo
+
+
+def modular_mult_u192u64(a: u192, b: u64) -> u192:
+    """ 
+    Calculates (a * b) % (2 ** 174 - 3) without overflow.
+    """
+    
+    a_hi, a_mi, a_lo = split_lo_mi_hi(a)
+    b_lo = b.ext()
+
+    ll_001, ll_000 = split_lo_hi(a_lo * b_lo)
+    ml_010, ml_001 = split_lo_hi(a_mi * b_lo)
+    hl_011, hl_010 = split_lo_hi(a_hi * b_lo)
+
+    # 1st 64-bit column
+    m = ll_000.ext_to_192()
+    
+    # 2nd 64-bit column
+    ll_001_int = ll_001.trunc_to_64()
+    ml_001_int = ml_001.trunc_to_64()
+    s, overflow = _add_w_overflow(ll_001_int, ml_001_int)
+    m |= s.ext_to_192() << u192(64)
+    
+    # 3rd 64-bit column
+    ml_010_int = ml_010.trunc_to_64()
+    hl_010_int = hl_010.trunc_to_64()
+    s, overflow_1 = _add_w_overflow(ml_010_int, overflow)
+    s, overflow_2 = _add_w_overflow(s, hl_010_int)
+    overflow = overflow_1 + overflow_2
+    s_msbs = s >> u64(46)  # 18 most significant bits of the sum
+    m |= (((s << u64(18)) >> u64(18)).ext_to_192() << u192(128))
+
+    # 4th 64-bit column
+    hl_011_int = hl_011.trunc_to_64()
+    s = hl_011_int + overflow
+    m += ((s.ext_to_192() << u192(18)) | s_msbs.ext_to_192()) * u192(3)
+
+    # Final shift
+    m = (m & MASK_MOD) + ((m >> u192(174)) * u192(3))
+    
+    if m >= MODULUS: return m - MODULUS
+    return m
+
+
+def modular_mult_u192u192(a: u192, b: u192) -> u192:
+    """ 
+    Calculates (a * b) % (2 ** 174 - 3) without overflow.
+    """
+    
+    a_hi, a_mi, a_lo = split_lo_mi_hi(a)
+    b_hi, b_mi, b_lo = split_lo_mi_hi(b)
+
+    ll_001, ll_000 = split_lo_hi(a_lo * b_lo)
+    lm_010, lm_001 = split_lo_hi(a_lo * b_mi)
+    ml_010, ml_001 = split_lo_hi(a_mi * b_lo)
+    lh_011, lh_010 = split_lo_hi(a_lo * b_hi)
+    mm_011, mm_010 = split_lo_hi(a_mi * b_mi)
+    hl_011, hl_010 = split_lo_hi(a_hi * b_lo)
+    mh_100, mh_011 = split_lo_hi(a_mi * b_hi)
+    hm_100, hm_011 = split_lo_hi(a_hi * b_mi)
+    hh_101, hh_100 = split_lo_hi(a_hi * b_hi)
+
+    # 1st 64-bit column
+    m = ll_000.ext_to_192()
+    
+    # 2nd 64-bit column
+    ll_001_int = ll_001.trunc_to_64()
+    lm_001_int = lm_001.trunc_to_64()
+    ml_001_int = ml_001.trunc_to_64()
+    s, overflow_1 = _add_w_overflow(ll_001_int, lm_001_int)
+    s, overflow_2 = _add_w_overflow(s, ml_001_int)
+    overflow = overflow_1 + overflow_2
+    m |= s.ext_to_192() << u192(64)
+    
+    # 3rd 64-bit column
+    lm_010_int = lm_010.trunc_to_64()
+    ml_010_int = ml_010.trunc_to_64()
+    lh_010_int = lh_010.trunc_to_64()
+    mm_010_int = mm_010.trunc_to_64()
+    hl_010_int = hl_010.trunc_to_64()
+    s, overflow_1 = _add_w_overflow(lm_010_int, overflow)
+    s, overflow_2 = _add_w_overflow(s, ml_010_int)
+    s, overflow_3 = _add_w_overflow(s, lh_010_int)
+    s, overflow_4 = _add_w_overflow(s, mm_010_int)
+    s, overflow_5 = _add_w_overflow(s, hl_010_int)
+    overflow = overflow_1 + overflow_2 + overflow_3 + overflow_4 + overflow_5
+    s_msbs = s >> u64(46)  # 18 most significant bits of the sum
+    m |= (((s << u64(18)) >> u64(18)).ext_to_192() << u192(128))
+
+    # 4th 64-bit column
+    lh_011_int = lh_011.trunc_to_64()
+    mm_011_int = mm_011.trunc_to_64()
+    hl_011_int = hl_011.trunc_to_64()
+    mh_011_int = mh_011.trunc_to_64()
+    hm_011_int = hm_011.trunc_to_64()
+    s, overflow_1 = _add_w_overflow(lh_011_int, overflow)
+    s, overflow_2 = _add_w_overflow(s, mm_011_int)
+    s, overflow_3 = _add_w_overflow(s, hl_011_int)
+    s, overflow_4 = _add_w_overflow(s, mh_011_int)
+    s, overflow_5 = _add_w_overflow(s, hm_011_int)
+    overflow = overflow_1 + overflow_2 + overflow_3 + overflow_4 + overflow_5
+    addendum_lo = (s.ext_to_192() << u192(18)) | s_msbs.ext_to_192()
+
+    # 5th 64-bit column
+    mh_100_int = mh_100.trunc_to_64()
+    hm_100_int = hm_100.trunc_to_64()
+    hh_100_int = hh_100.trunc_to_64()
+    s, overflow_1 = _add_w_overflow(mh_100_int, overflow)
+    s, overflow_2 = _add_w_overflow(s, hm_100_int)
+    s, overflow_3 = _add_w_overflow(s, hh_100_int)
+    overflow = overflow_1 + overflow_2 + overflow_3
+    addendum_mi = s.ext_to_192() << u192(82)
+
+    # 6th 64-bit column
+    hh_101_int = hh_101.trunc_to_64()
+    # Note: No need to worry about overflow in the addition below
+    #  if a and b are ensured to be less than ((2 ** 174) - 3)
+    s = hh_101_int + overflow
+    addendum_hi = s.ext_to_192() << u192(146)
+    m += (addendum_hi | addendum_mi | addendum_lo) * u192(3)
+
+    # Final shift
+    m = (m & MASK_MOD) + ((m >> u192(174)) * u192(3))
+    
+    if m >= MODULUS: return m - MODULUS
+    return m
+    
+
+if RUN_TESTS:
+    import random
+    import time
+
+    iterations = 1 << 22
+
+    for _ in range(iterations):
+        a = random.getrandbits_intn[u128](127).ext_to_192() * u192(1 << 46)
+        b = random.getrandbits_intn[u128](127).trunc_to_64()
+        assert modular_mult_u192u192(a, b.ext_to_192()) == modular_mult_u192u64(a, b), f"Failed for {a} and {b}"
+    print('Tests passed!')
+
+    g = []
+    s = time.time()
+    for _ in range(iterations):
+        a = random.getrandbits_intn[u128](127).ext_to_192() * u192(1 << 46)
+        b = random.getrandbits_intn[u128](127).trunc_to_64()
+        g.append(modular_mult_u192u64(a, b))
+    e = time.time()
+    print(f'Modular mult u192xu64 done in {e - s}s')
+
+    g = []
+    s = time.time()
+    for _ in range(iterations):
+        a = random.getrandbits_intn[u128](127).ext_to_192() * u192(1 << 46)
+        b = random.getrandbits_intn[u128](127).ext_to_192() * u192(1 << 46)
+        g.append(modular_mult_u192u192(a, b))
+    e = time.time()
+    print(f'Modular mult u192xu192 done in {e - s}s')
