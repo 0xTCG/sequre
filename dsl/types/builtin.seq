@@ -1,6 +1,6 @@
 from ..utils.param import \
     int_t, MOD_CONST, FIELD_SIZE, RING_SIZE, RING_MASK, DEBUG, \
-    MODULUS_OPT, MATRIX_OPT, MODULUS_BITS, IS_MERSENNE_FIELD
+    MODULUS_OPT, MATRIX_OPT, MODULUS_BITS, MERSENNE_OFFSET
 from ..utils.utils import __rand_int, __rand_vec, __rand_mat, \
     __rand_bits, __rand_vec_bits, __rand_mat_bits
 from ..utils.primitives import mod_pow
@@ -187,8 +187,11 @@ class UInt[N]:
         return self // UInt[N](other)
     def __mod__(self: UInt[N], other: UInt[N]) -> UInt[N]:
         if other == RING_SIZE: return self.__fast_mod_ring()
-        if not MODULUS_OPT: return self.__naive_mod(other)
+        if not MODULUS_OPT: raise NotImplementedError("Non-optimized modulus is disabled until LLVM's urem is fixed on longer ints.")
         if other == FIELD_SIZE: return self.__fast_mod_field()
+        if isinstance(self, UInt[192]):
+            # Temporary bypass. Until LLVM's urem is fixed for long integers.
+            return self.__experimental__truncated_mod(other)
         return self.__naive_mod(other)
     @llvm
     def get_mod_const(field_size: UInt[N]) -> UInt[N*2]:
@@ -215,6 +218,13 @@ class UInt[N]:
         %10 = lshr i{=N*2} %9, {=N}
         %11 = trunc i{=N*2} %10 to i{=N}
         ret i{=N} %11
+    @llvm
+    def __experimental__truncated_mod(self: UInt[N], other: UInt[N]) -> UInt[N]:
+        %0 = trunc i{=N} %self to i{=N//2}
+        %1 = trunc i{=N} %other to i{=N//2}
+        %2 = urem i{=N//2} %0, %1
+        %3 = zext i{=N//2} %2 to i{=N}
+        ret i{=N} %3
     def __fast_mod_mersenne(self: UInt[N], field_size: UInt[N] = FIELD_SIZE):
         """
         Bit-hack for computing modulus with the field size of the form 2^k - 1 (Mersenne form of a prime).
@@ -248,8 +258,29 @@ class UInt[N]:
         
         if m == field_size: return UInt[N](0)
         return m
+    def __fast_mod_semi_mersenne(self: UInt[N], field_size: UInt[N] = FIELD_SIZE, ring_mask: UInt[N] = RING_MASK, modulus_bits: int = MODULUS_BITS, s: int = 3):
+        """
+        Bit-hack for computing modulus with the field size of the form 2^k - s (semi-Mersenne).
+        There is no explicit check for the shape of the field,
+        so please make sure that the field_size has the form 2^k - s if you use this method.
+        """
+        m = (self & ring_mask) + ((self >> modulus_bits) * s)
+        while m > ring_mask: m = (m & ring_mask) + ((m >> modulus_bits) * s)
+        if m >= field_size: return m - field_size
+        return m
+    def __fast_mod_semi_mersenne_fixed(self: UInt[N], field_size: UInt[N] = FIELD_SIZE, ring_mask: UInt[N] = RING_MASK):
+        """
+        Bit-hack for computing modulus with the field size of the form 2^174 - 3 (semi-Mersenne).
+        There is no explicit check for the shape of the field,
+        so please make sure that the field_size has the form 2^174 - 3 if you use this method.
+        """
+        m = (self & ring_mask) + ((self >> 174) * 3)
+        m = (m & ring_mask) + ((m >> 174) * 3)
+        if m >= field_size: return m - field_size
+        return m
     def __fast_mod_field(self: UInt[N]):
-        if IS_MERSENNE_FIELD: return self.__fast_mod_mersenne_fixed()
+        if isinstance(self, UInt[192]): return self.__fast_mod_semi_mersenne_fixed()
+        if isinstance(self, UInt[128]): return self.__fast_mod_mersenne_fixed()
         return self.__fast_mod_const_field()
     def __fast_mod_ring(self: UInt[N]) -> UInt[N]:
         return self & RING_MASK
@@ -298,6 +329,10 @@ class UInt[N]:
     def ext(self: UInt[N]) -> UInt[N * 2]:
         %0 = zext i{=N} %self to i{=N*2}
         ret i{=N*2} %0
+    @llvm
+    def upcast(other: u64) -> UInt[N]:
+        %0 = zext i64 %other to i{=N}
+        ret i{=N} %0
     def neg_mod(self, modulus) -> UInt[N]:
         return self.fixed_value(modulus) - self
     def add_mod(self, other, modulus) -> UInt[N]:
@@ -305,7 +340,11 @@ class UInt[N]:
     def sub_mod(self, other, modulus) -> UInt[N]:
         return (self + modulus - other) % modulus
     def mul_mod(self, other, modulus) -> UInt[N]:
-        if modulus == RING_SIZE: return (self * other) & RING_MASK
+        if modulus == RING_SIZE:
+            if not isinstance(self, u64) and isinstance(other, u64):
+                # Assume other is shorter than self
+                return (self * UInt[N].upcast(other)) & RING_MASK
+            else: return (self * other) & RING_MASK
         if modulus == FIELD_SIZE:
             if isinstance(self, UInt[128]):
                 if isinstance(other, UInt[N]): return modular_mult_u128u128_v1(self, other)
@@ -324,12 +363,12 @@ class UInt[N]:
     def pow_mod(self, other, modulus) -> UInt[N]:
         return mod_pow(self, other, modulus)
     def lsh_mod(self: UInt[N], other: int, modulus) -> UInt[N]:
-        if DEBUG: assert other <= 127, f'Cannot left shift more than the length of modulus: 127'
+        if DEBUG: assert other <= MODULUS_BITS, f'Cannot left shift more than the length of modulus: {MODULUS_BITS}'
         if modulus == RING_SIZE: return (self << other) & RING_MASK
         if modulus == FIELD_SIZE:
-            s = (self << other) & FIELD_SIZE
-            s += self >> (127 - other)
-            return (s & FIELD_SIZE) + (s >> 127)
+            s = (self << other) & RING_MASK
+            s += (self >> (MODULUS_BITS - other)) * MERSENNE_OFFSET
+            return (s & RING_MASK) + (s >> MODULUS_BITS) * MERSENNE_OFFSET
         raise ValueError(f"Invalid modulus for modular multiplication: {modulus}")
     def to_bytes(self: UInt[N]):
         for _ in range(1): yield self
