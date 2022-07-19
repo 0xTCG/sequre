@@ -68,7 +68,7 @@ def offline_gwas(pheno_path, cov_path, geno_path, miss_path, num_inds, num_snps,
     
     maf = np.nan_to_num(dosage.sum(axis=0) / ((num_inds - miss.sum(axis=0)) * 2))
     g_std_bern = np.sqrt(maf * (1 - maf))
-    standardized_dosage = np.nan_to_num((dosage - (1 - miss) * maf) / g_std_bern)
+    standardized_dosage = np.nan_to_num((dosage - (1 - miss) * maf * 2) / g_std_bern)
 
     pca_components = PCA(top_components).fit_transform(standardized_dosage)
     V = orthonormal_basis(np.hstack((pca_components, cov)).T)
