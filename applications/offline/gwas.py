@@ -30,6 +30,16 @@ def load_dosage(f_geno, f_miss, rows, cols):
     return miss, dosage
 
 
+def load_snp_pos(f_snp_pos, num_snps):
+    snp_pos = []
+
+    for _, line in zip(range(num_snps), f_snp_pos):
+        chrom, pos = line.split()
+        snp_pos.append(int(chrom.strip()) * 10 ** 9 + int(pos.strip()))
+    
+    return np.array(snp_pos)
+
+
 def householder(x):
     u = x.copy()
     u[0] += np.linalg.norm(x) * np.sign(x[0])
@@ -54,21 +64,39 @@ def orthonormal_basis(A):
     return Q
 
 
-def offline_gwas(pheno_path, cov_path, geno_path, miss_path, num_inds, num_snps, num_covs, top_components):
+def locus_distance_filter(snp_pos, ld_dist_thres):
+    selected = [False for _ in range(len(snp_pos))]
+
+    prev = -1
+    for i in range(len(selected)):
+        if (prev < 0) or (snp_pos[i] - prev > ld_dist_thres):
+            selected[i] = True
+            prev = snp_pos[i]
+    
+    return selected
+
+
+def offline_gwas(pheno_path, cov_path, snp_pos_path, geno_path, miss_path, num_inds, num_snps, num_covs, top_components, ld_dist_thres):
     f_pheno = open(pheno_path)
     f_cov   = open(cov_path)
     f_geno  = open(geno_path)
     f_miss  = open(miss_path)
+    f_snp_pos = open(snp_pos_path)
     
     pheno = np.array(read_vector(f_pheno, num_inds))
     cov = np.array(read_matrix(f_cov, num_inds, num_covs))
+    snp_pos = load_snp_pos(f_snp_pos, num_snps)
     miss, dosage = load_dosage(f_geno, f_miss, num_inds, num_snps)
 
     # TODO: Implement QC
-    
+
+    selected = locus_distance_filter(snp_pos, ld_dist_thres)
+
     maf = np.nan_to_num(dosage.sum(axis=0) / ((num_inds - miss.sum(axis=0)) * 2))
     g_std_bern = np.sqrt(maf * (1 - maf))
-    standardized_dosage = np.nan_to_num((dosage - (1 - miss) * maf * 2) / g_std_bern)
+    standardized_dosage = np.nan_to_num((dosage - (1 - miss) * maf * 2) / g_std_bern)[:,selected]
+
+    print(f'Selected {standardized_dosage.shape[0]} individuals and {standardized_dosage.shape[1]} SNPs.')
 
     pca_components = PCA(top_components).fit_transform(standardized_dosage)
     V = orthonormal_basis(np.hstack((pca_components, cov)).T)
@@ -90,12 +118,14 @@ def offline_gwas(pheno_path, cov_path, geno_path, miss_path, num_inds, num_snps,
 kwargs = {
     'pheno_path': 'data/gwas/input/lung_reduced/pheno.txt',
     'cov_path': 'data/gwas/input/lung_reduced/cov.txt',
+    'snp_pos_path': 'data/gwas/input/lung_reduced/pos.txt',
     'geno_path': 'data/gwas/input/lung_reduced/geno.txt',
     'miss_path': 'data/gwas/input/lung_reduced/miss.txt',
     'num_inds': 1000,
     'num_snps': 30000,
     'num_covs': 10,
-    'top_components': 5
+    'top_components': 3,
+    'ld_dist_thres': 10000
 }
 
 with open('log.txt', 'w') as f:
