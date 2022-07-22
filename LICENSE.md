@@ -1,6 +1,6 @@
 # License
 
-The following license governs the use of Sequre in academic and educational environments. Commercial use requires a commercial license from [Exaloop](https://exaloop.io).
+The following license governs the use of Sequre in academic and educational environments. Commercial use requires a commercial license.
 
 # ACADEMIC PUBLIC LICENSE
 _Written by [Andras Varga](https://omnetpp.org/intro/license) (license text is in public domain)._
