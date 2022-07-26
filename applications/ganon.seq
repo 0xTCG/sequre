@@ -1,17 +1,20 @@
+import time
+from bisect import bisect
+
 from sequre.types.builtin import *
 from sequre.attributes import sequre_beaver as sequre
 from sequre.utils.param import *
 from sequre.types.shared_tensor import SharedTensor as Stensor
 from sequre.stdlib.protocols import bit_decomposition
 
-from offline.ganon import FilterConfig, threshold_abs, \
+from offline.ganon import FilterConfig, threshold_abs, get_abundance_masks, \
     threshold_rel, get_kmer_encodings, get_threshold_filter, \
-        filter_matches, output_report, __fastq_record_generator, select_matches
+    filter_matches, output_report, fastq_record_generator, select_matches
 from offline.seqan import SEQAN_HASH_SEEDS, seqan_ibf_hash, bulk_count
 
 
-
 DELIMITER_PRIME = 127  # MUST BE A MERSENNE PRIME. Hardcoded for now. The smallest prime that is larger than the max kmer count in all reads.
+sharing_time = 0.0
 
 
 def one_hash_ibf_query(ibf, shared_hashes, modulus):
@@ -27,20 +30,28 @@ def one_hash_ibf_query(ibf, shared_hashes, modulus):
 
 
 @sequre
-def bulk_count_one_hot(mpc, ibf, kmer_encodings, technical_bin_count, bin_count, ibf_hash_count, hash_shift, modulus):
+def bulk_count_one_hot(
+        mpc, abundance_mask, ibf, kmer_encodings, technical_bin_count,
+        bin_count, ibf_hash_count, hash_shift, modulus):
+    global sharing_time
     queries_per_hash = []
     small_modulus = DELIMITER_PRIME + int(modulus.popcnt() == 1)
 
     for i in range(ibf_hash_count):
         ibf_hashes = []
+        masked_ibf = ibf[abundance_mask[i]]
 
+        s = time.time()
         for kmer_int in kmer_encodings:
-            ibf_hashes_row = [int_t(0) for _ in range(len(ibf))]
-            ibf_hashes_row[seqan_ibf_hash(kmer_int, SEQAN_HASH_SEEDS[i], u64(len(ibf)), hash_shift)] = int_t(1)
+            ibf_hashes_row = [int_t(0) for _ in range(len(masked_ibf))]
+            index_in_mask = bisect(abundance_mask[i], seqan_ibf_hash(kmer_int, SEQAN_HASH_SEEDS[i], u64(len(ibf)), hash_shift))
+            ibf_hashes_row[index_in_mask - 1] = int_t(1)
             ibf_hashes.append(ibf_hashes_row)
         
         shared_ibf_hashes = mpc.comms.share(ibf_hashes, modulus)
-        queries_per_hash.append(Stensor[list[int_t]](one_hash_ibf_query(ibf, shared_ibf_hashes, modulus), modulus))
+        e = time.time()
+        sharing_time += (e - s)
+        queries_per_hash.append(Stensor[list[int_t]](one_hash_ibf_query(masked_ibf, shared_ibf_hashes, modulus), modulus))
 
     decomposed_bits = bit_decomposition(mpc, queries_per_hash[0], technical_bin_count, small_modulus, modulus)
 
@@ -52,6 +63,7 @@ def bulk_count_one_hot(mpc, ibf, kmer_encodings, technical_bin_count, bin_count,
 
 def classify(
         mpc,
+        abundance_masks,
         reads_generator,
         filters_configs,
         hierarchy_config,
@@ -90,19 +102,20 @@ def classify(
             kmers = len(sequence) - hierarchy_config["kmer_size"] + 1
             
             # For each filter in the hierarchy
-            for filter_config in filters_configs:
+            for i, filter_config in enumerate(filters_configs):
+                abundance_mask = abundance_masks[i]
                 # count matches
                 counts_f = bulk_count(
                     filter_config.ibf, kmer_enc,
                     filter_config.bin_count, filter_config.hash_count) if offline else bulk_count_one_hot(
-                        mpc, filter_config.ibf, kmer_enc,
+                        mpc, abundance_mask, filter_config.ibf, kmer_enc,
                         filter_config.technical_bin_count,
                         filter_config.bin_count, filter_config.hash_count,
                         filter_config.hash_shift, modulus)
                 counts_r = bulk_count(
                     filter_config.ibf, kmer_enc_rev_comp,
                     filter_config.bin_count, filter_config.hash_count) if offline else bulk_count_one_hot(
-                        mpc, filter_config.ibf, kmer_enc_rev_comp,
+                        mpc, abundance_mask, filter_config.ibf, kmer_enc_rev_comp,
                         filter_config.technical_bin_count,
                         filter_config.bin_count, filter_config.hash_count,
                         filter_config.hash_shift, modulus)
@@ -159,12 +172,15 @@ def ganon(mpc, parsed_hierarchy, filters_configs, input_fasta, modulus, offline)
 
     for hierarchy_label, hierarchy_config in parsed_hierarchy.items():
         hierarchy_id += 1
-
-        reads_generator = iter(unclassified_reads) if unclassified_reads else __fastq_record_generator(input_fasta)
+        abundance_masks = [get_abundance_masks(
+            input_fasta, len(filter_config.ibf), hierarchy_config["window_size"], hierarchy_config["offset"],
+            hierarchy_config["alphabet_size"], filter_config.hash_shift) for filter_config in filters_configs]
+        reads_generator = iter(unclassified_reads) if unclassified_reads else fastq_record_generator(input_fasta)
 
         # Parallelize
         classified_reads, unclassified_reads = classify(
             mpc,
+            abundance_masks,
             reads_generator,
             filters_configs,
             hierarchy_config,
@@ -177,6 +193,7 @@ def ganon(mpc, parsed_hierarchy, filters_configs, input_fasta, modulus, offline)
             target, count = max_by_key(readout.matches, key=lambda x: x[1])
             filtered_matches.append([readout.read_name, str(target), str(count)])
     
+    print(f'Secret sharing time at CP{mpc.pid}: {sharing_time}s.')
     return filtered_matches
 
 
