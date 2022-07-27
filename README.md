@@ -83,7 +83,7 @@ To run the same procedure on multiple machines, [install Sequre](#quick-start) a
 Example network configuration (`dsl/settings.seq` --- the IP addresses are fictional):
 ```python
 # IPs
-TRUSTED_DEALER = '8.8.8.8'  # CP0
+TRUSTED_DEALER = '8.8.8.8'  # Trusted dealer
 COMPUTING_PARTIES = [
     '9.9.9.9',  # First computing party (CP1)
     '10.10.10.10'  # Second computing party (CP2)
@@ -124,7 +124,7 @@ If using the online mode, make sure to configure the network within Sequre's [se
 Example network configuration (`dsl/settings.seq` --- the IP addresses are fictional):
 ```python
 # IPs
-TRUSTED_DEALER = '8.8.8.8'  # CP0
+TRUSTED_DEALER = '8.8.8.8'  # Trusted dealer
 COMPUTING_PARTIES = [
     '9.9.9.9',  # First computing party (CP1)
     '10.10.10.10'  # Second computing party (CP2)
@@ -197,7 +197,7 @@ This will benchmark the following applications in Sequre:
 - Genome-wide association study on top of a toy dataset from [Cho _et al._](https://github.com/hhcho/secure-gwas).
 - Drug-target inference on top of a reduced STITCH dataset from [Hie _et al._](https://github.com/brianhie/secure-dti).
 - Opal (metagenomic binning) with 0.1x and 15x coverage of the complete Opal dataset from [Yu _et al._](https://github.com/yunwilliamyu/opal)
-- Ganon (metagenomic binning) on top of the complete Opal dataset from [Yu _et al._](https://github.com/yunwilliamyu/opal)
+- Ganon (metagenomic binning) on top of a single read from the complete Opal dataset from [Yu _et al._](https://github.com/yunwilliamyu/opal)
 
 Benchmark results are stored in the [results](results) folder.
 
