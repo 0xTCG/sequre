@@ -147,14 +147,14 @@ where:
 - `--use-ring` flag coerces usage of $2^k$ rings for MPC subroutines that are generally faster but introduce a slight inaccuracy ($\pm 1/2^{20}$) in fixed point numbers. Without the flag, Sequre defaults to a finite field instead. **Note:** `--use-ring` is ignored while running tests. Tests are executed on both rings and fields.
 - `--unit` flag restricts the tests to unit test only. By default, both unit and end-to-end tests of applications (GWAS, DTI, Opal, and Ganon) are executed.
 
-**Note:** Each run bellow is executed in a local setup. Online run is also possible. See [example](#online-run) above for a step-by-step guide and/or [Sequre's network config](#sequres-network-config) for details.
-
 Example invocation of unit tests in a `localhost` in an online network environment: (use multiple terminals for clear output)
 ```bash
 srcipts/run.sh tests --unit 0 & \
 srcipts/run.sh tests --unit 1 & \
 srcipts/run.sh tests --unit 2
 ```
+
+**Note:** Each run bellow is executed in a local setup. Online run is also possible. See [example](#online-run) above for a step-by-step guide and/or [Sequre's network config](#sequres-network-config) for details.
 
 ### Running playground
 
