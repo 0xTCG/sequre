@@ -17,7 +17,7 @@ class Internal:
         r = list[TP](len(x_))
 
         for sn in x_:
-            x_r_, r_ = sn.get_partitions(mpc)
+            x_r_, r_ = sn.get_partitions(mpc, force=not BEAVER_CACHING)
             x_r.append(x_r_)
             r.append(r_)
 
@@ -46,6 +46,8 @@ class Internal:
             return Internal.__add_public(mpc, y.to_fp(x.modulus) if x.fp else int_t(y), x, False)
         elif isinstance(x, SharedTensor[list[list[int_t]]]) and isinstance(y, SharedTensor[list[int_t]]):
             return x.broadcast_add(y)
+        elif isinstance(x, SharedTensor[list[int_t]]) and isinstance(y, SharedTensor[int_t]):
+            return x.broadcast_add(y)
         else:
             if not x.is_public() and not y.is_public():
                 return x + y
@@ -54,10 +56,30 @@ class Internal:
             elif y.is_public():
                 return Internal.__add_public(mpc, y.share, x, y.diagonal)
             
-            raise TypeError("Invalid type of addends")
+            raise TypeError("Invalid type of addends in secure add")
 
     def secure_sub(mpc, x, y):
-        return Internal.secure_add(mpc, x, -y)
+        if isinstance(x, float):
+            return Internal.__add_public(mpc, x.to_fp(y.modulus), -y, False)
+        elif isinstance(y, float):
+            return Internal.__add_public(mpc, (-y).to_fp(x.modulus), x, False)
+        elif isinstance(x, int):
+            return Internal.__add_public(mpc, x.to_fp(y.modulus) if y.fp else int_t(x), -y, False)
+        elif isinstance(y, int):
+            return Internal.__add_public(mpc, (-y).to_fp(x.modulus) if x.fp else (x.modulus - y), x, False)
+        elif isinstance(x, SharedTensor[list[list[int_t]]]) and isinstance(y, SharedTensor[list[int_t]]):
+            return x.broadcast_add(-y)
+        elif isinstance(x, SharedTensor[list[int_t]]) and isinstance(y, SharedTensor[int_t]):
+            return x.broadcast_add(-y)
+        else:
+            if not x.is_public() and not y.is_public():
+                return x + (-y)
+            elif x.is_public():
+                return Internal.__add_public(mpc, x.share, -y, x.diagonal)
+            elif y.is_public():
+                return Internal.__add_public(mpc, y.share.neg_mod(x.modulus), x, y.diagonal)
+            
+            raise TypeError("Invalid type of addends in secure_sub")
 
     def secure_mult(mpc, x, y):
         if isinstance(y, float):
@@ -68,11 +90,17 @@ class Internal:
             sv.fp = True
             return sv
         else:
-            assert x.modulus == y.modulus
+            if x.public or y.public:
+                c_share = x.share.mul_mod(y.share, x.modulus if y.public else y.modulus)
+                sv = SharedTensor[typeof(c_share)](c_share, x.modulus if y.public else y.modulus)
+                sv.fp = x.is_fp() or y.is_fp()
+                return sv
+            
+            if DEBUG: assert x.modulus == y.modulus, f"Non-matching moduli for factors: {x.modulus} != {y.modulus}"
             modulus = x.modulus
 
-            x_1_r, r_1 = x.get_partitions(mpc)
-            x_2_r, r_2 = y.get_partitions(mpc)
+            x_1_r, r_1 = x.get_partitions(mpc, force=not BEAVER_CACHING)
+            x_2_r, r_2 = y.get_partitions(mpc, force=not BEAVER_CACHING)
 
             c = mpc.arithmetic.__beaver_mult(x_1_r, r_1, x_2_r, r_2, modulus)
             c = mpc.arithmetic.__beaver_reconstruct(c, modulus)
@@ -106,7 +134,7 @@ class Internal:
             sv.fp = True
             return sv
         else:
-            assert x_.modulus == y_.modulus
+            if DEBUG: assert x_.modulus == y_.modulus
             modulus = x_.modulus
             x = x_.share
             y = y_.share
@@ -128,15 +156,9 @@ class Internal:
             # TODO: #58 Implement efficient pows calculation for FPs
             return Internal.secure_pow_no_cache(mpc, x_, p)
 
-        if p >= len(x_.pows):
-            x_r, r = x_.get_partitions(mpc)
-
-            pows = mpc.polynomial.powers_cached(
-                x_r, r, p, modulus)
-            for i in range(len(x_.pows), len(pows)):
-                x_.pows.append(pows[i])
+        x_r, r = x_.get_partitions(mpc, force=not BEAVER_CACHING)
+        c = mpc.polynomial.powers_cached(x_r, r, p, modulus)[p]
         
-        c = x_.pows[p]
         sv = SharedTensor[typeof(c)](c, modulus)
         sv.fp = x_.is_fp()
 
@@ -160,13 +182,15 @@ class Internal:
     def secure_div(mpc, x, y):
         # TODO: #26 Currently does not work for complex algebraic structures.
         # Resolve issue #26 and change code below in order to fix this.
-        if isinstance(y, float):
+        if isinstance(x, int) or isinstance(x, float):
+            if isinstance(y.share, list):
+                sv = SharedTensor[typeof(y.share)]([double_to_fp(float(x), y.modulus) for _ in range(len(y.share))], y.modulus)
+                return fp_div(mpc, sv, y)
+            else:
+                sv = SharedTensor[typeof(y.share)](double_to_fp(float(x), y.modulus), y.modulus)
+                return fp_div(mpc, sv, y)
+        elif isinstance(y, float) or isinstance(y, int):
             sv = x * double_to_fp(1.0 / y, x.modulus)
-            if x.is_fp(): sv = sv.trunc(mpc.fp)
-            return sv
-        elif isinstance(y, int) or isinstance(y, TP):
-            denom = double_to_fp(1.0 / y, x.modulus) if x.is_fp() else mod_inv(y, x.modulus)
-            sv = x * denom
             if x.is_fp(): sv = sv.trunc(mpc.fp)
             return sv
         else:
@@ -181,14 +205,14 @@ class Internal:
             if y == 0:
                 return SharedTensor[typeof(x.share)](mpc.boolean.is_positive(x.share, modulus), modulus)
 
-            return SharedTensor[typeof(x.share)](mpc.boolean.not_less_than_public(x.share, TP(y), modulus), modulus)
+            return SharedTensor[typeof(x.share)](mpc.boolean.greater_than_public(x.share, TP(y), modulus), modulus)
         elif isinstance(y, float):
             modulus = x.modulus
-            return SharedTensor[typeof(x.share)](mpc.boolean.not_less_than_public(x.share, double_to_fp(y, modulus), modulus), modulus)
+            return SharedTensor[typeof(x.share)](mpc.boolean.greater_than_public(x.to_fp().share, double_to_fp(y, modulus), modulus), modulus)
         else:
-            assert x.modulus == y.modulus
+            if DEBUG: assert x.modulus == y.modulus
             modulus = x.modulus
-            return SharedTensor[typeof(x.share)](mpc.boolean.not_less_than(x.share, y.share, modulus), modulus)
+            return SharedTensor[typeof(x.share)](mpc.boolean.greater_than(x.share, y.share, modulus), modulus)
         
         # TODO: Efficiently calculate beaver partitions of sv here
 
@@ -198,22 +222,36 @@ class Internal:
         if isinstance(y, int) or isinstance(y, TP):
             modulus = x.modulus
             if y == 0:
-                return SharedTensor[typeof(x.share)](mpc.boolean.is_not_positive(x.share, modulus), modulus)
+                return SharedTensor[typeof(x.share)](mpc.boolean.is_positive(x.share.neg_mod(modulus), modulus), modulus)
             
             return SharedTensor[typeof(x.share)](mpc.boolean.less_than_public(x.share, TP(y), modulus), modulus)
         elif isinstance(y, float):
             modulus = x.modulus
-            return SharedTensor[typeof(x.share)](mpc.boolean.less_than_public(x.share, double_to_fp(y, modulus), modulus), modulus)
+            return SharedTensor[typeof(x.share)](mpc.boolean.less_than_public(x.to_fp().share, double_to_fp(y, modulus), modulus), modulus)
         else:
-            assert x.modulus == y.modulus
+            if DEBUG: assert x.modulus == y.modulus
             modulus = x.modulus
             return SharedTensor[typeof(x.share)](mpc.boolean.less_than(x.share, y.share, modulus), modulus)
         
         # TODO: #23 Efficiently calculate beaver partitions of sv here
+    
+    def secure_eq(mpc, x, y):
+        if x.modulus.popcnt() == 1:
+            # TODO: #158 Make comparisons stable on rings.
+            l = Internal.secure_gt(mpc, Internal.secure_sub(mpc, x, y), 0)
+            r = Internal.secure_gt(mpc, Internal.secure_sub(mpc, y, x), 0)
+            return Internal.secure_sub(mpc, 1, Internal.secure_add(mpc, l, r))
+
+        sub = Internal.secure_sub(mpc, x, y)
+        is_pos = Internal.secure_gt(mpc, Internal.secure_mult(mpc, sub, sub), 0)
+        return Internal.secure_sub(mpc, 1, is_pos)
 
     def secure_sqrt_inv(mpc, x, y):
         # TODO: #26 Currently does not work for complex algebraic structures.
         # Resolve issue #26 and change code below in order to fix this.
+        if not PATTERN_MATHCING_OPT:
+            return Internal.secure_div(mpc, x, fp_sqrt(mpc, y)[0])
+        
         if not y.sqrt_inv:
             s, sinv = fp_sqrt(mpc, y)
             y.sqrt, y.sqrt_inv = s.share, sinv.share
@@ -228,10 +266,10 @@ class Internal:
             # sv.set_partitions(mpc.arithmetic.__beaver_partition(sv.share, modulus))
             return sv * x
         else:
-            assert x.modulus == y.modulus
+            if DEBUG: assert x.modulus == y.modulus
             modulus = x.modulus
             
-            x_1_r, r_1 = x.get_partitions(mpc)
+            x_1_r, r_1 = x.get_partitions(mpc, force=not BEAVER_CACHING)
             x_2_r, r_2 = mpc.arithmetic.__beaver_partition(y.sqrt_inv, modulus)
             
             c = mpc.arithmetic.__beaver_mult(x_1_r, r_1, x_2_r, r_2, modulus)
@@ -250,6 +288,10 @@ class Internal:
 
     def secure_sqrt_inv_no_cache(mpc, x, y):
         # TODO: #26 Currently does not work for complex algebraic structures.
+
+        if not PATTERN_MATHCING_OPT:
+            return Internal.secure_div(mpc, x, fp_sqrt(mpc, y)[0])
+        
         sqrt_inv = fp_sqrt(mpc, y)[1].share
         
         if isinstance(x, int):
@@ -257,7 +299,7 @@ class Internal:
             sv.fp = True
             return sv * x
         else:
-            assert x.modulus == y.modulus
+            if DEBUG: assert x.modulus == y.modulus
             modulus = x.modulus
 
             result = mpc.arithmetic.multiply(x.share, sqrt_inv, modulus)
@@ -266,25 +308,31 @@ class Internal:
             sv.fp = True
             
             return sv
+    
+    def powers(mpc, x_, p):
+        modulus = x_.modulus
 
-    def secure_reveal(mpc, e):
-        modulus = e.modulus
-        revealed_e = mpc.comms.reveal(e.share, modulus)
+        if x_.is_fp():
+            # TODO: #58 Implement efficient pows calculation for FPs
+            raise NotImplementedError("Powers method not yet implemented for fixed-point shared tensors.")
+
+        x_r, r = x_.get_partitions(mpc, force=not BEAVER_CACHING)
+
+        pows = mpc.polynomial.powers_cached(
+            x_r, r, p, modulus)
         
-        c = revealed_e // 2
-        if mpc.pid == 1: c += (revealed_e % TP(2))
+        sv = SharedTensor[typeof(pows)](pows, modulus)
 
-        sv = SharedTensor[typeof(c)](c, e.x_r, e.r, modulus)
-        sv.fp = e.is_fp()
-            
+        # TODO: #23 Efficiently calculate beaver partitions of c here
+        # TODO: #23 Check if there is a way to calculate cached sqrts efficiently
         return sv
 
     def dot(mpc, x, y):
-        assert x.modulus == y.modulus
+        if DEBUG: assert x.modulus == y.modulus
         modulus = x.modulus
 
-        x_1_r, r_1 = x.get_partitions(mpc, force=NO_OPT)
-        x_2_r, r_2 = y.get_partitions(mpc, force=NO_OPT)
+        x_1_r, r_1 = x.get_partitions(mpc, force=not BEAVER_CACHING)
+        x_2_r, r_2 = y.get_partitions(mpc, force=not BEAVER_CACHING)
 
         c = mpc.arithmetic.__beaver_dot_prod(x_1_r, r_1, x_2_r, r_2, modulus)
         c = mpc.arithmetic.__beaver_reconstruct(c, modulus)
@@ -306,11 +354,11 @@ class Internal:
         return Internal.dot(mpc, x, x)
 
     def matmul(mpc, x, y):
-        assert x.modulus == y.modulus
+        if DEBUG: assert x.modulus == y.modulus
         modulus = x.modulus
 
-        x_1_r, r_1 = x.get_partitions(mpc, force=NO_OPT)
-        x_2_r, r_2 = y.get_partitions(mpc, force=NO_OPT)
+        x_1_r, r_1 = x.get_partitions(mpc, force=not BEAVER_CACHING)
+        x_2_r, r_2 = y.get_partitions(mpc, force=not BEAVER_CACHING)
 
         c = mpc.arithmetic.__beaver_matmul(x_1_r, r_1, x_2_r, r_2, modulus)
         c = mpc.arithmetic.__beaver_reconstruct(c, modulus)
@@ -342,7 +390,7 @@ class Internal:
     def sqrt(mpc, x):
         # TODO: #26 Currently does not work for complex algebraic structures.
         # Resolve issue #26 and change code below in order to fix this.
-        if not x.sqrt or NO_OPT:
+        if not x.sqrt:
             s, sinv = fp_sqrt(mpc, x)
             x.sqrt, x.sqrt_inv = s.share, sinv.share
         
@@ -359,8 +407,9 @@ class Internal:
     def dist(mpc, shape, name, modulus, params):
         if name == 'normal':
             rows, cols = shape
-            gaussian = [[double_to_fp(random.gauss(*params), modulus) if mpc.pid == 2 else TP(0)
+            gaussian = [[double_to_fp(random.gauss(*params), modulus) if mpc.pid == 0 else TP(0)
                         for _ in range(cols)] for _ in range(rows)]
+            gaussian = mpc.comms.share(gaussian, modulus)
 
             stensor = SharedTensor(gaussian, modulus)
             stensor.fp = True
@@ -374,7 +423,7 @@ class Internal:
         modulus = y.modulus
 
         if isinstance(share, list[list]) and isinstance(x_public, list[list]):
-            if diagonal and not NO_OPT:
+            if diagonal and MATRIX_OPT:
                 for i in range(len(share)):
                     share[i][i] = mpc.arithmetic.add_public(share[i][i], x_public[i][i], modulus)
             else: share = mpc.arithmetic.add_public(share, x_public, modulus)
@@ -390,7 +439,7 @@ class Internal:
         if not y.is_partitioned():
             return sv
         
-        sv.x_r = y.x_r + x_public
+        sv.x_r = y.x_r.add_mod(x_public, modulus)
         sv.r = y.r
 
         return sv
