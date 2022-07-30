@@ -2,29 +2,166 @@ from ..attributes import sequre_beaver as sequre
 from internal import Internal as sq
 
 
-@sequre
-def linear_svm(mpc, X, y, eta, epochs, l1, l2, optimizer):
-    assert optimizer in {'sgd', 'bgd'}, f"Invalid SVM optimizer: {optimizer}."
-    is_sgd = optimizer == 'sgd'
-    is_bgd = optimizer == 'bgd'
+def offline_backprop(x, y, w, b, l2):
+    z = sum(x * w) - b
+    grad_b = y * int((1 - z * y) > 0)
+    grad_w = w * l2 * 2 - x * grad_b
+    return grad_w, grad_b
+
+
+def offline_lsvm_predict(X, w, b):
+    return (X.matmul([[e] for e in w]) - b).flatten()
+
+
+def offline_lsvm_score(X, Y, w, b, l2):
+    predictions = offline_lsvm_predict(X, w, b)
+    hinge = - Y * predictions + 1
+    hinge = [(0.0 if e < 0 else e) for e in hinge]
+    return sum(w * w) * l2 + sum(hinge)
+
+
+def offline_lsvm_epoch_via_sgd(X, Y, w, b, eta, l2):
+    for feature_vector, label in zip(X, Y):
+        grad_w, grad_b = offline_backprop(feature_vector, label, w, b, l2)
+        w = w - grad_w * eta
+        b = b - grad_b * eta
     
-    w = X[0].zeros() + 1
+    return w, b
+
+
+def offline_lsvm_epoch_via_bgd(X, Y, w, b, eta, l2):
+    mean_grad_b = 0.0
+    mean_grad_w = [0.0 for _ in range(len(w))]
+    
+    for feature_vector, label in zip(X, Y):
+        grad_w, grad_b = offline_backprop(feature_vector, label, w, b, l2)
+        mean_grad_b += grad_b
+        mean_grad_w += grad_w
+    
+    w = w - mean_grad_w / len(X) * eta
+    b = b - mean_grad_b / len(X) * eta
+
+    return w, b
+
+
+def offline_lsvm_epoch_via_mbgd(X, Y, w, b, eta, l2, num_batches):
+    batch_size = len(X) // num_batches
+    
+    for i in range(num_batches):
+        mean_grad_b = 0.0
+        mean_grad_w = [0.0 for _ in range(len(w))]
+        X_batch = X[i * batch_size:(i + 1) * batch_size]
+        Y_batch = Y[i * batch_size:(i + 1) * batch_size]
+        
+        for feature_vector, label in zip(X_batch, Y_batch):
+            grad_w, grad_b = offline_backprop(feature_vector, label, w, b, l2)
+            mean_grad_b += grad_b
+            mean_grad_w += grad_w
+        
+        w = w - mean_grad_w / len(X_batch) * eta
+        b = b - mean_grad_b / len(X_batch) * eta
+
+    return w, b
+
+
+def offline_lsvm_train(X, Y, eta, epochs, l2, mini_batch_size, optimizer='sgd'):
+    assert optimizer in {'sgd', 'bgd', 'mbgd'}, f'Invalid optimizer set for linear SVM: {optimizer}.'
+    w = [1.0 for _ in range(len(X[0]))]
+    b = 1.0
 
     for i in range(epochs):
-        if mpc.pid == 2: print(f'Epoch: {i + 1}/{epochs}')
+        print(f'Offline LSVM via {optimizer.upper()} epoch: {i + 1}/{epochs}.')
+        if optimizer == 'sgd': w, b = offline_lsvm_epoch_via_sgd(X, Y, w, b, eta, l2)
+        elif optimizer == 'bgd': w, b = offline_lsvm_epoch_via_bgd(X, Y, w, b, eta, l2)
+        elif optimizer == 'mbgd': w, b = offline_lsvm_epoch_via_mbgd(X, Y, w, b, eta, l2, mini_batch_size)
+        print(f'\tScore: {offline_lsvm_score(X, Y, w, b, l2)}.')
+    
+    return w, b
 
-        mean_grad = w.zeros()
-        for feature_vector, label in zip(X, y):
-            # TODO: #157 Remove bias from reularizer w
-            z = sq.dot(mpc, feature_vector, w)
-            grad = w * l2 * 2 - feature_vector * label * ((1 - z * label) > 0) / len(w) + l1
-            if is_sgd: w = w - grad * eta
-            elif is_bgd: mean_grad = mean_grad + grad
+
+@sequre
+def backprop(mpc, x, y, w, b, l2):
+    z = sq.dot(mpc, x, w) - b
+    grad_b = y * ((1 - z * y) > 0)
+    # TODO: #3 Multiplication (possibly due to truncation is unstable).
+    grad_w = w * l2 * 2 - x * grad_b
+    return grad_w, grad_b
+
+
+@sequre
+def lsvm_predict(mpc, X, w, b):
+    return sq.matmul(mpc, X, w.expand_dims().T).flatten() - b
+
+
+@sequre
+def lsvm_score(mpc, X, Y, w, b, l2):
+    predictions = lsvm_predict(mpc, X, w, b)
+    hinge = 1 - Y * predictions
+    hinge_float = [(0.0 if e < 0 else e) for e in hinge.print(mpc)]
+    w_float = w.print(mpc)
+    return sum(w_float * w_float) * l2 + sum(hinge_float)
+
+
+@sequre
+def lsvm_epoch_via_sgd(mpc, X, Y, w, b, eta, l2):
+    for feature_vector, label in zip(X, Y):
+        grad_w, grad_b = backprop(mpc, feature_vector, label, w, b, l2)
+        w = w - grad_w * eta
+        b = b - grad_b * eta
+    
+    return w, b
+
+
+@sequre
+def lsvm_epoch_via_bgd(mpc, X, Y, w, b, eta, l2):
+    mean_grad_b = b.zeros()
+    mean_grad_w = w.zeros()
+    
+    for feature_vector, label in zip(X, Y):
+        grad_w, grad_b = backprop(mpc, feature_vector, label, w, b, l2)
+        mean_grad_b += grad_b
+        mean_grad_w += grad_w
+    
+    w = w - mean_grad_w / len(X) * eta
+    b = b - mean_grad_b / len(X) * eta
+
+    return w, b
+
+
+@sequre
+def lsvm_epoch_via_mbgd(mpc, X, Y, w, b, eta, l2, num_batches):
+    batch_size = len(X) // num_batches
+    
+    for i in range(num_batches):
+        mean_grad_b = b.zeros()
+        mean_grad_w = w.zeros()
+        X_batch = X[i * batch_size:(i + 1) * batch_size]
+        Y_batch = Y[i * batch_size:(i + 1) * batch_size]
         
-        if is_bgd: w = w + mean_grad / len(X) * eta
+        for feature_vector, label in zip(X_batch, Y_batch):
+            grad_w, grad_b = backprop(mpc, feature_vector, label, w, b, l2)
+            mean_grad_b += grad_b
+            mean_grad_w += grad_w
+        
+        w = w - mean_grad_w / len(X_batch) * eta
+        b = b - mean_grad_b / len(X_batch) * eta
 
-    return w
+    return w, b
 
 
-def predict(mpc, X, w):
-    return sq.matmul(mpc, X, w.expand_dims().T).flatten()
+@sequre
+def lsvm_train(mpc, X, Y, eta, epochs, l2, mini_batch_size, optimizer, debug=False):
+    assert optimizer in {'sgd', 'bgd', 'mbgd'}, f'Invalid optimizer set for linear SVM: {optimizer}.'
+    w = X[0].zeros() + 1
+    b = Y[0].zeros() + 1
+
+    for i in range(epochs):
+        if mpc.pid == 2: print(f'Online LSVM via {optimizer.upper()} epoch: {i + 1}/{epochs}.')
+        if optimizer == 'sgd': w, b = lsvm_epoch_via_sgd(mpc, X, Y, w, b, eta, l2)
+        elif optimizer == 'bgd': w, b = lsvm_epoch_via_bgd(mpc, X, Y, w, b, eta, l2)
+        elif optimizer == 'mbgd': w, b = lsvm_epoch_via_mbgd(mpc, X, Y, w, b, eta, l2, mini_batch_size)
+        if debug:
+            score = offline_lsvm_score(X.print(mpc), Y.print(mpc), w.print(mpc), b.print(mpc), l2)
+            if mpc.pid == 2: print(f'\tScore: {score}.')
+    
+    return w, b
