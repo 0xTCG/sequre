@@ -1,122 +1,14 @@
-from bio.fasta import FASTA
-from bio.kmer import Kmer
-from sequre.stdlib.linear_svm import linear_svm, predict
+from sequre.stdlib.linear_svm import lsvm_train, lsvm_predict
 from sequre.types.shared_tensor import SharedTensor as Stensor
 from sequre.types.builtin import *
 from sequre.attributes import *
+
+from offline.opal import preprocess_training_data, preprocess_test_data, load_dico, offline_opal
 from utils.param import OPAL_COVERAGE
 
-import random
-import time
 
-
-ACGT = {c: i for i, c in enumerate('ACGT')}
-
-
-def hmap(feature):
-    value = 0
-    for c in feature[::-1]: value = (value << 2) | ACGT[c]
-    return float(value) / (1 << (len(feature) * 2))
-
-
-def drawfrag(input_fasta, taxid_path, target_coverage, kmer_size=64):
-    taxid_infile = open(taxid_path, 'r')
-
-    for record in FASTA(input_fasta, fai=False):
-        tlabel = int(next(taxid_infile).strip())
-        coverage = 0
-        desired_coverage = target_coverage * len(record.seq)
-        if len(record.seq) >= kmer_size:
-            try_num = 0
-            while coverage < desired_coverage:
-                try_num = try_num + 1
-                pos = random.randint(0, len(record.seq) - kmer_size)
-                sample = record.seq[pos:pos + kmer_size]
-                if not sample.N() and len(sample) == kmer_size:
-                    coverage = coverage + kmer_size
-                    yield sample, tlabel
-                if try_num > 10 * len(record.seq): break
-
-
-def gen_features(pattern_getters, sequence):
-    '''Generates features from a pattern list and a sequence'''
-    features = []
-    for kmer in sequence.kmers[Kmer[64]](1):
-        for pat in pattern_getters:
-            features.append(str(kmer)[pat])
-    return features
-
-
-def skms(frag_generator, patterns, dico):
-    for sequence, label in frag_generator:
-        feature_list = gen_features(patterns, sequence)
-        feature_list.extend(gen_features(patterns, ~sequence))
-        yield dico[label], feature_list
-
-
-def get_patterns_and_dico(patterns_path, taxid_path):
-    patterns = []
-    with open(patterns_path, 'r') as pattern_file:
-        for pattern in pattern_file:
-            patterns.append([int(e) for e in pattern.split()])
-    
-    labels = list(int(label.strip()) for label in open(taxid_path, 'r'))
-    labels_set = set(labels)
-    dico = {v: i for i, v in enumerate(labels_set)}
-
-    return patterns, dico, labels_set
-
-
-def share_data(mpc, input_path, taxid_path, patterns_path, target_coverage, modulus):
-    '''
-    Can be extended for multiple clients.
-    New mean will be sum_i(M_i \cdot c_i) / sum_i(c_i)
-    where for i-th client, M_i is the mean and c_i is the count of features per label.
-    '''
-    s = time.time()
-    patterns, dico, _ = get_patterns_and_dico(patterns_path, taxid_path)
-    frag_generator = drawfrag(input_path, taxid_path, target_coverage)
-
-    X_positive = []
-    y_positive = []
-    X_negative = []
-    y_negative = []
-    count_positives = 0
-    count_negatives = 0
-
-    for label, features in skms(frag_generator, patterns, dico):
-        if int(label) == 1:
-            count_positives += 1
-            X_positive.append(features)
-            y_positive.append(1.0)
-        else:
-            count_negatives += 1
-            X_negative.append(features)
-            y_negative.append(-1.0)
-
-    if DEBUG:
-        assert count_positives > 0
-        assert count_negatives > 0
-        assert count_negatives > count_positives
-    
-    neg_data = list(zip(X_negative, y_negative))
-    random.shuffle(neg_data)
-    neg_data = neg_data[:count_positives]
-
-    data = list(zip(X_positive, y_positive))
-    for e in neg_data: data.append(e)
-    random.shuffle(data)
-
-    X = []
-    y = []
-    for features, label in data:
-        hashed_features = [hmap(feature) for feature in features]
-        hashed_features.append(-1.0)  # Appendix for bias
-        X.append(hashed_features)
-        y.append(label)
-    
-    e = time.time()
-    print(f'Preprocessing time took {e - s}s at CP{mpc.pid}')
+def share_training_data(mpc, input_path, taxid_path, patterns_path, target_coverage, modulus):
+    X, y = preprocess_training_data(input_path, taxid_path, patterns_path, target_coverage)
 
     sv_x = Stensor(mpc.comms.share(X.to_fp(modulus), modulus), modulus)
     sv_x.fp = True
@@ -125,32 +17,19 @@ def share_data(mpc, input_path, taxid_path, patterns_path, target_coverage, modu
     sv_y.fp = True
     sv_y.get_partitions(mpc)
 
-    return sv_x, sv_y, dico
+    return sv_x, sv_y
 
 
-def load_test_features(mpc, input_path, patterns_path, modulus):
-    # Read in the pattern file
-    patterns = []
-    with open(patterns_path, 'r') as pattern_file:
-        for pattern in pattern_file:
-            patterns.append([int(e) for e in pattern.split()])
-    
-    all_features = []
+def share_test_data(mpc, input_path, patterns_path, modulus):
+    all_features = preprocess_test_data(input_path, patterns_path)
 
-    for record in FASTA(input_path, fai=False):
-        feature_list = gen_features(patterns, record.seq)
-        feature_list.extend(gen_features(patterns, ~record.seq))
-        hashed_features = [hmap(feature) for feature in feature_list]
-        hashed_features.append(-1.0)  # Appendix for bias
-        all_features.append(hashed_features)
-    
     sv = Stensor(mpc.comms.share(all_features.to_fp(modulus), modulus), modulus)
     sv.fp = True
 
     return sv
 
 
-def opal_protocol(mpc, test_run, modulus, coverage = OPAL_COVERAGE):
+def sequre_opal(mpc, test_run, modulus, coverage = OPAL_COVERAGE):
     # TODO: Make the params configurable
     tests_path = 'tests/' if test_run else ''
     input_path = f'{tests_path}data/opal/A1.train.fasta'
@@ -160,20 +39,20 @@ def opal_protocol(mpc, test_run, modulus, coverage = OPAL_COVERAGE):
 
     # Data sharing should be done apriori in a real-world scenario
     if mpc.pid == 2: print('Sharing Opal data ...')
-    X, y, dico = share_data(
+    X, Y = share_training_data(
         mpc=mpc, input_path=input_path, taxid_path=taxid_path,
         patterns_path=patterns_path, target_coverage=coverage,
         modulus=modulus)
 
     if mpc.pid == 2: print(f'Training linear SVM ... Input size: {X.shape()}')
-    weights = linear_svm(
-        mpc=mpc, X=X, y=y, eta=0.001, epochs=10, l1=0.001, l2=0.001, optimizer='bgd')
+    weights, bias = lsvm_train(
+        mpc=mpc, X=X, Y=Y, eta=0.001, epochs=50, l2=0.001, debug=True)
 
     # Test features should be shared in apriori in a real-world scenario
     if mpc.pid == 2: print('Loading test features ...')
-    test_features = load_test_features(
+    test_features = share_test_data(
         mpc=mpc, input_path=test_input_path,
         patterns_path=patterns_path, modulus=modulus)
 
     if mpc.pid == 2: print(f'Calculating predictions ... Input size: {test_features.shape()}. Weights size: {len(weights)}')
-    return predict(mpc, test_features, weights), dico
+    return lsvm_predict(mpc, test_features, weights, bias)
