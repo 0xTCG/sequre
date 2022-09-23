@@ -144,7 +144,7 @@ where:
 - `<program>` is either `tests`, `benchmarks`, or `playground`.
 - `<pid>` is optional ID of computing party if the run is [online](#sequres-network-config).
 - `--local` flag triggers the [local](#sequres-network-config) run, intead of online, using the inter-process communication instead of TCP. **Note:** `<pid>` is ignored if the `--local` flag is present.
-- `--use-ring` flag coerces usage of $2^k$ rings for MPC subroutines that are generally faster but introduce a slight inaccuracy ( $\pm 1/2^{20}$ ) in fixed point numbers. Without the flag, Sequre defaults to a finite field instead. **Note:** `--use-ring` is ignored while running tests. Tests are executed on both rings and fields.
+- `--use-ring` flag coerces usage of $2^k$ rings for MPC subroutines that are generally faster but introduce a slight inaccuracy ( $\pm 1/2^{20}$ ) to the fixed-point arithmetic. Without the flag, Sequre defaults to a finite field instead. **Note:** `--use-ring` is ignored while running tests. Tests are executed on both rings and fields.
 - `--unit` flag restricts the tests to unit test only. By default, both unit and end-to-end tests of applications (GWAS, DTI, Opal, and Ganon) are executed.
 
 Example invocation of unit tests in a `localhost` in an online network environment: (use multiple terminals for clear output)
