@@ -13,6 +13,7 @@ cmake .. \
     -DLLVM_TARGETS_TO_BUILD=host
 make
 make install
+cd ../../..
 
 git clone https://github.com/HarisSmajlovic/seq.git
 cd seq
