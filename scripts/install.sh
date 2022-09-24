@@ -22,7 +22,7 @@ cp -r dsl/* stdlib/sequre/
 mkdir build
 cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release \
-         -DLLVM_DIR=$(pwd)/../../llvm-build/lib/cmake \
+         -DLLVM_DIR=$(pwd)/../../llvm-build/lib/cmake/llvm \
          -DCMAKE_C_COMPILER=clang \
          -DCMAKE_CXX_COMPILER=clang++
 cd ..
