@@ -13,16 +13,17 @@ make
 make install
 cd ../../..
 
-# git clone https://github.com/HarisSmajlovic/seq.git
-git clone https://github.com/seq-lang/seq.git
+git clone https://github.com/HarisSmajlovic/seq.git
 cd seq
-# git checkout feature/sequre-v0.0.1
-# mkdir stdlib/sequre
-# cp -r dsl/* stdlib/sequre/
+git checkout feature/sequre-v0.0.1
+mkdir stdlib/sequre
+cp -r dsl/* stdlib/sequre/
 
 mkdir build
-(cd build && cmake .. -DCMAKE_BUILD_TYPE=Release \
-                      -DLLVM_DIR=$(pwd)/../../llvm-build \
-                      -DCMAKE_C_COMPILER=clang \
-                      -DCMAKE_CXX_COMPILER=clang++)
+cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release \
+         -DLLVM_DIR=$(pwd)/../../llvm-build \
+         -DCMAKE_C_COMPILER=clang \
+         -DCMAKE_CXX_COMPILER=clang++
+cd ..
 cmake --build build --config Release
