@@ -2,6 +2,7 @@ git clone --depth 1 -b release/12.x https://github.com/llvm/llvm-project
 mkdir -p llvm-project/llvm/build
 cd llvm-project/llvm/build
 cmake .. \
+    -DCMAKE_INSTALL_PREFIX=$(pwd)/../../../llvm-build
     -DCMAKE_BUILD_TYPE=Release \
     -DLLVM_INCLUDE_TESTS=OFF \
     -DLLVM_ENABLE_RTTI=ON \
@@ -14,14 +15,13 @@ cd ../../..
 
 git clone https://github.com/HarisSmajlovic/seq.git
 cd seq
-git checkout feature/sequre-v0.0.1
-mkdir stdlib/sequre
-cp -r dsl/* stdlib/sequre/
-
+# git checkout feature/sequre-v0.0.1
+# mkdir stdlib/sequre
+# cp -r dsl/* stdlib/sequre/
 
 mkdir build
 (cd build && cmake .. -DCMAKE_BUILD_TYPE=Release \
-                      -DLLVM_DIR=$(llvm-config --cmakedir) \
+                      -DLLVM_DIR=$(pwd)/../../llvm-build \
                       -DCMAKE_C_COMPILER=clang \
-                      -DCMAKE_CXX_COMPILER=clang++ )
+                      -DCMAKE_CXX_COMPILER=clang++)
 cmake --build build --config Release
