@@ -629,7 +629,7 @@ class Poly:
         return bool(self.buff)
     
     def __eq__(self, other: Poly) -> bool:
-        return self.coeffs == other.coeffs
+        return self.buff == other.buff
     
     def __ne__(self, other: Poly) -> bool:
          return not self == other
@@ -648,7 +648,7 @@ class Poly:
         self.is_mform = other.is_mform
     
     def copy_values(self, other: Poly):
-        self.coeffs = copy(other.coeffs)
+        self.coeffs = [copy(row) for row in other.coeffs]
         self.buff = copy(other.buff)
 
     # n returns the number of coefficients of the polynomial, which equals the degree of the Ring cyclotomic polynomial.
@@ -945,8 +945,8 @@ class Ring:
     def mul_scalar_bigint_lvl(self, level, p1, scalar, p2 ):
         for i in range(level + 1):
             scalarQi = scalar.bigint_mod(self.modulus[i].ext_to_bigint())
-            mul_scalar_montgomery_vec(p1.coeffs[i][:self.n], p2.coeffs[i], mform(bred_add(scalarQi, self.modulus[i], self.bred_params[i]), self.modulus[i], self.bred_params[i]), self.modulus[i], self.mred_params[i])
-            p2.update_buffer()
+            mul_scalar_montgomery_vec(p1.coeffs[i][:self.n], p2.coeffs[i], mform(bred_add(scalarQi.trunc_to_u64(), self.modulus[i], self.bred_params[i]), self.modulus[i], self.bred_params[i]), self.modulus[i], self.mred_params[i])
+        p2.update_buffer()
     
     # mul_scalar multiplies each coefficient of p1 by a scalar and writes the result on p2.
     def mul_scalar(self, p1, scalar, p2):
@@ -1034,6 +1034,19 @@ class Ring:
                 coeffs_bigint[i] += p1.coeffs[k][j].ext_to_bigint() * crt_reconstruction[k]
             coeffs_bigint[i] = coeffs_bigint[i].bigint_mod(modulus_bigint)
             i, j = i + 1, j + gap
+    
+    # permute_ntt_index computes the index table for PermuteNTT.
+    def permute_ntt_index(self, gal_el: u64) -> list[u64]:
+        log_nth_root = int(self.nth_root.bitlen() - u64(2))
+        mask = self.nth_root - u64(1)
+        index = list[u64](self.n)
+
+        for i in range(self.n):
+            tmp_1 = u64(2) * u64(i.bit_reverse_subset(log_nth_root)) + u64(1)
+            tmp_2 = ((gal_el * tmp_1 & mask) - u64(1)) >> u64(1)
+            index.append(u64(tmp_2.bit_reverse_subset(log_nth_root)))
+
+        return index
 
 
 class BaseSampler:
@@ -1418,6 +1431,7 @@ def gen_mod_up_params(q, P):
         qoverqimodp=qoverqimodp,
         vtimesqmodp=vtimesqmodp)
 
+
 def gen_mod_down_params(ringq, ringp):
     params = list[list[u64]](len(ringp.modulus))
 
@@ -1433,6 +1447,7 @@ def gen_mod_down_params(ringq, ringp):
             if j > 0: params[j][i] = mred(params[j][i], params[j - 1][i], qi, mred_params[i])
 
     return params
+
 
 def new_basis_extender(ringq, ringp):
     new_params = BasisExtender()
@@ -1456,6 +1471,7 @@ def new_basis_extender(ringq, ringp):
 
     return new_params
 
+
 # NewGaussianSampler creates a new instance of GaussianSampler from a PRNG, a ring definition and the truncated
 # Gaussian distribution parameters. Sigma is the desired standard deviation and bound is the maximum coefficient norm in absolute
 # value.
@@ -1468,6 +1484,7 @@ def new_gaussian_sampler(prng, base_ring, sigma, bound):
         sigma=sigma,
         bound=bound)
 
+
 # NewTernarySamplerWithHammingWeight creates a new instance of a fixed-hamming-weight TernarySampler from a PRNG, the ring definition and the desired
 # hamming weight for the output polynomials. If "montgomery" is set to true, polynomials read from this sampler
 # are in Montgomery form.
@@ -1479,6 +1496,7 @@ def new_ternary_sampler_with_hamming_weight(prng, base_ring, hw, montgomery):
         sample_name="samplesparse")
     ternary_sampler.initialize_matrix(montgomery)
     return ternary_sampler
+
 
 # CopyValuesLvl copies the values of p0 on p1, up to level+1 moduli.
 def copy_values_lvl(level, p0, p1):
@@ -1493,3 +1511,55 @@ def copy_lvl(level, p0, p1):
 	copy_values_lvl(level, p0, p1)
 	p1.is_ntt = p0.is_ntt
 	p1.is_mform = p0.is_mform
+
+
+# Decomposer is a structure that stores the parameters of the arbitrary decomposer.
+# This decomposer takes a p(x)_Q (in basis q) and returns p(x) mod qi in basis QP, where
+# qi = prod(Q_i) for 0<=i<=L, where L is the number of factors in P.
+class Decomposer:
+    ring_q: Ring
+    ring_p: Ring
+    mod_up_params: list[list[list[ModupParams]]]
+
+
+# NewDecomposer creates a new Decomposer.
+def new_decomposer(ring_q: Ring, ring_p: Ring):
+    decomposer = Decomposer()
+
+    decomposer.ring_q = ring_q
+    decomposer.ring_p = ring_p
+
+    q = ring_q.modulus
+
+    decomposer.mod_up_params = list[list[list[ModupParams]]](len(ring_p.modulus) - 1)
+
+    for lvl_p in range(len(ring_p.modulus) - 1):
+        p = ring_p.modulus[:lvl_p + 2]
+
+        nb_pi = len(p)
+        decomp_rns = (len(q) + nb_pi - 1) // nb_pi
+
+        xnb_pi = [nb_pi for _ in range(decomp_rns)]
+
+        if len(q) % nb_pi != 0: xnb_pi[decomp_rns - 1] = len(q) % nb_pi
+
+        decomposer.mod_up_params.append(list[list[ModupParams]](decomp_rns))
+
+        # Create mod_up_params for each possible combination of [Qi,Pj] according to xnb_pi
+        for i in range(decomp_rns):
+            decomposer.mod_up_params[lvl_p].append(list[ModupParams](xnb_pi[i] - 1))
+
+            for j in range(xnb_pi[i] - 1):
+                q_i = list[u64](j + 2)
+                p_i = list[u64](len(q) + len(p))
+
+                for k in range(j + 2): q_i.append(q[i * nb_pi + k])
+
+                p_i = copy(q)
+
+                for k  in range(len(q), len(q) + len(p)):
+                    p_i.append(p[k - len(q)])
+
+                decomposer.mod_up_params[lvl_p][i].append(gen_mod_up_params(q_i, p_i))
+
+    return decomposer
