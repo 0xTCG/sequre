@@ -16,6 +16,7 @@ from rlwe import Ciphertext as RLWECiphertext
 from rlwe import PkEncryptor as RLWEPkEncryptor
 from rlwe import SkEncryptor as RLWESkEncryptor
 from rlwe import Decryptor as RLWEDecryptor
+from rlwe import Evaluator as RLWEEvaluator
 from common import BIG_INT_LEN, big_uint, big_int
 
 
@@ -50,7 +51,7 @@ class Parameters(RLWEParams):
             self.ring_p,
             self.ring_type)
 
-    def from_rlwe_params(self, rlwe_params) -> Parameters:
+    def set_rlwe_params(self, rlwe_params):
         self.logn = rlwe_params.logn
         self.qi =  rlwe_params.qi
         self.pi = rlwe_params.pi
@@ -60,7 +61,9 @@ class Parameters(RLWEParams):
         self.ring_q = rlwe_params.ring_q
         self.ring_p = rlwe_params.ring_p
         self.ring_type = rlwe_params.ring_type
-
+    
+    def from_rlwe_params(self, rlwe_params) -> Parameters:
+        self.set_rlwe_params(rlwe_params)
         return self
     
     # Returns the maximum ciphertext level
@@ -143,9 +146,9 @@ class KeyGenerator(RLWEKeyGen):
         self.gaussian_sampler = rlwe_keygen.gaussian_sampler
         self.ternary_sampler = rlwe_keygen.ternary_sampler
         self.basisextender = rlwe_keygen.basisextender
-        self.buffq = rlwe_keygen.buffq
-        self.buffp = rlwe_keygen.buffp
-        self.buffqp = rlwe_keygen.buffqp
+        self.buff_q = rlwe_keygen.buff_q
+        self.buff_p = rlwe_keygen.buff_p
+        self.buff_qp = rlwe_keygen.buff_qp
     
     def __str__(self) -> str:
         return f"""\tCKKSKeyGen:
@@ -189,8 +192,26 @@ class Ciphertext(RLWECiphertext):
                 \t{self.get_rlwe_ciphertext()}
         """
 
+    def __bool__(self):
+        return self.scale > 0
+
+    def __eq__(self, other: Ciphertext) -> bool:
+        is_equal = True
+
+        for self_v, other_v in zip(self.value, other.value):
+            is_equal &= (self_v == other_v)
+        
+        return is_equal
+    
+    def __ne__(self, other: Ciphertext) -> bool:
+        return not self == other
+
     def get_rlwe_ciphertext(self):
         return RLWECiphertext(value=self.value)
+    
+    # SetScale sets the scaling factor of the ciphertext
+    def set_scale(self, scale: float):
+        self.scale = scale
 
 
 class PkEncryptor(RLWEPkEncryptor):
@@ -202,9 +223,9 @@ class PkEncryptor(RLWEPkEncryptor):
         self.gaussian_sampler = rlwe_enc.gaussian_sampler
         self.ternary_sampler = rlwe_enc.ternary_sampler
         self.basisextender = rlwe_enc.basisextender
-        self.buffq = rlwe_enc.buffq
-        self.buffp = rlwe_enc.buffp
-        self.buffqp = rlwe_enc.buffqp
+        self.buff_q = rlwe_enc.buff_q
+        self.buff_p = rlwe_enc.buff_p
+        self.buff_qp = rlwe_enc.buff_qp
 
         self.pk = rlwe_enc.pk
 
@@ -229,9 +250,9 @@ class SkEncryptor(RLWESkEncryptor):
         self.gaussian_sampler = rlwe_enc.gaussian_sampler
         self.ternary_sampler = rlwe_enc.ternary_sampler
         self.basisextender = rlwe_enc.basisextender
-        self.buffq = rlwe_enc.buffq
-        self.buffp = rlwe_enc.buffp
-        self.buffqp = rlwe_enc.buffqp
+        self.buff_q = rlwe_enc.buff_q
+        self.buff_p = rlwe_enc.buff_p
+        self.buff_qp = rlwe_enc.buff_qp
 
         self.sk = rlwe_enc.sk
         self.uniform_sampler = rlwe_enc.uniform_sampler
@@ -677,11 +698,11 @@ def single_float_to_fixed_point_crt(level: int, i: int, value: float, scale: flo
     moduli = ring_q.modulus
 
     if value > 1.8446744073709552e+19:
-        # xFlo = big_float(value)
-        # xFlo += big_float(0.5)
-        # xInt = big_uint(xFlo)
+        # x_flo = big_float(value)
+        # x_flo += big_float(0.5)
+        # x_int = big_uint(x_flo)
         # for j, qi in enumerate(moduli[:level + 1]):
-        #     tmp = xInt % qi
+        #     tmp = x_int % qi
         #     if is_negative: coeffs[j][i] = qi - tmp
         #     else: coeffs[j][i] = tmp
         raise NotImplementedError()
@@ -882,7 +903,7 @@ class EncoderComplex128(Encoder):
             len_values = len(values)
 
             if self.params.ring_type == ring.StandardRing:
-                self.values[:len_values] = copy(values)
+                self.values[:len_values] = [v.copy() for v in values]
             elif self.params.ring_type == ring.ConjugateInvariantRing:
                 # Discards the imaginary part
                 for i, v in enumerate(values):
@@ -956,7 +977,7 @@ class EncoderComplex128(Encoder):
         else:
             special_fft_ul8_vec(self.values, 1 << log_slots, self.m, self.rot_group, self.roots)
 
-        return copy(self.values)
+        return [v.copy() for v in self.values]
     
     def plaintext_to_complex(self, level: int, scale: float, log_slots: int, p: ring.Poly, values: list[Complex]):
         isreal = self.params.ring_type == ring.ConjugateInvariantRing
@@ -1173,3 +1194,337 @@ def get_precision_stats(
     prec.std_time = encoder.get_err_std_coeff_domain(values_want, values_test, params.default_scale)
     
     return prec
+
+
+class EvaluatorBuffers:
+    buff_q: list[ring.Poly]  #[3] Memory buffer in order: for MForm(c_0), MForm(c_1), c2
+    buff_ct: Ciphertext  # Memory buffer for ciphertexts that need to be scaled up (to be eventually removed)
+
+
+class EvaluatorBase:
+	ckks_params: Parameters
+
+
+def scale_up_exact(value: float, n: float, q: u64) -> u64:
+    is_negative = False
+    x_flo = 0.0
+
+    if value < 0:
+        is_negative = True
+        x_flo = -n * value  # big.NewFloat(-n * value)
+    else:
+        x_flo = n * value  # big.NewFloat(n * value)
+
+    x_flo += 0.5  # x_flo.add(x_flo, big.NewFloat(0.5))
+
+    # x_int = new(big.Int)
+    x_int = u64(x_flo)  # x_flo.Int(x_int)
+    x_int = x_int.__naive_mod(q)
+
+    res = x_int
+    if is_negative: res = q - res
+
+    return res
+
+
+# evaluator is a struct that holds the necessary elements to execute the homomorphic operations between Ciphertexts and/or Plaintexts.
+# It also holds a memory buffer used to store intermediate computations.
+class Evaluator(EvaluatorBase, EvaluatorBuffers, RLWEEvaluator):
+    def set_evaluator_base(self, eval_base: EvaluatorBase):
+        self.ckks_params = eval_base.ckks_params
+    
+    def set_evaluator_buffers(self, eval_buffers: EvaluatorBuffers):
+        self.buff_ct = eval_buffers.buff_ct
+        self.buff_q = eval_buffers.buff_q
+    
+    def set_rlwe_evaluator(self, eval: RLWEEvaluator):
+        self.ckks_params.set_rlwe_params(eval.params)
+        self.params = eval.params
+        
+        self.buff_qp = eval.buff_qp
+        self.buff_inv_ntt = eval.buff_inv_ntt
+        self.buff_decomp_qp = eval.buff_decomp_qp
+        self.buff_bit_decomp = eval.buff_bit_decomp
+
+        self.rlk = eval.rlk
+        self.rtks = eval.rtks
+        self.permute_ntt_index = eval.permute_ntt_index
+
+        self.basis_extender = eval.basis_extender
+        self.decomposer = eval.decomposer
+    
+    def get_evaluator_base(self) -> EvaluatorBase:
+        return EvaluatorBase(self.ckks_params)
+    
+    def get_const_and_scale(self, level: int, constant) -> Tuple[float, float, float]:
+        # Converts to float and determines if a scaling is required
+        # (which is the case if either real or imag have a rational part)
+        scale = 1.0
+        c_real, c_imag = 0.0, 0.0
+
+        if isinstance(constant, Complex):
+            c_real = constant.r
+            c_imag = constant.i
+
+            if c_real != 0:
+                value_int = int(c_real)
+                value_float = c_real - float(value_int)
+
+                if value_float != 0:
+                    scale = float(self.params.ring_q.modulus[level])
+
+            if c_imag != 0:
+                value_int = int(c_imag)
+                value_float = c_imag - float(value_int)
+
+                if value_float != 0:
+                    scale = float(self.params.ring_q.modulus[level])
+        elif isinstance(constant, float):
+            c_real = constant
+            c_imag = float(0)
+
+            if c_real != 0:
+                value_int = int(c_real)
+                value_float = c_real - float(value_int)
+
+                if value_float != 0:
+                    scale = float(self.params.ring_q.modulus[level])
+        elif isinstance(constant, u64) or isinstance(constant, int):
+            c_real = float(constant)
+            c_imag = float(0)
+        else:
+            raise ValueError("Invalid constant type within ciphertext multiplication.")
+
+        if self.params.ring_type == ring.ConjugateInvariantRing:
+            c_imag = float(0)
+
+        return c_real, c_imag, scale
+    
+    # mult_by_const multiplies ct_0 by the input constant and returns the result in ct_out.
+    # The scale of the output element will depend on the scale of the input element and the constant (if the constant
+    # needs to be scaled (its rational part is not zero)). The constant can be a u64, int, float or complex128.
+    def mult_by_const(self, ct_0: Ciphertext, constant, ct_out: Ciphertext):
+        level = min(ct_0.level(), ct_out.level())
+
+        c_real, c_imag, scale = self.get_const_and_scale(int(level), constant)
+
+        # Component wise multiplication of the following vector with the ciphertext:
+        # [a + b*psi_qi^2, ....., a + b*psi_qi^2, a - b*psi_qi^2, ...., a - b*psi_qi^2] mod Qi
+        # [{                  N/2                }{                N/2               }]
+        # Which is equivalent outside of the NTT domain to adding a to the first coefficient of ct_0 and b to the N/2-th coefficient of ct_0.
+        ring_q = self.params.ring_q
+        for i in range(level + 1):
+            qi = ring_q.modulus[i]
+            bred_params = ring_q.bred_params[i]
+            mred_params = ring_q.mred_params[i]
+
+            scaled_const_real = u64(0)
+            scaled_const_imag = u64(0)
+            scaled_const = u64(0)
+
+            if c_real != 0:
+                scaled_const_real = scale_up_exact(c_real, scale, qi)
+                scaled_const = scaled_const_real
+
+            if c_imag != 0:
+                scaled_const_imag = scale_up_exact(c_imag, scale, qi)
+                scaled_const_imag = ring.mred(scaled_const_imag, ring_q.ntt_psi[i][1], qi, mred_params)
+                scaled_const = ring.cred(scaled_const + scaled_const_imag, qi)
+
+            scaled_const = ring.mform(scaled_const, qi, bred_params)
+
+            for u in range(len(ct_0.value)):
+                p0_tmp = ct_0.value[u].coeffs[i]
+                p1_tmp = ct_out.value[u].coeffs[i]
+                ring.mul_scalar_montgomery_vec(p0_tmp[:ring_q.n >> 1], p1_tmp[:ring_q.n >> 1], scaled_const, qi, mred_params)
+
+            if c_imag != 0:
+                scaled_const = ring.cred(scaled_const_real + (qi - scaled_const_imag), qi)
+                scaled_const = ring.mform(scaled_const, qi, bred_params)
+
+            for u in range(len(ct_0.value)):
+                p0_tmp = ct_0.value[u].coeffs[i]
+                p1_tmp = ct_out.value[u].coeffs[i]
+                ring.mul_scalar_montgomery_vec(p0_tmp[ring_q.n >> 1:], p1_tmp[ring_q.n >> 1:], scaled_const, qi, mred_params)
+
+        ct_out.scale = ct_0.scale * scale
+
+    # drop_level reduces the level of ct_0 by levels and returns the result in ct_0.
+    # No rescaling is applied during this procedure.
+    def drop_level(self, ct_0: Ciphertext, levels: int):
+        ct_0.resize(ct_0.degree(), ct_0.level() - levels)
+
+    def evaluate_in_place(self, c_0, c_1, ct_out, evaluate_callable):
+        level = min(min(c_0.level(), c_1.level()), ct_out.level())
+        max_degree = max(c_0.degree(), c_1.degree())
+        min_degree = min(c_0.degree(), c_1.degree())
+
+        # Else resizes the receiver element
+        ct_out.resize(max_degree, ct_out.level())
+
+        c_0_scale = c_0.scale
+        c_1_scale = c_1.scale
+        ct_out_scale = ct_out.scale
+
+        if ct_out.level() > level:
+            self.drop_level(Ciphertext(ct_out, ct_out_scale), ct_out.level() - min(c_0.level(), c_1.level()))
+
+        tmp_0, tmp_1 = c_0, c_1
+        # Checks whether or not the receiver element is the same as one of the input elements
+        # and acts accordingly to avoid unnecessary element creation or element overwriting,
+        # and scales properly the element before the evaluation.
+        if ct_out == c_0:
+            if c_0_scale > c_1_scale and math.floor(c_0_scale / c_1_scale) > 1:
+                tmp_1 = self.buff_ct
+                self.mult_by_const(Ciphertext(c_1, c_1_scale), math.floor(c_0_scale / c_1_scale), Ciphertext(tmp_1, ct_out_scale))
+            elif c_1_scale > c_0_scale and math.floor(c_1_scale / c_0_scale) > 1:
+                self.mult_by_const(Ciphertext(c_0, c_0_scale), math.floor(c_1_scale / c_0_scale), Ciphertext(c_0, c_0_scale))
+                ct_out.set_scale(c_1_scale)
+                tmp_1 = c_1
+            else:
+                tmp_1 = c_1
+            tmp_0 = c_0
+        elif ct_out == c_1:
+            if c_1_scale > c_0_scale and math.floor(c_1_scale / c_0_scale) > 1:
+                tmp_0 = self.buff_ct
+                self.mult_by_const(Ciphertext(c_0, c_0_scale), math.floor(c_1_scale / c_0_scale), Ciphertext(tmp_0, ct_out_scale))
+            elif c_0_scale > c_1_scale and math.floor(c_0_scale / c_1_scale) > 1:
+                self.mult_by_const(Ciphertext(c_1, c_1_scale), math.floor(c_0_scale / c_1_scale), Ciphertext(ct_out, ct_out_scale))
+                ct_out.set_scale(c_0_scale)
+                tmp_0 = c_0
+            else:
+                tmp_0 = c_0
+            tmp_1 = c_1
+        else:
+            if c_1_scale > c_0_scale and math.floor(c_1_scale / c_0_scale) > 1:
+                tmp_0 = self.buff_ct
+                self.mult_by_const(Ciphertext(c_0, c_0_scale), math.floor(c_1_scale / c_0_scale), Ciphertext(tmp_0, ct_out_scale))
+                tmp_1 = c_1
+            elif c_0_scale > c_1_scale and math.floor(c_0_scale / c_1_scale) > 1:
+                tmp_1 = self.buff_ct
+                self.mult_by_const(Ciphertext(c_1, c_1_scale), math.floor(c_0_scale / c_1_scale), Ciphertext(tmp_1, ct_out_scale))
+                tmp_0 = c_0
+            else:
+                tmp_0 = c_0
+                tmp_1 = c_1
+
+        for i in range(min_degree + 1):
+            if evaluate_callable == "add":
+                self.params.ring_q.add_lvl(level, tmp_0.value[i], tmp_1.value[i], ct_out.value[i])
+            else:
+                raise NotImplementedError("Generic evaluator supports only addition at the moment.")
+
+        ct_out.set_scale(max(c_0_scale, c_1_scale))
+
+        # If the inputs degrees differ, it copies the remaining degree on the receiver.
+        # Also checks that the receiver is not one of the inputs to avoid unnecessary work.
+        if c_0.degree() > c_1.degree() and tmp_0 != ct_out:
+            for i in range(min_degree + 1, max_degree + 1):
+                ring.copy_values_lvl(level, tmp_0.value[i], ct_out.value[i])
+        elif c_1.degree() > c_0.degree() and tmp_1 != ct_out:
+            for i in range(min_degree + 1, max_degree + 1):
+                ring.copy_values_lvl(level, tmp_1.value[i], ct_out.value[i])
+    
+    def new_ciphertext_binary(self, op_0, op_1) -> Ciphertext:
+        max_degree = max(op_0.degree(), op_1.degree())
+        max_scale = max(op_0.scale, op_1.scale)
+        min_level = min(op_0.level(), op_1.level())
+
+        return new_ciphertext(self.ckks_params, max_degree, min_level, max_scale)
+    
+    def check_binary(self, op_0, op_1, op_out, op_out_min_degree: int):
+        if not op_0 or not op_1 or not op_out:
+            raise ValueError("cannot check_binary: operands cannot be nil")
+
+        if op_0.degree() + op_1.degree() == 0:
+            raise ValueError("cannot check_binary: operands cannot be both plaintext")
+
+        if op_out.degree() < op_out_min_degree:
+            raise ValueError("cannot check_binary: receiver operand degree is too small")
+
+        for pol in op_0.value:
+            if not pol.is_ntt:
+                raise ValueError("cannot check_binary: op_0 must be in NTT")
+
+        for pol in op_1.value:
+            if not pol.is_ntt:
+                raise ValueError("cannot check_binary: op_1 must be in NTT")
+
+    # add adds op_1 to ct_in and returns the result in ct_out.
+    def add(self, ct_in: Ciphertext, op_1, ct_out: Ciphertext):
+        self.check_binary(ct_in, op_1, ct_out, max(ct_in.degree(), op_1.degree()))
+        self.evaluate_in_place(ct_in, op_1, ct_out, "add")
+    
+    # add_new adds op_1 to ct_in and returns the result in a newly created element.
+    def add_new(self, ct_in: Ciphertext, op_1) -> Ciphertext:
+        ct_out = self.new_ciphertext_binary(ct_in, op_1)
+        self.add(ct_in, op_1, ct_out)
+        return ct_out
+    
+    # mult_by_i multiplies ct_0 by the imaginary number i, and returns the result in ct_out.
+    # It does not change the scale.
+    def mult_by_i(self, ct_0: Ciphertext, ct_out: Ciphertext):
+        if self.params.ring_type == ring.ConjugateInvariantRing:
+            raise ValueError("cannot mult_by_i: method not supported when params.RingType() == ring.ConjugateInvariant")
+
+        level = min(ct_0.level(), ct_out.level())
+        ct_out.scale = ct_0.scale
+        ring_q = self.params.ring_q
+
+        # Equivalent to a product by the monomial x^(n/2) outside of the NTT domain
+        for i in range(level + 1):
+            qi = ring_q.modulus[i]
+            mred_params = ring_q.mred_params[i]
+            imag = ring_q.ntt_psi[i][1]  # Psi^2
+
+            for u in range(len(ct_out.value)):
+                p0_tmp = ct_0.value[u].coeffs[i]
+                p1_tmp = ct_out.value[u].coeffs[i]
+                ring.mul_scalar_montgomery_vec(p0_tmp[:ring_q.n >> 1], p1_tmp, imag, qi, mred_params)
+                ct_0.value[u].update_buffer()
+                ct_out.value[u].update_buffer()
+            
+            imag = qi - imag
+
+            for u in range(len(ct_out.value)):
+                p0_tmp = ct_0.value[u].coeffs[i]
+                p1_tmp = ct_out.value[u].coeffs[i]
+                ring.mul_scalar_montgomery_vec(p0_tmp[ring_q.n >> 1:], p1_tmp.slice_reference(ring_q.n >> 1, ring_q.n), imag, qi, mred_params)
+                ct_0.value[u].update_buffer()
+                ct_out.value[u].update_buffer()
+
+    # mult_by_i_new multiplies ct_0 by the imaginary number i, and returns the result in a newly created element.
+    # It does not change the scale.
+    def mult_by_i_new(self, ct_0: Ciphertext) -> Ciphertext:
+        if self.params.ring_type == ring.ConjugateInvariantRing:
+            raise ValueError("cannot mult_by_i_new: method not supported when params.RingType() == ring.ConjugateInvariant")
+
+        ct_out = new_ciphertext(self.ckks_params, 1, ct_0.level(), ct_0.scale)
+        self.mult_by_i(ct_0, ct_out)
+        return ct_out
+
+
+def new_evaluator_buffers(eval_base: EvaluatorBase) -> EvaluatorBuffers:
+	buff = EvaluatorBuffers()
+	params = eval_base.ckks_params
+	ring_q = params.ring_q
+	buff.buff_q = [ring_q.new_poly() for _ in range(3)]
+	buff.buff_ct = new_ciphertext(params, 2, params.max_level(), params.default_scale)
+	return buff
+
+
+def new_evaluator_base(params: Parameters) -> EvaluatorBase:
+	ev = EvaluatorBase()
+	ev.ckks_params = params
+	return ev
+
+
+# NewEvaluator creates a new Evaluator, that can be used to do homomorphic
+# operations on the Ciphertexts and/or Plaintexts. It stores a memory buffer
+# and Ciphertexts that will be used for intermediate values.
+def new_evaluator(params: Parameters, evaluation_key: rlwe.EvaluationKey) -> Evaluator:
+    eval = Evaluator()
+    eval.set_evaluator_base(new_evaluator_base(params))
+    eval.set_evaluator_buffers(new_evaluator_buffers(eval.get_evaluator_base()))
+    eval.set_rlwe_evaluator(rlwe.new_evaluator(params.get_rlwe_params(), evaluation_key))
+    return eval
