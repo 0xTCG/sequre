@@ -232,7 +232,7 @@ class PkEncryptor(RLWEPkEncryptor):
         self.ckks_params = params
 
 
-# NewCiphertext creates a new Ciphertext parameterized by degree, level and scale.
+# new_ciphertext creates a new Ciphertext parameterized by degree, level and scale.
 def new_ciphertext(params: Parameters, degree: int, level: int, scale: float) -> Ciphertext:
 	ciphertext = Ciphertext(
         ciphertext=rlwe.new_ciphertext(params.get_rlwe_params(), degree, level),
@@ -882,7 +882,7 @@ class EncoderComplex128(Encoder):
     # The imaginary part of []complex128 will be discarded if ring_type == ring.ConjugateInvariant.
     # logslots: user must ensure that 1 <= len(values) <= 2^log_slots < 2^logn and that log_slots >= 3.
     # scale: the scaling factor used do discretize float64 to fixed point integers.
-    # montgomery: if true then the value written on polyOut are put in the Montgomery domain.
+    # montgomery: if True then the value written on polyOut are put in the Montgomery domain.
     # polyOut: polyOut.(type) can be either ringqp.Poly or *ring.Poly.
     # The encoding encoding is done at the level of polyOut.
     # Values written on  polyOut are always in the NTT domain.
@@ -1409,10 +1409,12 @@ class Evaluator(EvaluatorBase, EvaluatorBuffers, RLWEEvaluator):
                 tmp_1 = c_1
 
         for i in range(min_degree + 1):
-            if evaluate_callable == "add":
+            if evaluate_callable == "ring.add_lvl":
                 self.params.ring_q.add_lvl(level, tmp_0.value[i], tmp_1.value[i], ct_out.value[i])
+            elif evaluate_callable == "ring.sub_lvl":
+                self.params.ring_q.sub_lvl(level, tmp_0.value[i], tmp_1.value[i], ct_out.value[i])
             else:
-                raise NotImplementedError("Generic evaluator supports only addition at the moment.")
+                raise NotImplementedError("Generic evaluator supports only addition and subtraction at the moment.")
 
         ct_out.set_scale(max(c_0_scale, c_1_scale))
 
@@ -1450,15 +1452,49 @@ class Evaluator(EvaluatorBase, EvaluatorBuffers, RLWEEvaluator):
             if not pol.is_ntt:
                 raise ValueError("cannot check_binary: op_1 must be in NTT")
 
+    # neg negates the value of ct_0 and returns the result in ct_out.
+    def neg(self, ct_0: Ciphertext, ct_out: Ciphertext):
+        level = min(ct_0.level(), ct_out.level())
+
+        if ct_0.degree() != ct_out.degree():
+            raise ValueError("cannot Negate: invalid receiver Ciphertext does not match input Ciphertext degree")
+
+        for i in range(len(ct_0.value)):
+            self.params.ring_q.neg_lvl(level, ct_0.value[i], ct_out.value[i])
+
+        ct_out.scale = ct_0.scale
+
+    # neg_new negates ct_0 and returns the result in a newly created element.
+    def neg_new(self, ct_0: Ciphertext) -> Ciphertext:
+        ct_out = new_ciphertext(self.ckks_params, ct_0.degree(), ct_0.level(), ct_0.scale)
+        self.neg(ct_0, ct_out)
+        return ct_out
+
     # add adds op_1 to ct_in and returns the result in ct_out.
     def add(self, ct_in: Ciphertext, op_1, ct_out: Ciphertext):
         self.check_binary(ct_in, op_1, ct_out, max(ct_in.degree(), op_1.degree()))
-        self.evaluate_in_place(ct_in, op_1, ct_out, "add")
+        self.evaluate_in_place(ct_in, op_1, ct_out, "ring.add_lvl")
     
     # add_new adds op_1 to ct_in and returns the result in a newly created element.
     def add_new(self, ct_in: Ciphertext, op_1) -> Ciphertext:
         ct_out = self.new_ciphertext_binary(ct_in, op_1)
         self.add(ct_in, op_1, ct_out)
+        return ct_out
+    
+    # sub subtracts op_1 from ct_in and returns the result in ct_out.
+    def sub(self, ct_in: Ciphertext, op_1, ct_out: Ciphertext):
+        self.check_binary(ct_in, op_1, ct_out, max(ct_in.degree(), op_1.degree()))
+        self.evaluate_in_place(ct_in, op_1, ct_out, "ring.sub_lvl")
+
+        level = min(min(ct_in.level(), op_1.level()), ct_out.level())
+        if ct_in.degree() < op_1.degree():
+            for i in range(ct_in.degree() + 1, op_1.degree() + 1):
+                self.params.ring_q.neg_lvl(level, ct_out.value[i], ct_out.value[i])
+
+    # sub_new subtracts op_1 from ct_in and returns the result in a newly created element.
+    def sub_new(self, ct_in: Ciphertext, op_1) -> Ciphertext:
+        ct_out = self.new_ciphertext_binary(ct_in, op_1)
+        self.sub(ct_in, op_1, ct_out)
         return ct_out
     
     # mult_by_i multiplies ct_0 by the imaginary number i, and returns the result in ct_out.
@@ -1502,6 +1538,92 @@ class Evaluator(EvaluatorBase, EvaluatorBuffers, RLWEEvaluator):
         ct_out = new_ciphertext(self.ckks_params, 1, ct_0.level(), ct_0.scale)
         self.mult_by_i(ct_0, ct_out)
         return ct_out
+    
+    # mult_new multiplies ct_in with op_1 without relinearization and returns the result in a newly created element.
+    # The procedure will panic if either ct_in.degree or op_1.degree > 1.
+    def mult_new(self, ct_in: Ciphertext, op_1) -> Ciphertext:
+        ct_out = new_ciphertext(self.ckks_params, ct_in.degree() + op_1.degree(), min(ct_in.level(), op_1.level()), 0)
+        self.mult_relin(ct_in, op_1, False, ct_out)
+        return ct_out
+
+    # mult multiplies ct_in with op_1 without relinearization and returns the result in ct_out.
+    # The procedure will panic if either ct_in or op_1 are have a degree higher than 1.
+    # The procedure will panic if ct_out.degree != ct_in.degree + op_1.degree.
+    def mult(self, ct_in: Ciphertext, op_1, ct_out: Ciphertext):
+        self.mult_relin(ct_in, op_1, False, ct_out)
+
+    # mult_relin_new multiplies ct_in with op_1 with relinearization and returns the result in a newly created element.
+    # The procedure will panic if either ct_in.degree or op_1.degree > 1.
+    # The procedure will panic if the evaluator was not created with an relinearization key.
+    def mult_relin_new(self, ct_in: Ciphertext, op_1) -> Ciphertext:
+        ct_out = new_ciphertext(self.ckks_params, 1, min(ct_in.level(), op_1.level()), 0)
+        self.mult_relin(ct_in, op_1, True, ct_out)
+        return ct_out
+
+    # MulRelin multiplies ct_in with op_1 with relinearization and returns the result in ct_out.
+    # The procedure will panic if either ct_in.degree or op_1.degree > 1.
+    # The procedure will panic if ct_out.degree != ct_in.degree + op_1.degree.
+    # The procedure will panic if the evaluator was not created with an relinearization key.
+    def mult_relin(self, ct_in: Ciphertext, op_1, relin: bool, ct_out: Ciphertext):
+        self.check_binary(ct_in, op_1, ct_out, max(ct_in.degree(), op_1.degree()))
+        level = min(min(ct_in.level(), op_1.level()), ct_out.level())
+
+        if ct_in.degree() + op_1.degree() > 2:
+            raise ValueError("cannot MulRelin: the sum of the input elements' total degree cannot be larger than 2")
+
+        ct_out.scale = ct_in.scale * op_1.scale
+        ring_q = self.params.ring_q
+
+        # Case Ciphertext (x) Ciphertext
+        if ct_in.degree() == 1 and op_1.degree() == 1:
+            c00 = self.buff_q[0]
+            c01 = self.buff_q[1]
+
+            c0 = ct_out.value[0]
+            c1 = ct_out.value[1]
+            c2 = self.buff_q[2]
+
+            if not relin:
+                ct_out.resize(2, level)
+                c2 = ct_out.value[2]
+            else: ct_out.resize(1, level)
+
+            # Avoid overwriting if the second input is the output
+            tmp0, tmp1 = ct_in, op_1
+            if op_1 == ct_out:
+                tmp0, tmp1 = op_1, ct_in
+
+            ring_q.mform_lvl(level, tmp0.value[0], c00)
+            ring_q.mform_lvl(level, tmp0.value[1], c01)
+
+            if ct_in == op_1:  # squaring case
+                ring_q.mul_coeffs_montgomery_lvl(level, c00, tmp1.value[0], c0) # c0 = c[0]*c[0]
+                ring_q.mul_coeffs_montgomery_lvl(level, c01, tmp1.value[1], c2) # c2 = c[1]*c[1]
+                ring_q.mul_coeffs_montgomery_lvl(level, c00, tmp1.value[1], c1) # c1 = 2*c[0]*c[1]
+                ring_q.add_lvl(level, c1, c1, c1)
+            else:  # regular case
+                ring_q.mul_coeffs_montgomery_lvl(level, c00, tmp1.value[0], c0)  # c0 = c0[0]*c0[0]
+                ring_q.mul_coeffs_montgomery_lvl(level, c01, tmp1.value[1], c2)  # c2 = c0[1]*c1[1]
+                ring_q.mul_coeffs_montgomery_lvl(level, c00, tmp1.value[1], c1)
+                ring_q.mul_coeffs_montgomery_and_add_lvl(level, c01, tmp1.value[0], c1)  # c1 = c0[0]*c1[1] + c0[1]*c1[0]
+
+            if relin:
+                c2.is_ntt = True
+                self.gadget_product(level, c2, self.rlk.keys[0].gadget_ciphertext(), self.buff_qp[1].q, self.buff_qp[2].q)
+                ring_q.add_lvl(level, c0, self.buff_qp[1].q, ct_out.value[0])
+                ring_q.add_lvl(level, c1, self.buff_qp[2].q, ct_out.value[1])
+            # Case Plaintext (x) Ciphertext or Ciphertext (x) Plaintext
+        else:
+            if ct_out.degree() < ct_in.degree():
+                ct_out.resize(ct_in.degree(), level)
+            else:
+                ct_out.resize(ct_out.degree(), level)
+
+            c00 = self.buff_q[0]
+
+            ring_q.mform_lvl(level, op_1.value[0], c00)
+            for i in range(len(ct_in.value)):
+                ring_q.mul_coeffs_montgomery_lvl(level, ct_in.value[i], c00, ct_out.value[i])
 
 
 def new_evaluator_buffers(eval_base: EvaluatorBase) -> EvaluatorBuffers:

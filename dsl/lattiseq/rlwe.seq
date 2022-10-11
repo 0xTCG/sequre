@@ -132,6 +132,16 @@ class Parameters:
 
         return int(tmp.bitlen())
 
+    # qi_overflow_margin returns floor(2^64 / max(Qi)), i.e. the number of times elements of Z_max{Qi} can
+    # be added together before overflowing 2^64.
+    def qi_overflow_margin(self, level: int) -> int:
+        return int((2.0 ** 64) / float(max(self.qi[:level+1])))
+
+    # pi_overflow_margin returns floor(2^64 / max(Pi)), i.e. the number of times elements of Z_max{Pi} can
+    # be added together before overflowing 2^64.
+    def pi_overflow_margin(self, level: int) -> int:
+        return int((2.0 ** 64) / float(max(self.pi[:level + 1])))
+
 
 # ParametersLiteral is a literal representation of BFV parameters.  It has public
 # fields and is used to express unchecked user-defined parameters literally into
@@ -530,10 +540,10 @@ class GadgetCiphertext:
 
 # SwitchingKey is a type for generic RLWE public switching keys.
 class SwitchingKey(GadgetCiphertext):
-    def __init__(self, GadgetCiphertext):
-        self.value = GadgetCiphertext.value
+    def __init__(self, gadget_ciphertext):
+        self.value = gadget_ciphertext.value
     
-    def GadgetCiphertext(self):
+    def gadget_ciphertext(self):
         return GadgetCiphertext(self.value)
 
 
@@ -758,7 +768,7 @@ def add_poly_times_gadget_vector_to_GadgetCiphertext(pt, cts, ring_qp, logbase2,
 # NewSwitchingKey returns a new public switching key with pre-allocated zero-value
 def new_switching_key(params, level_q, level_p):
 	return SwitchingKey(
-        GadgetCiphertext=new_GadgetCiphertext(
+        gadget_ciphertext=new_GadgetCiphertext(
             level_q,
             level_p,
             params.decomp_rns(level_q, level_p),
@@ -836,7 +846,7 @@ class KeyGenerator(SkEncryptor):
 
         # Adds the plaintext (input-key) to the switching-key.
         add_poly_times_gadget_vector_to_GadgetCiphertext(
-            skIn, [swk.GadgetCiphertext()],
+            skIn, [swk.gadget_ciphertext()],
             self.params.ring_qp(), self.params.pow2_base, self.buff_q[0])
 
 
@@ -1007,6 +1017,190 @@ class Evaluator(EvaluatorBase, EvaluatorBuffers):
             permute_ntt_index[gal_el] = self.params.ring_q.permute_ntt_index(gal_el)
 
         return permute_ntt_index
+    
+    # decompose_single_ntt takes the input polynomial c2 (c2_ntt and c2_inv_ntt, respectively in the NTT and out of the NTT domain)
+    # modulo the RNS basis, and returns the result on c2_qi_q and c2_qi_p, the receiver polynomials respectively mod Q and mod P (in the NTT domain)
+    def decompose_single_ntt(
+            self, level_q: int, level_p: int, nb_pi: int,
+            decomp_rns: int, c2_ntt: ring.Poly, c2_inv_ntt: ring.Poly,
+            c2_qi_q: ring.Poly, c2_qi_p: ring.Poly):
+        ring_q = self.params.ring_q
+        ring_p = self.params.ring_p
+
+        self.decomposer.decompose_and_split(level_q, level_p, nb_pi, decomp_rns, c2_inv_ntt, c2_qi_q, c2_qi_p)
+
+        p0_idx_st = decomp_rns * nb_pi
+        p0_idx_ed = p0_idx_st + nb_pi
+
+        # c2_qi = cx mod qi mod qi
+        for x in range(level_q +1 ):
+            if p0_idx_st <= x and x < p0_idx_ed:
+                c2_qi_q.coeffs[x] = copy(c2_ntt.coeffs[x])
+            else:
+                ring_q.ntt_single(x, c2_qi_q.coeffs[x], c2_qi_q.coeffs[x])
+
+        if ring_p:
+            # c2_qi_p = c2 mod qi mod pj
+            ring_p.ntt_lvl(level_p, c2_qi_p, c2_qi_p)
+        
+        c2_qi_q.update_buffer()
+
+    # GadgetProductSinglePAndBitDecompNoModDown applies the key-switch to the polynomial cx:
+    # p0_qp = dot(decomp(cx) * evakey[0]) mod QP (encrypted input is multiplied by P factor)
+    # p1_qp = dot(decomp(cx) * evakey[1]) mod QP (encrypted input is multiplied by P factor)
+    # Expects the flag is_ntt of cx to correctly reflect the domain of cx.
+    def gadget_product_single_p_and_bit_decomp_no_mod_down(
+            self, level_q: int, cx: ring.Poly, gadget_ct: GadgetCiphertext,
+            p0_qp: ringqp.Poly, p1_qp: ringqp.Poly):
+        ring_q = self.params.ring_q
+        ring_p = self.params.ring_p
+
+        cx_inv_ntt = cx
+        if cx.is_ntt:
+            cx_inv_ntt = self.buff_inv_ntt
+            ring_q.inv_ntt_lvl(level_q, cx, cx_inv_ntt)
+
+        level_p = gadget_ct.level_p()
+        decomp_rns = self.params.decomp_rns(level_q, level_p)
+        decomp_pw2 = self.params.decomp_pw2(level_q, level_p)
+        pw2 = self.params.pow2_base
+        mask = u64(((1 << pw2) - 1))
+        if mask == u64(0): mask = u64(0xFFFFFFFFFFFFFFFF)
+
+        cw = self.buff_qp[0].q.coeffs[0]
+        cw_ntt = self.buff_bit_decomp
+        qi_over_f = self.params.qi_overflow_margin(level_q) >> 1
+        pi_over_f = self.params.pi_overflow_margin(level_p) >> 1
+        el = gadget_ct.value
+
+        # Key switching with CRT decomposition for the Qi
+        reduce = 0
+        for i in range(decomp_rns):
+            for j in range(decomp_pw2):
+                ring.mask_vec(cx_inv_ntt.coeffs[i], cw, j * pw2, mask)
+
+                if i == 0 and j == 0:
+                    for u in range(level_q + 1):
+                        ring_q.ntt_single_lazy(u, cw, cw_ntt)
+                        ring.mul_coeffs_montgomery_constant_vec(el[i][j].value[0].q.coeffs[u], cw_ntt, p0_qp.q.coeffs[u], ring_q.modulus[u], ring_q.mred_params[u])
+                        ring.mul_coeffs_montgomery_constant_vec(el[i][j].value[1].q.coeffs[u], cw_ntt, p1_qp.q.coeffs[u], ring_q.modulus[u], ring_q.mred_params[u])
+                    for u in range(level_p + 1):
+                        ring_p.ntt_single_lazy(u, cw, cw_ntt)
+                        ring.mul_coeffs_montgomery_constant_vec(el[i][j].value[0].p.coeffs[u], cw_ntt, p0_qp.p.coeffs[u], ring_p.modulus[u], ring_p.mred_params[u])
+                        ring.mul_coeffs_montgomery_constant_vec(el[i][j].value[1].p.coeffs[u], cw_ntt, p1_qp.p.coeffs[u], ring_p.modulus[u], ring_p.mred_params[u])
+                else:
+                    for u in range(level_q + 1):
+                        ring_q.ntt_single_lazy(u, cw, cw_ntt)
+                        ring.mul_coeffs_montgomery_constant_and_add_no_mod_vec(el[i][j].value[0].q.coeffs[u], cw_ntt, p0_qp.q.coeffs[u], ring_q.modulus[u], ring_q.mred_params[u])
+                        ring.mul_coeffs_montgomery_constant_and_add_no_mod_vec(el[i][j].value[1].q.coeffs[u], cw_ntt, p1_qp.q.coeffs[u], ring_q.modulus[u], ring_q.mred_params[u])
+
+                    for u in range(level_p + 1):
+                        ring_p.ntt_single_lazy(u, cw, cw_ntt)
+                        ring.mul_coeffs_montgomery_constant_and_add_no_mod_vec(el[i][j].value[0].p.coeffs[u], cw_ntt, p0_qp.p.coeffs[u], ring_p.modulus[u], ring_p.mred_params[u])
+                        ring.mul_coeffs_montgomery_constant_and_add_no_mod_vec(el[i][j].value[1].p.coeffs[u], cw_ntt, p1_qp.p.coeffs[u], ring_p.modulus[u], ring_p.mred_params[u])
+
+                if reduce % qi_over_f == qi_over_f - 1:
+                    ring_q.reduce_lvl(level_q, p0_qp.q, p0_qp.q)
+                    ring_q.reduce_lvl(level_q, p1_qp.q, p1_qp.q)
+
+                if reduce % pi_over_f == pi_over_f - 1:
+                    ring_p.reduce_lvl(level_p, p0_qp.p, p0_qp.p)
+                    ring_p.reduce_lvl(level_p, p1_qp.p, p1_qp.p)
+
+                reduce += 1
+
+        if reduce % qi_over_f != 0:
+            ring_q.reduce_lvl(level_q, p0_qp.q, p0_qp.q)
+            ring_q.reduce_lvl(level_q, p1_qp.q, p1_qp.q)
+
+        if reduce % pi_over_f != 0:
+            ring_p.reduce_lvl(level_p, p0_qp.p, p0_qp.p)
+            ring_p.reduce_lvl(level_p, p1_qp.p, p1_qp.p)
+
+
+    # gadget_product_no_mod_down applies the gadget prodcut to the polynomial cx:
+    # p0_qp = dot(decomp(cx) * gadget[0]) mod QP (encrypted input is multiplied by P factor)
+    # p1_qp = dot(decomp(cx) * gadget[1]) mod QP (encrypted input is multiplied by P factor)
+    # Expects the flag is_ntt of cx to correctly reflect the domain of cx.
+    def gadget_product_no_mod_down(self, level_q: int, cx: ring.Poly, gadget_ct: GadgetCiphertext, p0_qp: ringqp.Poly, p1_qp: ringqp.Poly):
+        ring_q = self.params.ring_q
+        ring_p = self.params.ring_p
+        ring_qp = self.params.ring_qp()
+
+        c2_qp = self.buff_qp[0]
+        cx_ntt = self.buff_inv_ntt
+        cx_inv_ntt = cx
+
+        if cx.is_ntt:
+            cx_ntt = cx
+            cx_inv_ntt = self.buff_inv_ntt
+            ring_q.inv_ntt_lvl(level_q, cx_ntt, cx_inv_ntt)
+        else:
+            ring_q.ntt_lvl(level_q, cx_inv_ntt, cx_ntt)
+
+        level_p = gadget_ct.level_p()
+        decomp_rns = self.params.decomp_rns(level_q, level_p)
+        qi_over_f = self.params.qi_overflow_margin(level_q) >> 1
+        pi_over_f = self.params.pi_overflow_margin(level_p) >> 1
+        el = gadget_ct.value
+
+        reduce = 0
+        # Key switching with CRT decomposition for the Qi
+        for i in range(decomp_rns):
+            self.decompose_single_ntt(level_q, level_p, level_p + 1, i, cx_ntt, cx_inv_ntt, c2_qp.q, c2_qp.p)
+
+            if i == 0:
+                ring_qp.mul_coeffs_montgomery_constant_lvl(level_q, level_p, el[i][0].value[0], c2_qp, p0_qp)
+                ring_qp.mul_coeffs_montgomery_constant_lvl(level_q, level_p, el[i][0].value[1], c2_qp, p1_qp)
+            else:
+                ring_qp.mul_coeffs_montgomery_constant_and_add_no_mod_lvl(level_q, level_p, el[i][0].value[0], c2_qp, p0_qp)
+                ring_qp.mul_coeffs_montgomery_constant_and_add_no_mod_lvl(level_q, level_p, el[i][0].value[1], c2_qp, p1_qp)
+
+            if reduce % qi_over_f == qi_over_f - 1:
+                ring_q.reduce_lvl(level_q, p0_qp.q, p0_qp.q)
+                ring_q.reduce_lvl(level_q, p1_qp.q, p1_qp.q)
+
+            if reduce % pi_over_f == pi_over_f - 1:
+                ring_p.reduce_lvl(level_p, p0_qp.p, p0_qp.p)
+                ring_p.reduce_lvl(level_p, p1_qp.p, p1_qp.p)
+
+            reduce += 1
+
+        if reduce % qi_over_f != 0:
+            ring_q.reduce_lvl(level_q, p0_qp.q, p0_qp.q)
+            ring_q.reduce_lvl(level_q, p1_qp.q, p1_qp.q)
+
+        if reduce % pi_over_f != 0:
+            ring_p.reduce_lvl(level_p, p0_qp.p, p0_qp.p)
+            ring_p.reduce_lvl(level_p, p1_qp.p, p1_qp.p)
+
+    # gadget_product evaluates poly x Gadget -> RLWE where
+    # p0 = dot(decomp(cx) * gadget[0]) mod Q
+    # p1 = dot(decomp(cx) * gadget[1]) mod Q
+    # Expects the flag is_ntt of cx to correctly reflect the domain of cx.
+    def gadget_product(self, level_q: int, cx: ring.Poly, gadget_ct: GadgetCiphertext, p0: ring.Poly, p1: ring.Poly):
+        level_p = gadget_ct.level_p()
+
+        p0_qp = ringqp.Poly(q=p0, p=self.buff_qp[1].p)
+        p1_qp = ringqp.Poly(q=p1, p=self.buff_qp[2].p)
+
+        if level_p > 0:
+            self.gadget_product_no_mod_down(level_q, cx, gadget_ct, p0_qp, p1_qp)
+        else:
+            self.gadget_product_single_p_and_bit_decomp_no_mod_down(level_q, cx, gadget_ct, p0_qp, p1_qp)
+
+        if cx.is_ntt and level_p != -1:
+            self.basis_extender.mod_down_qp_to_q_ntt(level_q, level_p, p0_qp.q, p0_qp.p, p0_qp.q)
+            self.basis_extender.mod_down_qp_to_q_ntt(level_q, level_p, p1_qp.q, p1_qp.p, p1_qp.q)
+        elif not cx.is_ntt:
+            self.params.ring_q.inv_ntt_lazy_lvl(level_q, p0_qp.q, p0_qp.q)
+            self.params.ring_q.inv_ntt_lazy_lvl(level_q, p1_qp.q, p1_qp.q)
+
+            if level_p != -1:
+                self.params.ring_p.inv_ntt_lazy_lvl(level_p, p0_qp.p, p0_qp.p)
+                self.params.ring_p.inv_ntt_lazy_lvl(level_p, p1_qp.p, p1_qp.p)
+                self.basis_extender.mod_down_qp_to_q(level_q, level_p, p0_qp.q, p0_qp.p, p0_qp.q)
+                self.basis_extender.mod_down_qp_to_q(level_q, level_p, p1_qp.q, p1_qp.p, p1_qp.q)
 
 
 # EvaluationKey is a type for storing generic RLWE public evaluation keys. An evaluation key is a union
