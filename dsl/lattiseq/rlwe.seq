@@ -6,7 +6,7 @@ import random
 
 import ring, ringqp, utils
 
-from common import big_uint
+from common import big_uint, GALOIS_GEN
 
 from ..utils.utils import zeros_vec
 
@@ -141,6 +141,17 @@ class Parameters:
     # be added together before overflowing 2^64.
     def pi_overflow_margin(self, level: int) -> int:
         return int((2.0 ** 64) / float(max(self.pi[:level + 1])))
+    
+    # galois_elementForColumnRotationBy returns the Galois element for plaintext
+    # column rotations by k position to the left. Providing a negative k is
+    # equivalent to a right rotation.
+    def galois_element_for_column_rotation_by(self, k: int) -> u64:
+        return ring.mod_exp_u64(GALOIS_GEN, u64(k & int(self.ring_q.nth_root - 1)), self.ring_q.nth_root)
+    
+    # InverseGaloisElement takes a Galois element and returns the Galois element
+    # corresponding to the inverse automorphism
+    def inverse_galois_element(self, gal_el: u64) -> u64:
+        return ring.mod_exp_u64(gal_el, self.ring_q.nth_root - 1, self.ring_q.nth_root)
 
 
 # ParametersLiteral is a literal representation of BFV parameters.  It has public
@@ -298,6 +309,19 @@ class Ciphertext:
         return f"""\tRLWECipherText:
                 \t{self.value}
         """
+    def __eq__(self, other: Ciphertext) -> bool:
+        is_equal = True
+
+        for self_v, other_v in zip(self.value, other.value):
+            is_equal &= (self_v == other_v)
+        
+        return is_equal
+    
+    def __ne__(self, other: Ciphertext) -> bool:
+        return not self == other
+    
+    def copy(self) -> Ciphertext:
+        return Ciphertext(self.value.copy())
 
     # level returns the level of the target element.
     def level(self):
@@ -416,7 +440,7 @@ class SkEncryptor(EncryptorBase):
             ring_qp.inv_ntt_lvl(level_q, level_p, c1, c1)
     
     # encrypt_zero generates an encryption of zero using the stored secret-key and writes the result on ct.
-    # The method accepts only *rlwe.Ciphertext, *CiphertextC0 or *rgsw.Ciphertext as input and will panic otherwise.
+    # The method accepts only *rlwe.Ciphertext, *CiphertextC0 or *rgsw.Ciphertext as input and will raise ValueError otherwise.
     def encrypt_zero(self, ct):
         if isinstance(ct, Ciphertext):
             self.uniform_sampler.read_lvl(ct.level(), -1, ringqp.Poly(q=ct.value[1]))
@@ -463,7 +487,7 @@ class SkEncryptor(EncryptorBase):
         return SkEncryptor(self.encryptor_base(), key, self.uniform_sampler)
     
     # encrypt encrypts the input plaintext using the stored secret-key and writes the result on ct.
-    # The method accepts only *rlwe.Ciphertext, *CiphertextC0 or *rgsw.Ciphertext as input and will panic otherwise.
+    # The method accepts only *rlwe.Ciphertext, *CiphertextC0 or *rgsw.Ciphertext as input and will raise ValueError otherwise.
     def encrypt(self, pt: Plaintext, ct):
         if not pt: self.encrypt_zero(ct)
         else:
@@ -920,7 +944,7 @@ class Decryptor:
 
     def __str__(self) -> str:
         return f"""\tRLWEDecryptor:
-                \tringQ: {self.ring_q}
+                \tring_q: {self.ring_q}
                 \tbuff: {self.buff}
                 \tsk: {self.sk}
         """
@@ -986,6 +1010,14 @@ class RotationKeySet:
 
     def __bool__(self):
         return bool(len(self.keys))
+    
+    # GetRotationKey return the rotation key for the given galois element or nil if such key is not in the set. The
+    # second argument is true iff the first one is non-nil.
+    def get_rotation_key(self, galois_el: u64) -> Tuple[SwitchingKey, bool]:
+        if galois_el not in self.keys:
+            return SwitchingKey(), False
+
+        return self.keys[galois_el], True
 
 
 # Evaluator is a struct that holds the necessary elements to execute general homomorphic
@@ -1210,6 +1242,36 @@ class Evaluator(EvaluatorBase, EvaluatorBuffers):
                 self.params.ring_p.inv_ntt_lazy_lvl(level_p, p1_qp.p, p1_qp.p)
                 self.basis_extender.mod_down_qp_to_q(level_q, level_p, p0_qp.q, p0_qp.p, p0_qp.q)
                 self.basis_extender.mod_down_qp_to_q(level_q, level_p, p1_qp.q, p1_qp.p, p1_qp.q)
+    
+    # Automorphism computes phi(ct), where phi is the map X -> X^gal_el. The method requires
+    # that the corresponding RotationKey has been added to the Evaluator. The method will
+    # raise ValueError if either ct_in or ct_out degree is not equal to 1.
+    def automorphism(self, ct_in: Ciphertext, gal_el: u64, ct_out: Ciphertext):
+        if ct_in.degree() != 1 or ct_out.degree() != 1:
+            raise ValueError("cannot apply Automorphism: input and output Ciphertext must be of degree 1")
+
+        if gal_el == 1:
+            if ct_out != ct_in: ct_out = ct_in.copy()
+            return
+
+        rtk, generated = self.rtks.get_rotation_key(gal_el)
+        if not generated:
+            raise ValueError(f"gal_el key 5^{self.params.inverse_galois_element(gal_el)} missing")
+
+        level = min(ct_in.level(), ct_out.level())
+        ring_q = self.params.ring_q
+
+        self.gadget_product(level, ct_in.value[1], rtk.gadget_ciphertext(), self.buff_qp[1].q, self.buff_qp[2].q)
+        ring_q.add_lvl(level, self.buff_qp[1].q, ct_in.value[0], self.buff_qp[1].q)
+
+        if ct_in.value[0].is_ntt:
+            ring_q.permute_ntt_with_index_lvl(level, self.buff_qp[1].q, self.permute_ntt_index[gal_el], ct_out.value[0])
+            ring_q.permute_ntt_with_index_lvl(level, self.buff_qp[2].q, self.permute_ntt_index[gal_el], ct_out.value[1])
+        else:
+            ring_q.permute_lvl(level, self.buff_qp[1].q, gal_el, ct_out.value[0])
+            ring_q.permute_lvl(level, self.buff_qp[2].q, gal_el, ct_out.value[1])
+
+        ct_out.resize(ct_out.degree(), level)
 
 
 # EvaluationKey is a type for storing generic RLWE public evaluation keys. An evaluation key is a union
