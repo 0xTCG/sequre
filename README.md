@@ -6,6 +6,8 @@ Sequre is an end-to-end, statically compiled and performance engineered, Pythoni
 
 ### Install
 
+**Note:** For quick testing and bypassing the installation we recommend running Sequre [via docker](#via-docker).
+
 Sequre can **only** be built from source at the moment.
 To install Sequre, first clone the repository:
 ```bash
@@ -200,6 +202,23 @@ This will benchmark the following applications in Sequre:
 - Ganon (metagenomic binning) on top of a single read from the complete Opal dataset from [Yu _et al._](https://github.com/yunwilliamyu/opal)
 
 Benchmark results are stored in the [results](results) folder.
+
+## Via docker
+
+**Note:** Docker runs are currently enabled **only** for the [local](#sequres-network-config) network environments.
+
+[Playground, test, and benchmark runs](#running-playground-tests-and-benchmarks) can be executed via docker:
+```bash
+docker run hsmile/sequre:latest <command>
+```
+
+where `<command>` can be any of the (local network oriented) [commands above](#running-playground-tests-and-benchmarks).
+
+For example:
+```bash
+docker run hsmile/sequre:latest scripts/run.sh tests --unit --local
+```
+will run all the unit tests in the local network environment.
 
 ## License
 
