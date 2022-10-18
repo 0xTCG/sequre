@@ -14,9 +14,10 @@ cd ../../..
 
 git clone https://github.com/HarisSmajlovic/seq.git
 cd seq
-git checkout feature/sequre-v0.0.1
+git checkout sequre-v0.0.1
+git pull
 mkdir stdlib/sequre
-cp -r dsl/* stdlib/sequre/
+cp -r ../dsl/* stdlib/sequre/
 
 
 mkdir build
