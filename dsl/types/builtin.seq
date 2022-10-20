@@ -57,8 +57,8 @@ class str:
 
 @extend
 class float:
-    def __init__(self: float, other: int_t):
-        self = float(int(other))
+    def __init__(self, other: int_t):
+        self = other.to_float()
     
     def __add__[TP](self, other: SharedTensor[TP]) -> SharedTensor[TP]:
         return other + self
@@ -92,6 +92,16 @@ class int:
     def __mod__(self: int, other: int) -> int:
         # TODO: #138 Check why performance gets worsened with the fast modulus enabled (Note: naive_mod includes ring check)OND_FIELD_SIZE, SECOND_MOD_CONST)
         return self.__naive_mod(other)
+    def bitlen(self: int) -> int:
+        if self >> 63: self = -self
+        return int(u64(self).bitlen())
+    @llvm
+    def bit_reverse(self: int) -> int:
+        declare i64 @llvm.bitreverse.i64(i64)
+        %0 = call i64 @llvm.bitreverse.i64(i64 %self)
+        ret i64 %0
+    def bit_reverse_subset(self: int, bitlen: int) -> int:
+	    return self.bit_reverse() >> (64 - bitlen)
     @llvm
     def get_mod_const(field_size: int) -> UInt[128]:
         %fs_ext = zext i64 %field_size to i128
@@ -171,15 +181,59 @@ class int:
         return []
     def has_zero(self: int) -> bool:
         return self == 0
-    def to_float(self: int) -> float:
-        return float(self)
+
+
+@extend
+class Int:
+    @llvm
+    def trunc_to_i64(self: Int[N]) -> int:
+        %0 = trunc i{=N} %self to i64
+        ret i64 %0
+    def bitlen(self: Int[N]) -> Int[N]:
+        if self < Int[N](0): self = -self
+        return UInt[N](self).bitlen()
+    def to_float(self: Int[N]) -> float:
+        # TODO: Implement a more efficient and hardware-friendly solution        
+        if N <= 64: return float(self)
+
+        sign = 1.0
+        if self >> Int[N]((N - 1)):  # Case negative
+            self = -self
+            sign = -1.0
+
+        return UInt[N](self).to_float() * sign
+    def __str__(self: Int[N]) -> str:
+        self_cp = self
+        int_str = ''
+        while self_cp:
+            remainder = 0
+            quotient = Int[N](0)
+            # Euclidean division
+            for bit_idx in range(N - 1, -1, -1):
+                mask = int((self_cp & (Int[N](1) << Int[N](bit_idx))) != Int[N](0))
+                remainder = (remainder << 1) + mask
+                if remainder >= 10:
+                    quotient = (quotient << Int[N](1)) + Int[N](1)
+                    remainder -= 10
+                else: quotient = quotient << Int[N](1)
+            int_str = str(remainder) + int_str
+            self_cp = quotient
+        return int_str if int_str else '0'
 
 
 @extend
 class UInt:
     @llvm
+    def __new__(other: UInt[1]) -> UInt[N]:
+        %0 = zext i1 %other to i{=N}
+        ret i{=N} %0
+    @llvm
     def __new__(other: bool) -> UInt[N]:
         %0 = zext i8 %other to i{=N}
+        ret i{=N} %0
+    @llvm
+    def __new__(other: float) -> UInt[N]:
+        %0 = fptoui double %other to i{=N}
         ret i{=N} %0
     def __add__(self: UInt[N], other: int) -> UInt[N]:
         return self + UInt[N](other)
@@ -224,6 +278,24 @@ class UInt:
             # Temporary bypass. Until LLVM's urem is fixed for long integers.
             return self.__experimental__truncated_mod(other)
         return self.__naive_mod(other)
+    @llvm
+    def raw_add_overflow(self: UInt[N], other: UInt[N]) -> tuple[UInt[N], UInt[1]]:
+        declare {i{=N}, i1} @llvm.uadd.with.overflow.i{=N}(i{=N}, i{=N})
+        %res = call {i{=N}, i1} @llvm.uadd.with.overflow.i{=N}(i{=N} %self, i{=N} %other)
+        ret {i{=N}, i1} %res
+    @llvm
+    def bit_reverse(self: UInt[N]) -> UInt[N]:
+        declare i{=N} @llvm.bitreverse.i{=N}(i{=N})
+        %0 = call i{=N} @llvm.bitreverse.i{=N}(i{=N} %self)
+        ret i{=N} %0
+    def bit_reverse_subset(self: UInt[N], bitlen: int) -> UInt[N]:
+        return self.bit_reverse() >> UInt[N](N - bitlen)
+    @llvm
+    def bitlen(self: UInt[N]) -> UInt[N]:
+        declare i{=N} @llvm.ctlz.i{=N}(i{=N}, i1)
+        %0 = call i{=N} @llvm.ctlz.i{=N}(i{=N} %self, i1 0)
+        %1 = sub i{=N} {=N}, %0
+        ret i{=N} %1
     @llvm
     def get_mod_const(field_size: UInt[N]) -> UInt[N*2]:
         %fs_ext = zext i{=N} %field_size to i{=N*2}
@@ -315,36 +387,22 @@ class UInt:
         return self.__fast_mod_const_field()
     def __fast_mod_ring(self: UInt[N]) -> UInt[N]:
         return self & RING_MASK
-    def __str__(self: UInt[N]) -> str:
-        # TODO: Fix the ineficient string manipulation below.
-        if isinstance(self, u64): return str(int(self))
-        self_cp = self
-        int_str = ''
-        while self_cp:
-            remainder = 0
-            quotient = UInt[N](0)
-            # Euclidean division
-            for bit_idx in range(MODULUS_BITS, -1, -1):
-                remainder = (remainder << 1) + int((self_cp & (UInt[N](1) << bit_idx)) != 0)
-                if remainder >= 10:
-                    quotient = (quotient << 1) + 1
-                    remainder -= 10
-                else: quotient = quotient << 1
-            int_str = str(remainder) + int_str
-            self_cp = quotient
-        return int_str if int_str else '0'
-    @llvm
-    def trunc(self: UInt[N]) -> UInt[N // 2]:
-        %0 = trunc i{=N} %self to i{=N//2}
-        ret i{=N//2} %0
-    @llvm
-    def ext(self: UInt[N]) -> UInt[N * 2]:
-        %0 = zext i{=N} %self to i{=N*2}
-        ret i{=N*2} %0
     @llvm
     def upcast(other: u64) -> UInt[N]:
         %0 = zext i64 %other to i{=N}
         ret i{=N} %0
+    @llvm
+    def trunc_half(self: UInt[N]) -> UInt[N // 2]:
+        %0 = trunc i{=N} %self to i{=N//2}
+        ret i{=N//2} %0
+    @llvm
+    def trunc_to_u64(self: UInt[N]) -> u64:
+        %0 = trunc i{=N} %self to i64
+        ret i64 %0
+    @llvm
+    def ext_double(self: UInt[N]) -> UInt[N * 2]:
+        %0 = zext i{=N} %self to i{=N*2}
+        ret i{=N*2} %0
     def neg_mod(self, modulus) -> UInt[N]:
         return self.fixed_value(modulus) - self
     def add_mod(self, other, modulus) -> UInt[N]:
@@ -402,10 +460,20 @@ class UInt:
         return []
     def has_zero(self: UInt[N]) -> bool:
         return self == UInt[N](0)
-    def to_float(self: UInt[N]) -> float:
-        return float(int(self))
     def to_int(self: UInt[N]) -> int:
         return int(self)
+    def to_intn(self: UInt[N]) -> Int[N]:
+        return Int[N](self)
+    def to_float(self: UInt[N]) -> float:
+        # TODO: Implement a more efficient and hardware-friendly solution
+        if N <= 64: return float(self)
+
+        bl = self.bitlen()
+        if bl <= UInt[N](64): return float(self.trunc_to_u64())
+
+        exponent = bl - UInt[N](63)
+        mantissa = float((self >> exponent).trunc_to_u64())
+        return mantissa * (2.0 ** float(exponent.trunc_to_u64()))
     def fixed_value(self: UInt[N], value) -> UInt[N]:
         return UInt[N](value)
 
@@ -1154,3 +1222,75 @@ class list:
         for s, o in zip(self, pows):
             result = result.mul_mod(mod_pow(s, int_t(o), modulus), modulus)
         return result
+    
+    def slice_reference(self: list[T], begin: int, end: int) -> list[T]:
+        len_: int = end - begin
+        return list[T](
+            arr=Array(
+                ptr=self.arr.ptr + begin,
+                sz=len_),
+            len=len_)
+
+
+class Complex:
+    r: float
+    i: float
+
+    def __init__(self, r):
+        self.r = float(r)
+        self.i = 0.0
+    
+    def __init__(self, r, i):
+        self.r = float(r)
+        self.i = float(i)
+    
+    def __str__(self):
+        return f"{self.r} + {self.i}i"
+    
+    def __iadd__(self, other):
+        self.r += other.r
+        self.i += other.i
+        return self
+    
+    def __isub__(self, other):
+        self.r -= other.r
+        self.i -= other.i
+        return self
+    
+    def __imul__(self, other):
+        r = self.r * other.r - self.i * other.i
+        i = self.r * other.i + self.i * other.r
+        self.r = r
+        self.i = i
+        return self
+    
+    def __itruediv__(self, other):
+        denom = other.r * other.r + other.i * other.i
+        r = (self.r * other.r + self.i * other.i) / denom
+        i = (self.i * other.r - self.r * other.i) / denom
+        self.r = r
+        self.i = i
+        return self
+    
+    def __add__(self, other):
+        new_c = self.copy()
+        new_c += other
+        return new_c
+    
+    def __sub__(self, other):
+        new_c = self.copy()
+        new_c -= other
+        return new_c
+    
+    def __mul__(self, other):
+        new_c = self.copy()
+        new_c *= other
+        return new_c
+    
+    def __truediv__(self, other):
+        new_c = self.copy()
+        new_c /= other
+        return new_c
+    
+    def copy(self):
+        return Complex(self.r, self.i)
