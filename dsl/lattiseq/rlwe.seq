@@ -1,0 +1,1326 @@
+"""
+Ported from https://github.com/tuneinsight/lattigo/tree/master/rlwe
+"""
+
+import random
+
+import ring, ringqp, utils
+
+from common import big_uint, GALOIS_GEN
+
+from ..utils.utils import zeros_vec
+
+
+MAX_LOGN: Static[int] = 17
+MIN_LOGN: Static[int] = 4
+MAX_MODULI_COUNT: Static[int] = 34
+DEFAULT_SIGMA: float = 3.2
+MAX_MODULI_SIZE: Static[int] = 60
+
+
+class Parameters:
+    logn: int
+    qi: list[u64]
+    pi: list[u64]
+    pow2_base: int
+    sigma: float
+    h: int
+    ring_q: ring.Ring
+    ring_p: ring.Ring
+    ring_type: int
+
+    def __init__(self, logn, qi, pi, pow2_base, sigma, h, ring_q, ring_p, ring_type):
+        self.logn = logn
+        self.qi = qi
+        self.pi = pi
+        self.pow2_base = pow2_base
+        self.sigma = sigma
+        self.h = h
+        self.ring_q = ring_q
+        self.ring_p = ring_p
+        self.ring_type = ring_type
+    
+    def __init__(self, logn, qi, pi, pow2_base, h, sigma, ring_type):
+        self.logn = logn
+        self.qi = qi
+        self.pi = pi
+        self.pow2_base = pow2_base
+        self.h = h
+        self.sigma = sigma
+        self.ring_type = ring_type
+    
+    def __bool__(self):
+        return self.logn != 0
+    
+    def __str__(self):
+        return f"""\tRLWEParams:
+                \tLog n: {self.logn}
+                \tQi: {self.qi}
+                \tPi: {self.pi}
+                \tPow2 base: {self.pow2_base}
+                \tSigma: {self.sigma}
+                \tH: {self.h}
+                \tRing q: {self.ring_q}
+                \tRing p: {self.ring_p}
+                \tRing type: {self.ring_type}
+        """
+
+    def init_rings(self):
+        self.ring_q = ring.new_ring_from_type(1 << self.logn, self.qi, self.ring_type)
+
+        if len(self.pi) != 0:
+            self.ring_p = ring.new_ring_from_type(1 << self.logn, self.pi, self.ring_type)
+        
+    # Checks two Parameter structs for equality.
+    def equals(self, other):
+        res = self.logn == other.logn
+        res &= self.qi == other.qi
+        res &= self.pi == other.pi
+        res &= (self.h == other.h)
+        res &= (self.sigma == other.sigma)
+        res &= (self.ring_type == other.ring_type)
+        return res
+    
+    # Returns a pointer to ring_qp
+    def ring_qp(self):
+        return ringqp.Ring(ring_q=self.ring_q, ring_p=self.ring_p)
+    
+    # Returns the number of factors of the ciphertext modulus extension q
+    def q_count(self):
+        return len(self.qi)
+    
+    # p_count returns the number of factors of the ciphertext modulus extension p
+    def p_count(self):
+        return len(self.pi)
+    
+    # Returns the ring degree
+    def n(self):
+        return 1 << self.logn
+    
+    # decomp_rns returns the number of element in the RNS decomposition basis: Ceil(lenQi / lenPi)
+    def decomp_rns(self, levelq, levelp):
+        if levelp == -1: return levelq + 1
+        return (levelq + levelp + 1) // (levelp + 1)
+    
+    # decomp_pw2 returns ceil(p.MaxBitQ(level_q, level_p)/bitDecomp).
+    def decomp_pw2(self, levelq, levelp):
+        if self.pow2_base == 0: return 1
+        return (self.max_bit(levelq, levelp) + self.pow2_base - 1) // self.pow2_base
+    
+    # MaxBit returns max(max(bitLen(q[:level_q+1])), max(bitLen(p[:level_p+1])).
+    def max_bit(self, levelq, levelp):
+        c = 0
+
+        for qi in self.q()[:levelq + 1]: c = max(c, int(qi.bitlen()))
+        for pi in self.q()[:levelp + 1]: c = max(c, int(pi.bitlen()))
+
+        return c
+    
+    # q returns a new slice with the factors of the ciphertext modulus q
+    def q(self):
+        return [e for e in self.qi]
+    
+    # p returns a new slice with the factors of the ciphertext modulus extension p
+    def p(self):
+        return [e for e in self.pi]
+    
+    # LogQP returns the size of the extended modulus QP in bits
+    def log_qp(self) -> int:
+        tmp = big_uint(1)
+        for qi in self.qi: tmp *= qi.ext_to_bigint()
+        for pi in self.pi: tmp *= pi.ext_to_bigint()
+
+        return int(tmp.bitlen())
+
+    # qi_overflow_margin returns floor(2^64 / max(Qi)), i.e. the number of times elements of Z_max{Qi} can
+    # be added together before overflowing 2^64.
+    def qi_overflow_margin(self, level: int) -> int:
+        return int((2.0 ** 64) / float(max(self.qi[:level+1])))
+
+    # pi_overflow_margin returns floor(2^64 / max(Pi)), i.e. the number of times elements of Z_max{Pi} can
+    # be added together before overflowing 2^64.
+    def pi_overflow_margin(self, level: int) -> int:
+        return int((2.0 ** 64) / float(max(self.pi[:level + 1])))
+    
+    # galois_elementForColumnRotationBy returns the Galois element for plaintext
+    # column rotations by k position to the left. Providing a negative k is
+    # equivalent to a right rotation.
+    def galois_element_for_column_rotation_by(self, k: int) -> u64:
+        return ring.mod_exp_u64(GALOIS_GEN, u64(k & int(self.ring_q.nth_root - 1)), self.ring_q.nth_root)
+    
+    # InverseGaloisElement takes a Galois element and returns the Galois element
+    # corresponding to the inverse automorphism
+    def inverse_galois_element(self, gal_el: u64) -> u64:
+        return ring.mod_exp_u64(gal_el, self.ring_q.nth_root - 1, self.ring_q.nth_root)
+
+
+# ParametersLiteral is a literal representation of BFV parameters.  It has public
+# fields and is used to express unchecked user-defined parameters literally into
+# Go programs. The NewParametersFromLiteral function is used to generate the actual
+# checked parameters from the literal representation.
+#
+# Users must set the polynomial degree (logn) and the coefficient modulus, by either setting
+# the q and p fields to the desired moduli chain, or by setting the logq and logp fields to
+# the desired moduli sizes.
+#
+# Optionally, users may specify
+# - the base 2 decomposition for the gadget ciphertexts
+# - the error variance (sigma) and secrets' density (h) and the ring
+# type (ring_type). If left unset, standard default values for these field are substituted at
+# parameter creation (see NewParametersFromLiteral).
+class ParametersLiteral:
+    logn: int
+    q: list[u64]
+    p: list[u64]
+    logq: list[int]
+    logp: list[int]
+    pow2_base: int
+    sigma: float
+    h: int
+    ring_type: int
+
+    def __init__(self, logn, q, p, logq, logp, pow2_base, sigma, h, ring_type):
+        self.logn = logn
+        self.q = q
+        self.p = p
+        self.logq = logq
+        self.logp = logp
+        self.pow2_base = pow2_base
+        self.sigma = sigma
+        self.h = h
+        self.ring_type = ring_type
+
+
+class EncryptorBuffers:
+    buff_q: list[ring.Poly]  # (2)
+    buff_p: list[ring.Poly]  # (3)
+    buff_qp: ringqp.Poly
+
+    def __init__(self, buff_q, buff_p, buff_qp):
+        self.buff_q = buff_q
+        self.buff_p = buff_p
+        self.buff_qp = buff_qp
+    
+    def __str__(self) -> str:
+        return f"""\tRLWEEncryptorBuffers:
+                \tBuffQ: {self.buff_q}
+                \tBuffP: {self.buff_p}
+                \tbuff_qp: {self.buff_qp}
+        """
+
+
+# SecretKey is a type for generic RLWE secret keys.
+class SecretKey:
+    value: ringqp.Poly
+
+    def __init__(self, value):
+        self.value = value
+    
+    def __str__(self):
+        return f"""\tRLWESecretKey:
+                \t{self.value}
+        """
+    
+    # level_q returns the level of the modulus q of the target.
+    def level_q(self):
+        return self.value.q.level()
+    
+    # level_p returns the level of the modulus p of the target.
+    # Returns -1 if p is absent.
+    def level_p(self):
+        if self.value.p:
+            return self.value.p.level()
+
+        return -1
+
+
+class EncryptorBase(EncryptorBuffers):
+    params: Parameters
+    prng: random.Random
+    gaussian_sampler: ring.GaussianSampler
+    ternary_sampler: ring.TernarySampler
+    basisextender: ring.BasisExtender
+
+    def __init__(self, params, prng, gaussian_sampler, ternary_sampler, encryptor_buffers, basisextender):
+        self.params = params
+        self.prng = prng
+        self.gaussian_sampler = gaussian_sampler
+        self.ternary_sampler = ternary_sampler
+        self.basisextender = basisextender
+        self.buff_q = encryptor_buffers.buff_q
+        self.buff_p = encryptor_buffers.buff_p
+        self.buff_qp = encryptor_buffers.buff_qp
+    
+    def __str__(self) -> str:
+        return f"""\tRLWEEncryptorBase:
+                \t{self.params}
+                \t{self.gaussian_sampler}
+                \t{self.ternary_sampler}
+                \t{self.basisextender}
+                \t{self.get_rlwe_encryptor_buffers()}
+        """
+    
+    def get_rlwe_encryptor_buffers(self):
+        return EncryptorBuffers(self.buff_q, self.buff_p, self.buff_qp)
+    
+    # check_sk checks that a given sk is correct for the parameters.
+    def check_sk(self, key):
+        assert isinstance(key, SecretKey), f"key is not a valid public key type {key}"
+
+        if key.value.q.n() != self.params.n():
+            raise ValueError("cannot check_sk: sk ring degree does not match params ring degree")
+
+
+def new_encryptor_buffers(params):
+    ring_q = params.ring_q
+    ring_p = params.ring_p
+
+    buff_p = list[ring.Poly](3)
+    if params.p_count() != 0:
+        for _ in range(3): buff_p.append(ring_p.new_poly())
+
+    return EncryptorBuffers(
+        buff_q=[ring_q.new_poly(), ring_q.new_poly()],
+        buff_p=buff_p,
+        buff_qp=params.ring_qp().new_poly())
+
+
+def new_encryptor_base(params):
+    prng = utils.new_prng()
+	
+    bc = None
+    if params.p_count() != 0:
+        bc = ring.new_basis_extender(params.ring_q, params.ring_p)
+    
+    return EncryptorBase(
+        params=params,
+        prng=prng,
+        gaussian_sampler=ring.new_gaussian_sampler(prng, params.ring_q, params.sigma, int(6 * params.sigma)),
+        ternary_sampler=ring.new_ternary_sampler_with_hamming_weight(prng, params.ring_q, params.h, False),
+        encryptor_buffers=new_encryptor_buffers(params),
+        basisextender=bc)
+
+
+# Ciphertext is a generic type for RLWE ciphertexts.
+class Ciphertext:
+    value: list[ring.Poly]
+
+    def __str__(self) -> str:
+        return f"""\tRLWECipherText:
+                \t{self.value}
+        """
+    def __eq__(self, other: Ciphertext) -> bool:
+        is_equal = True
+
+        for self_v, other_v in zip(self.value, other.value):
+            is_equal &= (self_v == other_v)
+        
+        return is_equal
+    
+    def __ne__(self, other: Ciphertext) -> bool:
+        return not self == other
+    
+    def copy(self) -> Ciphertext:
+        return Ciphertext(self.value.copy())
+
+    # level returns the level of the target element.
+    def level(self):
+        return len(self.value[0].coeffs) - 1
+
+    # degree returns the degree of the target element.
+    def degree(self):
+        return len(self.value) - 1
+    
+    # resize resizes the degree of the target element.
+    # Sets the NTT flag of the added poly equal to the NTT flag
+    # to the poly at degree zero.
+    def resize(self, degree: int, level: int):
+        if self.level() != level:
+            for v in self.value:
+                v.resize(level)
+
+        if self.degree() > degree:
+            self.value = self.value[:degree + 1]
+        elif self.degree() < degree:
+            while self.degree() < degree:
+                self.value.append(ring.new_poly(self.value[0].n(), level))
+                self.value[self.degree()].is_ntt = self.value[0].is_ntt
+
+
+# CiphertextQP is a generic type for RLWE ciphertexts in R_qp.
+class CiphertextQP:
+    value: list[ringqp.Poly]  # [2]
+
+    def __init__(self, rqp_1, rqp_2):
+        self.value = list[ringqp.Poly](2)
+        self.value.append(rqp_1)
+        self.value.append(rqp_2)
+
+
+# Plaintext is a common base type for RLWE plaintexts.
+class Plaintext:
+    value: ring.Poly
+
+    def __init__(self, value=ring.Poly):
+        self.value = value
+    
+    def __bool__(self):
+        return bool(self.value)
+    
+    def __str__(self) -> str:
+        return f"""\tRLWEPlaintext:
+                \t{self.value}
+        """
+    
+    # level returns the level of the target element.
+    def level(self):
+        return len(self.value.coeffs) - 1
+
+
+class SkEncryptor(EncryptorBase):
+    sk: SecretKey
+    uniform_sampler: ringqp.UniformSampler
+
+    def __init__(self, encryptor_base, sk, uniform_sampler):
+        self.params = encryptor_base.params
+        self.prng = encryptor_base.prng
+        self.gaussian_sampler = encryptor_base.gaussian_sampler
+        self.ternary_sampler = encryptor_base.ternary_sampler
+        self.basisextender = encryptor_base.basisextender
+        self.buff_q = encryptor_base.buff_q
+        self.buff_p = encryptor_base.buff_p
+        self.buff_qp = encryptor_base.buff_qp
+
+        self.sk = sk
+        self.uniform_sampler = uniform_sampler
+    
+    def __str__(self) -> str:
+        return f"""\tRLWESkEncryptor:
+                \t{self.sk}
+                \t{self.uniform_sampler}
+                \t{self.get_rlwe_encryptorbase()}
+        """
+    
+    def get_rlwe_encryptorbase(self):
+        return EncryptorBase(
+            self.params, self.prng, self.gaussian_sampler, self.ternary_sampler,
+            self.get_rlwe_encryptor_buffers(), self.basisextender)
+    
+    # EncryptZeroSeeded generates en encryption of zero under sk.
+    # level_q : level of the modulus q
+    # level_p : level of the modulus p
+    # sk     : secret key
+    # sampler: uniform sampler; if `sampler` is nil, then will sample using the internal sampler.
+    # montgomery: returns the result in the Montgomery domain.
+    def encrypt_zero_qp(self, ct):
+        c0, c1 = ct.value[0], ct.value[1]
+
+        level_q, level_p = c0.level_q(), c1.level_p()
+        ring_qp = self.params.ring_qp()
+
+        # ct = (e, 0)
+        self.gaussian_sampler.read_lvl(level_q, c0.q)
+        if level_p != -1:
+            ring_qp.extend_basis_small_norm_and_center(c0.q, level_p, None, c0.p)
+
+        ring_qp.ntt_lvl(level_q, level_p, c0, c0)
+        # ct[1] is assumed to be sampled in of the Montgomery domain,
+        # thus -as will also be in the Montgomery domain (s is by default), therefore 'e'
+        # must be switched to the Montgomery domain.
+        ring_qp.mform_lvl(level_q, level_p, c0, c0)
+
+        # ct = (e, a)
+        self.uniform_sampler.read_lvl(level_q, level_p, c1)
+
+        # (-a*sk + e, a)
+        ring_qp.mul_coeffs_montgomery_and_sub_lvl(level_q, level_p, c1, self.sk.value, c0)
+
+        if not ct.value[0].q.is_ntt:
+            ring_qp.inv_ntt_lvl(level_q, level_p, c0, c0)
+            ring_qp.inv_ntt_lvl(level_q, level_p, c1, c1)
+    
+    # encrypt_zero generates an encryption of zero using the stored secret-key and writes the result on ct.
+    # The method accepts only *rlwe.Ciphertext, *CiphertextC0 or *rgsw.Ciphertext as input and will raise ValueError otherwise.
+    def encrypt_zero(self, ct):
+        if isinstance(ct, Ciphertext):
+            self.uniform_sampler.read_lvl(ct.level(), -1, ringqp.Poly(q=ct.value[1]))
+            self.encrypt_zero_ring(ct.value[0], ct.value[1])
+        elif isinstance(ct, ring.Poly):
+            self.uniform_sampler.read_lvl(ct.level(), -1, ringqp.Poly(q=self.buff_q[1]))
+            self.encrypt_zero_ring(ct, self.buff_q[1])
+        elif isinstance(ct, CiphertextQP):
+            self.encrypt_zero_qp(ct)
+        else:
+            raise ValueError("cannot encrypt_zero: input ciphertext type unsupported")
+    
+    def encrypt_zero_ring(self, c0: ring.Poly, c1: ring.Poly):
+        ring_q = self.params.ring_q
+        level_q = c0.level()
+
+        ring_q.mul_coeffs_montgomery_lvl(level_q, c1, self.sk.value.q, c0) # c0 = NTT(sc1)
+        ring_q.neg_lvl(level_q, c0, c0)                                  # c0 = NTT(-sc1)
+
+        if c0.is_ntt:
+            self.gaussian_sampler.read_lvl(level_q, self.buff_q[0]) # e
+            ring_q.ntt_lvl(level_q, self.buff_q[0], self.buff_q[0])  # NTT(e)
+            ring_q.add_lvl(level_q, c0, self.buff_q[0], c0)         # c0 = NTT(-sc1 + e)
+        else:
+            ring_q.inv_ntt_lvl(level_q, c0, c0)                # c0 = -sc1
+            ring_q.inv_ntt_lvl(level_q, c1, c1)                # c1 = c1
+            self.gaussian_sampler.read_and_add_lvl(level_q, c0) # c0 = -sc1 + e
+
+    def encryptor_base(self):
+        return EncryptorBase(
+            params=self.params,
+            prng=self.prng,
+            gaussian_sampler=self.gaussian_sampler,
+            ternary_sampler=self.ternary_sampler,
+            encryptor_buffers=EncryptorBuffers(
+                buff_q=self.buff_q,
+                buff_p=self.buff_p,
+                buff_qp=self.buff_qp),
+            basisextender=self.basisextender)
+
+    # with_key returns this encryptor with a new key.
+    def with_key(self, key):
+        self.check_sk(key)
+        return SkEncryptor(self.encryptor_base(), key, self.uniform_sampler)
+    
+    # encrypt encrypts the input plaintext using the stored secret-key and writes the result on ct.
+    # The method accepts only *rlwe.Ciphertext, *CiphertextC0 or *rgsw.Ciphertext as input and will raise ValueError otherwise.
+    def encrypt(self, pt: Plaintext, ct):
+        if not pt: self.encrypt_zero(ct)
+        else:
+            if isinstance(ct, Ciphertext):
+                self.uniform_sampler.read_lvl(min(pt.level(), ct.level()), -1, ringqp.Poly(q=ct.value[1]))
+                self.encrypt_rlwe(pt, ct.value[0], ct.value[1])
+            elif isinstance(ct, ring.Poly):
+                self.uniform_sampler.read_lvl(min(pt.level(), ct.level()), -1, ringqp.Poly(q=self.buff_q[1]))
+                self.encrypt_rlwe(pt, ct, self.buff_q[1])
+            else: raise ValueError("cannot encrypt: input ciphertext type unsuported (must be *rlwe.Ciphertext or *rgsw.Ciphertext)")
+    
+    def encrypt_rlwe(self, pt: Plaintext, c0: ring.Poly, c1: ring.Poly):
+        ring_q = self.params.ring_q
+        level_q = min(pt.level(), c0.level())
+        ct_ntt = c0.is_ntt
+
+        ring_q.mul_coeffs_montgomery_lvl(level_q, c1, self.sk.value.q, c0)
+        ring_q.neg_lvl(level_q, c0, c0)
+
+        self.add_pt_error_c0(pt, c0)
+
+        if not ct_ntt and c1 != self.buff_q[0]: ring_q.inv_ntt_lvl(level_q, c1, c1)
+    
+    def add_pt_error_c0(self, pt: Plaintext, c0: ring.Poly):
+        ring_q = self.params.ring_q
+        level_q = min(pt.level(), c0.level())
+        ct_ntt = c0.is_ntt
+        pt_ntt = pt.value.is_ntt
+        buffq0 = self.buff_q[0]
+
+        if ct_ntt and pt_ntt:
+            self.gaussian_sampler.read_lvl(level_q, buffq0)
+            ring_q.ntt_lvl(level_q, buffq0, buffq0)
+            ring_q.add_lvl(level_q, c0, buffq0, c0)
+            ring_q.add_lvl(level_q, c0, pt.value, c0)
+        elif ct_ntt and not pt_ntt:
+            self.gaussian_sampler.read_lvl(level_q, buffq0)
+            ring_q.add_lvl(level_q, buffq0, pt.value, buffq0)
+            ring_q.ntt_lvl(level_q, buffq0, buffq0)
+            ring_q.add_lvl(level_q, c0, buffq0, c0)
+        elif not ct_ntt and pt_ntt:
+            ring_q.add_lvl(level_q, c0, pt.value, c0)
+            ring_q.inv_ntt_lvl(level_q, c0, c0)
+            self.gaussian_sampler.read_and_add_lvl(c0.level(), c0)
+        elif not ct_ntt and not pt_ntt:
+            ring_q.inv_ntt_lvl(level_q, c0, c0)
+            ring_q.add_lvl(level_q, c0, pt.value, c0)
+            self.gaussian_sampler.read_and_add_lvl(c0.level(), c0)
+
+
+def new_sk_encryptor(params, key):
+    prng = utils.new_prng()
+    enc = SkEncryptor(new_encryptor_base(params), key, ringqp.new_uniform_sampler(prng, params.ring_qp()))
+    enc.check_sk(key)
+    return enc
+
+
+# GadgetCiphertext is a struct for storing an encrypted
+# plaintext times the gadget power matrix.
+class GadgetCiphertext:
+    value: list[list[CiphertextQP]]
+
+    # level_q returns the level of the modulus q of the target Ciphertext.
+    def level_q(self):
+        return self.value[0][0].value[0].q.level()
+    
+    # level_p returns the level of the modulus p of the target Ciphertext.
+    def level_p(self):
+        if self.value[0][0].value[0].p:
+            return self.value[0][0].value[0].p.level()
+
+        return -1
+
+
+# SwitchingKey is a type for generic RLWE public switching keys.
+class SwitchingKey(GadgetCiphertext):
+    def __init__(self, gadget_ciphertext):
+        self.value = gadget_ciphertext.value
+    
+    def gadget_ciphertext(self):
+        return GadgetCiphertext(self.value)
+
+
+# NewCiphertext returns a new Element with zero values.
+def new_ciphertext(params: Parameters, degree: int, level: int) -> Ciphertext:
+	el = Ciphertext()
+	el.value = list[ring.Poly](degree + 1)
+	for _ in range(degree + 1): el.value.append(ring.new_poly(params.n(), level))
+	return el
+
+
+# RelinearizationKey is a type for generic RLWE public relinearization keys. It stores a slice with a
+# switching key per relinearizable degree. The switching key at index i is used to relinearize a degree
+# i+2 ciphertexts back to a degree i + 1 one.
+class RelinearizationKey:
+    keys: list[SwitchingKey]
+
+    def __bool__(self):
+        return bool(len(self.keys))
+
+
+# NewGadgetCiphertext returns a new Ciphertext key with pre-allocated zero-value.
+# Ciphertext is always in the NTT domain.
+def new_GadgetCiphertext(level_q, level_p, decomp_rns, decomp_bit, ring_qp):
+    ct = GadgetCiphertext()
+    ct.value = list[list[CiphertextQP]](decomp_rns)
+	
+    for _ in range(decomp_rns):
+        ct_value = list[CiphertextQP](decomp_bit)
+		
+        for _ in range(decomp_bit):
+            ct_value_poly_0 = ring_qp.new_poly_lvl(level_q, level_p)
+            ct_value_poly_1 = ring_qp.new_poly_lvl(level_q, level_p)
+            ct_value_poly_0.q.is_ntt = True
+            ct_value_poly_1.q.is_ntt = True
+            
+            if level_p != -1:
+                ct_value_poly_0.p.is_ntt = True
+                ct_value_poly_1.p.is_ntt = True
+
+            ct_value.append(CiphertextQP(ct_value_poly_0, ct_value_poly_1))
+            
+        ct.value.append(ct_value)
+
+    return ct
+
+
+def check_size_params(logn, len_q, len_p):
+	if logn > MAX_LOGN:
+		raise ValueError(f"logn={logn} is larger than MaxLogN={MAX_LOGN}")
+	if logn < MIN_LOGN:
+		raise ValueError(f"logn={logn} is smaller than MinLogN={MIN_LOGN}")
+	if len_q > MAX_MODULI_COUNT:
+		raise ValueError(f"len_q={len_q} is larger than MaxModuliCount={MAX_MODULI_COUNT}")
+	if len_p > MAX_MODULI_COUNT:
+		raise ValueError(f"len_p={len_p} is larger than MaxModuliCount={MAX_MODULI_COUNT}")
+
+
+def check_moduli(q, p):
+    if len(q) > MAX_MODULI_COUNT:
+        raise ValueError("#Qi is larger than {MAX_MODULI_COUNT}")
+
+    for i, qi in enumerate(q):
+        if u64(int(qi.bitlen()) - 1) > u64(MAX_MODULI_SIZE + 1):
+            raise ValueError(f"a Qi bit-size (i={i}) is larger than {MAX_MODULI_SIZE}")
+
+    for i, qi in enumerate(q):
+        if not utils.is_prime(qi):
+            raise ValueError(f"a Qi (i={i}) is not a prime")
+        
+    if p:
+        if len(p) > MAX_MODULI_COUNT:
+            raise ValueError(f"#Pi is larger than {MAX_MODULI_COUNT}")
+
+        for i, pi in enumerate(p):
+            if u64(int(pi.bitlen()) - 1) > u64(MAX_MODULI_SIZE + 2):
+                raise ValueError(f"a Pi bit-size (i={i}) is larger than {MAX_MODULI_SIZE}")
+        
+        for i, pi in enumerate(p):
+            if not utils.is_prime(pi):
+                raise ValueError(f"a Pi (i={i}) is not a prime")
+
+
+def new_parameters(logn, q, p, pow2_base, h, sigma, ring_type):
+    if pow2_base != 0 and len(p) > 1:
+        raise ValueError("rlwe.NewParameters: invalid parameters, cannot have pow2_base > 0 if len(p) > 1")
+
+    check_size_params(logn, len(q), len(p))
+
+    params = Parameters(
+        logn=logn,
+		qi=list[u64](len(q)),
+		pi=list[u64](len(p)),
+		pow2_base=pow2_base,
+		h=h,
+		sigma=sigma,
+		ring_type=ring_type)
+
+	# pre-check that moduli chain is of valid size and that all factors are prime.
+	# note: the Ring instantiation checks that the moduli are valid NTT-friendly primes.
+    check_moduli(q, p)
+
+    for e in q: params.qi.append(e)
+    for e in p: params.pi.append(e)
+
+    params.init_rings()
+
+    return params
+
+
+def check_moduli_log_size(log_q, log_p):
+    for i, qi in enumerate(log_q):
+        if qi <= 0 or qi > MAX_MODULI_SIZE:
+            raise ValueError(f"log_q[{i}]={qi} is not in ]0, {MAX_MODULI_SIZE}]")
+
+    for i, pi in enumerate(log_p):
+        if pi <= 0 or pi > MAX_MODULI_SIZE + 1:
+            raise ValueError(f"log_p[{i}]={pi} is not in ]0,{MAX_MODULI_SIZE + 1}]")
+
+
+def gen_moduli(logn, log_q, log_p):
+    check_size_params(logn, len(log_q), len(log_p))
+    check_moduli_log_size(log_q, log_p)
+
+	# Extracts all the different primes bit size and maps their number
+    primesbitlen = {}
+    for qi in log_q: primesbitlen[qi] = 0
+    for pj in log_p: primesbitlen[pj] = 0
+    for qi in log_q: primesbitlen[qi] += 1
+    for pj in log_p: primesbitlen[pj] += 1
+
+	# For each bit-size, finds that many primes
+    primes = {}
+    for key, value in primesbitlen.items():
+        primes[key] = ring.generate_ntt_primes(int(key), 2 << logn, int(value))
+
+    q, p = [], []
+	
+    # Assigns the primes to the moduli chain
+    for qi in log_q:
+        q.append(primes[qi][0])
+        primes[qi] = primes[qi][1:]
+
+    # Assigns the primes to the special primes list for the extended ring
+    for pj in log_p:
+        p.append(primes[pj][0])
+        primes[pj] = primes[pj][1:]
+
+    return q, p
+
+
+def new_parameters_from_literal(param_def):
+    if param_def.h == 0:
+        param_def.h = 1 << (param_def.logn - 1)
+
+    if param_def.sigma == 0:
+        # prevents the zero value of ParameterLiteral to result in a noise-less parameter instance.
+        # Users should use the NewParameters method to explicitely create noiseless instances.
+        param_def.sigma = DEFAULT_SIGMA
+
+    if param_def.q and not param_def.logq:
+        return new_parameters(param_def.logn, param_def.q, param_def.p, param_def.pow2_base, param_def.h, param_def.sigma, param_def.ring_type)
+
+    if param_def.logq and not param_def.q:
+        log_n = param_def.logn
+        if param_def.ring_type == ring.ConjugateInvariantRing: log_n += 1
+
+        q, p = gen_moduli(param_def.logn, param_def.logq, param_def.logp)
+
+        return new_parameters(param_def.logn, q, p, param_def.pow2_base, param_def.h, param_def.sigma, param_def.ring_type)
+
+    raise ValueError("rlwe.NewParametersFromLiteral: invalid parameter literal")
+
+
+# AddPolyTimesGadgetVectorToGadgetCiphertext takes a plaintext polynomial and a list of Ciphertexts and adds the
+# plaintext times the RNS and BIT decomposition to the i-th element of the i-th Ciphertexts. This method panics if
+# len(cts) > 2.
+def add_poly_times_gadget_vector_to_GadgetCiphertext(pt, cts, ring_qp, logbase2, buff):
+    ring_q = ring_qp.ring_q
+    level_q = cts[0].level_q()
+    level_p = cts[0].level_p()
+
+    if len(cts) > 2:
+        raise ValueError("cannot AddPolyTimesGadgetVectorToGadgetCiphertext: len(cts) should be <= 2")
+
+    if level_p != -1:
+        ring_q.mul_scalar_bigint_lvl(level_q, pt, ring_qp.ring_p.modulus_at_level[level_p], buff)  # p * pt
+    else:
+        level_p = 0
+        if pt != buff:
+            ring.copy_lvl(level_q, pt, buff)  # 1 * pt
+
+    rns_decomp = len(cts[0].value)
+    bit_decomp = len(cts[0].value[0])
+
+    for j in range(bit_decomp):
+        for i in range(rns_decomp):
+            # e + (m * p * w^2j) * (q_star * q_tild) mod QP
+            # q_prod = prod(q[i*#Pi+j])
+            # q_star = q/qprod
+            # q_tild = q_star^-1 mod q_prod
+            # Therefore : (pt * p * w^2j) * (q_star * q_tild) = pt*p*w^2j mod q[i*#Pi+j], else 0
+            for k in range(level_p + 1):
+                index = i * (level_p + 1) + k
+
+				# Handle cases where #pj does not divide #qi
+                if index >= level_q + 1: break
+
+                qi = ring_q.modulus[index]
+                p0tmp = buff.coeffs[index]
+
+                for u, ct in enumerate(cts):
+                    p1tmp = ct.value[i][j].value[u].q.coeffs[index]
+                    for w in range(ring_q.n):
+                        p1tmp[w] = ring.cred(p1tmp[w] + p0tmp[w], qi)
+                    ct.value[i][j].value[u].q.update_buffer()
+		# w^2j
+        ring_q.mul_scalar(buff, 1 << logbase2, buff)
+    
+
+# NewSwitchingKey returns a new public switching key with pre-allocated zero-value
+def new_switching_key(params, level_q, level_p):
+	return SwitchingKey(
+        gadget_ciphertext=new_GadgetCiphertext(
+            level_q,
+            level_p,
+            params.decomp_rns(level_q, level_p),
+            params.decomp_pw2(level_q, level_p),
+            params.ring_qp()))
+
+
+# KeyGenerator is a structure that stores the elements required to create new keys,
+# as well as a memory buffer for intermediate values.
+class KeyGenerator(SkEncryptor):
+    def __init__(self, sk_encryptor):
+        self.params = sk_encryptor.params
+        self.prng = sk_encryptor.prng
+        self.gaussian_sampler = sk_encryptor.gaussian_sampler
+        self.ternary_sampler = sk_encryptor.ternary_sampler
+        self.basisextender = sk_encryptor.basisextender
+        self.buff_q = sk_encryptor.buff_q
+        self.buff_p = sk_encryptor.buff_p
+        self.buff_qp = sk_encryptor.buff_qp
+
+        self.sk = sk_encryptor.sk
+        self.uniform_sampler = sk_encryptor.uniform_sampler
+    
+    def __str__(self) -> str:
+        return f"""\tRLWEKeyGen:
+                \t{self.get_rlwe_skencryptor()}
+        """
+    
+    def get_rlwe_skencryptor(self):
+        return SkEncryptor(self.get_rlwe_encryptorbase(), self.sk, self.uniform_sampler)
+    
+    # gen_secret_key generates a new SecretKey with the distribution [1/3, 1/3, 1/3].
+    def gen_secret_key(self):
+        return self.gen_secret_key_from_sampler(self.ternary_sampler)
+
+    # gen_secret_key_from_sampler generates a new SecretKey sampled from the provided Sampler.
+    def gen_secret_key_from_sampler(self, sampler):
+        ring_qp = self.params.ring_qp()
+        sk = SecretKey(value=ring_qp.new_poly())
+        level_q, level_p = sk.level_q(), sk.level_p()
+        sampler.read(sk.value.q)
+
+        if level_p > -1:
+            ring_qp.extend_basis_small_norm_and_center(sk.value.q, level_p, None, sk.value.p)
+
+        ring_qp.ntt_lvl(level_q, level_p, sk.value, sk.value)
+        ring_qp.mform_lvl(level_q, level_p, sk.value, sk.value)
+
+        return sk
+    
+    # GenRelinKey generates a new EvaluationKey that will be used to relinearize Ciphertexts during multiplication.
+    def gen_relinearization_key(self, sk, maxDegree):
+        level_q = self.params.q_count() - 1
+        level_p = self.params.p_count() - 1
+
+        evk = RelinearizationKey()
+        evk.keys = list[SwitchingKey](maxDegree)
+        for _ in range(maxDegree): evk.keys.append(new_switching_key(self.params, level_q, level_p))
+
+        self.buff_qp.q.copy_values(sk.value.q)
+        ring_q = self.params.ring_q
+        for i in range(maxDegree):
+            ring_q.mul_coeffs_montgomery(self.buff_qp.q, sk.value.q, self.buff_qp.q)
+            self.gen_switching_key(self.buff_qp.q, sk.value, evk.keys[i])
+        
+        return evk
+    
+    def gen_switching_key(self, skIn, skOut, swk):
+        enc = self.with_key(SecretKey(skOut))
+        # Samples an encryption of zero for each element of the switching-key.
+        
+        for row in swk.value:
+            for elem in row:
+                enc.encrypt_zero(elem)
+
+        # Adds the plaintext (input-key) to the switching-key.
+        add_poly_times_gadget_vector_to_GadgetCiphertext(
+            skIn, [swk.gadget_ciphertext()],
+            self.params.ring_qp(), self.params.pow2_base, self.buff_q[0])
+
+
+# NewSecretKey generates a new SecretKey with zero values.
+def new_secret_key(params):
+    return SecretKey(value=params.ring_qp().new_poly())
+
+
+# NewKeyGenerator creates a new KeyGenerator, from which the secret and public keys, as well as the evaluation,
+# rotation and switching keys can be generated.
+def new_key_generator(params):
+    return KeyGenerator(sk_encryptor=new_sk_encryptor(params, new_secret_key(params)))
+
+
+# PublicKey is a type for generic RLWE public keys.
+class PublicKey:
+    value: ringqp.Poly  # [2]
+
+    def __init__(self):
+        raise NotImplementedError()
+
+
+class PkEncryptor(EncryptorBase):
+    pk: PublicKey
+
+    def __init__(self, encryptor_base, pk):
+        self.params = encryptor_base.params
+        self.prng = encryptor_base.prng
+        self.gaussian_sampler = encryptor_base.gaussian_sampler
+        self.ternary_sampler = encryptor_base.ternary_sampler
+        self.basisextender = encryptor_base.basisextender
+        self.buff_q = encryptor_base.buff_q
+        self.buff_p = encryptor_base.buff_p
+        self.buff_qp = encryptor_base.buff_qp
+
+        self.pk = pk
+    
+    # check_pk checks that a given pk is correct for the parameters.
+    def check_pk(self, key: PublicKey):
+        if key.value[0].q.n() != self.params.n() or key.value[1].q.n() != self.params.n():
+            raise ValueError("pk ring degree does not match params ring degree")
+
+
+def new_pk_encryptor(params: Parameters, key):
+	enc = PkEncryptor(new_encryptor_base(params), key)
+	enc.check_pk(key)
+	return enc
+
+
+# NewEncryptor creates a new Encryptor
+# Accepts either a secret-key or a public-key.
+def new_encryptor(params: Parameters, key):
+	if isinstance(key, PublicKey):
+		return new_pk_encryptor(params, key)
+	elif isinstance(key, SecretKey):
+		return new_sk_encryptor(params, key)
+	else:
+		raise ValueError("cannot NewEncryptor: key must be either *rlwe.PublicKey or *rlwe.SecretKey")
+
+
+# NewPlaintext creates a new Plaintext at level `level` from the parameters.
+def new_plaintext(params: Parameters, level: int) -> Plaintext:
+	return Plaintext(value=ring.new_poly(params.n(), level))
+
+
+# decryptor is a structure used to decrypt ciphertext. It stores the secret-key.
+class Decryptor:
+    ring_q: ring.Ring
+    buff: ring.Poly
+    sk: SecretKey
+
+    def __str__(self) -> str:
+        return f"""\tRLWEDecryptor:
+                \tring_q: {self.ring_q}
+                \tbuff: {self.buff}
+                \tsk: {self.sk}
+        """
+
+    # decrypt decrypts the ciphertext and write the result in ptOut.
+    # The level of the output plaintext is min(ciphertext.level(), plaintext.level())
+    # Output domain will match plaintext.value.is_ntt value.
+    def decrypt(self, ciphertext: Ciphertext, plaintext: Plaintext):
+        ring_q = self.ring_q
+        level = min(ciphertext.level(), plaintext.level())
+
+        plaintext.value.resize(level)
+
+        if ciphertext.value[0].is_ntt:
+            ring.copy_values_lvl(level, ciphertext.value[ciphertext.degree()], plaintext.value)
+        else:
+            ring_q.ntt_lazy_lvl(level, ciphertext.value[ciphertext.degree()], plaintext.value)
+
+        for i in range(ciphertext.degree(), 0, -1):
+            ring_q.mul_coeffs_montgomery_lvl(level, plaintext.value, self.sk.value.q, plaintext.value)
+
+            if not ciphertext.value[0].is_ntt:
+                ring_q.ntt_lazy_lvl(level, ciphertext.value[i - 1], self.buff)
+                ring_q.add_lvl(level, plaintext.value, self.buff, plaintext.value)
+            else: ring_q.add_lvl(level, plaintext.value, ciphertext.value[i - 1], plaintext.value)
+
+            if i & 7 == 7: ring_q.reduce_lvl(level, plaintext.value, plaintext.value)
+
+        if ciphertext.degree() & 7 != 7: ring_q.reduce_lvl(level, plaintext.value, plaintext.value)
+
+        if not plaintext.value.is_ntt: ring_q.inv_ntt_lvl(level, plaintext.value, plaintext.value)
+
+
+# NewDecryptor instantiates a new generic RLWE Decryptor.
+def new_decryptor(params, sk):
+	if sk.value.q.n() != params.n():
+		raise ValueError("secret_key is invalid for the provided parameters")
+
+	return Decryptor(
+        ring_q=params.ring_q,
+        buff=params.ring_q.new_poly(),
+        sk=sk)
+
+
+class EvaluatorBuffers:
+	# buff_qp[0-0]: Key-Switch on the fly decomp(c2)
+	# buff_qp[1-2]: Key-Switch output
+	# buff_qp[3-5]: Available
+	buff_qp: list[ringqp.Poly]  #[6]
+	buff_inv_ntt: ring.Poly
+	buff_decomp_qp: list[ringqp.Poly]  # Memory Buff for the basis extension in hoisting
+	buff_bit_decomp: list[u64]
+
+
+class EvaluatorBase:
+    params: Parameters
+
+
+# RotationKeySet is a type for storing generic RLWE public rotation keys. It stores a map indexed by the
+# galois element defining the automorphism.
+class RotationKeySet:
+    keys: dict[u64, SwitchingKey]
+
+    def __bool__(self):
+        return bool(len(self.keys))
+    
+    # GetRotationKey return the rotation key for the given galois element or nil if such key is not in the set. The
+    # second argument is true iff the first one is non-nil.
+    def get_rotation_key(self, galois_el: u64) -> Tuple[SwitchingKey, bool]:
+        if galois_el not in self.keys:
+            return SwitchingKey(), False
+
+        return self.keys[galois_el], True
+
+
+# Evaluator is a struct that holds the necessary elements to execute general homomorphic
+# operation on RLWE ciphertexts, such as automorphisms, key-switching and relinearization.
+class Evaluator(EvaluatorBase, EvaluatorBuffers):
+    rlk: RelinearizationKey
+    rtks: RotationKeySet
+    permute_ntt_index: dict[u64, list[u64]]
+
+    basis_extender: ring.BasisExtender
+    decomposer:    ring.Decomposer
+
+    def set_evaluator_base(self, eval_base: EvaluatorBase):
+        self.params = eval_base.params
+    
+    def set_evaluator_buffers(self, eval_buffers: EvaluatorBuffers):
+        self.buff_qp = eval_buffers.buff_qp
+        self.buff_inv_ntt = eval_buffers.buff_inv_ntt
+        self.buff_decomp_qp = eval_buffers.buff_decomp_qp
+        self.buff_bit_decomp = eval_buffers.buff_bit_decomp
+
+    # permute_ntt_indexes_for_key generates permutation indexes for automorphisms for ciphertexts
+    # that are given in the NTT domain.
+    def permute_ntt_indexes_for_key(self, rtks: RotationKeySet) -> dict[u64, list[u64]]:
+        if not rtks: return dict[u64, list[u64]]()
+
+        permute_ntt_index = dict[u64, list[u64]]()
+        for gal_el in rtks.keys:
+            permute_ntt_index[gal_el] = self.params.ring_q.permute_ntt_index(gal_el)
+
+        return permute_ntt_index
+    
+    # decompose_single_ntt takes the input polynomial c2 (c2_ntt and c2_inv_ntt, respectively in the NTT and out of the NTT domain)
+    # modulo the RNS basis, and returns the result on c2_qi_q and c2_qi_p, the receiver polynomials respectively mod Q and mod P (in the NTT domain)
+    def decompose_single_ntt(
+            self, level_q: int, level_p: int, nb_pi: int,
+            decomp_rns: int, c2_ntt: ring.Poly, c2_inv_ntt: ring.Poly,
+            c2_qi_q: ring.Poly, c2_qi_p: ring.Poly):
+        ring_q = self.params.ring_q
+        ring_p = self.params.ring_p
+
+        self.decomposer.decompose_and_split(level_q, level_p, nb_pi, decomp_rns, c2_inv_ntt, c2_qi_q, c2_qi_p)
+
+        p0_idx_st = decomp_rns * nb_pi
+        p0_idx_ed = p0_idx_st + nb_pi
+
+        # c2_qi = cx mod qi mod qi
+        for x in range(level_q +1 ):
+            if p0_idx_st <= x and x < p0_idx_ed:
+                c2_qi_q.coeffs[x] = copy(c2_ntt.coeffs[x])
+            else:
+                ring_q.ntt_single(x, c2_qi_q.coeffs[x], c2_qi_q.coeffs[x])
+
+        if ring_p:
+            # c2_qi_p = c2 mod qi mod pj
+            ring_p.ntt_lvl(level_p, c2_qi_p, c2_qi_p)
+        
+        c2_qi_q.update_buffer()
+
+    # GadgetProductSinglePAndBitDecompNoModDown applies the key-switch to the polynomial cx:
+    # p0_qp = dot(decomp(cx) * evakey[0]) mod QP (encrypted input is multiplied by P factor)
+    # p1_qp = dot(decomp(cx) * evakey[1]) mod QP (encrypted input is multiplied by P factor)
+    # Expects the flag is_ntt of cx to correctly reflect the domain of cx.
+    def gadget_product_single_p_and_bit_decomp_no_mod_down(
+            self, level_q: int, cx: ring.Poly, gadget_ct: GadgetCiphertext,
+            p0_qp: ringqp.Poly, p1_qp: ringqp.Poly):
+        ring_q = self.params.ring_q
+        ring_p = self.params.ring_p
+
+        cx_inv_ntt = cx
+        if cx.is_ntt:
+            cx_inv_ntt = self.buff_inv_ntt
+            ring_q.inv_ntt_lvl(level_q, cx, cx_inv_ntt)
+
+        level_p = gadget_ct.level_p()
+        decomp_rns = self.params.decomp_rns(level_q, level_p)
+        decomp_pw2 = self.params.decomp_pw2(level_q, level_p)
+        pw2 = self.params.pow2_base
+        mask = u64(((1 << pw2) - 1))
+        if mask == u64(0): mask = u64(0xFFFFFFFFFFFFFFFF)
+
+        cw = self.buff_qp[0].q.coeffs[0]
+        cw_ntt = self.buff_bit_decomp
+        qi_over_f = self.params.qi_overflow_margin(level_q) >> 1
+        pi_over_f = self.params.pi_overflow_margin(level_p) >> 1
+        el = gadget_ct.value
+
+        # Key switching with CRT decomposition for the Qi
+        reduce = 0
+        for i in range(decomp_rns):
+            for j in range(decomp_pw2):
+                ring.mask_vec(cx_inv_ntt.coeffs[i], cw, j * pw2, mask)
+
+                if i == 0 and j == 0:
+                    for u in range(level_q + 1):
+                        ring_q.ntt_single_lazy(u, cw, cw_ntt)
+                        ring.mul_coeffs_montgomery_constant_vec(el[i][j].value[0].q.coeffs[u], cw_ntt, p0_qp.q.coeffs[u], ring_q.modulus[u], ring_q.mred_params[u])
+                        ring.mul_coeffs_montgomery_constant_vec(el[i][j].value[1].q.coeffs[u], cw_ntt, p1_qp.q.coeffs[u], ring_q.modulus[u], ring_q.mred_params[u])
+                    for u in range(level_p + 1):
+                        ring_p.ntt_single_lazy(u, cw, cw_ntt)
+                        ring.mul_coeffs_montgomery_constant_vec(el[i][j].value[0].p.coeffs[u], cw_ntt, p0_qp.p.coeffs[u], ring_p.modulus[u], ring_p.mred_params[u])
+                        ring.mul_coeffs_montgomery_constant_vec(el[i][j].value[1].p.coeffs[u], cw_ntt, p1_qp.p.coeffs[u], ring_p.modulus[u], ring_p.mred_params[u])
+                else:
+                    for u in range(level_q + 1):
+                        ring_q.ntt_single_lazy(u, cw, cw_ntt)
+                        ring.mul_coeffs_montgomery_constant_and_add_no_mod_vec(el[i][j].value[0].q.coeffs[u], cw_ntt, p0_qp.q.coeffs[u], ring_q.modulus[u], ring_q.mred_params[u])
+                        ring.mul_coeffs_montgomery_constant_and_add_no_mod_vec(el[i][j].value[1].q.coeffs[u], cw_ntt, p1_qp.q.coeffs[u], ring_q.modulus[u], ring_q.mred_params[u])
+                    for u in range(level_p + 1):
+                        ring_p.ntt_single_lazy(u, cw, cw_ntt)
+                        ring.mul_coeffs_montgomery_constant_and_add_no_mod_vec(el[i][j].value[0].p.coeffs[u], cw_ntt, p0_qp.p.coeffs[u], ring_p.modulus[u], ring_p.mred_params[u])
+                        ring.mul_coeffs_montgomery_constant_and_add_no_mod_vec(el[i][j].value[1].p.coeffs[u], cw_ntt, p1_qp.p.coeffs[u], ring_p.modulus[u], ring_p.mred_params[u])
+                
+                p0_qp.q.update_buffer()
+                p0_qp.p.update_buffer()
+                p1_qp.q.update_buffer()
+                p1_qp.p.update_buffer()
+
+                if reduce % qi_over_f == qi_over_f - 1:
+                    ring_q.reduce_lvl(level_q, p0_qp.q, p0_qp.q)
+                    ring_q.reduce_lvl(level_q, p1_qp.q, p1_qp.q)
+
+                if reduce % pi_over_f == pi_over_f - 1:
+                    ring_p.reduce_lvl(level_p, p0_qp.p, p0_qp.p)
+                    ring_p.reduce_lvl(level_p, p1_qp.p, p1_qp.p)
+
+                reduce += 1
+
+        if reduce % qi_over_f != 0:
+            ring_q.reduce_lvl(level_q, p0_qp.q, p0_qp.q)
+            ring_q.reduce_lvl(level_q, p1_qp.q, p1_qp.q)
+
+        if reduce % pi_over_f != 0:
+            ring_p.reduce_lvl(level_p, p0_qp.p, p0_qp.p)
+            ring_p.reduce_lvl(level_p, p1_qp.p, p1_qp.p)
+
+
+    # gadget_product_no_mod_down applies the gadget prodcut to the polynomial cx:
+    # p0_qp = dot(decomp(cx) * gadget[0]) mod QP (encrypted input is multiplied by P factor)
+    # p1_qp = dot(decomp(cx) * gadget[1]) mod QP (encrypted input is multiplied by P factor)
+    # Expects the flag is_ntt of cx to correctly reflect the domain of cx.
+    def gadget_product_no_mod_down(self, level_q: int, cx: ring.Poly, gadget_ct: GadgetCiphertext, p0_qp: ringqp.Poly, p1_qp: ringqp.Poly):
+        ring_q = self.params.ring_q
+        ring_p = self.params.ring_p
+        ring_qp = self.params.ring_qp()
+
+        c2_qp = self.buff_qp[0]
+        cx_ntt = self.buff_inv_ntt
+        cx_inv_ntt = cx
+
+        if cx.is_ntt:
+            cx_ntt = cx
+            cx_inv_ntt = self.buff_inv_ntt
+            ring_q.inv_ntt_lvl(level_q, cx_ntt, cx_inv_ntt)
+        else:
+            ring_q.ntt_lvl(level_q, cx_inv_ntt, cx_ntt)
+
+        level_p = gadget_ct.level_p()
+        decomp_rns = self.params.decomp_rns(level_q, level_p)
+        qi_over_f = self.params.qi_overflow_margin(level_q) >> 1
+        pi_over_f = self.params.pi_overflow_margin(level_p) >> 1
+        el = gadget_ct.value
+
+        reduce = 0
+        # Key switching with CRT decomposition for the Qi
+        for i in range(decomp_rns):
+            self.decompose_single_ntt(level_q, level_p, level_p + 1, i, cx_ntt, cx_inv_ntt, c2_qp.q, c2_qp.p)
+
+            if i == 0:
+                ring_qp.mul_coeffs_montgomery_constant_lvl(level_q, level_p, el[i][0].value[0], c2_qp, p0_qp)
+                ring_qp.mul_coeffs_montgomery_constant_lvl(level_q, level_p, el[i][0].value[1], c2_qp, p1_qp)
+            else:
+                ring_qp.mul_coeffs_montgomery_constant_and_add_no_mod_lvl(level_q, level_p, el[i][0].value[0], c2_qp, p0_qp)
+                ring_qp.mul_coeffs_montgomery_constant_and_add_no_mod_lvl(level_q, level_p, el[i][0].value[1], c2_qp, p1_qp)
+
+            p0_qp.q.update_buffer()
+            p0_qp.p.update_buffer()
+            p1_qp.q.update_buffer()
+            p1_qp.p.update_buffer()
+
+            if reduce % qi_over_f == qi_over_f - 1:
+                ring_q.reduce_lvl(level_q, p0_qp.q, p0_qp.q)
+                ring_q.reduce_lvl(level_q, p1_qp.q, p1_qp.q)
+
+            if reduce % pi_over_f == pi_over_f - 1:
+                ring_p.reduce_lvl(level_p, p0_qp.p, p0_qp.p)
+                ring_p.reduce_lvl(level_p, p1_qp.p, p1_qp.p)
+
+            reduce += 1
+
+        if reduce % qi_over_f != 0:
+            ring_q.reduce_lvl(level_q, p0_qp.q, p0_qp.q)
+            ring_q.reduce_lvl(level_q, p1_qp.q, p1_qp.q)
+
+        if reduce % pi_over_f != 0:
+            ring_p.reduce_lvl(level_p, p0_qp.p, p0_qp.p)
+            ring_p.reduce_lvl(level_p, p1_qp.p, p1_qp.p)
+
+    # gadget_product evaluates poly x Gadget -> RLWE where
+    # p0 = dot(decomp(cx) * gadget[0]) mod Q
+    # p1 = dot(decomp(cx) * gadget[1]) mod Q
+    # Expects the flag is_ntt of cx to correctly reflect the domain of cx.
+    def gadget_product(self, level_q: int, cx: ring.Poly, gadget_ct: GadgetCiphertext, p0: ring.Poly, p1: ring.Poly):
+        level_p = gadget_ct.level_p()
+
+        p0_qp = ringqp.Poly(q=p0, p=self.buff_qp[1].p)
+        p1_qp = ringqp.Poly(q=p1, p=self.buff_qp[2].p)
+
+        if level_p > 0:
+            self.gadget_product_no_mod_down(level_q, cx, gadget_ct, p0_qp, p1_qp)
+        else:
+            self.gadget_product_single_p_and_bit_decomp_no_mod_down(level_q, cx, gadget_ct, p0_qp, p1_qp)
+
+        if cx.is_ntt and level_p != -1:
+            self.basis_extender.mod_down_qp_to_q_ntt(level_q, level_p, p0_qp.q, p0_qp.p, p0_qp.q)
+            self.basis_extender.mod_down_qp_to_q_ntt(level_q, level_p, p1_qp.q, p1_qp.p, p1_qp.q)
+        elif not cx.is_ntt:
+            self.params.ring_q.inv_ntt_lazy_lvl(level_q, p0_qp.q, p0_qp.q)
+            self.params.ring_q.inv_ntt_lazy_lvl(level_q, p1_qp.q, p1_qp.q)
+
+            if level_p != -1:
+                self.params.ring_p.inv_ntt_lazy_lvl(level_p, p0_qp.p, p0_qp.p)
+                self.params.ring_p.inv_ntt_lazy_lvl(level_p, p1_qp.p, p1_qp.p)
+                self.basis_extender.mod_down_qp_to_q(level_q, level_p, p0_qp.q, p0_qp.p, p0_qp.q)
+                self.basis_extender.mod_down_qp_to_q(level_q, level_p, p1_qp.q, p1_qp.p, p1_qp.q)
+    
+    # Automorphism computes phi(ct), where phi is the map X -> X^gal_el. The method requires
+    # that the corresponding RotationKey has been added to the Evaluator. The method will
+    # raise ValueError if either ct_in or ct_out degree is not equal to 1.
+    def automorphism(self, ct_in: Ciphertext, gal_el: u64, ct_out: Ciphertext):
+        if ct_in.degree() != 1 or ct_out.degree() != 1:
+            raise ValueError("cannot apply Automorphism: input and output Ciphertext must be of degree 1")
+
+        if gal_el == 1:
+            if ct_out != ct_in: ct_out = ct_in.copy()
+            return
+
+        rtk, generated = self.rtks.get_rotation_key(gal_el)
+        if not generated:
+            raise ValueError(f"gal_el key 5^{self.params.inverse_galois_element(gal_el)} missing")
+
+        level = min(ct_in.level(), ct_out.level())
+        ring_q = self.params.ring_q
+
+        self.gadget_product(level, ct_in.value[1], rtk.gadget_ciphertext(), self.buff_qp[1].q, self.buff_qp[2].q)
+        ring_q.add_lvl(level, self.buff_qp[1].q, ct_in.value[0], self.buff_qp[1].q)
+
+        if ct_in.value[0].is_ntt:
+            ring_q.permute_ntt_with_index_lvl(level, self.buff_qp[1].q, self.permute_ntt_index[gal_el], ct_out.value[0])
+            ring_q.permute_ntt_with_index_lvl(level, self.buff_qp[2].q, self.permute_ntt_index[gal_el], ct_out.value[1])
+        else:
+            ring_q.permute_lvl(level, self.buff_qp[1].q, gal_el, ct_out.value[0])
+            ring_q.permute_lvl(level, self.buff_qp[2].q, gal_el, ct_out.value[1])
+
+        ct_out.resize(ct_out.degree(), level)
+
+
+# EvaluationKey is a type for storing generic RLWE public evaluation keys. An evaluation key is a union
+# of a relinearization key and a set of rotation keys.
+class EvaluationKey:
+    rlk: RelinearizationKey
+    rtks: RotationKeySet
+
+    def __bool__(self):
+        return bool(self.rlk) or bool(self.rtks)
+
+
+def new_evaluator_buffers(params: Parameters) -> EvaluatorBuffers:
+	buff = EvaluatorBuffers()
+	decomp_rns = params.decomp_rns(params.q_count() -1 , params.p_count() - 1)
+	ring_qp = params.ring_qp()
+
+	buff.buff_qp = [ring_qp.new_poly() for _ in range(6)]
+	buff.buff_inv_ntt = params.ring_q.new_poly()
+
+	buff.buff_decomp_qp = list[ringqp.Poly](decomp_rns)
+	for _ in range(decomp_rns): buff.buff_decomp_qp.append(ring_qp.new_poly())
+
+	buff.buff_bit_decomp = zeros_vec(params.ring_q.n, TP=u64)
+
+	return buff
+
+
+def new_evaluator_base(params: Parameters) -> EvaluatorBase:
+	ev = EvaluatorBase()
+	ev.params = params
+	return ev
+
+
+# NewEvaluator creates a new Evaluator.
+def new_evaluator(params: Parameters, evaluation_key: EvaluationKey) -> Evaluator:
+    eval = Evaluator()
+    eval.set_evaluator_base(new_evaluator_base(params))
+    eval.set_evaluator_buffers(new_evaluator_buffers(params))
+
+    if params.ring_p:
+        eval.basis_extender = ring.new_basis_extender(params.ring_q, params.ring_p)
+        eval.decomposer = ring.new_decomposer(params.ring_q, params.ring_p)
+
+    if evaluation_key:
+        if evaluation_key.rlk:
+            eval.rlk = evaluation_key.rlk
+
+        if evaluation_key.rtks:
+            eval.rtks = evaluation_key.rtks
+            eval.permute_ntt_index = eval.permute_ntt_indexes_for_key(eval.rtks)
+    
+    return eval
