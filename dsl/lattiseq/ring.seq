@@ -324,12 +324,37 @@ def butterfly(u, v, psi, two_q, four_q, q, q_inv):
 	return u + v, u + two_q - v
 
 
-# BRedAdd computes a mod q.
+# bred_add computes a mod q.
 def bred_add(a: u64, q: u64, u: list[u64]):
 	mhi, _ = a.mul_overflow(u[0])
 	r = a - mhi * q
 	if r >= q: r -= q
 	return r
+
+
+# AddScalarVec returns p2 = p1 + scalar mod qi.
+def add_scalar_vec(p1: list[u64], p2: list[u64], scalar: u64, qi: u64):
+	for j in range(len(p1)):
+		p2[j] = cred(p1[j] + scalar, qi)
+
+
+# AddScalarNoModAndNegTwoQiNoModVec returns p2 = 2*qi - p1 + scalar.
+def add_scalar_no_mod_and_neg_two_qi_no_mod_vec(p1: list[u64], p2: list[u64], scalar: u64, qi: u64):
+	twoqi = qi << 1
+	for j in range(len(p1)):
+		p2[j] = scalar + twoqi - p1[j]
+
+
+# AddScalarNoModVec returns p2 = p1 + scalar.
+def add_scalar_no_mod_vec(p1: list[u64], p2: list[u64], scalar: u64):
+	for j in range(len(p1)):
+		p2[j] = p1[j] + scalar
+
+
+# AddVecNoModAndMulScalarMontgomeryVec returns p3 = (p1+p2)*scalar_mont mod qi.
+def add_vec_no_mod_and_mul_scalar_montgomery_vec(p1: list[u64], p2: list[u64], p3: list[u64], scalar_mont: u64, qi: u64, mred_params: u64):
+	for j in range(len(p1)):
+		p3[j] = mred(p1[j] + p2[j], scalar_mont, qi, mred_params)
 
 
 # ReduceVec returns p2 = p1 mod qi.
@@ -901,6 +926,11 @@ class NumberTheoreticTransformerStandard:
     # Returns values in the range [0, 2q-1].
     def forward_lazy_vec(r, level: int, p1: list[u64], p2: list[u64]):
         ntt_lazy(p1, p2, r.n, r.ntt_psi[level], r.modulus[level], r.mred_params[level], r.bred_params[level])
+    
+    # BackwardLazyVec writes the backward NTT in Z[X]/(X^N+1) of the i-th level of p1 on the i-th level of p2.
+    # Returns values in the range [0, 2q-1].
+    def backward_lazy_vec(r, level: int, p1: list[u64], p2: list[u64]):
+        inv_ntt_lazy(p1, p2, r.n, r.ntt_psi_inv[level], r.ntt_n_inv[level], r.modulus[level], r.mred_params[level])
 
 
 # NumberTheoreticTransformerConjugateInvariant computes the NTT in the ring Z[X+X^-1]/(X^2N+1).
@@ -1139,6 +1169,14 @@ class Ring:
         if self.ntt_type == NumberTheoreticTransformerStandard().name:
             NumberTheoreticTransformerStandard.backward_lazy_lvl(self, level, p1, p2)
         else: raise NotImplementedError()
+
+    # InvNTTSingleLazy computes the InvNTT of p1 and returns the result on p2.
+    # The level-th moduli of the ring InvNTT params are used.
+    # Output values are in the range [0, 2q-1]
+    def inv_ntt_single_lazy(self, level: int, p1: list[u64], p2: list[u64]):
+        if self.ntt_type == NumberTheoreticTransformerStandard().name:
+            NumberTheoreticTransformerStandard.backward_lazy_vec(self, level, p1, p2)
+        else: raise NotImplementedError()
     
     # permute_ntt_index computes the index table for PermuteNTT.
     def permute_ntt_index(self, gal_el: u64) -> list[u64]:
@@ -1291,6 +1329,54 @@ class Ring:
         for i in range(level + 1):
             reduce_vec(p1.coeffs[i][:self.n], p2.coeffs[i], self.modulus[i], self.bred_params[i])
         p2.update_buffer()
+    
+    # DivRoundByLastModulusLvl divides (rounded) the polynomial by its last modulus. The input must be in the NTT domain.
+    # Output poly level must be equal or one less than input level.
+    def div_round_by_last_modulus_lvl(self, level: int, p0: Poly, p1: Poly):
+        # Center by (p-1)/2
+        pj = self.modulus[level]
+        p_half = (pj - 1) >> 1
+
+        add_scalar_vec(p0.coeffs[level], p0.coeffs[level], p_half, pj)
+
+        for i in range(level):
+            qi = self.modulus[i]
+            add_scalar_no_mod_and_neg_two_qi_no_mod_vec(p0.coeffs[i], p0.coeffs[i], qi - bred_add(p_half, qi, self.bred_params[i]), qi)
+            add_vec_no_mod_and_mul_scalar_montgomery_vec(p0.coeffs[level], p0.coeffs[i], p1.coeffs[i], self.rescale_params[level - 1][i], qi, self.mred_params[i])
+
+    # DivRoundByLastModulusNTTLvl divides (rounded) the polynomial by its last modulus. The input must be in the NTT domain.
+    # Output poly level must be equal or one less than input level.
+    def div_round_by_last_modulus_ntt_lvl(self, level: int, p0: Poly, buff: Poly, p1: Poly):
+        self.inv_ntt_single_lazy(level, p0.coeffs[level], buff.coeffs[level])
+
+        # Center by (p-1)/2
+        pj = self.modulus[level]
+        p_half = (pj - 1) >> 1
+
+        add_scalar_vec(buff.coeffs[level], buff.coeffs[level], p_half, pj)
+
+        for i in range(level):
+            qi = self.modulus[i]
+            add_scalar_no_mod_vec(buff.coeffs[level], buff.coeffs[i], qi - bred_add(p_half, qi, self.bred_params[i]))
+            self.ntt_single_lazy(i, buff.coeffs[i], buff.coeffs[i])
+            sub_vec_and_mul_scalar_montgomery_two_qi_vec(buff.coeffs[i], p0.coeffs[i], p1.coeffs[i], self.rescale_params[level - 1][i], qi, self.mred_params[i])
+
+
+    # DivRoundByLastModulusManyNTTLvl divides (rounded) sequentially nb_rescales times the polynomial by its last modulus. The input must be in the NTT domain.
+    # Output poly level must be equal or nb_rescales less than input level.
+    def div_round_by_last_modulus_many_ntt_lvl(self, level: int, nb_rescales: int, p0: Poly, buff: Poly, p1: Poly):
+        if nb_rescales == 0:
+            if p0 != p1:
+                p1.buff = copy(p0.buff)
+                p1.update_coeffs()
+        else:
+            if nb_rescales > 1:
+                self.inv_ntt_lvl(level, p0, buff)
+                for i in range(nb_rescales):
+                    self.div_round_by_last_modulus_lvl(level - i, buff, buff)
+                self.ntt_lvl(level - nb_rescales, buff, p1)
+            else:
+                self.div_round_by_last_modulus_ntt_lvl(level, p0, buff, p1)
     
     # poly_to_bigint reconstructs p1 and returns the result in an array of Int.
     # gap defines coefficients X^{i*gap} that will self reconstructed.
