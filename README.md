@@ -209,14 +209,14 @@ Benchmark results are stored in the [results](results) folder.
 
 [Playground, test, and benchmark runs](#running-playground-tests-and-benchmarks) can be executed via docker:
 ```bash
-docker run hsmile/sequre:latest <command>
+docker run --rm hsmile/sequre:manylinux <command>
 ```
 
 where `<command>` can be any of the (local network oriented) [commands above](#running-playground-tests-and-benchmarks).
 
 For example:
 ```bash
-docker run hsmile/sequre:latest scripts/run.sh tests --unit --local
+docker run --rm hsmile/sequre:manylinux scripts/run.sh tests --unit --local
 ```
 will run all the unit tests in the local network environment.
 
