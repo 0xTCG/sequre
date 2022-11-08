@@ -1,7 +1,60 @@
-import ckks, drlwe
+import random, math
+
+import ring, rlwe, ckks, drlwe
 
 from drlwe import PCKSProtocol as DRLWEPCKSProtocol
 from drlwe import CKGProtocol as DRLWECKGProtocol
+from drlwe import CKSProtocol as RLWECKSProtocol
+
+from common import big_int, big_uint
+
+from ..utils.utils import zeros_vec
+from ..types.builtin import Complex
+
+
+# MaskedTransformShare is a struct storing the decryption and recryption shares.
+class MaskedTransformShare:
+    e2s_share: drlwe.CKSShare
+    s2e_share: drlwe.CKSShare
+
+    def __pickle__(self, jar: Jar, pasteurized: bool):
+        pickle(self.e2s_share, jar, pasteurized)
+        if not pasteurized: jar += self.e2s_share.pickle_size()
+        pickle(self.s2e_share, jar, pasteurized)
+    
+    def __unpickle__(jar: Jar, pasteurized: bool) -> MaskedTransformShare:
+        e2s_share = unpickle(jar, pasteurized, drlwe.CKSShare)
+        if not pasteurized: jar += e2s_share.pickle_size()
+        s2e_share = unpickle(jar, pasteurized, drlwe.CKSShare)
+        
+        return MaskedTransformShare(
+            e2s_share=e2s_share,
+            s2e_share=s2e_share)
+    
+    def pickle_size(self) -> int:
+        return self.e2s_share.pickle_size() + self.s2e_share.pickle_size()
+
+
+# RefreshShare is a struct storing a party's share in the Refresh protocol.
+class RefreshShare(MaskedTransformShare):
+    def __init__(self, e2s_share_poly: ring.Poly, s2e_share_poly: ring.Poly):
+        self.e2s_share = drlwe.CKSShare(value=e2s_share_poly)
+        self.s2e_share = drlwe.CKSShare(value=s2e_share_poly)
+    
+    def __init__(self, mts: MaskedTransformShare):
+        self.e2s_share = mts.e2s_share
+        self.s2e_share = mts.s2e_share
+    
+    def __unpickle__(jar: Jar, pasteurized: bool) -> RefreshShare:
+         return RefreshShare(MaskedTransformShare.__unpickle__(jar, pasteurized))
+    
+    def pickle_size(self) -> int:
+        return self.get_mts().pickle_size()
+    
+    def get_mts(self) -> MaskedTransformShare:
+        return MaskedTransformShare(
+            e2s_share=self.e2s_share,
+            s2e_share=self.s2e_share)
 
 
 # PCKSProtocol is the structure storing the parameters for the collective public key-switching.
@@ -23,6 +76,379 @@ class PCKSProtocol(DRLWEPCKSProtocol):
         ct_out.set_scale(ct_in.scale)
 
 
+# CKSProtocol is a structure storing the parameters for the collective key-switching protocol.
+class CKSProtocol(RLWECKSProtocol):
+    def __init__(self, cks_protocol):
+        self.params = cks_protocol.params
+        self.sigma_smudging = cks_protocol.sigma_smudging
+        self.gaussian_sampler = cks_protocol.gaussian_sampler
+        self.basis_extender = cks_protocol.basis_extender
+        self.tmp_qp = cks_protocol.tmp_qp
+        self.tmp_delta = cks_protocol.tmp_delta
+    
+
+# E2SProtocol is the structure storing the parameters and temporary buffers
+# required by the encryption-to-shares protocol.
+class E2SProtocol(CKSProtocol):
+    ckks_params: ckks.Parameters
+    zero: rlwe.SecretKey
+    mask_bigint: list[big_int]
+    buff: ring.Poly
+
+    def __init__(
+            self, cks_protocol: CKSProtocol, params: ckks.Parameters,
+            zero: rlwe.SecretKey, mask_bigint: list[big_int], buff: ring.Poly):
+        self.params = cks_protocol.params
+        self.sigma_smudging = cks_protocol.sigma_smudging
+        self.gaussian_sampler = cks_protocol.gaussian_sampler
+        self.basis_extender = cks_protocol.basis_extender
+        self.tmp_qp = cks_protocol.tmp_qp
+        self.tmp_delta = cks_protocol.tmp_delta
+
+        self.ckks_params=params
+        self.zero=zero
+        self.mask_bigint=mask_bigint
+        self.buff=buff
+    
+    # AllocateShare allocates a share of the E2S protocol
+    def allocate_share(self, level: int) -> drlwe.CKSShare:
+        share = self._allocate_share(level)
+        share.value.is_ntt = True
+        return share
+    
+    # GenShare generates a party's share in the encryption-to-shares protocol. This share consist in the additive secret-share of the party
+    # which is written in secret_share_out and in the public masked-decryption share written in public_share_out.
+    # This protocol requires additional inputs which are :
+    # log_bound : the bit length of the masks
+    # log_slots : the bit length of the number of slots
+    # ct1      : the degree 1 element the ciphertext to share, i.e. ct1 = ckk.Ciphertext.value[1].
+    # The method "GetMinimumlevelForBootstrapping" should be used to get the minimum level at which E2S can be called while still ensure 128-bits of security, as well as the
+    # value for log_bound.
+    def gen_share(self, sk: rlwe.SecretKey, log_bound: int, log_slots: int, ct1: ring.Poly, secret_share_out: rlwe.AdditiveShareBigint, public_share_out: drlwe.CKSShare):
+        ring_q = self.params.ring_q
+        level_q = min(ct1.level(), public_share_out.value.level())
+
+        # Get the upperbound on the norm
+        # Ensures that bound >= 2^{128+logbound}
+        bound = big_uint(1) << log_bound
+        bound_max = ring_q.modulus[0].ext_to_bigint()
+        for i in range(1, level_q + 1):
+            bound_max *= ring_q.modulus[i].ext_to_bigint()
+
+        if bound > bound_max:
+            raise ValueError("cannot GenShare: ciphertext level is not large enough for refresh correctness")
+
+        bound_half = bound >> 1
+
+        dslots = 1 << log_slots
+        if ring_q.type() == ring.StandardRing: dslots *= 2
+
+        # Generate the mask in Z[Y] for Y = X^{N/(2*slots)}
+        for i in range(dslots):
+            self.mask_bigint[i] = big_int(random.getrandbits_intn(log_bound, big_uint))
+            if self.mask_bigint[i] >= big_int(bound_half):
+                self.mask_bigint[i] -= big_int(bound)
+
+            secret_share_out.value[i] = self.mask_bigint[i]
+
+        # Encrypt the mask
+        # Generates an encryption of zero and subtracts the mask
+        self._gen_share(sk, self.zero, ct1, public_share_out)
+
+        ring_q.set_coefficients_bigint_lvl(level_q, secret_share_out.value[:dslots], self.buff)
+
+        # Maps Y^{N/n} -> X^{N} in Montgomery and NTT
+        ckks.ntt_and_montgomery_lvl(level_q, log_slots, ring_q, False, self.buff)
+
+        # Subtracts the mask to the encryption of zero
+        ring_q.sub_lvl(level_q, public_share_out.value, self.buff, public_share_out.value)
+    
+    # GetShare is the final step of the encryption-to-share protocol. It performs the masked decryption of the target ciphertext followed by a
+    # the removal of the caller's secret_share as generated in the GenShare method.
+    # If the caller is not secret-key-share holder (i.e., didn't generate a decryption share), `secret_share` can be set to nil.
+    # Therefore, in order to obtain an additive sharing of the message, only one party should call this method, and the other parties should use
+    # the secret_share_out output of the GenShare method.
+    def get_share(self, secret_share: Optional[rlwe.AdditiveShareBigint], aggregate_public_share: drlwe.CKSShare, log_slots: int, ct: ckks.Ciphertext, secret_share_out: rlwe.AdditiveShareBigint):
+        ring_q = self.params.ring_q
+        level_q = min(ct.level(), aggregate_public_share.value.level())
+
+        # Adds the decryption share on the ciphertext and stores the result in a buff
+        ring_q.add_lvl(level_q, aggregate_public_share.value, ct.value[0], self.buff)
+
+        # Switches the LSSS RNS NTT ciphertext outside of the NTT domain
+        ring_q.inv_ntt_lvl(level_q, self.buff, self.buff)
+
+        dslots = 1 << log_slots
+        if ring_q.type() == ring.StandardRing: dslots *= 2
+
+        gap = ring_q.n // dslots
+
+        # Switches the LSSS RNS ciphertext outside of the RNS domain
+        ring_q.poly_to_bigint_centered_lvl(level_q, self.buff, gap, self.mask_bigint)
+
+        # Subtracts the last mask
+        if secret_share is not None:
+            a = secret_share_out.value
+            b = self.mask_bigint
+            c = secret_share.value
+            for i in range(dslots):
+                a[i] = c[i] + b[i]
+        else:
+            a = secret_share_out.value
+            b = self.mask_bigint
+            for i in range(dslots): a[i] = b[i]
+
+
+# S2EProtocol is the structure storing the parameters and temporary buffers
+# required by the shares-to-encryption protocol.
+class S2EProtocol(CKSProtocol):
+    ckks_params: ckks.Parameters
+    tmp: ring.Poly
+    ss_bigint: list[big_int]
+    zero: rlwe.SecretKey
+
+    def __init__(
+            self, cks_protocol: CKSProtocol, params: ckks.Parameters,
+            tmp: ring.Poly, ss_bigint: list[big_int], zero: rlwe.SecretKey):
+        self.params = cks_protocol.params
+        self.sigma_smudging = cks_protocol.sigma_smudging
+        self.gaussian_sampler = cks_protocol.gaussian_sampler
+        self.basis_extender = cks_protocol.basis_extender
+        self.tmp_qp = cks_protocol.tmp_qp
+        self.tmp_delta = cks_protocol.tmp_delta
+
+        self.ckks_params=params
+        self.zero=zero
+        self.ss_bigint=ss_bigint
+        self.tmp=tmp
+
+    # AllocateShare allocates a share of the S2E protocol
+    def allocate_share(self, level: int) -> drlwe.CKSShare:
+        share = self._allocate_share(level)
+        share.value.is_ntt = True
+        return share
+    
+    # GenShare generates a party's in the shares-to-encryption protocol given the party's secret-key share `sk`, a common
+    # polynomial sampled from the CRS `c1` and the party's secret share of the message.
+    def gen_share(
+            self, sk: rlwe.SecretKey, crs: ring.Poly, log_slots: int,
+            secret_share: rlwe.AdditiveShareBigint, c0_share_out: drlwe.CKSShare):
+        ring_q = self.params.ring_q
+
+        if crs.level() != c0_share_out.value.level():
+            raise ValueError("cannot GenShare: c1 and c0_share_out level must be equal")
+
+        # Generates an encryption share
+        crs.is_ntt = True
+        self._gen_share(self.zero, sk, crs, c0_share_out)
+
+        dslots = 1 << log_slots
+        if ring_q.type() == ring.StandardRing: dslots *= 2
+
+        ring_q.set_coefficients_bigint_lvl(crs.level(), secret_share.value[:dslots], self.tmp)
+
+        # Maps Y^{N/n} -> X^{N} in Montgomery and NTT
+        ckks.ntt_and_montgomery_lvl(crs.level(), log_slots, ring_q, False, self.tmp)
+
+        ring_q.add_lvl(crs.level(), c0_share_out.value, self.tmp, c0_share_out.value)
+
+    # GetEncryption computes the final encryption of the secret-shared message when provided with the aggregation `c0_agg` of the parties'
+    # share in the protocol and with the common, CRS-sampled polynomial `c1`.
+    def get_encryption(self, c0_agg: drlwe.CKSShare, crs: ring.Poly, ct_out: ckks.Ciphertext):
+        if ct_out.degree() != 1:
+            raise ValueError("cannot GetEncryption: ct_out must have degree 1.")
+
+        if c0_agg.value.level() != crs.level():
+            raise ValueError("cannot GetEncryption: c0_agg level must be equal to c1 level")
+
+        if ct_out.level() != crs.level():
+            raise ValueError("cannot GetEncryption: ct_out level must be equal to c1 level")
+
+        ct_out.value[0] = copy(c0_agg.value)
+        ct_out.value[1] = copy(crs)
+
+
+# MaskedTransformFunc represents a user-defined in-place function that can be evaluated on masked CKKS plaintexts, as a part of the
+# Masked Transform Protocol.
+# The function is called with a vector of *ring.Complex modulo ckks.Parameters.Slots() as input, and must write
+# its output on the same buffer.
+# Transform can be the identity.
+# Decode: if true, then the masked CKKS plaintext will be decoded before applying Transform.
+# Recode: if true, then the masked CKKS plaintext will be recoded after applying Transform.
+# i.e. : Decode (true/false) -> Transform -> Recode (true/false).
+class MaskedTransformFunc:
+	decode: bool
+    # TODO: Add func (see original Lattigo implementation)
+	encode: bool
+
+
+# MaskedTransformProtocol is a struct storing the parameters for the MaskedTransformProtocol protocol.
+class MaskedTransformProtocol:
+    e2s: E2SProtocol
+    s2e: S2EProtocol
+
+    sigma_smudging: float
+
+    default_scale: big_int
+    precision: int
+
+    tmp_mask: list[big_int]
+    encoder: ckks.EncoderComplex128  # TODO: Switch to EncoderBigComplex
+
+    # AllocateShare allocates the shares of the PermuteProtocol
+    def _allocate_share(self, level_decrypt: int, level_recrypt: int) -> MaskedTransformShare:
+        return MaskedTransformShare(
+            e2s_share=self.e2s.allocate_share(level_decrypt),
+            s2e_share=self.s2e.allocate_share(level_recrypt))
+    
+    # GenShare generates the shares of the PermuteProtocol
+    # This protocol requires additional inputs which are :
+    # sk_in     : the secret-key if the input ciphertext.
+    # skOut    : the secret-key of the output ciphertext.
+    # log_bound : the bit length of the masks.
+    # log_slots : the bit length of the number of slots.
+    # ct1      : the degree 1 element the ciphertext to refresh, i.e. ct1 = ckk.Ciphetext.value[1].
+    # scale    : the scale of the ciphertext when entering the refresh.
+    # The method "GetMinimumlevelForBootstrapping" should be used to get the minimum level at which the masked transform can be called while still ensure 128-bits of security, as well as the
+    # value for log_bound.
+    def _gen_share(
+            self, sk_in: rlwe.SecretKey, sk_out: rlwe.SecretKey,
+            log_bound: int, log_slots: int, ct1: ring.Poly,
+            scale: float, crs: ring.Poly, transform: Optional[MaskedTransformFunc],
+            share_out: MaskedTransformShare):
+        ring_q = self.s2e.params.ring_q
+
+        if ct1.level() < share_out.e2s_share.value.level():
+            raise ValueError("cannot GenShare: ct[1] level must be at least equal to e2s_share level")
+        if crs.level() != share_out.s2e_share.value.level():
+            raise ValueError("cannot GenShare: crs level must be equal to s2e_share")
+
+        slots = 1 << log_slots
+        dslots = slots
+        if ring_q.type() == ring.StandardRing: dslots *= 2
+
+        # Generates the decryption share
+        # Returns [M_i] on rfp.tmp_mask and [a*s_i -M_i + e] on e2s_share
+        self.e2s.gen_share(sk_in, log_bound, log_slots, ct1, rlwe.AdditiveShareBigint(value=self.tmp_mask), share_out.e2s_share)
+
+        # Applies LT(M_i)
+        if transform is not None:
+            raise NotImplementedError("TODO: Implement LT")
+
+        # Applies LT(M_i) * diffscale
+        input_scale_int = big_int(scale)
+
+        # Scales the mask by the ratio between the two scales
+        for i in range(dslots):
+            self.tmp_mask[i] *= self.default_scale
+            self.tmp_mask[i] = self.tmp_mask[i].bigint_floordiv(input_scale_int)
+
+        # Returns [-a*s_i + LT(M_i) * diffscale + e] on s2e_share
+        self.s2e.gen_share(sk_out, crs, log_slots, rlwe.AdditiveShareBigint(value=self.tmp_mask), share_out.s2e_share)
+
+    # AggregateShares sums share1 and share2 on share_out.
+    def _aggregate_shares(self, share1: MaskedTransformShare, share2: MaskedTransformShare, share_out: MaskedTransformShare):
+        if share1.e2s_share.value.level() != share2.e2s_share.value.level() or share1.e2s_share.value.level() != share_out.e2s_share.value.level():
+            raise ValueError("cannot AggregateShares: all e2s shares must be at the same level")
+
+        if share1.s2e_share.value.level() != share2.s2e_share.value.level() or share1.s2e_share.value.level() != share_out.s2e_share.value.level():
+            raise ValueError("cannot AggregateShares: all s2e shares must be at the same level")
+
+        self.e2s.params.ring_q.add_lvl(share1.e2s_share.value.level(), share1.e2s_share.value, share2.e2s_share.value, share_out.e2s_share.value)
+        self.s2e.params.ring_q.add_lvl(share1.s2e_share.value.level(), share1.s2e_share.value, share2.s2e_share.value, share_out.s2e_share.value)
+    
+    # Transform applies Decrypt, Recode and Recrypt on the input ciphertext.
+    # The ciphertext scale is reset to the default scale.
+    def transform(self, ct: ckks.Ciphertext, log_slots: int, transform: Optional[MaskedTransformFunc], crs: ring.Poly, share: MaskedTransformShare, ct_out: ckks.Ciphertext):
+        if ct.level() < share.e2s_share.value.level():
+            raise ValueError("cannot Transform: input ciphertext level must be at least equal to e2s level")
+
+        max_level = crs.level()
+
+        if max_level != share.s2e_share.value.level():
+            raise ValueError("cannot Transform: crs level and s2e level must be the same")
+
+        ring_q = self.s2e.params.ring_q
+
+        slots = 1 << log_slots
+
+        dslots = slots
+        if ring_q.type() == ring.StandardRing: dslots *= 2
+
+        # Returns -sum(M_i) + x (outside of the NTT domain)
+
+        self.e2s.get_share(None, share.e2s_share, log_slots, ct, rlwe.AdditiveShareBigint(value=self.tmp_mask))
+
+        # Returns LT(-sum(M_i) + x)
+        if transform is not None: raise NotImplementedError()
+
+        # Returns LT(-sum(M_i) + x) * diffscale
+        input_scale_int = big_int(ct.scale)
+
+        # Scales the mask by the ratio between the two scales
+        for i in range(dslots):
+            self.tmp_mask[i] *= self.default_scale
+            self.tmp_mask[i] = self.tmp_mask[i].bigint_floordiv(input_scale_int)
+
+        # Extend the levels of the ciphertext for future allocation
+        if ct_out.value[0].n() != ring_q.n:
+            for i in range(len(ct_out.value)):
+                is_ntt = ct_out.value[i].is_ntt
+                ct_out.value[i] = ring_q.new_poly_lvl(max_level)
+                ct_out.value[i].is_ntt = is_ntt
+        else:
+            ct_out.resize(ct_out.degree(), max_level)
+
+        # Sets LT(-sum(M_i) + x) * diffscale in the RNS domain
+        ring_q.set_coefficients_bigint_lvl(max_level, self.tmp_mask[:dslots], ct_out.value[0])
+
+        ckks.ntt_and_montgomery_lvl(max_level, log_slots, ring_q, False, ct_out.value[0])
+
+        # LT(-sum(M_i) + x) * diffscale + [-a*s + LT(M_i) * diffscale + e] = [-a*s + LT(x) * diffscale + e]
+        ring_q.add_lvl(max_level, ct_out.value[0], share.s2e_share.value, ct_out.value[0])
+
+        # Copies the result on the out ciphertext
+        self.s2e.get_encryption(drlwe.CKSShare(value=ct_out.value[0]), crs, ct_out)
+
+        ct_out.set_scale(self.s2e.ckks_params.default_scale)
+
+
+# RefreshProtocol is a struct storing the relevant parameters for the Refresh protocol.
+class RefreshProtocol(MaskedTransformProtocol):
+    def __init__(self, masked_transform_protocol):
+        self.e2s = masked_transform_protocol.e2s
+        self.s2e = masked_transform_protocol.s2e
+        self.sigma_smudging = masked_transform_protocol.sigma_smudging
+        self.default_scale = masked_transform_protocol.default_scale
+        self.precision = masked_transform_protocol.precision
+        self.tmp_mask = masked_transform_protocol.tmp_mask
+        self.encoder = masked_transform_protocol.encoder
+    
+    # AllocateShare allocates the shares of the PermuteProtocol
+    def allocate_share(self, input_level: int, output_level: int) -> RefreshShare:
+        return RefreshShare(self._allocate_share(input_level, output_level))
+
+    # GenShare generates a share for the Refresh protocol.
+    # This protocol requires additional inputs which are :
+    # log_bound : the bit length of the masks
+    # log_slots : the bit length of the number of slots
+    # ct1      : the degree 1 element the ciphertext to refresh, i.e. ct1 = ckk.Ciphetext.value[1].
+    # scale    : the scale of the ciphertext entering the refresh.
+    # The method "GetMinimumlevelForBootstrapping" should be used to get the minimum level at which the refresh can be called while still ensure 128-bits of security, as well as the
+    # value for log_bound.
+    def gen_share(self, sk: rlwe.SecretKey, log_bound: int, log_slots: int, ct1: ring.Poly, scale: float, crs: ring.Poly, share_out: RefreshShare):
+        self._gen_share(sk, sk, log_bound, log_slots, ct1, scale, crs, None, share_out.get_mts())
+    
+    # AggregateShares aggregates two parties' shares in the Refresh protocol.
+    def aggregate_shares(self, share1: RefreshShare, share2: RefreshShare, share_out: RefreshShare):
+        self._aggregate_shares(share1.get_mts(), share2.get_mts(), share_out.get_mts())
+    
+    # Finalize applies Decrypt, Recode and Recrypt on the input ciphertext.
+    # The ciphertext scale is reset to the default scale.
+    def finalize(self, ct_in: ckks.Ciphertext, log_slots: int, crs: ring.Poly, share: RefreshShare, ct_out: ckks.Ciphertext):
+        self.transform(ct_in, log_slots, None, crs, share.get_mts(), ct_out)
+    
+
 # new_pcks_protocol creates a new PCKSProtocol object and will be used to re-encrypt a Ciphertext ctx encrypted under a secret-shared key mong j parties under a new
 # collective public-key.
 def new_pcks_protocol(params: ckks.Parameters, sigma_smudging: float) -> PCKSProtocol:
@@ -37,3 +463,79 @@ def new_ckg_protocol(params: ckks.Parameters) -> DRLWECKGProtocol:
 # NewRKGProtocol creates a new drlwe.RKGProtocol instance from the CKKS parameters
 def new_rkg_protocol(params: ckks.Parameters) -> drlwe.RKGProtocol:
 	return drlwe.new_rkg_protocol(params.get_rlwe_params())
+
+
+# NewCKSProtocol creates a new CKSProtocol that will be used to perform a collective key-switching on a ciphertext encrypted under a collective public-key, whose
+# secret-shares are distributed among j parties, re-encrypting the ciphertext under another public-key, whose secret-shares are also known to the
+# parties.
+def new_cks_protocol(params: ckks.Parameters, sigma_smudging: float) -> CKSProtocol:
+	return CKSProtocol(drlwe.new_cks_protocol(params.get_rlwe_params(), sigma_smudging))
+
+
+# NewE2SProtocol creates a new E2SProtocol struct from the passed CKKS parameters.
+def new_e2s_protocol(params: ckks.Parameters, sigma_smudging: float) -> E2SProtocol:
+	return E2SProtocol(
+        cks_protocol=new_cks_protocol(params, sigma_smudging),
+        params=params,
+        zero=rlwe.new_secret_key(params.get_rlwe_params()),
+        mask_bigint=zeros_vec(params.n(), big_int),
+        buff=params.ring_q.new_poly())
+
+
+# NewS2EProtocol creates a new S2EProtocol struct from the passed CKKS parameters.
+def new_s2e_protocol(params: ckks.Parameters, sigma_smudging: float) -> S2EProtocol:
+	return S2EProtocol(
+        cks_protocol=new_cks_protocol(params, sigma_smudging),
+        params=params,
+        tmp=params.ring_q.new_poly(),
+        ss_bigint=zeros_vec(params.n(), big_int),
+        zero=rlwe.new_secret_key(params.get_rlwe_params()))
+
+
+# NewMaskedTransformProtocol creates a new instance of the PermuteProtocol.
+# params_in: the ckks.Parameters of the ciphertext before the protocol.
+# params_out: the ckks.Parameters of the ciphertext after the protocol.
+# precision : the log2 of decimal precision of the internal encoder.
+# The method will return an error if the maximum number of slots of the output parameters is smaller than the number of slots of the input ciphertext.
+def new_masked_transform_protocol(params_in: ckks.Parameters, params_out: ckks.Parameters, precision: int, sigma_smudging: float) -> MaskedTransformProtocol:
+    if params_in.slots() > params_out.max_slots():
+        raise ValueError("newMaskedTransformProtocol: params_out.N()/2 < params_in.slots()")
+	
+    return MaskedTransformProtocol(
+        sigma_smudging=sigma_smudging,
+        e2s=new_e2s_protocol(params_in, sigma_smudging),
+        s2e=new_s2e_protocol(params_out, sigma_smudging),
+        precision=precision,
+        default_scale=big_int(params_out.default_scale),  # TODO: Include precision (see original GO implementation)
+        tmp_mask=zeros_vec(params_in.n(), big_int),
+        encoder=ckks.new_encoder_complex(params_in)  # TODO: Include precision (see original GO implementation)
+    )
+
+
+# NewRefreshProtocol creates a new Refresh protocol instance.
+# precision : the log2 of decimal precision of the internal encoder.
+def new_refresh_protocol(params: ckks.Parameters, precision: int, sigma_smudging: float) -> RefreshProtocol:
+	return RefreshProtocol(new_masked_transform_protocol(params, params, precision, sigma_smudging))
+
+
+# GetMinimumLevelForBootstrapping takes the security parameter lambda, the ciphertext scale, the number of parties and the moduli chain
+# and returns the minimum level at which the collective refresh can be called with a security of at least 128-bits.
+# It returns 3 parameters :
+# min_level : the minimum level at which the collective refresh must be called to ensure correctness
+# log_bound : the bit length of the masks to be sampled to mask the plaintext and ensure 128-bits of statistical indistinguishability
+# ok 		: a boolean flag, which is set to false if no such instance exist
+def get_minimum_level_for_bootstrapping(lbd: int, scale: float, n_parties: int, moduli: list[u64]) -> tuple[int, int, bool]:
+    log_bound = lbd + int(math.ceil(math.log2(scale)))
+    max_bound = log_bound + n_parties.bitlen()
+    min_level = -1
+    log_q, i = 0, 0
+    
+    while log_q < max_bound:
+        if i >= len(moduli): return 0, 0, False
+        log_q += int(moduli[i].bitlen())
+        min_level += 1
+        i += 1
+
+    if len(moduli) < min_level: return 0, 0, False
+
+    return min_level, log_bound, True
