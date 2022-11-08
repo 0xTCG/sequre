@@ -22,6 +22,99 @@ class RKGShare:
 	value: list[list[list[ringqp.Poly]]]  # [][][2]
 
 
+# CKSShare is a type for the CKS protocol shares.
+class CKSShare:
+	value: ring.Poly
+
+	def __pickle__(self, jar: Jar, pasteurized: bool):
+		pickle(self.value, jar, pasteurized)
+    
+	def __unpickle__(jar: Jar, pasteurized: bool) -> CKSShare:
+		return CKSShare(value=unpickle(jar, pasteurized, ring.Poly))
+	
+	def pickle_size(self) -> int:
+		return self.value.pickle_size()
+
+
+# CKSProtocol is the structure storing the parameters and and precomputations for the collective key-switching protocol.
+class CKSProtocol:
+	params: rlwe.Parameters
+	sigma_smudging: float
+	gaussian_sampler: ring.GaussianSampler
+	basis_extender: ring.BasisExtender
+	tmp_qp: ringqp.Poly
+	tmp_delta: ring.Poly
+
+	# AllocateShare allocates the shares of the CKSProtocol
+	def _allocate_share(self, level: int) -> CKSShare:
+		return CKSShare(self.params.ring_q.new_poly_lvl(level))
+	
+	# GenShare computes a party's share in the CKS protocol.
+	# ct1 is the degree 1 element of the rlwe.Ciphertext to keyswitch, i.e. ct1 = rlwe.Ciphertext.value[1].
+	# NTT flag for ct1 is expected to be set correctly.
+	def _gen_share(self, sk_input: rlwe.SecretKey, sk_output: rlwe.SecretKey, c1: ring.Poly, share_out: CKSShare):
+		ring_q = self.params.ring_q
+		ring_p = self.params.ring_p
+		ring_qp = self.params.ring_qp()
+
+		level_q = min(share_out.value.level(), c1.level())
+		level_p = self.params.p_count() - 1
+
+		ring_q.sub_lvl(level_q, sk_input.value.q, sk_output.value.q, self.tmp_delta)
+
+		ct1 = c1
+		if not c1.is_ntt:
+			ring_q.ntt_lazy_lvl(level_q, c1, self.tmp_qp.q)
+			ct1 = self.tmp_qp.q
+
+		# a * (skIn - skOut) mod Q
+		ring_q.mul_coeffs_montgomery_constant_lvl(level_q, ct1, self.tmp_delta, share_out.value)
+
+		if ring_p:
+			# P * a * (skIn - skOut) mod QP (mod P = 0)
+			ring_q.mul_scalar_bigint_lvl(level_q, share_out.value, ring_p.modulus_at_level[level_p], share_out.value)
+
+		if not c1.is_ntt:
+			# InvNTT(P * a * (skIn - skOut)) mod QP (mod P = 0)
+			ring_q.inv_ntt_lazy_lvl(level_q, share_out.value, share_out.value)
+
+			# Samples e in Q
+			self.gaussian_sampler.read_lvl(level_q, self.tmp_qp.q)
+
+			if ring_p:
+				# Extend e to P (assumed to have norm < qi)
+				ring_qp.extend_basis_small_norm_and_center(self.tmp_qp.q, level_p, None, self.tmp_qp.p)
+
+			# InvNTT(P * a * (skIn - skOut) + e) mod QP (mod P = e)
+			ring_q.add_lvl(level_q, share_out.value, self.tmp_qp.q, share_out.value)
+
+			if ring_p:
+				# InvNTT(P * a * (skIn - skOut) + e) * (1/P) mod QP (mod P = e)
+				self.basis_extender.mod_down_qp_to_q(level_q, level_p, share_out.value, self.tmp_qp.p, share_out.value)
+
+		else:
+			# Sample e in Q
+			self.gaussian_sampler.read_lvl(level_q, self.tmp_qp.q)
+
+			if ring_p:
+				# Extend e to P (assumed to have norm < qi)
+				ring_qp.extend_basis_small_norm_and_center(self.tmp_qp.q, level_p, None, self.tmp_qp.p)
+
+			# Takes the error to the NTT domain
+			ring_q.inv_ntt_lvl(level_q, share_out.value, share_out.value)
+
+			# P * a * (skIn - skOut) + e mod Q (mod P = 0, so P = e)
+			ring_q.add_lvl(level_q, share_out.value, self.tmp_qp.q, share_out.value)
+
+			if ring_p:
+				# (P * a * (skIn - skOut) + e) * (1/P) mod QP (mod P = e)
+				self.basis_extender.mod_down_qp_to_q(level_q, level_p, share_out.value, self.tmp_qp.p, share_out.value)
+
+			ring_q.ntt_lvl(level_q, share_out.value, share_out.value)
+
+		share_out.value.resize(level_q)
+
+
 # PCKSProtocol is the structure storing the parameters for the collective public key-switching.
 class PCKSProtocol:
 	params: rlwe.Parameters
@@ -372,3 +465,20 @@ def new_rkg_protocol(params: rlwe.Parameters) -> RKGProtocol:
 		ternary_sampler_q=ring.new_ternary_sampler_with_hamming_weight(prng, params.ring_q, params.hamming_weight(), False),
 		tmp_poly_1=params.ring_qp().new_poly(),
 		tmp_poly_2=params.ring_qp().new_poly())
+
+
+# NewCKSProtocol creates a new CKSProtocol that will be used to perform a collective key-switching on a ciphertext encrypted under a collective public-key, whose
+# secret-shares are distributed among j parties, re-encrypting the ciphertext under another public-key, whose secret-shares are also known to the
+# parties.
+def new_cks_protocol(params: rlwe.Parameters, sigma_smudging: float) -> CKSProtocol:
+	cks_protocol = CKSProtocol(
+		params=params,
+		sigma_smudging=sigma_smudging,
+		gaussian_sampler=ring.new_gaussian_sampler(utils.new_prng(), params.ring_q, sigma_smudging, int(6 * sigma_smudging)),
+		tmp_qp=params.ring_qp().new_poly(),
+		tmp_delta=params.ring_q.new_poly())
+
+	if params.ring_p:
+		cks_protocol.basis_extender = ring.new_basis_extender(params.ring_q, params.ring_p)
+
+	return cks_protocol
