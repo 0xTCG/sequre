@@ -4,7 +4,7 @@ RUN yum -y update
 # This line might  be needed; we used nvidia centos that lacked these, but manylinux has them methinks
 # RUN yum -y install centos-release-scl-rh epel-release
 RUN yum -y install \
-    ninja-build libuuid-devel openssl openssl-devel \
+    ninja-build libuuid-devel openssl openssl-devel vim \
     libsodium-devel cmake3 zlib-devel git patch perl-Data-Dumper
 
 # Setup work environment
