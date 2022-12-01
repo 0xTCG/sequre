@@ -4,7 +4,9 @@ import logger
 from ..lattiseq.rlwe import \
     SecretKey, \
     PublicKey, \
-    RelinearizationKey
+    RelinearizationKey, \
+    RotationKeySet, \
+    new_rotation_key_set
 from ..lattiseq.ckks import \
     Parameters, \
     Ciphertext, \
@@ -34,7 +36,7 @@ from ..lattiseq.drlwe import \
     RKGShare
 from ..lattiseq.ring import new_poly, Poly as RingPoly
 from ..lattiseq.utils import new_prng
-from ..types.mhe import CryptoParams
+from ..types.mhe import CryptoParams, RotationType, generate_rot_keys
 from ..types.builtin import Complex
 
 from prg import MPCPRG
@@ -214,6 +216,45 @@ class MPCHE[TP]:
             prot.gen_relinearization_key(out_round_1, outRound2, evk)
         
         return evk
+    
+    def collective_rot_key_gen(self, parameters: Parameters, sk_shard: SecretKey,
+            crp_gen: UniformSampler, rot_types: list[RotationType]) -> RotationKeySet:
+        slots = parameters.slots()
+        sk = sk_shard
+
+        shifts = list[int](len(rot_types))
+        for rot_type in rot_types:
+            shift = 0
+            if rot_type.is_right(): shift = slots - rot_type.value
+            else: shift = rot_type.value
+
+            shifts.append(shift)
+
+        g_elems = list[u64](len(shifts))
+
+        for k in shifts:
+            g_elems.append(parameters.galois_element_for_column_rotation_by(k))
+
+        # Need to sortInt otherwise different parties might have different ordering
+        g_elems.sort()
+
+        rot_keys = new_rotation_key_set(parameters.get_rlwe_params(), g_elems)
+
+        # for gal_el in g_elems:
+        #     rtg_protocol = new_rotkg_protocol(parameters)
+        #     rtg_share = rtg_protocol.allocate_shares()
+
+        #     rtg_crp = list[Poly](parameters.beta())
+        #     for i in range(parameters.beta()):
+        #         rtg_crp.append(crp_gen.read_new())
+
+        #     rtg_protocol.gen_share(sk, gal_el, rtg_crp, rtg_share)
+
+        #     rtg_agg = self.aggregate_rot_key_share(rtg_share)
+
+        #     rtg_protocol.gen_rotation_key(rtg_agg, rtg_crp, rot_keys.keys[gal_el])
+
+        return rot_keys
 
     def collective_init(self, params: Parameters, prec: u64):
         print(f"CP{self.pid}:\tMHE collective initialization ...")
@@ -225,7 +266,6 @@ class MPCHE[TP]:
         if self.pid == 0: sk_shard.value = ring_qp.new_poly()
         else: sk_shard = kgen.gen_secret_key()
 
-        # TODO: DEBUG Globally shared key
         p = ring_qp.new_poly()
         self.crp_gen.read(p)
         logger.log(f"CP{self.pid}: Crp gen check", p.q.coeffs[0][0], p.q.coeffs[1][1], p.q.coeffs[2][2])
@@ -233,7 +273,6 @@ class MPCHE[TP]:
         print(f"CP{self.pid}:\tMHE generating public key ...")
         pk = self.collective_pub_key_gen(params, sk_shard, self.crp_gen)
 
-        # TODO: DEBUG
         logger.log(f"CP{self.pid}: PubKey check", pk.value[0].q.coeffs[0][0], pk.value[0].q.coeffs[1][1], pk.value[0].q.coeffs[2][2])
         logger.log(f"CP{self.pid}: PubKey check", pk.value[1].q.coeffs[0][0], pk.value[1].q.coeffs[1][1], pk.value[1].q.coeffs[2][2])
 
@@ -242,16 +281,12 @@ class MPCHE[TP]:
         
         d = rlk.keys[0].value[0][0].value
         logger.log(f"CP{self.pid}: RelinKeyGen check", d[0].q.buff[0], d[1].q.buff[1])
+        
+        print("MHE generating rotation keys ... ")
+        rtks = self.collective_rot_key_gen(params, sk_shard, self.crp_gen, generate_rot_keys(params.slots(), 20, True))
 
-        self.crypto_params.initialize(sk_shard, sk_shard, pk, rlk, prec)
-
-        # TODO Setup rotation keys
-        # print("MHE generating rotation keys ... ")
-        # if self.pid > 0:
-        #     rotks = self.collective_rot_key_gen(params, sk_shard, self.crp_gen, libspindle.GenerateRotKeys(cps.GetSlots(), 20, True))
-        #     self.crypto_params.RotKs = rotks
-        #     self.crypto_params.SetEvaluators(cps.Params, rlk, cps.RotKs)
-
+        print("Initializing MHE ... ")
+        self.crypto_params.initialize(sk_shard, sk_shard, pk, rlk, rtks, prec)
         print(f"CP{self.pid}:\tMHE setup complete.")
     
     def precision_stats(self, result: list, expected: list) -> PrecisionStats:
@@ -324,7 +359,6 @@ class MPCHE[TP]:
                     out.value.append(self.comms.receive_as_jar(self.comms.hub_pid, type(poly[i])))
 
         return out
-
 
     def collective_decrypt(self, cps: CryptoParams, ct: Ciphertext, source_pid: int) -> Plaintext:
         tmp = ct
