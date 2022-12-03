@@ -155,6 +155,14 @@ class Parameters:
     def galois_element_for_column_rotation_by(self, k: int) -> u64:
         return ring.mod_exp_u64(GALOIS_GEN, u64(k & int(self.ring_q.nth_root - 1)), self.ring_q.nth_root)
     
+    # GaloisElementForRowRotation returns the Galois element for generating the row
+    # rotation automorphism
+    def galois_element_for_row_rotation(self) -> u64:
+        if self.ring_type == ring.ConjugateInvariantRing:
+            raise ValueError("Cannot generate GaloisElementForRowRotation if ringType is ConjugateInvariant")
+
+        return self.ring_q.nth_root - 1
+    
     # InverseGaloisElement takes a Galois element and returns the Galois element
     # corresponding to the inverse automorphism
     def inverse_galois_element(self, gal_el: u64) -> u64:
@@ -824,6 +832,56 @@ def new_relin_key(params: Parameters, max_relin_degree: int) -> RelinearizationK
     return evakey
 
 
+# RotationKeySet is a type for storing generic RLWE public rotation keys. It stores a map indexed by the
+# galois element defining the automorphism.
+class RotationKeySet:
+    keys: dict[u64, SwitchingKey]
+
+    def __bool__(self):
+        return bool(len(self.keys))
+    
+    # GetRotationKey return the rotation key for the given galois element or None if such key is not in the set. The
+    # second argument is True iff the first one is non-None.
+    def get_rotation_key(self, galois_el: u64) -> Tuple[SwitchingKey, bool]:
+        if galois_el not in self.keys:
+            return SwitchingKey(), False
+
+        return self.keys[galois_el], True
+    
+    # Equals checks to RotationKeySets for equality.
+    def equals(self, other: RotationKeySet) -> bool:
+        if self == other: return True
+        if not self or not other: return False
+        if len(self.keys) != len(other.keys): return False
+
+        for gal_el, other_key in other.keys.items():
+            if not gal_el in self.keys: return False
+            
+            key = self.keys[gal_el]
+            if not other_key.gadget_ciphertext().equals(key.gadget_ciphertext):
+                return False
+
+        return True
+    
+    # Includes checks whether the receiver RotationKeySet includes the given other RotationKeySet.
+    def includes(self, other: RotationKeySet) -> bool:
+        if not self or not other: return False
+
+        for gal_el in other.keys.keys():
+            if not gal_el in self.keys: return False
+
+        return True
+
+
+# NewRotationKeySet returns a new RotationKeySet with pre-allocated switching keys for each distinct galoisElement value.
+def new_rotation_key_set(params: Parameters, galois_element: list[u64]) -> RotationKeySet:
+	keys = {
+        gal_el: new_switching_key(params, params.q_count() - 1, params.p_count() - 1)
+        for gal_el in galois_element}
+
+	return RotationKeySet(keys=keys)
+
+
 # KeyGenerator is a structure that stores the elements required to create new keys,
 # as well as a memory buffer for intermediate values.
 class KeyGenerator(SkEncryptor):
@@ -896,6 +954,40 @@ class KeyGenerator(SkEncryptor):
         add_poly_times_gadget_vector_to_gadget_ciphertext(
             skIn, [swk.gadget_ciphertext()],
             self.params.ring_qp(), self.params.pow2_base, self.buff_q[0])
+    
+    # GenRotationKeysForRotations generates a RotationKeySet supporting left rotations by k positions for all k in ks.
+    # Negative k is equivalent to a right rotation by k positions
+    # If include_conjugate is true, the resulting set contains the conjugation key.
+    def gen_rotation_keys_for_rotations(self, ks: list[int], include_conjugate: bool, sk: SecretKey) -> RotationKeySet:
+        gal_els = list[u64](len(ks))
+        for k in ks:
+            gal_els.append(self.params.galois_element_for_column_rotation_by(k))
+
+        if include_conjugate:
+            gal_els.append(self.params.galois_element_for_row_rotation())
+
+        return self.gen_rotation_keys(gal_els, sk)
+
+    # GenRotationKeys generates a RotationKeySet from a list of galois element corresponding to the desired rotations
+    # See also GenRotationKeysForRotations.
+    def gen_rotation_keys(self, gal_els: list[u64], sk: SecretKey) -> RotationKeySet:
+        rks = new_rotation_key_set(self.params, gal_els)
+
+        for gal_el in gal_els:
+            self.gen_rot_key(sk.value, self.params.inverse_galois_element(gal_el), rks.keys[gal_el])
+
+        return rks
+
+    def gen_rot_key(self, sk: ringqp.Poly, gal_el: u64, swk: SwitchingKey):
+        sk_in = sk
+        sk_out = self.buff_qp
+        ring_q = self.params.ring_q
+
+        index = ring_q.permute_ntt_index(gal_el)
+        ring_q.permute_ntt_with_index_lvl(self.params.q_count() - 1, sk_in.q, index, sk_out.q)
+        ring_q.permute_ntt_with_index_lvl(self.params.p_count() - 1, sk_in.p, index, sk_out.p)
+
+        self.gen_switching_key(sk_in.q, sk_out, swk)
 
 
 # NewSecretKey generates a new SecretKey with zero values.
@@ -1170,56 +1262,6 @@ class EvaluatorBuffers:
 
 class EvaluatorBase:
     params: Parameters
-
-
-# RotationKeySet is a type for storing generic RLWE public rotation keys. It stores a map indexed by the
-# galois element defining the automorphism.
-class RotationKeySet:
-    keys: dict[u64, SwitchingKey]
-
-    def __bool__(self):
-        return bool(len(self.keys))
-    
-    # GetRotationKey return the rotation key for the given galois element or None if such key is not in the set. The
-    # second argument is True iff the first one is non-None.
-    def get_rotation_key(self, galois_el: u64) -> Tuple[SwitchingKey, bool]:
-        if galois_el not in self.keys:
-            return SwitchingKey(), False
-
-        return self.keys[galois_el], True
-    
-    # Equals checks to RotationKeySets for equality.
-    def equals(self, other: RotationKeySet) -> bool:
-        if self == other: return True
-        if not self or not other: return False
-        if len(self.keys) != len(other.keys): return False
-
-        for gal_el, other_key in other.keys.items():
-            if not gal_el in self.keys: return False
-            
-            key = self.keys[gal_el]
-            if not other_key.gadget_ciphertext().equals(key.gadget_ciphertext):
-                return False
-
-        return True
-    
-    # Includes checks whether the receiver RotationKeySet includes the given other RotationKeySet.
-    def includes(self, other: RotationKeySet) -> bool:
-        if not self or not other: return False
-
-        for gal_el in other.keys.keys():
-            if not gal_el in self.keys: return False
-
-        return True
-
-
-# NewRotationKeySet returns a new RotationKeySet with pre-allocated switching keys for each distinct galoisElement value.
-def new_rotation_key_set(params: Parameters, galois_element: list[u64]) -> RotationKeySet:
-	keys = {
-        gal_el: new_switching_key(params, params.q_count() - 1, params.p_count() - 1)
-        for gal_el in galois_element}
-
-	return RotationKeySet(keys=keys)
 
 
 # Evaluator is a struct that holds the necessary elements to execute general homomorphic
