@@ -21,6 +21,7 @@ from ..lattiseq.ckks import \
 from ..lattiseq.ringqp import \
     UniformSampler, \
     Poly, \
+    Ring, \
     new_uniform_sampler
 from ..lattiseq.dckks import \
     RefreshShare, \
@@ -29,11 +30,13 @@ from ..lattiseq.dckks import \
     new_ckg_protocol, \
     new_rkg_protocol, \
     new_refresh_protocol, \
-    get_minimum_level_for_bootstrapping
+    get_minimum_level_for_bootstrapping, \
+    new_rot_kg_protocol
 from ..lattiseq.drlwe import \
     PCKSShare, \
     CKGShare, \
-    RKGShare
+    RKGShare, \
+    RTGShare
 from ..lattiseq.ring import new_poly, Poly as RingPoly
 from ..lattiseq.utils import new_prng
 from ..types.mhe import CryptoParams, RotationType, generate_rot_keys
@@ -51,9 +54,9 @@ class MPCHE[TP]:
     crp_gen: UniformSampler
     crypto_params: CryptoParams
     
-    def __init__(self, pid: int, prg: MPCPRG, comms: MPCComms[TP]):
-        self.pid = pid
-        self.prg = prg
+    def __init__(self, comms: MPCComms[TP]):
+        self.pid = comms.pid
+        self.prg = comms.prg
         self.comms = comms
 
     def set_params(self, params: Parameters):
@@ -195,15 +198,7 @@ class MPCHE[TP]:
         assert len(share_1.value) == len(share_2.value)
         assert len(share_1.value[0]) == len(share_2.value[0])
 
-        crp = list[list[Poly]](rns_decomp)
-        for _ in range(rns_decomp):
-            row = list[Poly](bit_decomp)
-            for _ in range(bit_decomp):
-                p = ring_qp.new_poly()
-                crp_gen.read(p)
-                row.append(p)
-            crp.append(row)
-
+        crp = self._gen_crp_matrix(ring_qp, crp_gen, rns_decomp, bit_decomp)
         evk = new_relinearization_key(params)
 
         if self.pid > 0:
@@ -211,11 +206,32 @@ class MPCHE[TP]:
             out_round_1 = self.aggregate_relin_key_share(share_1, True)
 
             prot.gen_share_round_two(eph_sk, sk, out_round_1, share_2)
-            outRound2 = self.aggregate_relin_key_share(share_2, True)
+            out_round_2 = self.aggregate_relin_key_share(share_2, True)
 
-            prot.gen_relinearization_key(out_round_1, outRound2, evk)
+            prot.gen_relinearization_key(out_round_1, out_round_2, evk)
         
         return evk
+    
+    def aggregate_rot_key_share(self, share: RTGShare) -> RTGShare:
+        rns_decomp, bit_decomp = share.value.shape()
+        in_share_value = list[list[list[Poly]]](rns_decomp)
+        for i in range(rns_decomp):
+            in_share_value_row = list[list[Poly]](bit_decomp)
+            for j in range(bit_decomp):
+                in_share_value_row.append([share.value[i][j]])
+            in_share_value.append(in_share_value_row)
+        
+        in_share = RKGShare(in_share_value)
+        out = self.aggregate_relin_key_share(in_share, False).value
+
+        share_out_value = list[list[Poly]](rns_decomp)
+        for i in range(rns_decomp):
+            share_out_row = list[Poly](bit_decomp)
+            for j in range(bit_decomp):
+                share_out_row.append(out[i][j][0])
+            share_out_value.append(share_out_row)
+
+        return RTGShare(share_out_value)
     
     def collective_rot_key_gen(self, parameters: Parameters, sk_shard: SecretKey,
             crp_gen: UniformSampler, rot_types: list[RotationType]) -> RotationKeySet:
@@ -240,19 +256,20 @@ class MPCHE[TP]:
 
         rot_keys = new_rotation_key_set(parameters.get_rlwe_params(), g_elems)
 
-        # for gal_el in g_elems:
-        #     rtg_protocol = new_rotkg_protocol(parameters)
-        #     rtg_share = rtg_protocol.allocate_shares()
+        if self.pid == 0: return rot_keys
 
-        #     rtg_crp = list[Poly](parameters.beta())
-        #     for i in range(parameters.beta()):
-        #         rtg_crp.append(crp_gen.read_new())
+        ring_qp = parameters.ring_qp()
+        for gal_el in g_elems:
+            
+            rtg_protocol = new_rot_kg_protocol(parameters)
+            rtg_share = rtg_protocol.allocate_share()
 
-        #     rtg_protocol.gen_share(sk, gal_el, rtg_crp, rtg_share)
+            crp = self._gen_crp_matrix(
+                ring_qp, crp_gen, len(rtg_share.value), len(rtg_share.value[0]))
 
-        #     rtg_agg = self.aggregate_rot_key_share(rtg_share)
-
-        #     rtg_protocol.gen_rotation_key(rtg_agg, rtg_crp, rot_keys.keys[gal_el])
+            rtg_protocol.gen_share(sk, gal_el, crp, rtg_share)
+            rtg_agg = self.aggregate_rot_key_share(rtg_share)
+            rtg_protocol.gen_rotation_key(rtg_agg, crp, rot_keys.keys[gal_el])
 
         return rot_keys
 
@@ -273,8 +290,16 @@ class MPCHE[TP]:
         print(f"CP{self.pid}:\tMHE generating public key ...")
         pk = self.collective_pub_key_gen(params, sk_shard, self.crp_gen)
 
-        logger.log(f"CP{self.pid}: PubKey check", pk.value[0].q.coeffs[0][0], pk.value[0].q.coeffs[1][1], pk.value[0].q.coeffs[2][2])
-        logger.log(f"CP{self.pid}: PubKey check", pk.value[1].q.coeffs[0][0], pk.value[1].q.coeffs[1][1], pk.value[1].q.coeffs[2][2])
+        logger.log(
+            f"CP{self.pid}: PubKey check",
+            pk.value[0].q.coeffs[0][0],
+            pk.value[0].q.coeffs[1][1],
+            pk.value[0].q.coeffs[2][2])
+        logger.log(
+            f"CP{self.pid}: PubKey check",
+            pk.value[1].q.coeffs[0][0],
+            pk.value[1].q.coeffs[1][1],
+            pk.value[1].q.coeffs[2][2])
 
         print(f"CP{self.pid}:\tMHE generating relinearization key ...")
         rlk = self.collective_relin_key_gen(params, sk_shard, self.crp_gen)
@@ -283,7 +308,9 @@ class MPCHE[TP]:
         logger.log(f"CP{self.pid}: RelinKeyGen check", d[0].q.buff[0], d[1].q.buff[1])
         
         print("MHE generating rotation keys ... ")
-        rtks = self.collective_rot_key_gen(params, sk_shard, self.crp_gen, generate_rot_keys(params.slots(), 20, True))
+        rtks = self.collective_rot_key_gen(
+            params, sk_shard, self.crp_gen,
+            generate_rot_keys(params.slots(), 20, True))
 
         print("Initializing MHE ... ")
         self.crypto_params.initialize(sk_shard, sk_shard, pk, rlk, rtks, prec)
@@ -407,6 +434,12 @@ class MPCHE[TP]:
 
         return res
     
+    def rotate(self, x: list[Ciphertext], k: int) -> list[Ciphertext]:
+        res = list[Ciphertext](len(x))
+        for i in range(len(x)): res.append(self.crypto_params.evaluator.rotate_new(x[i], k))
+
+        return res
+    
     def drop_level(self, a: list[list[Ciphertext]], out_level: int) -> list[list[Ciphertext]]:
         out = list[list[Ciphertext]](len(a))
         for i in range(len(a)):
@@ -509,3 +542,18 @@ class MPCHE[TP]:
             data_decoded.extend([(c.r if isinstance(DTP, float) else c) for c in val])
 
         return data_decoded
+    
+    def _gen_crp_matrix(
+            self, ring_qp: Ring, crp_gen: UniformSampler,
+            rows: int, cols: int) -> list[list[Poly]]:
+        crp = list[list[Poly]](rows)
+        
+        for _ in range(rows):
+            row = list[Poly](cols)
+            for _ in range(cols):
+                p = ring_qp.new_poly()
+                crp_gen.read(p)
+                row.append(p)
+            crp.append(row)
+        
+        return crp
