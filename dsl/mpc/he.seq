@@ -6,6 +6,7 @@ from ..lattiseq.rlwe import \
     PublicKey, \
     RelinearizationKey, \
     RotationKeySet, \
+    AdditiveShareBigint, \
     new_rotation_key_set
 from ..lattiseq.ckks import \
     Parameters, \
@@ -31,12 +32,16 @@ from ..lattiseq.dckks import \
     new_rkg_protocol, \
     new_refresh_protocol, \
     get_minimum_level_for_bootstrapping, \
-    new_rot_kg_protocol
+    new_rot_kg_protocol, \
+    new_e2s_protocol, \
+    new_s2e_protocol, \
+    new_additive_share_bigint
 from ..lattiseq.drlwe import \
     PCKSShare, \
     CKGShare, \
     RKGShare, \
-    RTGShare
+    RTGShare, \
+    CKSShare
 from ..lattiseq.ring import new_poly, Poly as RingPoly
 from ..lattiseq.utils import new_prng
 from ..types.mhe import CryptoParams, RotationType, generate_rot_keys
@@ -499,11 +504,11 @@ class MPCHE[TP]:
         return share_out
 
     def collective_bootstrap(self, ct: Ciphertext, source_pid: int):
-        # source_pid broadcasts ct to other parties for collective decryption
+        # if source_pid == 0, assume cm is already shared across parties
         if self.pid == 0:
             return
 
-        # if source_pid <= 0, assume cm is already shared across parties
+        # source_pid broadcasts ct to other parties for collective decryption
         if source_pid > 0:
             if self.pid == source_pid:
                 for p in range(1, self.comms.number_of_parties):
@@ -533,6 +538,82 @@ class MPCHE[TP]:
         
         ref_agg = self.aggregate_refresh_share(ref_protocol, ref_share)
         ref_protocol.finalize(ct, parameters.log_slots, crp, ref_agg, ct)
+    
+    def cipher_to_additive_share(self, ct: Ciphertext, source_pid: int) -> AdditiveShareBigint:
+        parameters = self.crypto_params.params
+        
+        # if source_pid == 0, assume cm is already shared across parties
+        if self.pid == 0:
+            return new_additive_share_bigint(parameters, parameters.log_slots)
+
+        # source_pid broadcasts ct to other parties for collective decryption
+        if source_pid > 0:
+            if self.pid == source_pid:
+                for p in range(1, self.comms.number_of_parties):
+                    if p != source_pid: self.comms.send_as_jar(ct, p)
+            else: ct = self.comms.receive_as_jar(source_pid, Ciphertext)
+
+        level_start = ct.level()
+
+        min_level, log_bound, ok = get_minimum_level_for_bootstrapping(
+            128, parameters.default_scale, self.comms.number_of_parties - 1, parameters.q())
+
+        assert ok and min_level <= level_start and min_level < parameters.max_level(), "E2S: Not enough levels to ensure correctness and 128 security."
+        self.crypto_params.evaluator.drop_level(ct, ct.level() - min_level - 1)
+
+        e2s_protocol = new_e2s_protocol(parameters, 3.2)
+        public_e2s_share = e2s_protocol.allocate_share(level_start)
+        secret_share = new_additive_share_bigint(parameters, parameters.log_slots)
+        
+        e2s_protocol.gen_share(
+            self.crypto_params.sk,
+            log_bound,
+            parameters.log_slots,
+            ct.value[1],
+            secret_share,
+            public_e2s_share)
+        
+        if self.pid == source_pid:
+            for p in range(1, self.comms.number_of_parties):
+                if p != source_pid:
+                    e2s_protocol._aggregate_shares(public_e2s_share, self.comms.receive_as_jar(p, CKSShare), public_e2s_share)
+
+            # sum(-M_i) + x
+            e2s_protocol.get_share(secret_share, public_e2s_share, parameters.log_slots, ct, secret_share)
+        else: self.comms.send_as_jar(public_e2s_share, source_pid)
+        
+        return secret_share
+    
+    def additive_share_to_cipher(self, secret_share: AdditiveShareBigint, source_pid: int) -> Ciphertext:
+        parameters = self.crypto_params.params
+        cipher_level = parameters.max_level()
+
+        min_level, _, ok = get_minimum_level_for_bootstrapping(
+            128, parameters.default_scale, self.comms.number_of_parties - 1, parameters.q())
+
+        assert ok and min_level <= cipher_level and min_level < parameters.max_level(), "S2E: Not enough levels to ensure correctness and 128 security."
+
+        crp = self.crp_gen.read_new(parameters).q
+        s2e_protocol = new_s2e_protocol(parameters, 3.2)
+        public_s2e_share = s2e_protocol.allocate_share(cipher_level)
+
+        s2e_protocol.gen_share(
+            self.crypto_params.sk,
+            crp,
+            parameters.log_slots,
+            secret_share,
+            public_s2e_share)
+        
+        if self.pid == source_pid:
+            for p in range(1, self.comms.number_of_parties):
+                if p != source_pid:
+                    s2e_protocol._aggregate_shares(public_s2e_share, self.comms.receive_as_jar(p, CKSShare), public_s2e_share)
+        else: self.comms.send_as_jar(public_s2e_share, source_pid)
+
+        ct_rec = new_ciphertext(parameters, 1, cipher_level, parameters.default_scale)
+        if self.pid == source_pid: s2e_protocol.get_encryption(public_s2e_share, crp, ct_rec)
+
+        return ct_rec
 
     def decode_vector[DTP=Complex](self, cps: CryptoParams, fenc: list[Plaintext]) -> list[DTP]:
         data_decoded = []
