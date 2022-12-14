@@ -219,7 +219,3 @@ For example:
 docker run --rm hsmile/sequre:manylinux scripts/run.sh tests --unit --local
 ```
 will run all the unit tests in the local network environment.
-
-## License
-
-Sequre is published under the [academic public license](LICENSE.md).
