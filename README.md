@@ -11,7 +11,7 @@ Sequre is an end-to-end, statically compiled and performance engineered, Pythoni
 Sequre can **only** be built from source at the moment.
 To install Sequre, first clone the repository:
 ```bash
-git clone --depth 1 ==branch v0.0.1-alpha git@github.com:0xTCG/sequre.git && cd sequre
+git clone --depth 1 --branch v0.0.1-alpha git@github.com:0xTCG/sequre.git && cd sequre
 ```
 And then run the install script:
 ```bash
