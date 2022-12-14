@@ -3,7 +3,7 @@ export CXX=clang++
 
 git clone https://github.com/HarisSmajlovic/seq.git
 cd seq
-git checkout sequre-seq-v0.10
+git checkout feature/sequre
 ./scripts/deps.sh 4
 cd ..
 
