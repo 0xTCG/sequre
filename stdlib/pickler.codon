@@ -1,0 +1,309 @@
+from internal.file import _gz_errcheck
+from bio.seq import seq
+from internal.gc import sizeof, atomic
+
+from C import memcpy(Jar, cobj, int)
+
+def pickle[T](x: T, jar: Jar, pasteurized: bool = True):
+    x.__pickle__(jar, pasteurized)
+
+def unpickle[T](jar: Jar, pasteurized: bool = True):
+    return T.__unpickle__(jar, pasteurized)
+
+def dump[T](x: T, f):
+    x.__pickle__(f.fp, True)
+
+def load[T](f) -> T:
+    return T.__unpickle__(f.fp, True)
+
+def _write_raw(jar: Jar, p: cobj, n: int, pasteurized: bool = True):
+    if not pasteurized:
+        memcpy(jar, p, n)
+        return
+
+    LIMIT = 0x7fffffff
+    while n > 0:
+        b = n if n < LIMIT else LIMIT
+        status = int(_C.gzwrite(jar, p, u32(b)))
+        if status != b:
+            _gz_errcheck(jar)
+            raise IOError("pickle error: gzwrite returned " + str(status))
+        p += b
+        n -= b
+
+def _read_raw(jar: Jar, p: cobj, n: int, pasteurized: bool = True):
+    if not pasteurized:
+        memcpy(p, jar, n)
+        return
+    
+    LIMIT = 0x7fffffff
+    while n > 0:
+        b = n if n < LIMIT else LIMIT
+        status = int(_C.gzread(jar, p, u32(b)))
+        if status != b:
+            _gz_errcheck(jar)
+            raise IOError("pickle error: gzread returned " + str(status))
+        p += b
+        n -= b
+
+def _write[T](jar: Jar, x: T, pasteurized: bool = True):
+    y = __ptr__(x)
+    _write_raw(jar, y.as_byte(), sizeof(T), pasteurized)
+
+def _read[T](jar: Jar, pasteurized: bool = True):
+    x = T()
+    y = __ptr__(x)
+    _read_raw(jar, y.as_byte(), sizeof(T), pasteurized)
+    return x
+
+# Extend core types to allow pickling
+
+@extend
+class Int:
+    def __pickle__(self, jar: Jar, pasteurized: bool = True):
+        _write(jar, self, pasteurized)
+
+    def __unpickle__(jar: Jar, pasteurized: bool = True) -> Int[N]:
+        return _read(jar, pasteurized, Int[N])
+
+@extend
+class UInt:
+    def __pickle__(self, jar: Jar, pasteurized: bool = True):
+        _write(jar, self, pasteurized)
+
+    def __unpickle__(jar: Jar, pasteurized: bool = True) -> UInt[N]:
+        return _read(jar, pasteurized, UInt[N])
+
+@extend
+class int:
+    def __pickle__(self, jar: Jar, pasteurized: bool = True):
+        _write(jar, self, pasteurized)
+
+    def __unpickle__(jar: Jar, pasteurized: bool = True):
+        return _read(jar, pasteurized, int)
+
+@extend
+class float:
+    def __pickle__(self, jar: Jar, pasteurized: bool = True):
+        _write(jar, self, pasteurized)
+
+    def __unpickle__(jar: Jar, pasteurized: bool = True):
+        return _read(jar, pasteurized, float)
+
+@extend
+class bool:
+    def __pickle__(self, jar: Jar, pasteurized: bool = True):
+        _write(jar, self, pasteurized)
+
+    def __unpickle__(jar: Jar, pasteurized: bool = True):
+        return _read(jar, pasteurized, bool)
+
+@extend
+class byte:
+    def __pickle__(self, jar: Jar, pasteurized: bool = True):
+        _write(jar, self, pasteurized)
+
+    def __unpickle__(jar: Jar, pasteurized: bool = True):
+        return _read(jar, pasteurized, byte)
+
+@extend
+class str:
+    def __pickle__(self, jar: Jar, pasteurized: bool = True):
+        _write(jar, self.len, pasteurized)
+        if not pasteurized: jar += sizeof(int)
+        _write_raw(jar, self.ptr, self.len, pasteurized)
+
+    def __unpickle__(jar: Jar, pasteurized: bool = True):
+        n = _read(jar, pasteurized, int)
+        if not pasteurized: jar += sizeof(int)
+        p = Ptr[byte](n)
+        _read_raw(jar, p, n, pasteurized)
+        return str(p, n)
+
+@extend
+class seq:
+    def __pickle__(self, jar: Jar, pasteurized: bool = True):
+        _write(jar, self.len, pasteurized)
+        if not pasteurized: jar += sizeof(int)
+        _write_raw(jar, self.ptr, abs(self.len), pasteurized)
+
+    def __unpickle__(jar: Jar, pasteurized: bool = True):
+        n = _read(jar, pasteurized, int)
+        if not pasteurized: jar += sizeof(int)
+        m = abs(n)
+        p = Ptr[byte](m)
+        _read_raw(jar, p, m, pasteurized)
+        return seq(p, n)
+
+@extend
+class List:
+    def __pickle__(self, jar: Jar, pasteurized: bool = True):
+        n = len(self)
+        pickle(n, jar, pasteurized)
+        if not pasteurized: jar += sizeof(int)
+        if atomic(T):
+            _write_raw(jar, (self.arr.ptr).as_byte(), n * sizeof(T), pasteurized)
+        else:
+            for i in range(n):
+                pickle(self.arr[i], jar, pasteurized)
+                if not pasteurized: jar += self.arr[i].pickle_size()
+
+    def __unpickle__(jar: Jar, pasteurized: bool = True):
+        n = unpickle(jar, pasteurized, int)
+        if not pasteurized: jar += sizeof(int)
+        arr = Array[T](n)
+        if atomic(T):
+            _read_raw(jar, (arr.ptr).as_byte(), n * sizeof(T), pasteurized)
+        else:
+            for i in range(n):
+                arr[i] = unpickle(jar, pasteurized, T)
+                if not pasteurized: jar += arr[i].pickle_size()
+        return List[T](arr, n)
+
+@extend
+class Dict:
+    def __pickle__(self, jar: Jar, pasteurized: bool = True):
+        import internal.khash as khash
+        if atomic(K) and atomic(V):
+            pickle(self._n_buckets, jar, pasteurized)
+            if not pasteurized: jar += sizeof(int)
+            pickle(self._size, jar, pasteurized)
+            if not pasteurized: jar += sizeof(int)
+            pickle(self._n_occupied, jar, pasteurized)
+            if not pasteurized: jar += sizeof(int)
+            pickle(self._upper_bound, jar, pasteurized)
+            if not pasteurized: jar += sizeof(int)
+            fsize = khash.__ac_fsize(self._n_buckets) if self._n_buckets > 0 else 0
+            _write_raw(jar, self._flags.as_byte(), fsize * sizeof(u32), pasteurized)
+            if not pasteurized: jar += fsize * sizeof(u32)
+            _write_raw(jar, self._keys.as_byte(), self._n_buckets * sizeof(K), pasteurized)
+            if not pasteurized: jar += self._n_buckets * sizeof(K)
+            _write_raw(jar, self._vals.as_byte(), self._n_buckets * sizeof(V), pasteurized)
+            if not pasteurized: jar += self._n_buckets * sizeof(V)
+        else:
+            pickle(self._n_buckets, jar, pasteurized)
+            if not pasteurized: jar += sizeof(int)
+            size = len(self)
+            pickle(size, jar, pasteurized)
+            if not pasteurized: jar += sizeof(int)
+
+            for k,v in self.items():
+                pickle(k, jar, pasteurized)
+                if not pasteurized: jar += sizeof(K)
+                pickle(v, jar, pasteurized)
+                if not pasteurized: jar += sizeof(V)
+
+    def __unpickle__(jar: Jar, pasteurized: bool = True):
+        import internal.khash as khash
+        d = Dict[K,V]()
+        if atomic(K) and atomic(V):
+            n_buckets = unpickle(jar, pasteurized, int)
+            if not pasteurized: jar += sizeof(int)
+            size = unpickle(jar, pasteurized, int)
+            if not pasteurized: jar += sizeof(int)
+            n_occupied = unpickle(jar, pasteurized, int)
+            if not pasteurized: jar += sizeof(int)
+            upper_bound = unpickle(jar, pasteurized, int)
+            if not pasteurized: jar += sizeof(int)
+            fsize = khash.__ac_fsize(n_buckets) if n_buckets > 0 else 0
+            flags = Ptr[u32](fsize)
+            keys = Ptr[K](n_buckets)
+            vals = Ptr[V](n_buckets)
+            _read_raw(jar, flags.as_byte(), fsize * sizeof(u32), pasteurized)
+            if not pasteurized: jar += fsize * sizeof(u32)
+            _read_raw(jar, keys.as_byte(), n_buckets * sizeof(K), pasteurized)
+            if not pasteurized: jar += n_buckets * sizeof(K)
+            _read_raw(jar, vals.as_byte(), n_buckets * sizeof(V), pasteurized)
+            if not pasteurized: jar += n_buckets * sizeof(V)
+
+            d._n_buckets = n_buckets
+            d._size = size
+            d._n_occupied = n_occupied
+            d._upper_bound = upper_bound
+            d._flags = flags
+            d._keys = keys
+            d._vals = vals
+        else:
+            n_buckets = unpickle(jar, pasteurized, int)
+            if not pasteurized: jar += sizeof(int)
+            size = unpickle(jar, pasteurized, int)
+            if not pasteurized: jar += sizeof(int)
+            d.resize(n_buckets)
+            i = 0
+            while i < size:
+                k = unpickle(jar, pasteurized, K)
+                if not pasteurized: jar += sizeof(K)
+                v = unpickle(jar, pasteurized, V)
+                if not pasteurized: jar += sizeof(V)
+                d[k] = v
+                i += 1
+        return d
+
+@extend
+class Set:
+    def __pickle__(self, jar: Jar, pasteurized: bool = True):
+        import internal.khash as khash
+        if atomic(K):
+            pickle(self._n_buckets, jar, pasteurized)
+            if not pasteurized: jar += sizeof(int)
+            pickle(self._size, jar, pasteurized)
+            if not pasteurized: jar += sizeof(int)
+            pickle(self._n_occupied, jar, pasteurized)
+            if not pasteurized: jar += sizeof(int)
+            pickle(self._upper_bound, jar, pasteurized)
+            if not pasteurized: jar += sizeof(int)
+            fsize = khash.__ac_fsize(self._n_buckets) if self._n_buckets > 0 else 0
+            _write_raw(jar, self._flags.as_byte(), fsize * sizeof(u32), pasteurized)
+            if not pasteurized: jar += fsize * sizeof(u32)
+            _write_raw(jar, self._keys.as_byte(), self._n_buckets * sizeof(K), pasteurized)
+            if not pasteurized: jar += self._n_buckets * sizeof(K)
+        else:
+            pickle(self._n_buckets, jar, pasteurized)
+            if not pasteurized: jar += sizeof(int)
+            size = len(self)
+            pickle(size, jar, pasteurized)
+            if not pasteurized: jar += sizeof(int)
+
+            for k in self:
+                pickle(k, jar, pasteurized)
+                if not pasteurized: jar += sizeof(K)
+
+    def __unpickle__(jar: Jar, pasteurized: bool = True):
+        import internal.khash as khash
+        s = Set[K]()
+        if atomic(K):
+            n_buckets = unpickle(jar, pasteurized, int)
+            if not pasteurized: jar += sizeof(int)
+            size = unpickle(jar, pasteurized, int)
+            if not pasteurized: jar += sizeof(int)
+            n_occupied = unpickle(jar, pasteurized, int)
+            if not pasteurized: jar += sizeof(int)
+            upper_bound = unpickle(jar, pasteurized, int)
+            if not pasteurized: jar += sizeof(int)
+            fsize = khash.__ac_fsize(n_buckets) if n_buckets > 0 else 0
+            flags = Ptr[u32](fsize)
+            keys = Ptr[K](n_buckets)
+            _read_raw(jar, flags.as_byte(), fsize * sizeof(u32), pasteurized)
+            if not pasteurized: jar += fsize * sizeof(u32)
+            _read_raw(jar, keys.as_byte(), n_buckets * sizeof(K), pasteurized)
+            if not pasteurized: jar += n_buckets * sizeof(K)
+
+            s._n_buckets = n_buckets
+            s._size = size
+            s._n_occupied = n_occupied
+            s._upper_bound = upper_bound
+            s._flags = flags
+            s._keys = keys
+        else:
+            n_buckets = unpickle(jar, pasteurized, int)
+            if not pasteurized: jar += sizeof(int)
+            size = unpickle(jar, pasteurized, int)
+            if not pasteurized: jar += sizeof(int)
+            s.resize(n_buckets)
+            i = 0
+            while i < size:
+                k = unpickle(jar, pasteurized, K)
+                if not pasteurized: jar += sizeof(K)
+                s.add(k)
+                i += 1
+        return s
