@@ -13,7 +13,7 @@ git clone git@github.com:0xTCG/sequre.git && cd sequre
 ```
 And then run the install script:
 ```bash
-scripts/install.sh
+source scripts/install.sh
 ```
 This will:
 - Clone and install a version of [Seq](https://github.com/seq-lang/seq) that contains Sequre-related intermediate representation (IR) transformations.
