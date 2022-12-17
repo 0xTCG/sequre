@@ -6,8 +6,6 @@ Sequre is an end-to-end, statically compiled and performance engineered, Pythoni
 
 ### Install
 
-**Note:** For quick testing and bypassing the installation we recommend running Sequre [via docker](#via-docker).
-
 Sequre can **only** be built from source at the moment.
 To install Sequre, first clone the repository:
 ```bash
@@ -27,7 +25,7 @@ Execute
 ```bash
 scripts/run.sh playground --local
 ```
-to run the sample code from [playground.seq](playground.seq) that contains the benchmarks from [Hastings _et al._](https://github.com/MPC-SoK/frameworks).
+to run the sample code from [playground.codon](playground.codon) that contains the benchmarks from [Hastings _et al._](https://github.com/MPC-SoK/frameworks).
 
 This run will execute the code in a local, single machine, environment over inter-process communication channels (AF_UNIX). For running the codebase in a different environment, see [run instructions](#run-instructions).
 
@@ -37,12 +35,12 @@ Use `./sequre` script to execute Sequre both on server and client end.
 
 Server run command: _(`<pid>` denotes the ID of the computing party: 0, 1, 2, 3, ...)_
 ```bash
-./sequre foo.seq <pid>
+./sequre foo.codon <pid>
 ```
 
 Client run command:
 ```bash
-./sequre bar.seq
+./sequre bar.codon
 ```
 
 See the [example](#running-the-example) for a sample run at the `localhost`.
@@ -53,36 +51,36 @@ The [example](example) folder contains the running example of a typical multipar
 originates from a plasmid sequence or a chromosomal segment.
 
 Folder contains:
-- `client.seq` - Local source code executed by each client (data owner) locally. It contains a data processing step, followed by a secret sharing routine that initiates secure computing on the servers.
-- `server.seq` - Online source code executed by each untrusted computing party. It contains a data pooling routine that gathers the secret-shared data from the clients and conducts secure training of a linear support vector machine on top of it.
+- `client.codon` - Local source code executed by each client (data owner) locally. It contains a data processing step, followed by a secret sharing routine that initiates secure computing on the servers.
+- `server.codon` - Online source code executed by each untrusted computing party. It contains a data pooling routine that gathers the secret-shared data from the clients and conducts secure training of a linear support vector machine on top of it.
 
 ### Localhost run
 
-To run the example locally, execute `example/server.seq` in a separate terminal for each computing party `<pid>`:
+To run the example locally, execute `example/server.codon` in a separate terminal for each computing party `<pid>`:
 ```bash
-./sequre example/server.seq <pid>
+./sequre example/server.codon <pid>
 ```
 
 Finally, initiate the secret sharing of the data and, consequentially, secure training on top of it by running the client's code:
 
 ```bash
-./sequre example/client.seq
+./sequre example/client.codon
 ```
 
 Example (condensed into a single terminal for simplicity):
 ```bash
-./sequre example/server.seq 0 & \
-./sequre example/server.seq 1 & \
-./sequre example/server.seq 2 & \
-./sequre example/client.seq
+./sequre example/server.codon 0 & \
+./sequre example/server.codon 1 & \
+./sequre example/server.codon 2 & \
+./sequre example/client.codon
 ```
 **Note:** Expect obfuscated output (and possibly some minor warning messages) if running in a single terminal. Each party will output the results into the same terminal.
 
 ### Online run
 
-To run the same procedure on multiple machines, [install Sequre](#quick-start) and reconfigure the network within Sequre's [settings file](dsl/settings.seq) at each machine separately.
+To run the same procedure on multiple machines, [install Sequre](#quick-start) and reconfigure the network within Sequre's [settings file](dsl/settings.codon) at each machine separately.
 
-Example network configuration (`dsl/settings.seq` --- the IP addresses are fictional):
+Example network configuration (`dsl/settings.codon` --- the IP addresses are fictional):
 ```python
 # IPs
 TRUSTED_DEALER = '8.8.8.8'  # Trusted dealer
@@ -94,22 +92,22 @@ COMPUTING_PARTIES = [
 
 Then at `8.8.8.8` run
 ```bash
-./sequre example/server.seq 0
+./sequre example/server.codon 0
 ```
 
 At `9.9.9.9` run:
 ```bash
-./sequre example/server.seq 1
+./sequre example/server.codon 1
 ```
 
 At `10.10.10.10` run:
 ```bash
-./sequre example/server.seq 2
+./sequre example/server.codon 2
 ```
 
 And finally, at your client's machine, run:
 ```bash
-./sequre example/client.seq
+./sequre example/client.codon
 ```
 
 **Note:** Make sure to set the same network settings (IP addresses) at each computing party, including the client.
@@ -121,9 +119,9 @@ Sequre can operate in two network modes:
 - Local: using the inter-process communication (AF_UNIX) sockets.
 - Online: using the TCP (AF_INET) sockets.
 
-If using the online mode, make sure to configure the network within Sequre's [settings file](dsl/settings.seq) at each machine separately.
+If using the online mode, make sure to configure the network within Sequre's [settings file](dsl/settings.codon) at each machine separately.
 
-Example network configuration (`dsl/settings.seq` --- the IP addresses are fictional):
+Example network configuration (`dsl/settings.codon` --- the IP addresses are fictional):
 ```python
 # IPs
 TRUSTED_DEALER = '8.8.8.8'  # Trusted dealer
@@ -160,7 +158,7 @@ srcipts/run.sh tests --unit 2
 
 ### Running playground
 
-[Playground](playground.seq) contains the three MPC benchmarks from [Hastings _et al._](https://github.com/MPC-SoK/frameworks).
+[Playground](playground.codon) contains the three MPC benchmarks from [Hastings _et al._](https://github.com/MPC-SoK/frameworks).
 Use it to quickly explore Sequre and its [features](https://github.com/0xTCG/sequre/discussions/2).
 
 Example invocation:
@@ -202,24 +200,3 @@ This will benchmark the following applications in Sequre:
 - Ganon (metagenomic binning) on top of a single read from the complete Opal dataset from [Yu _et al._](https://github.com/yunwilliamyu/opal)
 
 Benchmark results are stored in the [results](results) folder.
-
-## Via docker
-
-**Note:** Docker runs are currently enabled **only** for the [local](#sequres-network-config) network environments.
-
-[Playground, test, and benchmark runs](#running-playground-tests-and-benchmarks) can be executed via docker:
-```bash
-docker run --rm hsmile/sequre:manylinux <command>
-```
-
-where `<command>` can be any of the (local network oriented) [commands above](#running-playground-tests-and-benchmarks).
-
-For example:
-```bash
-docker run --rm hsmile/sequre:manylinux scripts/run.sh tests --unit --local
-```
-will run all the unit tests in the local network environment.
-
-## License
-
-Sequre is published under the [academic public license](LICENSE.md).
