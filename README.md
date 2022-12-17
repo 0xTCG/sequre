@@ -23,7 +23,7 @@ This will:
 
 Execute
 ```bash
-scripts/run.sh playground --local
+scripts/run.sh benchmarks --playground --local
 ```
 to run the sample code from [playground.codon](playground.codon) that contains the benchmarks from [Hastings _et al._](https://github.com/MPC-SoK/frameworks).
 
@@ -138,14 +138,15 @@ COMPUTING_PARTIES = [
 
 For running [tests](#running-tests), [benchmarks](#running-benchmarks), and [playground](#running-playground), we recommend using the `scripts/run.sh` script:
 ```bash
-srcipts/run.sh <program> [<pid>] [--local] [--use-ring] [--unit]
+srcipts/run.sh <program> [<pid>] [--local] [--use-ring] [--unit | --all]
 ```
 where:
-- `<program>` is either `tests`, `benchmarks`, or `playground`.
+- `<program>` is either `tests` or `benchmarks`.
 - `<pid>` is optional ID of computing party if the run is [online](#sequres-network-config).
 - `--local` flag triggers the [local](#sequres-network-config) run, intead of online, using the inter-process communication instead of TCP. **Note:** `<pid>` is ignored if the `--local` flag is present.
 - `--use-ring` flag coerces usage of $2^k$ rings for MPC subroutines that are generally faster but introduce a slight inaccuracy ( $\pm 1/2^{20}$ ) to the fixed-point arithmetic. Without the flag, Sequre defaults to a finite field instead. **Note:** `--use-ring` is ignored while running tests. Tests are executed on both rings and fields.
-- `--unit` flag restricts the tests to unit test only. By default, both unit and end-to-end tests of applications (GWAS, DTI, Opal, and Ganon) are executed.
+- `--unit` flag restricts the tests to unit test only.
+- `--all` flag enables both unit and end-to-end tests of applications (i.e. GWAS, DTI, Opal, and Ganon). If set while running benchmarks, all benchmarks will be executed.
 
 Example invocation of unit tests in a `localhost` in an online network environment: (use multiple terminals for clear output)
 ```bash
@@ -163,33 +164,33 @@ Use it to quickly explore Sequre and its [features](https://github.com/0xTCG/seq
 
 Example invocation:
 ```bash
-scripts/run.sh playground --local --use-ring
+scripts/run.sh benchmarks --local --use-ring --playground
 ```
 
 ### Running tests
 
 To run all [unit tests](tests/unit_tests) execute:
 ```bash
-scripts/run.sh tests --unit --local
+scripts/run.sh tests --local --unit
 ```
 
 This will execute all unit tests [locally](#sequres-network-config), on a single machine.
 
-Drop the `--unit` flag to include the end-to-end tests for genome-wide association study, drug-target interaction inference, and metagenomic classifiers as well:
+Replace the `--unit` flag with `--all` flag to include the end-to-end tests for genome-wide association study, drug-target interaction inference, and metagenomic classifiers as well:
 ```bash
-scripts/run.sh tests --local
+scripts/run.sh tests --local --all
 ```
 
 ### Running benchmarks
 
 To benchmark all applications run:
 ```bash
-scripts/run.sh benchmarks --local
+scripts/run.sh benchmarks --local --all
 ```
 
 Include `--use-ring` flag to re-run all benchmarks on rings instead of fields:
 ```bash
-scripts/run.sh benchmarks --local --use-ring
+scripts/run.sh benchmarks --local --use-ring --all
 ```
 
 This will benchmark the following applications in Sequre:
