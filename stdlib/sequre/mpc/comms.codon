@@ -1,0 +1,222 @@
+from pickler import pickle, unpickle
+from internal.gc import sizeof
+
+from ..lattiseq.ckks import Ciphertext
+from ..lattiseq.ring import Poly
+from ..lattiseq.ringqp import Poly as QPPoly
+
+from ..utils.param import *
+from ..utils.utils import shapeof
+from ..types.utils import fp_to_double
+
+from randomness import MPCRandomness
+from ..network.socket import CSocket
+from ..network.connect import open_channel, connect
+from ..network.common import close_socket, receive, send_to_socket, snd_jar, receive_jar
+
+
+class MPCComms[TP]:
+    pid: int
+    hub_pid: int
+    sockets: dict[int, CSocket]
+    bytes_sent: int
+    requests_sent: int
+    randomness: MPCRandomness
+    local: bool
+    number_of_parties: int
+
+    def __init__(self: MPCComms[TP], randomness: MPCRandomness, local: bool, expect_data_sharing: bool):
+        self.pid = randomness.pid
+        self.hub_pid = 1
+        self.randomness = randomness
+        self.local = local
+        self.sockets = dict[int, CSocket]()
+        self.bytes_sent = 0
+        self.requests_sent = 0
+
+        self.__setup_channels(expect_data_sharing)
+        self.number_of_parties = len(self.sockets) + 1
+
+    def send[CT](self: MPCComms[TP], data: CT, to_pid: int) -> int:
+        bytes_sent = send_to_socket(self.sockets[to_pid], data)
+        self.bytes_sent += bytes_sent
+        self.requests_sent += 1
+        return bytes_sent
+    
+    def receive[T](self, from_pid: int, shape = False):
+        if isinstance(shape, bool):
+            return self.__receive_elem(from_pid, T=T)
+        if isinstance(shape, int):
+            return self.__receive_vector(from_pid, shape, T=T)
+        if isinstance(shape, list[int]):
+            return self.__receive_matrix(from_pid, shape, T=T)
+        
+        raise TypeError(f"Invalid type within receive method: {shape}")
+    
+    def send_jar_size(self, data, to_pid: int):
+        jar = ptr[byte](sizeof(int))
+        pickle(data.pickle_size(), jar, pasteurized=False)
+        snd_jar(self.sockets[to_pid].sock_fd, jar, sizeof(int))
+    
+    def receive_jar_size(self, from_pid: int) -> int:
+        return unpickle(receive_jar(self.sockets[from_pid].sock_fd, sizeof(int)), False, int)
+    
+    def send_as_jar[T](self, data: T, to_pid: int):
+        self.send_jar_size(data, to_pid)
+
+        pickle_size = data.pickle_size()
+        jar = ptr[byte](pickle_size)
+        pickle(data, jar, pasteurized=False)
+
+        snd_jar(self.sockets[to_pid].sock_fd, jar, pickle_size)
+
+    def receive_as_jar[T](self, from_pid: int) -> T:
+        msg_len = self.receive_jar_size(from_pid)
+        received_jar = receive_jar(self.sockets[from_pid].sock_fd, msg_len)
+        return unpickle(received_jar, False, T)
+    
+    def share(self, value, modulus):
+        if self.pid == 0:
+            self.randomness.switch_seed(1)
+            r = value.rand(modulus)
+            self.randomness.restore_seed(1)
+
+            blinded_value = value.sub_mod(r, modulus)
+
+            self.send(blinded_value, 2)
+            return value.zeros()
+        elif self.pid == 2:
+            return self.receive(0, shapeof(value), T=type(modulus))
+        else:
+            self.randomness.switch_seed(0)
+            r = value.rand(modulus)
+            self.randomness.restore_seed(0)
+            return r
+
+    def reveal(self, value, modulus):
+        if self.pid == 0:
+            return value
+        
+        if self.pid == 1:
+            self.send(value, 3 - self.pid)
+            received_value = self.receive(3 - self.pid, shapeof(value), T=type(modulus))
+            
+            return value.add_mod(received_value, modulus)
+        
+        received_value = self.receive(3 - self.pid, shapeof(value), T=type(modulus))
+        self.send(value, 3 - self.pid)
+
+        return value.add_mod(received_value, modulus)
+    
+    def broadcast(self, value, modulus):
+        revealed_value = self.reveal(value, modulus)
+        if self.pid == 2: self.send(revealed_value, 0)
+        elif self.pid == 0: revealed_value = self.receive(2, shapeof(value), T=type(modulus))
+        return revealed_value
+    
+    def sync_parties(self: MPCComms[TP], control_elem = 1):
+        if (self.pid == 0):
+            from_1 = self.receive(1, T=type(control_elem))
+            from_2 = self.receive(2, T=type(control_elem))
+            if DEBUG: assert from_1 == from_2 == control_elem
+            self.send(from_1, 1)
+            self.send(from_2, 2)
+        else:
+            self.send(control_elem, 0)
+            return_elem = self.receive(0, T=type(control_elem))
+            if DEBUG: assert return_elem == control_elem
+    
+    def clean_up(self: MPCComms[TP]):
+        for socket in self.sockets.values():
+            close_socket(socket.sock_fd)
+    
+    def print_stats(self: MPCComms[TP], file_stream = None):
+        bandwidth_message = f'Total bytes sent from CP{self.pid}: {self.bytes_sent}.'
+        requests_message = f'Total send requests at CP{self.pid}: {self.requests_sent}.'
+        if file_stream is not None:
+            file_stream.write(f'{bandwidth_message}\n{requests_message}\n')
+        print(f'{bandwidth_message}\n{requests_message}')
+    
+    def reset_stats(self: MPCComms[TP]):
+        self.bytes_sent = 0
+        self.requests_sent = 0
+    
+    def print_fp(self, value, modulus, debug = False, message = ""):
+        if self.pid == 0:
+            return value.zeros_float()
+        
+        revealed_value = self.reveal(value, modulus=modulus)
+        value_float = fp_to_double(revealed_value, modulus)
+
+        if self.pid == 2 and debug:
+            print(f'{self.pid}: Revealed value -{message}- {revealed_value}')
+            print(f'{self.pid}: Float value -{message}- {value_float}')
+        
+        return value_float
+    
+    def __receive_elem[T](self, from_pid: int) -> T:
+        return T(next(receive(self.sockets[from_pid].sock_fd, elem_count=1, T=T)))
+
+    def __receive_vector[T](self, from_pid: int, length: int) -> list[T]:
+        received_vec = list[T](length)
+
+        for elem in receive(self.sockets[from_pid].sock_fd, elem_count=length, T=T):
+            received_vec.append(T(elem))
+
+        return received_vec
+    
+    def __receive_matrix[T](self, from_pid: int, shape: list[int]):
+        rows, cols = shape
+        matrix = list[list[T]](rows)
+        row = list[T](cols)
+        j = 0
+
+        for elem in receive(self.sockets[from_pid].sock_fd, elem_count=rows * cols, T=T):
+            if j != cols:
+                row.append(T(elem))
+                j += 1
+            if j == cols:
+                matrix.append(row)
+                j = 0
+                row = list[T](cols)
+
+        return matrix
+    
+    def __setup_channels(self, expect_data_sharing):
+        # Sockets are spawned per corresponding party
+        for p_1 in range(2):
+            for p_2 in range(p_1 + 1, 3):
+                if (p_1 != self.pid and p_2 != self.pid):
+                    continue
+
+                serveraddr_or_port = P0_P1_SOCKET_PATH if self.local else str(PORT_P0_P1)
+                if (p_1 == 0 and p_2 == 1):
+                    serveraddr_or_port = P0_P1_SOCKET_PATH if self.local else str(PORT_P0_P1)
+                elif (p_1 == 0 and p_2 == 2):
+                    serveraddr_or_port = P0_P2_SOCKET_PATH if self.local else str(PORT_P0_P2)
+                elif (p_1 == 1 and p_2 == 2):
+                    serveraddr_or_port = P1_P2_SOCKET_PATH if self.local else str(PORT_P1_P2)
+                else:
+                    raise ValueError('Invalid CP node pairs!')
+                
+                pother = p_1 + p_2 - self.pid
+
+                if (p_1 == self.pid):
+                    self.sockets[pother] = CSocket(serveraddr_or_port)
+                    open_channel(self.sockets[pother])
+                else:
+                    ip_address = TRUSTED_DEALER
+                    if pother == 0: ip_address = TRUSTED_DEALER
+                    elif pother == 1: ip_address = COMPUTING_PARTIES[0]
+                    elif pother == 2: ip_address = COMPUTING_PARTIES[1]
+                    else: raise ValueError('Ivalid CP node pairs!')
+
+                    self.sockets[pother] = CSocket(serveraddr_or_port, ip_address)
+
+                    if (not connect(self.sockets[pother])):
+                        raise ValueError(f"CP{self.pid} failed to connect with CP{pother}")
+
+        if expect_data_sharing:
+            # Data sharing host socket is at self.sockets[self.pid]
+            self.sockets[self.pid] = CSocket(str(DATA_SHARING_PORTS[self.pid]))
+            open_channel(self.sockets[self.pid])
