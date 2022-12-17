@@ -1,0 +1,129 @@
+import math
+
+from ..attributes import sequre_beaver as sequre
+
+from ..types.shared_tensor import SharedTensor
+from ..utils.param import NBIT_K, NBIT_F, DEBUG
+
+
+def normalizer_even_exponent(mpc, a, modulus):
+    s_val, s_sqrt_val = mpc.fp.__nee_wrapper(a.share, modulus)
+    s = SharedTensor(s_val, modulus)
+    s_sqrt = SharedTensor(s_sqrt_val, modulus)
+    s.fp = True
+    s_sqrt.fp = True
+    return s, s_sqrt
+
+
+@sequre
+def __fp_div(mpc, a, b):
+    modulus = a.modulus
+    niter = int(2 * math.ceil(math.log2(NBIT_K / 3.5))) + 1
+    s, _ = normalizer_even_exponent(mpc, b, modulus)
+
+    # TODO: #67 Have Sequre calculate truncation sizes. Below code should be just: b_scaled = b * s
+    if not b.is_partitioned(): b.set_partitions(mpc.arithmetic.__beaver_partition(b.share, modulus))
+    if not s.is_partitioned(): s.set_partitions(mpc.arithmetic.__beaver_partition(s.share, modulus))
+    b_scaled_val = mpc.arithmetic.__beaver_mult(b.x_r, b.r, s.x_r, s.r, modulus)
+    b_scaled_val = mpc.arithmetic.__beaver_reconstruct(b_scaled_val, modulus)
+    b_scaled_val = mpc.fp.trunc(b_scaled_val, modulus, NBIT_K, NBIT_K - NBIT_F)
+    b_scaled = SharedTensor(b_scaled_val, modulus)
+    b_scaled.fp = True
+
+    scaled_est = b_scaled * b_scaled * 5 - b_scaled * 10 + 5.9430
+
+    # TODO: #67 Have Sequre calculate truncation sizes. Below code should be just: w = scaled_est * s
+    if not scaled_est.is_partitioned(): scaled_est.set_partitions(mpc.arithmetic.__beaver_partition(scaled_est.share, modulus))
+    if not s.is_partitioned(): s.set_partitions(mpc.arithmetic.__beaver_partition(s.share, modulus))
+    w_val = mpc.arithmetic.__beaver_mult(scaled_est.x_r, scaled_est.r, s.x_r, s.r, modulus)
+    w_val = mpc.arithmetic.__beaver_reconstruct(w_val, modulus)
+    w_val = mpc.fp.trunc(w_val, modulus, NBIT_K + NBIT_F + 2, NBIT_K - NBIT_F)
+    w = SharedTensor(w_val, modulus)
+    w.fp = True
+
+    # TODO: #67 Have Sequre calculate truncation sizes. Below code should be just: x = 1 - w * b; y = a * w
+    old_a_fp = a.fp
+    old_b_fp = b.fp
+    b.fp = a.fp = True
+    x = 1 - w * b
+    y = a * w
+    a.fp = old_a_fp
+    b.fp = old_b_fp
+
+    # TODO: #32 Have Sequre inspect code downstream in order to figure out if partitions are necessary.
+    for _ in range(niter):
+        if not x.is_partitioned(): x.set_partitions(mpc.arithmetic.__beaver_partition(x.share, modulus))
+        if not y.is_partitioned(): y.set_partitions(mpc.arithmetic.__beaver_partition(y.share, modulus))
+        y = y * (x + 1)
+        x = x * x
+    
+    # TODO: #32 Have Sequre inspect code downstream in order to figure out if partitions are necessary.
+    if not x.is_partitioned(): x.set_partitions(mpc.arithmetic.__beaver_partition(x.share, modulus))
+    if not y.is_partitioned(): y.set_partitions(mpc.arithmetic.__beaver_partition(y.share, modulus))
+
+    return y * (x + 1)
+
+
+@sequre
+def __fp_sqrt(mpc, a):
+    modulus = a.modulus
+    niter = int(2 * math.ceil(math.log2(NBIT_K / 3.5)))
+    s, s_sqrt = normalizer_even_exponent(mpc, a, modulus)
+
+    # TODO: #67 Have Sequre calculate truncation sizes. Below code should be just: a_scaled = a * s
+    if not a.is_partitioned(): a.set_partitions(mpc.arithmetic.__beaver_partition(a.share, modulus))
+    if not s.is_partitioned(): s.set_partitions(mpc.arithmetic.__beaver_partition(s.share, modulus))
+    a_scaled_val = mpc.arithmetic.__beaver_mult(a.x_r, a.r, s.x_r, s.r, modulus)
+    a_scaled_val = mpc.arithmetic.__beaver_reconstruct(a_scaled_val, modulus)
+    a_scaled_val = mpc.fp.trunc(a_scaled_val, modulus, NBIT_K, NBIT_K - NBIT_F)
+    a_scaled = SharedTensor(a_scaled_val, modulus)
+    a_scaled.fp = True
+
+    scaled_est = a_scaled * a_scaled * 2 - a_scaled * 4 + 2.9581
+
+    # TODO: #67 Have Sequre calculate truncation sizes. Below code should be just: h = scaled_est * s_sqrt
+    if not scaled_est.is_partitioned(): scaled_est.set_partitions(mpc.arithmetic.__beaver_partition(scaled_est.share, modulus))
+    if not s_sqrt.is_partitioned(): s_sqrt.set_partitions(mpc.arithmetic.__beaver_partition(s_sqrt.share, modulus))
+    h_val = mpc.arithmetic.__beaver_mult(scaled_est.x_r, scaled_est.r, s_sqrt.x_r, s_sqrt.r, modulus)
+    h_val = mpc.arithmetic.__beaver_reconstruct(h_val, modulus)
+    h_val = mpc.fp.trunc(h_val, modulus, NBIT_K // 2 + NBIT_F + 2, (NBIT_K - NBIT_F) // 2 + 1)
+    h = SharedTensor(h_val, modulus)
+    h.fp = True
+
+    g = h * 2 * a
+    for _ in range(niter):
+        r = 1.5 - h * g
+        # TODO: #16 Calculate h and g in parallel
+        # r.get_partitions(mpc, force=True)
+        h = h * r
+        g = g * r
+    
+    return g, h * 2
+
+
+def fp_div(mpc, a, b):
+    if DEBUG: assert a.modulus == b.modulus
+    modulus = a.modulus
+
+    if modulus.popcnt() == 1:
+        a.to_field(mpc)
+        b.to_field(mpc)
+        res = __fp_div(mpc, a, b)
+        res.to_ring(mpc)
+        b.to_ring(mpc)
+        a.to_ring(mpc)
+        return res
+    return __fp_div(mpc, a, b)
+    
+
+def fp_sqrt(mpc, a):
+    modulus = a.modulus
+
+    if modulus.popcnt() == 1:
+        a.to_field(mpc)
+        res, res_inv = __fp_sqrt(mpc, a)
+        res.to_ring(mpc)
+        res_inv.to_ring(mpc)
+        a.to_ring(mpc)
+        return res, res_inv
+    return __fp_sqrt(mpc, a)
