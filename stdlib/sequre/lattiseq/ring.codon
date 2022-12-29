@@ -1512,28 +1512,6 @@ class ModupParams:
 
 
 # Caution, returns the values in [0, 2q-1]
-def mult_sum(
-        v: list[u64], y: list[list[u64]], nb_pi: int, pj: u64,
-        q_inv: u64, vtimesqmodp: list[u64], qoverqimodp: list[u64], lane_size: Static[int]):
-    rlo = zeros_vec(lane_size, TP=u64)
-    rhi = zeros_vec(lane_size, TP=u64)
-    res = zeros_vec(lane_size, TP=u64)
-	
-    # Accumulates the sum on uint128 and does a lazy montgomery reduction at the end
-    for i in range(nb_pi):
-        for idx in range(lane_size):
-            mhi, mlo = y[idx][i].mul_overflow_u64(qoverqimodp[i])
-            rlo[idx], c = rlo[idx].add_overflow(mlo)
-            rhi[idx] += mhi + c
-
-    for idx in range(lane_size):
-        hhi, _ = (rlo[idx] * q_inv).mul_overflow_u64(pj)
-        res[idx] = rhi[idx] - hhi + pj + vtimesqmodp[int(v[idx])]
-
-    return res
-
-
-# Caution, returns the values in [0, 2q-1]
 def _mm_mult_sum(
         v: u64xN, y: list[u64xN],
         pj_const: u64xN, q_inv_const: u64xN,
@@ -2076,55 +2054,56 @@ class Decomposer:
             if p0_idx_ed > level_q + 1: p0_idx_ed = level_q + 1
             params = self.mod_up_params[nb_pi - 2][decomp_rns][decomp_lvl]
 
-            q = ring_q.modulus
-            p = ring_p.modulus
-            mred_params_q = ring_q.mred_params
-            mred_params_p = ring_p.mred_params
-            qoverqiinvqi = params.qoverqiinvqi
+            q = ring_q._mm_modulus
+            p = ring_p._mm_modulus
+            mred_params_q = ring_q._mm_mred_params
+            mred_params_p = ring_p._mm_mred_params
             vtimesqmodp = params.vtimesqmodp
-            qoverqimodp = params.qoverqimodp
+            qoverqimodp = params._mm_qoverqimodp
 
-            y = zeros(8, 32, TP=u64)
-            v = zeros_vec(8, TP=u64)
+            _mm_p0_q_coeffs = [[u64xN(row.arr.ptr + j) for j in range(0, len(row), SIMD_LANE_SIZE)] for row in p0_q.coeffs[:level_q + 1]].transpose()
+            _mm_p1_q_coeffs = [[u64xN(row.arr.ptr + j) for j in range(0, len(row), SIMD_LANE_SIZE)] for row in p1_q.coeffs[:level_q + 1]].transpose()
+            _mm_p1_p_coeffs = [[u64xN(row.arr.ptr + j) for j in range(0, len(row), SIMD_LANE_SIZE)] for row in p1_p.coeffs[:level_p + 1]].transpose()
+            
+            y = [u64xN(u64(0)) for _ in range(decomp_lvl + 2)]
             # We loop over each coefficient and apply the basis extension
-            for x in range(0, len(p0_q.coeffs[0]), 8):
-                vi = [0.0 for _ in range(8)]
+            for x in range(len(_mm_p0_q_coeffs)):
                 i, j = 0, lvl_q_start
+                vf = f64xN(0.0)
 
                 # Coefficients to self decomposed
                 while i < decomp_lvl + 2:
-                    qqiinv = qoverqiinvqi[i]
-                    qi = q[j]
-                    mred_params = mred_params_q[j]
-                    qif = float(qi)
-
                     # For the coefficients to self decomposed, we can simply copy them
-                    for idx in range(8): p1_q.coeffs[j][x + idx] = p0_q.coeffs[j][x + idx]
-                    for idx in range(8): y[idx][i] = mred(p0_q.coeffs[j][x + idx], qqiinv, qi, mred_params)
+                    _mm_p1_q_coeffs[x][j] = _mm_p0_q_coeffs[x][j]
+                    y[i] = _mm_mred(_mm_p0_q_coeffs[x][j], params._mm_qoverqiinvqi[i], q[j], mred_params_q[j])
                     # Computation of the correction term v * q%pi
-                    for idx in range(8): vi[idx] += float(y[idx][i]) / qif
-
+                    vf = vf + y[i] / q[j]
                     i, j = i + 1, j + 1
 
                 # Index of the correction term
-                for idx in range(8): v[idx] = u64(vi[idx])
+                v = vf.to_u64()
  
                 # Coefficients of index smaller than the ones to self decomposed
                 for j in range(p0_idx_st):
-                    p1_q.coeffs[j][x:x + 8] = mult_sum(v, y, decomp_lvl + 2, q[j], mred_params_q[j], vtimesqmodp[j], qoverqimodp[j], 8)
+                    _mm_p1_q_coeffs[x][j] = _mm_mult_sum(v, y, q[j], mred_params_q[j], vtimesqmodp[j], qoverqimodp[j])
 
                 # Coefficients of index greater than the ones to self decomposed
                 for j in range(p0_idx_ed, level_q + 1):
-                    p1_q.coeffs[j][x:x + 8] = mult_sum(v, y, decomp_lvl + 2, q[j], mred_params_q[j], vtimesqmodp[j], qoverqimodp[j], 8)
+                    _mm_p1_q_coeffs[x][j] = _mm_mult_sum(v, y, q[j], mred_params_q[j], vtimesqmodp[j], qoverqimodp[j])
 
                 # Coefficients of the special primes Pi
                 j, u = 0, len(ring_q.modulus)
                 while j < level_p + 1:
-                    p1_p.coeffs[j][x:x + 8] = mult_sum(v, y, decomp_lvl + 2, p[j], mred_params_p[j], vtimesqmodp[u], qoverqimodp[u], 8)
+                    _mm_p1_p_coeffs[x][j] = _mm_mult_sum(v, y, p[j], mred_params_p[j], vtimesqmodp[u], qoverqimodp[u])
                     j, u = j + 1, u + 1
 
+            _mm_p0_q_coeffs = _mm_p0_q_coeffs.transpose()
+            _mm_p1_q_coeffs = _mm_p1_q_coeffs.transpose()
             # Copies the coefficients of polynomials mod the RNS decomposition
-            for i in range(p0_idx_st, p0_idx_ed): p1_q.coeffs[i] = copy(p0_q.coeffs[i])
+            for i in range(p0_idx_st, p0_idx_ed): _mm_p1_q_coeffs[i] = copy(_mm_p0_q_coeffs[i])
+
+            p1_q.coeffs[:level_q + 1] = _mm_p1_q_coeffs.scatter_inplace()
+            p1_p.coeffs[:level_p + 1] = _mm_p1_p_coeffs.transpose().scatter_inplace()
         
 
 # NewDecomposer creates a new Decomposer.
