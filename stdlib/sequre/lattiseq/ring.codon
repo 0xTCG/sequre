@@ -11,8 +11,9 @@ import utils
 
 from common import big_uint, big_int, BIG_INT_LEN, biguint_mod_inv, bigint_floordiv, bigint_mod, biguint_floordiv, biguint_mod
 
+from ..types.builtin import u64xN, f64xN
 from ..utils.utils import zeros_vec, zeros
-from ..utils.constants import _MM_0F_u128xN, SIMD_LANE_SIZE
+from ..utils.constants import SIMD_LANE_SIZE
 
 
 SMALL_PRIMES = [
@@ -206,7 +207,7 @@ def mred(x, y, q, q_inv):
 # mred computes x * y * (1/2^64) mod q.
 def _mm_mred(x, y, q, q_inv):
     m = x.zext_mul(y)
-    h = ((m & _MM_0F_u128xN).trunc_half() * q_inv).mulhi(q)
+    h = (m.trunc_half() * q_inv).mulhi(q)
     r, c = (m.shift_half().trunc_half() - h).add_overflow(q)
     return r.sub_if(q, c.bit_flip())
 
@@ -918,6 +919,7 @@ class Ring:
     n: int
     # moduli
     modulus: list[u64]
+    _mm_modulus: list[u64xN]
     # 2^bit_length(Qi) - 1
     mask: list[u64]
     # Indicates whether NTT can self used with the current ring.
@@ -927,6 +929,7 @@ class Ring:
     # Fast reduction parameters
     bred_params: list[list[u64]]
     mred_params: list[u64]
+    _mm_mred_params: list[u64xN]
     rescale_params: list[list[u64]]
     # NTT Parameters
     nth_root: u64
@@ -964,10 +967,12 @@ class Ring:
         self.n = n
 
         self.modulus = list[u64](len(modulus))
+        self._mm_modulus = list[u64xN](len(modulus))
         self.mask = list[u64](len(modulus))
 
         for qi in modulus:
             self.modulus.append(qi)
+            self._mm_modulus.append(u64xN(qi))
             self.mask.append((u64(1) << qi.bitlen()) - u64(1))
 
         # Computes bigQ for all levels
@@ -998,7 +1003,10 @@ class Ring:
             # would return an error as there is no valid Montgomery form mod a power of 2)
             if (qi & (qi - u64(1))) != u64(0) and qi != u64(0):
                 self.mred_params.append(mred_params(qi))
-            else: self.mred_params.append(u64(0))
+                self._mm_mred_params.append(u64xN(self.mred_params[i]))
+            else:
+                self.mred_params.append(u64(0))
+                self._mm_mred_params.append(u64xN(u64(0)))
         
     def set_number_theoretic_transformer(self, ntt):
         self.ntt_type = ntt
@@ -1495,8 +1503,10 @@ class ModupParams:
     # Parameters for basis extension from q to p
     # (q/Qi)^-1) (mod each Qi) (in Montgomery form)
     qoverqiinvqi: list[u64]
+    _mm_qoverqiinvqi: list[u64xN]
     # q/qi (mod each Pj) (in Montgomery form)
     qoverqimodp: list[list[u64]]
+    _mm_qoverqimodp: list[list[u64xN]]
 	# q*v (mod each Pj) for v in [1,...,k] where k is the number of Pj moduli
     vtimesqmodp: list[list[u64]]
 
@@ -1523,42 +1533,42 @@ def mult_sum(
     return res
 
 
+# Caution, returns the values in [0, 2q-1]
+def _mm_mult_sum(
+        v: u64xN, y: list[u64xN],
+        pj_const: u64xN, q_inv_const: u64xN,
+        vtimesqmodp: list[u64], qoverqimodp: list[u64xN]):
+    r = u64xN(u64(0)).zext_double()
+    # Accumulates the sum on uint128 and does a lazy montgomery reduction at the end
+    for i in range(len(y)): r = r + y[i].zext_mul(qoverqimodp[i])
+
+    h = (r.trunc_half() * q_inv_const).mulhi(pj_const)
+    return r.shift_half().trunc_half() - h + pj_const + vtimesqmodp.shuffle(v)
+
+
 def _mm_reconstruct_rns(
-        index: int, x: int, p: list[list[u64]], q: list[u64],
-        q_inv: list[u64], qb_mont: list[u64]) -> tuple[list[u64], list[list[u64]]]:
-    v = Vec[f64, SIMD_LANE_SIZE](0.0)
-    y = list[Vec[u64, SIMD_LANE_SIZE]](32)
+        p_row: list[u64xN], q: list[u64xN],
+        q_inv: list[u64xN], qb_mont: list[u64xN]) -> tuple[u64xN, list[u64xN]]:
+    v = f64xN(0.0)
+    y = list[u64xN](len(p_row))
 
-    for i in range(index):
-        # TODO: Instantiate _mm_* vars once at param setup stage upstream
-        _mm_p = Vec[u64, SIMD_LANE_SIZE](p[i].arr.ptr + x)
-        _mm_q = Vec[u64, SIMD_LANE_SIZE](q[i])
-        _mm_q_inv = Vec[u64, SIMD_LANE_SIZE](q_inv[i])
-        _mm_qb_mont = Vec[u64, SIMD_LANE_SIZE](qb_mont[i])
-
-        y.append(_mm_mred(_mm_p, _mm_qb_mont, _mm_q, _mm_q_inv))
-
-        v = v + (y[i] / _mm_q)
+    for i in range(len(p_row)):
+        y.append(_mm_mred(p_row[i], qb_mont[i], q[i], q_inv[i]))
+        v = v + (y[i] / q[i])
     
-    return v.to_u64().scatter(), y.scatter().transpose()
+    return v.to_u64(), y
 
 
 # ModUpExact takes p1 mod q and switches its basis to P, returning the result on p2.
 # Caution, returns the values in [0, 2q-1]
-def mod_up_exact(p1: list[list[u64]], p2: list[list[u64]], ring_q: Ring, ring_p: Ring, params: ModupParams):
-    q = ring_q.modulus
-    p = ring_p.modulus
-    mred_params_q = ring_q.mred_params
-    mred_params_p = ring_p.mred_params
-    vtimesqmodp = params.vtimesqmodp
-    qoverqiinvqi = params.qoverqiinvqi
-    qoverqimodp = params.qoverqimodp
-
+def _mm_mod_up_exact(p1: list[list[u64xN]], p2: list[list[u64xN]], ring_q: Ring, ring_p: Ring, params: ModupParams):
     # We loop over each coefficient and apply the basis extension
-    for x in range(0, len(p1[0]), SIMD_LANE_SIZE):
-        v, y = _mm_reconstruct_rns(len(p1), x, p1, q, mred_params_q, qoverqiinvqi)
-        for j in range(len(p2)):
-            p2[j][x:x + SIMD_LANE_SIZE] = mult_sum(v, y, len(p1), p[j], mred_params_p[j], vtimesqmodp[j], qoverqimodp[j], SIMD_LANE_SIZE)
+    for i in range(len(p1)):
+        v, y = _mm_reconstruct_rns(
+            p1[i], ring_q._mm_modulus, ring_q._mm_mred_params, params._mm_qoverqiinvqi)
+        for j in range(len(p2[0])):
+            p2[i][j] = _mm_mult_sum(
+                v, y, ring_p._mm_modulus[j], ring_p._mm_mred_params[j], params.vtimesqmodp[j], params._mm_qoverqimodp[j])
 
 
 class BasisExtender:
@@ -1584,7 +1594,11 @@ class BasisExtender:
     # Given a polynomial with coefficients in basis {P0,P1....Plevel},
     # it extends its basis from {P0,P1....Plevel} to {Q0,Q1...Qj}
     def mod_up_p_to_q(self, level_p: int, level_q: int, pol_p: Poly, pol_q: Poly):
-        mod_up_exact(pol_p.coeffs[:level_p + 1], pol_q.coeffs.slice_reference(0, level_q + 1), self.ring_p, self.ring_q, self.params_p_to_q[level_p])
+        _mm_p_coeffs = [[u64xN(row.arr.ptr + j) for j in range(0, len(row), SIMD_LANE_SIZE)] for row in pol_p.coeffs[:level_p + 1]].transpose()
+        _mm_q_coeffs = [[u64xN(row.arr.ptr + j) for j in range(0, len(row), SIMD_LANE_SIZE)] for row in pol_q.coeffs[:level_q + 1]].transpose()
+        _mm_mod_up_exact(_mm_p_coeffs, _mm_q_coeffs, self.ring_p, self.ring_q, self.params_p_to_q[level_p])
+        pol_q.coeffs[:level_q + 1] = _mm_q_coeffs.transpose().scatter_inplace()
+
 
     # ModDownQPtoQNTT reduces the basis of a polynomial.
     # Given a polynomial with coefficients in basis {Q0,Q1....Qi} and {P0,P1...Pj},
@@ -1902,12 +1916,9 @@ def gen_mod_up_params(q, p):
         mred_params_p.append(mred_params(pi))
 
     qoverqiinvqi = list[u64](len(q))
-    qoverqimodp = list[list[u64]](len(p))
-
-    for _ in range(len(p)):
-        q_row = list[u64](len(q))
-        for _ in range(len(q)): q_row.append(u64(0))
-        qoverqimodp.append(q_row)
+    _mm_qoverqiinvqi = list[u64xN](len(q))
+    qoverqimodp = list[list[u64]](len(q))
+    _mm_qoverqimodp = list[list[u64xN]](len(q))
 
     for i, qi in enumerate(q):
         qi_star = mform(u64(1), qi, bred_params_q[i])
@@ -1917,14 +1928,20 @@ def gen_mod_up_params(q, p):
 
         # (q/Qi)^-1) * r (mod Qi) (in Montgomery form)
         qoverqiinvqi.append(mod_exp_montgomery(qi_star, int(qi - u64(2)), qi, mred_params_q[i], bred_params_q[i]))
+        _mm_qoverqiinvqi.append(u64xN(qoverqiinvqi[i]))
 
+        qoverqimodp_row = list[u64](len(p))
+        _mm_qoverqimodp_row = list[u64xN](len(p))
         for j, pj in enumerate(p):
             # (q/qi * r) (mod Pj) (in Montgomery form)
             qi_star = u64(1)
             for u in range(len(q)):
                 if u != i: qi_star = mred(qi_star, mform(q[u], pj, bred_params_p[j]), pj, mred_params_p[j])
 
-            qoverqimodp[j][i] = mform(qi_star, pj, bred_params_p[j])
+            qoverqimodp_row.append(mform(qi_star, pj, bred_params_p[j]))
+            _mm_qoverqimodp_row.append(u64xN(qoverqimodp_row[j]))
+        qoverqimodp.append(qoverqimodp_row)
+        _mm_qoverqimodp.append(_mm_qoverqimodp_row)
 
     vtimesqmodp = list[list[u64]](len(p))
     for j, pj in enumerate(p):
@@ -1940,7 +1957,9 @@ def gen_mod_up_params(q, p):
     
     return ModupParams(
         qoverqiinvqi=qoverqiinvqi,
-        qoverqimodp=qoverqimodp,
+        _mm_qoverqiinvqi=_mm_qoverqiinvqi,
+        qoverqimodp=qoverqimodp.transpose(),
+        _mm_qoverqimodp=_mm_qoverqimodp.transpose(),
         vtimesqmodp=vtimesqmodp)
 
 
