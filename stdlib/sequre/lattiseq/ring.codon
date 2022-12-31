@@ -221,9 +221,15 @@ def cred(a, q):
 # mred_constant computes x * y * (1/2^64) mod q in constant time.
 # The result is between 0 and 2*q-1.
 def mred_constant(x, y, q, q_inv):
-	ahi, alo = x.mul_overflow_u64(y)
-	h, _ = (alo * q_inv).mul_overflow_u64(q)
-	return ahi - h + q
+    ahi, alo = x.mul_overflow_u64(y)
+    h, _ = (alo * q_inv).mul_overflow_u64(q)
+    return ahi - h + q
+
+
+def _mm_mred_constant(x: u64xN, y: u64xN, q: u64xN, q_inv: u64xN) -> u64xN:
+    a = x.zext_mul(y)
+    h = (a.trunc_half() * q_inv).mulhi(q)
+    return a.shift_half().trunc_half() - h + q
 
 
 # butterfly computes X, Y = U + v * Psi, U - v * Psi mod q.
@@ -233,6 +239,94 @@ def butterfly(u, v, psi, two_q, four_q, q, q_inv):
 	return u + v, u + two_q - v
 
 
+def _mm_butterfly(u: u64xN, v: u64xN, psi: u64xN, two_q: u64xN, four_q: u64xN, q: u64xN, q_inv: u64xN) -> Tuple[u64xN, u64xN]:
+    u = u.sub_if(four_q, u.__ge__(four_q))
+    v = _mm_mred_constant(v, psi, q, q_inv)
+    return u + v, u + two_q - v
+
+
+@llvm
+def _mm_butterfly_inplace_x2_sub(u: u64xN, four_q: u64xN) -> u64xN:
+    %0 = icmp uge <4 x i64> %u, %four_q
+    %1 = and <4 x i1> %0, <i1 1, i1 1, i1 0, i1 0>
+    %2 = sub <4 x i64> %u, %four_q
+    %3 = select <4 x i1> %1, <4 x i64> %2, <4 x i64> %u
+    ret <4 x i64> %3
+
+
+@llvm
+def _mm_butterfly_inplace_x2_shuffle_addend_1(u: u64xN, two_q: u64) -> u64xN:
+    %0 = shufflevector <4 x i64> %u, <4 x i64> undef, <4 x i32> <i32 0, i32 1, i32 0, i32 1>
+    %1 = insertelement <4 x i64> zeroinitializer, i64 %two_q, i32 2
+    %2 = insertelement <4 x i64> %1, i64 %two_q, i32 3
+    %3 = add <4 x i64> %0, %2
+    ret <4 x i64> %3
+
+
+@llvm
+def _mm_butterfly_inplace_x2_shuffle_addend_2(u: u64xN) -> u64xN:
+    %0 = shufflevector <4 x i64> %u, <4 x i64> undef, <4 x i32> <i32 2, i32 3, i32 2, i32 3>
+    ret <4 x i64> %0
+
+
+@llvm
+def _mm_butterfly_inplace_x2_twist(u: u64xN) -> u64xN:
+    %0 = sub <4 x i64> zeroinitializer, %u
+    %1 = shufflevector <4 x i64> %u, <4 x i64> %0, <4 x i32> <i32 0, i32 1, i32 6, i32 7>
+    ret <4 x i64> %1
+
+
+def _mm_ntt_intrinsic_inplace(coeffs: u64xN, ntt_psi: u64xN, two_q: u64, q: u64xN, q_inv: u64xN) -> u64xN:
+    res = _mm_butterfly_inplace_x2_shuffle_addend_1(coeffs, two_q)
+    mrc = _mm_mred_constant(_mm_butterfly_inplace_x2_shuffle_addend_2(coeffs), ntt_psi, q, q_inv)
+    alt_mrc = _mm_butterfly_inplace_x2_twist(mrc)
+    return res + alt_mrc
+
+
+def _mm_butterfly_inplace_x2(u: u64xN, ntt_psi: u64xN, two_q: u64, four_q: u64xN, q: u64xN, q_inv: u64xN) -> u64xN:
+    u = _mm_butterfly_inplace_x2_sub(u, four_q)
+    return _mm_ntt_intrinsic_inplace(u, ntt_psi, two_q, q, q_inv)
+
+
+@llvm
+def _mm_butterfly_inplace_x1_sub(u: u64xN, four_q: u64xN) -> u64xN:
+    %0 = icmp uge <4 x i64> %u, %four_q
+    %1 = and <4 x i1> %0, <i1 1, i1 0, i1 1, i1 0>
+    %2 = sub <4 x i64> %u, %four_q
+    %3 = select <4 x i1> %1, <4 x i64> %2, <4 x i64> %u
+    ret <4 x i64> %3
+
+
+@llvm
+def _mm_butterfly_inplace_x1_shuffle_addend_1(u: u64xN, two_q: u64) -> u64xN:
+    %0 = shufflevector <4 x i64> %u, <4 x i64> undef, <4 x i32> <i32 0, i32 0, i32 2, i32 2>
+    %1 = insertelement <4 x i64> zeroinitializer, i64 %two_q, i32 1
+    %2 = insertelement <4 x i64> %1, i64 %two_q, i32 3
+    %3 = add <4 x i64> %0, %2
+    ret <4 x i64> %3
+
+
+@llvm
+def _mm_butterfly_inplace_x1_shuffle_addend_2(u: u64xN) -> u64xN:
+    %0 = shufflevector <4 x i64> %u, <4 x i64> undef, <4 x i32> <i32 1, i32 1, i32 3, i32 3>
+    ret <4 x i64> %0
+
+
+@llvm
+def _mm_butterfly_inplace_x1_twist(u: u64xN) -> u64xN:
+    %0 = sub <4 x i64> zeroinitializer, %u
+    %1 = shufflevector <4 x i64> %u, <4 x i64> %0, <4 x i32> <i32 0, i32 5, i32 2, i32 7>
+    ret <4 x i64> %1
+
+
+def _mm_butterfly_inplace_x1(u: u64xN, ntt_psi: u64xN, two_q: u64, four_q: u64xN, q: u64xN, q_inv: u64xN) -> u64xN:
+    u = _mm_butterfly_inplace_x1_sub(u, four_q)
+    res = _mm_butterfly_inplace_x1_shuffle_addend_1(u, two_q)
+    mrc = _mm_mred_constant(_mm_butterfly_inplace_x1_shuffle_addend_2(u), ntt_psi, q, q_inv)
+    alt_mrc = _mm_butterfly_inplace_x1_twist(mrc)
+    return res + alt_mrc
+
+                
 # invbutterfly computes X, Y = U + v, (U - v) * Psi mod q.
 def invbutterfly(u, v, psi, two_q, four_q, q, q_inv):
     x = u + v
@@ -461,95 +555,35 @@ def sub_vec(p1: list[u64], p2: list[u64], p3: list[u64], qi: u64):
 
 
 # ntt_lazy computes the NTT on the input coefficients using the input parameters with output values in the range [0, 2q-1].
-def ntt_lazy(coeffs_in: list[u64], coeffs_out: list[u64], n: int, ntt_psi: list[u64], q: u64, q_inv: u64, bred_params: list[u64]):
-    four_q = u64(4) * q
-    two_q = u64(2) * q
+def ntt_lazy(coeffs_in: list[u64], coeffs_out: list[u64], n: int, ntt_psi: list[u64], q: u64, q_inv: u64):
+    four_q = q << 2
+    two_q = q << 1
 
     # Copy the result of the first round of butterflies on p2 with approximate reduction
     t = n >> 1
-    F = ntt_psi[1]
-    jx, jy = 0, t
 
-    while jx <= t - 1:
-        V = mred_constant(coeffs_in[jy + 0], F, q, q_inv)
-        coeffs_out[jx + 0], coeffs_out[jy + 0] = coeffs_in[jx + 0] + V, coeffs_in[jx + 0] + two_q - V
+    for jx in range(t):
+        V = mred_constant(coeffs_in[jx + t], ntt_psi[1], q, q_inv)
+        coeffs_out[jx], coeffs_out[jx + t] = coeffs_in[jx] + V, coeffs_in[jx] + two_q - V
 
-        V = mred_constant(coeffs_in[jy + 1], F, q, q_inv)
-        coeffs_out[jx + 1], coeffs_out[jy + 1] = coeffs_in[jx + 1] + V, coeffs_in[jx + 1] + two_q - V
-
-        V = mred_constant(coeffs_in[jy + 2], F, q, q_inv)
-        coeffs_out[jx + 2], coeffs_out[jy + 2] = coeffs_in[jx + 2] + V, coeffs_in[jx + 2] + two_q - V
-
-        V = mred_constant(coeffs_in[jy + 3], F, q, q_inv)
-        coeffs_out[jx + 3], coeffs_out[jy + 3] = coeffs_in[jx + 3] + V, coeffs_in[jx + 3] + two_q - V
-
-        V = mred_constant(coeffs_in[jy + 4], F, q, q_inv)
-        coeffs_out[jx + 4], coeffs_out[jy + 4] = coeffs_in[jx + 4] + V, coeffs_in[jx + 4] + two_q - V
-
-        V = mred_constant(coeffs_in[jy + 5], F, q, q_inv)
-        coeffs_out[jx + 5], coeffs_out[jy + 5] = coeffs_in[jx + 5] + V, coeffs_in[jx + 5] + two_q - V
-
-        V = mred_constant(coeffs_in[jy + 6], F, q, q_inv)
-        coeffs_out[jx + 6], coeffs_out[jy + 6] = coeffs_in[jx + 6] + V, coeffs_in[jx + 6] + two_q - V
-
-        V = mred_constant(coeffs_in[jy + 7], F, q, q_inv)
-        coeffs_out[jx + 7], coeffs_out[jy + 7] = coeffs_in[jx + 7] + V, coeffs_in[jx + 7] + two_q - V
-
-        jx, jy = jx + 8, jy + 8
-    
 	# Continue the rest of the second to the n-1 butterflies on p2 with approximate reduction
     m = 2
     while m < n:
-        reduce = (m.bitlen() & 1 == 1)
+        reduce = (m.bitlen() & 1) == 1
         t >>= 1
 
         if t >= 8:
             for i in range(m):
                 j1 = (i * t) << 1
-                j2 = j1 + t - 1
                 F = ntt_psi[m + i]
 
                 if reduce:
-                    jx, jy = j1, j1 + t
-                    while jx <= j2:
-                        coeffs_out[jx + 0], coeffs_out[jy + 0] = butterfly(coeffs_out[jx + 0], coeffs_out[jy + 0], F, two_q, four_q, q, q_inv)
-                        coeffs_out[jx + 1], coeffs_out[jy + 1] = butterfly(coeffs_out[jx + 1], coeffs_out[jy + 1], F, two_q, four_q, q, q_inv)
-                        coeffs_out[jx + 2], coeffs_out[jy + 2] = butterfly(coeffs_out[jx + 2], coeffs_out[jy + 2], F, two_q, four_q, q, q_inv)
-                        coeffs_out[jx + 3], coeffs_out[jy + 3] = butterfly(coeffs_out[jx + 3], coeffs_out[jy + 3], F, two_q, four_q, q, q_inv)
-                        coeffs_out[jx + 4], coeffs_out[jy + 4] = butterfly(coeffs_out[jx + 4], coeffs_out[jy + 4], F, two_q, four_q, q, q_inv)
-                        coeffs_out[jx + 5], coeffs_out[jy + 5] = butterfly(coeffs_out[jx + 5], coeffs_out[jy + 5], F, two_q, four_q, q, q_inv)
-                        coeffs_out[jx + 6], coeffs_out[jy + 6] = butterfly(coeffs_out[jx + 6], coeffs_out[jy + 6], F, two_q, four_q, q, q_inv)
-                        coeffs_out[jx + 7], coeffs_out[jy + 7] = butterfly(coeffs_out[jx + 7], coeffs_out[jy + 7], F, two_q, four_q, q, q_inv)
-
-                        jx, jy = jx + 8, jy + 8
+                    for jx in range(j1, j1 + t):
+                        coeffs_out[jx], coeffs_out[jx + t] = butterfly(coeffs_out[jx], coeffs_out[jx + t], F, two_q, four_q, q, q_inv)
                 else:
-                    jx, jy = j1, j1 + t
-                    while jx <= j2:
-                        V = mred_constant(coeffs_out[jy + 0], F, q, q_inv)
-                        coeffs_out[jx + 0], coeffs_out[jy + 0] = coeffs_out[jx + 0]+V, coeffs_out[jx + 0]+two_q-V
-
-                        V = mred_constant(coeffs_out[jy + 1], F, q, q_inv)
-                        coeffs_out[jx + 1], coeffs_out[jy + 1] = coeffs_out[jx + 1]+V, coeffs_out[jx + 1]+two_q-V
-
-                        V = mred_constant(coeffs_out[jy + 2], F, q, q_inv)
-                        coeffs_out[jx + 2], coeffs_out[jy + 2] = coeffs_out[jx + 2]+V, coeffs_out[jx + 2]+two_q-V
-
-                        V = mred_constant(coeffs_out[jy + 3], F, q, q_inv)
-                        coeffs_out[jx + 3], coeffs_out[jy + 3] = coeffs_out[jx + 3]+V, coeffs_out[jx + 3]+two_q-V
-
-                        V = mred_constant(coeffs_out[jy + 4], F, q, q_inv)
-                        coeffs_out[jx + 4], coeffs_out[jy + 4] = coeffs_out[jx + 4]+V, coeffs_out[jx + 4]+two_q-V
-
-                        V = mred_constant(coeffs_out[jy + 5], F, q, q_inv)
-                        coeffs_out[jx + 5], coeffs_out[jy + 5] = coeffs_out[jx + 5]+V, coeffs_out[jx + 5]+two_q-V
-
-                        V = mred_constant(coeffs_out[jy + 6], F, q, q_inv)
-                        coeffs_out[jx + 6], coeffs_out[jy + 6] = coeffs_out[jx + 6]+V, coeffs_out[jx + 6]+two_q-V
-
-                        V = mred_constant(coeffs_out[jy + 7], F, q, q_inv)
-                        coeffs_out[jx + 7], coeffs_out[jy + 7] = coeffs_out[jx + 7]+V, coeffs_out[jx + 7]+two_q-V
-
-                        jx, jy = jx+8, jy+8
+                    for jx in range(j1, j1 + t):
+                        V = mred_constant(coeffs_out[jx + t], F, q, q_inv)
+                        coeffs_out[jx], coeffs_out[jx + t] = coeffs_out[jx] + V, coeffs_out[jx] + two_q - V
         elif t == 4:
             if reduce:
                 i, j1 = m, 0
@@ -563,7 +597,7 @@ def ntt_lazy(coeffs_in: list[u64], coeffs_out: list[u64], n: int, ntt_psi: list[
                     coeffs_out[j1 + 10], coeffs_out[j1 + 14] = butterfly(coeffs_out[j1 + 10], coeffs_out[j1 + 14], ntt_psi[i + 1], two_q, four_q, q, q_inv)
                     coeffs_out[j1 + 11], coeffs_out[j1 + 15] = butterfly(coeffs_out[j1 + 11], coeffs_out[j1 + 15], ntt_psi[i + 1], two_q, four_q, q, q_inv)
 
-                    i, j1 = i + 2, j1 + 4 * t
+                    i, j1 = i + 2, j1 + 16
             else:
                 i, j1 = m, 0
                 while i < 2 * m:
@@ -591,7 +625,7 @@ def ntt_lazy(coeffs_in: list[u64], coeffs_out: list[u64], n: int, ntt_psi: list[
                     V = mred_constant(coeffs_out[j1 + 15], ntt_psi[i + 1], q, q_inv)
                     coeffs_out[j1 + 11], coeffs_out[j1 + 15] = coeffs_out[j1 + 11]+V, coeffs_out[j1 + 11]+two_q-V
 
-                    i, j1 = i + 2, j1 + 4 * t
+                    i, j1 = i + 2, j1 + 16
         elif t == 2:
             if reduce:
                 i, j1 = m, 0
@@ -605,7 +639,7 @@ def ntt_lazy(coeffs_in: list[u64], coeffs_out: list[u64], n: int, ntt_psi: list[
                     coeffs_out[j1 + 12], coeffs_out[j1 + 14] = butterfly(coeffs_out[j1 + 12], coeffs_out[j1 + 14], ntt_psi[i + 3], two_q, four_q, q, q_inv)
                     coeffs_out[j1 + 13], coeffs_out[j1 + 15] = butterfly(coeffs_out[j1 + 13], coeffs_out[j1 + 15], ntt_psi[i + 3], two_q, four_q, q, q_inv)
 
-                    i, j1 = i+4, j1+8*t
+                    i, j1 = i + 4, j1 + 16
             else:
                 i, j1 = m, 0
                 while i < 2 * m:
@@ -633,7 +667,7 @@ def ntt_lazy(coeffs_in: list[u64], coeffs_out: list[u64], n: int, ntt_psi: list[
                     V = mred_constant(coeffs_out[j1 + 15], ntt_psi[i + 3], q, q_inv)
                     coeffs_out[j1 + 13], coeffs_out[j1 + 15] = coeffs_out[j1 + 13]+V, coeffs_out[j1 + 13]+two_q-V
 
-                    i, j1 = i + 4, j1 + 8 * t
+                    i, j1 = i + 4, j1 + 16
         else:
             i, j1 = m, 0
             while i < 2 * m:
@@ -647,6 +681,108 @@ def ntt_lazy(coeffs_in: list[u64], coeffs_out: list[u64], n: int, ntt_psi: list[
                 coeffs_out[j1 + 14], coeffs_out[j1 + 15] = butterfly(coeffs_out[j1 + 14], coeffs_out[j1 + 15], ntt_psi[i + 7], two_q, four_q, q, q_inv)
 
                 i, j1 = i + 8, j1 + 16
+
+        m <<= 1
+
+
+def _mm_ntt_lazy_x4(
+        coeffs_in: list[u64xN],
+        coeffs_out: list[u64xN],
+        n: int,
+        ntt_psi: list[u64],
+        q: u64xN,
+        q_inv: u64xN,
+        two_q: u64xN,
+        four_q: u64xN,
+        q_u64: u64,
+        q_inv_u64: u64,
+        two_q_u64: u64,
+        four_q_u64: u64):
+    assert SIMD_LANE_SIZE == 4
+    
+    # Copy the result of the first round of butterflies on p2 with approximate reduction
+    t = n >> 1
+    _mm_ntt_psi = u64xN(ntt_psi[1])
+
+    t_mm = t >> 2
+    for jx in range(t_mm):
+        V = _mm_mred_constant(coeffs_in[jx + t_mm], _mm_ntt_psi, q, q_inv)
+        coeffs_out[jx], coeffs_out[jx + t_mm] = coeffs_in[jx] + V, coeffs_in[jx] + two_q - V
+    
+	# Continue the rest of the second to the n-1 butterflies on p2 with approximate reduction
+    m = 2
+    while m < n:
+        reduce = (m.bitlen() & 1) == 1
+        t >>= 1
+        t_mm = t >> 2
+
+        if t >= 8:
+            for i in range(m):
+                j1 = (i * t_mm) << 1
+                _mm_F = u64xN(ntt_psi[m + i])
+
+                if reduce:
+                    for jx in range(j1, j1 + t_mm):
+                        coeffs_out[jx], coeffs_out[jx + t_mm] = _mm_butterfly(coeffs_out[jx], coeffs_out[jx + t_mm], _mm_F, two_q, four_q, q, q_inv)
+                else:
+                    for jx in range(j1, j1 + t_mm):
+                        V = _mm_mred_constant(coeffs_out[jx + t_mm], _mm_F, q, q_inv)
+                        coeffs_out[jx], coeffs_out[jx + t_mm] = coeffs_out[jx] + V, coeffs_out[jx] + two_q - V
+        elif t == 4:
+            if reduce:
+                i, j1 = m, 0
+                while i < 2 * m:
+                    _mm_ntt_psi = u64xN(ntt_psi[i])
+                    coeffs_out[j1], coeffs_out[j1 + 1] = _mm_butterfly(coeffs_out[j1], coeffs_out[j1 + 1], _mm_ntt_psi, two_q, four_q, q, q_inv)
+
+                    _mm_ntt_psi = u64xN(ntt_psi[i + 1])
+                    coeffs_out[j1 + 2], coeffs_out[j1 + 3] = _mm_butterfly(coeffs_out[j1 + 2], coeffs_out[j1 + 3], _mm_ntt_psi, two_q, four_q, q, q_inv)
+
+                    i, j1 = i + 2, j1 + 4
+            else:
+                i, j1 = m, 0
+                while i < 2 * m:
+                    _mm_ntt_psi = u64xN(ntt_psi[i])
+                    V = _mm_mred_constant(coeffs_out[j1 + 1], _mm_ntt_psi, q, q_inv)
+                    coeffs_out[j1], coeffs_out[j1 + 1] = coeffs_out[j1] + V, coeffs_out[j1] + two_q - V
+
+                    _mm_ntt_psi = u64xN(ntt_psi[i + 1])
+                    V = _mm_mred_constant(coeffs_out[j1 + 3], _mm_ntt_psi, q, q_inv)
+                    coeffs_out[j1 + 2], coeffs_out[j1 + 3] = coeffs_out[j1 + 2] + V, coeffs_out[j1 + 2] + two_q - V
+
+                    i, j1 = i + 2, j1 + 4
+        elif t == 2:
+            if reduce:
+                i, j1 = m, 0
+                while i < 2 * m:
+                    coeffs_out[j1] = _mm_butterfly_inplace_x2(coeffs_out[j1], u64xN(ntt_psi[i]), two_q_u64, four_q, q, q_inv)
+                    coeffs_out[j1 + 1] = _mm_butterfly_inplace_x2(coeffs_out[j1 + 1], u64xN(ntt_psi[i + 1]), two_q_u64, four_q, q, q_inv)
+                    coeffs_out[j1 + 2] = _mm_butterfly_inplace_x2(coeffs_out[j1 + 2], u64xN(ntt_psi[i + 2]), two_q_u64, four_q, q, q_inv)
+                    coeffs_out[j1 + 3] = _mm_butterfly_inplace_x2(coeffs_out[j1 + 3], u64xN(ntt_psi[i + 3]), two_q_u64, four_q, q, q_inv)
+
+                    i, j1 = i + 4, j1 + 4
+            else:
+                i, j1 = m, 0
+                while i < 2 * m:
+                    coeffs_out[j1] = _mm_ntt_intrinsic_inplace(coeffs_out[j1], u64xN(ntt_psi[i]), two_q_u64, q, q_inv)
+                    coeffs_out[j1 + 1] = _mm_ntt_intrinsic_inplace(coeffs_out[j1 + 1], u64xN(ntt_psi[i + 1]), two_q_u64, q, q_inv)
+                    coeffs_out[j1 + 2] = _mm_ntt_intrinsic_inplace(coeffs_out[j1 + 2], u64xN(ntt_psi[i + 2]), two_q_u64, q, q_inv)
+                    coeffs_out[j1 + 3] = _mm_ntt_intrinsic_inplace(coeffs_out[j1 + 3], u64xN(ntt_psi[i + 3]), two_q_u64, q, q_inv)
+
+                    i, j1 = i + 4, j1 + 4
+        else:
+            i, j1 = m, 0
+            while i < 2 * m:
+                _mm_ntt_psi = u64xN([ntt_psi[i], ntt_psi[i], ntt_psi[i + 1], ntt_psi[i + 1]])
+                coeffs_out[j1] = _mm_butterfly_inplace_x1(coeffs_out[j1], _mm_ntt_psi, two_q_u64, four_q, q, q_inv)
+                _mm_ntt_psi = u64xN([ntt_psi[i + 2], ntt_psi[i + 2], ntt_psi[i + 3], ntt_psi[i + 3]])
+                coeffs_out[j1 + 1] = _mm_butterfly_inplace_x1(coeffs_out[j1 + 1], _mm_ntt_psi, two_q_u64, four_q, q, q_inv)
+                _mm_ntt_psi = u64xN([ntt_psi[i + 4], ntt_psi[i + 4], ntt_psi[i + 5], ntt_psi[i + 5]])
+                coeffs_out[j1 + 2] = _mm_butterfly_inplace_x1(coeffs_out[j1 + 2], _mm_ntt_psi, two_q_u64, four_q, q, q_inv)
+                _mm_ntt_psi = u64xN([ntt_psi[i + 6], ntt_psi[i + 6], ntt_psi[i + 7], ntt_psi[i + 7]])
+                coeffs_out[j1 + 3] = _mm_butterfly_inplace_x1(coeffs_out[j1 + 3], _mm_ntt_psi, two_q_u64, four_q, q, q_inv)
+
+                i, j1 = i + 8, j1 + 4
 
         m <<= 1
 
@@ -741,8 +877,19 @@ def inv_ntt_core(coeffs_in, coeffs_out, n, ntt_psi_inv, q, q_inv):
 
 # NTT computes the NTT on the input coefficients using the input parameters.
 def ntt(coeffs_in: list[u64], coeffs_out: list[u64], n: int, ntt_psi: list[u64], q: u64, mred_params: u64, bred_params: list[u64]):
-    ntt_lazy(coeffs_in, coeffs_out, n, ntt_psi, q, mred_params, bred_params)
-    reduce_vec(coeffs_out, coeffs_out, q, bred_params)
+    _mm_coeffs_in = coeffs_in.vectorize(SIMD_LANE_SIZE)
+    _mm_coeffs_out = coeffs_out.vectorize(SIMD_LANE_SIZE)
+    _mm_q = u64xN(q)
+    _mm_q_inv = u64xN(mred_params)
+    _mm_two_q = u64xN(q << 1)
+    _mm_four_q = u64xN(q << 2)
+
+    _mm_ntt_lazy_x4(
+        _mm_coeffs_in, _mm_coeffs_out, n, ntt_psi,
+        _mm_q, _mm_q_inv, _mm_two_q, _mm_four_q,
+        q, mred_params, q << 1, q << 2)
+    
+    reduce_vec(_mm_coeffs_out.scatter_inplace(), coeffs_out, q, bred_params)
 
 
 # InvNTT computes the InvNTT transformation on the input coefficients using the input parameters.
@@ -882,7 +1029,7 @@ class NumberTheoreticTransformerStandard:
     # Only computes the NTT for the first level+1 moduli and returns values in the range [0, 2q-1].
     def forward_lazy_lvl(r, level, p1, p2):
         for x in range(level + 1):
-            ntt_lazy(p1.coeffs[x], p2.coeffs[x], r.n, r.ntt_psi[x], r.modulus[x], r.mred_params[x], r.bred_params[x])
+            ntt_lazy(p1.coeffs[x], p2.coeffs[x], r.n, r.ntt_psi[x], r.modulus[x], r.mred_params[x])
     
     # ForwardVec writes the forward NTT in Z[X]/(X^n+1) of the i-th level of p1 on the i-th level of p2.
     def forward_vec(r, level: int, p1: list[u64], p2: list[u64]):
@@ -891,7 +1038,7 @@ class NumberTheoreticTransformerStandard:
     # ForwardLazyVec writes the forward NTT in Z[X]/(X^n+1) of the i-th level of p1 on the i-th level of p2.
     # Returns values in the range [0, 2q-1].
     def forward_lazy_vec(r, level: int, p1: list[u64], p2: list[u64]):
-        ntt_lazy(p1, p2, r.n, r.ntt_psi[level], r.modulus[level], r.mred_params[level], r.bred_params[level])
+        ntt_lazy(p1, p2, r.n, r.ntt_psi[level], r.modulus[level], r.mred_params[level])
     
     # BackwardLazyVec writes the backward NTT in Z[X]/(X^N+1) of the i-th level of p1 on the i-th level of p2.
     # Returns values in the range [0, 2q-1].
@@ -1572,8 +1719,8 @@ class BasisExtender:
     # Given a polynomial with coefficients in basis {P0,P1....Plevel},
     # it extends its basis from {P0,P1....Plevel} to {Q0,Q1...Qj}
     def mod_up_p_to_q(self, level_p: int, level_q: int, pol_p: Poly, pol_q: Poly):
-        _mm_p_coeffs = [[u64xN(row.arr.ptr + j) for j in range(0, len(row), SIMD_LANE_SIZE)] for row in pol_p.coeffs[:level_p + 1]].transpose()
-        _mm_q_coeffs = [[u64xN(row.arr.ptr + j) for j in range(0, len(row), SIMD_LANE_SIZE)] for row in pol_q.coeffs[:level_q + 1]].transpose()
+        _mm_p_coeffs = pol_p.coeffs[:level_p + 1].vectorize(SIMD_LANE_SIZE).transpose()
+        _mm_q_coeffs = pol_q.coeffs[:level_q + 1].vectorize(SIMD_LANE_SIZE).transpose()
         _mm_mod_up_exact(_mm_p_coeffs, _mm_q_coeffs, self.ring_p, self.ring_q, self.params_p_to_q[level_p])
         pol_q.coeffs[:level_q + 1] = _mm_q_coeffs.transpose().scatter_inplace()
 
