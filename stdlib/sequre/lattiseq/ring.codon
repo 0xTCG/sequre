@@ -240,13 +240,6 @@ def _mm_mred_constant(x: u64xN, y: u64xN, q: u64xN, q_inv: u64xN) -> u64xN:
     return a.shift_half().trunc_half() - h + q
 
 
-# butterfly computes X, Y = U + v * Psi, U - v * Psi mod q.
-def butterfly(u, v, psi, two_q, four_q, q, q_inv):
-	if u >= four_q: u -= four_q
-	v = mred_constant(v, psi, q, q_inv)
-	return u + v, u + two_q - v
-
-
 def _mm_butterfly(u: u64xN, v: u64xN, psi: u64xN, two_q: u64xN, four_q: u64xN, q: u64xN, q_inv: u64xN) -> Tuple[u64xN, u64xN]:
     u = u.sub_if(four_q, u.__ge__(four_q))
     v = _mm_mred_constant(v, psi, q, q_inv)
@@ -337,6 +330,15 @@ def invbutterfly(u, v, psi, two_q, four_q, q, q_inv):
     if x >= two_q: x -= two_q
     # At the moment it is not possible to use mred_constant if q > 61 bits
     y = mred_constant(u + four_q - v, psi, q, q_inv)
+    return x, y
+
+
+# invbutterfly computes X, Y = U + v, (U - v) * Psi mod q.
+def _mm_invbutterfly(u, v, psi, two_q, four_q, q, q_inv):
+    x = u + v
+    x = x.sub_if(two_q, x.__ge__(two_q))
+    # At the moment it is not possible to use mred_constant if q > 61 bits
+    y = _mm_mred_constant(u + four_q - v, psi, q, q_inv)
     return x, y
 
 
@@ -681,89 +683,81 @@ def _mm_ntt_lazy_x4(
         m <<= 1
 
 
-def inv_ntt_core(coeffs_in, coeffs_out, n, ntt_psi_inv, q, q_inv):
-    f = u64(0)
+def _mm_invbutterfly_inplace_0_x4(coeffs: u64xN, ntt_psi_inv_0: u64, ntt_psi_inv_1: u64, two_q: u64, four_q: u64, q: u64, q_inv: u64) -> u64xN:
+    coeffs_in = coeffs.scatter()
+    c0, c1 = invbutterfly(coeffs_in[0], coeffs_in[1], ntt_psi_inv_0, two_q, four_q, q, q_inv)
+    c2, c3 = invbutterfly(coeffs_in[2], coeffs_in[3], ntt_psi_inv_1, two_q, four_q, q, q_inv)
+    return u64xN([c0, c1, c2, c3])
+
+
+def _mm_invbutterfly_inplace_1_x4(coeffs: u64xN, ntt_psi_inv: u64, two_q: u64, four_q: u64, q: u64, q_inv: u64) -> u64xN:
+    coeffs_out = coeffs.scatter()
+    coeffs_out[0], coeffs_out[2] = invbutterfly(coeffs_out[0], coeffs_out[2], ntt_psi_inv, two_q, four_q, q, q_inv)
+    coeffs_out[1], coeffs_out[3] = invbutterfly(coeffs_out[1], coeffs_out[3], ntt_psi_inv, two_q, four_q, q, q_inv)
+    return u64xN(coeffs_out)
+
+
+def _mm_inv_ntt_core_x4(coeffs_in: List[u64xN], coeffs_out: List[u64xN], n: int, ntt_psi_inv: List[u64], q: u64, q_inv: u64, _mm_q: u64xN, _mm_q_inv: u64xN):
+    assert SIMD_LANE_SIZE == 4
 
     # Copy the result of the first round of butterflies on p2 with approximate reduction
     t = 1
     h = n >> 1
-    two_q = q << u64(1)
-    four_q = q << u64(2)
+    two_q = q << 1
+    four_q = q << 2
+    _mm_two_q = u64xN(two_q)
+    _mm_four_q = u64xN(four_q)
 
-    i, j = h, 0
-
-    while i < 2 * h:
-        for j1 in range(8):
-            j2 = j + j1 * 2 
-            coeffs_out[j2], coeffs_out[j2 + 1] = invbutterfly(
-                coeffs_in[j2], coeffs_in[j2 + 1], ntt_psi_inv[i + j1], two_q, four_q, q, q_inv)
-        i, j = i+8, j+16
+    j = 0
+    for i in range(h, h << 1, 8):
+        coeffs_out[j] = _mm_invbutterfly_inplace_0_x4(coeffs_in[j], ntt_psi_inv[i], ntt_psi_inv[i + 1], two_q, four_q, q, q_inv)
+        coeffs_out[j + 1] = _mm_invbutterfly_inplace_0_x4(coeffs_in[j + 1], ntt_psi_inv[i + 2], ntt_psi_inv[i + 3], two_q, four_q, q, q_inv)
+        coeffs_out[j + 2] = _mm_invbutterfly_inplace_0_x4(coeffs_in[j + 2], ntt_psi_inv[i + 4], ntt_psi_inv[i + 5], two_q, four_q, q, q_inv)
+        coeffs_out[j + 3] = _mm_invbutterfly_inplace_0_x4(coeffs_in[j + 3], ntt_psi_inv[i + 6], ntt_psi_inv[i + 7], two_q, four_q, q, q_inv)
+        j += 4
 
     # Continue the rest of the second to the n-1 butterflies on p2 with approximate reduction
     t <<= 1
     m = n >> 1
     
     while m > 1:
-        
+        _mm_t = t >> 2
         h = m >> 1
 
         if t >= 8:
-            i, j1, j2 = 0, 0, t - 1
+            i, j1, j2 = 0, 0, t
             
             while i < h:
-                f = ntt_psi_inv[h + i]
-                jx, jy = j1, j1 + t
+                _mm_j1 = j1 >> 2
+                _mm_j2 = j2 >> 2
+                _mm_f = u64xN(ntt_psi_inv[h + i])
+                jx, jy = _mm_j1, _mm_j1 + _mm_t
 
-                while jx <= j2:
-                    for j in range(8):
-                        coeffs_out[jx + j], coeffs_out[jy + j] = invbutterfly(
-                            coeffs_out[jx + j], coeffs_out[jy + j], f, two_q, four_q, q, q_inv)
-                    jx, jy = jx+8, jy+8
+                while jx < _mm_j2:
+                    coeffs_out[jx], coeffs_out[jy] = _mm_invbutterfly(
+                        coeffs_out[jx], coeffs_out[jy], _mm_f, _mm_two_q, _mm_four_q, _mm_q, _mm_q_inv)
+                    jx, jy = jx + 1, jy + 1
                 
                 i, j1, j2 = i + 1, j1 + 2 * t, j2 + 2 * t
 
         elif t == 4:
-            i, j1 = h, 0
-            while i < 2 * h:
-                coeffs_out[j1], coeffs_out[j1 + 4] = invbutterfly(
-                    coeffs_out[j1], coeffs_out[j1 + 4], ntt_psi_inv[i], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 1], coeffs_out[j1 + 5] = invbutterfly(
-                    coeffs_out[j1 + 1], coeffs_out[j1 + 5], ntt_psi_inv[i], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 2], coeffs_out[j1 + 6] = invbutterfly(
-                    coeffs_out[j1 + 2], coeffs_out[j1 + 6], ntt_psi_inv[i], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 3], coeffs_out[j1 + 7] = invbutterfly(
-                    coeffs_out[j1 + 3], coeffs_out[j1 + 7], ntt_psi_inv[i], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 8], coeffs_out[j1 + 12] = invbutterfly(
-                    coeffs_out[j1 + 8], coeffs_out[j1 + 12], ntt_psi_inv[i + 1], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 9], coeffs_out[j1 + 13] = invbutterfly(
-                    coeffs_out[j1 + 9], coeffs_out[j1 + 13], ntt_psi_inv[i + 1], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 10], coeffs_out[j1 + 14] = invbutterfly(
-                    coeffs_out[j1 + 10], coeffs_out[j1 + 14], ntt_psi_inv[i + 1], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 11], coeffs_out[j1 + 15] = invbutterfly(
-                    coeffs_out[j1 + 11], coeffs_out[j1 + 15], ntt_psi_inv[i + 1], two_q, four_q, q, q_inv)
-
-                i, j1 = i + 2, j1 + 4 * t
+            j1 = 0
+            for i in range(h, h << 1, 2):
+                _mm_ntt_psi = u64xN(ntt_psi_inv[i])
+                coeffs_out[j1], coeffs_out[j1 + 1] = _mm_invbutterfly(
+                    coeffs_out[j1], coeffs_out[j1 + 1], _mm_ntt_psi, _mm_two_q, _mm_four_q, _mm_q, _mm_q_inv)
+                _mm_ntt_psi = u64xN(ntt_psi_inv[i + 1])
+                coeffs_out[j1 + 2], coeffs_out[j1 + 3] = _mm_invbutterfly(
+                    coeffs_out[j1 + 2], coeffs_out[j1 + 3], _mm_ntt_psi, _mm_two_q, _mm_four_q, _mm_q, _mm_q_inv)
+                j1 += 4
         else:
-            i, j1 = h, 0
-            while i < 2 * h:
-                coeffs_out[j1], coeffs_out[j1 + 2] = invbutterfly(
-                    coeffs_out[j1], coeffs_out[j1 + 2], ntt_psi_inv[i], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 1], coeffs_out[j1 + 3] = invbutterfly(
-                    coeffs_out[j1 + 1], coeffs_out[j1 + 3], ntt_psi_inv[i], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 4], coeffs_out[j1 + 6] = invbutterfly(
-                    coeffs_out[j1 + 4], coeffs_out[j1 + 6], ntt_psi_inv[i + 1], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 5], coeffs_out[j1 + 7] = invbutterfly(
-                    coeffs_out[j1 + 5], coeffs_out[j1 + 7], ntt_psi_inv[i + 1], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 8], coeffs_out[j1 + 10] = invbutterfly(
-                    coeffs_out[j1 + 8], coeffs_out[j1 + 10], ntt_psi_inv[i + 2], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 9], coeffs_out[j1 + 11] = invbutterfly(
-                    coeffs_out[j1 + 9], coeffs_out[j1 + 11], ntt_psi_inv[i + 2], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 12], coeffs_out[j1 + 14] = invbutterfly(
-                    coeffs_out[j1 + 12], coeffs_out[j1 + 14], ntt_psi_inv[i + 3], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 13], coeffs_out[j1 + 15] = invbutterfly(
-                    coeffs_out[j1 + 13], coeffs_out[j1 + 15], ntt_psi_inv[i + 3], two_q, four_q, q, q_inv)
-
-                i, j1 = i + 4, j1 + 8 * t
+            j1 = 0
+            for i in range(h, h << 1, 4):
+                coeffs_out[j1] = _mm_invbutterfly_inplace_1_x4(coeffs_out[j1], ntt_psi_inv[i], two_q, four_q, q, q_inv)
+                coeffs_out[j1 + 1] = _mm_invbutterfly_inplace_1_x4(coeffs_out[j1 + 1], ntt_psi_inv[i + 1], two_q, four_q, q, q_inv)
+                coeffs_out[j1 + 2] = _mm_invbutterfly_inplace_1_x4(coeffs_out[j1 + 2], ntt_psi_inv[i + 2], two_q, four_q, q, q_inv)
+                coeffs_out[j1 + 3] = _mm_invbutterfly_inplace_1_x4(coeffs_out[j1 + 3], ntt_psi_inv[i + 3], two_q, four_q, q, q_inv)
+                j1 += 4
 
         t <<= 1
         m >>= 1
@@ -777,14 +771,20 @@ def _mm_ntt(coeffs_in: list[u64xN], coeffs_out: list[u64xN], n: int, ntt_psi: li
 
 # InvNTT computes the InvNTT transformation on the input coefficients using the input parameters.
 def inv_ntt(coeffs_in, coeffs_out, n, ntt_psi_inv, ntt_n_inv, q, q_inv):
-    inv_ntt_core(coeffs_in, coeffs_out, n, ntt_psi_inv, q, q_inv)
+    c_in = coeffs_in.vectorize(SIMD_LANE_SIZE)
+    c_out = coeffs_out.vectorize(SIMD_LANE_SIZE)
+    _mm_inv_ntt_core_x4(c_in, c_out, n, ntt_psi_inv, q, q_inv, u64xN(q), u64xN(q_inv))
+    coeffs_out[:] = c_out.scatter_inplace()
     mul_scalar_montgomery_vec(coeffs_out, coeffs_out, ntt_n_inv, q, q_inv)
 
 
 # InvNTTLazy computes the InvNTT transformation on the input coefficients using the input parameters with output values in the range [0, 2q-1].
 def inv_ntt_lazy(coeffs_in: list[u64], coeffs_out: list[u64], n: int, ntt_psi_inv: list[u64], ntt_n_inv: u64, q: u64, q_inv: u64):
-	inv_ntt_core(coeffs_in, coeffs_out, n, ntt_psi_inv, q, q_inv)
-	mul_scalar_montgomery_constant_vec(coeffs_out, coeffs_out, ntt_n_inv, q, q_inv)
+    c_in = coeffs_in.vectorize(SIMD_LANE_SIZE)
+    c_out = coeffs_out.vectorize(SIMD_LANE_SIZE)
+    _mm_inv_ntt_core_x4(c_in, c_out, n, ntt_psi_inv, q, q_inv, u64xN(q), u64xN(q_inv))
+    coeffs_out[:] = c_out.scatter_inplace()
+    mul_scalar_montgomery_constant_vec(coeffs_out, coeffs_out, ntt_n_inv, q, q_inv)
 
 
 # mask_vec returns p2 = (p1>>w) & mask
