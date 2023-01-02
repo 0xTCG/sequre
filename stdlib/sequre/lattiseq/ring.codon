@@ -515,6 +515,12 @@ def mul_scalar_montgomery_vec(p1, p2, scalar_mont, qi, mred_params):
 		p2[j] = mred(p1[j], scalar_mont, qi, mred_params)
 
 
+# MulScalarMontgomeryVec returns p2 = p1*scalar_mont mod qi.
+def _mm_mul_scalar_montgomery_vec(p1, p2, scalar_mont, qi, mred_params):
+	for j in range(len(p1)):
+		p2[j] = _mm_mred(p1[j], scalar_mont, qi, mred_params)
+
+
 # mul_scalar_montgomery_constant_vec returns p2 = p1*scalar_mont mod qi with output coefficients in range [0, 2qi-1].
 def mul_scalar_montgomery_constant_vec(p1: list[u64], p2: list[u64], scalar_mont: u64, qi: u64, mred_params: u64):
 	for j in range(len(p1)):
@@ -770,12 +776,9 @@ def _mm_ntt(coeffs_in: list[u64xN], coeffs_out: list[u64xN], n: int, ntt_psi: li
 
 
 # InvNTT computes the InvNTT transformation on the input coefficients using the input parameters.
-def inv_ntt(coeffs_in, coeffs_out, n, ntt_psi_inv, ntt_n_inv, q, q_inv):
-    c_in = coeffs_in.vectorize(SIMD_LANE_SIZE)
-    c_out = coeffs_out.vectorize(SIMD_LANE_SIZE)
-    _mm_inv_ntt_core_x4(c_in, c_out, n, ntt_psi_inv, q, q_inv, u64xN(q), u64xN(q_inv))
-    coeffs_out[:] = c_out.scatter_inplace()
-    mul_scalar_montgomery_vec(coeffs_out, coeffs_out, ntt_n_inv, q, q_inv)
+def _mm_inv_ntt(coeffs_in: list[u64xN], coeffs_out: list[u64xN], n: int, ntt_psi_inv: list[u64], ntt_n_inv: u64xN, q: u64xN, q_inv: u64xN, q_u64: u64, q_inv_u64: u64):
+    _mm_inv_ntt_core_x4(coeffs_in, coeffs_out, n, ntt_psi_inv, q_u64, q_inv_u64, q, q_inv)
+    _mm_mul_scalar_montgomery_vec(coeffs_out, coeffs_out, ntt_n_inv, q, q_inv)
 
 
 # InvNTTLazy computes the InvNTT transformation on the input coefficients using the input parameters with output values in the range [0, 2q-1].
@@ -906,9 +909,9 @@ class NumberTheoreticTransformerStandard:
 
     # backward_lvl writes the backward NTT in Z[X]/(X^n+1) on p2.
     # Only computes the NTT for the first level+1 moduli.
-    def backward_lvl(r, level, p1, p2):
+    def _mm_backward_lvl(r, level, p1, p2):
         for x in range(level + 1):
-            inv_ntt(p1.coeffs[x], p2.coeffs[x], r.n, r.ntt_psi_inv[x], r.ntt_n_inv[x], r.modulus[x], r.mred_params[x])
+            _mm_inv_ntt(p1._mm_coeffs[x], p2._mm_coeffs[x], r.n, r.ntt_psi_inv[x], r._mm_ntt_n_inv[x], r._mm_modulus[x], r._mm_mred_params[x], r.modulus[x], r.mred_params[x])
     
     # BackwardLazyLvl writes the backward NTT in Z[X]/(X^n+1) on p2.
     # Only computes the NTT for the first level+1 moduli and returns values in the range [0, 2q-1].
@@ -977,6 +980,7 @@ class Ring:
     ntt_psi: list[list[u64]]  #powers of the inverse of the 2N-th primitive root in Montgomery form (in bit-reversed order)
     ntt_psi_inv: list[list[u64]]  #powers of the inverse of the 2N-th primitive root in Montgomery form (in bit-reversed order)
     ntt_n_inv: list[u64]  #[n^-1] mod Qi in Montgomery form
+    _mm_ntt_n_inv: list[u64xN]
 
     ntt_type: str
 
@@ -1102,6 +1106,7 @@ class Ring:
         for i, qi in enumerate(self.modulus):
             # 1.1 Computes n^(-1) mod q in Montgomery form
             self.ntt_n_inv.append(mform(mod_exp_u64(nth_root >> u64(1), qi - u64(2), qi), qi, self.bred_params[i]))
+            self._mm_ntt_n_inv.append(u64xN(self.ntt_n_inv[i]))
 
             # 1.2 Computes Psi and PsiInv in Montgomery form
             self.ntt_psi[i] = zeros_vec(int(nth_root >> u64(1)), TP=u64)
@@ -1171,9 +1176,9 @@ class Ring:
     
     # inv_ntt_lvl computes the inverse-NTT of p1 and returns the result on p2.
     # The value level defines the number of moduli of the input polynomials.
-    def inv_ntt_lvl(self, level, p1, p2):
+    def _mm_inv_ntt_lvl(self, level, p1, p2):
         if self.ntt_type == NumberTheoreticTransformerStandard().name:
-            NumberTheoreticTransformerStandard.backward_lvl(self, level, p1, p2)
+            NumberTheoreticTransformerStandard._mm_backward_lvl(self, level, p1, p2)
         else: raise NotImplementedError()
     
     # InvNTTLazyLvl computes the inverse-NTT of p1 and returns the result on p2.
@@ -1389,7 +1394,11 @@ class Ring:
                 p1.coeffs = p0.coeffs.copy()
         else:
             if nb_rescales > 1:
-                self.inv_ntt_lvl(level, p0, buff)
+                p0.temp_vectorize()
+                buff.temp_vectorize()
+                self._mm_inv_ntt_lvl(level, p0, buff)
+                p0.temp_scatter()
+                buff.temp_scatter()
                 for i in range(nb_rescales):
                     self.div_round_by_last_modulus_lvl(level - i, buff, buff)
                 buff.temp_vectorize()
