@@ -6,7 +6,7 @@ import math
 from pickler import pickle, unpickle
 
 from ..types.builtin import Complex, u64xN
-from ..utils.utils import zeros_vec
+from ..utils.utils import zeros_vec, zeros
 from ..utils.constants import SIMD_LANE_SIZE
 
 import rlwe, ring, ringqp, utils
@@ -885,7 +885,7 @@ def single_float_to_fixed_point_crt(level: int, i: int, value: float, scale: flo
         # x_flo = big_float(value)
         # x_flo += big_float(0.5)
         # x_int = big_uint(x_flo)
-        # for j, qi in enumerate(moduli[:level + 1]):
+        # for j, qi in enumerate(moduli.slice_reference(0, level + 1)):
         #     tmp = x_int % qi
         #     if is_negative: coeffs[j][i] = qi - tmp
         #     else: coeffs[j][i] = tmp
@@ -895,11 +895,11 @@ def single_float_to_fixed_point_crt(level: int, i: int, value: float, scale: flo
 
         c = u64(int(value + 0.5))
         if is_negative:
-            for j, qi in enumerate(moduli[:level + 1]):
+            for j, qi in enumerate(moduli.slice_reference(0, level + 1)):
                 if c > qi: coeffs[j][i] = qi - ring.bred_add(c, qi, bred_params[j][0])
                 else: coeffs[j][i] = qi - c
         else:
-            for j, qi in enumerate(moduli[:level + 1]):
+            for j, qi in enumerate(moduli.slice_reference(0, level + 1)):
                 if c > u64(0x1fffffffffffffff): coeffs[j][i] = ring.bred_add(c, qi, bred_params[j][0])
                 else: coeffs[j][i] = c
 
@@ -938,7 +938,9 @@ def _mm_ntt_and_montgomery_lvl(level: int, log_slots: int, ring_q: ring.Ring, mo
         raise NotImplementedError("Please tell code owners to implement this corner case.")
             
 
-def complex_to_fixed_point_crt(level: int, values: list[Complex], scale: float, ring_q: ring.Ring, coeffs: list[list[u64]], is_ring_standard: bool):
+def complex_to_fixed_point_crt(level: int, slots: int, values: list[Complex], scale: float, ring_q: ring.Ring, is_ring_standard: bool):
+    coeffs = zeros(level + 1, slots, TP=u64)
+    
     for i, v in enumerate(values):
         single_float_to_fixed_point_crt(level, i, v.r, scale, ring_q, coeffs)
 
@@ -946,6 +948,8 @@ def complex_to_fixed_point_crt(level: int, values: list[Complex], scale: float, 
         slots = len(values)
         for i, v in enumerate(values):
             single_float_to_fixed_point_crt(level, i + slots, v.i, scale, ring_q, coeffs)
+    
+    return coeffs
 
 
 # DivideComplex128SliceVec divides the entries in values by scale_val in place.
@@ -1061,6 +1065,7 @@ class EncoderComplex128(Static[Encoder]):
     # Returned plaintext is always in the NTT domain.
     def encode(self, values, plaintext: Plaintext, log_slots: int):
         self.embed(values, log_slots, plaintext.scale, False, plaintext.value)
+        plaintext.value.temp_scatter()
     
     # embed is a generic method to encode a set of values on the target polyOut interface.
     # This method is at the core of the slot encoding.
@@ -1119,21 +1124,15 @@ class EncoderComplex128(Static[Encoder]):
         is_ring_standard = self.params.ring_type == ring.StandardRing
 
         if isinstance(polyOut, ringqp.Poly):
-            complex_to_fixed_point_crt(polyOut.q.level(), self.values[:slots], scale, self.params.ring_q, self.q.coeffs, is_ring_standard)
-            polyOut.q.temp_vectorize()
+            polyOut.q._mm_coeffs = complex_to_fixed_point_crt(polyOut.q.level(), polyOut.q.n(), self.values.slice_reference(0, slots), scale, self.params.ring_q, is_ring_standard).vectorize(SIMD_LANE_SIZE)
             _mm_ntt_and_montgomery_lvl(polyOut.q.level(), log_slots, self.params.ring_q, montgomery, polyOut.q)
-            polyOut.q.temp_scatter()
 
             if polyOut.p:
-                complex_to_fixed_point_crt(polyOut.p.level(), self.values[:slots], scale, self.params.ring_p, polyOut.p.coeffs, is_ring_standard)
-                polyOut.p.temp_vectorize()
+                polyOut.p._mm_coeffs = complex_to_fixed_point_crt(polyOut.p.level(), polyOut.p.n(), self.values.slice_reference(0, slots), scale, self.params.ring_p, is_ring_standard).vectorize(SIMD_LANE_SIZE)
                 _mm_ntt_and_montgomery_lvl(polyOut.p.level(), log_slots, self.params.ring_p, montgomery, polyOut.p)
-                polyOut.p.temp_scatter()
         elif isinstance(polyOut, ring.Poly):
-            complex_to_fixed_point_crt(polyOut.level(), self.values[:slots], scale, self.params.ring_q, polyOut.coeffs, is_ring_standard)
-            polyOut.temp_vectorize()
+            polyOut._mm_coeffs = complex_to_fixed_point_crt(polyOut.level(), polyOut.n(), self.values.slice_reference(0, slots), scale, self.params.ring_q, is_ring_standard).vectorize(SIMD_LANE_SIZE)
             _mm_ntt_and_montgomery_lvl(polyOut.level(), log_slots, self.params.ring_q, montgomery, polyOut)
-            polyOut.temp_scatter()
         else:
             raise ValueError("cannot embed: invalid polyOut.(type) must be ringqp.Poly or *ring.Poly")
 
