@@ -444,11 +444,8 @@ class SkEncryptor(Static[rlwe.SkEncryptor]):
     # The level of the output ciphertext is min(plaintext.level(), ciphertext.level()).
     def encrypt_new(self, plaintext: Plaintext) -> Ciphertext:
         ciphertext = new_ciphertext(self.ckks_params, 1, plaintext.level(), plaintext.scale)
-        rlwe_pt = plaintext.get_rlwe_plaintext()
         rlwe_ct = ciphertext.get_rlwe_ciphertext()
-        rlwe_pt.value.temp_vectorize()
-        rlwe_ct.temp_vectorize()
-        self._mm_encrypt(rlwe_pt, rlwe_ct)
+        self._mm_encrypt(plaintext.get_rlwe_plaintext(), rlwe_ct)
         rlwe_ct.temp_scatter()
         return ciphertext
 
@@ -988,12 +985,12 @@ def scale_down(coeff: big_int, n: float) -> float:
     return coeff.to_float() / n
 
 
-def poly_to_complex_crt(poly: ring.Poly, bigint_coeffs: list[big_uint], values: list[Complex], scale: float, log_slots: int, isreal: bool, ring_q: ring.Ring, q: big_uint):
+def poly_to_complex_crt(level: int, coeffs: list[list[u64]], bigint_coeffs: list[big_uint], values: list[Complex], scale: float, log_slots: int, isreal: bool, ring_q: ring.Ring, q: big_uint):
     max_slots = int(ring_q.nth_root >> u64(2))
     slots = 1 << log_slots
     gap = max_slots // slots
 
-    ring_q.poly_to_bigint(poly, gap, bigint_coeffs)
+    ring_q.poly_to_bigint(level, coeffs, gap, bigint_coeffs)
 
     q_half = q >> big_uint(1)
 
@@ -1147,28 +1144,22 @@ class EncoderComplex128(Static[Encoder]):
     # If the underlying ring_type is ConjugateInvariant, the imaginary part (and
     # its related error) are zero.
     def decode_slots_public(self, plaintext: Plaintext, log_slots: int, bound: float):
-        return self.decode_public(plaintext, log_slots, bound)
+        return self._mm_decode_public(plaintext, log_slots, bound)
     
-    def decode_public(self, plaintext: Plaintext, log_slots: int, sigma: float):
+    def _mm_decode_public(self, plaintext: Plaintext, log_slots: int, sigma: float):
         if log_slots > self.params.max_log_slots() or log_slots < MIN_LOG_SLOTS:
             raise ValueError(f"cannot decode: ensure that {MIN_LOG_SLOTS} <= log_slots ({log_slots}) <= {self.params.max_log_slots()}")
 
         if plaintext.value.is_ntt:
-            plaintext.value.temp_vectorize()
-            self.buff.temp_vectorize()
             self.params.ring_q._mm_inv_ntt_lvl(plaintext.level(), plaintext.value, self.buff)
-            plaintext.value.temp_scatter()
-            self.buff.temp_scatter()
         else:
             ring.copy_values_lvl(plaintext.level(), plaintext.value, self.buff)
 
         # B = floor(sigma * sqrt(2*pi))
         if sigma != 0:
-            self.buff.temp_vectorize()
             self.gaussian_sampler._mm_read_and_add_from_dist_lvl(plaintext.level(), self.buff, self.params.ring_q, sigma, int(2.5066282746310002 * sigma))
-            self.buff.temp_scatter()
         
-        self.plaintext_to_complex(plaintext.level(), plaintext.scale, log_slots, self.buff, self.values)
+        self.plaintext_to_complex(plaintext.level(), plaintext.scale, log_slots, self.buff._mm_coeffs.scatter_inplace(), self.values)
 
         if log_slots < 3:
             special_fft_vec(self.values, 1 << log_slots, self.m, self.rot_group, self.roots)
@@ -1177,12 +1168,12 @@ class EncoderComplex128(Static[Encoder]):
 
         return [v.copy() for v in self.values]
     
-    def plaintext_to_complex(self, level: int, scale: float, log_slots: int, p: ring.Poly, values: list[Complex]):
+    def plaintext_to_complex(self, level: int, scale: float, log_slots: int, coeffs: list[list[u64]], values: list[Complex]):
         isreal = self.params.ring_type == ring.ConjugateInvariantRing
         if level == 0:
-            poly_to_complex_no_crt(p.coeffs[0], values, scale, log_slots, isreal, self.params.ring_q)
+            poly_to_complex_no_crt(coeffs[0], values, scale, log_slots, isreal, self.params.ring_q)
         else:
-            poly_to_complex_crt(p, self.bigint_coeffs, values, scale, log_slots, isreal, self.params.ring_q, self.bigint_chain[level])
+            poly_to_complex_crt(level, coeffs, self.bigint_coeffs, values, scale, log_slots, isreal, self.params.ring_q, self.bigint_chain[level])
 
         if isreal: # [X]/(X^n+1) to [X+X^-1]/(X^n+1)
             slots = 1 << log_slots
@@ -1379,9 +1370,9 @@ def get_precision_stats(
     values_want = []
     
     if isinstance(element, Ciphertext):
-        values_test = encoder.decode_public(decryptor.decrypt_new(element), log_slots, sigma)
+        values_test = encoder._mm_decode_public(decryptor.decrypt_new(element), log_slots, sigma)
     elif isinstance(element, Plaintext):
-        values_test = encoder.decode_public(element, log_slots, sigma)
+        values_test = encoder._mm_decode_public(element, log_slots, sigma)
     elif isinstance(element, list[Complex]):
         values_test = element
     elif isinstance(element, list[float]):
