@@ -12,7 +12,7 @@ import utils
 from common import big_uint, big_int, BIG_INT_LEN, biguint_mod_inv, bigint_floordiv, bigint_mod, biguint_floordiv, biguint_mod
 
 from ..types.builtin import u64xN, f64xN
-from ..utils.utils import zeros_vec, zeros
+from ..utils.utils import zeros_vec, zeros, arange
 from ..utils.constants import SIMD_LANE_SIZE
 
 
@@ -1786,46 +1786,28 @@ class TernarySampler(Static[BaseSampler]):
                 \thw: {self.hw}
                 \tsample_name: {self.sample_name}
         """
-
-    def sample(self, lvl: int, r: Poly):
-        if self.sample_name == 'samplesparse':
-            self.sample_sparse(lvl, r)
-        else: raise NotImplementedError()
     
     def sample_sparse(self, lvl: int, pol: Poly):
+        m, n = pol._mm_coeffs.shape()
+        coeffs = zeros(m, n * SIMD_LANE_SIZE, TP=u64)
+        
         if self.hw > self.base_ring.n:
             self.hw = self.base_ring.n
-
-        index = list[int](self.base_ring.n)
-        for i in range(self.base_ring.n): index.append(i)
-
-        random_bytes = self.prng.getrandbytes((self.hw + 7) // 8)
-        pointer = 0
+    
+        index = arange(self.base_ring.n, TP=int)
 
         for i in range(self.hw):
             bit_len = int((self.base_ring.n - i).bitlen()) - 1  # rejection sampling of a random variable between [0, len(index)]
-
             j = self.prng.getrandbits(bit_len)
-            while j >= self.base_ring.n - i:
-                j = self.prng.getrandbits(bit_len)
 
-            coeff = (int(random_bytes[0]) >> (i & 7)) & 1  # random binary digit [0, 1] from the random bytes (0 = 1, 1 = -1)
+            coeff = self.prng.getrandbits(1)  # random binary digit [0, 1] from the random bytes (0 = 1, 1 = -1)
             for k in range(lvl + 1):
-                pol.coeffs[k][index[j]] = self.matrix_values[k][coeff + 1]
+                coeffs[k][index[j]] = self.matrix_values[k][coeff + 1]
 
             # Remove the element in position j of the slice (order not preserved)
-            index[j] = index[len(index)-1]
-            index = index[:len(index)-1]
+            index[j] = index.pop()
 
-            pointer += 1
-
-            if pointer == 8:
-                random_bytes = random_bytes[1:]
-                pointer = 0
-
-        for i in index:
-            for k in range(lvl + 1):
-                pol.coeffs[k][i] = u64(0)
+        return coeffs
     
     def initialize_matrix(self, montgomery):
         self.matrix_values = zeros(len(self.base_ring.modulus), 3, TP=u64)
@@ -1844,19 +1826,28 @@ class TernarySampler(Static[BaseSampler]):
                 self.matrix_values[i][1] = u64(1)
                 self.matrix_values[i][2] = Qi - u64(1)
     
+    def _mm_sample(self, lvl: int, r: Poly):
+        if self.sample_name == 'samplesparse':
+            r._mm_coeffs = self.sample_sparse(lvl, r).vectorize(SIMD_LANE_SIZE)
+        else: raise NotImplementedError()
+
     # ReadLvl samples a polynomial into pol at the speciefied level.
-    def read_lvl(self, lvl: int, pol: Poly):
-        self.sample(lvl, pol)
+    def _mm_read_lvl(self, lvl: int, pol: Poly):
+        self._mm_sample(lvl, pol)
     
     # ReadLvlNew allocates and samples a polynomial at the speficied level.
     def read_lvl_new(self, lvl: int) -> Poly:
         pol = self.base_ring.new_poly_lvl(lvl)
-        self.read_lvl(lvl, pol)
+        pol.temp_vectorize()
+        self._mm_read_lvl(lvl, pol)
+        pol.temp_scatter()
         return pol
 
     # read samples a polynomial into pol.
     def read(self, pol):
-        self.read_lvl(len(self.base_ring.modulus) - 1, pol)
+        pol.temp_vectorize()
+        self._mm_read_lvl(len(self.base_ring.modulus) - 1, pol)
+        pol.temp_scatter()
 
     # ReadNew allocates and samples a polynomial at the max level.
     def read_new(self) -> Poly:
