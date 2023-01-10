@@ -504,6 +504,7 @@ class RTGProtocol:
 	# AllocateShare allocates a party's share in the RTG protocol.
 	def allocate_share(self) -> RTGShare:
 		params = self.params
+		ring_qp = self.params.ring_qp()
 		decomp_rns = self.params.decomp_rns(params.q_count() - 1, params.p_count() - 1)
 		decomp_pw2 = self.params.decomp_pw2(params.q_count() - 1, params.p_count() - 1)
 
@@ -512,12 +513,12 @@ class RTGProtocol:
 		for i in range(decomp_rns):
 			value.append(list[ringqp.Poly](decomp_pw2))
 			for _ in range(decomp_pw2):
-				value[i].append(self.params.ring_qp().new_poly())
+				value[i].append(ring_qp.new_poly())
 
 		return RTGShare(value)
 
 	# GenShare generates a party's share in the RTG protocol.
-	def gen_share(self, sk: rlwe.SecretKey, gal_el: u64, crp: list[list[ringqp.Poly]], share_out: RTGShare):
+	def _mm_gen_share(self, sk: rlwe.SecretKey, gal_el: u64, crp: list[list[ringqp.Poly]], share_out: RTGShare):
 		ring_q = self.params.ring_q
 		ring_qp = self.params.ring_qp()
 
@@ -532,16 +533,10 @@ class RTGProtocol:
 
 		if has_modulus_p:
 			ring_q.permute_ntt(sk.value.p, gal_el_inv, self.buff[1].p)
-			sk.value.q.temp_vectorize()
-			self.buff[0].q.temp_vectorize()
 			ring_q._mm_mul_scalar_bigint(sk.value.q, ring_qp.ring_p.modulus_at_level[level_p], self.buff[0].q)
-			sk.value.q.temp_scatter()
-			self.buff[0].q.temp_scatter()
 		else:
 			level_p = 0
-			sk.value.q.temp_vectorize()
 			ring._mm_copy_lvl(level_q, sk.value.q, self.buff[0].q)
-			self.buff[0].q.temp_scatter()
 
 		rns_decomp = len(share_out.value)
 		bit_decomp = len(share_out.value[0])
@@ -550,17 +545,13 @@ class RTGProtocol:
 		for j in range(bit_decomp):
 			for i in range(rns_decomp):
 				# e
-				share_out.value[i][j].q.temp_vectorize()
 				self.gaussian_sampler_q._mm_read(share_out.value[i][j].q)
-				share_out.value[i][j].q.temp_scatter()
 
-				share_out.value[i][j].temp_vectorize()
 				if has_modulus_p:
 					ring_qp._mm_extend_basis_small_norm_and_center(share_out.value[i][j].q, level_p, None, share_out.value[i][j].p)
 
 				ring_qp._mm_ntt_lazy_lvl(level_q, level_p, share_out.value[i][j], share_out.value[i][j])
 				ring_qp._mm_mform_lvl(level_q, level_p, share_out.value[i][j], share_out.value[i][j])
-				share_out.value[i][j].temp_scatter()
 
 				# a is the CRP
 				# e + sk_in * (qiBarre*qiStar) * 2^w
@@ -572,26 +563,20 @@ class RTGProtocol:
 					if index >= level_q + 1:
 						break
 
-					qi = ring_q.modulus[index]
-					tmp_0 = self.buff[0].q.coeffs[index]
-					tmp_1 = share_out.value[i][j].q.coeffs[index]
+					_mm_qi = ring_q._mm_modulus[index]
+					_mm_tmp_0 = self.buff[0].q._mm_coeffs[index]
+					_mm_tmp_1 = share_out.value[i][j].q._mm_coeffs[index]
 
-					for w in range(ring_q.n):
-						tmp_1[w] = ring.cred(tmp_1[w] + tmp_0[w], qi)
+					for w in range(ring_q._mm_n):
+						_mm_tmp_1[w] = ring._mm_cred(_mm_tmp_1[w] + _mm_tmp_0[w], _mm_qi)
 
 				# sk_in * (qiBarre*qiStar) * 2^w - a*sk + e
-				crp[i][j].temp_vectorize()
-				self.buff[1].temp_vectorize()
-				share_out.value[i][j].temp_vectorize()
 				ring_qp._mm_mul_coeffs_montgomery_and_sub_lvl(level_q, level_p, crp[i][j], self.buff[1], share_out.value[i][j])
-				share_out.value[i][j].temp_scatter()
 
-			self.buff[0].q.temp_vectorize()
 			ring_q._mm_mul_scalar(self.buff[0].q, 1 << self.params.pow2_base, self.buff[0].q)
-			self.buff[0].q.temp_scatter()
 
 	# AggregateShare aggregates two share in the Rotation Key Generation protocol.
-	def aggregate_share(self, share_1: RTGShare, share_2: RTGShare, share_out: RTGShare):
+	def _mm_aggregate_share(self, share_1: RTGShare, share_2: RTGShare, share_out: RTGShare):
 		ring_qp = self.params.ring_qp()
 		level_q = share_1.value[0][0].q.level()
 
@@ -603,11 +588,7 @@ class RTGProtocol:
 		bit_decomp = len(share_out.value[0])
 		for i in range(rns_decomp):
 			for j in range(bit_decomp):
-				share_1.value[i][j].temp_vectorize()
-				share_2.value[i][j].temp_vectorize()
-				share_out.value[i][j].temp_vectorize()
 				ring_qp._mm_add_lvl(level_q, level_p, share_1.value[i][j], share_2.value[i][j], share_out.value[i][j])
-				share_out.value[i][j].temp_scatter()
 
 	# GenRotationKey finalizes the RTG protocol and populates the input RotationKey with the computed collective SwitchingKey.
 	def gen_rotation_key(self, share: RTGShare, crp: list[list[ringqp.Poly]], rot_key: rlwe.SwitchingKey):
@@ -621,7 +602,8 @@ class RTGProtocol:
 
 # NewRTGProtocol creates a RTGProtocol instance.
 def new_rtg_protocol(params: rlwe.Parameters) -> RTGProtocol:
+	ring_qp = params.ring_qp()
 	gaussian_sampler_q = ring.new_gaussian_sampler(utils.new_prng(), params.ring_q, params.sigma, int(6 * params.sigma))
-	buff = [params.ring_qp().new_poly(), params.ring_qp().new_poly()]
+	buff = [ring_qp.new_poly(), ring_qp.new_poly()]
 
 	return RTGProtocol(params=params, gaussian_sampler_q=gaussian_sampler_q, buff=buff)
