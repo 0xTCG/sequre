@@ -5,7 +5,6 @@ import prg
 
 from pickler import pickle, unpickle
 from copy import copy
-from experimental.simd import Vec
 
 import utils
 
@@ -811,10 +810,16 @@ class Poly:
     is_mform: bool
 
     def temp_vectorize(self):
-        self._mm_coeffs = self.coeffs.vectorize(SIMD_LANE_SIZE)
+        self.vectorize_from_buffer()
     
     def temp_scatter(self):
-        self.coeffs = self._mm_coeffs.scatter_inplace()
+        self.scatter_to_buffer()
+
+    def vectorize_from_buffer(self):
+        self._mm_coeffs = self.coeffs.vectorize_bitcast()
+    
+    def scatter_to_buffer(self):
+        self.coeffs = self._mm_coeffs.scatter_bitcast()
     
     def __bool__(self):
         return len(self.coeffs) > 0
@@ -847,6 +852,7 @@ class Poly:
         if not pasteurized: jar += is_ntt.pickle_size()
         is_mform = unpickle(jar, pasteurized, bool)
         pol = Poly(
+            _mm_coeffs=coeffs.vectorize_bitcast(),
             coeffs=coeffs,
             is_ntt=is_ntt,
             is_mform=is_mform)
@@ -858,25 +864,34 @@ class Poly:
             self.is_ntt.pickle_size() + \
             self.is_mform.pickle_size()
 
+    def _mm_set_coeffs(self, _mm_coeffs: list[list[u64xN]]):
+        for i, row in enumerate(_mm_coeffs):
+            for j, _mm_coeff in enumerate(row):
+                self._mm_coeffs[i][j] = _mm_coeff
+    
     def _mm_set(self, other: Poly):
-        self._mm_coeffs = other._mm_coeffs
+        self._mm_set_coeffs(other._mm_coeffs)
         self.is_ntt = other.is_ntt
         self.is_mform = other.is_mform
-    
+
     def copy_values(self, other: Poly):
-        self.coeffs = [copy(row) for row in other.coeffs]
-        self._mm_coeffs = [copy(row) for row in other._mm_coeffs]
+        self._mm_set_coeffs(other._mm_coeffs.copy())
+        self.scatter_to_buffer()
     
     def copy(self) -> Poly:
-        new_poly = Poly()
-        new_poly.copy_values(self)
-        new_poly.is_ntt = self.is_ntt
-        new_poly.is_mform = self.is_mform
-        return new_poly
+        _mm_coeffs = self._mm_coeffs.copy()
+        return Poly(
+            _mm_coeffs=_mm_coeffs,
+            coeffs=_mm_coeffs.scatter_bitcast(),
+            is_ntt=self.is_ntt,
+            is_mform=self.is_mform)
 
     # n returns the number of coefficients of the polynomial, which equals the degree of the Ring cyclotomic polynomial.
     def n(self):
         return len(self.coeffs[0])
+    
+    def _mm_n(self):
+        return len(self._mm_coeffs[0])
 
     # level returns the current number of moduli minus 1.
     def level(self):
@@ -886,22 +901,26 @@ class Poly:
     # If the provided level is larger than the current level, then allocates zero
     # coefficients, otherwise dereferences the coefficients above the provided level.
     def resize(self, level: int):
-        n = self.n()
         if self.level() > level:
-            self.coeffs = self.coeffs[:level + 1]
+            for _ in range(self.level() - level):
+                self.coeffs.pop()
+                self._mm_coeffs.pop()
         elif level > self.level():
             for _ in range(level - self.level()):
-                self.coeffs.append(zeros_vec(n, TP=u64))
+                self._mm_coeffs.append(zeros_vec(self._mm_n(), TP=u64xN))
+            self.scatter_to_buffer()
     
     def randomize(self, upper_bound: int):
         self.coeffs = self.coeffs.rand(u64(upper_bound))
+        self.vectorize_from_buffer()
 
 
 # new_poly creates a new polynomial with n coefficients set to zero and level+1 moduli.
 def new_poly(n, level):
-    coeffs = zeros(level + 1, n, TP=u64)
-    _mm_coeffs = coeffs.vectorize(SIMD_LANE_SIZE)
-    return Poly(coeffs=coeffs, _mm_coeffs=_mm_coeffs)
+    _mm_coeffs = zeros(level + 1, n // SIMD_LANE_SIZE, TP=u64xN)
+    return Poly(
+        coeffs=_mm_coeffs.scatter_bitcast(),
+        _mm_coeffs=_mm_coeffs)
 
 
 # NumberTheoreticTransformerStandard computes the standard nega-cyclic NTT in the ring Z[X]/(X^n+1).
@@ -1434,7 +1453,7 @@ class Ring:
     def _mm_div_round_by_last_modulus_many_ntt_lvl(self, level: int, nb_rescales: int, p0: Poly, buff: Poly, p1: Poly):
         if nb_rescales == 0:
             if p0 != p1:
-                p1._mm_coeffs = p0._mm_coeffs.copy()
+                p1._mm_set_coeffs(p0._mm_coeffs.copy())
         else:
             if nb_rescales > 1:
                 self._mm_inv_ntt_lvl(level, p0, buff)
@@ -1827,7 +1846,7 @@ class TernarySampler(Static[BaseSampler]):
     
     def _mm_sample(self, lvl: int, r: Poly):
         if self.sample_name == 'samplesparse':
-            r._mm_coeffs = self.sample_sparse(lvl, r).vectorize(SIMD_LANE_SIZE)
+            r._mm_set_coeffs(self.sample_sparse(lvl, r).vectorize(SIMD_LANE_SIZE))
         else: raise NotImplementedError()
 
     # ReadLvl samples a polynomial into pol at the speciefied level.
@@ -2126,9 +2145,9 @@ class Decomposer:
             vtimesqmodp = params.vtimesqmodp
             qoverqimodp = params._mm_qoverqimodp
 
-            _mm_p0_q_coeffs = p0_q._mm_coeffs[:level_q + 1].transpose()
-            _mm_p1_q_coeffs = p1_q._mm_coeffs[:level_q + 1].transpose()
-            _mm_p1_p_coeffs = p1_p._mm_coeffs[:level_p + 1].transpose()
+            _mm_p0_q_coeffs = p0_q._mm_coeffs.slice_reference(0, level_q + 1).transpose()
+            _mm_p1_q_coeffs = p1_q._mm_coeffs.slice_reference(0, level_q + 1).transpose()
+            _mm_p1_p_coeffs = p1_p._mm_coeffs.slice_reference(0, level_p + 1).transpose()
             
             y = [u64xN(u64(0)) for _ in range(decomp_lvl + 2)]
             # We loop over each coefficient and apply the basis extension
@@ -2167,8 +2186,8 @@ class Decomposer:
             # Copies the coefficients of polynomials mod the RNS decomposition
             for i in range(p0_idx_st, p0_idx_ed): _mm_p1_q_coeffs[i] = copy(_mm_p0_q_coeffs[i])
 
-            p1_q._mm_coeffs[:level_q + 1] = _mm_p1_q_coeffs
-            p1_p._mm_coeffs[:level_p + 1] = _mm_p1_p_coeffs.transpose()
+            p1_q._mm_set_coeffs(_mm_p1_q_coeffs)
+            p1_p._mm_set_coeffs(_mm_p1_p_coeffs.transpose())
         
 
 # NewDecomposer creates a new Decomposer.
