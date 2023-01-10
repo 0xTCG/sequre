@@ -1,7 +1,6 @@
 """
 Ported from https://github.com/tuneinsight/lattigo/tree/master/ring
 """
-
 import prg
 
 from pickler import pickle, unpickle
@@ -9,9 +8,11 @@ from copy import copy
 
 import utils
 
-from common import big_uint, big_int, BIG_INT_LEN
+from common import big_uint, big_int, BIG_INT_LEN, biguint_mod_inv, bigint_floordiv, bigint_mod, biguint_floordiv, biguint_mod
 
-from ..utils.utils import zeros_vec, zeros
+from ..types.builtin import u64xN, f64xN
+from ..utils.utils import zeros_vec, zeros, arange
+from ..utils.constants import SIMD_LANE_SIZE
 
 
 SMALL_PRIMES = [
@@ -120,37 +121,28 @@ ConjugateInvariantRing = 1
 
 # BRedParams computes the parameters for the BRed algorithm.
 # Returns ((2^128)/q)/(2^64) and (2^128)/q mod 2^64.
-# Relies on fact that 2^128 = d * q + r, where d = (2^128 - 1) / q and r = ((2^128 - 1) % q) + 1
 def bred_params(q: u64):
-    # q_big = q.ext_double()
-    # d = u128(-1) // q_big
-    # r = u128(-1) - d * q_big + u128(1)
-
-    # if r == q_big: d += u128(1)
-
-    # mhi = (d >> u128(64)).trunc_half()
-    # mlo = d.trunc_half()
-
-    # return [mhi, mlo]
-    big_r = big_uint(1) << big_uint(128)
-    big_r = big_r.bigint_floordiv(q.ext_to_bigint())
-
-    mhi = (big_r >> big_uint(64)).trunc_to_u64()
-    mlo = big_r.trunc_to_u64()
+    if q.popcnt() == 1:
+        d = UInt[128](1) << (128 - int(q.bitlen()) + 1)
+    else:
+        d = UInt[128](-1) // q.ext_double()
+    
+    mhi = (d >> 64).trunc_half()
+    mlo = d.trunc_half()
 
     return [mhi, mlo]
 
 
 # BRed computes x*y mod q.
 def bred(x, y, q, u):
-    mhi, mlo = u64(x).mul_overflow(u64(y))
+    mhi, mlo = u64(x).mul_overflow_u64(u64(y))
     r = mhi * u[0]
-    hhi, hlo = mlo.mul_overflow(u[0])
+    hhi, hlo = mlo.mul_overflow_u64(u[0])
     r += hhi
-    lhi, _ = mlo.mul_overflow(u[1])
+    lhi, _ = mlo.mul_overflow_u64(u[1])
     s0, carry = hlo.add_overflow(lhi)
     r += carry
-    hhi, hlo = mhi.mul_overflow(u[1])
+    hhi, hlo = mhi.mul_overflow_u64(u[1])
     r += hhi
     _, carry = hlo.add_overflow(s0)
     r += carry
@@ -176,28 +168,196 @@ def mod_exp_u64(x, e, p):
 # MForm switches a to the Montgomery domain by computing
 # a*2^64 mod q.
 def mform(a, q, u):
-    mhi, _ = a.mul_overflow(u[1])
+    mhi, _ = a.mul_overflow_u64(u[1])
     r = -(a * u[0] + mhi) * q
     if r >= q: r -= q
     return r
 
 
+# MForm switches a to the Montgomery domain by computing
+# a*2^64 mod q.
+def _mm_mform(a, q, u):
+    mhi = a.mulhi(u[1])
+    r = -(a * u[0] + mhi) * q
+    return r.sub_if(q, r.__ge__(q))
+
+
 # InvMForm switches a from the Montgomery domain back to the
 # standard domain by computing a*(1/2^64) mod q.
-def inv_mform(a: u64, q: u64, q_inv: u64) -> u64:
-	r, _ = (a * q_inv).mul_overflow(q)
-	r = q - r
-	if r >= q: r -= q
+def _mm_inv_mform(a: u64xN, q: u64xN, q_inv: u64xN) -> u64xN:
+	r = (a * q_inv).mulhi(q)
+	r, c = q.sub_overflow(r)
+	r = r.sub_if(q, c)
 	return r
+
+
+# MRedParams computes the parameter q_inv = (q^-1) mod 2^64,
+# required for mred.
+def mred_params(q):
+	q_inv = u64(1)
+	for _ in range(63):
+		q_inv *= q
+		q *= q
+
+	return q_inv
 
 
 # mred computes x * y * (1/2^64) mod q.
 def mred(x, y, q, q_inv):
-    mhi, mlo = x.mul_overflow(y)
-    hhi, _ = (mlo * q_inv).mul_overflow(q)
+    mhi, mlo = x.mul_overflow_u64(y)
+    hhi, _ = (mlo * q_inv).mul_overflow_u64(q)
     r = mhi - hhi + q
     if r >= q: r -= q
     return r
+
+
+# mred computes x * y * (1/2^64) mod q.
+def _mm_mred(x, y, q, q_inv):
+    m = x.zext_mul(y)
+    h = (m.trunc_half() * q_inv).mulhi(q)
+    r, c = (m.shift_half().trunc_half() - h).add_overflow(q)
+    return r.sub_if(q, c.bit_flip())
+
+
+# CRed reduce returns a mod q where a is between 0 and 2*q-1.
+def cred(a, q):
+    if a >= q: return a - q
+    return a
+
+
+# CRed reduce returns a mod q where a is between 0 and 2*q-1.
+def _mm_cred(a, q):
+    return a.sub_if(q, a.__ge__(q))
+
+
+# mred_constant computes x * y * (1/2^64) mod q in constant time.
+# The result is between 0 and 2*q-1.
+def mred_constant(x, y, q, q_inv):
+    ahi, alo = x.mul_overflow_u64(y)
+    h, _ = (alo * q_inv).mul_overflow_u64(q)
+    return ahi - h + q
+
+
+def _mm_mred_constant(x: u64xN, y: u64xN, q: u64xN, q_inv: u64xN) -> u64xN:
+    a = x.zext_mul(y)
+    h = (a.trunc_half() * q_inv).mulhi(q)
+    return a.shift_half().trunc_half() - h + q
+
+
+def _mm_butterfly(u: u64xN, v: u64xN, psi: u64xN, two_q: u64xN, four_q: u64xN, q: u64xN, q_inv: u64xN) -> Tuple[u64xN, u64xN]:
+    u = u.sub_if(four_q, u.__ge__(four_q))
+    v = _mm_mred_constant(v, psi, q, q_inv)
+    return u + v, u + two_q - v
+
+
+@llvm
+def _mm_butterfly_inplace_x2_sub(u: u64xN, four_q: u64xN) -> u64xN:
+    %0 = icmp uge <4 x i64> %u, %four_q
+    %1 = and <4 x i1> %0, <i1 1, i1 1, i1 0, i1 0>
+    %2 = sub <4 x i64> %u, %four_q
+    %3 = select <4 x i1> %1, <4 x i64> %2, <4 x i64> %u
+    ret <4 x i64> %3
+
+
+@llvm
+def _mm_butterfly_inplace_x2_shuffle_addend_1(u: u64xN, two_q: u64xN) -> u64xN:
+    %0 = shufflevector <4 x i64> %u, <4 x i64> undef, <4 x i32> <i32 0, i32 1, i32 0, i32 1>
+    %1 = add <4 x i64> %0, %two_q
+    ret <4 x i64> %1
+
+
+@llvm
+def _mm_butterfly_inplace_x2_shuffle_addend_2(u: u64xN) -> u64xN:
+    %0 = shufflevector <4 x i64> %u, <4 x i64> undef, <4 x i32> <i32 2, i32 3, i32 2, i32 3>
+    ret <4 x i64> %0
+
+
+@llvm
+def _mm_butterfly_inplace_x2_twist(u: u64xN) -> u64xN:
+    %0 = sub <4 x i64> zeroinitializer, %u
+    %1 = shufflevector <4 x i64> %u, <4 x i64> %0, <4 x i32> <i32 0, i32 1, i32 6, i32 7>
+    ret <4 x i64> %1
+
+
+def _mm_ntt_intrinsic_inplace(coeffs: u64xN, ntt_psi: u64xN, two_q: u64xN, q: u64xN, q_inv: u64xN) -> u64xN:
+    res = _mm_butterfly_inplace_x2_shuffle_addend_1(coeffs, two_q)
+    mrc = _mm_mred_constant(_mm_butterfly_inplace_x2_shuffle_addend_2(coeffs), ntt_psi, q, q_inv)
+    alt_mrc = _mm_butterfly_inplace_x2_twist(mrc)
+    return res + alt_mrc
+
+
+def _mm_butterfly_inplace_x2(u: u64xN, ntt_psi: u64xN, two_q: u64xN, four_q: u64xN, q: u64xN, q_inv: u64xN) -> u64xN:
+    u = _mm_butterfly_inplace_x2_sub(u, four_q)
+    return _mm_ntt_intrinsic_inplace(u, ntt_psi, two_q, q, q_inv)
+
+
+@llvm
+def _mm_butterfly_inplace_x1_sub(u: u64xN, four_q: u64xN) -> u64xN:
+    %0 = icmp uge <4 x i64> %u, %four_q
+    %1 = and <4 x i1> %0, <i1 1, i1 0, i1 1, i1 0>
+    %2 = sub <4 x i64> %u, %four_q
+    %3 = select <4 x i1> %1, <4 x i64> %2, <4 x i64> %u
+    ret <4 x i64> %3
+
+
+@llvm
+def _mm_butterfly_inplace_x1_shuffle_addend_1(u: u64xN, two_q: u64xN) -> u64xN:
+    %0 = shufflevector <4 x i64> %u, <4 x i64> undef, <4 x i32> <i32 0, i32 0, i32 2, i32 2>
+    %1 = add <4 x i64> %0, %two_q
+    ret <4 x i64> %1
+
+
+@llvm
+def _mm_butterfly_inplace_x1_shuffle_addend_2(u: u64xN) -> u64xN:
+    %0 = shufflevector <4 x i64> %u, <4 x i64> undef, <4 x i32> <i32 1, i32 1, i32 3, i32 3>
+    ret <4 x i64> %0
+
+
+@llvm
+def _mm_butterfly_inplace_x1_twist(u: u64xN) -> u64xN:
+    %0 = sub <4 x i64> zeroinitializer, %u
+    %1 = shufflevector <4 x i64> %u, <4 x i64> %0, <4 x i32> <i32 0, i32 5, i32 2, i32 7>
+    ret <4 x i64> %1
+
+
+def _mm_butterfly_inplace_x1(u: u64xN, ntt_psi: u64xN, two_q: u64xN, four_q: u64xN, q: u64xN, q_inv: u64xN) -> u64xN:
+    u = _mm_butterfly_inplace_x1_sub(u, four_q)
+    res = _mm_butterfly_inplace_x1_shuffle_addend_1(u, two_q)
+    mrc = _mm_mred_constant(_mm_butterfly_inplace_x1_shuffle_addend_2(u), ntt_psi, q, q_inv)
+    alt_mrc = _mm_butterfly_inplace_x1_twist(mrc)
+    return res + alt_mrc
+
+                
+# invbutterfly computes X, Y = U + v, (U - v) * Psi mod q.
+def invbutterfly(u, v, psi, two_q, four_q, q, q_inv):
+    x = u + v
+    if x >= two_q: x -= two_q
+    # At the moment it is not possible to use mred_constant if q > 61 bits
+    y = mred_constant(u + four_q - v, psi, q, q_inv)
+    return x, y
+
+
+# invbutterfly computes X, Y = U + v, (U - v) * Psi mod q.
+def _mm_invbutterfly(u, v, psi, two_q, four_q, q, q_inv):
+    x = u + v
+    x = x.sub_if(two_q, x.__ge__(two_q))
+    # At the moment it is not possible to use mred_constant if q > 61 bits
+    y = _mm_mred_constant(u + four_q - v, psi, q, q_inv)
+    return x, y
+
+
+# bred_add computes a mod q.
+def bred_add(a: u64, q: u64, u0: u64):
+    mhi, _ = a.mul_overflow_u64(u0)
+    r = a - mhi * q
+    if r >= q: r -= q
+    return r
+
+
+# bred_add computes a mod q.
+def _mm_bred_add(a: u64xN, q: u64xN, u0: u64xN):
+    r = a - a.mulhi(u0) * q
+    return r.sub_if(q, r.__ge__(q))
 
 
 # ModexpMontgomery performs the modular exponentiation x^e mod p,
@@ -304,73 +464,35 @@ def primitive_root(q):
     return g
 
 
-# CRed reduce returns a mod q where a is between 0 and 2*q-1.
-def cred(a, q):
-    if a >= q: return a - q
-    return a
-
-
-# mred_constant computes x * y * (1/2^64) mod q in constant time.
-# The result is between 0 and 2*q-1.
-def mred_constant(x, y, q, q_inv):
-	ahi, alo = x.mul_overflow(y)
-	h, _ = (alo * q_inv).mul_overflow(q)
-	return ahi - h + q
-
-
-# butterfly computes X, Y = U + v * Psi, U - v * Psi mod q.
-def butterfly(u, v, psi, two_q, four_q, q, q_inv):
-	if u >= four_q: u -= four_q
-	v = mred_constant(v, psi, q, q_inv)
-	return u + v, u + two_q - v
-
-
-# bred_add computes a mod q.
-def bred_add(a: u64, q: u64, u: list[u64]):
-	mhi, _ = a.mul_overflow(u[0])
-	r = a - mhi * q
-	if r >= q: r -= q
-	return r
-
-
 # AddScalarVec returns p2 = p1 + scalar mod qi.
-def add_scalar_vec(p1: list[u64], p2: list[u64], scalar: u64, qi: u64):
+def _mm_add_scalar_vec(p1: list[u64xN], p2: list[u64xN], scalar: u64xN, qi: u64xN):
 	for j in range(len(p1)):
-		p2[j] = cred(p1[j] + scalar, qi)
+		p2[j] = _mm_cred(p1[j] + scalar, qi)
 
 
 # AddScalarNoModAndNegTwoQiNoModVec returns p2 = 2*qi - p1 + scalar.
-def add_scalar_no_mod_and_neg_two_qi_no_mod_vec(p1: list[u64], p2: list[u64], scalar: u64, qi: u64):
-	twoqi = qi << 1
+def _mm_add_scalar_no_mod_and_neg_two_qi_no_mod_vec(p1: list[u64xN], p2: list[u64xN], scalar: u64xN, qi: u64xN):
+	twoqi = qi << u64xN(u64(1))
 	for j in range(len(p1)):
 		p2[j] = scalar + twoqi - p1[j]
 
 
 # AddScalarNoModVec returns p2 = p1 + scalar.
-def add_scalar_no_mod_vec(p1: list[u64], p2: list[u64], scalar: u64):
+def _mm_add_scalar_no_mod_vec(p1: list[u64xN], p2: list[u64xN], scalar: u64xN):
 	for j in range(len(p1)):
 		p2[j] = p1[j] + scalar
 
 
 # AddVecNoModAndMulScalarMontgomeryVec returns p3 = (p1+p2)*scalar_mont mod qi.
-def add_vec_no_mod_and_mul_scalar_montgomery_vec(p1: list[u64], p2: list[u64], p3: list[u64], scalar_mont: u64, qi: u64, mred_params: u64):
+def _mm_add_vec_no_mod_and_mul_scalar_montgomery_vec(p1: list[u64xN], p2: list[u64xN], p3: list[u64xN], scalar_mont: u64xN, qi: u64xN, mred_params: u64xN):
 	for j in range(len(p1)):
-		p3[j] = mred(p1[j] + p2[j], scalar_mont, qi, mred_params)
+		p3[j] = _mm_mred(p1[j] + p2[j], scalar_mont, qi, mred_params)
 
 
 # ReduceVec returns p2 = p1 mod qi.
-def reduce_vec(p1, p2, qi, bred_params):
+def _mm_reduce_vec(p1, p2, qi, bred_params):
     for j in range(len(p1)):
-        p2[j] = bred_add(p1[j], qi, bred_params)
-
-
-# invbutterfly computes X, Y = U + v, (U - v) * Psi mod q.
-def invbutterfly(u, v, psi, two_q, four_q, q, q_inv):
-    x = u + v
-    if x >= two_q: x -= two_q
-    # At the moment it is not possible to use mred_constant if q > 61 bits
-    y = mred_constant(u + four_q - v, psi, q, q_inv)
-    return x, y
+        p2[j] = _mm_bred_add(p1[j], qi, bred_params)
 
 
 # MFormVec returns p2 = p1 * 2^64 mod qi.
@@ -379,508 +501,413 @@ def mform_vec(p1, p2, qi, bred_params):
 		p2[j] = mform(p1[j], qi, bred_params)
 
 
-# InvMFormVec returns p2 = p1 * (2^64)^-1 mod qi.
-def inv_mform_vec(p1: list[u64], p2: list[u64], qi: u64, mred_params: u64):
+# MFormVec returns p2 = p1 * 2^64 mod qi.
+def _mm_mform_vec(p1, p2, qi, bred_params):
 	for j in range(len(p1)):
-		p2[j] = inv_mform(p1[j], qi, mred_params)
+		p2[j] = _mm_mform(p1[j], qi, bred_params)
+
+
+# InvMFormVec returns p2 = p1 * (2^64)^-1 mod qi.
+def _mm_inv_mform_vec(p1: list[u64xN], p2: list[u64xN], qi: u64xN, mred_params: u64xN):
+	for j in range(len(p1)):
+		p2[j] = _mm_inv_mform(p1[j], qi, mred_params)
 
 
 # MulScalarMontgomeryVec returns p2 = p1*scalar_mont mod qi.
-def mul_scalar_montgomery_vec(p1, p2, scalar_mont, qi, mred_params):
+def _mm_mul_scalar_montgomery_vec(p1, p2, scalar_mont, qi, mred_params):
 	for j in range(len(p1)):
-		p2[j] = mred(p1[j], scalar_mont, qi, mred_params)
+		p2[j] = _mm_mred(p1[j], scalar_mont, qi, mred_params)
+
+
+# MulScalarMontgomeryVec returns p2 = p1*scalar_mont mod qi.
+def _mm_mul_scalar_montgomery_vec(p1, p2, scalar_mont, qi, mred_params):
+	for j in range(len(p1)):
+		p2[j] = _mm_mred(p1[j], scalar_mont, qi, mred_params)
 
 
 # mul_scalar_montgomery_constant_vec returns p2 = p1*scalar_mont mod qi with output coefficients in range [0, 2qi-1].
-def mul_scalar_montgomery_constant_vec(p1: list[u64], p2: list[u64], scalar_mont: u64, qi: u64, mred_params: u64):
+def _mm_mul_scalar_montgomery_constant_vec(p1: list[u64xN], p2: list[u64xN], scalar_mont: u64xN, qi: u64xN, mred_params: u64xN):
 	for j in range(len(p1)):
-		p2[j] = mred_constant(p1[j], scalar_mont, qi, mred_params)
+		p2[j] = _mm_mred_constant(p1[j], scalar_mont, qi, mred_params)
 
 
 # MulcoeffsMontgomeryVec returns p3 = p1*p2 mod qi.
-def mul_coeffs_montgomery_vec(p1, p2, p3, qi, mred_params):
+def _mm_mul_coeffs_montgomery_vec(p1, p2, p3, qi, mred_params):
     for j in range(len(p1)):
-        p3[j] = mred(p1[j], p2[j], qi, mred_params)
+        p3[j] = _mm_mred(p1[j], p2[j], qi, mred_params)
 
 
 # MulcoeffsMontgomeryAndSubVec returns p3 = p3 - p1*p2 mod qi.
-def mul_coeffs_montgomery_and_sub_vec(p1, p2, p3, qi, mred_params):
+def _mm_mul_coeffs_montgomery_and_sub_vec(p1, p2, p3, qi, mred_params):
 	for j in range(len(p1)):
-		p3[j] = cred(p3[j] + (qi - mred(p1[j], p2[j], qi, mred_params)), qi)
+		p3[j] = _mm_cred(p3[j] + (qi - _mm_mred(p1[j], p2[j], qi, mred_params)), qi)
 
 
 # MulcoeffsMontgomeryConstantVec returns p3 = p1*p2 mod qi with output coefficients in range [0, 2qi-1].
-def mul_coeffs_montgomery_constant_vec(p1: list[u64], p2: list[u64], p3: list[u64], qi: u64, mred_params: u64):
+def _mm_mul_coeffs_montgomery_constant_vec(p1: list[u64xN], p2: list[u64xN], p3: list[u64xN], qi: u64xN, mred_params: u64xN):
 	for j in range(len(p1)):
-		p3[j] = mred_constant(p1[j], p2[j], qi, mred_params)
+		p3[j] = _mm_mred_constant(p1[j], p2[j], qi, mred_params)
 
 
 # MulcoeffsMontgomeryConstantAndAddNoModVec returns p3 = p3 + p1*p2 mod qi with output coefficients in range [0, 3qi-2].
-def mul_coeffs_montgomery_constant_and_add_no_mod_vec(p1: list[u64], p2: list[u64], p3: list[u64], qi: u64, mred_params: u64):
+def _mm_mul_coeffs_montgomery_constant_and_add_no_mod_vec(p1: list[u64xN], p2: list[u64xN], p3: list[u64xN], qi: u64xN, mred_params: u64xN):
 	for j in range(len(p1)):
-		p3[j] += mred_constant(p1[j], p2[j], qi, mred_params)
+		p3[j] += _mm_mred_constant(p1[j], p2[j], qi, mred_params)
 
 
 # MulcoeffsMontgomeryAndAddVec returns p3 = p3 + (p1*p2) mod qi.
-def mul_coeffs_montgomery_and_add_vec(p1: list[u64], p2: list[u64], p3: list[u64], qi: u64, mred_params: u64):
+def _mm_mul_coeffs_montgomery_and_add_vec(p1: list[u64xN], p2: list[u64xN], p3: list[u64xN], qi: u64xN, mred_params: u64xN):
 	for j in range(len(p1)):
-		p3[j] = cred(p3[j] + mred(p1[j], p2[j], qi, mred_params), qi)
+		p3[j] = _mm_cred(p3[j] + _mm_mred(p1[j], p2[j], qi, mred_params), qi)
 
 
 # sub_vec_and_mul_scalar_montgomery_two_qi_vec returns p3 = (p1 + twoqi - p2) * scalar_mont mod qi.
-def sub_vec_and_mul_scalar_montgomery_two_qi_vec(p1: list[u64], p2: list[u64], p3: list[u64], scalar_mont: u64, qi: u64, mred_params: u64):
-	twoqi = qi << 1
+def _mm_sub_vec_and_mul_scalar_montgomery_two_qi_vec(p1: list[u64xN], p2: list[u64xN], p3: list[u64xN], scalar_mont: u64xN, qi: u64xN, mred_params: u64xN):
+	twoqi = qi << u64xN(u64(1))
 	for j in range(len(p1)):
-		p3[j] = mred(twoqi - p2[j] + p1[j], scalar_mont, qi, mred_params)
+		p3[j] = _mm_mred(twoqi - p2[j] + p1[j], scalar_mont, qi, mred_params)
+
 
 # NegVec returns p2 = -p1 mod qi.
-def neg_vec(p1: list[u64], p2: list[u64], qi: u64):
+def _mm_neg_vec(p1: list[u64xN], p2: list[u64xN], qi: u64xN):
 	for j in range(len(p1)): p2[j] = qi - p1[j]
 
 
 # AddVec returns p3 = p1 + p2 mod qi.
-def add_vec(p1: list[u64], p2: list[u64], p3: list[u64], qi: u64):
-	for j in range(len(p1)): p3[j] = cred(p1[j] + p2[j], qi)
+def _mm_add_vec(p1: list[u64xN], p2: list[u64xN], p3: list[u64xN], qi: u64xN):
+    for j in range(len(p1)):
+        p3[j] = _mm_cred(p1[j] + p2[j], qi)
 
 
 # sub_vec returns p3 = p1 - p2 mod qi.
-def sub_vec(p1: list[u64], p2: list[u64], p3: list[u64], qi: u64):
-	for j in range(len(p1)): p3[j] = cred((p1[j] + qi) - p2[j], qi)
+def _mm_sub_vec(p1: list[u64xN], p2: list[u64xN], p3: list[u64xN], qi: u64xN):
+    for j in range(len(p1)):
+        p3[j] = _mm_cred((p1[j] + qi) - p2[j], qi)
 
 
-# ntt_lazy computes the NTT on the input coefficients using the input parameters with output values in the range [0, 2q-1].
-def ntt_lazy(coeffs_in: list[u64], coeffs_out: list[u64], n: int, ntt_psi: list[u64], q: u64, q_inv: u64, bred_params: list[u64]):
-    four_q = u64(4) * q
-    two_q = u64(2) * q
+# mask_vec returns p2 = (p1>>w) & mask
+def _mm_mask_vec(p1: list[u64xN], p2: list[u64xN], w: u64xN, mask: u64xN):
+    for j in range(len(p1)):
+        p2[j] = (p1[j] >> w) & mask
 
+
+@llvm
+def _mm_mask_half(u: u64xN) -> u64xN:
+    %0 = shufflevector <4 x i64> zeroinitializer, <4 x i64> %u, <4 x i32> <i32 0, i32 0, i32 4, i32 4>
+    ret <4 x i64> %0
+
+
+@llvm
+def _mm_mask_alternate(u: u64xN) -> u64xN:
+    %0 = shufflevector <4 x i64> zeroinitializer, <4 x i64> %u, <4 x i32> <i32 0, i32 4, i32 0, i32 4>
+    ret <4 x i64> %0
+
+
+def _mm_ntt_lazy_x4(
+        coeffs_in: list[u64xN],
+        coeffs_out: list[u64xN],
+        n: int,
+        ntt_psi: list[u64],
+        q: u64xN,
+        q_inv: u64xN):
+    assert SIMD_LANE_SIZE == 4
+    
     # Copy the result of the first round of butterflies on p2 with approximate reduction
+    two_q = q << u64xN(u64(1))
+    four_q = q << u64xN(u64(2))
+    two_q_masked_half = _mm_mask_half(two_q)
+    two_q_masked_alternate = _mm_mask_alternate(two_q)
     t = n >> 1
-    F = ntt_psi[1]
-    jx, jy = 0, t
+    _mm_ntt_psi = u64xN(ntt_psi[1])
 
-    while jx <= t - 1:
-        V = mred_constant(coeffs_in[jy + 0], F, q, q_inv)
-        coeffs_out[jx + 0], coeffs_out[jy + 0] = coeffs_in[jx + 0] + V, coeffs_in[jx + 0] + two_q - V
-
-        V = mred_constant(coeffs_in[jy + 1], F, q, q_inv)
-        coeffs_out[jx + 1], coeffs_out[jy + 1] = coeffs_in[jx + 1] + V, coeffs_in[jx + 1] + two_q - V
-
-        V = mred_constant(coeffs_in[jy + 2], F, q, q_inv)
-        coeffs_out[jx + 2], coeffs_out[jy + 2] = coeffs_in[jx + 2] + V, coeffs_in[jx + 2] + two_q - V
-
-        V = mred_constant(coeffs_in[jy + 3], F, q, q_inv)
-        coeffs_out[jx + 3], coeffs_out[jy + 3] = coeffs_in[jx + 3] + V, coeffs_in[jx + 3] + two_q - V
-
-        V = mred_constant(coeffs_in[jy + 4], F, q, q_inv)
-        coeffs_out[jx + 4], coeffs_out[jy + 4] = coeffs_in[jx + 4] + V, coeffs_in[jx + 4] + two_q - V
-
-        V = mred_constant(coeffs_in[jy + 5], F, q, q_inv)
-        coeffs_out[jx + 5], coeffs_out[jy + 5] = coeffs_in[jx + 5] + V, coeffs_in[jx + 5] + two_q - V
-
-        V = mred_constant(coeffs_in[jy + 6], F, q, q_inv)
-        coeffs_out[jx + 6], coeffs_out[jy + 6] = coeffs_in[jx + 6] + V, coeffs_in[jx + 6] + two_q - V
-
-        V = mred_constant(coeffs_in[jy + 7], F, q, q_inv)
-        coeffs_out[jx + 7], coeffs_out[jy + 7] = coeffs_in[jx + 7] + V, coeffs_in[jx + 7] + two_q - V
-
-        jx, jy = jx + 8, jy + 8
+    t_mm = t >> 2
+    for jx in range(t_mm):
+        V = _mm_mred_constant(coeffs_in[jx + t_mm], _mm_ntt_psi, q, q_inv)
+        coeffs_out[jx], coeffs_out[jx + t_mm] = coeffs_in[jx] + V, coeffs_in[jx] + two_q - V
     
 	# Continue the rest of the second to the n-1 butterflies on p2 with approximate reduction
     m = 2
     while m < n:
-        reduce = (m.bitlen() & 1 == 1)
+        reduce = (m.bitlen() & 1) == 1
         t >>= 1
+        t_mm = t >> 2
 
         if t >= 8:
             for i in range(m):
-                j1 = (i * t) << 1
-                j2 = j1 + t - 1
-                F = ntt_psi[m + i]
+                j1 = (i * t_mm) << 1
+                _mm_F = u64xN(ntt_psi[m + i])
 
                 if reduce:
-                    jx, jy = j1, j1 + t
-                    while jx <= j2:
-                        coeffs_out[jx + 0], coeffs_out[jy + 0] = butterfly(coeffs_out[jx + 0], coeffs_out[jy + 0], F, two_q, four_q, q, q_inv)
-                        coeffs_out[jx + 1], coeffs_out[jy + 1] = butterfly(coeffs_out[jx + 1], coeffs_out[jy + 1], F, two_q, four_q, q, q_inv)
-                        coeffs_out[jx + 2], coeffs_out[jy + 2] = butterfly(coeffs_out[jx + 2], coeffs_out[jy + 2], F, two_q, four_q, q, q_inv)
-                        coeffs_out[jx + 3], coeffs_out[jy + 3] = butterfly(coeffs_out[jx + 3], coeffs_out[jy + 3], F, two_q, four_q, q, q_inv)
-                        coeffs_out[jx + 4], coeffs_out[jy + 4] = butterfly(coeffs_out[jx + 4], coeffs_out[jy + 4], F, two_q, four_q, q, q_inv)
-                        coeffs_out[jx + 5], coeffs_out[jy + 5] = butterfly(coeffs_out[jx + 5], coeffs_out[jy + 5], F, two_q, four_q, q, q_inv)
-                        coeffs_out[jx + 6], coeffs_out[jy + 6] = butterfly(coeffs_out[jx + 6], coeffs_out[jy + 6], F, two_q, four_q, q, q_inv)
-                        coeffs_out[jx + 7], coeffs_out[jy + 7] = butterfly(coeffs_out[jx + 7], coeffs_out[jy + 7], F, two_q, four_q, q, q_inv)
-
-                        jx, jy = jx + 8, jy + 8
+                    for jx in range(j1, j1 + t_mm):
+                        coeffs_out[jx], coeffs_out[jx + t_mm] = _mm_butterfly(coeffs_out[jx], coeffs_out[jx + t_mm], _mm_F, two_q, four_q, q, q_inv)
                 else:
-                    jx, jy = j1, j1 + t
-                    while jx <= j2:
-                        V = mred_constant(coeffs_out[jy + 0], F, q, q_inv)
-                        coeffs_out[jx + 0], coeffs_out[jy + 0] = coeffs_out[jx + 0]+V, coeffs_out[jx + 0]+two_q-V
-
-                        V = mred_constant(coeffs_out[jy + 1], F, q, q_inv)
-                        coeffs_out[jx + 1], coeffs_out[jy + 1] = coeffs_out[jx + 1]+V, coeffs_out[jx + 1]+two_q-V
-
-                        V = mred_constant(coeffs_out[jy + 2], F, q, q_inv)
-                        coeffs_out[jx + 2], coeffs_out[jy + 2] = coeffs_out[jx + 2]+V, coeffs_out[jx + 2]+two_q-V
-
-                        V = mred_constant(coeffs_out[jy + 3], F, q, q_inv)
-                        coeffs_out[jx + 3], coeffs_out[jy + 3] = coeffs_out[jx + 3]+V, coeffs_out[jx + 3]+two_q-V
-
-                        V = mred_constant(coeffs_out[jy + 4], F, q, q_inv)
-                        coeffs_out[jx + 4], coeffs_out[jy + 4] = coeffs_out[jx + 4]+V, coeffs_out[jx + 4]+two_q-V
-
-                        V = mred_constant(coeffs_out[jy + 5], F, q, q_inv)
-                        coeffs_out[jx + 5], coeffs_out[jy + 5] = coeffs_out[jx + 5]+V, coeffs_out[jx + 5]+two_q-V
-
-                        V = mred_constant(coeffs_out[jy + 6], F, q, q_inv)
-                        coeffs_out[jx + 6], coeffs_out[jy + 6] = coeffs_out[jx + 6]+V, coeffs_out[jx + 6]+two_q-V
-
-                        V = mred_constant(coeffs_out[jy + 7], F, q, q_inv)
-                        coeffs_out[jx + 7], coeffs_out[jy + 7] = coeffs_out[jx + 7]+V, coeffs_out[jx + 7]+two_q-V
-
-                        jx, jy = jx+8, jy+8
+                    for jx in range(j1, j1 + t_mm):
+                        V = _mm_mred_constant(coeffs_out[jx + t_mm], _mm_F, q, q_inv)
+                        coeffs_out[jx], coeffs_out[jx + t_mm] = coeffs_out[jx] + V, coeffs_out[jx] + two_q - V
         elif t == 4:
             if reduce:
-                i, j1 = m, 0
-                while i < 2 * m:
-                    coeffs_out[j1 + 0], coeffs_out[j1 + 4] = butterfly(coeffs_out[j1 + 0], coeffs_out[j1 + 4], ntt_psi[i + 0], two_q, four_q, q, q_inv)
-                    coeffs_out[j1 + 1], coeffs_out[j1 + 5] = butterfly(coeffs_out[j1 + 1], coeffs_out[j1 + 5], ntt_psi[i + 0], two_q, four_q, q, q_inv)
-                    coeffs_out[j1 + 2], coeffs_out[j1 + 6] = butterfly(coeffs_out[j1 + 2], coeffs_out[j1 + 6], ntt_psi[i + 0], two_q, four_q, q, q_inv)
-                    coeffs_out[j1 + 3], coeffs_out[j1 + 7] = butterfly(coeffs_out[j1 + 3], coeffs_out[j1 + 7], ntt_psi[i + 0], two_q, four_q, q, q_inv)
-                    coeffs_out[j1 + 8], coeffs_out[j1 + 12] = butterfly(coeffs_out[j1 + 8], coeffs_out[j1 + 12], ntt_psi[i + 1], two_q, four_q, q, q_inv)
-                    coeffs_out[j1 + 9], coeffs_out[j1 + 13] = butterfly(coeffs_out[j1 + 9], coeffs_out[j1 + 13], ntt_psi[i + 1], two_q, four_q, q, q_inv)
-                    coeffs_out[j1 + 10], coeffs_out[j1 + 14] = butterfly(coeffs_out[j1 + 10], coeffs_out[j1 + 14], ntt_psi[i + 1], two_q, four_q, q, q_inv)
-                    coeffs_out[j1 + 11], coeffs_out[j1 + 15] = butterfly(coeffs_out[j1 + 11], coeffs_out[j1 + 15], ntt_psi[i + 1], two_q, four_q, q, q_inv)
+                j1 = 0
+                for i in range(m, m << 1, 2):
+                    _mm_ntt_psi = u64xN(ntt_psi[i])
+                    coeffs_out[j1], coeffs_out[j1 + 1] = _mm_butterfly(coeffs_out[j1], coeffs_out[j1 + 1], _mm_ntt_psi, two_q, four_q, q, q_inv)
 
-                    i, j1 = i + 2, j1 + 4 * t
+                    _mm_ntt_psi = u64xN(ntt_psi[i + 1])
+                    coeffs_out[j1 + 2], coeffs_out[j1 + 3] = _mm_butterfly(coeffs_out[j1 + 2], coeffs_out[j1 + 3], _mm_ntt_psi, two_q, four_q, q, q_inv)
+
+                    j1 += 4
             else:
-                i, j1 = m, 0
-                while i < 2 * m:
-                    V = mred_constant(coeffs_out[j1 + 4], ntt_psi[i + 0], q, q_inv)
-                    coeffs_out[j1 + 0], coeffs_out[j1 + 4] = coeffs_out[j1 + 0]+V, coeffs_out[j1 + 0]+two_q-V
+                j1 = 0
+                for i in range(m, m << 1, 2):
+                    _mm_ntt_psi = u64xN(ntt_psi[i])
+                    V = _mm_mred_constant(coeffs_out[j1 + 1], _mm_ntt_psi, q, q_inv)
+                    coeffs_out[j1], coeffs_out[j1 + 1] = coeffs_out[j1] + V, coeffs_out[j1] + two_q - V
 
-                    V = mred_constant(coeffs_out[j1 + 5], ntt_psi[i + 0], q, q_inv)
-                    coeffs_out[j1 + 1], coeffs_out[j1 + 5] = coeffs_out[j1 + 1]+V, coeffs_out[j1 + 1]+two_q-V
+                    _mm_ntt_psi = u64xN(ntt_psi[i + 1])
+                    V = _mm_mred_constant(coeffs_out[j1 + 3], _mm_ntt_psi, q, q_inv)
+                    coeffs_out[j1 + 2], coeffs_out[j1 + 3] = coeffs_out[j1 + 2] + V, coeffs_out[j1 + 2] + two_q - V
 
-                    V = mred_constant(coeffs_out[j1 + 6], ntt_psi[i + 0], q, q_inv)
-                    coeffs_out[j1 + 2], coeffs_out[j1 + 6] = coeffs_out[j1 + 2]+V, coeffs_out[j1 + 2]+two_q-V
-
-                    V = mred_constant(coeffs_out[j1 + 7], ntt_psi[i + 0], q, q_inv)
-                    coeffs_out[j1 + 3], coeffs_out[j1 + 7] = coeffs_out[j1 + 3]+V, coeffs_out[j1 + 3]+two_q-V
-
-                    V = mred_constant(coeffs_out[j1 + 12], ntt_psi[i + 1], q, q_inv)
-                    coeffs_out[j1 + 8], coeffs_out[j1 + 12] = coeffs_out[j1 + 8]+V, coeffs_out[j1 + 8]+two_q-V
-
-                    V = mred_constant(coeffs_out[j1 + 13], ntt_psi[i + 1], q, q_inv)
-                    coeffs_out[j1 + 9], coeffs_out[j1 + 13] = coeffs_out[j1 + 9]+V, coeffs_out[j1 + 9]+two_q-V
-
-                    V = mred_constant(coeffs_out[j1 + 14], ntt_psi[i + 1], q, q_inv)
-                    coeffs_out[j1 + 10], coeffs_out[j1 + 14] = coeffs_out[j1 + 10]+V, coeffs_out[j1 + 10]+two_q-V
-
-                    V = mred_constant(coeffs_out[j1 + 15], ntt_psi[i + 1], q, q_inv)
-                    coeffs_out[j1 + 11], coeffs_out[j1 + 15] = coeffs_out[j1 + 11]+V, coeffs_out[j1 + 11]+two_q-V
-
-                    i, j1 = i + 2, j1 + 4 * t
+                    j1 += 4
         elif t == 2:
             if reduce:
-                i, j1 = m, 0
-                while i < 2 * m:
-                    coeffs_out[j1 + 0], coeffs_out[j1 + 2] = butterfly(coeffs_out[j1 + 0], coeffs_out[j1 + 2], ntt_psi[i + 0], two_q, four_q, q, q_inv)
-                    coeffs_out[j1 + 1], coeffs_out[j1 + 3] = butterfly(coeffs_out[j1 + 1], coeffs_out[j1 + 3], ntt_psi[i + 0], two_q, four_q, q, q_inv)
-                    coeffs_out[j1 + 4], coeffs_out[j1 + 6] = butterfly(coeffs_out[j1 + 4], coeffs_out[j1 + 6], ntt_psi[i + 1], two_q, four_q, q, q_inv)
-                    coeffs_out[j1 + 5], coeffs_out[j1 + 7] = butterfly(coeffs_out[j1 + 5], coeffs_out[j1 + 7], ntt_psi[i + 1], two_q, four_q, q, q_inv)
-                    coeffs_out[j1 + 8], coeffs_out[j1 + 10] = butterfly(coeffs_out[j1 + 8], coeffs_out[j1 + 10], ntt_psi[i + 2], two_q, four_q, q, q_inv)
-                    coeffs_out[j1 + 9], coeffs_out[j1 + 11] = butterfly(coeffs_out[j1 + 9], coeffs_out[j1 + 11], ntt_psi[i + 2], two_q, four_q, q, q_inv)
-                    coeffs_out[j1 + 12], coeffs_out[j1 + 14] = butterfly(coeffs_out[j1 + 12], coeffs_out[j1 + 14], ntt_psi[i + 3], two_q, four_q, q, q_inv)
-                    coeffs_out[j1 + 13], coeffs_out[j1 + 15] = butterfly(coeffs_out[j1 + 13], coeffs_out[j1 + 15], ntt_psi[i + 3], two_q, four_q, q, q_inv)
+                j1 = 0
+                for i in range(m, m << 1, 4):
+                    coeffs_out[j1] = _mm_butterfly_inplace_x2(coeffs_out[j1], u64xN(ntt_psi[i]), two_q_masked_half, four_q, q, q_inv)
+                    coeffs_out[j1 + 1] = _mm_butterfly_inplace_x2(coeffs_out[j1 + 1], u64xN(ntt_psi[i + 1]), two_q_masked_half, four_q, q, q_inv)
+                    coeffs_out[j1 + 2] = _mm_butterfly_inplace_x2(coeffs_out[j1 + 2], u64xN(ntt_psi[i + 2]), two_q_masked_half, four_q, q, q_inv)
+                    coeffs_out[j1 + 3] = _mm_butterfly_inplace_x2(coeffs_out[j1 + 3], u64xN(ntt_psi[i + 3]), two_q_masked_half, four_q, q, q_inv)
 
-                    i, j1 = i+4, j1+8*t
+                    j1 += 4
             else:
-                i, j1 = m, 0
-                while i < 2 * m:
-                    V = mred_constant(coeffs_out[j1 + 2], ntt_psi[i + 0], q, q_inv)
-                    coeffs_out[j1 + 0], coeffs_out[j1 + 2] = coeffs_out[j1 + 0]+V, coeffs_out[j1 + 0]+two_q-V
+                j1 = 0
+                for i in range(m, m << 1, 4):
+                    coeffs_out[j1] = _mm_ntt_intrinsic_inplace(coeffs_out[j1], u64xN(ntt_psi[i]), two_q_masked_half, q, q_inv)
+                    coeffs_out[j1 + 1] = _mm_ntt_intrinsic_inplace(coeffs_out[j1 + 1], u64xN(ntt_psi[i + 1]), two_q_masked_half, q, q_inv)
+                    coeffs_out[j1 + 2] = _mm_ntt_intrinsic_inplace(coeffs_out[j1 + 2], u64xN(ntt_psi[i + 2]), two_q_masked_half, q, q_inv)
+                    coeffs_out[j1 + 3] = _mm_ntt_intrinsic_inplace(coeffs_out[j1 + 3], u64xN(ntt_psi[i + 3]), two_q_masked_half, q, q_inv)
 
-                    V = mred_constant(coeffs_out[j1 + 3], ntt_psi[i + 0], q, q_inv)
-                    coeffs_out[j1 + 1], coeffs_out[j1 + 3] = coeffs_out[j1 + 1]+V, coeffs_out[j1 + 1]+two_q-V
-
-                    V = mred_constant(coeffs_out[j1 + 6], ntt_psi[i + 1], q, q_inv)
-                    coeffs_out[j1 + 4], coeffs_out[j1 + 6] = coeffs_out[j1 + 4]+V, coeffs_out[j1 + 4]+two_q-V
-
-                    V = mred_constant(coeffs_out[j1 + 7], ntt_psi[i + 1], q, q_inv)
-                    coeffs_out[j1 + 5], coeffs_out[j1 + 7] = coeffs_out[j1 + 5]+V, coeffs_out[j1 + 5]+two_q-V
-
-                    V = mred_constant(coeffs_out[j1 + 10], ntt_psi[i + 2], q, q_inv)
-                    coeffs_out[j1 + 8], coeffs_out[j1 + 10] = coeffs_out[j1 + 8]+V, coeffs_out[j1 + 8]+two_q-V
-
-                    V = mred_constant(coeffs_out[j1 + 11], ntt_psi[i + 2], q, q_inv)
-                    coeffs_out[j1 + 9], coeffs_out[j1 + 11] = coeffs_out[j1 + 9]+V, coeffs_out[j1 + 9]+two_q-V
-
-                    V = mred_constant(coeffs_out[j1 + 14], ntt_psi[i + 3], q, q_inv)
-                    coeffs_out[j1 + 12], coeffs_out[j1 + 14] = coeffs_out[j1 + 12]+V, coeffs_out[j1 + 12]+two_q-V
-
-                    V = mred_constant(coeffs_out[j1 + 15], ntt_psi[i + 3], q, q_inv)
-                    coeffs_out[j1 + 13], coeffs_out[j1 + 15] = coeffs_out[j1 + 13]+V, coeffs_out[j1 + 13]+two_q-V
-
-                    i, j1 = i + 4, j1 + 8 * t
+                    j1 += 4
         else:
-            i, j1 = m, 0
-            while i < 2 * m:
-                coeffs_out[j1 + 0], coeffs_out[j1 + 1] = butterfly(coeffs_out[j1 + 0], coeffs_out[j1 + 1], ntt_psi[i + 0], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 2], coeffs_out[j1 + 3] = butterfly(coeffs_out[j1 + 2], coeffs_out[j1 + 3], ntt_psi[i + 1], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 4], coeffs_out[j1 + 5] = butterfly(coeffs_out[j1 + 4], coeffs_out[j1 + 5], ntt_psi[i + 2], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 6], coeffs_out[j1 + 7] = butterfly(coeffs_out[j1 + 6], coeffs_out[j1 + 7], ntt_psi[i + 3], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 8], coeffs_out[j1 + 9] = butterfly(coeffs_out[j1 + 8], coeffs_out[j1 + 9], ntt_psi[i + 4], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 10], coeffs_out[j1 + 11] = butterfly(coeffs_out[j1 + 10], coeffs_out[j1 + 11], ntt_psi[i + 5], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 12], coeffs_out[j1 + 13] = butterfly(coeffs_out[j1 + 12], coeffs_out[j1 + 13], ntt_psi[i + 6], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 14], coeffs_out[j1 + 15] = butterfly(coeffs_out[j1 + 14], coeffs_out[j1 + 15], ntt_psi[i + 7], two_q, four_q, q, q_inv)
+            j1 = 0
+            for i in range(m, m << 1, 8):
+                _mm_ntt_psi = u64xN([ntt_psi[i], ntt_psi[i], ntt_psi[i + 1], ntt_psi[i + 1]])
+                coeffs_out[j1] = _mm_butterfly_inplace_x1(coeffs_out[j1], _mm_ntt_psi, two_q_masked_alternate, four_q, q, q_inv)
+                _mm_ntt_psi = u64xN([ntt_psi[i + 2], ntt_psi[i + 2], ntt_psi[i + 3], ntt_psi[i + 3]])
+                coeffs_out[j1 + 1] = _mm_butterfly_inplace_x1(coeffs_out[j1 + 1], _mm_ntt_psi, two_q_masked_alternate, four_q, q, q_inv)
+                _mm_ntt_psi = u64xN([ntt_psi[i + 4], ntt_psi[i + 4], ntt_psi[i + 5], ntt_psi[i + 5]])
+                coeffs_out[j1 + 2] = _mm_butterfly_inplace_x1(coeffs_out[j1 + 2], _mm_ntt_psi, two_q_masked_alternate, four_q, q, q_inv)
+                _mm_ntt_psi = u64xN([ntt_psi[i + 6], ntt_psi[i + 6], ntt_psi[i + 7], ntt_psi[i + 7]])
+                coeffs_out[j1 + 3] = _mm_butterfly_inplace_x1(coeffs_out[j1 + 3], _mm_ntt_psi, two_q_masked_alternate, four_q, q, q_inv)
 
-                i, j1 = i + 8, j1 + 16
+                j1 += 4
 
         m <<= 1
 
 
-def inv_ntt_core(coeffs_in, coeffs_out, n, ntt_psi_inv, q, q_inv):
-    f = u64(0)
+def _mm_invbutterfly_inplace_0_x4(coeffs: u64xN, ntt_psi_inv_0: u64, ntt_psi_inv_1: u64, two_q: u64, four_q: u64, q: u64, q_inv: u64) -> u64xN:
+    coeffs_in = coeffs.scatter()
+    c0, c1 = invbutterfly(coeffs_in[0], coeffs_in[1], ntt_psi_inv_0, two_q, four_q, q, q_inv)
+    c2, c3 = invbutterfly(coeffs_in[2], coeffs_in[3], ntt_psi_inv_1, two_q, four_q, q, q_inv)
+    return u64xN([c0, c1, c2, c3])
+
+
+def _mm_invbutterfly_inplace_1_x4(coeffs: u64xN, ntt_psi_inv: u64, two_q: u64, four_q: u64, q: u64, q_inv: u64) -> u64xN:
+    coeffs_out = coeffs.scatter()
+    coeffs_out[0], coeffs_out[2] = invbutterfly(coeffs_out[0], coeffs_out[2], ntt_psi_inv, two_q, four_q, q, q_inv)
+    coeffs_out[1], coeffs_out[3] = invbutterfly(coeffs_out[1], coeffs_out[3], ntt_psi_inv, two_q, four_q, q, q_inv)
+    return u64xN(coeffs_out)
+
+
+def _mm_inv_ntt_core_x4(coeffs_in: List[u64xN], coeffs_out: List[u64xN], n: int, ntt_psi_inv: List[u64], q: u64, q_inv: u64, _mm_q: u64xN, _mm_q_inv: u64xN):
+    assert SIMD_LANE_SIZE == 4
 
     # Copy the result of the first round of butterflies on p2 with approximate reduction
     t = 1
     h = n >> 1
-    two_q = q << u64(1)
-    four_q = q << u64(2)
+    two_q = q << 1
+    four_q = q << 2
+    _mm_two_q = u64xN(two_q)
+    _mm_four_q = u64xN(four_q)
 
-    i, j = h, 0
-
-    while i < 2 * h:
-        for j1 in range(8):
-            j2 = j + j1 * 2 
-            coeffs_out[j2], coeffs_out[j2 + 1] = invbutterfly(
-                coeffs_in[j2], coeffs_in[j2 + 1], ntt_psi_inv[i + j1], two_q, four_q, q, q_inv)
-        i, j = i+8, j+16
+    j = 0
+    for i in range(h, h << 1, 8):
+        coeffs_out[j] = _mm_invbutterfly_inplace_0_x4(coeffs_in[j], ntt_psi_inv[i], ntt_psi_inv[i + 1], two_q, four_q, q, q_inv)
+        coeffs_out[j + 1] = _mm_invbutterfly_inplace_0_x4(coeffs_in[j + 1], ntt_psi_inv[i + 2], ntt_psi_inv[i + 3], two_q, four_q, q, q_inv)
+        coeffs_out[j + 2] = _mm_invbutterfly_inplace_0_x4(coeffs_in[j + 2], ntt_psi_inv[i + 4], ntt_psi_inv[i + 5], two_q, four_q, q, q_inv)
+        coeffs_out[j + 3] = _mm_invbutterfly_inplace_0_x4(coeffs_in[j + 3], ntt_psi_inv[i + 6], ntt_psi_inv[i + 7], two_q, four_q, q, q_inv)
+        j += 4
 
     # Continue the rest of the second to the n-1 butterflies on p2 with approximate reduction
     t <<= 1
     m = n >> 1
     
     while m > 1:
-        
+        _mm_t = t >> 2
         h = m >> 1
 
         if t >= 8:
-            i, j1, j2 = 0, 0, t - 1
+            i, j1, j2 = 0, 0, t
             
             while i < h:
-                f = ntt_psi_inv[h + i]
-                jx, jy = j1, j1 + t
+                _mm_j1 = j1 >> 2
+                _mm_j2 = j2 >> 2
+                _mm_f = u64xN(ntt_psi_inv[h + i])
+                jx, jy = _mm_j1, _mm_j1 + _mm_t
 
-                while jx <= j2:
-                    for j in range(8):
-                        coeffs_out[jx + j], coeffs_out[jy + j] = invbutterfly(
-                            coeffs_out[jx + j], coeffs_out[jy + j], f, two_q, four_q, q, q_inv)
-                    jx, jy = jx+8, jy+8
+                while jx < _mm_j2:
+                    coeffs_out[jx], coeffs_out[jy] = _mm_invbutterfly(
+                        coeffs_out[jx], coeffs_out[jy], _mm_f, _mm_two_q, _mm_four_q, _mm_q, _mm_q_inv)
+                    jx, jy = jx + 1, jy + 1
                 
                 i, j1, j2 = i + 1, j1 + 2 * t, j2 + 2 * t
 
         elif t == 4:
-            i, j1 = h, 0
-            while i < 2 * h:
-                coeffs_out[j1], coeffs_out[j1 + 4] = invbutterfly(
-                    coeffs_out[j1], coeffs_out[j1 + 4], ntt_psi_inv[i], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 1], coeffs_out[j1 + 5] = invbutterfly(
-                    coeffs_out[j1 + 1], coeffs_out[j1 + 5], ntt_psi_inv[i], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 2], coeffs_out[j1 + 6] = invbutterfly(
-                    coeffs_out[j1 + 2], coeffs_out[j1 + 6], ntt_psi_inv[i], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 3], coeffs_out[j1 + 7] = invbutterfly(
-                    coeffs_out[j1 + 3], coeffs_out[j1 + 7], ntt_psi_inv[i], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 8], coeffs_out[j1 + 12] = invbutterfly(
-                    coeffs_out[j1 + 8], coeffs_out[j1 + 12], ntt_psi_inv[i + 1], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 9], coeffs_out[j1 + 13] = invbutterfly(
-                    coeffs_out[j1 + 9], coeffs_out[j1 + 13], ntt_psi_inv[i + 1], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 10], coeffs_out[j1 + 14] = invbutterfly(
-                    coeffs_out[j1 + 10], coeffs_out[j1 + 14], ntt_psi_inv[i + 1], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 11], coeffs_out[j1 + 15] = invbutterfly(
-                    coeffs_out[j1 + 11], coeffs_out[j1 + 15], ntt_psi_inv[i + 1], two_q, four_q, q, q_inv)
-
-                i, j1 = i + 2, j1 + 4 * t
+            j1 = 0
+            for i in range(h, h << 1, 2):
+                _mm_ntt_psi = u64xN(ntt_psi_inv[i])
+                coeffs_out[j1], coeffs_out[j1 + 1] = _mm_invbutterfly(
+                    coeffs_out[j1], coeffs_out[j1 + 1], _mm_ntt_psi, _mm_two_q, _mm_four_q, _mm_q, _mm_q_inv)
+                _mm_ntt_psi = u64xN(ntt_psi_inv[i + 1])
+                coeffs_out[j1 + 2], coeffs_out[j1 + 3] = _mm_invbutterfly(
+                    coeffs_out[j1 + 2], coeffs_out[j1 + 3], _mm_ntt_psi, _mm_two_q, _mm_four_q, _mm_q, _mm_q_inv)
+                j1 += 4
         else:
-            i, j1 = h, 0
-            while i < 2 * h:
-                coeffs_out[j1], coeffs_out[j1 + 2] = invbutterfly(
-                    coeffs_out[j1], coeffs_out[j1 + 2], ntt_psi_inv[i], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 1], coeffs_out[j1 + 3] = invbutterfly(
-                    coeffs_out[j1 + 1], coeffs_out[j1 + 3], ntt_psi_inv[i], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 4], coeffs_out[j1 + 6] = invbutterfly(
-                    coeffs_out[j1 + 4], coeffs_out[j1 + 6], ntt_psi_inv[i + 1], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 5], coeffs_out[j1 + 7] = invbutterfly(
-                    coeffs_out[j1 + 5], coeffs_out[j1 + 7], ntt_psi_inv[i + 1], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 8], coeffs_out[j1 + 10] = invbutterfly(
-                    coeffs_out[j1 + 8], coeffs_out[j1 + 10], ntt_psi_inv[i + 2], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 9], coeffs_out[j1 + 11] = invbutterfly(
-                    coeffs_out[j1 + 9], coeffs_out[j1 + 11], ntt_psi_inv[i + 2], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 12], coeffs_out[j1 + 14] = invbutterfly(
-                    coeffs_out[j1 + 12], coeffs_out[j1 + 14], ntt_psi_inv[i + 3], two_q, four_q, q, q_inv)
-                coeffs_out[j1 + 13], coeffs_out[j1 + 15] = invbutterfly(
-                    coeffs_out[j1 + 13], coeffs_out[j1 + 15], ntt_psi_inv[i + 3], two_q, four_q, q, q_inv)
-
-                i, j1 = i + 4, j1 + 8 * t
+            j1 = 0
+            for i in range(h, h << 1, 4):
+                coeffs_out[j1] = _mm_invbutterfly_inplace_1_x4(coeffs_out[j1], ntt_psi_inv[i], two_q, four_q, q, q_inv)
+                coeffs_out[j1 + 1] = _mm_invbutterfly_inplace_1_x4(coeffs_out[j1 + 1], ntt_psi_inv[i + 1], two_q, four_q, q, q_inv)
+                coeffs_out[j1 + 2] = _mm_invbutterfly_inplace_1_x4(coeffs_out[j1 + 2], ntt_psi_inv[i + 2], two_q, four_q, q, q_inv)
+                coeffs_out[j1 + 3] = _mm_invbutterfly_inplace_1_x4(coeffs_out[j1 + 3], ntt_psi_inv[i + 3], two_q, four_q, q, q_inv)
+                j1 += 4
 
         t <<= 1
         m >>= 1
 
 
 # NTT computes the NTT on the input coefficients using the input parameters.
-def ntt(coeffs_in: list[u64], coeffs_out: list[u64], n: int, ntt_psi: list[u64], q: u64, mred_params: u64, bred_params: list[u64]):
-    ntt_lazy(coeffs_in, coeffs_out, n, ntt_psi, q, mred_params, bred_params)
-    reduce_vec(coeffs_out, coeffs_out, q, bred_params)
+def _mm_ntt(coeffs_in: list[u64xN], coeffs_out: list[u64xN], n: int, ntt_psi: list[u64], q: u64xN, mred_params: u64xN, bred_params: u64xN):
+    _mm_ntt_lazy_x4( coeffs_in, coeffs_out, n, ntt_psi, q, mred_params)
+    _mm_reduce_vec(coeffs_out, coeffs_out, q, bred_params)
 
 
 # InvNTT computes the InvNTT transformation on the input coefficients using the input parameters.
-def inv_ntt(coeffs_in, coeffs_out, n, ntt_psi_inv, ntt_n_inv, q, q_inv):
-    inv_ntt_core(coeffs_in, coeffs_out, n, ntt_psi_inv, q, q_inv)
-    mul_scalar_montgomery_vec(coeffs_out, coeffs_out, ntt_n_inv, q, q_inv)
+def _mm_inv_ntt(coeffs_in: list[u64xN], coeffs_out: list[u64xN], n: int, ntt_psi_inv: list[u64], ntt_n_inv: u64xN, q: u64xN, q_inv: u64xN, q_u64: u64, q_inv_u64: u64):
+    _mm_inv_ntt_core_x4(coeffs_in, coeffs_out, n, ntt_psi_inv, q_u64, q_inv_u64, q, q_inv)
+    _mm_mul_scalar_montgomery_vec(coeffs_out, coeffs_out, ntt_n_inv, q, q_inv)
 
 
 # InvNTTLazy computes the InvNTT transformation on the input coefficients using the input parameters with output values in the range [0, 2q-1].
-def inv_ntt_lazy(coeffs_in: list[u64], coeffs_out: list[u64], n: int, ntt_psi_inv: list[u64], ntt_n_inv: u64, q: u64, q_inv: u64):
-	inv_ntt_core(coeffs_in, coeffs_out, n, ntt_psi_inv, q, q_inv)
-	mul_scalar_montgomery_constant_vec(coeffs_out, coeffs_out, ntt_n_inv, q, q_inv)
-
-
-# MRedParams computes the parameter q_inv = (q^-1) mod 2^64,
-# required for mred.
-def mred_params(q):
-	q_inv = u64(1)
-	for _ in range(63):
-		q_inv *= q
-		q *= q
-
-	return q_inv
-
-
-# mask_vec returns p2 = (p1>>w) & mask
-def mask_vec(p1: list[u64], p2: list[u64], w: int, mask: u64):
-	for j in range(len(p1)): p2[j] = (p1[j] >> w) & mask
+def _mm_inv_ntt_lazy(coeffs_in: list[u64xN], coeffs_out: list[u64xN], n: int, ntt_psi_inv: list[u64], ntt_n_inv: u64xN, q: u64xN, q_inv: u64xN, q_u64: u64, q_inv_u64: u64):
+    _mm_inv_ntt_core_x4(coeffs_in, coeffs_out, n, ntt_psi_inv, q_u64, q_inv_u64, q, q_inv)
+    _mm_mul_scalar_montgomery_constant_vec(coeffs_out, coeffs_out, ntt_n_inv, q, q_inv)
 
 
 # Poly is the structure that contains the coefficients of a polynomial.
 class Poly:
-    coeffs: list[list[u64]]  # Dimension-2 slice of coefficients (re-slice of buff)
-    buff: list[u64]  # Dimension-1 slice of coefficient
+    _mm_coeffs: list[list[u64xN]]
+    _buf_coeffs: list[list[u64]]
     is_ntt: bool
     is_mform: bool
-    
+
     def __bool__(self):
-        return bool(self.buff)
+        return len(self._buf_coeffs) > 0
     
     def __eq__(self, other: Poly) -> bool:
-        return self.buff == other.buff
+        return self._buf_coeffs == other._buf_coeffs
     
     def __ne__(self, other: Poly) -> bool:
          return not self == other
         
-    def __str__(self) -> str:
-        return f"""\tPolynomial:
-                \tBuff[:100]: {self.buff[:100]}
-                \tBuff sum: {sum(self.buff)}
-        """
-    
     def __repr__(self) -> str:
-        return self.__str__()
+        return f"""\tPolynomial:
+                \tCoeffs[0][:3]: {self._buf_coeffs[0][:3]}
+        """
     
     def __copy__(self) -> Poly:
         return self.copy()
     
     def __pickle__(self, jar: Jar, pasteurized: bool):
-        pickle(self.coeffs, jar, pasteurized)
-        if not pasteurized: jar += self.coeffs.pickle_size()
+        pickle(self._buf_coeffs, jar, pasteurized)
+        if not pasteurized: jar += self._buf_coeffs.pickle_size()
         pickle(self.is_ntt, jar, pasteurized)
         if not pasteurized: jar += self.is_ntt.pickle_size()
         pickle(self.is_mform, jar, pasteurized)
     
     def __unpickle__(jar: Jar, pasteurized: bool) -> Poly:
-        coeffs = unpickle(jar, pasteurized, list[list[u64]])
-        if not pasteurized: jar += coeffs.pickle_size()
+        _buf_coeffs = unpickle(jar, pasteurized, list[list[u64]])
+        if not pasteurized: jar += _buf_coeffs.pickle_size()
         is_ntt = unpickle(jar, pasteurized, bool)
         if not pasteurized: jar += is_ntt.pickle_size()
         is_mform = unpickle(jar, pasteurized, bool)
         pol = Poly(
-            coeffs=coeffs,
+            _mm_coeffs=_buf_coeffs.vectorize_bitcast(),
+            _buf_coeffs=_buf_coeffs,
             is_ntt=is_ntt,
             is_mform=is_mform)
-        pol.buff = coeffs.flatten()
         
         return pol
     
     def pickle_size(self) -> int:
-        return self.coeffs.pickle_size() + \
+        return self._buf_coeffs.pickle_size() + \
             self.is_ntt.pickle_size() + \
             self.is_mform.pickle_size()
 
-    def set(self, other: Poly):
-        self.coeffs = other.coeffs
-        self.buff = other.buff
+    def _mm_set_coeffs(self, _mm_coeffs: list[list[u64xN]]):
+        for i, row in enumerate(_mm_coeffs):
+            for j, _mm_coeff in enumerate(row):
+                self._mm_coeffs[i][j] = _mm_coeff
+    
+    def _mm_set(self, other: Poly):
+        self._mm_set_coeffs(other._mm_coeffs)
         self.is_ntt = other.is_ntt
         self.is_mform = other.is_mform
-    
+
     def copy_values(self, other: Poly):
-        self.coeffs = [copy(row) for row in other.coeffs]
-        self.buff = copy(other.buff)
+        self._mm_set_coeffs(other._mm_coeffs.copy())
+        self._buf_coeffs = self._mm_coeffs.scatter_bitcast()
     
     def copy(self) -> Poly:
-        new_poly = Poly()
-        new_poly.copy_values(self)
-        new_poly.is_ntt = self.is_ntt
-        new_poly.is_mform = self.is_mform
-        return new_poly
+        _mm_coeffs = self._mm_coeffs.copy()
+        return Poly(
+            _mm_coeffs=_mm_coeffs,
+            _buf_coeffs=_mm_coeffs.scatter_bitcast(),
+            is_ntt=self.is_ntt,
+            is_mform=self.is_mform)
 
     # n returns the number of coefficients of the polynomial, which equals the degree of the Ring cyclotomic polynomial.
     def n(self):
-        return len(self.coeffs[0])
+        return len(self._buf_coeffs[0])
+    
+    def _mm_n(self):
+        return len(self._mm_coeffs[0])
 
     # level returns the current number of moduli minus 1.
     def level(self):
-        return len(self.coeffs) - 1
+        return len(self._mm_coeffs) - 1
     
     # resize resizes the level of the target polynomial to the provided level.
     # If the provided level is larger than the current level, then allocates zero
     # coefficients, otherwise dereferences the coefficients above the provided level.
     def resize(self, level: int):
-        n = self.n()
         if self.level() > level:
-            self.buff = self.buff[:n * (level + 1)]
-            self.coeffs = self.coeffs[:level + 1]
+            for _ in range(self.level() - level):
+                self._buf_coeffs.pop()
+                self._mm_coeffs.pop()
         elif level > self.level():
-            self.buff.extend(zeros_vec(n * (level - self.level()), TP=u64))
-            self.coeffs = list[list](n * (level + 1))
-            for i in range(level + 1): self.coeffs.append(self.buff[i * n : (i + 1) * n])
-    
-    def update_buffer(self):
-        # TODO: Deprecate.
-        idx = 0
-        for row in self.coeffs:
-            for e in row:
-                self.buff[idx] = e
-                idx += 1
-    
-    def update_coeffs(self):
-        # TODO: Deprecate.
-        idx = 0
-        for i in range(len(self.coeffs)):
-            for j in range(len(self.coeffs[i])):
-                self.coeffs[i][j] = self.buff[idx]
-                idx += 1
+            for _ in range(level - self.level()):
+                self._mm_coeffs.append(zeros_vec(self._mm_n(), TP=u64xN))
+            self._buf_coeffs = self._mm_coeffs.scatter_bitcast()
     
     def randomize(self, upper_bound: int):
-        self.buff = self.buff.rand(u64(upper_bound))
-        self.update_coeffs()
+        self._buf_coeffs = self._buf_coeffs.rand(u64(upper_bound))
+        self._mm_coeffs = self._buf_coeffs.vectorize_bitcast()
+
 
 # new_poly creates a new polynomial with n coefficients set to zero and level+1 moduli.
 def new_poly(n, level):
-    pol = Poly()
-
-    pol.buff = zeros_vec(n * (level + 1), TP=u64)
-    pol.coeffs = zeros(level + 1, n, TP=u64)
-
-    return pol
+    _mm_coeffs = zeros(level + 1, n // SIMD_LANE_SIZE, TP=u64xN)
+    return Poly(
+        _mm_coeffs=_mm_coeffs,
+        _buf_coeffs=_mm_coeffs.scatter_bitcast())
 
 
 # NumberTheoreticTransformerStandard computes the standard nega-cyclic NTT in the ring Z[X]/(X^n+1).
@@ -892,45 +919,41 @@ class NumberTheoreticTransformerStandard:
     
     # forward_lvl writes the forward NTT in Z[X]/(X^n+1) of p1 on p2.
     # Only computes the NTT for the first level+1 moduli.
-    def forward_lvl(r, level: int, p1: Poly, p2: Poly):
+    def _mm_forward_lvl(r, level: int, p1: Poly, p2: Poly):
         for x in range(level + 1):
-            ntt(p1.coeffs[x], p2.coeffs[x], r.n, r.ntt_psi[x], r.modulus[x], r.mred_params[x], r.bred_params[x])
-        p2.update_buffer()
-    
+            _mm_ntt(p1._mm_coeffs[x], p2._mm_coeffs[x], r.n, r.ntt_psi[x], r._mm_modulus[x], r._mm_mred_params[x], r._mm_bred_params[x][0])
+
     # backward_lvl writes the backward NTT in Z[X]/(X^n+1) on p2.
     # Only computes the NTT for the first level+1 moduli.
-    def backward_lvl(r, level, p1, p2):
+    def _mm_backward_lvl(r, level, p1, p2):
         for x in range(level + 1):
-            inv_ntt(p1.coeffs[x], p2.coeffs[x], r.n, r.ntt_psi_inv[x], r.ntt_n_inv[x], r.modulus[x], r.mred_params[x])
-        p2.update_buffer()
+            _mm_inv_ntt(p1._mm_coeffs[x], p2._mm_coeffs[x], r.n, r.ntt_psi_inv[x], r._mm_ntt_n_inv[x], r._mm_modulus[x], r._mm_mred_params[x], r.modulus[x], r.mred_params[x])
     
     # BackwardLazyLvl writes the backward NTT in Z[X]/(X^n+1) on p2.
     # Only computes the NTT for the first level+1 moduli and returns values in the range [0, 2q-1].
-    def backward_lazy_lvl(r, level: int, p1: Poly, p2: Poly):
+    def _mm_backward_lazy_lvl(r, level: int, p1: Poly, p2: Poly):
         for x in range(level + 1):
-            inv_ntt_lazy(p1.coeffs[x], p2.coeffs[x], r.n, r.ntt_psi_inv[x], r.ntt_n_inv[x], r.modulus[x], r.mred_params[x])
-        p2.update_buffer()
+            _mm_inv_ntt_lazy(p1._mm_coeffs[x], p2._mm_coeffs[x], r.n, r.ntt_psi_inv[x], r._mm_ntt_n_inv[x], r._mm_modulus[x], r._mm_mred_params[x], r.modulus[x], r.mred_params[x])
     
     # forward_lazy_lvl writes the forward NTT in Z[X]/(X^n+1) of p1 on p2.
     # Only computes the NTT for the first level+1 moduli and returns values in the range [0, 2q-1].
-    def forward_lazy_lvl(r, level, p1, p2):
+    def _mm_forward_lazy_lvl(r, level, p1, p2):
         for x in range(level + 1):
-            ntt_lazy(p1.coeffs[x], p2.coeffs[x], r.n, r.ntt_psi[x], r.modulus[x], r.mred_params[x], r.bred_params[x])
-        p2.update_buffer()
+            _mm_ntt_lazy_x4(p1._mm_coeffs[x], p2._mm_coeffs[x], r.n, r.ntt_psi[x], r._mm_modulus[x], r._mm_mred_params[x])
     
     # ForwardVec writes the forward NTT in Z[X]/(X^n+1) of the i-th level of p1 on the i-th level of p2.
-    def forward_vec(r, level: int, p1: list[u64], p2: list[u64]):
-        ntt(p1, p2, r.n, r.ntt_psi[level], r.modulus[level], r.mred_params[level], r.bred_params[level])
+    def _mm_forward_vec(r, level: int, p1: list[u64xN], p2: list[u64xN]):
+        _mm_ntt(p1, p2, r.n, r.ntt_psi[level], r._mm_modulus[level], r._mm_mred_params[level], r._mm_bred_params[level][0])
 
     # ForwardLazyVec writes the forward NTT in Z[X]/(X^n+1) of the i-th level of p1 on the i-th level of p2.
     # Returns values in the range [0, 2q-1].
-    def forward_lazy_vec(r, level: int, p1: list[u64], p2: list[u64]):
-        ntt_lazy(p1, p2, r.n, r.ntt_psi[level], r.modulus[level], r.mred_params[level], r.bred_params[level])
+    def _mm_forward_lazy_vec(r, level: int, p1: list[u64xN], p2: list[u64xN]):
+        _mm_ntt_lazy_x4(p1, p2, r.n, r.ntt_psi[level], r._mm_modulus[level], r._mm_mred_params[level])
     
     # BackwardLazyVec writes the backward NTT in Z[X]/(X^N+1) of the i-th level of p1 on the i-th level of p2.
     # Returns values in the range [0, 2q-1].
-    def backward_lazy_vec(r, level: int, p1: list[u64], p2: list[u64]):
-        inv_ntt_lazy(p1, p2, r.n, r.ntt_psi_inv[level], r.ntt_n_inv[level], r.modulus[level], r.mred_params[level])
+    def _mm_backward_lazy_vec(r, level: int, p1: list[u64xN], p2: list[u64xN]):
+        _mm_inv_ntt_lazy(p1, p2, r.n, r.ntt_psi_inv[level], r._mm_ntt_n_inv[level], r._mm_modulus[level], r._mm_mred_params[level], r.modulus[level], r.mred_params[level])
 
 
 # NumberTheoreticTransformerConjugateInvariant computes the NTT in the ring Z[X+X^-1]/(X^2N+1).
@@ -951,8 +974,10 @@ class NumberTheoreticTransformerConjugateInvariant:
 class Ring:
     # Polynomial nb.Coefficients
     n: int
+    _mm_n: int
     # moduli
     modulus: list[u64]
+    _mm_modulus: list[u64xN]
     # 2^bit_length(Qi) - 1
     mask: list[u64]
     # Indicates whether NTT can self used with the current ring.
@@ -961,8 +986,11 @@ class Ring:
     modulus_at_level: list[big_uint]
     # Fast reduction parameters
     bred_params: list[list[u64]]
+    _mm_bred_params: list[Tuple[u64xN, u64xN]]
     mred_params: list[u64]
+    _mm_mred_params: list[u64xN]
     rescale_params: list[list[u64]]
+    _mm_rescale_params: list[list[u64xN]]
     # NTT Parameters
     nth_root: u64
     psi_mont: list[u64]  #2N-th primitive root in Montgomery form
@@ -970,13 +998,14 @@ class Ring:
     ntt_psi: list[list[u64]]  #powers of the inverse of the 2N-th primitive root in Montgomery form (in bit-reversed order)
     ntt_psi_inv: list[list[u64]]  #powers of the inverse of the 2N-th primitive root in Montgomery form (in bit-reversed order)
     ntt_n_inv: list[u64]  #[n^-1] mod Qi in Montgomery form
+    _mm_ntt_n_inv: list[u64xN]
 
     ntt_type: str
 
     def __bool__(self):
         return bool(self.n)
     
-    def __str__(self):
+    def __repr__(self):
         return f"""\tRing:
                 \tN: {self.n}
                 \tModuli[:10]: {self.modulus[:10]}
@@ -984,9 +1013,6 @@ class Ring:
                 \modulus_at_level[:10]: {self.modulus_at_level[:10]}
         """
     
-    def __repr__(self) -> str:
-        return self.__str__()
-
     def set_parameters(self, n, modulus):
 	    # Checks if n is a power of 2
         if (n < 16) or (n & (n - 1)) != 0 and n != 0:
@@ -1000,12 +1026,15 @@ class Ring:
 
         self.allows_ntt = False
         self.n = n
+        self._mm_n = n // SIMD_LANE_SIZE
 
         self.modulus = list[u64](len(modulus))
+        self._mm_modulus = list[u64xN](len(modulus))
         self.mask = list[u64](len(modulus))
 
         for qi in modulus:
             self.modulus.append(qi)
+            self._mm_modulus.append(u64xN(qi))
             self.mask.append((u64(1) << qi.bitlen()) - u64(1))
 
         # Computes bigQ for all levels
@@ -1031,12 +1060,17 @@ class Ring:
         for i, qi in enumerate(self.modulus):
             # Computes the fast modular reduction parameters for the Ring
             self.bred_params.append(bred_params(qi))
+            self._mm_bred_params.append(
+                (u64xN(self.bred_params[i][0]), u64xN(self.bred_params[i][1])))
 
             # If qi is not a power of 2, we can compute the MRedParams (otherwise, it
             # would return an error as there is no valid Montgomery form mod a power of 2)
             if (qi & (qi - u64(1))) != u64(0) and qi != u64(0):
                 self.mred_params.append(mred_params(qi))
-            else: self.mred_params.append(u64(0))
+                self._mm_mred_params.append(u64xN(self.mred_params[i]))
+            else:
+                self.mred_params.append(u64(0))
+                self._mm_mred_params.append(u64xN(u64(0)))
         
     def set_number_theoretic_transformer(self, ntt):
         self.ntt_type = ntt
@@ -1080,6 +1114,8 @@ class Ring:
                         self.modulus[i] - mod_exp_u64(self.modulus[j], self.modulus[i] - u64(2), self.modulus[i]),
                         self.modulus[i], self.bred_params[i]))
         
+        self._mm_rescale_params = [[u64xN(e) for e in row] for row in self.rescale_params]
+        
         self.psi_mont = list[u64](len(self.modulus))
         self.psi_inv_mont = list[u64](len(self.modulus))
         self.ntt_psi = [[] for _ in range(len(self.modulus))]
@@ -1091,6 +1127,7 @@ class Ring:
         for i, qi in enumerate(self.modulus):
             # 1.1 Computes n^(-1) mod q in Montgomery form
             self.ntt_n_inv.append(mform(mod_exp_u64(nth_root >> u64(1), qi - u64(2), qi), qi, self.bred_params[i]))
+            self._mm_ntt_n_inv.append(u64xN(self.ntt_n_inv[i]))
 
             # 1.2 Computes Psi and PsiInv in Montgomery form
             self.ntt_psi[i] = zeros_vec(int(nth_root >> u64(1)), TP=u64)
@@ -1127,59 +1164,18 @@ class Ring:
     # new_poly creates a new polynomial with all coefficients set to 0.
     def new_poly(self):
         return new_poly(self.n, len(self.modulus) - 1)
+    
+    # new_poly_lvl creates a new polynomial with all coefficients set to 0.
+    def new_poly_lvl(self, level):
+        return new_poly(self.n, level)
+    
+    def check_lvls(p1: Poly, p2: Poly) -> int:
+        lvl1, lvl2 = p1.level(), p2.level()
 
-    # ntt_lvl computes the NTT of p1 and returns the result on p2.
-    # The value level defines the number of moduli of the input polynomials.
-    def ntt_lvl(self, level: int, p1: Poly, p2: Poly):
-        if self.ntt_type == NumberTheoreticTransformerStandard().name:
-            NumberTheoreticTransformerStandard.forward_lvl(self, level, p1, p2)
-        else: raise NotImplementedError()
-    
-    # ntt_single computes the NTT of p1 and returns the result on p2.
-    # The level-th moduli of the ring NTT params are used.
-    def ntt_single(self, level: int, p1: list[u64], p2: list[u64]):
-        if self.ntt_type == NumberTheoreticTransformerStandard().name:
-            NumberTheoreticTransformerStandard.forward_vec(self, level, p1, p2)
-        else: raise NotImplementedError()
-    
-    # NTTSingleLazy computes the NTT of p1 and returns the result on p2.
-    # The level-th moduli of the ring NTT params are used.
-    # Output values are in the range [0, 2q-1]
-    def ntt_single_lazy(self, level: int, p1: list[u64], p2: list[u64]):
-        if self.ntt_type == NumberTheoreticTransformerStandard().name:
-            NumberTheoreticTransformerStandard.forward_lazy_vec(self, level, p1, p2)
-        else: raise NotImplementedError()
-    
-    # ntt_lazy_lvl computes the NTT of p1 and returns the result on p2.
-    # The value level defines the number of moduli of the input polynomials.
-    # Output values are in the range [0, 2q-1]
-    def ntt_lazy_lvl(self, level: int, p1: Poly, p2: Poly):
-        if self.ntt_type == NumberTheoreticTransformerStandard().name:
-            NumberTheoreticTransformerStandard.forward_lazy_lvl(self, level, p1, p2)
-        else: raise NotImplementedError()
-    
-    # inv_ntt_lvl computes the inverse-NTT of p1 and returns the result on p2.
-    # The value level defines the number of moduli of the input polynomials.
-    def inv_ntt_lvl(self, level, p1, p2):
-        if self.ntt_type == NumberTheoreticTransformerStandard().name:
-            NumberTheoreticTransformerStandard.backward_lvl(self, level, p1, p2)
-        else: raise NotImplementedError()
-    
-    # InvNTTLazyLvl computes the inverse-NTT of p1 and returns the result on p2.
-    # The value level defines the number of moduli of the input polynomials.
-    # Output values are in the range [0, 2q-1]
-    def inv_ntt_lazy_lvl(self, level: int, p1: Poly, p2: Poly):
-        if self.ntt_type == NumberTheoreticTransformerStandard().name:
-            NumberTheoreticTransformerStandard.backward_lazy_lvl(self, level, p1, p2)
-        else: raise NotImplementedError()
-
-    # InvNTTSingleLazy computes the InvNTT of p1 and returns the result on p2.
-    # The level-th moduli of the ring InvNTT params are used.
-    # Output values are in the range [0, 2q-1]
-    def inv_ntt_single_lazy(self, level: int, p1: list[u64], p2: list[u64]):
-        if self.ntt_type == NumberTheoreticTransformerStandard().name:
-            NumberTheoreticTransformerStandard.backward_lazy_vec(self, level, p1, p2)
-        else: raise NotImplementedError()
+        if lvl1 != lvl2:
+            print(f"WARNING: Incompatible levels of polynomials -- {lvl1} != {lvl2}")
+        
+        return min(lvl1, lvl2)
     
     # PermuteNTT applies the Galois transform on a polynomial in the NTT domain.
     # It maps the coefficients x^i to x^(gen*i)
@@ -1210,10 +1206,10 @@ class Ring:
     # It maps the coefficients x^i to x^(gen*i) using the PermuteNTTIndex table.
     # It must be noted that the result cannot be in-place.
     def permute_ntt_with_index_lvl(self, level: int, pol_in: Poly, index: list[u64], pol_out: Poly):
-        for j in range(0, self.n, 8):
-            for i in range(level + 1):
-                y = pol_in.coeffs[i]
-                for k in range(8): pol_out.coeffs[i][j + k] = y[int(index[j + k])]
+        for i in range(level + 1):
+            y = pol_in._buf_coeffs[i]
+            for j in range(self.n):
+                pol_out._buf_coeffs[i][j] = y[int(index[j])]
     
     # PermuteLvl applies the Galois transform on a polynomial outside of the NTT domain.
     # It maps the coefficients x^i to x^(gen*i).
@@ -1228,202 +1224,259 @@ class Ring:
             tmp = (index_raw >> log_n) & u64(1)
 
             for j, qi in enumerate(self.modulus[:level + 1]):
-                pol_out.coeffs[j][index] = pol_in.coeffs[j][i] * (tmp ^ u64(1)) | (qi - pol_in.coeffs[j][i]) * tmp
-
-    # mform_lvl switches p1 to the Montgomery domain for the moduli from q_0 up to q_level and writes the result on p2.
-    def mform_lvl(self, level, p1, p2):
-        for i in range(level + 1):
-            mform_vec(p1.coeffs[i][:self.n], p2.coeffs[i], self.modulus[i], self.bred_params[i])
-        p2.update_buffer()
-    
-    # InvMForm switches back p1 from the Montgomery domain to the conventional domain and writes the result on p2.
-    def inv_mform(self, p1: Poly, p2: Poly):
-        self.inv_mform_lvl(self.min_level_binary(p1, p2), p1, p2)
-    
-    # InvMFormLvl switches back p1 from the Montgomery domain to the conventional domain and writes the result on p2.
-    def inv_mform_lvl(self, level: int, p1: Poly, p2: Poly):
-        for i in range(level + 1):
-            inv_mform_vec(p1.coeffs[i][:self.n], p2.coeffs[i], self.modulus[i], self.mred_params[i])
-    
-    # mul_coeffs_montgomery multiplies p1 by p2 coefficient-wise with a
-    # Montgomery modular reduction and returns the result on p3.
-    def mul_coeffs_montgomery(self, p1, p2, p3):
-        self.mul_coeffs_montgomery_lvl(self.min_level_ternary(p1, p2, p3), p1, p2, p3)
-    
-    def min_level_ternary(self, p1, p2, p3):
-        return min(min(len(self.modulus) - 1, p1.level()), min(p2.level(), p3.level()))
-    
-    # mul_coeffs_montgomery_lvl multiplies p1 by p2 coefficient-wise with a Montgomery
-    # modular reduction for the moduli from q_0 up to q_level and returns the result on p3.
-    def mul_coeffs_montgomery_lvl(self, level, p1, p2, p3):
-        for i in range(level + 1):
-            mul_coeffs_montgomery_vec(p1.coeffs[i][:self.n], p2.coeffs[i][:self.n], p3.coeffs[i], self.modulus[i], self.mred_params[i])
-        p3.update_buffer()
-    
-    # MulScalarBigint multiplies each coefficient of p1 by a big.Int scalar and writes the result on p2.
-    def mul_scalar_bigint(self, p1, scalar, p2):
-        self.mul_scalar_bigint_lvl(self.min_level_binary(p1, p2), p1, scalar, p2)
-
-    # mul_scalar_bigint_lvl multiplies each coefficient of p1 by a big.Int scalar
-    # for the moduli from q_0 up to q_level and writes the result on p2.
-    def mul_scalar_bigint_lvl(self, level, p1, scalar, p2 ):
-        for i in range(level + 1):
-            scalarQi = scalar.bigint_mod(self.modulus[i].ext_to_bigint())
-            mul_scalar_montgomery_vec(p1.coeffs[i][:self.n], p2.coeffs[i], mform(bred_add(scalarQi.trunc_to_u64(), self.modulus[i], self.bred_params[i]), self.modulus[i], self.bred_params[i]), self.modulus[i], self.mred_params[i])
-        p2.update_buffer()
-    
-    # MulcoeffsMontgomeryConstantLvl multiplies p1 by p2 coefficient-wise with a Montgomery
-    # modular reduction for the moduli from q_0 up to q_level and returns the result on p3.
-    def mul_coeffs_montgomery_constant_lvl(self, level: int, p1: Poly, p2: Poly, p3: Poly):
-        for i in range(level + 1):
-            mul_coeffs_montgomery_constant_vec(p1.coeffs[i][:self.n], p2.coeffs[i][:self.n], p3.coeffs[i], self.modulus[i], self.mred_params[i])
-        p2.update_buffer()
-    
-    # mul_scalar multiplies each coefficient of p1 by a scalar and writes the result on p2.
-    def mul_scalar(self, p1, scalar, p2):
-        self.mul_scalar_lvl(self.min_level_binary(p1, p2), p1, scalar, p2)
+                pol_out._buf_coeffs[j][index] = pol_in._buf_coeffs[j][i] * (tmp ^ u64(1)) | (qi - pol_in._buf_coeffs[j][i]) * tmp
     
     def min_level_binary(self, p1, p2):
         return min(min(len(self.modulus) - 1, p1.level()), p2.level())
+
+    def min_level_ternary(self, p1, p2, p3):
+        return min(min(len(self.modulus) - 1, p1.level()), min(p2.level(), p3.level()))
+    
+    # ntt_lvl computes the NTT of p1 and returns the result on p2.
+    # The value level defines the number of moduli of the input polynomials.
+    def _mm_ntt_lvl(self, level: int, p1: Poly, p2: Poly):
+        if self.ntt_type == NumberTheoreticTransformerStandard().name:
+            NumberTheoreticTransformerStandard._mm_forward_lvl(self, level, p1, p2)
+        else: raise NotImplementedError()
+    
+    # ntt_single computes the NTT of p1 and returns the result on p2.
+    # The level-th moduli of the ring NTT params are used.
+    def _mm_ntt_single(self, level: int, p1: list[u64xN], p2: list[u64xN]):
+        if self.ntt_type == NumberTheoreticTransformerStandard().name:
+            NumberTheoreticTransformerStandard._mm_forward_vec(self, level, p1, p2)
+        else: raise NotImplementedError()
+    
+    # NTTSingleLazy computes the NTT of p1 and returns the result on p2.
+    # The level-th moduli of the ring NTT params are used.
+    # Output values are in the range [0, 2q-1]
+    def _mm_ntt_single_lazy(self, level: int, p1: list[u64xN], p2: list[u64xN]):
+        if self.ntt_type == NumberTheoreticTransformerStandard().name:
+            NumberTheoreticTransformerStandard._mm_forward_lazy_vec(self, level, p1, p2)
+        else: raise NotImplementedError()
+    
+    # ntt_lazy_lvl computes the NTT of p1 and returns the result on p2.
+    # The value level defines the number of moduli of the input polynomials.
+    # Output values are in the range [0, 2q-1]
+    def _mm_ntt_lazy_lvl(self, level: int, p1: Poly, p2: Poly):
+        if self.ntt_type == NumberTheoreticTransformerStandard().name:
+            NumberTheoreticTransformerStandard._mm_forward_lazy_lvl(self, level, p1, p2)
+        else: raise NotImplementedError()
+    
+    # inv_ntt_lvl computes the inverse-NTT of p1 and returns the result on p2.
+    # The value level defines the number of moduli of the input polynomials.
+    def _mm_inv_ntt_lvl(self, level, p1, p2):
+        if self.ntt_type == NumberTheoreticTransformerStandard().name:
+            NumberTheoreticTransformerStandard._mm_backward_lvl(self, level, p1, p2)
+        else: raise NotImplementedError()
+    
+    # InvNTTLazyLvl computes the inverse-NTT of p1 and returns the result on p2.
+    # The value level defines the number of moduli of the input polynomials.
+    # Output values are in the range [0, 2q-1]
+    def _mm_inv_ntt_lazy_lvl(self, level: int, p1: Poly, p2: Poly):
+        if self.ntt_type == NumberTheoreticTransformerStandard().name:
+            NumberTheoreticTransformerStandard._mm_backward_lazy_lvl(self, level, p1, p2)
+        else: raise NotImplementedError()
+
+    # InvNTTSingleLazy computes the InvNTT of p1 and returns the result on p2.
+    # The level-th moduli of the ring InvNTT params are used.
+    # Output values are in the range [0, 2q-1]
+    def _mm_inv_ntt_single_lazy(self, level: int, p1: list[u64xN], p2: list[u64xN]):
+        if self.ntt_type == NumberTheoreticTransformerStandard().name:
+            NumberTheoreticTransformerStandard._mm_backward_lazy_vec(self, level, p1, p2)
+        else: raise NotImplementedError()
+
+    # mform_lvl switches p1 to the Montgomery domain for the moduli from q_0 up to q_level and writes the result on p2.
+    def _mm_mform_lvl(self, level, p1, p2):
+        for i in range(level + 1):
+            _mm_mform_vec(p1._mm_coeffs[i], p2._mm_coeffs[i], self._mm_modulus[i], self._mm_bred_params[i])
+
+    # InvMForm switches back p1 from the Montgomery domain to the conventional domain and writes the result on p2.
+    def _mm_inv_mform(self, p1: Poly, p2: Poly):
+        self._mm_inv_mform_lvl(self.min_level_binary(p1, p2), p1, p2)
+    
+    # InvMFormLvl switches back p1 from the Montgomery domain to the conventional domain and writes the result on p2.
+    def _mm_inv_mform_lvl(self, level: int, p1: Poly, p2: Poly):
+        for i in range(level + 1):
+            _mm_inv_mform_vec(
+                p1._mm_coeffs[i].slice_reference(0, self._mm_n),
+                p2._mm_coeffs[i], self._mm_modulus[i], self._mm_mred_params[i])
+    
+    # mul_coeffs_montgomery multiplies p1 by p2 coefficient-wise with a
+    # Montgomery modular reduction and returns the result on p3.
+    def _mm_mul_coeffs_montgomery(self, p1, p2, p3):
+        self._mm_mul_coeffs_montgomery_lvl(self.min_level_ternary(p1, p2, p3), p1, p2, p3)
+    
+    # mul_coeffs_montgomery_lvl multiplies p1 by p2 coefficient-wise with a Montgomery
+    # modular reduction for the moduli from q_0 up to q_level and returns the result on p3.
+    def _mm_mul_coeffs_montgomery_lvl(self, level, p1, p2, p3):
+        for i in range(level + 1):
+            _mm_mul_coeffs_montgomery_vec(
+                p1._mm_coeffs[i].slice_reference(0, self._mm_n),
+                p2._mm_coeffs[i], p3._mm_coeffs[i], self._mm_modulus[i], self._mm_mred_params[i])
+    
+    # MulScalarBigint multiplies each coefficient of p1 by a big.Int scalar and writes the result on p2.
+    def _mm_mul_scalar_bigint(self, p1, scalar, p2):
+        self._mm_mul_scalar_bigint_lvl(self.min_level_binary(p1, p2), p1, scalar, p2)
+
+    # mul_scalar_bigint_lvl multiplies each coefficient of p1 by a big.Int scalar
+    # for the moduli from q_0 up to q_level and writes the result on p2.
+    def _mm_mul_scalar_bigint_lvl(self, level, p1, scalar, p2):
+        for i in range(level + 1):
+            _mm_scalarQi = u64xN(biguint_mod(scalar, self.modulus[i].ext_to_bigint()).trunc_to(64))
+            _mm_m = _mm_mform(_mm_bred_add(_mm_scalarQi, self._mm_modulus[i], self._mm_bred_params[i][0]), self._mm_modulus[i], self._mm_bred_params[i])
+            _mm_mul_scalar_montgomery_vec(
+                p1._mm_coeffs[i].slice_reference(0, self._mm_n),
+                p2._mm_coeffs[i], _mm_m, self._mm_modulus[i], self._mm_mred_params[i])
+    
+    # MulcoeffsMontgomeryConstantLvl multiplies p1 by p2 coefficient-wise with a Montgomery
+    # modular reduction for the moduli from q_0 up to q_level and returns the result on p3.
+    def _mm_mul_coeffs_montgomery_constant_lvl(self, level: int, p1: Poly, p2: Poly, p3: Poly):
+        for i in range(level + 1):
+            _mm_mul_coeffs_montgomery_constant_vec(
+                p1._mm_coeffs[i].slice_reference(0, self._mm_n),
+                p2._mm_coeffs[i], p3._mm_coeffs[i],
+                self._mm_modulus[i], self._mm_mred_params[i])
+    
+    # mul_scalar multiplies each coefficient of p1 by a scalar and writes the result on p2.
+    def _mm_mul_scalar(self, p1, scalar, p2):
+        self._mm_mul_scalar_lvl(self.min_level_binary(p1, p2), p1, scalar, p2)
     
     # mul_scalar_lvl multiplies each coefficient of p1 by a scalar for the moduli from q_0 up to q_level and writes the result on p2.
-    def mul_scalar_lvl(self, level, p1, scalar, p2):
+    def _mm_mul_scalar_lvl(self, level, p1, scalar, p2):
         for i in range(level + 1):
-            mul_scalar_montgomery_vec(p1.coeffs[i][:self.n], p2.coeffs[i], mform(bred_add(u64(scalar), self.modulus[i], self.bred_params[i]), self.modulus[i], self.bred_params[i]), self.modulus[i], self.mred_params[i])
-        p2.update_buffer()
-    
-    # new_poly_lvl creates a new polynomial with all coefficients set to 0.
-    def new_poly_lvl(self, level):
-        return new_poly(self.n, level)
+            _mm_m = u64xN(mform(bred_add(u64(scalar), self.modulus[i], self.bred_params[i][0]), self.modulus[i], self.bred_params[i]))
+            _mm_mul_scalar_montgomery_vec(
+                p1._mm_coeffs[i].slice_reference(0, self._mm_n),
+                p2._mm_coeffs[i], _mm_m, self._mm_modulus[i], self._mm_mred_params[i])
     
     # MulcoeffsMontgomeryAndAddLvl multiplies p1 by p2 coefficient-wise with a Montgomery
     # modular reduction for the moduli from q_0 up to q_level and adds the result to p3.
-    def mul_coeffs_montgomery_and_add_lvl(self, level: int, p1: Poly, p2: Poly, p3: Poly):
+    def _mm_mul_coeffs_montgomery_and_add_lvl(self, level: int, p1: Poly, p2: Poly, p3: Poly):
         for i in range(level + 1):
-            mul_coeffs_montgomery_and_add_vec(p1.coeffs[i][:self.n], p2.coeffs[i][:self.n], p3.coeffs[i], self.modulus[i], self.mred_params[i])
-        p3.update_buffer()
+            _mm_mul_coeffs_montgomery_and_add_vec(
+                p1._mm_coeffs[i].slice_reference(0, self._mm_n),
+                p2._mm_coeffs[i], p3._mm_coeffs[i],
+                self._mm_modulus[i], self._mm_mred_params[i])
 
     # mul_coeffs_montgomery_and_sub_lvl multiplies p1 by p2 coefficient-wise with
     # a Montgomery modular reduction and subtracts the result from p3.
-    def mul_coeffs_montgomery_and_sub_lvl(self, level, p1, p2, p3):
+    def _mm_mul_coeffs_montgomery_and_sub_lvl(self, level, p1, p2, p3):
         for i in range(level + 1):
-            mul_coeffs_montgomery_and_sub_vec(p1.coeffs[i][:self.n], p2.coeffs[i][:self.n], p3.coeffs[i], self.modulus[i], self.mred_params[i])
-        p3.update_buffer()
-    
-    # mul_coeffs_monthomery_constant_lvl multiplies p1 by p2 coefficient-wise with a Montgomery
-    # modular reduction for the moduli from q_0 up to q_level and returns the result on p3.
-    def mul_coeffs_monthomery_constant_lvl(self, level: int, p1: Poly, p2: Poly, p3: Poly):
-        for i in range(level + 1):
-            mul_coeffs_montgomery_constant_vec(p1.coeffs[i][:self.n], p2.coeffs[i][:self.n], p3.coeffs[i], self.modulus[i], self.mred_params[i])
-        p3.update_buffer()
+            _mm_mul_coeffs_montgomery_and_sub_vec(
+                p1._mm_coeffs[i].slice_reference(0, self._mm_n),
+                p2._mm_coeffs[i], p3._mm_coeffs[i],
+                self._mm_modulus[i], self._mm_mred_params[i])
     
     # MulcoeffsMontgomeryConstantAndAddNoModLvl multiplies p1 by p2 coefficient-wise with a constant-time Montgomery
     # modular reduction for the moduli from q_0 up to q_level and adds the result to p3 without modular reduction.
     # Return values in [0, 3q-1]
-    def mul_coeffs_montgomery_constant_and_add_no_mod_lvl(self, level: int, p1: Poly, p2: Poly, p3: Poly):
+    def _mm_mul_coeffs_montgomery_constant_and_add_no_mod_lvl(self, level: int, p1: Poly, p2: Poly, p3: Poly):
         for i in range(level + 1):
-            mul_coeffs_montgomery_constant_and_add_no_mod_vec(p1.coeffs[i][:self.n], p2.coeffs[i][:self.n], p3.coeffs[i], self.modulus[i], self.mred_params[i])
-        p3.update_buffer()
+            _mm_mul_coeffs_montgomery_constant_and_add_no_mod_vec(
+                p1._mm_coeffs[i].slice_reference(0, self._mm_n),
+                p2._mm_coeffs[i], p3._mm_coeffs[i],
+                self._mm_modulus[i], self._mm_mred_params[i])
     
     # neg_lvl sets the coefficients of p1 to their additive inverse for
     # the moduli from q_0 up to q_level and writes the result on p2.
-    def neg_lvl(self, level: int, p1: Poly, p2: Poly):
-        for i in range(level + 1): neg_vec(p1.coeffs[i][:self.n], p2.coeffs[i], self.modulus[i])
-        p2.update_buffer()
+    def _mm_neg_lvl(self, level: int, p1: Poly, p2: Poly):
+        for i in range(level + 1):
+            _mm_neg_vec(
+                p1._mm_coeffs[i].slice_reference(0, self._mm_n),
+                p2._mm_coeffs[i], self._mm_modulus[i])
     
     # add_lvl adds p1 to p2 coefficient-wise for the moduli from
     # q_0 up to q_level and writes the result on p3.
-    def add_lvl(self, level: int, p1: Poly, p2: Poly, p3: Poly):
-        for i in range(level + 1): add_vec(p1.coeffs[i][:self.n], p2.coeffs[i][:self.n], p3.coeffs[i], self.modulus[i])
-        p3.update_buffer()
+    def _mm_add_lvl(self, level: int, p1: Poly, p2: Poly, p3: Poly):
+        for i in range(level + 1):
+            _mm_add_vec(
+                p1._mm_coeffs[i].slice_reference(0, self._mm_n),
+                p2._mm_coeffs[i], p3._mm_coeffs[i], self._mm_modulus[i])
     
     # sub_lvl subtracts p2 to p1 coefficient-wise and writes the result on p3.
-    def sub_lvl(self, level: int, p1: Poly, p2: Poly, p3: Poly):
-        for i in range(level + 1): sub_vec(p1.coeffs[i][:self.n], p2.coeffs[i][:self.n], p3.coeffs[i], self.modulus[i])
-        p3.update_buffer()
+    def _mm_sub_lvl(self, level: int, p1: Poly, p2: Poly, p3: Poly):
+        for i in range(level + 1):
+            _mm_sub_vec(
+                p1._mm_coeffs[i].slice_reference(0, self._mm_n),
+                p2._mm_coeffs[i], p3._mm_coeffs[i], self._mm_modulus[i])
     
     # reduce_lvl applies a modular reduction on the coefficients of p1
     # for the moduli from q_0 up to q_level and writes the result on p2.
-    def reduce_lvl(self, level: int, p1: Poly, p2: Poly):
+    def _mm_reduce_lvl(self, level: int, p1: Poly, p2: Poly):
         for i in range(level + 1):
-            reduce_vec(p1.coeffs[i][:self.n], p2.coeffs[i], self.modulus[i], self.bred_params[i])
-        p2.update_buffer()
+            _mm_reduce_vec(p1._mm_coeffs[i], p2._mm_coeffs[i], self._mm_modulus[i], self._mm_bred_params[i][0])
     
     # DivRoundByLastModulusLvl divides (rounded) the polynomial by its last modulus. The input must be in the NTT domain.
     # Output poly level must be equal or one less than input level.
-    def div_round_by_last_modulus_lvl(self, level: int, p0: Poly, p1: Poly):
+    def _mm_div_round_by_last_modulus_lvl(self, level: int, p0: Poly, p1: Poly):
         # Center by (p-1)/2
-        pj = self.modulus[level]
-        p_half = (pj - 1) >> 1
-
-        add_scalar_vec(p0.coeffs[level], p0.coeffs[level], p_half, pj)
+        _mm_phalf = u64xN((self.modulus[level] - 1) >> 1)
+        _mm_add_scalar_vec(p0._mm_coeffs[level], p0._mm_coeffs[level], _mm_phalf, self._mm_modulus[level])
 
         for i in range(level):
-            qi = self.modulus[i]
-            add_scalar_no_mod_and_neg_two_qi_no_mod_vec(p0.coeffs[i], p0.coeffs[i], qi - bred_add(p_half, qi, self.bred_params[i]), qi)
-            add_vec_no_mod_and_mul_scalar_montgomery_vec(p0.coeffs[level], p0.coeffs[i], p1.coeffs[i], self.rescale_params[level - 1][i], qi, self.mred_params[i])
+            _mm_qi = self._mm_modulus[i]
+            _mm_add_scalar_no_mod_and_neg_two_qi_no_mod_vec(p0._mm_coeffs[i], p0._mm_coeffs[i], _mm_qi - _mm_bred_add(_mm_phalf, _mm_qi, self._mm_bred_params[i][0]), _mm_qi)
+            _mm_add_vec_no_mod_and_mul_scalar_montgomery_vec(p0._mm_coeffs[level], p0._mm_coeffs[i], p1._mm_coeffs[i], self._mm_rescale_params[level - 1][i], _mm_qi, self._mm_mred_params[i])
 
     # DivRoundByLastModulusNTTLvl divides (rounded) the polynomial by its last modulus. The input must be in the NTT domain.
     # Output poly level must be equal or one less than input level.
-    def div_round_by_last_modulus_ntt_lvl(self, level: int, p0: Poly, buff: Poly, p1: Poly):
-        self.inv_ntt_single_lazy(level, p0.coeffs[level], buff.coeffs[level])
+    def _mm_div_round_by_last_modulus_ntt_lvl(self, level: int, p0: Poly, buff: Poly, p1: Poly):
+        self._mm_inv_ntt_single_lazy(level, p0._mm_coeffs[level], buff._mm_coeffs[level])
 
         # Center by (p-1)/2
-        pj = self.modulus[level]
-        p_half = (pj - 1) >> 1
-
-        add_scalar_vec(buff.coeffs[level], buff.coeffs[level], p_half, pj)
+        p_half = (self.modulus[level] - 1) >> 1
+        _mm_p_half = u64xN(p_half)
+        _mm_add_scalar_vec(buff._mm_coeffs[level], buff._mm_coeffs[level], _mm_p_half, self._mm_modulus[level])
 
         for i in range(level):
             qi = self.modulus[i]
-            add_scalar_no_mod_vec(buff.coeffs[level], buff.coeffs[i], qi - bred_add(p_half, qi, self.bred_params[i]))
-            self.ntt_single_lazy(i, buff.coeffs[i], buff.coeffs[i])
-            sub_vec_and_mul_scalar_montgomery_two_qi_vec(buff.coeffs[i], p0.coeffs[i], p1.coeffs[i], self.rescale_params[level - 1][i], qi, self.mred_params[i])
-
+            _mm_scalar = u64xN(qi - bred_add(p_half, qi, self.bred_params[i][0]))
+            _mm_add_scalar_no_mod_vec(buff._mm_coeffs[level], buff._mm_coeffs[i], _mm_scalar)
+            self._mm_ntt_single_lazy(i, buff._mm_coeffs[i], buff._mm_coeffs[i])
+            _mm_sub_vec_and_mul_scalar_montgomery_two_qi_vec(buff._mm_coeffs[i], p0._mm_coeffs[i], p1._mm_coeffs[i], self._mm_rescale_params[level - 1][i], self._mm_modulus[i], self._mm_mred_params[i])
 
     # DivRoundByLastModulusManyNTTLvl divides (rounded) sequentially nb_rescales times the polynomial by its last modulus. The input must be in the NTT domain.
     # Output poly level must be equal or nb_rescales less than input level.
-    def div_round_by_last_modulus_many_ntt_lvl(self, level: int, nb_rescales: int, p0: Poly, buff: Poly, p1: Poly):
+    def _mm_div_round_by_last_modulus_many_ntt_lvl(self, level: int, nb_rescales: int, p0: Poly, buff: Poly, p1: Poly):
         if nb_rescales == 0:
             if p0 != p1:
-                p1.buff = copy(p0.buff)
-                p1.update_coeffs()
+                p1._mm_set_coeffs(p0._mm_coeffs.copy())
         else:
             if nb_rescales > 1:
-                self.inv_ntt_lvl(level, p0, buff)
+                self._mm_inv_ntt_lvl(level, p0, buff)
                 for i in range(nb_rescales):
-                    self.div_round_by_last_modulus_lvl(level - i, buff, buff)
-                self.ntt_lvl(level - nb_rescales, buff, p1)
+                    self._mm_div_round_by_last_modulus_lvl(level - i, buff, buff)
+                self._mm_ntt_lvl(level - nb_rescales, buff, p1)
             else:
-                self.div_round_by_last_modulus_ntt_lvl(level, p0, buff, p1)
+                self._mm_div_round_by_last_modulus_ntt_lvl(level, p0, buff, p1)
     
     # poly_to_bigint reconstructs p1 and returns the result in an array of Int.
     # gap defines coefficients X^{i*gap} that will self reconstructed.
     # For example, if gap = 1, then all coefficients are reconstructed, while
     # if gap = 2 then only coefficients X^{2*i} are reconstructed.
-    def poly_to_bigint(self, p1: Poly, gap: int, coeffs_bigint: list[big_uint]):
-        self.poly_to_bigint_lvl(p1.level(), p1, gap, coeffs_bigint)
+    def poly_to_bigint(self, level: int, coeffs: list[list[u64]], gap: int, coeffs_bigint: list[big_uint]):
+        self.poly_to_bigint_lvl(level, coeffs, gap, coeffs_bigint)
     
     # poly_to_bigint_lvl reconstructs p1 and returns the result in an array of Int.
     # gap defines coefficients X^{i*gap} that will self reconstructed.
     # For example, if gap = 1, then all coefficients are reconstructed, while
     # if gap = 2 then only coefficients X^{2*i} are reconstructed.
-    def poly_to_bigint_lvl(self, level: int, p1: Poly, gap: int, coeffs_bigint: list[big_uint]):
+    def poly_to_bigint_lvl(self, level: int, coeffs: list[list[u64]], gap: int, coeffs_bigint: list[big_uint]):
         crt_reconstruction = list[big_uint](level + 1)
         modulus_bigint = self.modulus_at_level[level]
 
         for i in range(level + 1):
             qib = self.modulus[i].ext_to_bigint()
-            crt_reconstruction.append(modulus_bigint.bigint_floordiv(qib))
-            crt_reconstruction[i] *= crt_reconstruction[i].mod_inv(qib).bigint_mod(qib)
+            crt_reconstruction.append(biguint_floordiv(modulus_bigint, qib))
+            crt_reconstruction[i] *= biguint_mod(biguint_mod_inv(crt_reconstruction[i], qib), qib)
 
         i, j = 0, 0
 
         while j < self.n:
             coeffs_bigint[i] = big_uint(0)
             for k in range(level + 1):
-                coeffs_bigint[i] += p1.coeffs[k][j].ext_to_bigint() * crt_reconstruction[k]
-            coeffs_bigint[i] = coeffs_bigint[i].bigint_mod(modulus_bigint)
+                coeffs_bigint[i] += coeffs[k][j].ext_to_bigint() * crt_reconstruction[k]
+            coeffs_bigint[i] = biguint_mod(coeffs_bigint[i], modulus_bigint)
             i, j = i + 1, j + gap
     
     # PolyToBigintCenteredLvl reconstructs p1 and returns the result in an array of Int.
@@ -1437,8 +1490,8 @@ class Ring:
 
         for i in range(level + 1):
             qib = self.modulus[i].ext_to_bigint()
-            crt_reconstruction.append(modulus_bigint.bigint_floordiv(qib))
-            crt_reconstruction[i] *= crt_reconstruction[i].mod_inv(qib).bigint_mod(qib)
+            crt_reconstruction.append(biguint_floordiv(modulus_bigint, qib))
+            crt_reconstruction[i] *= biguint_mod(biguint_mod_inv(crt_reconstruction[i], qib), qib)
 
         modulus_bigint_half = big_int(modulus_bigint >> 1)
 
@@ -1446,8 +1499,8 @@ class Ring:
         while j < self.n:
             coeffs_bigint[i] = big_int(0)
             for k in range(level + 1):
-                coeffs_bigint[i] += big_int(p1.coeffs[k][j].ext_to_bigint() * crt_reconstruction[k])
-            coeffs_bigint[i] = coeffs_bigint[i].bigint_mod(big_int(modulus_bigint))
+                coeffs_bigint[i] += big_int(p1._buf_coeffs[k][j].ext_to_bigint() * crt_reconstruction[k])
+            coeffs_bigint[i] = bigint_mod(coeffs_bigint[i], big_int(modulus_bigint))
 
             # Centers the coefficients
             if coeffs_bigint[i] >= modulus_bigint_half:
@@ -1455,98 +1508,62 @@ class Ring:
 
             i, j = i + 1, j + gap
     
-    def check_lvls(p1: Poly, p2: Poly) -> int:
-        lvl1, lvl2 = p1.level(), p2.level()
-
-        if lvl1 != lvl2:
-            print(f"WARNING: Incompatible levels of polynomials -- {lvl1} != {lvl2}")
-        
-        return min(lvl1, lvl2)
-    
     # SetCoefficientsBigintLvl sets the coefficients of p1 from an array of Int variables.
     def set_coefficients_bigint_lvl(self, level: int, coeffs: list[big_int], p1: Poly):
         for i in range(level + 1):
             qi_big_int = big_int(self.modulus[i].ext_to_bigint())
             for j, coeff in enumerate(coeffs):
-                p1.coeffs[i][j] = u64(coeff.bigint_mod(qi_big_int).trunc_to_i64())
+                p1._buf_coeffs[i][j] = u64(bigint_mod(coeff, qi_big_int).trunc_to_i64())
 
 
 class BaseSampler:
     prng: prg.Random
     base_ring: Ring
 
-    def __str__(self) -> str:
+    def __repr__(self) -> str:
         return f"""\tBase sampler:
                 \tBase ring: {self.base_ring}
         """
 
-    def __repr__(self) -> str:
-        return self.__str__()
 
 class UniformSampler(Static[BaseSampler]):
-    random_buffer_n: list[byte]
-
-    def __init__(self, prng, base_ring, random_buffer_n):
+    def __init__(self, prng, base_ring):
         self.prng = prng
         self.base_ring = base_ring
-        self.random_buffer_n = random_buffer_n
     
     def __bool__(self):
-        return bool(len(self.random_buffer_n))
+        return bool(self.base_ring)
     
-    def __str__(self) -> str:
+    def __repr__(self) -> str:
         return f"""\tUniformSampler:
                 \t{self.get_base_sampler()}
         """
-    
-    def __repr__(self) -> str:
-        return self.__str__()
     
     def get_base_sampler(self):
         return BaseSampler(self.prng, self.base_ring)
     
     # ReadNew generates a new polynomial with coefficients following a uniform distribution over [0, Qi-1].
     # Polynomial is created at the max level.
-    def read_new(self) -> Poly:
+    def _mm_read_new(self) -> Poly:
         pol = self.base_ring.new_poly()
-        self.read(pol)
+        self._mm_read(pol)
         return pol
     
     # Read generates a new polynomial with coefficients following a uniform distribution over [0, Qi-1].
-    def read(self, pol: Poly):
-        self.read_lvl(len(pol.coeffs) - 1, pol)
+    def _mm_read(self, pol: Poly):
+        self._mm_read_lvl(len(pol._mm_coeffs) - 1, pol)
 
-    # read_lvl generates coefficients following a uniform distribution over [0, Qi-1]
-    # for provided polynomial and for each level less or equal than provided level.
-    def read_lvl(self, level, pol):
-        ptr_, random_uint = 0, u64(0)
-        self.random_buffer_n = self.prng.getrandbytes(self.base_ring.n)
-
+    def _mm_read_lvl(self, level, pol):
         for j in range(level + 1):
-            qi = self.base_ring.modulus[j]
-            # Starts by computing the mask
-            mask = self.base_ring.mask[j]
-            ptmp = pol.coeffs[j]
+            bitlen = int(self.base_ring.modulus[j].bitlen())
+            _mm_qi = self.base_ring._mm_modulus[j]
+            _mm_ptmp = pol._mm_coeffs[j]
 
             # Iterates for each modulus over each coefficient
-            for i in range(self.base_ring.n):
+            for i in range(self.base_ring._mm_n):
                 # Samples an integer between [0, qi-1]
-                while True:
-                    # Refills the buff if it runs empty
-                    if ptr_ == self.base_ring.n:
-                        self.random_buffer_n = self.prng.getrandbytes(self.base_ring.n)
-                        ptr_ = 0
-
-                    # Reads bytes from the buff
-                    random_uint = ptr[u64](self.random_buffer_n.arr.ptr + ptr_)[0] & mask
-                    ptr_ += 8
-
-                    # If the integer is between [0, qi-1], breaks the loop
-                    if random_uint < qi: break
-
-                ptmp[i] = random_uint
-        
-        pol.update_buffer()
+                _mm_random_uint = self.prng._mm_getrandbits(bitlen, T=u64xN)
+                _mm_ptmp[i] = _mm_random_uint.sub_if(_mm_qi, _mm_random_uint.__ge__(_mm_qi))
 
 
 # ModupParams stores the necessary parameters for RNS basis extension.
@@ -1554,71 +1571,50 @@ class ModupParams:
     # Parameters for basis extension from q to p
     # (q/Qi)^-1) (mod each Qi) (in Montgomery form)
     qoverqiinvqi: list[u64]
+    _mm_qoverqiinvqi: list[u64xN]
     # q/qi (mod each Pj) (in Montgomery form)
     qoverqimodp: list[list[u64]]
+    _mm_qoverqimodp: list[list[u64xN]]
 	# q*v (mod each Pj) for v in [1,...,k] where k is the number of Pj moduli
     vtimesqmodp: list[list[u64]]
 
 
-def reconstruct_rns(
-        index: int, x: int, p: list[list[u64]], q: list[u64],
-        q_inv: list[u64], qb_mont: list[u64]) -> tuple[list[u64], list[list[u64]]]:
-    vi = zeros_vec(8, TP=float)
-    y = zeros(8, 32, TP=u64)
-
-    for i in range(index):
-        qoverqiinvqi = qb_mont[i]
-        qi = q[i]
-        qi_inv = q_inv[i]
-        qif = float(qi)
-
-        for idx in range(8): y[idx][i] = mred(p[i][x + idx], qoverqiinvqi, qi, qi_inv)
-        # Computation of the correction term v * q % pi
-        for idx in range(8): vi[idx] += float(y[idx][i]) / qif
-        
-    v = [u64(e) for e in vi]
-
-    return v, y
-
-
 # Caution, returns the values in [0, 2q-1]
-def mult_sum(
-        v: list[u64], y: list[list[u64]], nb_pi: int, pj: u64,
-        q_inv: u64, vtimesqmodp: list[u64], qoverqimodp: list[u64]):
-    rlo = zeros_vec(8, TP=u64)
-    rhi = zeros_vec(8, TP=u64)
-    res = zeros_vec(8, TP=u64)
-	
+def _mm_mult_sum(
+        v: u64xN, y: list[u64xN],
+        pj_const: u64xN, q_inv_const: u64xN,
+        vtimesqmodp: list[u64], qoverqimodp: list[u64xN]):
+    r = u64xN(u64(0)).zext_double()
     # Accumulates the sum on uint128 and does a lazy montgomery reduction at the end
-    for i in range(nb_pi):
-        for idx in range(8):
-            mhi, mlo = y[idx][i].mul_overflow(qoverqimodp[i])
-            rlo[idx], c = rlo[idx].add_overflow(mlo)
-            rhi[idx] += mhi + c
+    for i in range(len(y)): r = r + y[i].zext_mul(qoverqimodp[i])
 
-    for idx in range(8):
-        hhi, _ = (rlo[idx] * q_inv).mul_overflow(pj)
-        res[idx] = rhi[idx] - hhi + pj + vtimesqmodp[int(v[idx])]
+    h = (r.trunc_half() * q_inv_const).mulhi(pj_const)
+    return r.shift_half().trunc_half() - h + pj_const + vtimesqmodp.shuffle(v)
 
-    return res
+
+def _mm_reconstruct_rns(
+        p_row: list[u64xN], q: list[u64xN],
+        q_inv: list[u64xN], qb_mont: list[u64xN]) -> tuple[u64xN, list[u64xN]]:
+    v = f64xN(0.0)
+    y = list[u64xN](len(p_row))
+
+    for i in range(len(p_row)):
+        y.append(_mm_mred(p_row[i], qb_mont[i], q[i], q_inv[i]))
+        v = v + (y[i] / q[i])
+    
+    return v.to_u64(), y
 
 
 # ModUpExact takes p1 mod q and switches its basis to P, returning the result on p2.
 # Caution, returns the values in [0, 2q-1]
-def mod_up_exact(p1: list[list[u64]], p2: list[list[u64]], ring_q: Ring, ring_p: Ring, params: ModupParams):
-    q = ring_q.modulus
-    p = ring_p.modulus
-    mred_params_q = ring_q.mred_params
-    mred_params_p = ring_p.mred_params
-    vtimesqmodp = params.vtimesqmodp
-    qoverqiinvqi = params.qoverqiinvqi
-    qoverqimodp = params.qoverqimodp
-
+def _mm_mod_up_exact(p1: list[list[u64xN]], p2: list[list[u64xN]], ring_q: Ring, ring_p: Ring, params: ModupParams):
     # We loop over each coefficient and apply the basis extension
-    for x in range(0, len(p1[0]), 8):
-        v, y = reconstruct_rns(len(p1), x, p1, q, mred_params_q, qoverqiinvqi)
-        for j in range(len(p2)):
-            p2[j][x:x + 8] = mult_sum(v, y, len(p1), p[j], mred_params_p[j], vtimesqmodp[j], qoverqimodp[j])
+    for i in range(len(p1)):
+        v, y = _mm_reconstruct_rns(
+            p1[i], ring_q._mm_modulus, ring_q._mm_mred_params, params._mm_qoverqiinvqi)
+        for j in range(len(p2[0])):
+            p2[i][j] = _mm_mult_sum(
+                v, y, ring_p._mm_modulus[j], ring_p._mm_mred_params[j], params.vtimesqmodp[j], params._mm_qoverqimodp[j])
 
 
 class BasisExtender:
@@ -1626,13 +1622,13 @@ class BasisExtender:
     ring_p: Ring
     params_q_to_p: list[ModupParams]
     params_p_to_q: list[ModupParams]
-    mod_down_params_p_to_q: list[list[u64]]
+    _mm_mod_down_params_p_to_q: list[list[u64xN]]
     mod_down_params_q_to_p: list[list[u64]]
 
     buff_q: Poly
     buff_p: Poly
 
-    def __str__(self) -> str:
+    def __repr__(self) -> str:
         return f"""\tBasisExtender:
                 \tringQ: {self.ring_q}
                 \tringP: {self.ring_p}
@@ -1640,47 +1636,44 @@ class BasisExtender:
                 \tbuffP: {self.buff_p}
         """
     
-    def __repr__(self) -> str:
-        return self.__str__()
-    
     # mod_up_p_to_q extends the RNS basis of a polynomial from P to PQ.
     # Given a polynomial with coefficients in basis {P0,P1....Plevel},
     # it extends its basis from {P0,P1....Plevel} to {Q0,Q1...Qj}
-    def mod_up_p_to_q(self, level_p: int, level_q: int, pol_p: Poly, pol_q: Poly):
-        mod_up_exact(pol_p.coeffs[:level_p + 1], pol_q.coeffs.slice_reference(0, level_q + 1), self.ring_p, self.ring_q, self.params_p_to_q[level_p])
-        pol_q.update_buffer()
+    def _mm_mod_up_p_to_q(self, level_p: int, level_q: int, pol_p: Poly, pol_q: Poly):
+        _mm_reference = pol_q._mm_coeffs.slice_reference(0, level_q + 1).transpose()
+        _mm_mod_up_exact(
+            pol_p._mm_coeffs.slice_reference(0, level_p + 1).transpose(),
+            _mm_reference,
+            self.ring_p, self.ring_q, self.params_p_to_q[level_p])
+        pol_q._mm_coeffs[:level_q] = _mm_reference.transpose()
 
     # ModDownQPtoQNTT reduces the basis of a polynomial.
     # Given a polynomial with coefficients in basis {Q0,Q1....Qi} and {P0,P1...Pj},
     # it reduces its basis from {Q0,Q1....Qi} and {P0,P1...Pj} to {Q0,Q1....Qi}
     # and does a rounded integer division of the result by P.
     # Inputs must self in the NTT domain.
-    def mod_down_qp_to_q_ntt(self, level_q: int, level_p: int, p1_q: Poly, p1_p: Poly, p2_q: Poly):
+    def _mm_mod_down_qp_to_q_ntt(self, level_q: int, level_p: int, p1_q: Poly, p1_p: Poly, p2_q: Poly):
         ring_q = self.ring_q
         ring_p = self.ring_p
-        mod_down_params = self.mod_down_params_p_to_q
+        mod_down_params = self._mm_mod_down_params_p_to_q
         buff_p = self.buff_p
         buff_q = self.buff_q
 
         # First we get the P basis part of p1 out of the NTT domain
-        ring_p.inv_ntt_lazy_lvl(level_p, p1_p, buff_p)
-
+        ring_p._mm_inv_ntt_lazy_lvl(level_p, p1_p, buff_p)
         # Then we target this P basis of p1 and convert it to a q basis (at the "level" of p1) and copy it on the buffer.
         # The buffer is now the representation of the P basis of p1 but in basis q (at the "level" of p1)
-        self.mod_up_p_to_q(level_p, level_q, buff_p, buff_q)
-
+        self._mm_mod_up_p_to_q(level_p, level_q, buff_p, buff_q)
         # First, we switch back the buffer CRT array back to the NTT domain
-        ring_q.ntt_lazy_lvl(level_q, buff_q, buff_q)
-
+        ring_q._mm_ntt_lazy_lvl(level_q, buff_q, buff_q)
+        
         # Finally, for each level of p1 (and the buffer since they now share the same basis) we compute p2 = (P^-1) * (p1 - buff) mod q
         for i in range(level_q + 1):
             # Then for each coefficient we compute (P^-1) * (p1[i][j] - buff[i][j]) mod qi
-            sub_vec_and_mul_scalar_montgomery_two_qi_vec(
-                buff_q.coeffs[i], p1_q.coeffs[i], p2_q.coeffs[i],
-                ring_q.modulus[i] - mod_down_params[level_p][i],
-                ring_q.modulus[i], ring_q.mred_params[i])
-
-        p2_q.update_buffer()
+            _mm_sub_vec_and_mul_scalar_montgomery_two_qi_vec(
+                buff_q._mm_coeffs[i], p1_q._mm_coeffs[i], p2_q._mm_coeffs[i],
+                ring_q._mm_modulus[i] - mod_down_params[level_p][i],
+                ring_q._mm_modulus[i], ring_q._mm_mred_params[i])
 
         # In total we do len(P) + len(q) NTT, which is optimal (linear in the number of moduli of P and q)
 
@@ -1688,20 +1681,20 @@ class BasisExtender:
     # Given a polynomial with coefficients in basis {Q0,Q1....Qlevel} and {P0,P1...Pj},
     # it reduces its basis from {Q0,Q1....Qlevel} and {P0,P1...Pj} to {Q0,Q1....Qlevel}
     # and does a rounded integer division of the result by P.
-    def mod_down_qp_to_q(self, level_q: int, level_p: int, p1_q: Poly, p1_p: Poly, p2_q: Poly):
+    def _mm_mod_down_qp_to_q(self, level_q: int, level_p: int, p1_q: Poly, p1_p: Poly, p2_q: Poly):
         ring_q = self.ring_q
-        mod_down_params = self.mod_down_params_p_to_q
+        mod_down_params = self._mm_mod_down_params_p_to_q
         buff = self.buff_q
 
         # Then we target this P basis of p1 and convert it to a q basis (at the "level" of p1) and copy it on buff
         # buff is now the representation of the P basis of p1 but in basis q (at the "level" of p1)
-        self.mod_up_p_to_q(level_p, level_q, p1_p, buff)
+        self._mm_mod_up_p_to_q(level_p, level_q, p1_p, buff)
 
         # Finally, for each level of p1 (and buff since they now share the same basis) we compute p2 = (P^-1) * (p1 - buff) mod q
         for i in range(level_q + 1):
-            sub_vec_and_mul_scalar_montgomery_two_qi_vec(buff.coeffs[i], p1_q.coeffs[i], p2_q.coeffs[i], ring_q.modulus[i] - mod_down_params[level_p][i], ring_q.modulus[i], ring_q.mred_params[i])
+            _mm_sub_vec_and_mul_scalar_montgomery_two_qi_vec(
+                buff._mm_coeffs[i], p1_q._mm_coeffs[i], p2_q._mm_coeffs[i], ring_q._mm_modulus[i] - mod_down_params[level_p][i], ring_q._mm_modulus[i], ring_q._mm_mred_params[i])
 
-        p2_q.update_buffer()
         # In total we do len(P) + len(q) NTT, which is optimal (linear in the number of moduli of P and q)
 
 
@@ -1709,42 +1702,41 @@ class BasisExtender:
 class GaussianSampler(Static[BaseSampler]):
     sigma: float
     bound: int
-    random_buffer_n: list[byte]
-    ptr: u64
 
-    def __str__(self) -> str:
+    def __repr__(self) -> str:
         return f"""\tGaussianSampler:
                 \tSigma: {self.sigma}
                 \tBound: {self.bound}
-                \tPtr: {self.ptr}
         """
     
-    def __repr__(self) -> str:
-        return self.__str__()
-    
     # Read samples a truncated Gaussian polynomial on "pol" at the maximum level in the default ring, standard deviation and bound.
-    def read(self, pol: Poly):
-        self.read_lvl(len(self.base_ring.modulus) - 1, pol)
+    def _mm_read(self, pol: Poly):
+        self._mm_read_lvl(len(self.base_ring.modulus) - 1, pol)
 
-    # read_lvl samples a truncated Gaussian polynomial at the provided level, in the default ring, standard deviation and bound.
-    def read_lvl(self, level, pol):
-        self.read_lvl(level, pol, self.base_ring, self.sigma, self.bound)
+    # # read_lvl samples a truncated Gaussian polynomial at the provided level, in the default ring, standard deviation and bound.
+    # def old_read_lvl(self, level, pol):
+    #     self.old_read_lvl(level, pol, self.base_ring, self.sigma, self.bound)
     
-    def read_lvl(self, level, pol, ring, sigma, bound):
-        coeff_int, sign = u64(0), u64(0)
-        modulus = ring.modulus[:level + 1]
+    # def old_read_lvl(self, level, pol, ring, sigma, bound):
+    #     coeff_int, sign = u64(0), u64(0)
+    #     modulus = ring.modulus[:level + 1]
 
-        for i in range(ring.n):
-            while True:
-                coeff_flo, sign = self.norm_float_64()
-                coeff_int = u64(int(coeff_flo * sigma + 0.5))
-                if coeff_int <= u64(bound): break
+    #     for i in range(ring.n):
+    #         while True:
+    #             coeff_flo, sign = self.norm_float_64()
+    #             coeff_int = u64(int(coeff_flo * sigma + 0.5))
+    #             if coeff_int <= u64(bound): break
 
-            for j, qi in enumerate(modulus):
-                pol.coeffs[j][i] = u64(1)  # TODO: Revert: (coeff_int * sign) | (qi - coeff_int) * (sign ^ u64(1))
+    #         for j, qi in enumerate(modulus):
+    #             pol._buf_coeffs[j][i] = u64(1)  # TODO: Revert: (coeff_int * sign) | (qi - coeff_int) * (sign ^ u64(1))
+    
+    def _mm_read_lvl(self, level, pol):
+        # TODO: Temp method (see old_read_lvl above)
+        _mm_ones = u64xN(u64(1))
+        for i in range(level + 1):
+            for j in range(self.base_ring._mm_n):
+                pol._mm_coeffs[i][j] = _mm_ones
         
-        pol.update_buffer()
-    
     # NormFloat64 returns a normally distributed float64 in
     # the range [-math.MaxFloat64, +math.MaxFloat64], bounds included,
     # with standard normal distribution (mean = 0, stddev = 1).
@@ -1756,25 +1748,27 @@ class GaussianSampler(Static[BaseSampler]):
         return abs(r), u64(r < 0)
     
     # read_and_add_lvl samples a truncated Gaussian polynomial at the given level for the receiver's default standard deviation and bound and adds it on "pol".
-    def read_and_add_lvl(self, level: int, pol: Poly):
-        self.read_and_add_from_dist_lvl(level, pol, self.base_ring, self.sigma, self.bound)
+    def _mm_read_and_add_lvl(self, level: int, pol: Poly):
+        self._mm_read_and_add_from_dist_lvl(level, pol, self.base_ring, self.sigma, self.bound)
+    
+    # read_and_add_lvl samples a truncated Gaussian polynomial at the given level for the receiver's default standard deviation and bound and adds it on "pol".
+    def _mm_read_and_add_lvl(self, level: int, pol: Poly):
+        self._mm_read_and_add_from_dist_lvl(level, pol, self.base_ring, self.sigma, self.bound)
     
     # read_and_add_from_dist_lvl samples a truncated Gaussian polynomial at the given level in the provided ring, standard deviation and bound and adds it on "pol".
-    def read_and_add_from_dist_lvl(self, level: int, pol: Poly, ring: Ring, sigma: float, bound: int):
+    def _mm_read_and_add_from_dist_lvl(self, level: int, pol: Poly, ring: Ring, sigma: float, bound: int):
         modulus = ring.modulus[:level + 1]
         coeff_flo, sign, coeff_int = 0.0, u64(0), u64(0)
 
-        for i in range(ring.n):
+        for j, qi in enumerate(modulus):
             while True:
                 coeff_flo, sign = self.norm_float_64()
                 coeff_int = u64(int(coeff_flo * sigma + 0.5))
                 if coeff_int <= u64(bound): break
 
-            for j, qi in enumerate(modulus):
-                pol.coeffs[j][i] = cred(pol.coeffs[j][i] + ((coeff_int * sign) | (qi - coeff_int) * (sign ^ u64(1))), qi)
-        
-        pol.update_buffer()
-
+            for i in range(ring._mm_n):
+                _mm_noise = u64xN((coeff_int * sign) | (qi - coeff_int) * (sign ^ u64(1)))
+                pol._mm_coeffs[j][i] = _mm_cred(pol._mm_coeffs[j][i] + _mm_noise, ring._mm_modulus[j])
 
 # TernarySampler keeps the state of a polynomial sampler in the ternary distribution.
 class TernarySampler(Static[BaseSampler]):
@@ -1784,58 +1778,30 @@ class TernarySampler(Static[BaseSampler]):
     hw: int
     sample_name: str
 
-    def __str__(self) -> str:
+    def __repr__(self) -> str:
         return f"""\tTernarySampler:
                 \tmatrixValues: {self.matrix_values}
                 \tp: {self.p}
                 \thw: {self.hw}
                 \tsample_name: {self.sample_name}
         """
-
-    def __repr__(self) -> str:
-        return self.__str__()
-
-    def sample(self, lvl: int, r: Poly):
-        if self.sample_name == 'samplesparse':
-            self.sample_sparse(lvl, r)
-        else: raise NotImplementedError()
     
     def sample_sparse(self, lvl: int, pol: Poly):
         if self.hw > self.base_ring.n:
             self.hw = self.base_ring.n
-
-        index = list[int](self.base_ring.n)
-        for i in range(self.base_ring.n): index.append(i)
-
-        random_bytes = self.prng.getrandbytes((self.hw + 7) // 8)
-        pointer = 0
+    
+        index = arange(self.base_ring.n, TP=int)
 
         for i in range(self.hw):
             bit_len = int((self.base_ring.n - i).bitlen()) - 1  # rejection sampling of a random variable between [0, len(index)]
-
             j = self.prng.getrandbits(bit_len)
-            while j >= self.base_ring.n - i:
-                j = self.prng.getrandbits(bit_len)
 
-            coeff = (int(random_bytes[0]) >> (i & 7)) & 1  # random binary digit [0, 1] from the random bytes (0 = 1, 1 = -1)
+            coeff = self.prng.getrandbits(1)  # random binary digit [0, 1] from the random bytes (0 = 1, 1 = -1)
             for k in range(lvl + 1):
-                pol.coeffs[k][index[j]] = self.matrix_values[k][coeff + 1]
+                pol._buf_coeffs[k][index[j]] = self.matrix_values[k][coeff + 1]
 
             # Remove the element in position j of the slice (order not preserved)
-            index[j] = index[len(index)-1]
-            index = index[:len(index)-1]
-
-            pointer += 1
-
-            if pointer == 8:
-                random_bytes = random_bytes[1:]
-                pointer = 0
-
-        for i in index:
-            for k in range(lvl + 1):
-                pol.coeffs[k][i] = u64(0)
-        
-        pol.update_buffer()
+            index[j] = index.pop()
     
     def initialize_matrix(self, montgomery):
         self.matrix_values = zeros(len(self.base_ring.modulus), 3, TP=u64)
@@ -1854,24 +1820,29 @@ class TernarySampler(Static[BaseSampler]):
                 self.matrix_values[i][1] = u64(1)
                 self.matrix_values[i][2] = Qi - u64(1)
     
+    def _mm_sample(self, lvl: int, r: Poly):
+        if self.sample_name == 'samplesparse':
+            self.sample_sparse(lvl, r)
+        else: raise NotImplementedError()
+
     # ReadLvl samples a polynomial into pol at the speciefied level.
-    def read_lvl(self, lvl: int, pol: Poly):
-        self.sample(lvl, pol)
+    def _mm_read_lvl(self, lvl: int, pol: Poly):
+        self._mm_sample(lvl, pol)
     
     # ReadLvlNew allocates and samples a polynomial at the speficied level.
-    def read_lvl_new(self, lvl: int) -> Poly:
+    def _mm_read_lvl_new(self, lvl: int) -> Poly:
         pol = self.base_ring.new_poly_lvl(lvl)
-        self.read_lvl(lvl, pol)
+        self._mm_read_lvl(lvl, pol)
         return pol
 
     # read samples a polynomial into pol.
-    def read(self, pol):
-        self.read_lvl(len(self.base_ring.modulus) - 1, pol)
+    def _mm_read(self, pol):
+        self._mm_read_lvl(len(self.base_ring.modulus) - 1, pol)
 
     # ReadNew allocates and samples a polynomial at the max level.
-    def read_new(self) -> Poly:
+    def _mm_read_new(self) -> Poly:
         pol = self.base_ring.new_poly()
-        self.read(pol)
+        self._mm_read(pol)
         return pol
 
 
@@ -1961,8 +1932,7 @@ def generate_ntt_primes(logq, nth_root, n):
 def new_uniform_sampler(prng, base_ring):
     return UniformSampler(
         prng=prng,
-        base_ring=base_ring,
-        random_buffer_n=zeros_vec(base_ring.n, TP=byte))
+        base_ring=base_ring)
 
 
 # GenModUpParams generates the ModupParams for basis extension from q to p and p to q.
@@ -1981,12 +1951,9 @@ def gen_mod_up_params(q, p):
         mred_params_p.append(mred_params(pi))
 
     qoverqiinvqi = list[u64](len(q))
-    qoverqimodp = list[list[u64]](len(p))
-
-    for _ in range(len(p)):
-        q_row = list[u64](len(q))
-        for _ in range(len(q)): q_row.append(u64(0))
-        qoverqimodp.append(q_row)
+    _mm_qoverqiinvqi = list[u64xN](len(q))
+    qoverqimodp = list[list[u64]](len(q))
+    _mm_qoverqimodp = list[list[u64xN]](len(q))
 
     for i, qi in enumerate(q):
         qi_star = mform(u64(1), qi, bred_params_q[i])
@@ -1996,14 +1963,20 @@ def gen_mod_up_params(q, p):
 
         # (q/Qi)^-1) * r (mod Qi) (in Montgomery form)
         qoverqiinvqi.append(mod_exp_montgomery(qi_star, int(qi - u64(2)), qi, mred_params_q[i], bred_params_q[i]))
+        _mm_qoverqiinvqi.append(u64xN(qoverqiinvqi[i]))
 
+        qoverqimodp_row = list[u64](len(p))
+        _mm_qoverqimodp_row = list[u64xN](len(p))
         for j, pj in enumerate(p):
             # (q/qi * r) (mod Pj) (in Montgomery form)
             qi_star = u64(1)
             for u in range(len(q)):
                 if u != i: qi_star = mred(qi_star, mform(q[u], pj, bred_params_p[j]), pj, mred_params_p[j])
 
-            qoverqimodp[j][i] = mform(qi_star, pj, bred_params_p[j])
+            qoverqimodp_row.append(mform(qi_star, pj, bred_params_p[j]))
+            _mm_qoverqimodp_row.append(u64xN(qoverqimodp_row[j]))
+        qoverqimodp.append(qoverqimodp_row)
+        _mm_qoverqimodp.append(_mm_qoverqimodp_row)
 
     vtimesqmodp = list[list[u64]](len(p))
     for j, pj in enumerate(p):
@@ -2019,7 +1992,9 @@ def gen_mod_up_params(q, p):
     
     return ModupParams(
         qoverqiinvqi=qoverqiinvqi,
-        qoverqimodp=qoverqimodp,
+        _mm_qoverqiinvqi=_mm_qoverqiinvqi,
+        qoverqimodp=qoverqimodp.transpose(),
+        _mm_qoverqimodp=_mm_qoverqimodp.transpose(),
         vtimesqmodp=vtimesqmodp)
 
 
@@ -2054,7 +2029,8 @@ def new_basis_extender(ring_q, ring_p):
     for i in range(len(ring_p.modulus)):
         new_params.params_p_to_q.append(gen_mod_up_params(ring_p.modulus[:i + 1], ring_q.modulus))
 
-    new_params.mod_down_params_p_to_q = gen_mod_down_params(ring_q, ring_p)
+    mod_down_params_p_to_q = gen_mod_down_params(ring_q, ring_p)
+    new_params._mm_mod_down_params_p_to_q = [[u64xN(e) for e in row] for row in mod_down_params_p_to_q]
     new_params.mod_down_params_q_to_p = gen_mod_down_params(ring_p, ring_q)
 
     new_params.buff_q = ring_q.new_poly()
@@ -2069,8 +2045,6 @@ def new_basis_extender(ring_q, ring_p):
 def new_gaussian_sampler(prng, base_ring, sigma, bound):
     return GaussianSampler(
         prng=prng,
-        random_buffer_n=[byte(0) for _ in range(1024)],
-        ptr=u64(0),
         base_ring=base_ring,
         sigma=sigma,
         bound=bound)
@@ -2090,18 +2064,18 @@ def new_ternary_sampler_with_hamming_weight(prng, base_ring, hw, montgomery):
 
 
 # CopyValuesLvl copies the values of p0 on p1, up to level+1 moduli.
-def copy_values_lvl(level, p0, p1):
-    for i in range(level + 1): p1.coeffs[i] = copy(p0.coeffs[i])
-    p1.buff[:p1.n() * (level + 1)] = copy(p0.buff)
+def _mm_copy_values_lvl(level, p0, p1):
+    for i in range(level + 1):
+        p1._mm_coeffs[i] = copy(p0._mm_coeffs[i])
 
 # CopyLvl copies the coefficients of p0 on p1 within the given Ring.
 # Copies for up to level+1 moduli.
 # Expects the degree of both polynomials to self identical.
 # Transfers the is_ntt and is_mform flags.
-def copy_lvl(level, p0, p1):
-	copy_values_lvl(level, p0, p1)
-	p1.is_ntt = p0.is_ntt
-	p1.is_mform = p0.is_mform
+def _mm_copy_lvl(level, p0, p1):
+    _mm_copy_values_lvl(level, p0, p1)
+    p1.is_ntt = p0.is_ntt
+    p1.is_mform = p0.is_mform
 
 
 # Decomposer is a structure that stores the parameters of the arbitrary decomposer.
@@ -2114,7 +2088,7 @@ class Decomposer:
 
     # decompose_and_split decomposes a polynomial p(x) in basis q, reduces it modulo qi, and returns
     # the result in basis QP separately.
-    def decompose_and_split(
+    def _mm_decompose_and_split(
             self, level_q: int, level_p: int, nb_pi: int,
             decomp_rns: int, p0_q: Poly, p1_q: Poly, p1_p: Poly):
         ring_q = self.ring_q
@@ -2127,8 +2101,8 @@ class Decomposer:
 
         # First we check if the vector can simply by copying and rearranging elements (the case where no reconstruction is needed)
         if decomp_lvl == -1:
-            for j in range(level_q + 1): p1_q.coeffs[j] = copy(p0_q.coeffs[lvl_q_start])
-            for j in range(level_p + 1): p1_p.coeffs[j] = copy(p0_q.coeffs[lvl_q_start])
+            for j in range(level_q + 1): p1_q._mm_coeffs[j] = copy(p0_q._mm_coeffs[lvl_q_start])
+            for j in range(level_p + 1): p1_p._mm_coeffs[j] = copy(p0_q._mm_coeffs[lvl_q_start])
             # Otherwise, we apply a fast exact base conversion for the reconstruction
         else:
             p0_idx_st = decomp_rns * nb_pi
@@ -2137,59 +2111,57 @@ class Decomposer:
             if p0_idx_ed > level_q + 1: p0_idx_ed = level_q + 1
             params = self.mod_up_params[nb_pi - 2][decomp_rns][decomp_lvl]
 
-            q = ring_q.modulus
-            p = ring_p.modulus
-            mred_params_q = ring_q.mred_params
-            mred_params_p = ring_p.mred_params
-            qoverqiinvqi = params.qoverqiinvqi
+            q = ring_q._mm_modulus
+            p = ring_p._mm_modulus
+            mred_params_q = ring_q._mm_mred_params
+            mred_params_p = ring_p._mm_mred_params
             vtimesqmodp = params.vtimesqmodp
-            qoverqimodp = params.qoverqimodp
+            qoverqimodp = params._mm_qoverqimodp
 
-            y = zeros(8, 32, TP=u64)
-            v = zeros_vec(8, TP=u64)
+            _mm_p0_q_coeffs = p0_q._mm_coeffs.slice_reference(0, level_q + 1).transpose()
+            _mm_p1_q_coeffs = p1_q._mm_coeffs.slice_reference(0, level_q + 1).transpose()
+            _mm_p1_p_coeffs = p1_p._mm_coeffs.slice_reference(0, level_p + 1).transpose()
+            
+            y = [u64xN(u64(0)) for _ in range(decomp_lvl + 2)]
             # We loop over each coefficient and apply the basis extension
-            for x in range(0, len(p0_q.coeffs[0]), 8):
-                vi = [0.0 for _ in range(8)]
+            for x in range(len(_mm_p0_q_coeffs)):
                 i, j = 0, lvl_q_start
+                vf = f64xN(0.0)
 
                 # Coefficients to self decomposed
                 while i < decomp_lvl + 2:
-                    qqiinv = qoverqiinvqi[i]
-                    qi = q[j]
-                    mred_params = mred_params_q[j]
-                    qif = float(qi)
-
                     # For the coefficients to self decomposed, we can simply copy them
-                    for idx in range(8): p1_q.coeffs[j][x + idx] = p0_q.coeffs[j][x + idx]
-                    for idx in range(8): y[idx][i] = mred(p0_q.coeffs[j][x + idx], qqiinv, qi, mred_params)
+                    _mm_p1_q_coeffs[x][j] = _mm_p0_q_coeffs[x][j]
+                    y[i] = _mm_mred(_mm_p0_q_coeffs[x][j], params._mm_qoverqiinvqi[i], q[j], mred_params_q[j])
                     # Computation of the correction term v * q%pi
-                    for idx in range(8): vi[idx] += float(y[idx][i]) / qif
-
+                    vf = vf + y[i] / q[j]
                     i, j = i + 1, j + 1
 
                 # Index of the correction term
-                for idx in range(8): v[idx] = u64(vi[idx])
+                v = vf.to_u64()
  
                 # Coefficients of index smaller than the ones to self decomposed
                 for j in range(p0_idx_st):
-                    p1_q.coeffs[j][x:x + 8] = mult_sum(v, y, decomp_lvl + 2, q[j], mred_params_q[j], vtimesqmodp[j], qoverqimodp[j])
+                    _mm_p1_q_coeffs[x][j] = _mm_mult_sum(v, y, q[j], mred_params_q[j], vtimesqmodp[j], qoverqimodp[j])
 
                 # Coefficients of index greater than the ones to self decomposed
                 for j in range(p0_idx_ed, level_q + 1):
-                    p1_q.coeffs[j][x:x + 8] = mult_sum(v, y, decomp_lvl + 2, q[j], mred_params_q[j], vtimesqmodp[j], qoverqimodp[j])
+                    _mm_p1_q_coeffs[x][j] = _mm_mult_sum(v, y, q[j], mred_params_q[j], vtimesqmodp[j], qoverqimodp[j])
 
                 # Coefficients of the special primes Pi
                 j, u = 0, len(ring_q.modulus)
                 while j < level_p + 1:
-                    p1_p.coeffs[j][x:x + 8] = mult_sum(v, y, decomp_lvl + 2, p[j], mred_params_p[j], vtimesqmodp[u], qoverqimodp[u])
+                    _mm_p1_p_coeffs[x][j] = _mm_mult_sum(v, y, p[j], mred_params_p[j], vtimesqmodp[u], qoverqimodp[u])
                     j, u = j + 1, u + 1
 
+            _mm_p0_q_coeffs = _mm_p0_q_coeffs.transpose()
+            _mm_p1_q_coeffs = _mm_p1_q_coeffs.transpose()
             # Copies the coefficients of polynomials mod the RNS decomposition
-            for i in range(p0_idx_st, p0_idx_ed): p1_q.coeffs[i] = copy(p0_q.coeffs[i])
-        
-        p1_q.update_buffer()
-        p1_p.update_buffer()
+            for i in range(p0_idx_st, p0_idx_ed): _mm_p1_q_coeffs[i] = copy(_mm_p0_q_coeffs[i])
 
+            p1_q._mm_set_coeffs(_mm_p1_q_coeffs)
+            p1_p._mm_set_coeffs(_mm_p1_p_coeffs.transpose())
+        
 
 # NewDecomposer creates a new Decomposer.
 def new_decomposer(ring_q: Ring, ring_p: Ring):

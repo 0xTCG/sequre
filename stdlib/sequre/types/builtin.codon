@@ -1,13 +1,16 @@
 import math
 
-from internal.gc import sizeof
+from internal.gc import sizeof, atomic
+from experimental.simd import Vec, bitcast_scatter, bitcast_vectorize
 
 from ..utils.param import \
     int_t, FIELD_SIZE, RING_SIZE, RING_MASK, DEBUG, \
-    MODULUS_BITS, MERSENNE_OFFSET
+    MODULUS_BITS, MERSENNE_OFFSET, INT_LEN
 from ..utils.utils import __rand_int, __rand_vec, __rand_mat, \
     __rand_bits, __rand_vec_bits, __rand_mat_bits
 from ..utils.primitives import mod_pow
+from ..utils.constants import SIMD_LANE_SIZE
+
 from shared_tensor import SharedTensor
 from utils import double_to_fp
 
@@ -15,31 +18,27 @@ from ..experimental.fast_modular_multiplication.u128_w_llvm_overflow_intrinsic i
 from ..experimental.fast_modular_multiplication.u192_w_llvm_overflow_intrinsic import modular_mult_u192u192, modular_mult_u192u64
 
 
+# Frequently used vectors
+u64xN = Vec[u64, SIMD_LANE_SIZE]
+f64xN = Vec[f64, SIMD_LANE_SIZE]
+
+
 # IEEE 754 2008 FP standardization
 IEEE_754_MANTISSA_SIZE: Static[int] = 52
 IEEE_754_EXPONENT_SIZE: Static[int] = 64 - IEEE_754_MANTISSA_SIZE - 1
 IEEE_754_EXPONENT_HALF_RANGE: int = (1 << (IEEE_754_EXPONENT_SIZE - 1)) - 1
+# Masks
+MASK32: Static[int] = 0xffffffff
 
-# Consts for optimized modulus operation
-@extend
-class int:
-    @llvm
-    def get_mod_const(field_size: int) -> UInt[128]:
-        %fs_ext = zext i64 %field_size to i128
-        %0 = udiv i128 -1, %fs_ext
-        %1 = add i128 %0, 1
-        ret i128 %1
-@extend
-class UInt:
-    @llvm
-    def get_mod_const(field_size: UInt[N]) -> UInt[N * 2]:
-        %fs_ext = zext i{=N} %field_size to i{=N*2}
-        %0 = udiv i{=N*2} -1, %fs_ext
-        %1 = add i{=N*2} %0, 1
-        ret i{=N*2} %1
-MOD_CONST = int_t.get_mod_const(FIELD_SIZE)
-# SECOND_MOD_CONST = get_mod_const(SECOND_FIELD_SIZE)
-# THIRD_MOD_CONST = get_mod_const(THIRD_FIELD_SIZE)
+
+# Const for optimized modulus operation
+int_tt = UInt[INT_LEN * 2]
+# MOD_CONST = (int_tt(-1).bigint_floordiv(FIELD_SIZE.ext_double())) + int_tt(1)
+MOD_CONST = int_tt(0)
+if INT_LEN == 128: MOD_CONST = int_tt("680564733841876926926749214863536422917")
+elif INT_LEN == 192: MOD_CONST = int_tt("1645504557321206042154969182557350504982735865633580069507039233")
+else: raise ValueError(f"Unsupported int len: {INT_LEN}. Should be 128 or 192.")
+
 
 # Socket instrinsics
 @tuple
@@ -96,11 +95,8 @@ class Complex:
         self.r = float(r)
         self.i = float(i)
     
-    def __str__(self):
-        return f"{self.r} + {self.i}i"
-    
     def __repr__(self):
-        return self.__str__()
+        return f"{self.r} + {self.i}i"
     
     def __iadd__(self, other):
         self.r += other.r
@@ -306,6 +302,7 @@ class UInt:
         elif isinstance(other, UInt[1]): return UInt[N]._new_from_bit(other)
         elif isinstance(other, bool): return UInt[N]._new_from_bool(other)
         elif isinstance(other, float):
+            # TODO: Implement faster solution
             assert other >= 0, f"Casting float to UInt requires it to be non-negative for safety reasons. Float value received: {other}"
 
             other_raw_int = other.raw_int()
@@ -372,12 +369,13 @@ class UInt:
         return self >> UInt[N](other)
     def __mod__(self: UInt[N], other: UInt[N]) -> UInt[N]:
         if other == RING_SIZE: return self.__fast_mod_ring()
-        if other == FIELD_SIZE: return self.__fast_mod_field()
-        if isinstance(self, UInt[192]):
+        elif other == FIELD_SIZE: return self.__fast_mod_field()
+        elif isinstance(self, UInt[192]):
             # Temporary bypass. Until LLVM's urem is fixed for long integers.
             return self.__experimental__truncated_mod(other)
-        return self.__naive_mod(other)
-    def __str__(self: UInt[N]) -> str:
+        else: return self.__naive_mod(other)
+    def __repr__(self: UInt[N]) -> str:
+        # TODO: Implement faster solution
         self_cp = self
         int_str = ''
         while self_cp:
@@ -394,13 +392,36 @@ class UInt:
             int_str = str(remainder) + int_str
             self_cp = quotient
         return int_str if int_str else '0'
-    def __repr__(self) -> str:
-        return self.__str__()
+    def split_lo_hi_u64(self: UInt[64]) -> Tuple[UInt[64], UInt[64]]:
+        self_lo = self & MASK32
+        self_hi = self >> 32
+        
+        return self_hi, self_lo
     @llvm
-    def raw_add_overflow(self: UInt[N], other: UInt[N]) -> tuple[UInt[N], UInt[1]]:
+    def raw_add_overflow(self: UInt[N], other: UInt[N]) -> Tuple[UInt[N], UInt[1]]:
         declare {i{=N}, i1} @llvm.uadd.with.overflow.i{=N}(i{=N}, i{=N})
         %res = call {i{=N}, i1} @llvm.uadd.with.overflow.i{=N}(i{=N} %self, i{=N} %other)
         ret {i{=N}, i1} %res
+    def add_overflow(self: UInt[N], other: UInt[N]) -> Tuple[UInt[N], UInt[N]]:
+        s, overflow = self.raw_add_overflow(other)
+        return s, UInt[N](overflow)
+    def mul_overflow(a: UInt[N], b: UInt[N]) -> Tuple[UInt[N], UInt[N]]:
+        a_hi, a_lo = a.split_lo_hi()
+        b_hi, b_lo = b.split_lo_hi()
+
+        ll = a_lo * b_lo
+        hl = a_hi * b_lo
+        lh = a_lo * b_hi
+        hl_hi, hl_lo = hl.split_lo_hi()
+        lh_hi, lh_lo = lh.split_lo_hi()
+        
+        s, overflow_1 = ll.add_overflow(hl_lo << (N // 2))
+        s, overflow_2 = s.add_overflow(lh_lo << (N // 2))
+
+        return a_hi * b_hi + hl_hi + lh_hi + overflow_1 + overflow_2, s
+    def mul_overflow_u64(a: UInt[64], b: UInt[64]) -> Tuple[UInt[64], UInt[64]]:
+        p = a.ext_to(128) * b.ext_to(128)
+        return (p >> 64).trunc_to(64), p.trunc_to(64)
     @llvm
     def bit_reverse(self: UInt[N]) -> UInt[N]:
         declare i{=N} @llvm.bitreverse.i{=N}(i{=N})
@@ -508,13 +529,17 @@ class UInt:
         %0 = trunc i{=N} %self to i{=N//2}
         ret i{=N//2} %0
     @llvm
-    def trunc_to_u64(self: UInt[N]) -> u64:
-        %0 = trunc i{=N} %self to i64
-        ret i64 %0
+    def trunc_to(self: UInt[N], T: Static[int]) -> UInt[T]:
+        %0 = trunc i{=N} %self to i{=T}
+        ret i{=T} %0
     @llvm
     def ext_double(self: UInt[N]) -> UInt[N * 2]:
         %0 = zext i{=N} %self to i{=N*2}
         ret i{=N*2} %0
+    @llvm
+    def ext_to(self: UInt[N], T: Static[int]) -> UInt[T]:
+        %0 = zext i{=N} %self to i{=T}
+        ret i{=T} %0
     def neg_mod(self, modulus) -> UInt[N]:
         return self.fixed_value(modulus) - self
     def add_mod(self, other, modulus) -> UInt[N]:
@@ -581,11 +606,11 @@ class UInt:
         if N <= 64: return float(self)
 
         bl = self.bitlen()
-        if bl <= UInt[N](64): return float(self.trunc_to_u64())
+        if bl <= UInt[N](64): return float(self.trunc_to(64))
 
         exponent = bl - UInt[N](63)
-        mantissa = float((self >> exponent).trunc_to_u64())
-        return mantissa * (2.0 ** float(exponent.trunc_to_u64()))
+        mantissa = float((self >> exponent).trunc_to(64))
+        return mantissa * (2.0 ** float(exponent.trunc_to(64)))
     def to_complex(self: UInt[N]) -> Complex:
         return self.to_float().to_complex()
     def fixed_value(self: UInt[N], value) -> UInt[N]:
@@ -626,14 +651,12 @@ class Int:
         return UInt[N](self).to_float() * sign
     def to_complex(self: Int[N]):
         return self.to_float().to_complex()
-    def __str__(self: Int[N]) -> str:
+    def __repr__(self: Int[N]) -> str:
         negative = self < Int[N](0)
         if negative: self = -self
-        _str = UInt[N](self).__str__()
+        _str = UInt[N](self).__repr__()
         if negative: return f"-{_str}"
         return _str
-    def __repr__(self) -> str:
-        return self.__str__()
     def size(self: Int[N]) -> int:
         return (N + 7) // 8
     def pickle_size(self: Int[N]) -> int:
@@ -642,57 +665,71 @@ class Int:
 
 @extend
 class List:
+    def __getitem__(self: list[T], i: u64) -> T:
+        return self[int(i)]
+    
+    def __setitem__(self: list[T], i: u64, other: T) -> T:
+        self[int(i)] = other
+    
+    def __getitem__(self: list[T], l: list[u64]) -> list[T]:
+        return self[[int(e) for e in l]]
+    
+    def __setitem__(self: list[T], l: list[u64], other: generator[T]):
+        self[[int(e) for e in l]] = other
+    
     def __getitem__(self: list[T], l: list[int]) -> list[T]:
         new_arr = list[T](len(l))
         for i in range(len(l)): new_arr.append(self[l[i]])
         return new_arr
-    def __setitem__(self: list[T], l: list[int], other: generator[T]) -> list[T]:
+    
+    def __setitem__(self: list[T], l: list[int], other: generator[T]):
         for i in range(len(l)): self[l[i]] = next(other)
-    def __getitem__(self: list[T], s: tuple[slice, slice]) -> list[T]:
+    
+    def __getitem__(self: list[T], s: Tuple[slice, slice]) -> list[T]:
         rs, cs = s
         sliced_arr = self[rs]
         new_arr = list[T](len(sliced_arr))
         for i in range(len(sliced_arr)): new_arr.append(sliced_arr[i][cs])
         return new_arr
     
-    def __setitem__(self: list[T], s: tuple[slice, slice], other: generator[T]):
+    def __setitem__(self: list[T], s: Tuple[slice, slice], other: generator[T]):
         rs, cs = s
         start, stop, _, _ = rs.adjust_indices(len(self))
         for i in range(start, stop):
             self[i][cs] = next(other)
 
-    def __getitem__(self: list[list[int_t]], s: tuple[slice, int]) -> list[int_t]:
+    def __getitem__(self: list[list[int_t]], s: Tuple[slice, int]) -> list[int_t]:
         rs, cs = s
         sliced_arr = self[rs]
         new_arr = list[int_t](len(sliced_arr))
         for i in range(len(sliced_arr)): new_arr.append(sliced_arr[i][cs])
         return new_arr
 
-    def __setitem__(self: list[list[int_t]], s: tuple[slice, int], other: generator[int_t]):
+    def __setitem__(self: list[list[int_t]], s: Tuple[slice, int], other: generator[int_t]):
         rs, cs = s
         start, stop, _, _ = rs.adjust_indices(len(self))
         for i in range(start, stop):
             self[i][cs] = next(other)
     
-    def __getitem__(self: list[list[int_t]], s: tuple[int, slice]) -> list[int_t]:
+    def __getitem__(self: list[list[int_t]], s: Tuple[int, slice]) -> list[int_t]:
         ri, cs = s
         return self[ri][cs]
 
-    def __setitem__(self: list[list[int_t]], s: tuple[int, slice], other: generator[int_t]):
+    def __setitem__(self: list[list[int_t]], s: Tuple[int, slice], other: generator[int_t]):
         ri, cs = s
         start, stop, _, _ = cs.adjust_indices(len(self))
         for j in range(start, stop):
             self[ri][j] = next(other)
     
-    def __getitem__(self: list[list[int_t]], s: tuple[int, int]) -> int_t:
+    def __getitem__(self: list[list[int_t]], s: Tuple[int, int]) -> int_t:
         i, j = s
         return self[i][j]
 
-    def __setitem__(self: list[list[int_t]], s: tuple[int, int], other: int_t):
+    def __setitem__(self: list[list[int_t]], s: Tuple[int, int], other: int_t):
         i, j = s
         self[i][j] = other
 
-    def __setitem__(self: list[T], s: tuple[slice, slice], other: int_t):
+    def __setitem__(self: list[T], s: Tuple[slice, slice], other: int_t):
         rs, cs = s
         start_row, stop_row, _, _ = rs.adjust_indices(len(self))
         start_col, stop_col, _, _ = cs.adjust_indices(len(self[0]))
@@ -1404,6 +1441,60 @@ class List:
         sum_of_sizes = sizeof(int)
         for e in self: sum_of_sizes += e.pickle_size()
         return sum_of_sizes
+    
+    def scatter(self):
+        return [e.scatter() for e in self]
+    
+    def scatter_inplace(self: List[T]):
+        if isinstance(T, List):
+            return [e.scatter_inplace() for e in self]
+        elif isinstance(T, Vec):
+            new_list = List[u64](len(self) * SIMD_LANE_SIZE)
+            for v in self: new_list.extend(v.scatter())
+            return new_list
+        else: raise TypeError("Invalid list to scatter. Possibly not vectorized?")
+    
+    def scatter_bitcast(self: List[List[u64xN]]) -> List[List[u64]]:
+        m, _mm_n = self.shape()
+        n = _mm_n * SIMD_LANE_SIZE
+
+        coeffs = list[list[u64]](m)
+        for i in range(m):
+            _arr = Array(
+                ptr=bitcast_scatter(self[i].arr.ptr),
+                sz=n)
+            coeffs.append(List(arr=_arr, len=n))
+        
+        return coeffs
+
+    def shuffle(self: List[u64], vec: Vec[u64, 4]) -> Vec[u64, 4]:
+        return Vec[u64, 4](self[[vec.get0(), vec.get1(), vec.get2(), vec.get3()]])
+    
+    def shuffle(self: List[u64], vec: Vec[u64, 8]) -> Vec[u64, 8]:
+        return Vec[u64, 8](
+            self[[vec.get0(), vec.get1(), vec.get2(), vec.get3(),
+             vec.get4(), vec.get5(), vec.get6(), vec.get7()]])
+    
+    def vectorize(self: List[T], lane_size: Static[int]):
+        if isinstance(T, List):
+            return [e.vectorize(lane_size) for e in self]
+        elif isinstance(T, u64) or isinstance(T, f64):
+            return [Vec[T, lane_size](self.arr.ptr + i) for i in range(0, len(self), lane_size)]
+        else:
+            raise TypeError("Invalid vectorization argument.")
+    
+    def vectorize_bitcast(self: List[List[u64]]) -> List[List[u64xN]]:
+        m, n = self.shape()
+        _mm_n = n // SIMD_LANE_SIZE
+
+        coeffs = list[list[u64xN]](m)
+        for i in range(m):
+            _arr = Array(
+                ptr=bitcast_vectorize(self[i].arr.ptr),
+                sz=_mm_n)
+            coeffs.append(List(arr=_arr, len=_mm_n))
+        
+        return coeffs
 
 
-print(f"Sequre setup:\n\t Galois field size: {FIELD_SIZE.__str__()}\n\t Z_(2^k) ring size: {RING_SIZE.__str__()}")
+print(f"Sequre setup:\n\t Galois field size: {FIELD_SIZE.__repr__()}\n\t Z_(2^k) ring size: {RING_SIZE.__repr__()}")
