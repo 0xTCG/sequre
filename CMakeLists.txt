@@ -29,6 +29,8 @@ if(xz_ADDED)
 endif()
 
 set(SEQURE_FILES
+    ir/profiler.cpp
+    ir/profiler.h
     ir/arithmetics.cpp
     ir/arithmetics.h
     ir/sequre.cpp
