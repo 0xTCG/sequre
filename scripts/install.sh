@@ -19,8 +19,10 @@ cmake --build codon-llvm/build
 cmake --install codon-llvm/build
 
 # Build Codon
-git clone https://github.com/exaloop/codon.git
+git clone https://github.com/HarisSmajlovic/codon.git
 cd codon
+git checkout sequre
+git pull
 
 cmake -S . -B build -G Ninja \
     -DLLVM_DIR=$LLVM_INSTALL_PATH/lib/cmake/llvm \
