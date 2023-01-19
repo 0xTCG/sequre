@@ -22,11 +22,8 @@ func TestKingProtocol(t *testing.T) {
 		}
 
 		tprime := (2 - 4*t)*het
-
 		one := newMatriceOnes(len(X), len(X[0]))
-
-		kinship := tprime - (X * X * one - 2 * X * X.T() + 1.T() * X.T() X X.T())
-
+		kinship := tprime - (X * X * one - 2 * X * X.T() + 1.T() * X.T() x X.T())
 		relatives := IsPositive(kinship)
 	*/
 
