@@ -717,9 +717,9 @@ bool BET::reduceLvl(BETNode *node) {
 
   auto *lc = node->getLeftChild();
   auto *rc = node->getRightChild();
-  bool atomic_mult = lc->isMul() && rc->isMul();
-  bool matrix_mult = lc->isMatmul() && rc->isMatmul();
-  bool children_multiplicative = atomic_mult || matrix_mult;
+  bool atomic_mul = lc->isMul() && rc->isMul();
+  bool matrix_mul = lc->isMatmul() && rc->isMatmul();
+  bool children_multiplicative = atomic_mul || matrix_mul;
   bool not_reducible = !node->isAdd() || !children_multiplicative;
 
   bool reducible = false;
@@ -748,9 +748,9 @@ bool BET::reduceLvl(BETNode *node) {
     return reduceLvl(rc);
   }
 
-  if (atomic_mult)
+  if (atomic_mul)
     collapseMul(node, llc_lrc, llc_rrc, rlc_lrc, rlc_rrc);
-  else if (matrix_mult)
+  else if (matrix_mul)
     collapseMatmul(node, llc_lrc, llc_rrc, rlc_lrc, rlc_rrc);
   else assert(false);
   
@@ -1235,7 +1235,7 @@ void ArithmeticsOptimizations::applyBeaverOptimizations(CallInstr *v) {
                            : isLt      ? "secure_lt"
                            : isAdd     ? "secure_add"
                            : isSub     ? "secure_sub"
-                           : isMul     ? "secure_mult"
+                           : isMul     ? "secure_mul"
                            : isSqrtInv ? "secure_sqrt_inv"
                            : isDiv     ? "secure_div"
                            : isPow     ? "secure_pow"
