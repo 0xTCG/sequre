@@ -1,4 +1,4 @@
-#include "arithmetics.h"
+#include "mpc.h"
 #include "codon/sir/util/cloning.h"
 #include "codon/sir/util/irtools.h"
 #include "codon/sir/util/matching.h"
@@ -1144,7 +1144,7 @@ void routeFactorizations(CallInstr *v, BodiedFunc *bf, SeriesFlow *series,
 
 /* IR passes */
 
-void ArithmeticsOptimizations::applyFactorizationOptimizations(CallInstr *v) {
+void applyFactorizationOptimizations(CallInstr *v) {
   auto *f = util::getFunc(v->getCallee());
   if (!isFactOptFunc(f))
     return;
@@ -1158,7 +1158,7 @@ void ArithmeticsOptimizations::applyFactorizationOptimizations(CallInstr *v) {
   routeFactorizations(v, bf, series, factorizationTrees);
 }
 
-void ArithmeticsOptimizations::applyPolynomialOptimizations(CallInstr *v) {
+void applyPolynomialOptimizations(CallInstr *v) {
   auto *f = util::getFunc(v->getCallee());
   if (!isPolyOptFunc(f))
     return;
@@ -1172,7 +1172,7 @@ void ArithmeticsOptimizations::applyPolynomialOptimizations(CallInstr *v) {
   convertInstructions(v, bf, series, bet);
 }
 
-void ArithmeticsOptimizations::applyBeaverOptimizations(CallInstr *v) {
+void applyBeaverOptimizations(CallInstr *v) {
   auto *pf = getParentFunc();
   if (!isSequreFunc(pf) && !isBeaverOptFunc(pf))
     return;
@@ -1257,12 +1257,10 @@ void ArithmeticsOptimizations::applyBeaverOptimizations(CallInstr *v) {
   v->replaceAll(func);
 }
 
-void ArithmeticsOptimizations::applyOptimizations(CallInstr *v) {
+void MPCOptimizations::handle(CallInstr *v) {
   applyPolynomialOptimizations(v);
   applyBeaverOptimizations(v);
   applyFactorizationOptimizations(v);
 }
-
-void ArithmeticsOptimizations::handle(CallInstr *v) { applyOptimizations(v); }
 
 } // namespace sequre
