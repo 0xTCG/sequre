@@ -11,111 +11,141 @@ using namespace codon::ir;
 
 const std::string cipherTensorTypeName = "CipherTensor";
 const std::string builtinModule = "std.internal.builtin";
-const enum Operation { add, mul, matmul, pow, terminal, invalid };
-const enum NodeType { cipher, plain, constant, op, invalid };
 
-/*
- * Binary expression tree
- */
+const enum Operation { add, mul, matmul, pow, noop };
+
+/// CryptoType enumerates all possible data types in cryptographic context
+/// @param cipher Ciphertext type --- encoded and ancrypted data
+/// @param plain Plaintext type --- encoded data
+/// @param raw Raw type --- raw data (not encrypted nor encoded)
+/// @param invalid Any type that does not fit into cryptographic context
+const enum CryptoType  { cipher, plain, raw, invalid };
+
+
 class BETNode {
-  int64_t    value;
-  Var       *variable;
-  NodeType   nodeType;
-  Operation  operation;
-  BETNode   *leftChild;
-  BETNode   *rightChild;
-  bool       expanded;
+  Value      *value;
+  CryptoType  cryptoType;
+  Operation   operation;
+  BETNode    *leftChild;
+  BETNode    *rightChild;
+  bool        expanded;
 
 public:
   BETNode();
-  BETNode( Var *variable );
-  BETNode( int64_t value );
+  BETNode( Value *value );
   BETNode( Operation operation, BETNode *leftChild, BETNode *rightChild );
+  BETNode( Value *value, CryptoType cryptoType, Operation operation, bool expanded );
   ~BETNode() {
     if ( leftChild )  delete leftChild;
     if ( rightChild ) delete rightChild;
   }
   BETNode *copy() const;
 
-  int64_t      getValue() const { return value; }
-  Var         *getVariable() const { return variable; }
-  VarValue    *getVarValue( Module * ) const;
-  int          getVariableId() const;
-  types::Type *getVariableType();
-  Operation    getOperation() const { return operation; }
-  NodeType     getNodeType() const { return nodeType; }
-  BETNode     *getLeftChild() const { return leftChild; }
-  BETNode     *getRightChild() const { return rightChild; }
-  std::string const getOperationIRName() const;
+  Value           *getValue()       const { return value; };
+  Var             *getVariable()    const { return util::getVar(value); }
+  VarValue        *getVarValue()    const { return cast<VarValue>(value); };
+  BETNode         *getLeftChild()   const { return leftChild; }
+  BETNode         *getRightChild()  const { return rightChild; }
+  CryptoType       getCryptoType()  const { return cryptoType; }
+  Operation        getOperation()   const { return operation; }
+  int64_t          getIntConst()    const { return util::getConst<int64_t>(value); };
+  double           getDoubleConst() const { return util::getConst<double>(value); };
+  codon::ir::id_t  getVariableId()  const { return getVariable()->getId(); };
   
-  void setVariable( Var *variable ) { this->variable = variable; }
-  void setOperation( Operation operation ) { this->operation = operation; }
-  void setLeftChild( BETNode *leftChild ) { this->leftChild = leftChild; }
+  void setValue( Value *value )             { this->value = value; }
+  void setOperation( Operation operation )  { this->operation = operation; }
+  void setLeftChild( BETNode *leftChild )   { this->leftChild = leftChild; }
   void setRightChild( BETNode *rightChild ) { this->rightChild = rightChild; }
-  void setExpanded() { expanded = true; }
-  void setNodeTypeFromVarType();
+  void setExpanded()                        { expanded = true; }
+  void setCryptoTypeFromValue();
 
-  bool isLeaf() const { return !leftChild && !rightChild; }
-  bool isOperation() const { return operation != invalid; }
-  bool isAdd() const { return operation == add; }
-  bool isMul() const { return operation == mul; }
-  bool isPow() const { return operation == pow; }
-  bool isConstant() const { return nodeType == constant; }
-  bool isVariable() const { return bool(variable); }
-  bool isExpanded() conts { return expanded; }
-  bool isSameSubTree( BETNode * ) const;
-
-  void replace( BETNode * );
-  void swapChildren() { std::swap(leftChild, rightChild); }
+  bool isLeaf()        const { return !leftChild && !rightChild; }
+  bool isOperation()   const { return operation != noop; }
+  bool isAdd()         const { return operation == add; }
+  bool isMul()         const { return operation == mul; }
+  bool isPow()         const { return operation == pow; }
+  bool isCommutative() const { return isAdd() || isMul(); }
+  bool isExpanded()    const { return expanded; }
+  bool isCiphertext()  const { return cryptoType == cipher; }
+  bool isPlaintext()   const { return cryptoType == plain; }
   
+  bool checkIsVariable()            const { return bool(getVariable()); }
+  bool checkIsIntConst()            const { return util::isConst<int64_t>(value); }
+  bool checkIsDoubleConst()         const { return util::isConst<double>(value); }
+  bool checkIsConst()               const { return checkIsIntConst() || checkIsDoubleConst(); }
+  bool checkIsCipherTensor()        const;
+  bool checkIsCiphertext()          const;
+  bool checkIsPlaintext()           const;
+  bool checkIsSameTree( BETNode * ) const;
+  
+  void swapChildren() { std::swap(leftChild, rightChild); }
+  void replace( BETNode * );
+  void realizeCryptoType();
+
+  std::string       const getOperationIRName() const;
   void print( int ) const;
 };
 
 BETNode::BETNode()
-  : value(0), variable(nullptr), nodeType(invalid), operation(invalid), leftChild(nullptr), rightChild(nullptr), expanded(false) {}
+  : value(nullptr), cryptoType(invalid), operation(noop), leftChild(nullptr), rightChild(nullptr), expanded(false) {}
 
-BETNode::BETNode( int64_t value )
-  : value(value), variable(nullptr), nodeType(constant), operation(invalid), leftChild(nullptr), rightChild(nullptr), expanded(true) {}
-
-BETNode::BETNode( Var *variable )
-  : value(0), variable(variable), nodeType(invalid), operation(invalid), leftChild(nullptr), rightChild(nullptr), expanded(true) {
-  if ( variable ) setNodeTypeFromVarType();
+BETNode::BETNode( Value *value )
+  : value(value), cryptoType(invalid), operation(noop), leftChild(nullptr), rightChild(nullptr), expanded(true) {
+  if ( value ) setCryptoTypeFromValue();
 }
 
-BETNode::BETNode( Operation operation, BETNode *leftChild, BETNode *rightChild ) {
-  : value(0), variable(nullptr), nodeType(op), operation(operation), leftChild(leftChild), rightChild(rightChild), expanded(false) {}
+BETNode::BETNode( Operation operation, BETNode *leftChild, BETNode *rightChild )
+  : value(nullptr), cryptoType(invalid), operation(operation), leftChild(leftChild), rightChild(rightChild), expanded(false) {}
 
-BETNode::BETNode( int64_t value, Var *variable, NodeType nodeType, Operation operation, bool expanded )
-  : value(value), variable(variable), nodeType(nodeType), operation(operation), leftChild(nullptr), rightChild(nullptr), expanded(expanded) {}
+BETNode::BETNode( Value *value, CryptoType cryptoType, Operation operation, bool expanded )
+  : value(value), cryptoType(cryptoType), operation(operation), leftChild(nullptr), rightChild(nullptr), expanded(expanded) {}
 
-VarValue *BETNode::getVarValue( Module *M ) const {
-  Var *var = getVariable();
-  assert(var);
+BETNode *BETNode::copy() const {
+  auto *newNode = new BETNode(value, cryptoType, operation, expanded);
+  auto *lc      = getLeftChild();
+  auto *rc      = getRightChild();
   
-  VarValue *arg = M->Nr<VarValue>(var);
-  assert(arg);
+  if ( lc ) newNode->setLeftChild(lc->copy());
+  if ( rc ) newNode->setRightChild(rc->copy());
   
-  return arg;
+  return newNode;
 }
 
-int BETNode::getVariableId() const {
-  assert(isVariable() && "GetVariableId called on non-variable node.");
-  return variable->getId();
+void BETNode::setCryptoTypeFromValue() {
+  if ( checkIsCiphertext() ) cryptoType = cipher;
+  else if ( checkIsPlaintext() ) cryptoType = plain;
+  else if ( checkIsVariable() || checkIsConst() ) cryptoType = raw;
+  else cryptoType = invalid;
 }
 
-bool BETNode::isSameSubTree( BETNode *other ) const {
+bool BETNode::checkIsCipherTensor() const {
+  return value->getType()->getName().find(cipherTensorTypeName) != std::string::npos;
+}
+
+bool BETNode::checkIsCiphertext() const {
+  if ( !checkIsCipherTensor() ) return false;
+  return value->getType()->getName().find("Ciphertext") != std::string::npos;
+}
+
+bool BETNode::checkIsPlaintext() const {
+  if ( !checkIsCipherTensor() ) return false;
+  return value->getType()->getName().find("Plaintext") != std::string::npos;
+}
+
+bool BETNode::checkIsSameTree( BETNode *other ) const {
   if ( isLeaf() && other->isLeaf() ) {
-    if ( isConstant() && other->isConstant() ) return getValue() == other->getValue();
-    if ( isVariable() && other->isVariable() ) return getVariableId() == other->getVariableId();
+    if ( checkIsIntConst() && other->checkIsIntConst() ) return getIntConst() == other->getIntConst();
+    if ( checkIsDoubleConst() && other->checkIsDoubleConst() ) return getDoubleConst() == other->getDoubleConst();
+    if ( checkIsVariable() && other->checkIsVariable() ) return getVariableId() == other->getVariableId();
   } else if ( !isLeaf() && !other->isLeaf() ) {
     if ( isOperation() && other->isOperation() && getOperation() != other->getOperation() ) return false;
 
-    if ( getLeftChild()->isSameSubTree(other->getLeftChild()) &&
-         getRightChild()->isSameSubTree(other->getRightChild()) ) return true;
+    if ( getLeftChild()->checkIsSameTree(other->getLeftChild()) &&
+         getRightChild()->checkIsSameTree(other->getRightChild()) ) return true;
 
-    if ( isMul() || isAdd() )
-      if ( getLeftChild()->isSameSubTree(other->getRightChild()) &&
-           getRightChild()->isSameSubTree(other->getLeftChild()) ) return true;
+    if ( isCommutative() )
+      if ( getLeftChild()->checkIsSameTree(other->getRightChild()) &&
+           getRightChild()->checkIsSameTree(other->getLeftChild()) ) return true;
   }
 
   return false;
@@ -123,79 +153,65 @@ bool BETNode::isSameSubTree( BETNode *other ) const {
 
 void BETNode::replace( BETNode *other ) {
   value      = other->getValue();
-  variable   = other->getVariable();
-  nodeType   = other->getNodeType();
+  cryptoType = other->getCryptoType();
   operation  = other->getOperation();
   leftChild  = other->getLeftChild();
   rightChild = other->getRightChild();
+  expanded   = other->isExpanded();
 }
 
-BETNode *BETNode::copy() const {
-  auto *newNode = new BETNode(value, variable, operation, nodeType, expanded);
-  auto *lc      = getLeftChild();
-  auto *rc      = getRightChild();
-  if ( lc ) newNode->setLeftChild(lc->copy());
-  if ( rc ) newNode->setRightChild(rc->copy());
-  return newNode;
+void BETNode::realizeCryptoType() {
+  if ( cryptoType == invalid ) {
+    if ( isLeaf() ) setCryptoTypeFromValue();
+    else { // Realize crypto type from children
+      auto *lc = getLeftChild();
+      auto *rc = getRightChild();
+      
+      lc->realizeCryptoType();
+      rc->realizeCryptoType();
+
+      // Not possible for lc or rc to have invalid type here
+      assert( lc->getCryptoType() != invalid && "Crypto type realization error (left child type could not be realized)" );
+      assert( rc->getCryptoType() != invalid && "Crypto type realization error (left child type could not be realized)" );
+
+      if ( lc->isCiphertext() || rc->isCiphertext() ) cryptoType = cipher;
+      else if ( lc->isPlaintext() || rc->isPlaintext() ) cryptoType = plain;
+      else cryptoType = raw;
+    }
+  }
+
+  assert( cryptoType != invalid && "Cannot realize crypto type" );
+}
+
+std::string const BETNode::getOperationIRName() const {
+  if ( isAdd() ) return "__add__";
+  if ( isMul() ) return "__mul__";
+  if ( isPow() ) return "__pow__";
+  assert(false && "BET node operator not supported in MHE IR optimizations.");
 }
 
 void BETNode::print( int level = 0 ) const {
   for (int i = 0; i < level; ++i)
     std::cout << "    ";
 
-  std::cout << op << " " << getVariableId()
-            << ( isConstant() ? " Is constant " : " Not constant " )
+  std::cout << operation << " " << getVariableId()
+            << ( checkIsConst() ? " Is constant " : " Not constant " )
             << value << std::endl;
 
   if ( leftChild ) leftChild->print(level + 1);
   if ( rightChild ) rightChild->print(level + 1);
 }
 
-types::Type *BETNode::getType() {
-  if ( !nodeType ) {
-    if ( isConstant() ) nodeType = constant;
-    else if ( isLeaf() ) setNodeTypeFromVarType();
-    else setNodeTypeFromChildren();
-  }
-
-  assert(nodeType);
-  return nodeType;
-};
-
-std::string const BETNode::getOperatorIRName() const {
-  if ( isAdd() ) return "__add__";
-  if ( isMul() ) return "__mul__";
-  if ( isPow() ) return "__pow__";
-  assert(false && "BET node operator not supported in MHE IR optimizations.");
-};
-
-bool BETNode::isCiphertextVar() {
-  return variable->getType()->getName().find("Ciphertext") != std::string::npos
-}
-
-bool BETNode::isPlaintextVar() {
-  return variable->getType()->getName().find("Plaintext") != std::string::npos
-}
-
-bool BETNode::isAtomicVar() {
-  return variable->getType()->isAtomic()
-}
-
-void BETNode::setNodeTypeFromChildren() {
-  if ( isCiphertextVar() ) nodeType = cipher;
-  else if ( isPlaintextVar() ) nodeType = plain;
-  else if ( isAtomicVar() ) nodeType = constant;
-  else nodeType = invalid;
-}
 
 class BET {
-  std::unordered_map<Var *, BETNode *> betPerVar;
+  std::unordered_map<codon::ir::id_t, BETNode *> betPerVar;
 
 public:
   BET() {}
   ~BET() { for ( auto& it: betPerVar ) delete it.second; }
 
-  void addBET( Var* var, BETNode *betNode ) { betPerVar[var] = betNode; }
+  void addBET( Var* var, BETNode *betNode ) { betPerVar[var->getId()] = betNode; }
+  void expandNode( BETNode * );
 
   bool reduceLvl( BETNode * );
   void reduceAll( BETNode * );
@@ -203,19 +219,17 @@ public:
   void escapePows( BETNode * );
 
 private:
-  void addVar( int varId ) { vars.insert(varId); }
-  void expandNode( BETNode * );
-  void collapseDistributive( BETNode *, bool, bool, bool, bool, int, int );
-  void collapseMul( BETNode *, bool, bool, bool, bool );
-  void collapseMatmul( BETNode *, bool, bool, bool, bool );
+  std::pair<BETNode *, BETNode *> findFactorizationNodes( BETNode *, std::vector<BETNode *>&, std::unordered_map<BETNode *, std::vector<BETNode *>>& );
+  std::pair<BETNode *, BETNode *> findFactorsInMulTree( BETNode *, std::vector<BETNode *>&, std::unordered_map<BETNode *, std::vector<BETNode *>>&, BETNode *, BETNode *, BETNode * );
+  BETNode *internalIsVisited( BETNode *, std::vector<BETNode *>&, std::unordered_map<BETNode *, std::vector<BETNode *>>&, BETNode * );
 };
 
 void BET::expandNode( BETNode *betNode ) {
   if ( betNode->isExpanded() ) return;
 
   if ( betNode->isLeaf() ) {
-    auto search = roots.find(betNode->getVariable());
-    if ( search != roots.end() ) betNode->replace(search->second);
+    auto search = betPerVar.find(betNode->getVariableId());
+    if ( search != betPerVar.end() ) betNode->replace(search->second);
   } else {
     expandNode(betNode->getLeftChild());
     expandNode(betNode->getRightChild());
@@ -224,60 +238,40 @@ void BET::expandNode( BETNode *betNode ) {
   betNode->setExpanded();
 }
 
-void BET::collapseDistributive(
-    BETNode *betNode, bool llc_lrc, bool llc_rrc,
-    bool rlc_lrc, bool rlc_rrc, int weakOp, int strongOp ) {
-  assert(weakOp < strongOp);
+bool BET::reduceLvl( BETNode *node ) {
+  if ( node->isLeaf() || !node->isAdd() ) return false;
 
-  auto *lc = betNode->getLeftChild();
-  auto *rc = betNode->getRightChild();
+  std::vector<BETNode *> visited;
+  std::unordered_map<BETNode *, std::vector<BETNode *>> metadata;
+  std::pair<BETNode *, BETNode*> factors = findFactorizationNodes(node, visited, metadata);
+  if ( !factors.first || !factors.second ) return false;
+  
+  BETNode *factor               = factors.first;
+  BETNode *firstFactorParent    = metadata[factor][0];
+  BETNode *firstFactorSibling   = metadata[factor][1];
+  BETNode *firstFactorAncestor  = metadata[factor][2];
+  BETNode *secondFactorParent   = metadata[factors.second][0];
+  BETNode *secondFactorSibling  = metadata[factors.second][1];
+  BETNode *secondFactorAncestor = metadata[factors.second][2];
+  BETNode *vanisihingAdd        = metadata[factors.second][3];
+  BETNode *vanisihingAddTail    = metadata[factors.second][4];
 
-  auto *llc = lc->getLeftChild();
-  auto *rlc = lc->getRightChild();
-  auto *lrc = rc->getLeftChild();
-  auto *rrc = rc->getRightChild();
+  // Delete secondFactorParent from secondFactorAncestor mul subtree
+  secondFactorParent->replace(secondFactorSibling);
+  
+  // Delete firstFactorParent from firstFactorAncestor mul subtree
+  firstFactorParent->replace(firstFactorSibling);
 
-  BETNode *collapseNode;
-  BETNode *leftOtherNode, *rightOtherNode;
-
-  if ( llc_lrc ) {
-    collapseNode   = llc;
-    leftOtherNode  = rlc;
-    rightOtherNode = rrc;
-  } else if ( rlc_rrc ) {
-    collapseNode   = rlc;
-    leftOtherNode  = llc;
-    rightOtherNode = lrc;
-  } else if ( llc_rrc ) {
-    collapseNode   = llc;
-    leftOtherNode  = rlc;
-    rightOtherNode = lrc;
-  } else if ( rlc_lrc ) {
-    collapseNode   = rlc;
-    leftOtherNode  = llc;
-    rightOtherNode = rrc;
-  } else assert(false && "Non-reducible expression cannot be collapsed.");
-
-  BETNode *surviveNode = llc_lrc ? rc : lc;
-  BETNode *replaceNode = llc_lrc ? lc : rc;
-
-  betNode->setOperator(strongOp);
-  surviveNode->setOperator(weakOp);
-  surviveNode->setLeftChild(leftOtherNode);
-  surviveNode->setRightChild(rightOtherNode);
-
-  replaceNode->replace(collapseNode);
+  // Replace firstFactorAncestor with the new subtree
+  firstFactorAncestor->setLeftChild(factor);
+  firstFactorAncestor->setRightChild(new BETNode(add, firstFactorAncestor->copy(), firstFactorAncestor));
+  
+  // Delete the vanishingAdd node
+  vanisihingAdd->replace(vanisihingAddTail);
 }
 
-void BET::collapseMul(
-    BETNode *betNode, bool llc_lrc, bool llc_rrc, bool rlc_lrc, bool rlc_rrc) {
-  collapseDistributive(betNode, llc_lrc, llc_rrc, rlc_lrc, rlc_rrc, BET_ADD_OP, BET_MUL_OP);
-}
-
-void BET::collapseMatmul(
-    BETNode *betNode, bool llc_lrc, bool llc_rrc, bool rlc_lrc, bool rlc_rrc) {
-  assert(llc_lrc || rlc_rrc);
-  collapseDistributive(betNode, llc_lrc, llc_rrc, rlc_lrc, rlc_rrc, BET_ADD_OP, BET_MATMUL_OP);
+void BET::reduceAll( BETNode *root ) {
+  while ( reduceLvl(root) );
 }
 
 void BET::escapePows( BETNode *node ) {
@@ -292,101 +286,90 @@ void BET::escapePows( BETNode *node ) {
   auto *lc = node->getLeftChild();
   auto *rc = node->getRightChild();
 
-  assert(rc->isConstant() &&
-         "Sequre factorization optimization expects each exponent to be a constant.");
-  assert(rc->getValue() > 0 &&
+  assert(rc->checkIsIntConst() &&
+         "Sequre factorization optimization expects each exponent to be an integer constant.");
+  assert(rc->getIntConst() > 0 &&
          "Sequre factorization optimization expects each exponent to be positive.");
+  if ( rc->getIntConst() == 1 ) {
+    node->replace(lc);
+    return;
+  }
 
   auto *newMulNode = new BETNode(mul, lc, lc);
-
-  if ( rc->getValue() == 1 ) newMulNode->setRightChild(new BETNode(1));
-  for (int i = 0; i < rc->getValue() - 2; ++i) newMulNode = new BETNode(mul, lc, newMulNode->copy());
+  for (int i = 0; i < rc->getIntConst() - 2; ++i) newMulNode = new BETNode(mul, lc, newMulNode->copy());
 
   node->replace(newMulNode);
 }
 
-bool BET::internalIsVisited( BETNode *node, std::vector<BETNode *> &visited ) {
-  for (BETNode *n : visited)
-    if ( node->isSameSubTree(n) ) return true;
-  return false;
-}
+std::pair<BETNode *, BETNode *> BET::findFactorizationNodes(
+    BETNode *node, std::vector<BETNode *> &visited, std::unordered_map<BETNode *, std::vector<BETNode *>> &metadata ) {
+  assert(node->isAdd() && "BET: Tried to find factors in non-addition tree.");
 
-BETNode *BET::findFactorInMulTree( BETNode *node, std::vector<BETNode *> &visited ) {
   BETNode *lc = node->getLeftChild();
   BETNode *rc = node->getRightChild();
-  
-  assert(node->isMul(), "BET: Tried to find factors in non-multiplication tree.")
-  BETNode *factor = nullptr;
 
-  if ( lc->isMul() ) factor = findFactorInMulTree(lc, visited);
-  else if internalIsVisited(lc, visited) return lc;
-  else visited.push_back(lc);
-  
-  if ( rc->isMul() ) factor = findFactorInMulTree(rc, visited);
-  else if internalIsVisited(rc, visited) return rc;
-  else visited.push_back(rc);
+  std::pair<BETNode *, BETNode *> factors = std::make_pair(nullptr, nullptr);
+  if ( lc->isMul() ) factors = findFactorsInMulTree(lc, visited, metadata, node, lc, rc);
+  else if ( lc->isAdd() ) factors = findFactorizationNodes(lc, visited, metadata);
+  if ( rc->isMul()) factors = findFactorsInMulTree(rc, visited, metadata, node, rc, lc);
+  else if ( rc->isAdd() ) factors = findFactorizationNodes(rc, visited, metadata);
 
-  return factor;
+  return factors;
 }
 
-BETNode *BET::findFactor( BETNode *node, std::vector<BETNode *> &visited ) {
-  BETNode *lc = node->getLeftChild();
-  BETNode *rc = node->getRightChild();
-  
-  assert(node->isAdd(), "BET: Tried to find factors in non-addition tree.")
-
-  BETNode *factor = nullptr;
-  if ( lc->isMul() ) factor = findFactorInMulTree(lc, visited);
-  else if ( lc->isAdd() ) factor = findFactor(lc, visited);
-  if ( rc->isMul()) factor = findFactorInMulTree(rc, visited);
-  else if ( rc->isAdd() ) factor = findFactor(rs, visited);
-
-  return factor;
+BETNode *BET::internalIsVisited( BETNode *node, std::vector<BETNode *> &visited, std::unordered_map<BETNode *, std::vector<BETNode *>> &metadata, BETNode *firstMulAncestor ) {
+  for (BETNode *n : visited) {
+    if ( metadata[n][2] == firstMulAncestor ) continue;
+    if ( node->checkIsSameTree(n) ) return n;
   }
+  return nullptr;
 }
 
-void removeFactor(BETNode *node, BETNode *factor) {
+std::pair<BETNode *, BETNode *> BET::findFactorsInMulTree(
+    BETNode *node, std::vector<BETNode *> &visited,
+    std::unordered_map<BETNode *, std::vector<BETNode *>> &metadata,
+    BETNode *firstMulAncestor, BETNode *addAncestor, BETNode *addSibling ) {
+  assert(node->isMul() && "BET: Tried to find factors in non-multiplication tree.");
+
   BETNode *lc = node->getLeftChild();
   BETNode *rc = node->getRightChild();
+  
+  std::pair<BETNode *, BETNode *> factors = std::make_pair(nullptr, nullptr);
 
-  if ( node->isLeaf() ) return;
-  
-  if ( node->isMul() ) {
-    if ( lc->isSameSubTree(factor) ) {
-      node->replace(rc);
-      return;
-    }
-    else if ( rc->isSameSubTree(factor) ) {
-      node->replace(lc);
-      return;
-    } else if ( lc->isMul() ) removeFactor(lc);
-    else if ( rc->isMul() ) removeFactor(rc);
-  }  
-  
-  if ( node->isAdd() ) {
-    removeFactor(lc);
-    removeFactor(rc);
+  if ( !lc->isMul() ) {
+    metadata[lc].push_back(node);
+    metadata[lc].push_back(rc);
+    metadata[lc].push_back(firstMulAncestor);
+    metadata[lc].push_back(addAncestor);
+    metadata[lc].push_back(addSibling);
+
+    if ( factors.second = internalIsVisited(lc, visited, metadata, firstMulAncestor) ) {
+      factors.first = lc;
+      return factors;
+    } else visited.push_back(lc);
   }
+
+  if ( !rc->isMul() ) {
+    metadata[rc].push_back(node);
+    metadata[rc].push_back(lc);
+    metadata[rc].push_back(firstMulAncestor);
+    metadata[rc].push_back(addAncestor);
+    metadata[rc].push_back(addSibling);
+
+    if ( factors.second = internalIsVisited(rc, visited, metadata, firstMulAncestor) ) {
+      factors.first = rc;
+      return factors;
+    } else visited.push_back(rc);
+  }
+  
+  if ( lc->isMul() ) factors = findFactorsInMulTree(lc, visited, metadata, firstMulAncestor, addAncestor, addSibling);
+  if ( factors.first ) return factors;
+
+  if ( rc->isMul() ) factors = findFactorsInMulTree(rc, visited, metadata, firstMulAncestor, addAncestor, addSibling);
+  return factors;
 }
 
-bool BET::reduceLvl( BETNode *node ) {
-  if ( node->isLeaf() || !node->isAdd() ) return false;
-
-  BETNode *factor = findFactor(node);
-  if ( !factor ) return false;
-  removeFactor(node, factor);
-
-  setLeftChild(node);
-  setRightChild(*factors.begin());
-  setOperation(mul);
-}
-
-void BET::reduceAll( BETNode *root ) {
-  while ( reduceLvl(root) );
-}
-
-bool isArithmeticOperation( Operation op ) { return op == add || op == mul || op == matmul || op == pow; }
-bool isTerminalOperation( Operation op ) { return op == terminal; }
+bool isArithmeticOperation( Operation op ) { return op != add || op == mul || op == matmul || op == pow; }
 
 /*
  * Auxiliary helpers
@@ -402,16 +385,15 @@ Operation getOperation( CallInstr *callInstr ) {
   if ( instrName.find("__add__") != std::string::npos ) return add;
   if ( instrName.find("__mul__") != std::string::npos ) return mul;
   if ( instrName.find("__pow__") != std::string::npos ) return pow;
-  if ( instrName.find("matmul") != std::string::npos ) return matmul;
-  if ( instrName.find("reveal") != std::string::npos ) return terminal;
-  return invalid;
+  if ( instrName.find("matmul")  != std::string::npos ) return matmul;
+  return noop;
 }
 
 /* BET tree manipulation */
 
 Value *generateExpression(Module *M, BETNode *node) {
   if (node->isLeaf())
-    return node->getVarValue(M);
+    return node->getVarValue();
 
   auto *lc = node->getLeftChild();
   auto *rc = node->getRightChild();
@@ -421,10 +403,10 @@ Value *generateExpression(Module *M, BETNode *node) {
   auto *lopType = lc->getType();
   auto *ropType = rc->getType();
   auto *opFunc =
-      M->getOrRealizeMethod(lopType, node->getOperatorIRName(), {lopType, ropType});
+      M->getOrRealizeMethod(lopType, node->getOperationIRName(), {lopType, ropType});
 
   std::string const errMsg =
-      node->getOperatorIRName() + " not found in type " + lopType->getName();
+      node->getOperationIRName() + " not found in type " + lopType->getName();
   assert(opFunc && errMsg.c_str());
 
   auto *lop = generateExpression(M, lc);
@@ -441,9 +423,13 @@ Value *generateExpression(Module *M, BETNode *node) {
 }
 
 BETNode *parseArithmetic( CallInstr *callInstr ) {
-  // Arithmetics are binary
+  assert(callInstr->numArgs() == 2 && "Arithmetics are expected to be binary");
+
   auto *betNode = new BETNode();
-  betNode->setOperation(getOperation(callInstr));
+  Operation operation = getOperation(callInstr);
+  betNode->setOperation(operation);
+  betNode->setIRType(callInstr->getType());
+  if ( !isArithmeticOperation(operation) ) return betNode;
 
   auto *lhs = callInstr->front();
   auto *rhs = callInstr->back();
@@ -451,23 +437,26 @@ BETNode *parseArithmetic( CallInstr *callInstr ) {
   auto *lhsInstr = cast<CallInstr>(lhs);
   auto *rhsInstr = cast<CallInstr>(rhs);
 
-  if ( isAtomic() ) betNode->setLeftChild(new BETNode(lhs->getVal()));
-  else if ( lhsInstr ) { }
-  else if ( isVar ) betNode->setLeftChild(new BETNode(lhs->getUsedVariables().front()));
-  else betNode->setLeftChild(parseArithmetic(lhsInstr));
+  bool lhsIsConst = util::isConst<int64_t>(lhs) || util::isConst<double>(lhs);
+  bool rhsIsConst = util::isConst<int64_t>(rhs) || util::isConst<double>(rhs);
+  bool lhsIsLeaf  = ((lhs->getUsedVariables().size() == 1 && !lhsInstr) || lhsIsConst );
+  bool rhsIsLeaf  = ((rhs->getUsedVariables().size() == 1 && !rhsInstr) || rhsIsConst );
 
-  if ( rhs->isAtomic() ) betNode->setRightChild(new BETNode(rhs->getVal()));
-  else if ( lhsInstr ) { }
-  else if ( isVar ) betNode->setRightChild(new BETNode(rhs->getUsedVariables().front()));
-  else betNode->setRightChild(parseArithmetic(rhsInstr));
+  if ( lhsInstr ) betNode->setLeftChild(parseArithmetic(lhsInstr));
+  else if ( lhsIsLeaf ) betNode->setLeftChild(new BETNode(lhs));
+  else throw "BET: Arithmetic could not be parsed";
+
+  if ( rhsInstr ) betNode->setRightChild(parseArithmetic(rhsInstr));
+  else if ( rhsIsLeaf ) betNode->setRightChild(new BETNode(rhs));
+  else throw "BET: Arithmetic could not be parsed";
 
   return betNode;
 }
 
-std::pair<codon::ir::Value *, codon::ir::Value *> transformInstruction( codon::ir::Value *instruction, BET *bet ) {
+std::pair<Value *, BETNode *> minimizeCipherMult( Module *M, Value *instruction, BET *bet ) {
   auto *retIns = cast<ReturnInstr>(instruction);
   if ( retIns ) {
-    retIns->setValue(transformInstruction(retIns->getValue(), bet).first);
+    retIns->setValue(minimizeCipherMult(M, retIns->getValue(), bet).first);
     return std::make_pair(nullptr, nullptr);
   }
 
@@ -475,44 +464,44 @@ std::pair<codon::ir::Value *, codon::ir::Value *> transformInstruction( codon::i
   if ( assIns ) {
     auto *lhs = assIns->getLhs();
     auto *rhs = assIns->getRhs();
-    auto transformedInstruction = transformInstruction(rhs, bet);
-    if ( transformedInstruction.second ) bet->appendBET(lhs, betNode);
+    auto transformedInstruction = minimizeCipherMult(M, rhs, bet);
+    if ( transformedInstruction.second ) bet->addBET(lhs->getUsedVariables().front(), transformedInstruction.second);
     assIns->setRhs(transformedInstruction.first);
     return std::make_pair(nullptr, nullptr);
   }
 
   auto *callInstr = cast<CallInstr>(instruction);
   if ( callInstr ) {
-    auto op = getOperation(callInstr);
-    if ( isArithmetic(op) ) {
+    if ( isArithmeticOperation(getOperation(callInstr)) ) {
       auto *betNode = parseArithmetic(callInstr);
-      betNode->expandNode();
-      betNode->collapseAll();
-      betNode->reorderPriorities();
-      return std::make_pair(generateExpression(betNode), betNode);
+      bet->expandNode(betNode);
+      bet->reduceAll(betNode);
+      // bet->reorderPriorities(betNode)
+      return std::make_pair(generateExpression(M, betNode), betNode);
     } else {
       std::vector<Value *> newArgs;
       for ( auto arg = callInstr->begin(); arg < callInstr->end(); arg++ )
-        newArgs.push_back(transformInstruction(*arg, bet).first);
+        newArgs.push_back(minimizeCipherMult(M, *arg, bet).first);
       callInstr->setArgs(newArgs);
       return std::make_pair(callInstr, nullptr);
     }
   }
 
-  return std::make_pair(nullptr, nullptr);
+  return std::make_pair(instruction, new BETNode(instruction->getUsedVariables().front()));
 }
 
-void transformExpressions( SeriesFlow *series ) {
+void transformExpressions( Module *M, SeriesFlow *series ) {
   auto *bet = new BET();
-  for ( auto it = series->begin(); it != series->end(); ++it ) transformInstruction(*it, bet);
+  for ( auto it = series->begin(); it != series->end(); ++it ) minimizeCipherMult(M, *it, bet);
 }
 
 /* IR passes */
 
 void applyCipherPlainOptimizations( CallInstr *v ) {
+  auto *M = v->getModule();
   auto *f = util::getFunc(v->getCallee());
   if ( !isSequreFunc(f) ) return;
-  transformExpressions(cast<SeriesFlow>(cast<BodiedFunc>(f)->getBody()););
+  transformExpressions(M, cast<SeriesFlow>(cast<BodiedFunc>(f)->getBody()));
 }
 
 void MHEOptimizations::handle( CallInstr *v ) { applyCipherPlainOptimizations(v); }
