@@ -14,27 +14,20 @@ const std::string builtinModule = "std.internal.builtin";
 
 const enum Operation { add, mul, matmul, pow, noop };
 
-/// CryptoType enumerates all possible data types in cryptographic context
-/// @param cipher Ciphertext type --- encoded and ancrypted data
-/// @param plain Plaintext type --- encoded data
-/// @param raw Raw type --- raw data (not encrypted nor encoded)
-/// @param invalid Any type that does not fit into cryptographic context
-const enum CryptoType  { cipher, plain, raw, invalid };
-
 
 class BETNode {
-  Value      *value;
-  CryptoType  cryptoType;
-  Operation   operation;
-  BETNode    *leftChild;
-  BETNode    *rightChild;
-  bool        expanded;
+  Value       *value;
+  types::Type *irType;
+  Operation    operation;
+  BETNode     *leftChild;
+  BETNode     *rightChild;
+  bool         expanded;
 
 public:
   BETNode();
   BETNode( Value *value );
   BETNode( Operation operation, BETNode *leftChild, BETNode *rightChild );
-  BETNode( Value *value, CryptoType cryptoType, Operation operation, bool expanded );
+  BETNode( Value *value, types::Type *irType, Operation operation, bool expanded );
   ~BETNode() {
     if ( leftChild )  delete leftChild;
     if ( rightChild ) delete rightChild;
@@ -46,18 +39,17 @@ public:
   VarValue        *getVarValue()    const { return cast<VarValue>(value); };
   BETNode         *getLeftChild()   const { return leftChild; }
   BETNode         *getRightChild()  const { return rightChild; }
-  CryptoType       getCryptoType()  const { return cryptoType; }
   Operation        getOperation()   const { return operation; }
   int64_t          getIntConst()    const { return util::getConst<int64_t>(value); };
   double           getDoubleConst() const { return util::getConst<double>(value); };
   codon::ir::id_t  getVariableId()  const { return getVariable()->getId(); };
   
   void setValue( Value *value )             { this->value = value; }
+  void setIRType( types::Type *irType )     { this->irType = irType; }
   void setOperation( Operation operation )  { this->operation = operation; }
   void setLeftChild( BETNode *leftChild )   { this->leftChild = leftChild; }
   void setRightChild( BETNode *rightChild ) { this->rightChild = rightChild; }
   void setExpanded()                        { expanded = true; }
-  void setCryptoTypeFromValue();
 
   bool isLeaf()        const { return !leftChild && !rightChild; }
   bool isOperation()   const { return operation != noop; }
@@ -66,42 +58,40 @@ public:
   bool isPow()         const { return operation == pow; }
   bool isCommutative() const { return isAdd() || isMul(); }
   bool isExpanded()    const { return expanded; }
-  bool isCiphertext()  const { return cryptoType == cipher; }
-  bool isPlaintext()   const { return cryptoType == plain; }
   
   bool checkIsVariable()            const { return bool(getVariable()); }
   bool checkIsIntConst()            const { return util::isConst<int64_t>(value); }
   bool checkIsDoubleConst()         const { return util::isConst<double>(value); }
   bool checkIsConst()               const { return checkIsIntConst() || checkIsDoubleConst(); }
-  bool checkIsCipherTensor()        const;
-  bool checkIsCiphertext()          const;
-  bool checkIsPlaintext()           const;
   bool checkIsSameTree( BETNode * ) const;
+  bool checkIsCipherTensor();
+  bool checkIsCiphertext();
+  bool checkIsPlaintext();
   
   void swapChildren() { std::swap(leftChild, rightChild); }
   void replace( BETNode * );
-  void realizeCryptoType();
+  types::Type *getOrRealizeIRType();
 
   std::string       const getOperationIRName() const;
   void print( int ) const;
 };
 
 BETNode::BETNode()
-  : value(nullptr), cryptoType(invalid), operation(noop), leftChild(nullptr), rightChild(nullptr), expanded(false) {}
+  : value(nullptr), irType(nullptr), operation(noop), leftChild(nullptr), rightChild(nullptr), expanded(false) {}
 
 BETNode::BETNode( Value *value )
-  : value(value), cryptoType(invalid), operation(noop), leftChild(nullptr), rightChild(nullptr), expanded(true) {
-  if ( value ) setCryptoTypeFromValue();
+  : value(value), operation(noop), leftChild(nullptr), rightChild(nullptr), expanded(true) {
+  if ( value ) getOrRealizeIRType();
 }
 
 BETNode::BETNode( Operation operation, BETNode *leftChild, BETNode *rightChild )
-  : value(nullptr), cryptoType(invalid), operation(operation), leftChild(leftChild), rightChild(rightChild), expanded(false) {}
+  : value(nullptr), irType(nullptr), operation(operation), leftChild(leftChild), rightChild(rightChild), expanded(false) {}
 
-BETNode::BETNode( Value *value, CryptoType cryptoType, Operation operation, bool expanded )
-  : value(value), cryptoType(cryptoType), operation(operation), leftChild(nullptr), rightChild(nullptr), expanded(expanded) {}
+BETNode::BETNode( Value *value, types::Type *irType, Operation operation, bool expanded )
+  : value(value), irType(irType), operation(operation), leftChild(nullptr), rightChild(nullptr), expanded(expanded) {}
 
 BETNode *BETNode::copy() const {
-  auto *newNode = new BETNode(value, cryptoType, operation, expanded);
+  auto *newNode = new BETNode(value, irType, operation, expanded);
   auto *lc      = getLeftChild();
   auto *rc      = getRightChild();
   
@@ -111,25 +101,18 @@ BETNode *BETNode::copy() const {
   return newNode;
 }
 
-void BETNode::setCryptoTypeFromValue() {
-  if ( checkIsCiphertext() ) cryptoType = cipher;
-  else if ( checkIsPlaintext() ) cryptoType = plain;
-  else if ( checkIsVariable() || checkIsConst() ) cryptoType = raw;
-  else cryptoType = invalid;
+bool BETNode::checkIsCipherTensor() {
+  return getOrRealizeIRType()->getName().find(cipherTensorTypeName) != std::string::npos;
 }
 
-bool BETNode::checkIsCipherTensor() const {
-  return value->getType()->getName().find(cipherTensorTypeName) != std::string::npos;
-}
-
-bool BETNode::checkIsCiphertext() const {
+bool BETNode::checkIsCiphertext() {
   if ( !checkIsCipherTensor() ) return false;
-  return value->getType()->getName().find("Ciphertext") != std::string::npos;
+  return getOrRealizeIRType()->getName().find("Ciphertext") != std::string::npos;
 }
 
-bool BETNode::checkIsPlaintext() const {
+bool BETNode::checkIsPlaintext() {
   if ( !checkIsCipherTensor() ) return false;
-  return value->getType()->getName().find("Plaintext") != std::string::npos;
+  return getOrRealizeIRType()->getName().find("Plaintext") != std::string::npos;
 }
 
 bool BETNode::checkIsSameTree( BETNode *other ) const {
@@ -153,34 +136,37 @@ bool BETNode::checkIsSameTree( BETNode *other ) const {
 
 void BETNode::replace( BETNode *other ) {
   value      = other->getValue();
-  cryptoType = other->getCryptoType();
+  irType     = other->getOrRealizeIRType();
   operation  = other->getOperation();
   leftChild  = other->getLeftChild();
   rightChild = other->getRightChild();
   expanded   = other->isExpanded();
 }
 
-void BETNode::realizeCryptoType() {
-  if ( cryptoType == invalid ) {
-    if ( isLeaf() ) setCryptoTypeFromValue();
-    else { // Realize crypto type from children
-      auto *lc = getLeftChild();
-      auto *rc = getRightChild();
-      
-      lc->realizeCryptoType();
-      rc->realizeCryptoType();
+types::Type *BETNode::getOrRealizeIRType() {
+  if ( irType ) return irType;
+  if ( irType = value->getType() ) return irType;
+  if ( isLeaf() ) return nullptr;
 
-      // Not possible for lc or rc to have invalid type here
-      assert( lc->getCryptoType() != invalid && "Crypto type realization error (left child type could not be realized)" );
-      assert( rc->getCryptoType() != invalid && "Crypto type realization error (left child type could not be realized)" );
+  // Realize IR type from children
+  auto *lc = getLeftChild();
+  auto *rc = getRightChild();
 
-      if ( lc->isCiphertext() || rc->isCiphertext() ) cryptoType = cipher;
-      else if ( lc->isPlaintext() || rc->isPlaintext() ) cryptoType = plain;
-      else cryptoType = raw;
-    }
-  }
+  auto *lcType = lc->getOrRealizeIRType();
+  auto *rcType = rc->getOrRealizeIRType();
+  
+  // Not possible for lc or rc to have invalid type here
+  assert( lcType && "Crypto type realization error (left child type could not be realized)" );
+  assert( rcType && "Crypto type realization error (left child type could not be realized)" );
 
-  assert( cryptoType != invalid && "Cannot realize crypto type" );
+  if ( lc->checkIsCiphertext() ) irType = lcType;
+  else if ( rc->checkIsCiphertext() ) irType = rcType;
+  else if ( lc->checkIsPlaintext() ) irType = lcType;
+  else if ( rc->checkIsPlaintext() ) irType = rcType;
+  else irType = lcType;
+
+  assert( irType && "Cannot realize crypto type" );
+  return irType;
 }
 
 std::string const BETNode::getOperationIRName() const {
@@ -379,6 +365,10 @@ bool isSequreFunc( Func *f ) {
   return bool(f) && util::hasAttribute(f, "std.sequre.attributes.sequre");
 }
 
+bool isCipherOptFunc( Func *f ) {
+  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.mhe_cipher_opt");
+}
+
 Operation getOperation( CallInstr *callInstr ) {
   auto *f = util::getFunc(callInstr->getCallee());
   auto instrName = f->getName();
@@ -400,8 +390,8 @@ Value *generateExpression(Module *M, BETNode *node) {
   assert(lc);
   assert(rc);
 
-  auto *lopType = lc->getType();
-  auto *ropType = rc->getType();
+  auto *lopType = lc->getOrRealizeIRType();
+  auto *ropType = rc->getOrRealizeIRType();
   auto *opFunc =
       M->getOrRealizeMethod(lopType, node->getOperationIRName(), {lopType, ropType});
 
@@ -429,6 +419,9 @@ BETNode *parseArithmetic( CallInstr *callInstr ) {
   Operation operation = getOperation(callInstr);
   betNode->setOperation(operation);
   betNode->setIRType(callInstr->getType());
+  
+  std::cout << "DEBUG MHE PASS " << betNode->getOrRealizeIRType()->getName() << "\n";
+  
   if ( !isArithmeticOperation(operation) ) return betNode;
 
   auto *lhs = callInstr->front();
@@ -437,18 +430,11 @@ BETNode *parseArithmetic( CallInstr *callInstr ) {
   auto *lhsInstr = cast<CallInstr>(lhs);
   auto *rhsInstr = cast<CallInstr>(rhs);
 
-  bool lhsIsConst = util::isConst<int64_t>(lhs) || util::isConst<double>(lhs);
-  bool rhsIsConst = util::isConst<int64_t>(rhs) || util::isConst<double>(rhs);
-  bool lhsIsLeaf  = ((lhs->getUsedVariables().size() == 1 && !lhsInstr) || lhsIsConst );
-  bool rhsIsLeaf  = ((rhs->getUsedVariables().size() == 1 && !rhsInstr) || rhsIsConst );
-
   if ( lhsInstr ) betNode->setLeftChild(parseArithmetic(lhsInstr));
-  else if ( lhsIsLeaf ) betNode->setLeftChild(new BETNode(lhs));
-  else throw "BET: Arithmetic could not be parsed";
+  else betNode->setLeftChild(new BETNode(lhs));
 
   if ( rhsInstr ) betNode->setRightChild(parseArithmetic(rhsInstr));
-  else if ( rhsIsLeaf ) betNode->setRightChild(new BETNode(rhs));
-  else throw "BET: Arithmetic could not be parsed";
+  else betNode->setRightChild(new BETNode(rhs));
 
   return betNode;
 }
@@ -476,7 +462,7 @@ std::pair<Value *, BETNode *> minimizeCipherMult( Module *M, Value *instruction,
       auto *betNode = parseArithmetic(callInstr);
       bet->expandNode(betNode);
       bet->reduceAll(betNode);
-      // bet->reorderPriorities(betNode)
+      // bet->reorderPriorities(betNode)  // TODO
       return std::make_pair(generateExpression(M, betNode), betNode);
     } else {
       std::vector<Value *> newArgs;
@@ -487,7 +473,7 @@ std::pair<Value *, BETNode *> minimizeCipherMult( Module *M, Value *instruction,
     }
   }
 
-  return std::make_pair(instruction, new BETNode(instruction->getUsedVariables().front()));
+  return std::make_pair(instruction, new BETNode(instruction));
 }
 
 void transformExpressions( Module *M, SeriesFlow *series ) {
@@ -500,7 +486,7 @@ void transformExpressions( Module *M, SeriesFlow *series ) {
 void applyCipherPlainOptimizations( CallInstr *v ) {
   auto *M = v->getModule();
   auto *f = util::getFunc(v->getCallee());
-  if ( !isSequreFunc(f) ) return;
+  if ( !isSequreFunc(f) || !isCipherOptFunc(f) ) return;
   transformExpressions(M, cast<SeriesFlow>(cast<BodiedFunc>(f)->getBody()));
 }
 
