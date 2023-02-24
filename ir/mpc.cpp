@@ -1,4 +1,5 @@
 #include "mpc.h"
+#include "utils.h"
 #include "codon/sir/util/cloning.h"
 #include "codon/sir/util/irtools.h"
 #include "codon/sir/util/matching.h"
@@ -774,30 +775,6 @@ bool isReveal(int op) { return op == BET_REVEAL_OP; }
  * Auxiliary helpers
  */
 
-bool isSequreFunc(Func *f) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.sequre");
-}
-
-bool isPolyOptFunc(Func *f) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.sequre_poly");
-}
-
-bool isBeaverOptFunc(Func *f) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.sequre_beaver");
-}
-
-bool isFactOptFunc(Func *f) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.opt_mat_arth");
-}
-
-Func *getOrRealizeSequreInternalMethod(Module *M, std::string const &methodName,
-                                       std::vector<types::Type *> args,
-                                       std::vector<types::Generic> generics = {}) {
-  auto *sequreInternalType =
-      M->getOrRealizeType("Internal", {}, "std.sequre.stdlib.internal");
-  return M->getOrRealizeMethod(sequreInternalType, methodName, args, generics);
-}
-
 int getOperator(CallInstr *callInstr) {
   auto *f = util::getFunc(callInstr->getCallee());
   auto instrName = f->getName();
@@ -1100,8 +1077,7 @@ CallInstr *callRouter(Module *M, std::vector<Value *> newVars,
                       std::vector<Value *> costVars) {
   auto *varsTupleType = getTupleType(newVars.size(), newVars[0]->getType(), M);
   auto *costsTupleType = getTupleType(costVars.size(), M->getIntType(), M);
-  auto *routerMethod = getOrRealizeSequreInternalMethod(
-      M, "min_cost_router", {varsTupleType, costsTupleType});
+  auto *routerMethod = getOrRealizeSequreInternalMethod(M, "min_cost_router", {varsTupleType, costsTupleType});
   assert(routerMethod);
 
   auto *varsTuple = util::makeTuple(newVars, M);
@@ -1172,95 +1148,9 @@ void applyPolynomialOptimizations(CallInstr *v) {
   convertInstructions(v, bf, series, bet);
 }
 
-void applyBeaverOptimizations(CallInstr *v) {
-  auto *pf = getParentFunc();
-  if (!isSequreFunc(pf) && !isBeaverOptFunc(pf))
-    return;
-  auto *f = util::getFunc(v->getCallee());
-  if (!f)
-    return;
-  bool isEq = f->getName().find("__eq__") != std::string::npos;
-  bool isGt = f->getName().find("__gt__") != std::string::npos;
-  bool isLt = f->getName().find("__lt__") != std::string::npos;
-  bool isAdd = f->getName().find("__add__") != std::string::npos;
-  bool isSub = f->getName().find("__sub__") != std::string::npos;
-  bool isMul = f->getName().find("__mul__") != std::string::npos;
-  bool isDiv = f->getName().find("__truediv__") != std::string::npos;
-  bool isPow = f->getName().find("__pow__") != std::string::npos;
-  if (!isEq && !isGt && !isLt && !isAdd && !isSub && !isMul && !isPow && !isDiv)
-    return;
-
-  auto *M = v->getModule();
-  auto *self = M->Nr<VarValue>(pf->arg_front());
-  auto *selfType = self->getType();
-  auto *lhs = v->front();
-  auto *rhs = v->back();
-  auto *lhsType = lhs->getType();
-  auto *rhsType = rhs->getType();
-
-  bool isSqrtInv = false;
-  if (isDiv) { // Special case where 1 / sqrt(x) is called
-    auto *sqrtInstr = cast<CallInstr>(rhs);
-    if (sqrtInstr) {
-      auto *sqrtFunc = util::getFunc(sqrtInstr->getCallee());
-      if (sqrtFunc)
-        isSqrtInv = sqrtFunc->getName().find("sqrt") != std::string::npos;
-    }
-  }
-
-  bool lhs_is_secure_container =
-      lhsType->getName().find(secureContainerTypeName) != std::string::npos;
-  bool rhs_is_secure_container =
-      rhsType->getName().find(secureContainerTypeName) != std::string::npos;
-
-  if (!lhs_is_secure_container and !rhs_is_secure_container)
-    return;
-
-  bool lhs_is_int = lhsType->is(M->getIntType());
-  bool rhs_is_int = rhsType->is(M->getIntType());
-
-  if (isMul && lhs_is_int)
-    return;
-  if (isMul && rhs_is_int)
-    return;
-  if (isDiv && lhs_is_int && !isSqrtInv)
-    return;
-  if (isPow && lhs_is_int)
-    return;
-  if (isPow && !rhs_is_int)
-    return;
-
-  std::string methodName = isEq        ? "secure_eq"
-                           : isGt      ? "secure_gt"
-                           : isLt      ? "secure_lt"
-                           : isAdd     ? "secure_add"
-                           : isSub     ? "secure_sub"
-                           : isMul     ? "secure_mul"
-                           : isSqrtInv ? "secure_sqrt_inv"
-                           : isDiv     ? "secure_div"
-                           : isPow     ? "secure_pow"
-                                       : "invalid_operation";
-  if (!isBeaverOptFunc(pf) && (isMul || isPow || isSqrtInv))
-    methodName += "_no_cache";
-
-  if (isSqrtInv) {
-    rhs = cast<CallInstr>(rhs)->back();
-    rhsType = rhs->getType();
-  }
-
-  auto *method =
-      getOrRealizeSequreInternalMethod(M, methodName, {selfType, lhsType, rhsType});
-  if (!method)
-    return;
-
-  auto *func = util::call(method, {self, lhs, rhs});
-  v->replaceAll(func);
-}
-
 void MPCOptimizations::handle(CallInstr *v) {
   applyPolynomialOptimizations(v);
-  applyBeaverOptimizations(v);
-  applyFactorizationOptimizations(v);
+  // applyFactorizationOptimizations(v);
 }
 
 } // namespace sequre
