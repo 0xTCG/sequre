@@ -81,7 +81,10 @@ void ExpressivenessTransformations::transform(CallInstr *v) {
   }
 
   auto *method = getOrRealizeSequreInternalMethod(M, methodName, {selfType, lhsType, rhsType}, {});
-  if (!method) return;
+  if (!method) {
+    std::cout << "SEQURE TYPE REALIZATION ERROR: Could not realize internal method " << methodName << " for parameters of type " << selfType->getName() << ", " << lhsType->getName() << ", and " << rhsType->getName() << std::endl;
+    return;
+  }
 
   auto *func = util::call(method, {self, lhs, rhs});
   v->replaceAll(func);

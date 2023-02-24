@@ -38,7 +38,7 @@ bool isCipherTensor( types::Type *t ) {
 Func *getOrRealizeSequreInternalMethod(Module *M, std::string const &methodName,
                                        std::vector<types::Type *> args,
                                        std::vector<types::Generic> generics = {}) {
-  auto *sequreInternalType = M->getOrRealizeType("Internal", {}, "std.sequre.stdlib.internal");
+  auto *sequreInternalType = M->getOrRealizeType("Internal", {}, "std.sequre.types.internal");
   return M->getOrRealizeMethod(sequreInternalType, methodName, args, generics);
 }
 
