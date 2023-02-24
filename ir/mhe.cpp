@@ -1,4 +1,5 @@
 #include "mhe.h"
+#include "utils.h"
 #include "codon/sir/util/cloning.h"
 #include "codon/sir/util/irtools.h"
 #include "codon/sir/util/matching.h"
@@ -9,10 +10,9 @@ namespace sequre {
 
 using namespace codon::ir;
 
-const std::string cipherTensorTypeName = "CipherTensor";
 const std::string builtinModule = "std.internal.builtin";
 
-const enum Operation { add, mul, matmul, pow, noop };
+enum Operation { add, mul, matmul, pow, noop };
 
 
 class BETNode {
@@ -145,7 +145,7 @@ void BETNode::replace( BETNode *other ) {
 
 types::Type *BETNode::getOrRealizeIRType() {
   if ( irType ) return irType;
-  if ( irType = value->getType() ) return irType;
+  if ( (irType = value->getType()) ) return irType;
   if ( isLeaf() ) return nullptr;
 
   // Realize IR type from children
@@ -250,10 +250,12 @@ bool BET::reduceLvl( BETNode *node ) {
 
   // Replace firstFactorAncestor with the new subtree
   firstFactorAncestor->setLeftChild(factor);
-  firstFactorAncestor->setRightChild(new BETNode(add, firstFactorAncestor->copy(), firstFactorAncestor));
+  firstFactorAncestor->setRightChild(new BETNode(add, firstFactorAncestor->copy(), secondFactorAncestor));
   
   // Delete the vanishingAdd node
   vanisihingAdd->replace(vanisihingAddTail);
+
+  return true;
 }
 
 void BET::reduceAll( BETNode *root ) {
@@ -329,7 +331,7 @@ std::pair<BETNode *, BETNode *> BET::findFactorsInMulTree(
     metadata[lc].push_back(addAncestor);
     metadata[lc].push_back(addSibling);
 
-    if ( factors.second = internalIsVisited(lc, visited, metadata, firstMulAncestor) ) {
+    if ( (factors.second = internalIsVisited(lc, visited, metadata, firstMulAncestor)) ) {
       factors.first = lc;
       return factors;
     } else visited.push_back(lc);
@@ -342,7 +344,7 @@ std::pair<BETNode *, BETNode *> BET::findFactorsInMulTree(
     metadata[rc].push_back(addAncestor);
     metadata[rc].push_back(addSibling);
 
-    if ( factors.second = internalIsVisited(rc, visited, metadata, firstMulAncestor) ) {
+    if ( (factors.second = internalIsVisited(rc, visited, metadata, firstMulAncestor)) ) {
       factors.first = rc;
       return factors;
     } else visited.push_back(rc);
@@ -360,14 +362,6 @@ bool isArithmeticOperation( Operation op ) { return op != add || op == mul || op
 /*
  * Auxiliary helpers
  */
-
-bool isSequreFunc( Func *f ) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.sequre");
-}
-
-bool isCipherOptFunc( Func *f ) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.mhe_cipher_opt");
-}
 
 Operation getOperation( CallInstr *callInstr ) {
   auto *f = util::getFunc(callInstr->getCallee());
