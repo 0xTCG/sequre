@@ -16,16 +16,16 @@ void ExpressivenessTransformations::transform(CallInstr *v) {
   auto *f = util::getFunc(v->getCallee());
   if (!f)
     return;
-  bool isEq = f->getName().find("__eq__") != std::string::npos;
-  bool isGt = f->getName().find("__gt__") != std::string::npos;
-  bool isLt = f->getName().find("__lt__") != std::string::npos;
-  bool isAdd = f->getName().find("__add__") != std::string::npos;
-  bool isSub = f->getName().find("__sub__") != std::string::npos;
-  bool isMul = f->getName().find("__mul__") != std::string::npos;
-  bool isDiv = f->getName().find("__truediv__") != std::string::npos;
-  bool isPow = f->getName().find("__pow__") != std::string::npos;
-  if (!isEq && !isGt && !isLt && !isAdd && !isSub && !isMul && !isPow && !isDiv)
-    return;
+  bool isEq     = f->getName().find(Module::EQ_MAGIC_NAME) != std::string::npos;
+  bool isGt     = f->getName().find(Module::GT_MAGIC_NAME) != std::string::npos;
+  bool isLt     = f->getName().find(Module::LT_MAGIC_NAME) != std::string::npos;
+  bool isAdd    = f->getName().find(Module::ADD_MAGIC_NAME) != std::string::npos;
+  bool isSub    = f->getName().find(Module::SUB_MAGIC_NAME) != std::string::npos;
+  bool isMul    = f->getName().find(Module::MUL_MAGIC_NAME) != std::string::npos;
+  bool isMatMul = f->getName().find(Module::MATMUL_MAGIC_NAME) != std::string::npos;
+  bool isDiv    = f->getName().find(Module::TRUE_DIV_MAGIC_NAME) != std::string::npos;
+  bool isPow    = f->getName().find(Module::POW_MAGIC_NAME) != std::string::npos;
+  if (!isEq && !isGt && !isLt && !isAdd && !isSub && !isMul && !isMatMul && !isPow && !isDiv) return;
 
   auto *M = v->getModule();
   auto *self = M->Nr<VarValue>(pf->arg_front());
@@ -48,7 +48,7 @@ void ExpressivenessTransformations::transform(CallInstr *v) {
   bool lhs_is_secure_container = isSharedTensor(lhsType) || isCipherTensor(lhsType);
   bool rhs_is_secure_container = isSharedTensor(rhsType) || isCipherTensor(rhsType);
 
-  if (!lhs_is_secure_container and !rhs_is_secure_container)
+  if (!lhs_is_secure_container && !rhs_is_secure_container)
     return;
 
   bool lhs_is_int = lhsType->is(M->getIntType());
@@ -57,6 +57,8 @@ void ExpressivenessTransformations::transform(CallInstr *v) {
   if (isMul && lhs_is_int)
     return;
   if (isMul && rhs_is_int)
+    return;
+  if (isMatMul && !(lhs_is_secure_container && rhs_is_secure_container))
     return;
   if (isDiv && lhs_is_int && !isSqrtInv)
     return;
@@ -71,6 +73,7 @@ void ExpressivenessTransformations::transform(CallInstr *v) {
                            : isAdd     ? "secure_add"
                            : isSub     ? "secure_sub"
                            : isMul     ? "secure_mul"
+                           : isMatMul  ? "secure_matmul"
                            : isSqrtInv ? "secure_sqrt_inv"
                            : isDiv     ? "secure_div"
                            : isPow     ? "secure_pow"
