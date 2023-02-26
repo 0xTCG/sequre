@@ -58,8 +58,6 @@ void ExpressivenessTransformations::transform(CallInstr *v) {
     return;
   if (isMul && rhs_is_int)
     return;
-  if (isMatMul && !(lhs_is_secure_container && rhs_is_secure_container))
-    return;
   if (isDiv && lhs_is_int && !isSqrtInv)
     return;
   if (isPow && lhs_is_int)
