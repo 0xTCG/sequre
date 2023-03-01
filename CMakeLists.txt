@@ -29,10 +29,12 @@ if(xz_ADDED)
 endif()
 
 set(SEQURE_FILES
-    ir/profiler.cpp
-    ir/profiler.h
-    ir/arithmetics.cpp
-    ir/arithmetics.h
+    # ir/mhe.cpp
+    # ir/mhe.h
+    # ir/mpc.cpp
+    # ir/mpc.h
+    ir/expr.cpp
+    ir/expr.h
     ir/sequre.cpp
     ir/sequre.h)
 add_library(sequre SHARED ${SEQURE_FILES})

@@ -20,6 +20,9 @@ from ..lattiseq.ckks import \
     new_ciphertext, \
     new_relinearization_key, \
     new_parameters_from_literal
+from ..lattiseq.ring import \
+    Poly as ring_Poly, \
+    new_gaussian_sampler
 from ..lattiseq.ringqp import \
     UniformSampler, \
     Poly, \
@@ -46,6 +49,9 @@ from ..lattiseq.drlwe import \
 from ..lattiseq.utils import new_prng
 from ..types.mhe import CryptoParams, RotationType, generate_rot_keys
 from ..types.builtin import Complex
+from ..types.utils import double_to_fp, fp_to_double
+from ..utils.utils import zeros_vec
+from ..utils.param import int_t
 
 from randomness import MPCRandomness
 from comms import MPCComms
@@ -410,6 +416,13 @@ class MPCHE[TP]:
 			# TODO: Check level
             self.crypto_params.evaluator.add(x[i], y[i], x[i])
     
+    def isub(self, x: list, y: list) -> list[Ciphertext]:
+        assert len(x) == len(y), "Ciphervector lenghts differ"
+        
+        for i in range(len(x)):
+			# TODO: Check level
+            self.crypto_params.evaluator.sub(x[i], y[i], x[i])
+    
     def imul(self, x: list[Ciphertext], y: list) -> list[Ciphertext]:
         max_len = max(len(x), len(y))
         
@@ -429,6 +442,16 @@ class MPCHE[TP]:
         for i in range(len(x)):
 			# TODO: Check level
             res.append(self.crypto_params.evaluator.add_new(x[i], y[i]))
+
+        return res
+
+    def sub(self, x: list, y: list) -> list[Ciphertext]:
+        assert len(x) == len(y), "Ciphervector lenghts differ"
+        res = list[Ciphertext](len(x))
+        
+        for i in range(len(x)):
+			# TODO: Check level
+            res.append(self.crypto_params.evaluator.sub_new(x[i], y[i]))
 
         return res
     
@@ -543,7 +566,7 @@ class MPCHE[TP]:
         ref_agg = self.aggregate_refresh_share(ref_protocol, ref_share)
         ref_protocol.finalize(ct, parameters.log_slots, crp, ref_agg, ct)
     
-    def cipher_to_additive_share(self, ct: Ciphertext, source_pid: int) -> AdditiveShareBigint:
+    def cipher_to_additive_plaintext(self, ct: Ciphertext, source_pid: int) -> AdditiveShareBigint:
         parameters = self.crypto_params.params
         
         # if source_pid == 0, assume cm is already shared across parties
@@ -588,7 +611,7 @@ class MPCHE[TP]:
         
         return secret_share
     
-    def additive_share_to_cipher(self, secret_share: AdditiveShareBigint, source_pid: int) -> Ciphertext:
+    def additive_plaintext_to_cipher(self, secret_share: AdditiveShareBigint, source_pid: int) -> Ciphertext:
         parameters = self.crypto_params.params
         cipher_level = parameters.max_level()
 
@@ -654,3 +677,137 @@ class MPCHE[TP]:
             scale=self.crypto_params.params.default_scale)
         self.crypto_params.encryptor._mm_encrypt_zero(ct.get_rlwe_ciphertext())
         return ct
+
+    def aggregate_cipher_vector(self, ciphervector: List[Ciphertext]) -> List[Ciphertext]:
+        if self.pid == 0: return []
+
+        if self.pid == self.comms.hub_pid:
+            # receive and add
+            out = ciphervector.copy()
+            for p in range(1, self.comms.number_of_parties):
+                if p != self.pid:
+                    out = self.add(out, self.comms.receive_as_jar(p, List[Ciphertext]))
+
+            for p in range(1, self.comms.number_of_parties):
+                if p != self.pid:
+                    self.comms.send_as_jar(out, p)
+        else:
+            self.comms.send_as_jar(ciphervector, self.comms.hub_pid)
+            out = self.comms.receive_as_jar(self.comms.hub_pid, List[Ciphertext])
+
+        return out
+
+    def aggregate_refresh_share_vec(self, share: List[ring_Poly], out_level: int) -> List[ring_Poly]:
+        context_q = self.crypto_params.params.ring_q
+        share_out = []
+        
+        if self.pid > 0:
+            if self.pid == self.comms.hub_pid:
+                # Initialize
+                for i in range(len(share)):
+                    share_out.append(context_q.new_poly_lvl(out_level))
+
+                # Aggregate
+                for p in range(1, self.comms.number_of_parties):
+                    if p != self.pid: other = self.comms.receive_as_jar(p, List[ring_Poly])
+                    else: other = share
+
+                    for i in range(len(share)):
+                        context_q._mm_add_lvl(len(other[i]._buf_coeffs) - 1, other[i], share_out[i], share_out[i])
+
+                # Broadcast
+                for p in range(1, self.comms.number_of_parties):
+                    if p != self.pid:
+                        self.comms.send_as_jar(share_out, p)
+
+            else:
+                # Send share
+                self.comms.send_as_jar(share, self.comms.hub_pid)
+                # Receive result
+                share_out = self.comms.receive_as_jar(self.comms.hub_pid, List[ring_Poly])
+
+        return share_out
+
+    def additive_share_vector_to_ciphervector(self, shared_vector: List[int_t], modulus: int_t) -> List[Ciphertext]:
+        if self.pid == 0: return []
+
+        # mask = shared_vector.rand(modulus)
+        # shared_matrix_mask = self.comms.reveal(shared_vector.copy() - mask, modulus)
+        # share = (shared_matrix_mask + mask) if self.pid == self.comms.hub_pid else mask
+        # return self.aggregate_cipher_vector(self.enc_vector(values, T=Ciphertext))
+        
+        # Temp non-secure solution
+        revealed_share = self.comms.reveal(shared_vector, modulus)
+        values = fp_to_double(revealed_share, modulus)
+        return self.enc_vector(values, T=Ciphertext)
+
+    def ciphervector_to_additive_share_vector(self, ciphervector: List[Ciphertext], source_pid: int, number_of_elements: int, modulus: int_t) -> List[int_t]:
+        # slots = self.crypto_params.params.slots()
+        # shared_vector = zeros_vec(number_of_elements)
+        # if self.pid == 0: return shared_vector
+
+        # if source_pid > 0:
+        #     ciphervector = self.comms.distribute(ciphervector, source_pid)
+
+        # ciphermatrix, level_start = self.flatten_levels([ciphervector])
+        # ciphervector = ciphermatrix[0]
+
+        # params = self.crypto_params.params
+        # ring_q = params.ring_q
+
+        # share_decrypt = [params.ring_q.new_poly_lvl(level_start) for _ in range(len(ciphervector))]
+        
+        # self.randomness.switch_seed(-1)
+        # seed = u32(prg.getrandbits(32))
+        # self.randomness.restore_seed(-1)
+        # sampler = new_gaussian_sampler(new_prng(seed), ring_q, 3.19, 19)
+
+        # pt_mask = []
+        # for k in range(len(ciphervector)):
+        #     # h0 = mask (at level min)
+        #     share_decrypt[k].randomize(ring_q.modulus[level_start])
+        #     ring_q._mm_ntt_lvl(level_start, share_decrypt[k], share_decrypt[k])
+        #     pt_mask.append(Plaintext(share_decrypt[k].copy(), ciphervector[0].scale))
+
+        #     # h0 = sk*c1 + mask
+        #     ring_q._mm_mul_coeffs_montgomery_and_add_lvl(level_start, self.crypto_params.sk.value.q, ciphervector[k].value[1], share_decrypt[k])
+
+        #     # h0 = sk*c1 + mask + e0
+        #     tmp = sampler._mm_read_new()
+        #     ring_q._mm_ntt_lvl(level_start, tmp, tmp)
+            
+        #     ring_q._mm_add_lvl(level_start, share_decrypt[k], tmp, share_decrypt[k])
+
+        # # TODO: communicate in one batch
+        # agg = self.aggregate_refresh_share_vec(share_decrypt, level_start)
+
+        # pt = []
+        # for i in range(len(ciphervector)):
+        #     ct_out = ciphervector[i].copy()
+        #     ring_q._mm_add_lvl(level_start, ct_out.value[0], agg[i], ct_out.value[0])
+
+        #     pt.append(ct_out.plaintext())
+
+        # for i in range(len(pt)):
+        #     rv_out = zeros_vec(slots, TP=Complex)
+        #     if self.pid == self.comms.hub_pid:
+        #         rv_out = self.crypto_params.encoder.decode(pt[i], self.crypto_params.params.log_slots)
+
+        #     rv_mask = self.crypto_params.encoder.decode(pt_mask[i], self.crypto_params.params.log_slots)
+        #     rv_out -= rv_mask
+
+        #     rv_out_shared = double_to_fp([e.r for e in rv_out], modulus)
+
+        #     start = i * slots
+        #     end = start + slots
+        #     if end > number_of_elements: end -= number_of_elements
+        #     else: end = slots
+
+        #     shared_vector.extend(rv_out_shared.slice_reference(0, end))
+
+        # return shared_vector
+
+        # Temp non-secure solution:
+        decoded_values = self.decode_vector(self.decrypt_vector(ciphervector), DTP=float)
+        fp_values = double_to_fp(decoded_values, modulus)
+        return fp_values if self.pid == self.comms.hub_pid else fp_values.zeros()
