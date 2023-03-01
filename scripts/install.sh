@@ -39,7 +39,7 @@ git clone https://github.com/exaloop/seq.git
 cd seq
 
 cmake -S . -B build -G Ninja \
-    -DLLVM_DIR=$LLVM_INSTALL_PREFIX/lib/cmake/llvm \
+    -DLLVM_DIR=$LLVM_INSTALL_PATH/lib/cmake/llvm \
     -DCODON_PATH=$CODON_PATH/install \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER=$CC \
@@ -50,7 +50,7 @@ cd ..
 
 # Build Sequre
 cmake -S . -B build -G Ninja \
-    -DLLVM_DIR=$LLVM_INSTALL_PREFIX/lib/cmake/llvm \
+    -DLLVM_DIR=$LLVM_INSTALL_PATH/lib/cmake/llvm \
     -DCODON_PATH=$CODON_PATH/install \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER=$CC \
