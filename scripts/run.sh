@@ -22,7 +22,7 @@ fi
 echo "Seq plugin searched at $SEQ_PATH ..."
 echo "Sequre plugin searched at $SEQURE_PATH ..."
 echo "Compiling $2 in $1 mode ..."
-OMP_PROC_BIND=close codon run -plugin $SEQURE_PATH -plugin $SEQ_PATH $1 scripts/invoke.codon run-$2 ${*:3}
+OMP_PROC_BIND=close codon run -plugin $SEQURE_PATH -plugin $SEQ_PATH -plugin $NUMPY_PATH $1 scripts/invoke.codon run-$2 ${*:3}
 
 echo "Cleaning up sockets ..."
 find  . -name 'sock.*' -exec rm {} \;
