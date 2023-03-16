@@ -1,8 +1,8 @@
 #include "expr.h"
 #include "utils.h"
-#include "codon/sir/util/cloning.h"
-#include "codon/sir/util/irtools.h"
-#include "codon/sir/util/matching.h"
+#include "codon/cir/util/cloning.h"
+#include "codon/cir/util/irtools.h"
+#include "codon/cir/util/matching.h"
 
 
 namespace sequre {
