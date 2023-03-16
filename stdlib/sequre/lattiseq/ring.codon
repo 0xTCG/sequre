@@ -5,6 +5,8 @@ import prg
 
 from copy import copy
 from experimental.simd import Vec
+from numpy.create import zeros
+from numpy.ndarray import ndarray
 
 import utils
 
@@ -12,7 +14,7 @@ from pickler import pickle, unpickle
 from common import big_uint, big_int, BIG_INT_LEN, biguint_mod_inv, bigint_floordiv, bigint_mod, biguint_floordiv, biguint_mod
 
 from ..types.builtin import u64xN, f64xN
-from ..utils.utils import zeros_vec, zeros, arange
+from ..utils.utils import zeros_vec, zeros as zeros_mat, arange
 from ..utils.constants import SIMD_LANE_SIZE, NUM_THREADS
 
 
@@ -810,6 +812,7 @@ def _mm_inv_ntt_lazy(coeffs_in: list[u64xN], coeffs_out: list[u64xN], n: int, nt
 
 # Poly is the structure that contains the coefficients of a polynomial.
 class Poly:
+    _ndarray: ndarray[Tuple[int, int], u64xN]
     _mm_coeffs: list[list[u64xN]]
     _buf_coeffs: list[list[u64]]
     is_ntt: bool
@@ -834,30 +837,56 @@ class Poly:
         return self.copy()
     
     def __pickle__(self, jar: Jar, pasteurized: bool):
-        pickle(self._buf_coeffs, jar, pasteurized)
-        if not pasteurized: jar += self._buf_coeffs.pickle_size()
+        pickle(self._ndarray.nbytes, jar, pasteurized)
+        if not pasteurized: jar += self._ndarray.nbytes.pickle_size()
+        str.memcpy(jar, self._ndarray._data.as_byte(), self._ndarray.nbytes)
+        if not pasteurized: jar += self._ndarray.nbytes
         pickle(self.is_ntt, jar, pasteurized)
         if not pasteurized: jar += self.is_ntt.pickle_size()
         pickle(self.is_mform, jar, pasteurized)
+        if not pasteurized: jar += self.is_mform.pickle_size()
+        pickle(self._ndarray.shape[0], jar, pasteurized)
+        if not pasteurized: jar += self._ndarray.shape[0].pickle_size()
+        pickle(self._ndarray.shape[1], jar, pasteurized)
     
     def __unpickle__(jar: Jar, pasteurized: bool) -> Poly:
-        _buf_coeffs = unpickle(jar, pasteurized, list[list[u64]])
-        if not pasteurized: jar += _buf_coeffs.pickle_size()
+        _nbytes = unpickle(jar, pasteurized, int)
+        if not pasteurized: jar += _nbytes.pickle_size()
+        _data_bytes = Ptr[byte](_nbytes)
+        str.memcpy(_data_bytes, jar, _nbytes)
+        _data = Ptr[u64xN](_data_bytes)
+        if not pasteurized: jar += _nbytes
         is_ntt = unpickle(jar, pasteurized, bool)
         if not pasteurized: jar += is_ntt.pickle_size()
         is_mform = unpickle(jar, pasteurized, bool)
-        pol = Poly(
-            _mm_coeffs=_buf_coeffs.vectorize_bitcast(),
-            _buf_coeffs=_buf_coeffs,
+        if not pasteurized: jar += is_mform.pickle_size()
+        _shape_0 = unpickle(jar, pasteurized, int)
+        if not pasteurized: jar += int.pickle_size()
+        _shape_1 = unpickle(jar, pasteurized, int)
+        _shape = (_shape_0, _shape_1)
+        
+        _ndarray = ndarray[Tuple[int, int], u64xN]._new_contig(_shape, _data).reshape(_shape)
+        _mm_coeffs = _ndarray.to_list()
+        return Poly(
+            _ndarray=_ndarray,
+            _mm_coeffs=_mm_coeffs,
+            _buf_coeffs=_mm_coeffs.scatter_bitcast(),
             is_ntt=is_ntt,
             is_mform=is_mform)
-        
-        return pol
     
     def pickle_size(self) -> int:
-        return self._buf_coeffs.pickle_size() + \
+        return self._ndarray.nbytes.pickle_size() + \
+            self._ndarray.nbytes + \
             self.is_ntt.pickle_size() + \
-            self.is_mform.pickle_size()
+            self.is_mform.pickle_size() + \
+            self._ndarray.shape[0].pickle_size() + \
+            self._ndarray.shape[1].pickle_size()
+
+    def set_coeffs(self, coeffs: list[list[u64]]):
+        # @par(num_threads=NUM_THREADS)
+        for i, row in enumerate(coeffs):
+            for j, coeff in enumerate(row):
+                self._buf_coeffs[i][j] = coeff
 
     def _mm_set_coeffs(self, _mm_coeffs: list[list[u64xN]]):
         # @par(num_threads=NUM_THREADS)
@@ -872,11 +901,12 @@ class Poly:
 
     def copy_values(self, other: Poly):
         self._mm_set_coeffs(other._mm_coeffs.copy())
-        self._buf_coeffs = self._mm_coeffs.scatter_bitcast()
     
     def copy(self) -> Poly:
-        _mm_coeffs = self._mm_coeffs.copy()
+        _ndarray = self._ndarray.copy()
+        _mm_coeffs = _ndarray.to_list()
         return Poly(
+            _ndarray=_ndarray,
             _mm_coeffs=_mm_coeffs,
             _buf_coeffs=_mm_coeffs.scatter_bitcast(),
             is_ntt=self.is_ntt,
@@ -897,24 +927,21 @@ class Poly:
     # If the provided level is larger than the current level, then allocates zero
     # coefficients, otherwise dereferences the coefficients above the provided level.
     def resize(self, level: int):
-        if self.level() > level:
-            for _ in range(self.level() - level):
-                self._buf_coeffs.pop()
-                self._mm_coeffs.pop()
-        elif level > self.level():
-            for _ in range(level - self.level()):
-                self._mm_coeffs.append(zeros_vec(self._mm_n(), TP=u64xN))
-            self._buf_coeffs = self._mm_coeffs.scatter_bitcast()
+        if self.level() == level: return
+        self._ndarray = self._ndarray.resize((level + 1, self._mm_n()))
+        self._mm_coeffs = self._ndarray.to_list()
+        self._buf_coeffs = self._mm_coeffs.scatter_bitcast()
     
     def randomize(self, upper_bound: u64):
-        self._buf_coeffs = self._buf_coeffs.rand(upper_bound)
-        self._mm_coeffs = self._buf_coeffs.vectorize_bitcast()
+        self.set_coeffs(self._buf_coeffs.rand(upper_bound))
 
 
 # new_poly creates a new polynomial with n coefficients set to zero and level+1 moduli.
 def new_poly(n, level):
-    _mm_coeffs = zeros(level + 1, n // SIMD_LANE_SIZE, TP=u64xN)
+    _ndarray = zeros((level + 1, n // SIMD_LANE_SIZE), dtype=u64xN)
+    _mm_coeffs = _ndarray.to_list()
     return Poly(
+        _ndarray=_ndarray,
         _mm_coeffs=_mm_coeffs,
         _buf_coeffs=_mm_coeffs.scatter_bitcast())
 
@@ -1824,7 +1851,7 @@ class TernarySampler(Static[BaseSampler]):
         pol._mm_set_coeffs(_buf_coeffs_t.transpose().vectorize_bitcast())
     
     def initialize_matrix(self, montgomery):
-        self.matrix_values = zeros(3, len(self.base_ring.modulus), TP=u64)
+        self.matrix_values = zeros_mat(3, len(self.base_ring.modulus), TP=u64)
 
         # [0] = 0
         # [1] = 1 * 2^64 mod qi
