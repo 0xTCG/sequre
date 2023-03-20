@@ -1,7 +1,7 @@
 #ifndef _SEQURE_UTILS
 #define _SEQURE_UTILS
 
-#include "codon/sir/util/irtools.h"
+#include "codon/cir/util/irtools.h"
 
 namespace sequre {
 
