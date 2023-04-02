@@ -1,0 +1,337 @@
+from numpy.ndarray import ndarray
+from numpy.create import array
+
+from sequre.attributes import sequre
+from sequre.lattiseq.ckks import Ciphertext
+from sequre.types.cipher_tensor import CipherTensor
+from sequre.utils.io import read_ndarray
+from sequre.types.builtin import int_t
+
+
+# Multiparty partition
+class MPP[S, dtype]:
+    modulus: int_t
+    _ratios: list[int]
+    _local_data: ndarray[S, dtype]
+    _encryption_left: CipherTensor[Ciphertext]
+    _encryption_right: CipherTensor[Ciphertext]
+    _encryption_unified: CipherTensor[Ciphertext]
+    _transposed: bool
+
+    @property
+    def shape(self) -> S:
+        if self.is_local():
+            return self._local_data.shape
+        
+        if self.has_unified_encryption():
+            if staticlen(S) == 2:
+                rows, cols = self._encryption_unified.shape
+                return (rows, cols)
+            elif staticlen(S) == 1:
+                return (self._encryption_unified.shape[0], )
+            else:
+                compile_error("MPP: Dimension has to be less than 3 until tuple(list) is enabled")
+
+        assert self.has_local_data(), "MPP must have local data if it has no unified encryption"
+        last_lane = self._local_data.shape[-1]
+        if self._encryption_left: last_lane += self._encryption_left.shape[-1]
+        if self._encryption_right: last_lane += self._encryption_right.shape[-1]
+        
+        shape = (*self._local_data.shape[:-1], last_lane)
+        if self._transposed:
+            return shape[::-1]
+        return shape
+    
+    @property
+    def T(self) -> MPP[S, dtype]:
+        "Note: T is lazy and inplace"
+        self._transposed ^= True
+        return self
+    
+    @property
+    def ndim(self) -> int:
+        if self._local_data:
+            return self._local_data.ndim
+        elif self._encryption_unified:
+            return self._encryption_unified.ndim
+        return len(self.shape)
+
+    def __iter__(self):
+        assert not self.is_semi_encrypted() and not self.is_full_encrypted(), "Cannot iter encrypted data"
+        for e in self._local_data: yield e
+    
+    def __add__(self, other) -> MPP[S, dtype]:
+        raise NotImplementedError("MPPs cannot be added without IR pass enabled")
+    
+    def __sub__(self, other) -> MPP[S, dtype]:
+        raise NotImplementedError("MPPs cannot be subtracted without IR pass enabled")
+
+    def __mul__(self, other) -> MPP[S, dtype]:
+        raise NotImplementedError("MPPs cannot be multiplied without IR pass enabled")
+    
+    def __matmul__(self, other) -> MPP[S, dtype]:
+        raise NotImplementedError("MPPs cannot be matrix-multiplied without IR pass enabled")
+    
+    # Has either of the encrypted sub-partitions
+    def has_partial_encryption(self):
+        return bool(self._encryption_left) or bool(self._encryption_right)
+    
+    # Has encryption for whole partition
+    def has_unified_encryption(self):
+        return bool(self._encryption_unified)
+    
+    # Has local data
+    def has_local_data(self):
+        return bool(self._local_data)
+    
+    # Has local data and either of the encrypted portion
+    def is_semi_encrypted(self) -> bool:
+        return self.has_local_data() and self.has_partial_encryption()
+
+    # Does not have local data and whole partition is encrypted
+    def is_full_encrypted(self) -> bool:
+        return not self.has_local_data() and self.has_unified_encryption()
+    
+    # Has local data only
+    def is_local(self) -> bool:
+        return self.has_local_data() and not self.has_partial_encryption()
+
+    # Is either completely local or completely encrypted
+    def is_unified(self) -> bool:
+        return self.is_local() or self.has_unified_encryption()
+    
+    @staticmethod
+    def collective_load[dtype=int](mpc, data_path: str, rows: int, cols: int, binary: bool, modulus: int_t) -> MPP[Tuple[int, int], dtype]:
+        assert mpc.comms.collect(cols).reduce_and() == cols, "MPP: The numbers of columns should be the same in the horizontaly partitioned matrix"
+        
+        with open(data_path) as f:
+            data = read_ndarray(f, (rows, cols), binary, dtype=dtype)
+        
+        return MPP[Tuple[int, int], dtype](
+            modulus=modulus,
+            _ratios=mpc.comms.collect(rows),
+            _local_data=data)
+    
+    def unify_partition(self, mpc):
+        if self.is_unified():
+            return
+        assert self.has_local_data(), "MPP must have local data if it has no unified encryption"
+
+        self._encryption_unified = CipherTensor[Ciphertext].enc(mpc, self._local_data)
+        
+        if self._encryption_left:
+            self._encryption_unified = self._encryption_left.concat(self._encryption_unified, axis=1)
+        if self._encryption_right:
+            self._encryption_unified = self._encryption_unified.concat(self._encryption_right, axis=1)
+
+    def gather_partitions(self, mpc) -> list[CipherTensor[Ciphertext]]:
+        self.unify_partition(mpc)
+        return mpc.comms.collect(self._encryption_unified.copy())
+    
+    def collect(self, mpc) -> CipherTensor[Ciphertext]:
+        return self.gather_partitions(mpc).unfence()
+    
+    def collect_at(self, mpc, target_pid: int) -> CipherTensor[Ciphertext]:
+        self.unify_partition(mpc)
+        enc = self._encryption_unified.copy()
+        partitions = mpc.comms.collect_at(enc, target_pid)
+        if mpc.pid == target_pid:
+            return partitions.unfence()
+        return CipherTensor[Ciphertext]()
+    
+    def reveal(self, mpc) -> ndarray[S, dtype]:
+        if self.has_local_data():
+            print("WARNING! Revealing local data")
+        arr = self.collect(mpc).reveal(mpc, T=dtype)
+        if self._transposed: return arr.T
+        return arr
+    
+    @sequre
+    def matmul_public(mpc, first: MPP[S, dtype], other: ndarray[S, dtype]) -> MPP[S, dtype]:
+        _local_data = ndarray[S, dtype]()
+        _encryption_unified = CipherTensor[Ciphertext]()
+        
+        if first.is_local():
+            _local_data = first._local_data @ other
+        else:
+            first.unify_partition(mpc)
+            _encryption_unified = first._encryption_unified @ other.T
+        
+        return MPP[S, dtype](
+            modulus=first.modulus,
+            _ratios=first._ratios,
+            _local_data=_local_data,
+            _encryption_unified=_encryption_unified)
+    
+    @sequre
+    def matmul(mpc, first: MPP[S, dtype], other) -> MPP[S, dtype]:
+        if mpc.pid == 0:
+            return MPP[S, dtype]()
+        
+        _local_data = ndarray[S, dtype]()
+        _encryption_left = CipherTensor[Ciphertext]()
+        _encryption_right = CipherTensor[Ciphertext]()
+        _encryption_unified = CipherTensor[Ciphertext]()
+        
+        assert first.ndim == other.ndim == 2, "MPP: Invalid dimensions for matmul"
+        assert first.shape[0] == other.shape[1], "MPP: Invalid shapes for matmul"
+        
+        if isinstance(other, ndarray):
+            return MPP.matmul_public(mpc, first, other)
+
+        assert first._transposed ^ other._transposed, "MPP: Invalid shapes for matmul"
+        
+        if first._transposed:
+            if first.is_local() and other.is_local():
+                enc = CipherTensor[Ciphertext].enc(mpc, first._local_data @ other._local_data)
+            elif first.is_local():
+                other.unify_partition(mpc)
+                enc = first._local_data.reversed_matmul(mpc, other._encryption_unified)
+            else:
+                raise NotImplementedError("MPP: Cannot matmul encrypted transpose yet")
+
+            _encryption_unified = mpc.comms.collect(enc).sum().to_mpp(mpc, first._ratios, first.modulus, S=S, dtype=dtype)._encryption_unified
+        
+        else:
+            other_partitions = other.gather_partitions(mpc)
+            reference_pid = mpc.pid - 1  # Avoid CP0
+            
+            if other.is_local():
+                other_encryption_left = other_partitions[:reference_pid].unfence() if reference_pid else CipherTensor[Ciphertext]()
+                other_encryption_right = other_partitions[reference_pid + 1:].unfence() if not mpc.pid == mpc.comms.number_of_parties - 1 else CipherTensor[Ciphertext]()
+
+                if first.is_local():
+                    if other_encryption_left: _encryption_left = first._local_data.reversed_matmul(mpc, other_encryption_left)
+                    _local_data = first._local_data @ other._local_data
+                    if other_encryption_right: _encryption_right = first._local_data.reversed_matmul(mpc, other_encryption_right)
+                else:
+                    first.unify_partition(mpc)
+                    _encryption_unified_enclosed = []
+                    if other_encryption_left:
+                        _encryption_unified_enclosed.append(first._encryption_unified @ other_encryption_left)
+                    _encryption_unified_enclosed.append(first._encryption_unified @ other._local_data)
+                    if other_encryption_right:
+                        _encryption_unified_enclosed.append(first._encryption_unified @ other_encryption_right)
+                    _encryption_unified = _encryption_unified_enclosed.unfence()
+            elif first.is_local():
+                _encryption_unified = first._local_data.reversed_matmul(mpc, other_partitions.unfence())
+            else:
+                first.unify_partition(mpc)
+                _encryption_unified = first._encryption_unified @ other_partitions.unfence()
+            
+        return MPP[S, dtype](
+            modulus=first.modulus,
+            _ratios=first._ratios,
+            _local_data=_local_data,
+            _encryption_left=_encryption_left,
+            _encryption_right=_encryption_right,
+            _encryption_unified=_encryption_unified)
+
+    def _do_elem_wise_op_partitions(self, mpc, other_data: ndarray[S, dtype], elem_wise_op) -> Tuple[ndarray[S, dtype], CipherTensor[Ciphertext], CipherTensor[Ciphertext], CipherTensor[Ciphertext]]:
+        _local_data = ndarray[S, dtype]()
+        _encryption_left = CipherTensor[Ciphertext]()
+        _encryption_right = CipherTensor[Ciphertext]()
+        _encryption_unified = CipherTensor[Ciphertext]()
+
+        if other_data.shape[0] == self._ratios.sum():
+            reference_pid = mpc.pid - 1  # Avoid CP0
+            start = self._ratios[:reference_pid].sum()
+            end = start + self._ratios[reference_pid]
+            other_data = other_data[start:end]
+        elif not other_data.shape[0] == self.shape[0]:
+            raise ValueError("MPP: Shapes mismatch in elem-wise operation")
+        
+        col_end = 0
+        if self.is_local():
+            _local_data = elem_wise_op(mpc, self._local_data, other_data)
+        elif self.has_partial_encryption():
+            if self._encryption_left:
+                col_end = self._encryption_left.shape[1]
+                _encryption_left = elem_wise_op(mpc, self._encryption_left, other_data[:, :col_end])
+            assert self.has_local_data(), "MPP must have local data if it has partial encryption"
+            col_start = col_end
+            col_end = col_start + self._local_data.shape[1]
+            _local_data = elem_wise_op(mpc, self._local_data, other_data[:, col_start:col_end])
+            if self._encryption_right:
+                col_start = col_end
+                _encryption_right = elem_wise_op(mpc, self._encryption_right, other_data[:, col_start:])
+        elif self.has_unified_encryption():
+            _encryption_unified = elem_wise_op(mpc, self._encryption_unified, other_data)
+        else:
+            raise ValueError("MPP: Invalid partition")
+
+        return (_local_data, _encryption_left, _encryption_right, _encryption_unified)
+    
+    def _do_elem_wise_op(self, mpc, other, elem_wise_op) -> MPP[S, dtype]:
+        if mpc.pid == 0:
+            return MPP[S, dtype]()
+
+        _local_data = ndarray[S, dtype]()
+        _encryption_left = CipherTensor[Ciphertext]()
+        _encryption_right = CipherTensor[Ciphertext]()
+        _encryption_unified = CipherTensor[Ciphertext]()
+        
+        if isinstance(other, ndarray):
+            _local_data, _encryption_left, _encryption_right, _encryption_unified = self._do_elem_wise_op_partitions(mpc, other, elem_wise_op)
+        else:
+            assert self.shape == other.shape, "MPP: Shapes mismatch in elem-wise operation"
+
+            if self._transposed ^ other._transposed:
+                other_encryption_unified = other.to_mpc(mpc).T.to_mpp(mpc, self._ratios, S=S, dtype=dtype)._encryption_unified
+                if self.is_local():
+                    _encryption_unified = elem_wise_op(mpc, other_encryption_unified, self._local_data)
+                else:
+                    self.unify_partition(mpc)
+                    _encryption_unified = elem_wise_op(mpc, other_encryption_unified, self._encryption_unified)
+            elif self.is_local() and other.is_local():
+                _local_data = elem_wise_op(mpc, self._local_data, other._local_data)
+            elif other.is_local():
+                _local_data, _encryption_left, _encryption_right, _encryption_unified = self._do_elem_wise_op_partitions(mpc, other._local_data, elem_wise_op)
+            elif self.is_local():
+                _local_data, _encryption_left, _encryption_right, _encryption_unified = other._do_elem_wise_op_partitions(mpc, self._local_data, elem_wise_op)
+            elif self.has_unified_encryption() and not other.has_unified_encryption():
+                assert other.is_semi_encrypted(), "MPP: Operand expected to be semi-ecrypted"
+                other.unify_partition(mpc)
+                _encryption_unified = elem_wise_op(mpc, self._encryption_unified, other._encryption_unified)
+            elif not self.has_unified_encryption() and other.has_unified_encryption():
+                assert self.is_semi_encrypted(), "MPP: Operand expected to be semi-ecrypted"
+                self.unify_partition(mpc)
+                _encryption_unified = elem_wise_op(mpc, self._encryption_unified, other._encryption_unified)
+            else:
+                if self.has_local_data() and other.has_local_data():
+                    _local_data = elem_wise_op(mpc, self._local_data, other._local_data)
+                if self._encryption_left and other._encryption_left:
+                    _encryption_left = elem_wise_op(mpc, self._encryption_left, other._encryption_left)
+                if self._encryption_right and other._encryption_right:
+                    _encryption_right = elem_wise_op(mpc, self._encryption_right, other._encryption_right)
+                if self.has_unified_encryption() and other.has_unified_encryption():
+                    _encryption_unified = elem_wise_op(mpc, self._encryption_unified, other._encryption_unified)
+        
+        return MPP[S, dtype](
+            modulus=self.modulus,
+            _ratios=self._ratios,
+            _local_data=_local_data,
+            _encryption_left=_encryption_left,
+            _encryption_right=_encryption_right,
+            _encryption_unified=_encryption_unified,
+            _transposed=self._transposed)
+    
+    @sequre
+    def _elem_wise_add(mpc, a, b):
+        return a + b
+    
+    @sequre
+    def _elem_wise_sub(mpc, a, b):
+        return a - b
+    
+    @sequre
+    def _elem_wise_mul(mpc, a, b):
+        return a * b
+    
+    def _elem_wise_eq(mpc, a, b):
+        if isinstance(a, ndarray):
+            return (a == b).all()
+        elif isinstance(a, CipherTensor):
+            return a == b
+        else:
+            compile_error("MPP: Invalid types in equality check")

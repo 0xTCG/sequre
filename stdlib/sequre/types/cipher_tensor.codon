@@ -1,21 +1,25 @@
+from numpy.ndarray import ndarray
+from numpy.create import array
 from pickler import pickle, unpickle
 
 from sequre.lattiseq.ckks import Ciphertext, Plaintext
-from sequre.mpc.env import MPCEnv
 from sequre.utils.utils import one_hot_vector
 
 
-class CipherTensor[T]:
-    _data: list[T]
+class CipherTensor[ctype]:
+    _data: list[ctype]
     shape: list[int]
     slots: int
     _chunk_size: int
 
-    def __init__(self, _data: list[T], shape: list[int], slots: int):
+    def __init__(self, _data: list[ctype], shape: list[int], slots: int):
         self._data = _data
         self.shape = shape
         self.slots = slots
         self._reset_chunk_size()
+    
+    def __bool__(self) -> bool:
+        return bool(self._data)
     
     def __repr__(self) -> str:
         return f"""
@@ -24,6 +28,10 @@ class CipherTensor[T]:
             \tSlots: {self.slots}
             \t(Ciphertensor elements cannot be printed in a bulk)
         """
+    
+    def __iter__(self):
+        for i in range(self.shape[0]):
+            yield self[i]
 
     def __pickle__(self, jar: Jar, pasteurized: bool):
         pickle(self.slots, jar, pasteurized)
@@ -32,17 +40,24 @@ class CipherTensor[T]:
         if not pasteurized: jar += self.shape._pickle_size()
         pickle(self._data, jar, pasteurized)
     
-    def __unpickle__(jar: Jar, pasteurized: bool) -> CipherTensor[T]:
+    def __unpickle__(jar: Jar, pasteurized: bool) -> CipherTensor[ctype]:
         slots = unpickle(jar, pasteurized, int)
         if not pasteurized: jar += slots._pickle_size()
         shape = unpickle(jar, pasteurized, list[int])
         if not pasteurized: jar += shape._pickle_size()
-        _data = unpickle(jar, pasteurized, List[T])
+        _data = unpickle(jar, pasteurized, List[ctype])
 
-        return CipherTensor[T](
+        return CipherTensor[ctype](
             _data=_data,
             shape=shape,
             slots=slots)
+    
+    def copy(self) -> CipherTensor[ctype]:
+        return CipherTensor[ctype](
+            _data=self._data.copy(),
+            shape=self.shape.copy(),
+            slots=self.slots,
+            _chunk_size=self._chunk_size)
 
     def _pickle_size(self) -> int:
         return self.slots._pickle_size() + self.shape._pickle_size() + self._data._pickle_size()
@@ -53,33 +68,49 @@ class CipherTensor[T]:
         cs[-1] = (cs[-1] + self.slots - 1) // self.slots
         return cs
     
-    def __add__(self: CipherTensor[T], other) -> CipherTensor[T]:
+    @property
+    def ndim(self):
+        return len(self.shape)
+    
+    def __add__(self: CipherTensor[ctype], other) -> CipherTensor[ctype]:
         raise NotImplementedError("CipherTensors cannot be added without IR pass enabled.")
 
-    def __sub__(self: CipherTensor[T], other) -> CipherTensor[T]:
+    def __sub__(self: CipherTensor[ctype], other) -> CipherTensor[ctype]:
         raise NotImplementedError("CipherTensors cannot be subtracted without IR pass enabled.")
     
-    def __mul__(self: CipherTensor[T], other) -> CipherTensor[T]:
+    def __mul__(self: CipherTensor[ctype], other) -> CipherTensor[ctype]:
         raise NotImplementedError("CipherTensors cannot be multiplied without IR pass enabled.")
 
-    def __matmul__(self: CipherTensor[T], other) -> CipherTensor[T]:
+    def __matmul__(self: CipherTensor[ctype], other) -> CipherTensor[ctype]:
         raise NotImplementedError("CipherTensors matrices cannot be multiplied without IR pass enabled.")
 
-    def __gt__(self: CipherTensor[T], other) -> CipherTensor[T]:
+    def __gt__(self: CipherTensor[ctype], other) -> CipherTensor[ctype]:
         raise NotImplementedError("CipherTensors cannot be compared without IR pass enabled.")
 
-    def __lt__(self: CipherTensor[T], other) -> CipherTensor[T]:
+    def __lt__(self: CipherTensor[ctype], other) -> CipherTensor[ctype]:
         raise NotImplementedError("CipherTensors cannot be compared without IR pass enabled.")
 
-    def __eq__(self, other: CipherTensor[T]) -> bool:
+    def __eq__(self, other: CipherTensor[ctype]) -> bool:
         if self.shape != other.shape or self.slots != other.slots: return False
         return self._data == other._data
     
-    def __getitem__(self, i: int) -> CipherTensor[T]:
-        assert len(self.shape) > 1, "CipherTensor: Cannot getitem from one-dimensional CipherTensor."
-        return CipherTensor[T](
+    def __getitem__(self, i: int) -> CipherTensor[ctype]:
+        assert self.ndim > 1, "CipherTensor: Cannot getitem from one-dimensional CipherTensor."
+        return CipherTensor[ctype](
             _data=self._data[i * self._chunk_size:(i + 1) * self._chunk_size],
             shape=self.shape[1:],
+            slots=self.slots)
+
+    def __getitem__(self, s: slice) -> CipherTensor[ctype]:
+        shape = self.shape.copy()
+        shape[0] = s.stop - s.start
+
+        start = s.start * self.slots
+        end = s.stop * self.slots
+        
+        return CipherTensor[ctype](
+            _data=self._data[start:end],
+            shape=shape,
             slots=self.slots)
 
     @staticmethod
@@ -100,27 +131,71 @@ class CipherTensor[T]:
             total *= shape[i]
         return total * (shape[-1] + slots - 1) // slots
     
-    def enc(mpc: MPCEnv, data) -> CipherTensor[T]:
-        shape = data.shape()
+    def destroy(self):
+        self._data.clear()
+        self.shape.clear()
+        self.int = 0
+        self._chunk_size = 0
+    
+    def enc(mpc, data) -> CipherTensor[ctype]:
+        if isinstance(data, ndarray):
+            assert data.ndim <= 2, "CipherTensor can encode/encrypt only the ndarrays of dimension less than 3 at the moment"
+            data_list = data.tolist()
+        elif isinstance(data, list):
+            data_list = data
+        else:
+            compile_error("CipherTensor: Invalid input for ciphertensor encoding/encryption")
+        
+        shape = data_list.shape()
         vec_len = shape[-1]
         slots = mpc.he.crypto_params.params.slots()
         number_of_elements = CipherTensor._count_ciphers(shape, slots)
-        vector_generator = data.generate_vectors()
+        vector_generator = data_list.generate_vectors()
 
-        _data = List[T](number_of_elements)
-        for _ in range(0, shape.reduce_mul(), vec_len):
-            _data.extend(mpc.he.enc_vector(next(vector_generator), T=T))
+        _data = List[ctype](number_of_elements)
+        for _ in range(0, CipherTensor._count(shape), vec_len):
+            _data.extend(mpc.he.enc_vector(next(vector_generator), T=ctype))
         
-        return CipherTensor[T](
+        return CipherTensor[ctype](
             _data=_data,
             shape=shape,
             slots=slots)
     
-    def append(self, other: CipherTensor):
-        assert self.shape[1:] == other.shape, "CipherTensor: Invalid shapes for append."
+    def extendleft(self, other: CipherTensor):
+        assert self.shape[1:] == other.shape[1:], "CipherTensor: Invalid shapes for extend"
+
+        _data = other._data.copy()
+        _data.extend(self._data)
+        self._data = _data
+        self.shape[0] += other.shape[0]
+    
+    def extend(self, other: CipherTensor):
+        assert self.shape[1:] == other.shape[1:], "CipherTensor: Invalid shapes for extend"
 
         self._data.extend(other._data)
-        self.shape[0] += 1
+        self.shape[0] += other.shape[0]
+    
+    def concat(self, other: CipherTensor[ctype], axis: int) -> CipherTensor[ctype]:
+        assert axis <= 1 and self.ndim == 2, "CipherTensor concat not yet enabled for arbitrary ndim tensor. Internal note: Switch to ndarray to enable this"  # TODO
+        assert self.shape[axis ^ 1] == other.shape[axis ^ 1], "CipherTensor: Incompatible shapes for concatenation along provided axis"
+        assert self.slots == other.slots, "CipherTensor: Incompatible slots for concatenation"
+        
+        if axis == 0:
+            _data = self._data.copy()
+            _data.extend(other._data)
+        else:
+            _data = []
+            for self_row, other_row in zip(self, other):
+                _data.extend(self_row._data)
+                _data.extend(other_row._data)
+        
+        _shape = self.shape.copy()
+        _shape[axis] += other.shape[axis]
+
+        return CipherTensor[ctype](
+            _data=_data,
+            shape=_shape,
+            slots=self.slots)
     
     def pop(self):
         assert len(self.shape) > 1, "CipherTensor: Cannot pop from one-dimensional CipherTensor."
@@ -128,7 +203,7 @@ class CipherTensor[T]:
         self.shape[0] -= 1
     
     @staticmethod
-    def zeros(mpc: MPCEnv, shape: List[int]) -> CipherTensor[Ciphertext]:
+    def zeros(mpc, shape: List[int]) -> CipherTensor[Ciphertext]:
         slots = mpc.he.crypto_params.params.slots()
         number_of_elements = CipherTensor._count_ciphers(shape, slots)
         
@@ -137,71 +212,76 @@ class CipherTensor[T]:
             shape=shape,
             slots=slots)
 
-    def reveal(self, mpc: MPCEnv):
+    def reveal[T=complex](self, mpc):
         new_shape = self.shape[:-1]
         new_shape.append(self.shape[-1] // self.slots * self.slots + self.slots)
-        return mpc.he.decode_vector(mpc.he.decrypt_vector(self._data)).reshape(new_shape).pad_inplace(self.shape)
+        revealed_tensor = mpc.he.decode_vector(mpc.he.decrypt_vector(self._data), DTP=T).reshape(new_shape).pad_inplace(self.shape)
+        return array(revealed_tensor, dtype=T)
     
-    def iadd(self, mpc: MPCEnv, other) -> CipherTensor[T]:
+    def iadd(self, mpc, other) -> CipherTensor[ctype]:
         other_cipher = self._check_other_operand(mpc, other)
         assert self.shape == other_cipher.shape, f"CipherTensor.iadd: Shapes mismatch: {self.shape} != {other_cipher.shape}"
 
         mpc.he.iadd(self._data, other_cipher._data)
         return self
 
-    def isub(self, mpc: MPCEnv, other) -> CipherTensor[T]:
+    def isub(self, mpc, other) -> CipherTensor[ctype]:
         other_cipher = self._check_other_operand(mpc, other)
         assert self.shape == other_cipher.shape, f"CipherTensor.iadd: Shapes mismatch: {self.shape} != {other_cipher.shape}"
 
         mpc.he.isub(self._data, other_cipher._data)
         return self
 
-    def imul(self, mpc: MPCEnv, other) -> CipherTensor[T]:
+    def imul(self, mpc, other) -> CipherTensor[ctype]:
         other_cipher = self._check_other_operand(mpc, other)
         assert self.shape == other_cipher.shape, f"CipherTensor.imul: Shapes mismatch: {self.shape} != {other_cipher.shape}"
 
         mpc.he.imul(self._data, other_cipher._data)
         return self
 
-    def add(self, mpc: MPCEnv, other) -> CipherTensor[T]:
+    def add(self, mpc, other) -> CipherTensor[ctype]:
         other_cipher = self._check_other_operand(mpc, other)
         assert self.shape == other_cipher.shape, f"CipherTensor.add: Shapes mismatch: {self.shape} != {other_cipher.shape}"
         
         _data = mpc.he.add(self._data, other_cipher._data)
-        return CipherTensor[T](
+        return CipherTensor[ctype](
             _data=_data,
             shape=self.shape,
             slots=self.slots)
 
-    def sub(self, mpc: MPCEnv, other) -> CipherTensor[T]:
+    def sub(self, mpc, other) -> CipherTensor[ctype]:
         other_cipher = self._check_other_operand(mpc, other)
         assert self.shape == other_cipher.shape, f"CipherTensor.add: Shapes mismatch: {self.shape} != {other_cipher.shape}"
         
         _data = mpc.he.sub(self._data, other_cipher._data)
-        return CipherTensor[T](
+        return CipherTensor[ctype](
             _data=_data,
             shape=self.shape,
             slots=self.slots)
     
-    def mul(self, mpc: MPCEnv, other) -> CipherTensor[T]:
+    def mul(self, mpc, other) -> CipherTensor[ctype]:
         other_cipher = self._check_other_operand(mpc, other)
         assert self.shape == other_cipher.shape, f"CipherTensor.mul: Shapes mismatch: {self.shape} != {other_cipher.shape}"
         
         _data = mpc.he.mul(self._data, other_cipher._data)
-        return CipherTensor[T](
+        return CipherTensor[ctype](
             _data=_data,
             shape=self.shape,
             slots=self.slots)
 
-    def matmul(self, mpc: MPCEnv, other, debug=True) -> CipherTensor:
+    def reversed_matmul(self, mpc, other) -> CipherTensor[ctype]:
+        # TODO
+        raise NotImplementedError("TODO: Implement reversed matmul metnod in CipherTensor")
+    
+    def matmul(self, mpc, other, debug=True) -> CipherTensor:
         other_cipher = self._check_other_operand(mpc, other)
         assert len(self.shape) == len(other_cipher.shape) == 2, f"CipherTensor: At least one of the tensors is not a matrix. Self shape: {self.shape}, other shape: {other_cipher.shape}. Ciphertensor matmul supports only matrices at the moment."
-        # assert self.shape[1] == other_cipher.shape[0], f"CipherTensor: Invalid matrix dimentions: {self.shape} x {other_cipher.shape}."
+        assert self.shape[1] == other_cipher.shape[1], f"CipherTensor: Invalid matrix dimentions: {self.shape} x {other_cipher.shape}. CipherTensor matmul expects the second operand to be transposed apriori."
 
         masks = CipherTensor[Plaintext].enc(mpc, [one_hot_vector(i, other_cipher.shape[1], TP=float) for i in range(other_cipher.shape[0])])
 
-        new_cipher_tensor = CipherTensor[T](
-            shape=[0, other_cipher.shape[1]],
+        new_cipher_tensor = CipherTensor[ctype](
+            shape=[0, self.shape[1]],
             slots=self.slots)
         for i in range(self.shape[0]):
             new_row = CipherTensor[Ciphertext].zeros(mpc, [other_cipher.shape[1]])
@@ -219,18 +299,19 @@ class CipherTensor[T]:
                 if debug: print(f"Matmul: {i + 1}/{self.shape[0]} -- {j + 1}/{other_cipher.shape[0]}")
             if debug: print("----------------------")
             
-            new_cipher_tensor.append(new_row)
+            new_cipher_tensor.extend(new_row)
         
         return new_cipher_tensor
 
-    def rotate(self, mpc, step: int) -> CipherTensor[T]:
-        return CipherTensor[T](
+    def rotate(self, mpc, step: int) -> CipherTensor[ctype]:
+        return CipherTensor[ctype](
             _data=mpc.he.rotate(self._data, step),
             shape=self.shape,
             slots=self.slots)
 
     def _check_other_operand(self, mpc, other):
         if isinstance(other, CipherTensor): return other
+        elif isinstance(other, ndarray): return CipherTensor[Plaintext].enc(mpc, other.tolist())
         elif isinstance(other, List): return CipherTensor[Plaintext].enc(mpc, other)
         elif isinstance(other, int) or isinstance(other, float):
             new_tensor_flattened = [other for _ in range(self.shape.reduce_mul())]
@@ -238,7 +319,7 @@ class CipherTensor[T]:
             new_cipher.shape = self.shape
             new_cipher._reset_chunk_size()
             return new_cipher
-        else: raise TypeError("Invalid operand for CipherTensor")
+        else: compile_error("Invalid operand for CipherTensor")
 
     def _reset_chunk_size(self):
         self._chunk_size = 0 if len(self.shape) <= 1 else CipherTensor._count(self.cipher_shape[1:])
