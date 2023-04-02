@@ -9,6 +9,7 @@ using namespace codon::ir;
 
 const std::string sharedTensorTypeName = "SharedTensor";
 const std::string cipherTensorTypeName = "CipherTensor";
+const std::string MPPTypeName = "MPP";
 
 
 bool isSequreFunc(Func *f) {
@@ -33,6 +34,10 @@ bool isSharedTensor( types::Type *t ) {
 
 bool isCipherTensor( types::Type *t ) {
   return t->getName().find(cipherTensorTypeName) != std::string::npos;
+}
+
+bool isMPP( types::Type *t ) {
+  return t->getName().find(MPPTypeName) != std::string::npos;
 }
 
 Func *getOrRealizeSequreInternalMethod(Module *M, std::string const &methodName,

@@ -45,8 +45,8 @@ void ExpressivenessTransformations::transform(CallInstr *v) {
     }
   }
 
-  bool lhs_is_secure_container = isSharedTensor(lhsType) || isCipherTensor(lhsType);
-  bool rhs_is_secure_container = isSharedTensor(rhsType) || isCipherTensor(rhsType);
+  bool lhs_is_secure_container = isSharedTensor(lhsType) || isCipherTensor(lhsType) || isMPP(lhsType);
+  bool rhs_is_secure_container = isSharedTensor(rhsType) || isCipherTensor(rhsType) || isMPP(rhsType);
 
   if (!lhs_is_secure_container && !rhs_is_secure_container)
     return;
@@ -83,7 +83,12 @@ void ExpressivenessTransformations::transform(CallInstr *v) {
 
   auto *method = getOrRealizeSequreInternalMethod(M, methodName, {selfType, lhsType, rhsType}, {});
   if (!method) {
-    std::cout << "SEQURE TYPE REALIZATION ERROR: Could not realize internal method " << methodName << " for parameters of type " << selfType->getName() << ", " << lhsType->getName() << ", and " << rhsType->getName() << std::endl;
+    std::cout << "\nSEQURE TYPE REALIZATION ERROR: Could not realize internal method: " << methodName
+              << "\n\tfor parameters "
+              << "\n\t\t" << selfType->getName()
+              << "\n\t\t" << lhsType->getName()
+              << "\n\t\t" << rhsType->getName()
+              << "\n\tcalled within " << pf->getName() << std::endl;
     return;
   }
 
