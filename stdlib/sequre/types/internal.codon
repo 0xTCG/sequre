@@ -16,38 +16,57 @@ TP = int_t
 
 @extend
 class SharedTensor:
-    def to_mhe(self, mpc):
+    def to_mhe(self, mpc) -> CipherTensor:
         ciphervector = mpc.he.additive_share_vector_to_ciphervector(self.share.flatten(), self.modulus)
-        return CipherTensor(ciphervector, self.shape(), mpc.he.crypto_params.params.slots())
+        return CipherTensor(ciphervector, self.shape, mpc.he.crypto_params.params.slots())
 
-    def to_mpp[S, dtype](self, mpc, ratios: list[int]):
+    def to_mpp[S, dtype](self, mpc, ratios: list[int]) -> MPP:
         return self.to_mhe(mpc).to_mpp(mpc, ratios, self.modulus, S=S, dtype=dtype)
 
 
 @extend
 class CipherTensor:
-    def to_mpc(self, mpc, source_pid, modulus):
-        share = mpc.he.ciphervector_to_additive_share_vector(self._data, source_pid, self.shape.reduce_mul(), modulus).reshape(self.shape)
-        return SharedTensor(share, modulus)
+    def to_mpc[dtype](self, mpc, modulus: int_t) -> SharedTensor:
+        share = mpc.he.ciphervector_to_additive_share_vector(
+            self._data, self.shape.reduce_mul(), modulus, dtype=dtype).reshape(self.shape)
+        stensor = SharedTensor(share, modulus)
+        if isinstance(dtype, float):
+            stensor.fp = True
+        return stensor
     
-    def to_mpp[S, dtype](self, mpc, ratios: list[int], modulus: int_t):
+    def to_mpp[S, dtype](self, mpc, ratios: list[int], modulus: int_t) -> MPP:
+        if mpc.pid == 0:
+            return MPP[S, dtype]()
+        
+        if mpc.pid != mpc.comms.hub_pid:
+            return MPP[S, dtype](
+                modulus=modulus,
+                _encryption_unified=mpc.comms.receive_as_jar(mpc.comms.hub_pid, CipherTensor[ctype]))
+        
         n = self.shape[0]
         s = ratios.sum()
         assert n % s == 0, "CipherTensor: Cannot distribute partitions by the given proportion"
         
-        reference_pid = mpc.pid - 1  # Avoid CP0
-        k = n // s
-        start = ratios[:reference_pid].sum() * k
+        for p in range(1, mpc.comms.number_of_parties):
+            reference_pid = p - 1
+            k = n // s
+            start = ratios[:reference_pid].sum() * k
+            end = start + ratios[reference_pid] * k
 
-        return MPP[S, dtype](
-            modulus=modulus,
-            _encryption_unified=self[start:start + ratios[reference_pid] * k])
+            if p == mpc.comms.hub_pid:
+                _mpp = MPP[S, dtype](
+                    modulus=modulus,
+                    _encryption_unified=self[start:end])
+            else:
+                mpc.comms.send_as_jar(self[start:end], p)
+        
+        return _mpp
 
 
 @extend
 class MPP:
     def to_mpc(self, mpc) -> SharedTensor:
-        return self.collect_at(mpc, mpc.comms.hub_pid).to_mpc(mpc, mpc.comms.hub_pid, self.modulus)
+        return self.collect(mpc).to_mpc(mpc, self.modulus, dtype=dtype)
 
 
 class InternalMPC:
@@ -360,8 +379,8 @@ class InternalMPC:
         # TODO: #23 Efficiently calculate beaver partitions of sv here
         return sv
 
-    def broadcast(mpc, value):
-        value.share = mpc.comms.broadcast(value.share, value.modulus)
+    def reveal_to_all(mpc, value):
+        value.share = mpc.comms.reveal_to_all(value.share, value.modulus)
         value.public = True
         return value
 
@@ -420,19 +439,19 @@ class InternalMHE:
         return x.matmul(mpc, y)
     
     def gt(mpc, x, y):
-        if isinstance(x, CipherTensor): x_shared = x.to_mpc(mpc, mpc.comms.hub_pid, mpc.base_modulus)
+        if isinstance(x, CipherTensor): x_shared = x.to_mpc(mpc, mpc.base_modulus)
         else: x_shared = x
         
-        if isinstance(y, CipherTensor): y_shared = y.to_mpc(mpc, mpc.comms.hub_pid, mpc.base_modulus)
+        if isinstance(y, CipherTensor): y_shared = y.to_mpc(mpc, mpc.base_modulus)
         else: y_shared = y
         
         return InternalMPC.gt(mpc, x_shared, y_shared).to_mhe(mpc)
 
     def lt(mpc, x, y):
-        if isinstance(x, CipherTensor): x_shared = x.to_mpc(mpc, mpc.comms.hub_pid, mpc.base_modulus)
+        if isinstance(x, CipherTensor): x_shared = x.to_mpc(mpc, mpc.base_modulus)
         else: x_shared = x
         
-        if isinstance(y, CipherTensor): y_shared = y.to_mpc(mpc, mpc.comms.hub_pid, mpc.base_modulus)
+        if isinstance(y, CipherTensor): y_shared = y.to_mpc(mpc, mpc.base_modulus)
         else: y_shared = y
         
         return InternalMPC.lt(mpc, x_shared, y_shared).to_mhe(mpc)
@@ -455,19 +474,19 @@ class InternalMPP:
         return MPP.matmul(mpc, x, y)
     
     def gt(mpc, x, y):
-        if isinstance(x, MPP): x_shared = x.to_mpc(mpc, mpc.comms.hub_pid, mpc.base_modulus)
+        if isinstance(x, MPP): x_shared = x.to_mpc(mpc, mpc.base_modulus)
         else: x_shared = x
         
-        if isinstance(y, MPP): y_shared = y.to_mpc(mpc, mpc.comms.hub_pid, mpc.base_modulus)
+        if isinstance(y, MPP): y_shared = y.to_mpc(mpc, mpc.base_modulus)
         else: y_shared = y
         
         return InternalMPC.gt(mpc, x_shared, y_shared).to_mpp(mpc, ratios=x._ratios, S=x.S, dtype=x.dtype)
 
     def lt(mpc, x, y):
-        if isinstance(x, MPP): x_shared = x.to_mpc(mpc, mpc.comms.hub_pid, mpc.base_modulus)
+        if isinstance(x, MPP): x_shared = x.to_mpc(mpc, mpc.base_modulus)
         else: x_shared = x
         
-        if isinstance(y, MPP): y_shared = y.to_mpc(mpc, mpc.comms.hub_pid, mpc.base_modulus)
+        if isinstance(y, MPP): y_shared = y.to_mpc(mpc, mpc.base_modulus)
         else: y_shared = y
         
         return InternalMPC.lt(mpc, x_shared, y_shared).to_mpp(mpc, ratios=x._ratios, S=x.S, dtype=x.dtype)
@@ -586,11 +605,11 @@ class Internal:
             return InternalMHE.sqrt(mpc, x)
         else: compile_error("Invalid secure operands")
 
-    def broadcast(mpc, value):
+    def reveal_to_all(mpc, value):
         if isinstance(value, SharedTensor):
-            return InternalMPC.broadcast(mpc, value)
+            return InternalMPC.reveal_to_all(mpc, value)
         elif isinstance(value, CipherTensor):
-            return InternalMHE.broadcast(mpc, value)
+            return InternalMHE.reveal_to_all(mpc, value)
         else: compile_error("Invalid secure operands")
 
     def min_cost_router(new_vars, cost_vars):

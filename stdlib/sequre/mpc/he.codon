@@ -50,7 +50,7 @@ from ..lattiseq.drlwe import \
     RTGShare, \
     CKSShare
 from ..lattiseq.utils import new_prng
-from ..types.utils import double_to_fp, fp_to_double
+from ..types.utils import double_to_fp, fp_to_double, int_to_fp
 from ..utils.utils import zeros_vec
 from ..utils.param import int_t
 
@@ -72,7 +72,7 @@ class MPCHE[TP]:
         self.comms = comms
     
     def default_setup(self):
-        print("Setting up default MHE setup ...")
+        print(f"CP{self.pid}:\tSetting up default MHE setup ...")
         ckks_params = new_parameters_from_literal(PN14QP438)
         self.set_params(ckks_params)
         self.collective_init(ckks_params, u64(256))
@@ -225,7 +225,7 @@ class MPCHE[TP]:
         return evk
     
     def aggregate_rot_key_share(self, share: RTGShare) -> RTGShare:
-        rns_decomp, bit_decomp = share.value.shape()
+        rns_decomp, bit_decomp = share.value.shape
         in_share_value = list[list[list[Poly]]](rns_decomp)
         for i in range(rns_decomp):
             in_share_value_row = list[list[Poly]](bit_decomp)
@@ -304,20 +304,23 @@ class MPCHE[TP]:
         print(f"CP{self.pid}:\tMHE generating relinearization key ...")
         rlk = self.collective_relin_key_gen(params, sk_shard, self.crp_gen)
         
-        print("MHE generating rotation keys ... ")
+        print(f"CP{self.pid}:\tMHE generating rotation keys ... ")
         rtks = self.collective_rot_key_gen(
             params, sk_shard, self.crp_gen,
             generate_rot_keys(params.slots(), 20, True))
 
-        print("Initializing MHE ... ")
-        self.crypto_params.initialize(sk_shard, sk_shard, pk, rlk, rtks, prec)
+        print(f"CP{self.pid}:\tInitializing MHE ... ")
+        self.crypto_params.initialize(sk_shard, pk, rlk, rtks, prec)
         print(f"CP{self.pid}:\tMHE setup complete.")
     
     def precision_stats(self, result: list, expected: list) -> PrecisionStats:
-        print(f"CP{self.pid}:\tValues computed [0:4]: {result[:4]} ...\n")
-        print(f"CP{self.pid}:\tValues expected [0:4]: {expected[:4]} ...\n")
+        result_flattened = result.flatten()
+        expected_flattened = expected.flatten()
+        
+        print(f"CP{self.pid}:\tValues computed [0:4]: {result_flattened[:4]} ...\n")
+        print(f"CP{self.pid}:\tValues expected [0:4]: {expected_flattened[:4]} ...\n")
 
-        precision_stats = evaluate_precision(result.to_complex(), expected.to_complex())
+        precision_stats = evaluate_precision(result_flattened.to_complex(), expected_flattened.to_complex())
         print(precision_stats)
 
         return precision_stats
@@ -383,18 +386,14 @@ class MPCHE[TP]:
 
         return out
 
-    def collective_decrypt(self, cps: CryptoParams, ct: Ciphertext, source_pid: int) -> Plaintext:
-        tmp = ct
-
-        # source_pid broadcasts ct to other parties for collective decryption
-        if self.pid == source_pid:
-            for p in range(1, self.comms.number_of_parties):
-                if p != source_pid: self.comms.send_as_jar(ct, p)
-        elif self.pid > 0:
-            tmp = self.comms.receive_as_jar(source_pid, Ciphertext)
-        else:  # pid == 0
+    def collective_decrypt(self, cps: CryptoParams, ct: Ciphertext, hub_pid: int) -> Plaintext:
+        if self.pid == 0:
             return Plaintext()
-
+        
+        tmp = ct
+        if not self.comms.is_broadcast(ct):
+            tmp = self.comms.broadcast_from(ct, hub_pid)
+        
         parameters = cps.params
 
         zero_pk = new_public_key(parameters)
@@ -402,7 +401,7 @@ class MPCHE[TP]:
         pcks_protocol = new_pcks_protocol(parameters, 6.36)
         dec_share = pcks_protocol.allocate_share(tmp.level())
 
-        pcks_protocol._mm_gen_share(cps.sk, zero_pk, tmp.value[1], dec_share)
+        pcks_protocol._mm_gen_share(cps.sk_shard, zero_pk, tmp.value[1], dec_share)
         dec_agg = self.aggregate_decrypt_shares(dec_share, tmp.level())
 
         ciphertext_switched = new_ciphertext(parameters, 1, tmp.level(), tmp.scale)
@@ -531,17 +530,14 @@ class MPCHE[TP]:
 
         return share_out
 
-    def collective_bootstrap(self, ct: Ciphertext, source_pid: int):
-        # if source_pid == 0, assume cm is already shared across parties
+    def collective_bootstrap(self, ct: Ciphertext, hub_pid: int):
+        # if hub_pid == 0, assume cm is already shared across parties
         if self.pid == 0:
             return
 
-        # source_pid broadcasts ct to other parties for collective decryption
-        if source_pid > 0:
-            if self.pid == source_pid:
-                for p in range(1, self.comms.number_of_parties):
-                    if p != source_pid: self.comms.send_as_jar(ct, p)
-            else: ct = self.comms.receive_as_jar(source_pid, Ciphertext)
+        # hub_pid broadcasts ct to other parties for collective decryption
+        if not self.comms.is_broadcast(ct):
+            ct = self.comms.broadcast_from(ct, hub_pid)
 
         parameters = self.crypto_params.params
         level_start = ct.level()
@@ -556,7 +552,7 @@ class MPCHE[TP]:
         crp = self.crp_gen._mm_read_new(parameters).q
 
         ref_protocol.gen_share(
-            self.crypto_params.sk,
+            self.crypto_params.sk_shard,
             log_bound,
             parameters.log_slots,
             ct.value[1],
@@ -566,20 +562,18 @@ class MPCHE[TP]:
         
         ref_agg = self.aggregate_refresh_share(ref_protocol, ref_share)
         ref_protocol.finalize(ct, parameters.log_slots, crp, ref_agg, ct)
+        if self.pid != hub_pid: ct.clear()
     
-    def cipher_to_additive_plaintext(self, ct: Ciphertext, source_pid: int) -> AdditiveShareBigint:
+    def cipher_to_additive_plaintext(self, ct: Ciphertext, hub_pid: int) -> AdditiveShareBigint:
         parameters = self.crypto_params.params
         
-        # if source_pid == 0, assume cm is already shared across parties
+        # if hub_pid == 0, assume cm is already shared across parties
         if self.pid == 0:
             return new_additive_share_bigint(parameters, parameters.log_slots)
 
-        # source_pid broadcasts ct to other parties for collective decryption
-        if source_pid > 0:
-            if self.pid == source_pid:
-                for p in range(1, self.comms.number_of_parties):
-                    if p != source_pid: self.comms.send_as_jar(ct, p)
-            else: ct = self.comms.receive_as_jar(source_pid, Ciphertext)
+        # hub_pid broadcasts ct to other parties for collective decryption
+        if not self.comms.is_broadcast(ct):
+            ct = self.comms.broadcast_from(ct, hub_pid)
 
         level_start = ct.level()
 
@@ -594,25 +588,25 @@ class MPCHE[TP]:
         secret_share = new_additive_share_bigint(parameters, parameters.log_slots)
         
         e2s_protocol.gen_share(
-            self.crypto_params.sk,
+            self.crypto_params.sk_shard,
             log_bound,
             parameters.log_slots,
             ct.value[1],
             secret_share,
             public_e2s_share)
         
-        if self.pid == source_pid:
+        if self.pid == hub_pid:
             for p in range(1, self.comms.number_of_parties):
-                if p != source_pid:
+                if p != hub_pid:
                     e2s_protocol._mm_aggregate_shares(public_e2s_share, self.comms.receive_as_jar(p, CKSShare), public_e2s_share)
 
             # sum(-M_i) + x
             e2s_protocol.get_share(secret_share, public_e2s_share, parameters.log_slots, ct, secret_share)
-        else: self.comms.send_as_jar(public_e2s_share, source_pid)
+        else: self.comms.send_as_jar(public_e2s_share, hub_pid)
         
         return secret_share
     
-    def additive_plaintext_to_cipher(self, secret_share: AdditiveShareBigint, source_pid: int) -> Ciphertext:
+    def additive_plaintext_to_cipher(self, secret_share: AdditiveShareBigint, hub_pid: int) -> Ciphertext:
         parameters = self.crypto_params.params
         cipher_level = parameters.max_level()
 
@@ -626,32 +620,47 @@ class MPCHE[TP]:
         public_s2e_share = s2e_protocol.allocate_share(cipher_level)
 
         s2e_protocol.gen_share(
-            self.crypto_params.sk,
+            self.crypto_params.sk_shard,
             crp,
             parameters.log_slots,
             secret_share,
             public_s2e_share)
         
-        if self.pid == source_pid:
+        if self.pid == hub_pid:
             for p in range(1, self.comms.number_of_parties):
-                if p != source_pid:
+                if p != hub_pid:
                     s2e_protocol._mm_aggregate_shares(public_s2e_share, self.comms.receive_as_jar(p, CKSShare), public_s2e_share)
-        else: self.comms.send_as_jar(public_s2e_share, source_pid)
+        else: self.comms.send_as_jar(public_s2e_share, hub_pid)
 
         ct_rec = new_ciphertext(parameters, 1, cipher_level, parameters.default_scale)
-        if self.pid == source_pid: s2e_protocol.get_encryption(public_s2e_share, crp, ct_rec)
-
+        if self.pid == hub_pid:
+            s2e_protocol.get_encryption(public_s2e_share, crp, ct_rec)
+        else:
+            ct_rec.clear()
+        
         return ct_rec
 
-    def decrypt_vector(self, enc: list[Ciphertext]) -> list[Plaintext]:
-        return [self.collective_decrypt(self.crypto_params, cipher, self.comms.hub_pid) for cipher in enc]
+    def collective_decrypt_vector(self, enc: list[Ciphertext], hub_pid: int) -> list[Plaintext]:
+        if self.pid == 0:
+            return []
+        
+        if self.pid == hub_pid:
+            assert enc, "Empty ciphervector. Nothing to decrypt."
+
+        size = self.comms.broadcast_from(len(enc), hub_pid)
+        if not enc:
+            enc = [Ciphertext() for _ in range(size)]
+        return [self.collective_decrypt(self.crypto_params, cipher, hub_pid) for cipher in enc]
     
     def decode_vector[DTP=complex](self, enc: list[Plaintext]) -> list[DTP]:
         data_decoded = []
 
         for plaintext in enc:
             val = self.crypto_params.encoder.decode(plaintext, self.crypto_params.params.log_slots)
-            data_decoded.extend([DTP(c) for c in val])
+            if isinstance(DTP, int):
+                data_decoded.extend([int(round(float(c))) for c in val])
+            else:
+                data_decoded.extend([DTP(c) for c in val])
 
         return data_decoded
     
@@ -742,13 +751,13 @@ class MPCHE[TP]:
         values = fp_to_double(revealed_share, modulus)
         return self.enc_vector(values, T=Ciphertext)
 
-    def ciphervector_to_additive_share_vector(self, ciphervector: List[Ciphertext], source_pid: int, number_of_elements: int, modulus: int_t) -> List[int_t]:
+    def ciphervector_to_additive_share_vector[dtype](self, ciphervector: List[Ciphertext], number_of_elements: int, modulus: int_t) -> List[int_t]:
         # slots = self.crypto_params.params.slots()
         # shared_vector = zeros_vec(number_of_elements)
         # if self.pid == 0: return shared_vector
 
-        # if source_pid > 0:
-        #     ciphervector = self.comms.collect(ciphervector, source_pid)
+        # if hub_pid > 0:
+        #     ciphervector = self.comms.collect(ciphervector, hub_pid)
 
         # ciphermatrix, level_start = self.flatten_levels([ciphervector])
         # ciphervector = ciphermatrix[0]
@@ -771,7 +780,7 @@ class MPCHE[TP]:
         #     pt_mask.append(Plaintext(share_decrypt[k].copy(), ciphervector[0].scale))
 
         #     # h0 = sk*c1 + mask
-        #     ring_q._mm_mul_coeffs_montgomery_and_add_lvl(level_start, self.crypto_params.sk.value.q, ciphervector[k].value[1], share_decrypt[k])
+        #     ring_q._mm_mul_coeffs_montgomery_and_add_lvl(level_start, self.crypto_params.sk_shard.value.q, ciphervector[k].value[1], share_decrypt[k])
 
         #     # h0 = sk*c1 + mask + e0
         #     tmp = sampler._mm_read_new()
@@ -809,6 +818,13 @@ class MPCHE[TP]:
         # return shared_vector
 
         # Temp non-secure solution:
-        decoded_values = self.decode_vector(self.decrypt_vector(ciphervector), DTP=float)
-        fp_values = double_to_fp(decoded_values, modulus)
-        return fp_values if self.pid == self.comms.hub_pid else fp_values.zeros()
+        decrypted_vector = self.collective_decrypt_vector(ciphervector, self.comms.hub_pid)
+        if self.pid == self.comms.hub_pid:
+            decoded_values = self.decode_vector(decrypted_vector, DTP=dtype)
+            if isinstance(dtype, float):
+                return double_to_fp(decoded_values, modulus)
+            elif isinstance(dtype, int):
+                return decoded_values.to_int_t()
+            else:
+                compile_error("Invalid type in ciphervector to additive share vector switch")
+        return zeros_vec(number_of_elements, TP=type(modulus))
