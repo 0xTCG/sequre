@@ -18,6 +18,12 @@ class CipherTensor[ctype]:
         self.slots = slots
         self._reset_chunk_size()
     
+    def __init__(self, shape: list[int], slots: int):
+        self._data = []
+        self.shape = shape
+        self.slots = slots
+        self._reset_chunk_size()
+    
     def __bool__(self) -> bool:
         return bool(self._data)
     
@@ -129,7 +135,7 @@ class CipherTensor[ctype]:
         total = 1
         for i in range(len(shape) - 1):
             total *= shape[i]
-        return total * (shape[-1] + slots - 1) // slots
+        return (shape[-1] + slots - 1) // slots * total
     
     def destroy(self):
         self._data.clear()
@@ -157,7 +163,7 @@ class CipherTensor[ctype]:
         for _ in range(0, CipherTensor._count(shape), vec_len):
             _data.extend(mpc.he.enc_vector(next(vector_generator), T=ctype))
         
-        assert (data.size() + slots - 1) // slots == len(_data), f"(INTERNAL ERROR) CipherTensor: Input data shapes do not match encryption/encoding shape. Input shape: {data.shape}. Enc vector len: {len(_data)}. Slots: {slots}"
+        assert (shape[-1] + slots - 1) // slots * shape[:-1].reduce_mul() == len(_data), f"(INTERNAL ERROR) CipherTensor: Input data shapes do not match encryption/encoding shape. Input shape: {data.shape}. Enc vector len: {len(_data)}. Slots: {slots}"
 
         return CipherTensor[ctype](
             _data=_data,
@@ -179,10 +185,12 @@ class CipherTensor[ctype]:
         last_lane = (self.shape[-1] + self.slots - 1) // self.slots * self.slots
         new_shape.append(last_lane)
         decoded_vector = mpc.he.decode_vector(mpc.he.collective_decrypt_vector(self._data, mpc.comms.hub_pid), DTP=T)
+
         assert 0 < self.ndim < 3, "Ciphertensor: Only 1-dim and 2-dim ciphertensors can be revealed at the moment"
+        assert (decoded_vector.size() + self.slots - 1) // self.slots == len(self._data) == self.cipher_shape.reduce_mul(), f"CipherTensor: Input data shapes do not match encryption/encoding shape. Input shape: {decoded_vector.shape}. Enc vector len: {len(self._data)}. Slots: {self.slots}"
+
         new_shape_tuple = (1, new_shape[0]) if self.ndim == 1 else (new_shape[0], new_shape[1])
         shape_tuple = (1, self.shape[0]) if self.ndim == 1 else (self.shape[0], self.shape[1])
-        print("DEBUG !!!!!", shape_tuple, new_shape_tuple, self.slots, len(decoded_vector), len(self._data))
         return array(decoded_vector, dtype=T).reshape(new_shape_tuple).resize(shape_tuple)
     
     def append(self, other: CipherTensor):
@@ -283,7 +291,21 @@ class CipherTensor[ctype]:
             shape=self.shape,
             slots=self.slots)
 
+    def rotate(self, mpc, step: int) -> CipherTensor[ctype]:
+        return CipherTensor[ctype](
+            _data=mpc.he.rotate(self._data, step),
+            shape=self.shape,
+            slots=self.slots)
+
+    def reduce_add(self, mpc, new_size: int):
+        assert self.ndim == 1, "CipherTensor: Addition reduction can be applied only to 1-dimensional tensors"
+        return CipherTensor[ctype](
+            _data=mpc.he.reduce_add(self._data, min(self.slots, self.shape[-1]), new_size),
+            shape=[new_size],
+            slots=self.slots)
+
     def reversed_matmul(self, mpc, other: ndarray) -> CipherTensor[ctype]:
+        """ Returns other @ self"""
         new_cipher_tensor = CipherTensor[Ciphertext].zeros(mpc, [other.shape[0], self.shape[1]])
         assert self.ndim == other.ndim == 2, f"CipherTensor: At least one of the tensors is not a matrix. Self shape: {self.shape}, other shape: {other.shape}. Ciphertensor matmul supports only matrices at the moment"
         assert other.shape[1] == self.shape[0], f"CipherTensor: Invalid matrix dimentions for matmul: {other.shape} x {self.shape}"
@@ -299,36 +321,22 @@ class CipherTensor[ctype]:
         assert len(self.shape) == len(other_cipher.shape) == 2, f"CipherTensor: At least one of the tensors is not a matrix. Self shape: {self.shape}, other shape: {other_cipher.shape}. Ciphertensor matmul supports only matrices at the moment."
         assert self.shape[1] == other_cipher.shape[1], f"CipherTensor: Invalid matrix dimentions: {self.shape} x {other_cipher.shape}. CipherTensor matmul expects the second operand to be transposed apriori."
 
-        masks = CipherTensor[Plaintext].enc(mpc, [one_hot_vector(i, other_cipher.shape[1], TP=float) for i in range(other_cipher.shape[0])])
+        masks = CipherTensor[Plaintext].enc(mpc, [one_hot_vector(i, other_cipher.shape[0], TP=float) for i in range(other_cipher.shape[0])])
 
         new_cipher_tensor = CipherTensor[ctype](
-            shape=[0, self.shape[1]],
+            shape=[0, other_cipher.shape[0]],
             slots=self.slots)
         for i in range(self.shape[0]):
-            new_row = CipherTensor[Ciphertext].zeros(mpc, [other_cipher.shape[1]])
+            new_row = CipherTensor[Ciphertext].zeros(mpc, [other_cipher.shape[0]])
 
-            for j in range(other_cipher.shape[0]): # rows of two_x = columns of two_XT
-                rotated_result = self[i].mul(mpc, other_cipher[j])
-
-                rotation_step = 1
-                # for small matrices it would be better to do #int(math.ceil(math.log2(cols)))
-                for _ in range(mpc.he.crypto_params.params.log_slots):
-                    rotated_result.iadd(mpc, rotated_result.rotate(mpc, rotation_step))
-                    rotation_step <<= 1
-
-                new_row.iadd(mpc, rotated_result.mul(mpc, masks[j]))
-                if debug: print(f"Matmul: {i + 1}/{self.shape[0]} -- {j + 1}/{other_cipher.shape[0]}")
+            for j in range(other_cipher.shape[0]):
+                new_row.iadd(mpc, self[i].mul(mpc, other_cipher[j]).reduce_add(mpc, new_size=other_cipher.shape[0]).mul(mpc, masks[j]))
+                if debug: print(f"CipherTensor matmul: {i + 1}/{self.shape[0]} -- {j + 1}/{other_cipher.shape[0]}")
             if debug: print("----------------------")
             
-            new_cipher_tensor.extend(new_row)
+            new_cipher_tensor.append(new_row)
         
         return new_cipher_tensor
-
-    def rotate(self, mpc, step: int) -> CipherTensor[ctype]:
-        return CipherTensor[ctype](
-            _data=mpc.he.rotate(self._data, step),
-            shape=self.shape,
-            slots=self.slots)
 
     def _check_other_operand(self, mpc, other):
         if isinstance(other, CipherTensor): return other
