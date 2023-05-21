@@ -50,8 +50,8 @@ from ..lattiseq.drlwe import \
     RTGShare, \
     CKSShare
 from ..lattiseq.utils import new_prng
-from ..types.utils import double_to_fp, fp_to_double, int_to_fp
-from ..utils.utils import zeros_vec
+from ..types.utils import double_to_fp, fp_to_double
+from ..utils.utils import zeros_vec, one_hot_vector
 from ..utils.param import int_t
 
 from randomness import MPCRandomness
@@ -307,13 +307,14 @@ class MPCHE[TP]:
         print(f"CP{self.pid}:\tMHE generating rotation keys ... ")
         rtks = self.collective_rot_key_gen(
             params, sk_shard, self.crp_gen,
-            generate_rot_keys(params.slots(), 20, True))
+            generate_rot_keys(params.slots(), 32, True))
 
         print(f"CP{self.pid}:\tInitializing MHE ... ")
         self.crypto_params.initialize(sk_shard, pk, rlk, rtks, prec)
         print(f"CP{self.pid}:\tMHE setup complete.")
     
     def precision_stats(self, result: list, expected: list) -> PrecisionStats:
+        assert result.shape == expected.shape, f"Result and expected result shapes mismatch while checking MHE precision: {result.shape} != {expected.shape}"
         result_flattened = result.flatten()
         expected_flattened = expected.flatten()
         
@@ -468,9 +469,38 @@ class MPCHE[TP]:
     
     def rotate(self, x: list[Ciphertext], k: int) -> list[Ciphertext]:
         res = list[Ciphertext](len(x))
-        for i in range(len(x)): res.append(self.crypto_params.evaluator.rotate_new(x[i], k))
+        
+        for i in range(len(x)):
+            res.append(self.crypto_params.evaluator.rotate_new(x[i], k))
 
         return res
+    
+    def reduce_add(self, x: list[Ciphertext], cols_per_cipher: int, new_size: int) -> list[Ciphertext]:
+        assert cols_per_cipher > 0, "MPCHE.reduce_add: Invalid number of columns per cipher"
+        slots = self.crypto_params.params.slots()
+        reduced_vector = x.copy()
+        rotation_step = 1
+
+        for _ in range((cols_per_cipher - 1).bitlen()):
+            self.iadd(reduced_vector, self.rotate(reduced_vector, rotation_step))
+            rotation_step <<= 1
+
+        if cols_per_cipher < slots:
+            assert len(x) == 1, "Non-mandatory safety check failed: There should be only one ciphertext in ciphervector if cols_per_cipher < slots"
+            mask = self.enc_vector(one_hot_vector(0, slots, TP=float), T=Plaintext)
+            reduced_vector = self.rotate(self.mul(reduced_vector, mask), slots - cols_per_cipher + 1)
+
+            rotation_step = 1
+            for _ in range((cols_per_cipher - 1).bitlen()):
+                self.iadd(reduced_vector, self.rotate(reduced_vector, rotation_step))
+                rotation_step <<= 1
+        
+        reduced_cipher = reduced_vector[0]
+
+        for i in range(1, len(x)):
+            self.crypto_params.evaluator.add(reduced_cipher, reduced_vector[i], reduced_cipher)
+        
+        return [reduced_cipher.copy() for _ in range((new_size + slots - 1) // slots)]
     
     def drop_level(self, a: list[list[Ciphertext]], out_level: int) -> list[list[Ciphertext]]:
         out = list[list[Ciphertext]](len(a))
