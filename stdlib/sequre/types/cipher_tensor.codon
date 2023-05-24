@@ -264,7 +264,7 @@ class CipherTensor[ctype]:
         self._data.extend(other._data)
         self.shape[0] += other.shape[0]
     
-    def concat(self, other: CipherTensor[ctype], axis: int) -> CipherTensor[ctype]:
+    def concat(self, mpc, other: CipherTensor[ctype], axis: int) -> CipherTensor[ctype]:
         assert not self._transposed and not other._transposed, "Ciphertensor: Concatenating transposed ciphertensors is not implemented yet"
         assert axis <= 1 and self.ndim == 2, "CipherTensor concat not yet enabled for arbitrary ndim tensor. Internal note: Switch to ndarray to enable this"  # TODO
         assert self.shape[axis ^ 1] == other.shape[axis ^ 1], "CipherTensor: Incompatible shapes for concatenation along provided axis"
@@ -274,10 +274,21 @@ class CipherTensor[ctype]:
             _data = self._data.copy()
             _data.extend(other._data)
         else:
+            offset = self.shape[axis] % self.slots
             _data = []
             for self_row, other_row in zip(self, other):
                 _data.extend(self_row._data)
-                _data.extend(other_row._data)
+                if offset == 0:
+                    _data.extend(other_row._data)
+                else:
+                    rotated_other = other_row.shift(mpc, self.slots - offset)
+                    mask = mpc.he.enc_vector([(1.0 if i < offset else 0.0) for i in range(self.slots)], T=Plaintext)
+                    mpc.he.imul([_data[-1]], mask)
+                    mpc.he.iadd([_data[-1]], [rotated_other._data[0]])
+                    _data.extend(rotated_other._data[1:])
+
+                    if other.shape[axis] < self.slots - offset:
+                        _data.pop()
         
         _shape = self.shape.copy()
         _shape[axis] += other.shape[axis]
@@ -355,10 +366,38 @@ class CipherTensor[ctype]:
             slots=self.slots,
             _transposed=self._transposed)
 
-    def rotate(self, mpc, step: int) -> CipherTensor[ctype]:
-        return CipherTensor[ctype](
+    def rotate(self, mpc, step: int) -> CipherTensor[Ciphertext]:
+        return CipherTensor[Ciphertext](
             _data=mpc.he.rotate(self._data, step),
             shape=self.shape,
+            slots=self.slots,
+            _transposed=self._transposed)
+
+    def shift(self, mpc, step: int) -> CipherTensor[Ciphertext]:
+        """
+        Note: Shifting adds an extra ciphertext to the tensor and starts with self.slots - step number of zeros.
+        Warning: This changes the shape of the ciphertensor. All zeros will be included in the rotated Ciphertensor.
+        Example: [] - CipherTensor, () - Single ciphertext
+            [(1, 2, 3, 4), (5, 6, 7, 8)].shift(2) -> [(0, 0, 1, 2), (3, 4, 5, 6), (7, 8, 0, 0)]
+        """
+        assert step <= self.slots, "Ciphertensor: Shifting requires step to be less than the number of slots per each cipher"
+        rotated_tensor = self.rotate(mpc, step)
+        
+        mask = [(0 if (i % self.slots < self.slots - step) else 1) for i in range(len(self._data) * self.slots)]
+        maks_enc = mpc.he.enc_vector(mask, T=Plaintext)
+        mask_inv_enc = mpc.he.enc_vector(mask ^ 1, T=Plaintext)
+        
+        offset_tensor_data = mpc.he.mul(rotated_tensor._data, maks_enc)
+        offset_tensor_data.append(mpc.he.zero_cipher())
+        main_tensor_data = mpc.he.mul(rotated_tensor._data, mask_inv_enc)
+        main_tensor_data.insert(0, mpc.he.zero_cipher())
+
+        shape = self.shape.copy()
+        shape[-1] = (self.cipher_shape[-1] + 1) * self.slots
+
+        return CipherTensor[ctype](
+            _data=mpc.he.add(main_tensor_data, offset_tensor_data),
+            shape=shape,
             slots=self.slots,
             _transposed=self._transposed)
 
@@ -382,9 +421,9 @@ class CipherTensor[ctype]:
 
         debug_counter = 1
         for other_column, self_row in zip(other.T, self):
+            if debug: print(f"CipherTensor reversed matmul: Computing row {debug_counter}/{self.shape[0]} ...")
             for i, other_elem in enumerate(other_column):
                 new_cipher_tensor[i].iadd(mpc, self_row.mul(mpc, other_elem))
-            if debug: print(f"CipherTensor reversed matmul: Row {debug_counter}/{self.shape[0]} computed")
             debug_counter += 1
         
         return new_cipher_tensor
