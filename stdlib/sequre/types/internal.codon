@@ -1,9 +1,12 @@
 import prg
 
+from numpy.ndarray import ndarray
+
 from helpers import argmin
 
 from shared_tensor import SharedTensor
 from cipher_tensor import CipherTensor
+from multiparty_partition import MPP
 from utils import double_to_fp
 
 from ..stdlib.fp import fp_div, fp_sqrt
@@ -15,16 +18,68 @@ TP = int_t
 
 @extend
 class SharedTensor:
-    def cipher_tensor(self, mpc):
-        ciphervector = mpc.he.additive_share_vector_to_ciphervector(self.share, self.modulus)
-        return CipherTensor(ciphervector, self.shape(), mpc.he.crypto_params.params.slots())
+    def to_mhe(self, mpc) -> CipherTensor:
+        slots = mpc.he.crypto_params.params.slots()
+        
+        # Pad shape if ciphertexts are not fully utilized
+        new_shape = self.shape.copy()
+        new_shape[-1] = max(slots, new_shape[-1])
+        share = self.share
+        if new_shape[-1] != self.shape[-1]:
+            share = self.share.resize(new_shape)
+
+        ciphervector = mpc.he.additive_share_vector_to_ciphervector(share.flatten(), self.modulus)
+        return CipherTensor(ciphervector, self.shape, slots)
+
+    def to_mpp[S, dtype](self, mpc, ratios: list[int]) -> MPP:
+        return self.to_mhe(mpc).to_mpp(mpc, ratios, self.modulus, S=S, dtype=dtype)
 
 
 @extend
 class CipherTensor:
-    def shared_tensor(self, mpc, source_pid, modulus):
-        share = mpc.he.ciphervector_to_additive_share_vector(self._flat_array, source_pid, self.shape.reduce_mul(), modulus)
-        return SharedTensor(share, modulus)
+    def to_mpc[dtype](self, mpc, modulus: int_t) -> SharedTensor:
+        cipher_shape = self.cipher_shape
+        cipher_shape[-1] *= self.slots
+        share = mpc.he.ciphervector_to_additive_share_vector(
+            self._data, self.cipher_shape.reduce_mul() * self.slots, modulus, dtype=dtype).reshape(cipher_shape).resize(self.shape)
+        stensor = SharedTensor(share, modulus)
+        if isinstance(dtype, float):
+            stensor.fp = True
+        return stensor
+    
+    def to_mpp[S, dtype](self, mpc, ratios: list[int], modulus: int_t) -> MPP:
+        if mpc.pid == 0:
+            return MPP[S, dtype]()
+        
+        if mpc.pid != mpc.comms.hub_pid:
+            return MPP[S, dtype](
+                modulus=modulus,
+                _encryption_unified=mpc.comms.receive_as_jar(mpc.comms.hub_pid, CipherTensor[ctype]))
+        
+        n = self.shape[0]
+        s = ratios.sum()
+        assert n % s == 0, "CipherTensor: Cannot distribute partitions by the given proportion"
+        
+        for p in range(1, mpc.comms.number_of_parties):
+            reference_pid = p - 1
+            k = n // s
+            start = ratios[:reference_pid].sum() * k
+            end = start + ratios[reference_pid] * k
+
+            if p == mpc.comms.hub_pid:
+                _mpp = MPP[S, dtype](
+                    modulus=modulus,
+                    _encryption_unified=self[start:end])
+            else:
+                mpc.comms.send_as_jar(self[start:end], p)
+        
+        return _mpp
+
+
+@extend
+class MPP:
+    def to_mpc(self, mpc) -> SharedTensor:
+        return self.collect(mpc).to_mpc(mpc, self.modulus, dtype=dtype)
 
 
 class InternalMPC:
@@ -73,8 +128,8 @@ class InternalMPC:
                 return InternalMPC.__add_public(mpc, x.share, y, x.diagonal)
             elif y.is_public():
                 return InternalMPC.__add_public(mpc, y.share, x, y.diagonal)
-            
-            raise TypeError("Invalid type of addends in secure add")
+
+            raise ValueError("Invalid type of addends in secure add")
 
     def sub(mpc, x, y):
         if isinstance(x, float):
@@ -96,8 +151,8 @@ class InternalMPC:
                 return InternalMPC.__add_public(mpc, x.share, -y, x.diagonal)
             elif y.is_public():
                 return InternalMPC.__add_public(mpc, y.share.neg_mod(x.modulus), x, y.diagonal)
-            
-            raise TypeError("Invalid type of addends in sub")
+
+            raise ValueError("Invalid type of addends in sub")
 
     def mul(mpc, x, y):
         if isinstance(y, float):
@@ -337,8 +392,8 @@ class InternalMPC:
         # TODO: #23 Efficiently calculate beaver partitions of sv here
         return sv
 
-    def broadcast(mpc, value):
-        value.share = mpc.comms.broadcast(value.share, value.modulus)
+    def reveal_to_all(mpc, value):
+        value.share = mpc.comms.reveal_to_all(value.share, value.modulus)
         value.public = True
         return value
 
@@ -394,51 +449,94 @@ class InternalMHE:
         return x.mul(mpc, y)
 
     def matmul(mpc, x, y):
+        if isinstance(x, ndarray):
+            return y.reversed_matmul(mpc, x)
         return x.matmul(mpc, y)
     
     def gt(mpc, x, y):
-        if isinstance(x, CipherTensor): x_shared = x.shared_tensor(mpc, mpc.comms.hub_pid, mpc.base_modulus)
+        if isinstance(x, CipherTensor): x_shared = x.to_mpc(mpc, mpc.base_modulus)
         else: x_shared = x
         
-        if isinstance(y, CipherTensor): y_shared = y.shared_tensor(mpc, mpc.comms.hub_pid, mpc.base_modulus)
+        if isinstance(y, CipherTensor): y_shared = y.to_mpc(mpc, mpc.base_modulus)
         else: y_shared = y
         
-        return InternalMPC.gt(mpc, x_shared, y_shared).cipher_tensor(mpc)
+        return InternalMPC.gt(mpc, x_shared, y_shared).to_mhe(mpc)
 
     def lt(mpc, x, y):
-        if isinstance(x, CipherTensor): x_shared = x.shared_tensor(mpc, mpc.comms.hub_pid, mpc.base_modulus)
+        if isinstance(x, CipherTensor): x_shared = x.to_mpc(mpc, mpc.base_modulus)
         else: x_shared = x
         
-        if isinstance(y, CipherTensor): y_shared = y.shared_tensor(mpc, mpc.comms.hub_pid, mpc.base_modulus)
+        if isinstance(y, CipherTensor): y_shared = y.to_mpc(mpc, mpc.base_modulus)
         else: y_shared = y
         
-        return InternalMPC.lt(mpc, x_shared, y_shared).cipher_tensor(mpc)
+        return InternalMPC.lt(mpc, x_shared, y_shared).to_mhe(mpc)
 
     def eq(mpc, x, y):
         return x == y
 
 
+class InternalMPP:
+    def add(mpc, x, y):
+        return x._do_elem_wise_op(mpc, y, MPP._elem_wise_add)
+
+    def sub(mpc, x, y):
+        return x._do_elem_wise_op(mpc, y, MPP._elem_wise_sub)
+    
+    def mul(mpc, x, y):
+        return x._do_elem_wise_op(mpc, y, MPP._elem_wise_mul)
+
+    def matmul(mpc, x, y):
+        return MPP.matmul(mpc, x, y)
+    
+    def gt(mpc, x, y):
+        if isinstance(x, MPP): x_shared = x.to_mpc(mpc, mpc.base_modulus)
+        else: x_shared = x
+        
+        if isinstance(y, MPP): y_shared = y.to_mpc(mpc, mpc.base_modulus)
+        else: y_shared = y
+        
+        return InternalMPC.gt(mpc, x_shared, y_shared).to_mpp(mpc, ratios=x._ratios, S=x.S, dtype=x.dtype)
+
+    def lt(mpc, x, y):
+        if isinstance(x, MPP): x_shared = x.to_mpc(mpc, mpc.base_modulus)
+        else: x_shared = x
+        
+        if isinstance(y, MPP): y_shared = y.to_mpc(mpc, mpc.base_modulus)
+        else: y_shared = y
+        
+        return InternalMPC.lt(mpc, x_shared, y_shared).to_mpp(mpc, ratios=x._ratios, S=x.S, dtype=x.dtype)
+
+    def eq(mpc, x, y):
+        return x._do_elem_wise_op(mpc, y, MPP._elem_wise_eq)
+
+
 class Internal:
     def secure_add(mpc, x, y):
-        if isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
+        if isinstance(x, MPP) or isinstance(y, MPP):
+            return InternalMPP.add(mpc, x, y)
+        elif isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
             return InternalMPC.add(mpc, x, y)
         elif isinstance(x, CipherTensor) or isinstance(y, CipherTensor):
             return InternalMHE.add(mpc, x, y)
-        else: raise TypeError("Invalid secure operands")
+        else: compile_error("Invalid secure operands")
 
     def secure_sub(mpc, x, y):
-        if isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
+        if isinstance(x, MPP) or isinstance(y, MPP):
+            return InternalMPP.sub(mpc, x, y)
+        elif isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
             return InternalMPC.sub(mpc, x, y)
         elif isinstance(x, CipherTensor) or isinstance(y, CipherTensor):
             return InternalMHE.sub(mpc, x, y)
-        else: raise TypeError("Invalid secure operands")
+        else: compile_error("Invalid secure operands")
 
     def secure_mul(mpc, x, y):
-        if isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
+        if isinstance(x, MPP) or isinstance(y, MPP):
+            return InternalMPP.mul(mpc, x, y)
+        elif isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
             return InternalMPC.mul(mpc, x, y)
         elif isinstance(x, CipherTensor) or isinstance(y, CipherTensor):
             return InternalMHE.mul(mpc, x, y)
-        else: raise TypeError("Invalid secure operands")
+        else: compile_error("Invalid secure operands")
     
     def secure_matmul(mpc, x, y):
         return Internal.matmul(mpc, x, y)
@@ -448,35 +546,41 @@ class Internal:
             return InternalMPC.pow(mpc, x_, p)
         elif isinstance(x_, CipherTensor):
             return InternalMHE.pow(mpc, x_, p)
-        else: raise TypeError("Invalid secure operands")
+        else: compile_error("Invalid secure operands")
 
     def secure_div(mpc, x, y):
         if isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
             return InternalMPC.div(mpc, x, y)
         elif isinstance(x, CipherTensor) or isinstance(y, CipherTensor):
             return InternalMHE.div(mpc, x, y)
-        else: raise TypeError("Invalid secure operands")
+        else: compile_error("Invalid secure operands")
     
     def secure_gt(mpc, x, y):
-        if isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
+        if isinstance(x, MPP) or isinstance(y, MPP):
+            return InternalMPP.gt(mpc, x, y)
+        elif isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
             return InternalMPC.gt(mpc, x, y)
         elif isinstance(x, CipherTensor) or isinstance(y, CipherTensor):
             return InternalMHE.gt(mpc, x, y)
-        else: raise TypeError("Invalid secure operands")
+        else: compile_error("Invalid secure operands")
 
     def secure_lt(mpc, x, y):
-        if isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
+        if isinstance(x, MPP) or isinstance(y, MPP):
+            return InternalMPP.lt(mpc, x, y)
+        elif isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
             return InternalMPC.lt(mpc, x, y)
         elif isinstance(x, CipherTensor) or isinstance(y, CipherTensor):
             return InternalMHE.lt(mpc, x, y)
-        else: raise TypeError("Invalid secure operands")
+        else: compile_error("Invalid secure operands")
     
     def secure_eq(mpc, x, y):
-        if isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
+        if isinstance(x, MPP) or isinstance(y, MPP):
+            return InternalMPP.eq(mpc, x, y)
+        elif isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
             return InternalMPC.eq(mpc, x, y)
         elif isinstance(x, CipherTensor) or isinstance(y, CipherTensor):
             return InternalMHE.eq(mpc, x, y)
-        else: raise TypeError("Invalid secure operands")
+        else: compile_error("Invalid secure operands")
 
     def secure_sqrt_inv(mpc, x, y):
         assert isinstance(x, SharedTensor) or isinstance(y, SharedTensor), "Secure sqrt inverse computing is enabled only for MPC"
@@ -491,35 +595,37 @@ class Internal:
             return InternalMPC.dot(mpc, x, y)
         elif isinstance(x, CipherTensor) or isinstance(y, CipherTensor):
             return InternalMHE.dot(mpc, x, y)
-        else: raise TypeError("Invalid secure operands")
+        else: compile_error("Invalid secure operands")
 
     def dot(mpc, x):
         if isinstance(x, SharedTensor):
             return InternalMPC.dot(mpc, x)
         elif isinstance(x, CipherTensor):
             return InternalMHE.dot(mpc, x)
-        else: raise TypeError("Invalid secure operands")
+        else: compile_error("Invalid secure operands")
 
     def matmul(mpc, x, y):
-        if isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
+        if isinstance(x, MPP) or isinstance(y, MPP):
+            return InternalMPP.matmul(mpc, x, y)
+        elif isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
             return InternalMPC.matmul(mpc, x, y)
         elif isinstance(x, CipherTensor) or isinstance(y, CipherTensor):
             return InternalMHE.matmul(mpc, x, y)
-        else: raise TypeError("Invalid secure operands")
+        else: compile_error("Invalid secure operands")
 
     def sqrt(mpc, x):
         if isinstance(x, SharedTensor):
             return InternalMPC.sqrt(mpc, x)
         elif isinstance(x, CipherTensor):
             return InternalMHE.sqrt(mpc, x)
-        else: raise TypeError("Invalid secure operands")
+        else: compile_error("Invalid secure operands")
 
-    def broadcast(mpc, value):
+    def reveal_to_all(mpc, value):
         if isinstance(value, SharedTensor):
-            return InternalMPC.broadcast(mpc, value)
+            return InternalMPC.reveal_to_all(mpc, value)
         elif isinstance(value, CipherTensor):
-            return InternalMHE.broadcast(mpc, value)
-        else: raise TypeError("Invalid secure operands")
+            return InternalMHE.reveal_to_all(mpc, value)
+        else: compile_error("Invalid secure operands")
 
     def min_cost_router(new_vars, cost_vars):
         return new_vars[argmin(cost_vars)]
