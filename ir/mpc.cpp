@@ -1,8 +1,8 @@
 #include "mpc.h"
 #include "utils.h"
-#include "codon/sir/util/cloning.h"
-#include "codon/sir/util/irtools.h"
-#include "codon/sir/util/matching.h"
+#include "codon/cir/util/cloning.h"
+#include "codon/cir/util/irtools.h"
+#include "codon/cir/util/matching.h"
 #include <iterator>
 #include <math.h>
 
@@ -10,7 +10,6 @@ namespace sequre {
 
 using namespace codon::ir;
 
-const std::string secureContainerTypeName = "SharedTensor";
 const std::string builtinModule = "std.internal.builtin";
 
 /*
@@ -888,9 +887,8 @@ CallInstr *nextPolynomialCall(CallInstr *v, BodiedFunc *bf, BET *bet) {
   auto *coefsType = getTupleType(coefs.size(), M->getIntType(), M);
   auto *expsType = getTupleType(exps.size(), M->getIntType(), M);
 
-  auto *evalPolyFunc = M->getOrRealizeMethod(
-      selfType, "secure_evalp", {selfType, inputsType, coefsType, expsType});
-  assert(evalPolyFunc && "secure_evalp not found in provided MPC class");
+  auto *evalPolyFunc = getOrRealizeSequreInternalMethod(M, "secure_evalp", {selfType, inputsType, coefsType, expsType}, {});
+  assert(evalPolyFunc && "secure_evalp not found among Sequre's internal methods");
 
   std::vector<Value *> inputArgs;
   for (auto it = bf->arg_begin(); it != bf->arg_end(); ++it) {
@@ -1077,7 +1075,7 @@ CallInstr *callRouter(Module *M, std::vector<Value *> newVars,
                       std::vector<Value *> costVars) {
   auto *varsTupleType = getTupleType(newVars.size(), newVars[0]->getType(), M);
   auto *costsTupleType = getTupleType(costVars.size(), M->getIntType(), M);
-  auto *routerMethod = getOrRealizeSequreInternalMethod(M, "min_cost_router", {varsTupleType, costsTupleType});
+  auto *routerMethod = getOrRealizeSequreInternalMethod(M, "min_cost_router", {varsTupleType, costsTupleType}, {});
   assert(routerMethod);
 
   auto *varsTuple = util::makeTuple(newVars, M);
