@@ -1,7 +1,7 @@
 #pragma once
 
-#include "codon/sir/transform/pass.h"
-#include "codon/sir/sir.h"
+#include "codon/cir/transform/pass.h"
+#include "codon/cir/cir.h"
 
 namespace sequre {
 

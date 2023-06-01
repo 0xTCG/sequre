@@ -23,23 +23,23 @@ const int BET_REVEAL_OP = 5;
 const int BET_OTHER_OP = 6;
 const int BET_ARITHMETICS_OP_THRESHOLD = BET_REVEAL_OP;
 
-class BETNode {
+class MPCBETNode {
   int64_t value;
   Var *variable;
   types::Type *nodeType;
   int op;
-  BETNode *leftChild;
-  BETNode *rightChild;
+  MPCBETNode *leftChild;
+  MPCBETNode *rightChild;
   bool expanded;
   bool constant;
 
 public:
-  BETNode();
-  BETNode(Var *variable);
-  BETNode(Var *variable, int op, bool expanded, int64_t value, bool constant);
-  BETNode(Var *variable, int op, BETNode *leftChild, BETNode *rightChild, bool expanded,
+  MPCBETNode();
+  MPCBETNode(Var *variable);
+  MPCBETNode(Var *variable, int op, bool expanded, int64_t value, bool constant);
+  MPCBETNode(Var *variable, int op, MPCBETNode *leftChild, MPCBETNode *rightChild, bool expanded,
           int64_t value, bool constant);
-  ~BETNode() {
+  ~MPCBETNode() {
     if (leftChild)
       delete leftChild;
     if (rightChild)
@@ -48,8 +48,8 @@ public:
 
   void setVariable(Var *variable) { this->variable = variable; }
   void setOperator(int op) { this->op = op; }
-  void setLeftChild(BETNode *leftChild) { this->leftChild = leftChild; }
-  void setRightChild(BETNode *rightChild) { this->rightChild = rightChild; }
+  void setLeftChild(MPCBETNode *leftChild) { this->leftChild = leftChild; }
+  void setRightChild(MPCBETNode *rightChild) { this->rightChild = rightChild; }
   void swapChildren() { std::swap(leftChild, rightChild); }
   void setExpanded() { expanded = true; }
   Var *getVariable() const { return variable; }
@@ -57,31 +57,31 @@ public:
   int getVariableId() const { return variable ? variable->getId() : 0; }
   int getOperator() const { return op; }
   int64_t getValue() const { return value; }
-  BETNode *getLeftChild() const { return leftChild; }
-  BETNode *getRightChild() const { return rightChild; }
+  MPCBETNode *getLeftChild() const { return leftChild; }
+  MPCBETNode *getRightChild() const { return rightChild; }
   bool isExpanded() const { return expanded; }
   bool isLeaf() const { return !leftChild && !rightChild; }
   bool isAdd() const { return op == BET_ADD_OP; }
   bool isMul() const { return op == BET_MUL_OP; }
   bool isPow() const { return op == BET_POW_OP; }
   bool isConstant() const { return constant; }
-  bool isSameSubTree(BETNode *) const;
+  bool isSameSubTree(MPCBETNode *) const;
   bool isElemWiseOp() const { return isAdd() || isMul(); }
   bool isMatmul() const { return op == BET_MATMUL_OP; }
   bool hasAtomicType() { return getType()->isAtomic(); }
-  void replace(BETNode *);
-  BETNode *copy() const;
+  void replace(MPCBETNode *);
+  MPCBETNode *copy() const;
   void print(int) const;
 
   types::Type *getType();
   std::string const getOperatorIRName() const;
 };
 
-BETNode::BETNode()
+MPCBETNode::MPCBETNode()
     : value(1), variable(nullptr), nodeType(nullptr), op(0), leftChild(nullptr),
       rightChild(nullptr), expanded(false), constant(false) {}
 
-BETNode::BETNode(Var *variable)
+MPCBETNode::MPCBETNode(Var *variable)
     : value(1), variable(variable), op(0), leftChild(nullptr), rightChild(nullptr),
       expanded(false), constant(false) {
   if (variable)
@@ -90,7 +90,7 @@ BETNode::BETNode(Var *variable)
     nodeType = nullptr;
 }
 
-BETNode::BETNode(Var *variable, int op, bool expanded, int64_t value, bool constant)
+MPCBETNode::MPCBETNode(Var *variable, int op, bool expanded, int64_t value, bool constant)
     : value(value), variable(variable), op(op), leftChild(nullptr), rightChild(nullptr),
       expanded(expanded), constant(constant) {
   if (variable)
@@ -99,7 +99,7 @@ BETNode::BETNode(Var *variable, int op, bool expanded, int64_t value, bool const
     nodeType = nullptr;
 }
 
-BETNode::BETNode(Var *variable, int op, BETNode *leftChild, BETNode *rightChild,
+MPCBETNode::MPCBETNode(Var *variable, int op, MPCBETNode *leftChild, MPCBETNode *rightChild,
                  bool expanded, int64_t value, bool constant)
     : value(value), variable(variable), op(op), leftChild(leftChild),
       rightChild(rightChild), expanded(expanded), constant(constant) {
@@ -109,7 +109,7 @@ BETNode::BETNode(Var *variable, int op, BETNode *leftChild, BETNode *rightChild,
     nodeType = nullptr;
 }
 
-VarValue *BETNode::getVarValue(Module *M) const {
+VarValue *MPCBETNode::getVarValue(Module *M) const {
   auto *var = getVariable();
   assert(var);
   auto *arg = M->Nr<VarValue>(var);
@@ -117,13 +117,13 @@ VarValue *BETNode::getVarValue(Module *M) const {
   return arg;
 }
 
-bool BETNode::isSameSubTree(BETNode *other) const {
+bool MPCBETNode::isSameSubTree(MPCBETNode *other) const {
   if (isLeaf() && other->isLeaf()) {
     if (isConstant() && other->isConstant())
       return getValue() == other->getValue();
 
     assert(variable &&
-           "BET leaf is neither constant nor variable. (This is internal bug within IR "
+           "MPCBET leaf is neither constant nor variable. (This is internal bug within IR "
            "optimizations. Please report it to code owners.)");
 
     int varId = getVariableId();
@@ -147,7 +147,7 @@ bool BETNode::isSameSubTree(BETNode *other) const {
   return false;
 }
 
-void BETNode::replace(BETNode *other) {
+void MPCBETNode::replace(MPCBETNode *other) {
   variable = other->getVariable();
   op = other->getOperator();
   leftChild = other->getLeftChild();
@@ -157,8 +157,8 @@ void BETNode::replace(BETNode *other) {
   constant = other->isConstant();
 }
 
-BETNode *BETNode::copy() const {
-  auto *newNode = new BETNode(variable, op, expanded, value, constant);
+MPCBETNode *MPCBETNode::copy() const {
+  auto *newNode = new MPCBETNode(variable, op, expanded, value, constant);
   auto *lc = getLeftChild();
   auto *rc = getRightChild();
   if (lc)
@@ -168,7 +168,7 @@ BETNode *BETNode::copy() const {
   return newNode;
 }
 
-void BETNode::print(int level = 0) const {
+void MPCBETNode::print(int level = 0) const {
   for (int i = 0; i < level; ++i)
     std::cout << "    ";
 
@@ -181,7 +181,7 @@ void BETNode::print(int level = 0) const {
     rightChild->print(level + 1);
 }
 
-types::Type *BETNode::getType() {
+types::Type *MPCBETNode::getType() {
   if (!nodeType) {
     if (isConstant())
       nodeType = new types::IntType();
@@ -195,79 +195,79 @@ types::Type *BETNode::getType() {
   return nodeType;
 };
 
-std::string const BETNode::getOperatorIRName() const {
+std::string const MPCBETNode::getOperatorIRName() const {
   if (isAdd())
     return "__add__";
   if (isMul())
     return "__mul__";
   if (isPow())
     return "__pow__";
-  assert(false && "BET node operator not supported in IR optimizations.");
+  assert(false && "MPCBET node operator not supported in IR optimizations.");
 };
 
-class BET {
-  std::unordered_map<int, BETNode *> roots;
+class MPCBET {
+  std::unordered_map<int, MPCBETNode *> roots;
   std::vector<int> stopVarIds;
   std::set<int> vars;
-  std::vector<BETNode *> polynomials;
+  std::vector<MPCBETNode *> polynomials;
   std::vector<std::vector<int64_t>> pascalMatrix;
   bool treeAltered;
 
 public:
-  BET() : treeAltered(false) {}
-  ~BET() {
+  MPCBET() : treeAltered(false) {}
+  ~MPCBET() {
     auto *root = this->root();
     if (root)
       delete root;
   }
 
   int getVarsSize() const { return vars.size(); }
-  void addRoot(BETNode *betNode) { roots[betNode->getVariableId()] = betNode; }
+  void addRoot(MPCBETNode *betNode) { roots[betNode->getVariableId()] = betNode; }
   void addRoot(Var *, int);
-  void addNode(BETNode *);
+  void addNode(MPCBETNode *);
   void addStopVar(int varId) { stopVarIds.insert(stopVarIds.begin(), varId); }
   void formPolynomials();
-  void parseVars(BETNode *);
-  BETNode *root();
-  BETNode *polyRoot() const;
-  BETNode *getNextPolyNode();
-  std::vector<BETNode *> generateFactorizationTrees(int);
-  std::vector<int64_t> extractCoefficents(BETNode *) const;
-  std::vector<int64_t> extractExponents(BETNode *) const;
-  std::set<int> extractVars(BETNode *) const;
+  void parseVars(MPCBETNode *);
+  MPCBETNode *root();
+  MPCBETNode *polyRoot() const;
+  MPCBETNode *getNextPolyNode();
+  std::vector<MPCBETNode *> generateFactorizationTrees(int);
+  std::vector<int64_t> extractCoefficents(MPCBETNode *) const;
+  std::vector<int64_t> extractExponents(MPCBETNode *) const;
+  std::set<int> extractVars(MPCBETNode *) const;
   std::vector<std::vector<int64_t>> getPascalMatrix() const { return pascalMatrix; }
 
-  bool expandLvl(BETNode *);
-  bool reduceLvl(BETNode *);
-  void expandAll(BETNode *);
-  void reduceAll(BETNode *);
+  bool expandLvl(MPCBETNode *);
+  bool reduceLvl(MPCBETNode *);
+  void expandAll(MPCBETNode *);
+  void reduceAll(MPCBETNode *);
 
-  void escapePows(BETNode *);
+  void escapePows(MPCBETNode *);
 
 private:
   void addVar(int varId) { vars.insert(varId); }
-  void expandNode(BETNode *);
-  void expandPow(BETNode *);
-  void expandMul(BETNode *);
-  void expandMatmul(BETNode *);
-  void expandDistributive(BETNode *, int, int);
-  void collapseDistributive(BETNode *, bool, bool, bool, bool, int, int);
-  void collapseMul(BETNode *, bool, bool, bool, bool);
-  void collapseMatmul(BETNode *, bool, bool, bool, bool);
-  void formPolynomial(BETNode *);
-  void extractCoefficents(BETNode *, std::vector<int64_t> &) const;
-  void extractExponents(BETNode *, std::vector<int64_t> &) const;
-  void extractVars(BETNode *, std::set<int> &) const;
-  void parseExponents(BETNode *, std::map<int, int64_t> &) const;
+  void expandNode(MPCBETNode *);
+  void expandPow(MPCBETNode *);
+  void expandMul(MPCBETNode *);
+  void expandMatmul(MPCBETNode *);
+  void expandDistributive(MPCBETNode *, int, int);
+  void collapseDistributive(MPCBETNode *, bool, bool, bool, bool, int, int);
+  void collapseMul(MPCBETNode *, bool, bool, bool, bool);
+  void collapseMatmul(MPCBETNode *, bool, bool, bool, bool);
+  void formPolynomial(MPCBETNode *);
+  void extractCoefficents(MPCBETNode *, std::vector<int64_t> &) const;
+  void extractExponents(MPCBETNode *, std::vector<int64_t> &) const;
+  void extractVars(MPCBETNode *, std::set<int> &) const;
+  void parseExponents(MPCBETNode *, std::map<int, int64_t> &) const;
   void updatePascalMatrix(int64_t);
-  BETNode *getMulTree(BETNode *, BETNode *, int64_t, int64_t);
-  BETNode *getPowTree(BETNode *, BETNode *, int64_t, int64_t);
-  int64_t parseCoefficient(BETNode *) const;
+  MPCBETNode *getMulTree(MPCBETNode *, MPCBETNode *, int64_t, int64_t);
+  MPCBETNode *getPowTree(MPCBETNode *, MPCBETNode *, int64_t, int64_t);
+  int64_t parseCoefficient(MPCBETNode *) const;
   int64_t getBinomialCoefficient(int64_t, int64_t);
   std::vector<int64_t> getPascalRow(int64_t);
 };
 
-void BET::expandNode(BETNode *betNode) {
+void MPCBET::expandNode(MPCBETNode *betNode) {
   if (betNode->isExpanded())
     return;
 
@@ -284,7 +284,7 @@ void BET::expandNode(BETNode *betNode) {
   betNode->setExpanded();
 }
 
-void BET::expandPow(BETNode *betNode) {
+void MPCBET::expandPow(MPCBETNode *betNode) {
   auto *lc = betNode->getLeftChild();
   auto *rc = betNode->getRightChild();
 
@@ -296,7 +296,7 @@ void BET::expandPow(BETNode *betNode) {
     betNode->setOperator(BET_MUL_OP);
     lc->setOperator(BET_POW_OP);
     auto *newPowNode =
-        new BETNode(nullptr, BET_POW_OP, lc->getRightChild(), rc, true, 1, false);
+        new MPCBETNode(nullptr, BET_POW_OP, lc->getRightChild(), rc, true, 1, false);
     betNode->setRightChild(newPowNode);
     lc->setRightChild(rc->copy());
     return;
@@ -318,7 +318,7 @@ void BET::expandPow(BETNode *betNode) {
   }
 }
 
-void BET::expandDistributive(BETNode *betNode, int weakOp, int strongOp) {
+void MPCBET::expandDistributive(MPCBETNode *betNode, int weakOp, int strongOp) {
   assert(weakOp < strongOp);
   treeAltered = true;
 
@@ -329,7 +329,7 @@ void BET::expandDistributive(BETNode *betNode, int weakOp, int strongOp) {
   auto *otherNode = lc->isAdd() ? rc : lc;
   betNode->setOperator(weakOp);
   addNode->setOperator(strongOp);
-  auto *newMulNode = new BETNode(nullptr, strongOp, addNode->getRightChild(),
+  auto *newMulNode = new MPCBETNode(nullptr, strongOp, addNode->getRightChild(),
                                  otherNode, true, 1, false);
   addNode->setRightChild(otherNode->copy());
   
@@ -342,15 +342,15 @@ void BET::expandDistributive(BETNode *betNode, int weakOp, int strongOp) {
     betNode->setRightChild(newMulNode);
 }
 
-void BET::expandMul(BETNode *betNode) {
+void MPCBET::expandMul(MPCBETNode *betNode) {
   expandDistributive(betNode, BET_ADD_OP, BET_MUL_OP);
 }
 
-void BET::expandMatmul(BETNode *betNode) {
+void MPCBET::expandMatmul(MPCBETNode *betNode) {
   expandDistributive(betNode, BET_ADD_OP, BET_MATMUL_OP);
 }
 
-void BET::collapseDistributive(BETNode *betNode, bool llc_lrc, bool llc_rrc, bool rlc_lrc,
+void MPCBET::collapseDistributive(MPCBETNode *betNode, bool llc_lrc, bool llc_rrc, bool rlc_lrc,
                       bool rlc_rrc, int weakOp, int strongOp) {
   assert(weakOp < strongOp);
 
@@ -362,8 +362,8 @@ void BET::collapseDistributive(BETNode *betNode, bool llc_lrc, bool llc_rrc, boo
   auto *lrc = rc->getLeftChild();
   auto *rrc = rc->getRightChild();
 
-  BETNode *collapseNode;
-  BETNode *leftOtherNode, *rightOtherNode;
+  MPCBETNode *collapseNode;
+  MPCBETNode *leftOtherNode, *rightOtherNode;
 
   if (llc_lrc) {
     collapseNode = llc;
@@ -385,8 +385,8 @@ void BET::collapseDistributive(BETNode *betNode, bool llc_lrc, bool llc_rrc, boo
 
   treeAltered = true;
 
-  BETNode *surviveNode = llc_lrc ? rc : lc;
-  BETNode *replaceNode = llc_lrc ? lc : rc;
+  MPCBETNode *surviveNode = llc_lrc ? rc : lc;
+  MPCBETNode *replaceNode = llc_lrc ? lc : rc;
 
   betNode->setOperator(strongOp);
   surviveNode->setOperator(weakOp);
@@ -396,18 +396,18 @@ void BET::collapseDistributive(BETNode *betNode, bool llc_lrc, bool llc_rrc, boo
   replaceNode->replace(collapseNode);
 }
 
-void BET::collapseMul(BETNode *betNode, bool llc_lrc, bool llc_rrc, bool rlc_lrc,
+void MPCBET::collapseMul(MPCBETNode *betNode, bool llc_lrc, bool llc_rrc, bool rlc_lrc,
                       bool rlc_rrc) {
   collapseDistributive(betNode, llc_lrc, llc_rrc, rlc_lrc, rlc_rrc, BET_ADD_OP, BET_MUL_OP);
 }
 
-void BET::collapseMatmul(BETNode *betNode, bool llc_lrc, bool llc_rrc, bool rlc_lrc,
+void MPCBET::collapseMatmul(MPCBETNode *betNode, bool llc_lrc, bool llc_rrc, bool rlc_lrc,
                       bool rlc_rrc) {
   assert(llc_lrc || rlc_rrc);
   collapseDistributive(betNode, llc_lrc, llc_rrc, rlc_lrc, rlc_rrc, BET_ADD_OP, BET_MATMUL_OP);
 }
 
-void BET::formPolynomial(BETNode *betNode) {
+void MPCBET::formPolynomial(MPCBETNode *betNode) {
   if (betNode->isLeaf())
     return;
 
@@ -427,7 +427,7 @@ void BET::formPolynomial(BETNode *betNode) {
   expandMul(betNode);
 }
 
-void BET::extractCoefficents(BETNode *betNode,
+void MPCBET::extractCoefficents(MPCBETNode *betNode,
                              std::vector<int64_t> &coefficients) const {
   if (!(betNode->isAdd())) {
     coefficients.push_back(parseCoefficient(betNode));
@@ -440,7 +440,7 @@ void BET::extractCoefficents(BETNode *betNode,
   extractCoefficents(rc, coefficients);
 }
 
-void BET::extractExponents(BETNode *betNode, std::vector<int64_t> &exponents) const {
+void MPCBET::extractExponents(MPCBETNode *betNode, std::vector<int64_t> &exponents) const {
   if (!(betNode->isAdd())) {
     std::map<int, int64_t> termExponents;
     for (auto varId : vars)
@@ -457,7 +457,7 @@ void BET::extractExponents(BETNode *betNode, std::vector<int64_t> &exponents) co
   extractExponents(rc, exponents);
 }
 
-void BET::extractVars(BETNode *betNode, std::set<int> &vars) const {
+void MPCBET::extractVars(MPCBETNode *betNode, std::set<int> &vars) const {
   if (betNode->isConstant())
     return;
   if (betNode->isLeaf()) {
@@ -471,7 +471,7 @@ void BET::extractVars(BETNode *betNode, std::set<int> &vars) const {
   extractVars(rc, vars);
 }
 
-void BET::parseExponents(BETNode *betNode,
+void MPCBET::parseExponents(MPCBETNode *betNode,
                          std::map<int, int64_t> &termExponents) const {
   if (betNode->isConstant())
     return;
@@ -494,7 +494,7 @@ void BET::parseExponents(BETNode *betNode,
   parseExponents(rc, termExponents);
 }
 
-void BET::updatePascalMatrix(int64_t n) {
+void MPCBET::updatePascalMatrix(int64_t n) {
   for (auto i = pascalMatrix.size(); i < n + 1; ++i) {
     auto newRow = std::vector<int64_t>(i + 1);
     for (auto j = 0; j < i + 1; ++j)
@@ -505,28 +505,28 @@ void BET::updatePascalMatrix(int64_t n) {
   }
 }
 
-BETNode *BET::getMulTree(BETNode *v1, BETNode *v2, int64_t constant, int64_t iter) {
+MPCBETNode *MPCBET::getMulTree(MPCBETNode *v1, MPCBETNode *v2, int64_t constant, int64_t iter) {
   auto *pascalNode =
-      new BETNode(nullptr, 0, true, getBinomialCoefficient(constant, iter), true);
-  auto *leftConstNode = new BETNode(nullptr, 0, true, constant - iter, true);
-  auto *rightConstNode = new BETNode(nullptr, 0, true, iter, true);
+      new MPCBETNode(nullptr, 0, true, getBinomialCoefficient(constant, iter), true);
+  auto *leftConstNode = new MPCBETNode(nullptr, 0, true, constant - iter, true);
+  auto *rightConstNode = new MPCBETNode(nullptr, 0, true, iter, true);
   auto *leftPowNode =
-      new BETNode(nullptr, BET_POW_OP, v1->copy(), leftConstNode, true, 1, false);
+      new MPCBETNode(nullptr, BET_POW_OP, v1->copy(), leftConstNode, true, 1, false);
   auto *rightPowNode =
-      new BETNode(nullptr, BET_POW_OP, v2->copy(), rightConstNode, true, 1, false);
+      new MPCBETNode(nullptr, BET_POW_OP, v2->copy(), rightConstNode, true, 1, false);
   auto *rightMulNode =
-      new BETNode(nullptr, BET_MUL_OP, leftPowNode, rightPowNode, true, 1, false);
+      new MPCBETNode(nullptr, BET_MUL_OP, leftPowNode, rightPowNode, true, 1, false);
 
-  return new BETNode(nullptr, BET_MUL_OP, pascalNode, rightMulNode, true, 1, false);
+  return new MPCBETNode(nullptr, BET_MUL_OP, pascalNode, rightMulNode, true, 1, false);
 }
 
-BETNode *BET::getPowTree(BETNode *v1, BETNode *v2, int64_t constant, int64_t iter) {
+MPCBETNode *MPCBET::getPowTree(MPCBETNode *v1, MPCBETNode *v2, int64_t constant, int64_t iter) {
   auto *newMulNode = getMulTree(v1, v2, constant, iter);
 
   if (constant == iter)
     return newMulNode;
 
-  auto *newAddNode = new BETNode(nullptr, BET_ADD_OP, true, 1, false);
+  auto *newAddNode = new MPCBETNode(nullptr, BET_ADD_OP, true, 1, false);
 
   newAddNode->setLeftChild(newMulNode);
   newAddNode->setRightChild(getPowTree(v1, v2, constant, iter + 1));
@@ -534,7 +534,7 @@ BETNode *BET::getPowTree(BETNode *v1, BETNode *v2, int64_t constant, int64_t ite
   return newAddNode;
 }
 
-int64_t BET::parseCoefficient(BETNode *betNode) const {
+int64_t MPCBET::parseCoefficient(MPCBETNode *betNode) const {
   auto *lc = betNode->getLeftChild();
   auto *rc = betNode->getRightChild();
 
@@ -549,30 +549,30 @@ int64_t BET::parseCoefficient(BETNode *betNode) const {
   return parseCoefficient(lc) * parseCoefficient(rc);
 }
 
-int64_t BET::getBinomialCoefficient(int64_t n, int64_t k) {
+int64_t MPCBET::getBinomialCoefficient(int64_t n, int64_t k) {
   auto pascalRow = getPascalRow(n);
   return pascalRow[k];
 }
 
-std::vector<int64_t> BET::getPascalRow(int64_t n) {
+std::vector<int64_t> MPCBET::getPascalRow(int64_t n) {
   if (n >= pascalMatrix.size())
     updatePascalMatrix(n);
 
   return pascalMatrix[n];
 }
 
-void BET::addRoot(Var *newVar, int oldVarId) {
+void MPCBET::addRoot(Var *newVar, int oldVarId) {
   auto *oldNode = roots[oldVarId]->copy();
   oldNode->setVariable(newVar);
   roots[oldNode->getVariableId()] = oldNode;
 }
 
-void BET::addNode(BETNode *betNode) {
+void MPCBET::addNode(MPCBETNode *betNode) {
   expandNode(betNode);
   addRoot(betNode);
 }
 
-void BET::formPolynomials() {
+void MPCBET::formPolynomials() {
   for (int stopVarId : stopVarIds) {
     auto *polyRoot = roots[stopVarId]->copy();
     do {
@@ -583,7 +583,7 @@ void BET::formPolynomials() {
   }
 }
 
-void BET::parseVars(BETNode *betNode) {
+void MPCBET::parseVars(MPCBETNode *betNode) {
   if (betNode->isConstant())
     return;
   if (betNode->isLeaf()) {
@@ -595,7 +595,7 @@ void BET::parseVars(BETNode *betNode) {
   parseVars(betNode->getRightChild());
 }
 
-BETNode *BET::root() {
+MPCBETNode *MPCBET::root() {
   if (!stopVarIds.size())
     return nullptr;
 
@@ -607,14 +607,14 @@ BETNode *BET::root() {
   return roots[stopVarId];
 }
 
-BETNode *BET::polyRoot() const {
+MPCBETNode *MPCBET::polyRoot() const {
   if (!polynomials.size())
     return nullptr;
 
   return polynomials.back();
 }
 
-BETNode *BET::getNextPolyNode() {
+MPCBETNode *MPCBET::getNextPolyNode() {
   auto *polyNode = polyRoot();
 
   if (polyNode) {
@@ -625,25 +625,25 @@ BETNode *BET::getNextPolyNode() {
   return nullptr;
 }
 
-std::vector<int64_t> BET::extractCoefficents(BETNode *betNode) const {
+std::vector<int64_t> MPCBET::extractCoefficents(MPCBETNode *betNode) const {
   std::vector<int64_t> coefficients;
   extractCoefficents(betNode, coefficients);
   return coefficients;
 }
 
-std::vector<int64_t> BET::extractExponents(BETNode *betNode) const {
+std::vector<int64_t> MPCBET::extractExponents(MPCBETNode *betNode) const {
   std::vector<int64_t> exponents;
   extractExponents(betNode, exponents);
   return exponents;
 }
 
-std::set<int> BET::extractVars(BETNode *betNode) const {
+std::set<int> MPCBET::extractVars(MPCBETNode *betNode) const {
   std::set<int> varIds;
   extractVars(betNode, varIds);
   return varIds;
 }
 
-void BET::escapePows(BETNode *node) {
+void MPCBET::escapePows(MPCBETNode *node) {
   if (node->isLeaf())
     return;
 
@@ -661,24 +661,24 @@ void BET::escapePows(BETNode *node) {
   assert(rc->getValue() > 0 &&
          "Sequre factorization optimization expects each exponent to be positive.");
 
-  auto *newMulNode = new BETNode(nullptr, BET_MUL_OP, lc, lc, false, 1, false);
+  auto *newMulNode = new MPCBETNode(nullptr, BET_MUL_OP, lc, lc, false, 1, false);
 
   if (rc->getValue() == 1)
-    newMulNode->setRightChild(new BETNode(nullptr, 0, true, 1, true));
+    newMulNode->setRightChild(new MPCBETNode(nullptr, 0, true, 1, true));
 
   for (int i = 0; i < rc->getValue() - 2; ++i)
     newMulNode =
-        new BETNode(nullptr, BET_MUL_OP, lc, newMulNode->copy(), false, 1, false);
+        new MPCBETNode(nullptr, BET_MUL_OP, lc, newMulNode->copy(), false, 1, false);
 
   node->replace(newMulNode);
 }
 
-std::vector<BETNode *> BET::generateFactorizationTrees(int upperLimit = 10) {
-  BETNode *root = this->root()->copy();
+std::vector<MPCBETNode *> MPCBET::generateFactorizationTrees(int upperLimit = 10) {
+  MPCBETNode *root = this->root()->copy();
   escapePows(root);
   reduceAll(root);
 
-  std::vector<BETNode *> factorizations;
+  std::vector<MPCBETNode *> factorizations;
   for (int i = 0; i != upperLimit; ++i) {
     factorizations.push_back(root->copy());
     if (!expandLvl(root))
@@ -688,7 +688,7 @@ std::vector<BETNode *> BET::generateFactorizationTrees(int upperLimit = 10) {
   return factorizations;
 }
 
-bool BET::expandLvl(BETNode *node) {
+bool MPCBET::expandLvl(MPCBETNode *node) {
   // TODO: Add support for operators other than + and *
 
   if (node->isLeaf())
@@ -709,7 +709,7 @@ bool BET::expandLvl(BETNode *node) {
   return true;
 }
 
-bool BET::reduceLvl(BETNode *node) {
+bool MPCBET::reduceLvl(MPCBETNode *node) {
   // TODO: Add support for operators other than + and *
 
   if (node->isLeaf())
@@ -757,12 +757,12 @@ bool BET::reduceLvl(BETNode *node) {
   return true;
 }
 
-void BET::expandAll(BETNode *root) {
+void MPCBET::expandAll(MPCBETNode *root) {
   while (expandLvl(root))
     ;
 }
 
-void BET::reduceAll(BETNode *root) {
+void MPCBET::reduceAll(MPCBETNode *root) {
   while (reduceLvl(root))
     ;
 }
@@ -797,11 +797,11 @@ types::Type *getTupleType(int n, types::Type *elemType, Module *M) {
   return M->getTupleType(tupleTypes);
 }
 
-/* BET tree construction */
+/* MPCBET tree construction */
 
-BETNode *parseArithmetic(CallInstr *callInstr) {
+MPCBETNode *MPCParseArithmetic(CallInstr *callInstr) {
   // Arithmetics are binary
-  auto *betNode = new BETNode();
+  auto *betNode = new MPCBETNode();
 
   auto op = getOperator(callInstr);
   betNode->setOperator(op);
@@ -815,24 +815,24 @@ BETNode *parseArithmetic(CallInstr *callInstr) {
 
   if (lhsConst)
     betNode->setLeftChild(
-        new BETNode(cast<Var>(lhs), 0, true, lhsConst->getVal(), true));
+        new MPCBETNode(cast<Var>(lhs), 0, true, lhsConst->getVal(), true));
   else if (!lhsInstr) {
-    betNode->setLeftChild(new BETNode(lhs->getUsedVariables().front()));
+    betNode->setLeftChild(new MPCBETNode(lhs->getUsedVariables().front()));
   } else
-    betNode->setLeftChild(parseArithmetic(lhsInstr));
+    betNode->setLeftChild(MPCParseArithmetic(lhsInstr));
 
   if (rhsConst)
     betNode->setRightChild(
-        new BETNode(cast<Var>(rhs), 0, true, rhsConst->getVal(), true));
+        new MPCBETNode(cast<Var>(rhs), 0, true, rhsConst->getVal(), true));
   else if (!rhsInstr) {
-    betNode->setRightChild(new BETNode(rhs->getUsedVariables().front()));
+    betNode->setRightChild(new MPCBETNode(rhs->getUsedVariables().front()));
   } else
-    betNode->setRightChild(parseArithmetic(rhsInstr));
+    betNode->setRightChild(MPCParseArithmetic(rhsInstr));
 
   return betNode;
 }
 
-void parseInstruction(codon::ir::Value *instruction, BET *bet) {
+void parseInstruction(codon::ir::Value *instruction, MPCBET *bet) {
   auto *retIns = cast<ReturnInstr>(instruction);
   if (retIns) {
     auto vars = retIns->getValue()->getUsedVariables();
@@ -851,7 +851,7 @@ void parseInstruction(codon::ir::Value *instruction, BET *bet) {
 
   auto op = getOperator(callInstr);
   if (isArithmetic(op)) {
-    auto *betNode = parseArithmetic(callInstr);
+    auto *betNode = MPCParseArithmetic(callInstr);
     betNode->setVariable(var);
     bet->addNode(betNode);
   } else if (isReveal(op)) {
@@ -860,8 +860,8 @@ void parseInstruction(codon::ir::Value *instruction, BET *bet) {
   }
 }
 
-BET *parseBET(SeriesFlow *series) {
-  auto *bet = new BET();
+MPCBET *parseBET(SeriesFlow *series) {
+  auto *bet = new MPCBET();
   for (auto it = series->begin(); it != series->end(); ++it)
     parseInstruction(*it, bet);
 
@@ -872,7 +872,7 @@ BET *parseBET(SeriesFlow *series) {
 
 /* Polynomial MPC optimization */
 
-CallInstr *nextPolynomialCall(CallInstr *v, BodiedFunc *bf, BET *bet) {
+CallInstr *nextPolynomialCall(CallInstr *v, BodiedFunc *bf, MPCBET *bet) {
   auto polyNode = bet->getNextPolyNode();
   auto coefs = bet->extractCoefficents(polyNode);
   auto exps = bet->extractExponents(polyNode);
@@ -911,7 +911,7 @@ CallInstr *nextPolynomialCall(CallInstr *v, BodiedFunc *bf, BET *bet) {
   return util::call(evalPolyFunc, {self, inputArg, coefsArg, expsArg});
 }
 
-void convertInstructions(CallInstr *v, BodiedFunc *bf, SeriesFlow *series, BET *bet) {
+void convertInstructions(CallInstr *v, BodiedFunc *bf, SeriesFlow *series, MPCBET *bet) {
   auto it = series->begin();
   while (it != series->end()) {
     auto *retIns = cast<ReturnInstr>(*it);
@@ -949,7 +949,7 @@ void convertInstructions(CallInstr *v, BodiedFunc *bf, SeriesFlow *series, BET *
 
 /* Factorization optimizations */
 
-Value *generateExpression(Module *M, BETNode *node) {
+Value *generateExpression(Module *M, MPCBETNode *node) {
   if (node->isLeaf())
     return node->getVarValue(M);
 
@@ -1007,7 +1007,7 @@ Value *generateProduct(Module *M, std::vector<Value *> factors,
   return actualMulCall;
 }
 
-std::vector<Value *> parseOpCosts(Module *M, BETNode *node,
+std::vector<Value *> parseOpCosts(Module *M, MPCBETNode *node,
                                   std::vector<Value *> &opCosts) {
   if (node->hasAtomicType() || node->isConstant())
     return {M->getInt(1), M->getInt(1)};
@@ -1046,7 +1046,7 @@ std::vector<Value *> parseOpCosts(Module *M, BETNode *node,
     assert(rshape.size() == 2);
     shape = {lshape[0], lshape[1], rshape[1]};
   } else
-    assert(false && "Invalid BET node operation.");
+    assert(false && "Invalid MPCBET node operation.");
 
   opCosts.push_back(generateProduct(M, shape, M->getIntType()));
   if (node->isMatmul())
@@ -1055,7 +1055,7 @@ std::vector<Value *> parseOpCosts(Module *M, BETNode *node,
   return shape;
 }
 
-Value *generateCostExpression(Module *M, BETNode *factorizationTree) {
+Value *generateCostExpression(Module *M, MPCBETNode *factorizationTree) {
   std::vector<Value *> costProducts;
   parseOpCosts(M, factorizationTree, costProducts);
 
@@ -1087,7 +1087,7 @@ CallInstr *callRouter(Module *M, std::vector<Value *> newVars,
 }
 
 void routeFactorizations(CallInstr *v, BodiedFunc *bf, SeriesFlow *series,
-                         std::vector<BETNode *> factorizationTrees) {
+                         std::vector<MPCBETNode *> factorizationTrees) {
   auto *M = v->getModule();
 
   std::vector<Value *> newVars;
@@ -1134,7 +1134,7 @@ void applyFactorizationOptimizations(CallInstr *v) {
 
 void applyPolynomialOptimizations(CallInstr *v) {
   auto *f = util::getFunc(v->getCallee());
-  if (!isPolyOptFunc(f))
+  if (!isPolyOptFunc(f) || isSequreFunc(f))
     return;
 
   auto *bf = cast<BodiedFunc>(f);
