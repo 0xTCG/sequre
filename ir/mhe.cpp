@@ -64,6 +64,7 @@ public:
   bool checkIsIntConst()            const { return util::isConst<int64_t>(value); }
   bool checkIsDoubleConst()         const { return util::isConst<double>(value); }
   bool checkIsConst()               const { return checkIsIntConst() || checkIsDoubleConst(); }
+  bool checkIsTypeable()            const { return checkIsVariable() || checkIsConst(); }
   bool checkIsSameTree( BETNode * ) const;
   bool checkIsCipherTensor();
   bool checkIsCiphertext();
@@ -71,7 +72,7 @@ public:
   
   void swapChildren() { std::swap(leftChild, rightChild); }
   void replace( BETNode * );
-  types::Type *getOrRealizeIRType();
+  types::Type *getOrRealizeIRType( bool force = false);
 
   std::string            const getOperationIRName( bool ) const;
   std::string            const getName() const;
@@ -83,8 +84,8 @@ BETNode::BETNode()
   : value(nullptr), irType(nullptr), operation(noop), leftChild(nullptr), rightChild(nullptr), expanded(false) {}
 
 BETNode::BETNode( Value *value )
-  : value(value), operation(noop), leftChild(nullptr), rightChild(nullptr), expanded(true) {
-  if ( checkIsVariable() || checkIsConst() ) getOrRealizeIRType();
+  : value(value), irType(nullptr), operation(noop), leftChild(nullptr), rightChild(nullptr), expanded(true) {
+  getOrRealizeIRType();
 }
 
 BETNode::BETNode( Operation operation, BETNode *leftChild, BETNode *rightChild )
@@ -139,29 +140,27 @@ bool BETNode::checkIsSameTree( BETNode *other ) const {
 
 void BETNode::replace( BETNode *other ) {
   value      = other->getValue();
-  irType     = other->irType;
+  irType     = other->getOrRealizeIRType();
   operation  = other->getOperation();
   leftChild  = other->getLeftChild();
   rightChild = other->getRightChild();
   expanded   = other->isExpanded();
 }
 
-types::Type *BETNode::getOrRealizeIRType() {
-  // TODO: Check why `if ( irType ) return irType;` here causes irType to become silent killer of the whole code
-  // Might have to do something with the this->copy() method and the way irType is copied there.
-
-  if ( isLeaf() && (checkIsVariable() || checkIsConst()) ) {
+types::Type *BETNode::getOrRealizeIRType( bool force ) {
+  if ( irType && !force) return irType;
+  if ( isLeaf() && checkIsTypeable() ) {
     irType = getVariable()->getType();
     return irType;
   }
-  if ( isLeaf() ) assert( irType && "Cannot realize crypto type (leaf is not a variable nor constant)" );;
+  if ( isLeaf() ) assert( false && "Cannot realize crypto type (leaf is not a variable nor constant)" );
 
   // Realize IR type from children
   auto *lc = getLeftChild();
   auto *rc = getRightChild();
 
-  auto *lcType = lc->getOrRealizeIRType();
-  auto *rcType = rc->getOrRealizeIRType();
+  auto *lcType = lc->getOrRealizeIRType(force);
+  auto *rcType = rc->getOrRealizeIRType(force);
   
   // Not possible for lc or rc to have invalid type here
   assert( lcType && "Crypto type realization error (left child type could not be realized)" );
@@ -224,7 +223,7 @@ public:
   void addBET( Var* var, BETNode *betNode ) { betPerVar[var->getId()] = betNode; }
   void expandNode( BETNode * );
 
-  bool reduceLvl( BETNode * );
+  bool reduceLvl( BETNode *, bool );
   void reduceAll( BETNode * );
 
   void escapePows( BETNode * );
@@ -249,7 +248,9 @@ void BET::expandNode( BETNode *betNode ) {
   betNode->setExpanded();
 }
 
-bool BET::reduceLvl( BETNode *node ) {
+bool BET::reduceLvl( BETNode *node, bool cohort = false ) {
+  if ( !cohort )
+    std::cerr << "WARNING: Make sure to re-realize IR types by calling getOrRealizeIRType on node after reducing multiplications\n";
   if ( node->isLeaf() || !node->isAdd() ) return false;
 
   std::vector<BETNode *> visited;
@@ -286,7 +287,8 @@ bool BET::reduceLvl( BETNode *node ) {
 }
 
 void BET::reduceAll( BETNode *root ) {
-  while ( reduceLvl(root) );
+  while ( reduceLvl(root, true) );
+  root->getOrRealizeIRType(true);
 }
 
 void BET::escapePows( BETNode *node ) {
@@ -459,7 +461,8 @@ BETNode *parseArithmetic( CallInstr *callInstr ) {
     assert(false && "Arithmetics are expected to be binary");
   }
 
-  auto *betNode = new BETNode(callInstr);
+  auto *betNode = new BETNode();
+  betNode->setValue(callInstr);
   Operation operation = getOperation(callInstr);
   betNode->setOperation(operation);
   
