@@ -60,12 +60,13 @@ public:
   bool isCommutative() const { return isAdd() || isMul(); }
   bool isExpanded()    const { return expanded; }
   
-  bool checkIsVariable()            const { return bool(getVariable()); }
-  bool checkIsIntConst()            const { return util::isConst<int64_t>(value); }
-  bool checkIsDoubleConst()         const { return util::isConst<double>(value); }
-  bool checkIsConst()               const { return checkIsIntConst() || checkIsDoubleConst(); }
-  bool checkIsTypeable()            const { return checkIsVariable() || checkIsConst(); }
-  bool checkIsSameTree( BETNode * ) const;
+  bool checkIsVariable()               const { return bool(getVariable()); }
+  bool checkIsIntConst()               const { return util::isConst<int64_t>(value); }
+  bool checkIsDoubleConst()            const { return util::isConst<double>(value); }
+  bool checkIsConst()                  const { return checkIsIntConst() || checkIsDoubleConst(); }
+  bool checkIsTypeable()               const { return checkIsVariable() || checkIsConst(); }
+  bool checkIsSameTree( BETNode * )    const;
+  bool checkIsConsecutiveCommutative() const;
   bool checkIsCipherTensor();
   bool checkIsCiphertext();
   bool checkIsPlaintext();
@@ -137,6 +138,14 @@ bool BETNode::checkIsSameTree( BETNode *other ) const {
 
   return false;
 }
+
+bool BETNode::checkIsConsecutiveCommutative() const {
+  if ( !isCommutative() ) return false;
+  if ( getOperation() != getLeftChild()->getOperation() &&
+       getOperation() != getRightChild()->getOperation() ) return false;
+
+  return true;
+};
 
 void BETNode::replace( BETNode *other ) {
   value      = other->getValue();
@@ -226,6 +235,10 @@ public:
   bool reduceLvl( BETNode *, bool );
   void reduceAll( BETNode * );
 
+  bool swapPriorities( BETNode *, BETNode * );
+  bool reorderPriority( BETNode * );
+  void reorderPriorities( BETNode * );
+
   void escapePows( BETNode * );
 
 private:
@@ -251,7 +264,8 @@ void BET::expandNode( BETNode *betNode ) {
 bool BET::reduceLvl( BETNode *node, bool cohort = false ) {
   if ( !cohort )
     std::cerr << "WARNING: Make sure to re-realize IR types by calling getOrRealizeIRType on node after reducing multiplications\n";
-  if ( node->isLeaf() || !node->isAdd() ) return false;
+  if ( node->isLeaf() ) return false;
+  if ( !node->isAdd() ) return reduceLvl(node->getLeftChild(), cohort) || reduceLvl(node->getRightChild(), cohort);
 
   std::vector<BETNode *> visited;
   std::unordered_map<BETNode *, std::vector<BETNode *>> metadata;
@@ -289,6 +303,52 @@ bool BET::reduceLvl( BETNode *node, bool cohort = false ) {
 void BET::reduceAll( BETNode *root ) {
   while ( reduceLvl(root, true) );
   root->getOrRealizeIRType(true);
+}
+
+bool BET::swapPriorities( BETNode *root, BETNode *child ) {
+  if ( root->getOperation() != child->getOperation() ) return false;
+
+  auto *lc = root->getLeftChild();
+  auto *rc = root->getRightChild();
+  assert ( (lc == child || rc == child) && "Invalid parameters for BET::swapPriorities (second parameter has to be child of the first parameter)" );
+  
+  auto *sibling = ( lc == child ? rc : lc);
+  if ( sibling->checkIsCiphertext() ) return false;
+
+  auto *lcc = child->getLeftChild();
+  auto *rcc = child->getRightChild();
+
+  if ( lcc->checkIsCiphertext() && rcc->checkIsCiphertext() ) return false;
+
+  auto *cipherGrandChild = ( lcc->checkIsCiphertext() ? lcc : rcc );
+
+  if ( cipherGrandChild == lcc ) child->setLeftChild(sibling);
+  else child->setRightChild(sibling);
+
+  if ( sibling == lc ) root->setLeftChild(cipherGrandChild);
+  else root->setRightChild(cipherGrandChild);
+
+  child->setIRType(nullptr);
+  child->getOrRealizeIRType();
+  return true;
+}
+
+bool BET::reorderPriority( BETNode *node ) {
+  if ( node->isLeaf() || !node->checkIsCiphertext() ) return false;
+
+  auto *lc = node->getLeftChild();
+  auto *rc = node->getRightChild();
+
+  if ( node->checkIsConsecutiveCommutative() ) {
+    if ( swapPriorities(node, lc) ) return true;
+    if ( swapPriorities(node, rc) ) return true;
+  }
+
+  return reorderPriority(lc) || reorderPriority(rc);
+}
+
+void BET::reorderPriorities( BETNode *root ) {
+  while ( reorderPriority(root) );
 }
 
 void BET::escapePows( BETNode *node ) {
@@ -461,9 +521,10 @@ BETNode *parseArithmetic( CallInstr *callInstr ) {
     assert(false && "Arithmetics are expected to be binary");
   }
 
+  Operation operation = getOperation(callInstr);
   auto *betNode = new BETNode();
   betNode->setValue(callInstr);
-  Operation operation = getOperation(callInstr);
+  betNode->setIRType(callInstr->getType());
   betNode->setOperation(operation);
   
   if ( !isArithmeticOperation(operation) ) return betNode;
@@ -506,7 +567,7 @@ std::pair<Value *, BETNode *> minimizeCipherMult( Module *M, Value *instruction,
       auto *betNode = parseArithmetic(callInstr);
       bet->expandNode(betNode);
       bet->reduceAll(betNode);
-      // bet->reorderPriorities(betNode)  // TODO
+      bet->reorderPriorities(betNode);
       return std::make_pair(generateExpression(M, betNode), betNode);
     } else {
       std::vector<Value *> newArgs;
