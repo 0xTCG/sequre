@@ -85,7 +85,7 @@ BETNode::BETNode()
   : value(nullptr), irType(nullptr), operation(noop), leftChild(nullptr), rightChild(nullptr), expanded(false) {}
 
 BETNode::BETNode( Value *value )
-  : value(value), irType(nullptr), operation(noop), leftChild(nullptr), rightChild(nullptr), expanded(true) {
+  : value(value), irType(nullptr), operation(noop), leftChild(nullptr), rightChild(nullptr), expanded(false) {
   getOrRealizeIRType();
 }
 
@@ -227,17 +227,17 @@ class BET {
 
 public:
   BET() {}
-  ~BET() { for ( auto& it: betPerVar ) delete it.second; }
+  ~BET() { for ( auto &it: betPerVar ) delete it.second; }
 
   void addBET( Var* var, BETNode *betNode ) { betPerVar[var->getId()] = betNode; }
   void expandNode( BETNode * );
 
   bool reduceLvl( BETNode *, bool );
-  void reduceAll( BETNode * );
+  bool reduceAll( BETNode * );
 
   bool swapPriorities( BETNode *, BETNode * );
   bool reorderPriority( BETNode * );
-  void reorderPriorities( BETNode * );
+  bool reorderPriorities( BETNode * );
 
   void escapePows( BETNode * );
 
@@ -300,9 +300,11 @@ bool BET::reduceLvl( BETNode *node, bool cohort = false ) {
   return true;
 }
 
-void BET::reduceAll( BETNode *root ) {
-  while ( reduceLvl(root, true) );
-  root->getOrRealizeIRType(true);
+bool BET::reduceAll( BETNode *root ) {
+  auto reduced = false;
+  while ( reduceLvl(root, true) ) reduced = true;
+  if ( reduced ) root->getOrRealizeIRType(true);
+  return reduced;
 }
 
 bool BET::swapPriorities( BETNode *root, BETNode *child ) {
@@ -347,8 +349,10 @@ bool BET::reorderPriority( BETNode *node ) {
   return reorderPriority(lc) || reorderPriority(rc);
 }
 
-void BET::reorderPriorities( BETNode *root ) {
-  while ( reorderPriority(root) );
+bool BET::reorderPriorities( BETNode *root ) {
+  auto reordered = false;
+  while ( reorderPriority(root) ) reordered = true;
+  return reordered;
 }
 
 void BET::escapePows( BETNode *node ) {
@@ -465,19 +469,21 @@ bool isArithmeticOperation( Operation op ) { return op == add || op == mul || op
  */
 
 Operation getOperation( CallInstr *callInstr ) {
-  auto *f = util::getFunc(callInstr->getCallee());
+  auto *f        = util::getFunc(callInstr->getCallee());
   auto instrName = f->getName();
+  
   if ( instrName.find(Module::ADD_MAGIC_NAME) != std::string::npos ) return add;
   if ( instrName.find(Module::MUL_MAGIC_NAME) != std::string::npos ) return mul;
   if ( instrName.find(Module::POW_MAGIC_NAME) != std::string::npos ) return pow;
   if ( instrName.find(Module::MATMUL_MAGIC_NAME)  != std::string::npos ) return matmul;
+  
   return noop;
 }
 
 /* BET tree manipulation */
 
 Value *generateExpression(Module *M, BETNode *node) {
-  if (node->isLeaf())
+  if ( node->isLeaf() )
     return node->getVarValue();
 
   auto *lc = node->getLeftChild();
@@ -500,7 +506,7 @@ Value *generateExpression(Module *M, BETNode *node) {
   auto *rop = generateExpression(M, rc);
   assert(rop);
 
-  auto *callIns = util::call(opFunc, {lop, rop});
+  auto *callIns       = util::call(opFunc, {lop, rop});
   assert(callIns);
   auto *actualCallIns = callIns->getActual();
   assert(actualCallIns);
@@ -522,7 +528,8 @@ BETNode *parseArithmetic( CallInstr *callInstr ) {
   }
 
   Operation operation = getOperation(callInstr);
-  auto *betNode = new BETNode();
+  auto *betNode       = new BETNode();
+  
   betNode->setValue(callInstr);
   betNode->setIRType(callInstr->getType());
   betNode->setOperation(operation);
@@ -547,7 +554,8 @@ BETNode *parseArithmetic( CallInstr *callInstr ) {
 std::pair<Value *, BETNode *> minimizeCipherMult( Module *M, Value *instruction, BET *bet ) {
   auto *retIns = cast<ReturnInstr>(instruction);
   if ( retIns ) {
-    retIns->setValue(minimizeCipherMult(M, retIns->getValue(), bet).first);
+    auto ret = minimizeCipherMult(M, retIns->getValue(), bet);
+    retIns->setValue(ret.first);
     return std::make_pair(nullptr, nullptr);
   }
 
@@ -556,7 +564,8 @@ std::pair<Value *, BETNode *> minimizeCipherMult( Module *M, Value *instruction,
     auto *lhs = assIns->getLhs();
     auto *rhs = assIns->getRhs();
     auto transformedInstruction = minimizeCipherMult(M, rhs, bet);
-    if ( transformedInstruction.second ) bet->addBET(lhs->getUsedVariables().front(), transformedInstruction.second);
+    if ( transformedInstruction.second )
+      bet->addBET(lhs, transformedInstruction.second);
     assIns->setRhs(transformedInstruction.first);
     return std::make_pair(nullptr, nullptr);
   }
@@ -564,11 +573,12 @@ std::pair<Value *, BETNode *> minimizeCipherMult( Module *M, Value *instruction,
   auto *callInstr = cast<CallInstr>(instruction);
   if ( callInstr ) {
     if ( isArithmeticOperation(getOperation(callInstr)) ) {
-      auto *betNode = parseArithmetic(callInstr);
+      auto *betNode  = parseArithmetic(callInstr);
       bet->expandNode(betNode);
-      bet->reduceAll(betNode);
-      bet->reorderPriorities(betNode);
-      return std::make_pair(generateExpression(M, betNode), betNode);
+      auto reduced   = bet->reduceAll(betNode);
+      auto reordered = bet->reorderPriorities(betNode);
+      auto *newValue = ( reduced || reordered ? generateExpression(M, betNode) : callInstr);
+      return std::make_pair(newValue, betNode);
     } else {
       std::vector<Value *> newArgs;
       for ( auto arg = callInstr->begin(); arg < callInstr->end(); arg++ )
@@ -584,6 +594,8 @@ std::pair<Value *, BETNode *> minimizeCipherMult( Module *M, Value *instruction,
 void transformExpressions( Module *M, SeriesFlow *series ) {
   auto *bet = new BET();
   for ( auto it = series->begin(); it != series->end(); ++it ) minimizeCipherMult(M, *it, bet);
+  eliminateDeadCode(series);
+  // eliminateRedundance(M, series, bet);
 }
 
 /* IR passes */

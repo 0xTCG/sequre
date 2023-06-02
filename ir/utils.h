@@ -4,16 +4,21 @@ namespace sequre {
 
 using namespace codon::ir;
 
-bool isSequreFunc( Func *f );
-bool isPolyOptFunc( Func *f );
-bool isFactOptFunc( Func *f );
-bool isCipherOptFunc( Func *f );
-bool isSharedTensor( types::Type *t );
-bool isCipherTensor( types::Type *t );
-bool isMPP( types::Type *t );
+bool isSequreFunc( Func * );
+bool isPolyOptFunc( Func * );
+bool isFactOptFunc( Func * );
+bool isCipherOptFunc( Func * );
+bool isSharedTensor( types::Type * );
+bool isCipherTensor( types::Type * );
+bool isMPP( types::Type * );
 
-Func *getOrRealizeSequreInternalMethod( Module *M, std::string const &methodName,
-                                        std::vector<types::Type *> args,
-                                        std::vector<types::Generic> generics);
+Func *getOrRealizeSequreInternalMethod( Module *, std::string const &,
+                                        std::vector<types::Type *>,
+                                        std::vector<types::Generic>);
+
+// Dead code elimination
+void countVarUsage( Value *, std::set<codon::ir::id_t> &, std::set<codon::ir::id_t> & );
+void eliminateDeadAssignments( SeriesFlow *, std::set<codon::ir::id_t> & );
+void eliminateDeadCode( SeriesFlow * );
 
 } // namespace sequre
