@@ -1,5 +1,5 @@
 #include "expr.h"
-#include "utils.h"
+#include "helpers/utils.h"
 #include "codon/cir/util/cloning.h"
 #include "codon/cir/util/irtools.h"
 #include "codon/cir/util/matching.h"

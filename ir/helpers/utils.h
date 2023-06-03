@@ -1,9 +1,12 @@
 #pragma once
 
+#include "enums.h"
+
 namespace sequre {
 
 using namespace codon::ir;
 
+// Secure types helpers
 bool isSequreFunc( Func * );
 bool isPolyOptFunc( Func * );
 bool isFactOptFunc( Func * );
@@ -20,5 +23,9 @@ Func *getOrRealizeSequreInternalMethod( Module *, std::string const &,
 void countVarUsage( Value *, std::set<codon::ir::id_t> &, std::set<codon::ir::id_t> & );
 void eliminateDeadAssignments( SeriesFlow *, std::set<codon::ir::id_t> & );
 void eliminateDeadCode( SeriesFlow * );
+
+// BET helpers
+bool isArithmeticOperation( Operation );
+Operation getOperation( CallInstr * );
 
 } // namespace sequre
