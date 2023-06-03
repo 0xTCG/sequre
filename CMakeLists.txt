@@ -29,8 +29,10 @@ if(xz_ADDED)
 endif()
 
 set(SEQURE_FILES
-    ir/utils.cpp
-    ir/utils.h    
+    ir/helpers/utils.cpp
+    ir/helpers/utils.h
+    ir/helpers/bet.cpp
+    ir/helpers/bet.h
     ir/mhe.cpp
     ir/mhe.h
     ir/mpc.cpp

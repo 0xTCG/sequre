@@ -1,3 +1,4 @@
+#include "enums.h"
 #include "codon/cir/util/irtools.h"
 
 namespace sequre {
@@ -87,6 +88,20 @@ void eliminateDeadCode(SeriesFlow *series) {
   std::set<codon::ir::id_t> whitelist;
   for ( auto it = series->begin(); it != series->end(); ++it ) countVarUsage(*it, whitelist);
   eliminateDeadAssignments(series, whitelist);
+}
+
+bool isArithmeticOperation( Operation op ) { return op == add || op == mul || op == matmul || op == power; }
+
+Operation getOperation( CallInstr *callInstr ) {
+  auto *f        = util::getFunc(callInstr->getCallee());
+  auto instrName = f->getName();
+  
+  if ( instrName.find(Module::ADD_MAGIC_NAME) != std::string::npos ) return add;
+  if ( instrName.find(Module::MUL_MAGIC_NAME) != std::string::npos ) return mul;
+  if ( instrName.find(Module::POW_MAGIC_NAME) != std::string::npos ) return power;
+  if ( instrName.find(Module::MATMUL_MAGIC_NAME)  != std::string::npos ) return matmul;
+  
+  return noop;
 }
 
 } // namespace sequre
