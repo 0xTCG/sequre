@@ -33,10 +33,10 @@ set(SEQURE_FILES
     ir/helpers/utils.h
     ir/helpers/bet.cpp
     ir/helpers/bet.h
+    ir/obsolete/mpc.cpp
+    ir/obsolete/mpc.h
     ir/mhe.cpp
     ir/mhe.h
-    ir/mpc.cpp
-    ir/mpc.h
     ir/expr.cpp
     ir/expr.h
     ir/sequre.cpp

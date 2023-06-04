@@ -1,8 +1,8 @@
 #include "sequre.h"
 #include "expr.h"
-#include "mpc.h"
+#include "obsolete/mpc.h"
 #include "mhe.h"
-// #include "profiler.h"
+// #include "helpers/profiler.h"
 
 namespace sequre {
 
