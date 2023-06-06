@@ -29,6 +29,10 @@ if(xz_ADDED)
 endif()
 
 set(SEQURE_FILES
+    ir/analysis/consecutive_matmul.cpp
+    ir/analysis/consecutive_matmul.h
+    ir/analysis/dead_code.cpp
+    ir/analysis/dead_code.h
     ir/helpers/utils.cpp
     ir/helpers/utils.h
     ir/helpers/bet.cpp

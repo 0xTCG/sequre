@@ -59,7 +59,7 @@ public:
   bool checkIsIntConst()               const { return util::isConst<int64_t>(value); }
   bool checkIsDoubleConst()            const { return util::isConst<double>(value); }
   bool checkIsConst()                  const { return checkIsIntConst() || checkIsDoubleConst(); }
-  bool checkIsTypeable()               const { return checkIsVariable() || checkIsConst(); }
+  bool checkIsTypeable()               const { return bool(value->getType()); }
   bool checkIsSameTree( BETNode * )    const;
   bool checkIsConsecutiveCommutative() const;
   bool checkIsCipherTensor();

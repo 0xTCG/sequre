@@ -9,7 +9,7 @@ namespace sequre {
 
 using namespace codon::ir;
 
-void ExpressivenessTransformations::transform(CallInstr *v) {
+void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
   auto *pf = getParentFunc();
   if ( !isSequreFunc(pf) ) return;
   
@@ -94,6 +94,6 @@ void ExpressivenessTransformations::transform(CallInstr *v) {
   v->replaceAll(func);
 }
 
-void ExpressivenessTransformations::handle(CallInstr *v) { transform(v); }
+void ExpressivenessTransformations::handle( CallInstr *v ) { enableSecurity(v); }
 
 } // namespace sequre

@@ -9,20 +9,26 @@ using namespace codon::ir;
 // Secure types helpers
 bool isSequreFunc( Func * );
 bool isPolyOptFunc( Func * );
-bool isFactOptFunc( Func * );
 bool isCipherOptFunc( Func * );
+bool isMatmulReorderOptFunc ( Func * ); 
+
 bool isSharedTensor( types::Type * );
 bool isCipherTensor( types::Type * );
 bool isMPP( types::Type * );
+bool isMPC( Value *, types::Generic );
 
-Func *getOrRealizeSequreInternalMethod( Module *, std::string const &,
+types::Type *getTupleType( int, types::Type *, Module * );
+types::Type *getTupleType( std::vector<Value *>, Module * );
+Func        *getOrRealizeSequreInternalMethod( Module *, std::string const &,
                                         std::vector<types::Type *>,
-                                        std::vector<types::Generic>);
+                                        std::vector<types::Generic> );
+Func        *getOrRealizeSequreHelper( Module *M, std::string const &,
+                                std::vector<types::Type *>,
+                                std::vector<types::Generic> );
 
-// Dead code elimination
-void countVarUsage( Value *, std::set<codon::ir::id_t> &, std::set<codon::ir::id_t> & );
-void eliminateDeadAssignments( SeriesFlow *, std::set<codon::ir::id_t> & );
-void eliminateDeadCode( SeriesFlow * );
+bool   isCallOfName( const Value *, const std::string & );
+Value *findCallByName ( Value *, const std::string &, std::set<Value *> = {} );
+void   visitAllNodes( Value *, std::set<Value *> & );
 
 // BET helpers
 bool isArithmeticOperation( Operation );

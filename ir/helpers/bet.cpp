@@ -83,10 +83,10 @@ void BETNode::replace( BETNode *other ) {
 types::Type *BETNode::getOrRealizeIRType( bool force ) {
   if ( irType && !force) return irType;
   if ( isLeaf() && checkIsTypeable() ) {
-    irType = getVariable()->getType();
+    irType = value->getType();
     return irType;
   }
-  if ( isLeaf() ) assert( false && "Cannot realize crypto type (leaf is not a variable nor constant)" );
+  if ( isLeaf() ) assert( false && "Cannot realize crypto type (leaf is not typeable)" );
 
   // Realize IR type from children
   auto *lc = getLeftChild();
@@ -149,6 +149,7 @@ void BET::expandNode( BETNode *betNode ) {
   if ( betNode->isExpanded() ) return;
 
   if ( betNode->isLeaf() ) {
+    assert(betNode->checkIsVariable() && "Node needs to be a variable for expansion");
     auto search = betPerVar.find(betNode->getVariableId());
     if ( search != betPerVar.end() ) betNode->replace(search->second);
   } else {
@@ -361,18 +362,6 @@ std::pair<BETNode *, BETNode *> BET::findFactorsInMulTree(
 }
 
 BETNode *parseArithmetic( CallInstr *callInstr ) {
-  if ( callInstr->numArgs() != 2 ) {
-    std::cout << "SEQURE PARSER ERROR: Arithmetic operation is not binary."
-              << "\n\t\tOperation: " << util::getFunc(callInstr->getCallee())->getName()
-              << "\n\t\tArgs:";
-    
-    for ( auto it = callInstr->begin(); it != callInstr->end(); ++it )
-      std::cout << "\n\t\t\t" << (*it)->getType()->getName();
-    
-    std::cout << std::endl;
-    assert(false && "Arithmetics are expected to be binary");
-  }
-
   Operation operation = getOperation(callInstr);
   auto *betNode       = new BETNode();
   
@@ -380,7 +369,10 @@ BETNode *parseArithmetic( CallInstr *callInstr ) {
   betNode->setIRType(callInstr->getType());
   betNode->setOperation(operation);
   
-  if ( !isArithmeticOperation(operation) ) return betNode;
+  if ( !isArithmeticOperation(operation) ) {
+    betNode->setExpanded();
+    return betNode;
+  }
 
   auto *lhs = callInstr->front();
   auto *rhs = callInstr->back();
