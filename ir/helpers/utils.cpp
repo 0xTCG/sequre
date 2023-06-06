@@ -10,16 +10,16 @@ const std::string cipherTensorTypeName = "CipherTensor";
 const std::string MPPTypeName = "MPP";
 
 
-bool isSequreFunc(Func *f) {
+bool isSequreFunc( Func *f ) {
   return bool(f) && util::hasAttribute(f, "std.sequre.attributes.sequre");
 }
 
-bool isPolyOptFunc(Func *f) {
+bool isPolyOptFunc( Func *f ) {
   return bool(f) && util::hasAttribute(f, "std.sequre.attributes.mpc_poly_opt");
 }
 
-bool isFactOptFunc(Func *f) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.mhe_mat_opt");
+bool isMatmulReorderOptFunc( Func *f ) {
+  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.reorder_matmul");
 }
 
 bool isCipherOptFunc( Func *f ) {
@@ -36,6 +36,25 @@ bool isCipherTensor( types::Type *t ) {
 
 bool isMPP( types::Type *t ) {
   return t->getName().find(MPPTypeName) != std::string::npos;
+}
+
+bool isMPC( Value *value, types::Generic generic ) {
+  auto *M = value->getModule();
+  auto *mpcType = M->getOrRealizeType("MPCEnv", { generic }, "std.sequre.mpc.env");
+  assert(mpcType);
+  return value->getType()->is(mpcType);
+}
+
+types::Type *getTupleType( int n, types::Type *elemType, Module *M ) {
+  std::vector<types::Type *> tupleTypes;
+  for (int i = 0; i != n; ++i) tupleTypes.push_back(elemType);
+  return M->getTupleType(tupleTypes);
+}
+
+types::Type *getTupleType( std::vector<Value *> vals, Module *M ) {
+  std::vector<types::Type *> tupleTypes;
+  for ( auto *v : vals ) tupleTypes.push_back(v->getType());
+  return M->getTupleType(tupleTypes);
 }
 
 Func *getOrRealizeSequreInternalMethod( Module *M, std::string const &methodName,
@@ -57,37 +76,50 @@ Func *getOrRealizeSequreInternalMethod( Module *M, std::string const &methodName
   return method;
 }
 
-void countVarUsage( Value *instruction,
-                    std::set<codon::ir::id_t> &whitelist ) {
-
-  for ( auto *usedValue : instruction->getUsedValues() ) {
-    auto *var = util::getVar(usedValue);
-    if ( var ) whitelist.insert(var->getId());
-    else countVarUsage(usedValue, whitelist);
+Func *getOrRealizeSequreHelper( Module *M, std::string const &funcName,
+                                std::vector<types::Type *> args,
+                                std::vector<types::Generic> generics ) {
+  auto *func = M->getOrRealizeFunc(funcName, args, generics, "std.helpers");
+  
+  if ( !func ) {
+    std::cout << "\nSEQURE TYPE REALIZATION ERROR: Could not realize helper func: " << funcName
+              << "\n\tfor parameters ";
+    
+    for (auto arg : args)
+      std::cout << "\n\t\t" << arg->getName();
+              
+    std::cout << std::endl;
   }
   
+  return func;
 }
 
-void eliminateDeadAssignments(SeriesFlow *series, std::set<codon::ir::id_t> &whitelist) {
-  auto it = series->begin();
-  while ( it != series->end() ) {
-    auto *assIns = cast<AssignInstr>(*it);
-    if ( !assIns ) {
-      ++it;
-      continue;
-    }
+bool isCallOfName( const Value *value, const std::string &name ) {
+  if (auto *call = cast<CallInstr>(value)) {
+    auto *fn = util::getFunc(call->getCallee());
+    if ( !fn || call->numArgs() == 0 || fn->getUnmangledName() != name )
+      return false;
 
-    auto *lhsVar = assIns->getLhs();
-    if ( !whitelist.count(lhsVar->getId()) )
-      it = series->erase(it);
-    else ++it;
+    return true;
   }
+
+  return false;
 }
 
-void eliminateDeadCode(SeriesFlow *series) {
-  std::set<codon::ir::id_t> whitelist;
-  for ( auto it = series->begin(); it != series->end(); ++it ) countVarUsage(*it, whitelist);
-  eliminateDeadAssignments(series, whitelist);
+Value *findCallByName ( Value *value, const std::string &name, std::set<Value *> visited = {} ) {
+  if ( visited.count(value) ) return nullptr;
+  if ( isCallOfName(value, name) ) return value;
+
+  for ( auto *usedValue : value->getUsedValues() )
+    if ( auto *foundCall = findCallByName(usedValue, name, visited) )
+      return foundCall;
+  
+  return nullptr;
+}
+
+void visitAllNodes( Value *value, std::set<Value *> &visited ) {
+  visited.insert(value);
+  for ( auto *usedValue : value->getUsedValues() ) visitAllNodes(usedValue, visited);
 }
 
 bool isArithmeticOperation( Operation op ) { return op == add || op == mul || op == matmul || op == power; }

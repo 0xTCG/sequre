@@ -1,6 +1,8 @@
 #include "mhe.h"
 #include "helpers/bet.h"
 #include "helpers/utils.h"
+#include "analysis/consecutive_matmul.h"
+#include "analysis/dead_code.h"
 #include "codon/cir/util/cloning.h"
 #include "codon/cir/util/irtools.h"
 #include "codon/cir/util/matching.h"
@@ -51,20 +53,26 @@ std::pair<Value *, BETNode *> minimizeCipherMult( Module *M, Value *instruction,
   return std::make_pair(instruction, new BETNode(instruction));
 }
 
-void transformExpressions( Module *M, SeriesFlow *series ) {
+void transformExpressions( Module *M, SeriesFlow *series, Value *mpcValue ) {
   auto *bet = new BET();
   for ( auto it = series->begin(); it != series->end(); ++it ) minimizeCipherMult(M, *it, bet);
   eliminateDeadCode(series);
   // eliminateRedundance(M, series, bet);
+  reorderConsecutiveMatmuls(series, mpcValue);
 }
-
-/* IR passes */
 
 void applyCipherPlainOptimizations( CallInstr *v ) {
   auto *M = v->getModule();
   auto *f = util::getFunc(v->getCallee());
   if ( !isCipherOptFunc(f) ) return;
-  transformExpressions(M, cast<SeriesFlow>(cast<BodiedFunc>(f)->getBody()));
+  assert( v->numArgs() > 0 && "Compile error: The first argument of the mhe_cipher_opt annotated function should be the MPC instance (annotated function has no args)" );
+
+  auto *mpcValue = M->Nr<VarValue>(f->arg_front());
+  auto mpcGenerics = mpcValue->getType()->getGenerics();
+  assert( mpcGenerics.size() == 1 && "Compile error: The first argument of the mhe_cipher_opt annotated function should be the MPC instance with one and only one generic type" );
+  assert(  isMPC(mpcValue, mpcGenerics[0]) && "Compile error: The first argument of the mhe_cipher_opt annotated function should be the MPC instance" );
+  
+  transformExpressions(M, cast<SeriesFlow>(cast<BodiedFunc>(f)->getBody()), mpcValue);
 }
 
 void MHEOptimizations::handle( CallInstr *v ) { applyCipherPlainOptimizations(v); }
