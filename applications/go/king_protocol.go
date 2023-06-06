@@ -3,7 +3,6 @@ package king
 import (
 	"fmt"
 	"github.com/BurntSushi/toml"
-	mpc_core "github.com/hhcho/mpc-core"
 	"github.com/hhcho/sfgwas-private/cryptobasics"
 	"github.com/hhcho/sfgwas-private/gwas"
 	"github.com/hhcho/sfgwas-private/libspindle"
@@ -82,7 +81,7 @@ func InitializeKingProtocol(pid int, configFolder string) (relativeProt *KingPro
 }
 
 // KingProtocol computes kinship coefficients among all paiwise values between matrices held by different parties
-func (pi *KingProtocolInfo) KingProtocol() {
+func (pi *KingProtocolInfo) KingProtocol() map[int][][]float64 {
 	log.LLvl1(time.Now(), "Finished Setup")
 
 	pid := pi.Prot.MpcObj[0].GetPid()
@@ -182,32 +181,37 @@ func (pi *KingProtocolInfo) KingProtocol() {
 
 						// after sending the data, this node is ready to help in collective operations (// TODO for more than 2 parties, we will need go routines to not block)
 						log.LLvl1(pid, " sent everything, ready to decrypt for debugging")
-						_ = pi.Prot.MpcObj.GetNetworks()[otherPid].CollectiveDecryptMat(cps, nil, otherPid)
+						_, _ = pi.Prot.MpcObj.GetNetworks()[otherPid].CollectiveDecryptMat(cps, nil, otherPid)
 
 						log.LLvl1(pid, " help for sign test") // TODO function
 						distance := cryptobasics.CZeroMat(cps, len(hetYEncrypted[0]), len(hetYEncrypted))
 						log.LLvl1(pid, ": start minimum computation")
-						concatCvec := mpc_core.RVec{}
+						//concatCvec := mpc_core.RVec{}
 						log.LLvl1(" [DEBUG] start CMatToSS ", pi.Prot.MpcObj[otherPid].GetRType(),
 							distance, otherPid, len(distance), len(distance[0]), allPidsNbrRows[pid])
 						localThresSS := pi.Prot.MpcObj[otherPid].CMatToSS(cps, pi.Prot.MpcObj[otherPid].GetRType(),
 							distance, otherPid, len(distance), len(distance[0]), allPidsNbrRows[pid])
 
-						// TODO function for isPositive on Rmat
-						for l := 0; l < len(localThresSS); l++ {
-							concatCvec = append(concatCvec, localThresSS[l]...)
-						}
-						localThresSSsign := pi.Prot.MpcObj[otherPid].IsPositive(concatCvec)
-						backToRmat := make(mpc_core.RMat, len(distance))
-						for l := 0; l < len(localThresSS); l++ {
-							backToRmat[l] = localThresSSsign[l*allPidsNbrRows[otherPid] : (l+1)*allPidsNbrRows[otherPid]]
-						}
+						//for l := 0; l < len(localThresSS); l++ {
+						//	concatCvec = append(concatCvec, localThresSS[l]...)
+						//}
 
-						log.LLvl1("DEBUG ", pi.Prot.MpcObj[otherPid].RevealSymMat(backToRmat).ToFloat(0))
+						// TODO: there is probably a better way of doing this scaling
+						prec := pi.Prot.MpcObj[0].GetDataBits()
+						testScale := pi.Prot.MpcObj[0].GetRType().Zero().FromFloat64(1.0, prec)
+						backToRmat := pi.Prot.MpcObj[otherPid].IsPositiveMat(localThresSS)
+						backToRmat.MulScalar(testScale)
+						backToRmat = pi.Prot.MpcObj[0].TruncMat(backToRmat, pi.Prot.MpcObj[0].GetDataBits(), pi.Prot.MpcObj[0].GetFracBits())
+						//backToRmat := make(mpc_core.RMat, len(distance))
+						//for l := 0; l < len(localThresSS); l++ {
+						//	backToRmat[l] = localThresSSsign[l*allPidsNbrRows[otherPid] : (l+1)*allPidsNbrRows[otherPid]]
+						//}
+
+						//log.LLvl1("DEBUG ", pi.Prot.MpcObj[otherPid].RevealSymMat(backToRmat).ToFloat(0))
 						_ = pi.Prot.MpcObj[otherPid].SSToCMat(cps, backToRmat)
 
 						log.LLvl1(pid, " finished helping for sign test, ready to decrypt")
-						_ = pi.Prot.MpcObj.GetNetworks()[otherPid].CollectiveDecryptMat(cps, nil, otherPid)
+						_, _ = pi.Prot.MpcObj.GetNetworks()[otherPid].CollectiveDecryptMat(cps, nil, otherPid)
 					}
 				}
 			}
@@ -221,28 +225,35 @@ func (pi *KingProtocolInfo) KingProtocol() {
 			comparingPid, _ := strconv.Atoi(i)
 			distance := cryptobasics.CZeroMat(cps, int(math.Ceil(float64(allPidsNbrRows[comparingPid])/float64(cps.GetSlots()))), allPidsNbrRows[v[0]])
 			log.LLvl1(pid, ": start minimum computation")
-			concatCvec := mpc_core.RVec{}
+			//concatCvec := mpc_core.RVec{}
 			log.LLvl1("[]start CMatToSS ", pi.Prot.MpcObj[comparingPid].GetRType(),
 				distance, comparingPid, len(distance), len(distance[0]), allPidsNbrRows[comparingPid])
 			localThresSS := pi.Prot.MpcObj[comparingPid].CMatToSS(cps, pi.Prot.MpcObj[comparingPid].GetRType(),
 				distance, comparingPid, len(distance), len(distance[0]), allPidsNbrRows[comparingPid])
-			for l := 0; l < len(localThresSS); l++ {
-				concatCvec = append(concatCvec, localThresSS[l]...)
-			}
-			localThresSSsign := pi.Prot.MpcObj[comparingPid].IsPositive(concatCvec)
-			backToRmat := make(mpc_core.RMat, len(distance))
-			for l := 0; l < len(localThresSS); l++ {
-				backToRmat[l] = localThresSSsign[l*allPidsNbrRows[comparingPid] : (l+1)*allPidsNbrRows[comparingPid]]
-			}
-			log.LLvl1("DEBUG ", pi.Prot.MpcObj[comparingPid].RevealSymMat(backToRmat).ToFloat(0))
+			//for l := 0; l < len(localThresSS); l++ {
+			//	concatCvec = append(concatCvec, localThresSS[l]...)
+			//}
+			// TODO: there is probably a better way of doing this scaling
+			testScale := pi.Prot.MpcObj[0].GetRType().Zero().FromFloat64(1.0, pi.Prot.MpcObj[0].GetDataBits())
+			backToRmat := pi.Prot.MpcObj[comparingPid].IsPositiveMat(localThresSS)
+			backToRmat.MulScalar(testScale)
+			backToRmat = pi.Prot.MpcObj[0].TruncMat(backToRmat, pi.Prot.MpcObj[0].GetDataBits(), pi.Prot.MpcObj[0].GetFracBits())
+
+			//localThresSSsign := pi.Prot.MpcObj[comparingPid].IsPositive(concatCvec, true)
+			//backToRmat := make(mpc_core.RMat, len(distance))
+			////for l := 0; l < len(localThresSS); l++ {
+			//	backToRmat[l] = localThresSSsign[l*allPidsNbrRows[comparingPid] : (l+1)*allPidsNbrRows[comparingPid]]
+			//}
+			//log.LLvl1("DEBUG ", pi.Prot.MpcObj[comparingPid].RevealSymMat(backToRmat).ToFloat(0))
 			_ = pi.Prot.MpcObj[comparingPid].SSToCMat(cps, backToRmat)
 			log.LLvl1(pid, " finished helping, ready to decrypt")
-			_ = pi.Prot.MpcObj.GetNetworks()[comparingPid].CollectiveDecryptMat(cps, nil, comparingPid)
+			_, _ = pi.Prot.MpcObj.GetNetworks()[comparingPid].CollectiveDecryptMat(cps, nil, comparingPid)
 		}
 	}
 
 	log.LLvl1("Ready to receive from ", pi.ComparisonMap[strconv.Itoa(pid)])
 
+	comparisonResults := make(map[int][][]float64, 0)
 	for i := 0; i < len(pi.ComparisonMap[strconv.Itoa(pid)]); i++ {
 		otherPid := pi.ComparisonMap[strconv.Itoa(pid)][i]
 		log.LLvl1(pid, " ready to receive Y from ", otherPid)
@@ -317,7 +328,7 @@ func (pi *KingProtocolInfo) KingProtocol() {
 		XSquareEncoded := cryptobasics.EncodeDense(cps, mat.DenseCopyOf(XXOne))
 		distance := cryptobasics.AggregatePMat(cps, []libspindle.CipherMatrix{twoXYT, YSquare}, []libspindle.PlainMatrix{XSquareEncoded})
 
-		distanceDecrypt := pi.Prot.MpcObj[pid].Network.CollectiveDecryptMat(cps, distance, pid)
+		distanceDecrypt, _ := pi.Prot.MpcObj[pid].Network.CollectiveDecryptMat(cps, distance, pid)
 		for d := 0; d < len(distanceDecrypt); d++ {
 			distanceDecode := libspindle.DecodeFloatVector(cps, distanceDecrypt[d])
 			log.LLvl1("localResultDecode : ", distanceDecode[:2*allPidsNbrRows[otherPid]])
@@ -326,7 +337,7 @@ func (pi *KingProtocolInfo) KingProtocol() {
 		// compute minimum between hetX and hetY values for each sample comparison
 		// with secret sharing (maximum of inverses) (here using MHE only might be more efficient)
 		log.LLvl1(pid, ": start minimum computation")
-		concatCvec := mpc_core.RVec{}
+		//concatCvec := mpc_core.RVec{}
 		hetxMinushety := make(libspindle.CipherMatrix, len(Yhet))
 		for h := 0; h < len(Yhet); h++ {
 			hetxMinushety[h] = cryptobasics.CPAdd(cps, Yhet[h], hetxEncoded[h])
@@ -335,15 +346,23 @@ func (pi *KingProtocolInfo) KingProtocol() {
 			hetxMinushety, pid, len(hetxMinushety), len(hetxMinushety[0]), allPidsNbrRows[otherPid])
 		hetxMinushetySS := pi.Prot.MpcObj[pid].CMatToSS(cps, pi.Prot.MpcObj[pid].GetRType(),
 			hetxMinushety, pid, len(hetxMinushety), len(hetxMinushety[0]), allPidsNbrRows[otherPid])
-		for v := 0; v < len(hetxMinushetySS); v++ {
-			concatCvec = append(concatCvec, hetxMinushetySS[v]...)
-		}
-		hetxMinushetySSSSsign := pi.Prot.MpcObj[pid].IsPositive(concatCvec)
-		backToRmat := make(mpc_core.RMat, len(distance))
-		for v := 0; v < len(hetxMinushetySS); v++ {
-			backToRmat[v] = hetxMinushetySSSSsign[v*allPidsNbrRows[otherPid] : (v+1)*allPidsNbrRows[otherPid]]
-		}
-		log.LLvl1("DEBUG ", pi.Prot.MpcObj[pid].RevealSymMat(backToRmat).ToFloat(0))
+
+		// TODO: there is probably a better way of doing this
+		prec := pi.Prot.MpcObj[0].GetDataBits()
+		testScale := pi.Prot.MpcObj[0].GetRType().Zero().FromFloat64(1.0, prec)
+		backToRmat := pi.Prot.MpcObj[pid].IsPositiveMat(hetxMinushetySS)
+		backToRmat.MulScalar(testScale)
+		backToRmat = pi.Prot.MpcObj[0].TruncMat(backToRmat, pi.Prot.MpcObj[0].GetDataBits(), pi.Prot.MpcObj[0].GetFracBits())
+
+		//for v := 0; v < len(hetxMinushetySS); v++ {
+		//	concatCvec = append(concatCvec, hetxMinushetySS[v]...)
+		//}
+		//hetxMinushetySSSSsign := pi.Prot.MpcObj[pid].IsPositive(concatCvec, true)
+		//backToRmat := make(mpc_core.RMat, len(distance))
+		//for v := 0; v < len(hetxMinushetySS); v++ {
+		//	backToRmat[v] = hetxMinushetySSSSsign[v*allPidsNbrRows[otherPid] : (v+1)*allPidsNbrRows[otherPid]]
+		//}
+		//log.LLvl1("DEBUG ", pi.Prot.MpcObj[pid].RevealSymMat(backToRmat).ToFloat(0))
 
 		// minimum between a and b, using sign test result r on (a-b), which return 0 for neg and 1 for pos
 		// --> sign(a-b)*a + ((sign(a-b)-1)*(-b))
@@ -356,20 +375,24 @@ func (pi *KingProtocolInfo) KingProtocol() {
 
 		hetxMinushetySSsign := pi.Prot.MpcObj[pid].SSToCMat(cps, backToRmat)
 
+		//debugMat := make(libspindle.CipherMatrix, len(hetxMinushetySSsign))
 		for s := 0; s < len(hetxMinushetySSsign); s++ {
 			tmp := cryptobasics.CPAdd(cps, hetxMinushetySSsign[s], onesHetEncoded[s])
-			tmp = cryptobasics.CMult(cps, tmp, Yhet[s])
+			tmp2 := cryptobasics.CMult(cps, tmp, Yhet[s])
+			//debugMat[s] = hetxMinushetySSsign[s]
 			hetxMinushetySSsign[s] = cryptobasics.CPMult(cps, hetxMinushetySSsign[s], hetxEncoded[s])
-			hetxMinushetySSsign[s] = cryptobasics.CAdd(cps, hetxMinushetySSsign[s], tmp)
+			hetxMinushetySSsign[s] = cryptobasics.CAdd(cps, hetxMinushetySSsign[s], tmp2)
 			distance[s] = cryptobasics.CMult(cps, hetxMinushetySSsign[s], distance[s])
 		}
 
-		distanceDecrypt = pi.Prot.MpcObj[pid].Network.CollectiveDecryptMat(cps, distance, pid)
+		distanceDecrypt, _ = pi.Prot.MpcObj[pid].Network.CollectiveDecryptMat(cps, distance, pid)
+		decryptedMatrix := make([][]float64, len(distanceDecrypt))
 		for d := 0; d < len(distanceDecrypt); d++ {
 			distanceDecode := libspindle.DecodeFloatVector(cps, distanceDecrypt[d])
-			log.LLvl1("distanceDecrypt FINAL : ", distanceDecode[:2*allPidsNbrRows[otherPid]])
+			decryptedMatrix[d] = distanceDecode[:allPidsNbrRows[otherPid]]
+			//log.LLvl1("distanceDecrypt FINAL : ", distanceDecode[:2*allPidsNbrRows[otherPid]])
 		}
-
+		comparisonResults[otherPid] = decryptedMatrix
 	}
-
+	return comparisonResults
 }

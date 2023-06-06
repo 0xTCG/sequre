@@ -20,11 +20,12 @@ type ProtocolConfig struct {
 
 	divSqrtMaxLen   int `toml:"div_sqrt_max_len"`
 	Servers         map[string]mpc.Server
-	MpcFieldSize    int `toml:"mpc_field_size"`
-	MpcDataBits     int `toml:"mpc_data_bits"`
-	MpcFracBits     int `toml:"mpc_frac_bits"`
-	MpcNumThreads   int `toml:"mpc_num_threads"`
-	LocalNumThreads int `toml:"local_num_threads"`
+	MpcFieldSize    int    `toml:"mpc_field_size"`
+	MpcDataBits     int    `toml:"mpc_data_bits"`
+	MpcFracBits     int    `toml:"mpc_frac_bits"`
+	MpcNumThreads   int    `toml:"mpc_num_threads"`
+	LocalNumThreads int    `toml:"local_num_threads"`
+	BindingIP       string `toml:"binding_ipaddr"`
 }
 
 type ProtocolInfo struct {
@@ -60,7 +61,7 @@ func InitializeProtocol(pid int, configFolder string) (relativeProt *ProtocolInf
 
 	params := ckks.DefaultParams[chosen]
 	prec := uint(config.MpcFieldSize)
-	networks := mpc.ParallelNetworks(mpc.InitCommunication(config.Servers, pid, config.NumMainParties+1, config.MpcNumThreads))
+	networks := mpc.ParallelNetworks(mpc.InitCommunication(config.BindingIP, config.Servers, pid, config.NumMainParties+1, config.MpcNumThreads))
 	for thread := range networks {
 		networks[thread].SetMHEParams(params)
 	}
