@@ -1,5 +1,5 @@
 #include "expr.h"
-#include "utils.h"
+#include "helpers/utils.h"
 #include "codon/cir/util/cloning.h"
 #include "codon/cir/util/irtools.h"
 #include "codon/cir/util/matching.h"
@@ -9,13 +9,13 @@ namespace sequre {
 
 using namespace codon::ir;
 
-void ExpressivenessTransformations::transform(CallInstr *v) {
+void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
   auto *pf = getParentFunc();
-  if (!isSequreFunc(pf))
-    return;
+  if ( !isSequreFunc(pf) ) return;
+  
   auto *f = util::getFunc(v->getCallee());
-  if (!f)
-    return;
+  if ( !f ) return;
+  
   bool isEq     = f->getName().find(Module::EQ_MAGIC_NAME) != std::string::npos;
   bool isGt     = f->getName().find(Module::GT_MAGIC_NAME) != std::string::npos;
   bool isLt     = f->getName().find(Module::LT_MAGIC_NAME) != std::string::npos;
@@ -25,45 +25,48 @@ void ExpressivenessTransformations::transform(CallInstr *v) {
   bool isMatMul = f->getName().find(Module::MATMUL_MAGIC_NAME) != std::string::npos;
   bool isDiv    = f->getName().find(Module::TRUE_DIV_MAGIC_NAME) != std::string::npos;
   bool isPow    = f->getName().find(Module::POW_MAGIC_NAME) != std::string::npos;
-  if (!isEq && !isGt && !isLt && !isAdd && !isSub && !isMul && !isMatMul && !isPow && !isDiv) return;
+  
+  if ( !isEq &&
+       !isGt &&
+       !isLt && 
+       !isAdd && 
+       !isSub && 
+       !isMul && 
+       !isMatMul && 
+       !isPow && 
+       !isDiv )
+    return;
 
-  auto *M = v->getModule();
-  auto *self = M->Nr<VarValue>(pf->arg_front());
+  auto *M        = v->getModule();
+  auto *self     = M->Nr<VarValue>(pf->arg_front());
   auto *selfType = self->getType();
-  auto *lhs = v->front();
-  auto *rhs = v->back();
-  auto *lhsType = lhs->getType();
-  auto *rhsType = rhs->getType();
+  auto *lhs      = v->front();
+  auto *rhs      = v->back();
+  auto *lhsType  = lhs->getType();
+  auto *rhsType  = rhs->getType();
 
   bool isSqrtInv = false;
-  if (isDiv) { // Special case where 1 / sqrt(x) is called
+  if ( isDiv ) { // Special case where 1 / sqrt(x) is called
     auto *sqrtInstr = cast<CallInstr>(rhs);
-    if (sqrtInstr) {
+    if ( sqrtInstr ) {
       auto *sqrtFunc = util::getFunc(sqrtInstr->getCallee());
-      if (sqrtFunc)
+      if ( sqrtFunc )
         isSqrtInv = sqrtFunc->getName().find("sqrt") != std::string::npos;
     }
   }
 
   bool lhs_is_secure_container = isSharedTensor(lhsType) || isCipherTensor(lhsType) || isMPP(lhsType);
   bool rhs_is_secure_container = isSharedTensor(rhsType) || isCipherTensor(rhsType) || isMPP(rhsType);
-
-  if (!lhs_is_secure_container && !rhs_is_secure_container)
-    return;
+  if ( !lhs_is_secure_container && !rhs_is_secure_container ) return;
 
   bool lhs_is_int = lhsType->is(M->getIntType());
   bool rhs_is_int = rhsType->is(M->getIntType());
 
-  if (isMul && lhs_is_int)
-    return;
-  if (isMul && rhs_is_int)
-    return;
-  if (isDiv && lhs_is_int && !isSqrtInv)
-    return;
-  if (isPow && lhs_is_int)
-    return;
-  if (isPow && !rhs_is_int)
-    return;
+  if ( isMul && lhs_is_int ) return;
+  if ( isMul && rhs_is_int ) return;
+  if ( isDiv && lhs_is_int && !isSqrtInv ) return;
+  if ( isPow && lhs_is_int ) return;
+  if ( isPow && !rhs_is_int ) return;
 
   std::string methodName = isEq        ? "secure_eq"
                            : isGt      ? "secure_gt"
@@ -76,19 +79,14 @@ void ExpressivenessTransformations::transform(CallInstr *v) {
                            : isDiv     ? "secure_div"
                            : isPow     ? "secure_pow"
                                        : "invalid_operation";
-  if (isSqrtInv) {
+  if ( isSqrtInv ) {
     rhs = cast<CallInstr>(rhs)->back();
     rhsType = rhs->getType();
   }
 
   auto *method = getOrRealizeSequreInternalMethod(M, methodName, {selfType, lhsType, rhsType}, {});
-  if (!method) {
-    std::cout << "\nSEQURE TYPE REALIZATION ERROR: Could not realize internal method: " << methodName
-              << "\n\tfor parameters "
-              << "\n\t\t" << selfType->getName()
-              << "\n\t\t" << lhsType->getName()
-              << "\n\t\t" << rhsType->getName()
-              << "\n\tcalled within " << pf->getName() << std::endl;
+  if ( !method ) {
+    std::cout << "Called within " << pf->getName() << std::endl;
     return;
   }
 
@@ -96,6 +94,6 @@ void ExpressivenessTransformations::transform(CallInstr *v) {
   v->replaceAll(func);
 }
 
-void ExpressivenessTransformations::handle(CallInstr *v) { transform(v); }
+void ExpressivenessTransformations::handle( CallInstr *v ) { enableSecurity(v); }
 
 } // namespace sequre
