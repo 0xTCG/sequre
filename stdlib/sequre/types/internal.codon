@@ -1,4 +1,4 @@
-import prg
+import prg, secure_operator
 
 from numpy.ndarray import ndarray
 from numpy.create import zeros
@@ -82,23 +82,27 @@ class CipherTensor:
         if mpc.pid != mpc.comms.hub_pid:
             return MPP[S, dtype](
                 modulus=modulus,
+                _ratios=mpc.comms.receive_as_jar(mpc.comms.hub_pid, list[int]),
                 _encryption_unified=mpc.comms.receive_as_jar(mpc.comms.hub_pid, CipherTensor[ctype]))
         
         n = self.shape[0]
         s = ratios.sum()
         assert n % s == 0, f"CipherTensor: Cannot distribute partitions by the given proportion. Shape: {self.shape}. Ratios: {ratios}"
+
+        new_ratios = ratios * (n // s)
         
         for p in range(1, mpc.comms.number_of_parties):
             reference_pid = p - 1
-            k = n // s
-            start = ratios[:reference_pid].sum() * k
-            end = start + ratios[reference_pid] * k
+            start = new_ratios[:reference_pid].sum()
+            end = start + new_ratios[reference_pid]
 
             if p == mpc.comms.hub_pid:
                 _mpp = MPP[S, dtype](
                     modulus=modulus,
+                    _ratios=new_ratios,
                     _encryption_unified=self[start:end])
             else:
+                mpc.comms.send_as_jar(new_ratios, p)
                 mpc.comms.send_as_jar(self[start:end], p)
         
         return _mpp
@@ -108,13 +112,16 @@ class CipherTensor:
 class MPP:
     def to_mpc(self, mpc) -> SharedTensor:
         if mpc.pid == 0:
-            return SharedTensor(zeros(self.shape, dtype=dtype).tolist().to_int_t(), self.modulus)
+            return SharedTensor(zeros(self.shape, dtype=dtype).tolist().to_int_t(self.modulus), self.modulus)
         return self.collect(mpc).to_mpc(mpc, self.modulus, dtype=dtype)
 
 
 class InternalMPC:
     def evalp(mpc, x_, coefs_, exps_):
-        assert isinstance(x_, SharedTensor), "Secure polynomial evaluation is enabled only for SharedTensor"
+        assert isinstance(x_[0], SharedTensor), "Secure polynomial evaluation is enabled only for SharedTensor"
+        for x in x_:
+            assert not x.fp, "Not implemented error: Polynomial evaluation is not implemented for fixed-point numbers yet"
+        modulus = x_[0].modulus
         
         x_r = []
         r = []
@@ -124,14 +131,13 @@ class InternalMPC:
             x_r.append(x_r_)
             r.append(r_)
 
-        coefs = [int_t(coefs_[i])
-                    for i in range(len(coefs_))]
+        coefs = [coefs_[i].to_int_t(modulus) for i in range(len(coefs_))]
         exps = [[exps_[i + j] for j in range(len(x_))]
                 for i in range(0, len(exps_), len(x_))]
         
         result = mpc.polynomial._beaver_evaluate_poly(
-            x_r, r, coefs, exps, x_[0].modulus)
-        sv = SharedTensor(result, x_[0].modulus)
+            x_r, r, coefs, exps, modulus)
+        sv = SharedTensor(result, modulus)
         sv.fp = x_[0].is_fp()
         
         # TODO: #23 Handle sqrts and partitions
@@ -432,7 +438,7 @@ class InternalMPC:
             rows, cols = shape
             gaussian = [[double_to_fp(prg.gauss(*params), modulus) if mpc.pid == 0 else TP(0)
                         for _ in range(cols)] for _ in range(rows)]
-            gaussian = mpc.comms.share(gaussian, modulus)
+            gaussian = mpc.comms.share_from_trusted_dealer(gaussian, modulus)
 
             stensor = SharedTensor(gaussian, modulus)
             stensor.fp = True
@@ -507,15 +513,16 @@ class InternalMHE:
 
 class InternalMPP:
     def add(mpc, x, y):
-        return x._do_elem_wise_op(mpc, y, MPP._elem_wise_add)
+        return x._do_elem_wise_op(mpc, y, secure_operator.add)
 
     def sub(mpc, x, y):
-        return x._do_elem_wise_op(mpc, y, MPP._elem_wise_sub)
+        return x._do_elem_wise_op(mpc, y, secure_operator.sub)
     
     def mul(mpc, x, y):
-        return x._do_elem_wise_op(mpc, y, MPP._elem_wise_mul)
+        return x._do_elem_wise_op(mpc, y, secure_operator.mul)
 
     def matmul(mpc, x, y):
+        mpc.stats.secure_matmul_complexity += (x.cohort_shape[0] * x.cohort_shape[1] * y.cohort_shape[1])
         return MPP.matmul(mpc, x, y)
     
     def gt(mpc, x, y):
@@ -552,6 +559,7 @@ class InternalMPP:
 
 class Internal:
     def secure_add(mpc, x, y):
+        mpc.stats.secure_add_count += 1
         if isinstance(x, MPP) or isinstance(y, MPP):
             return InternalMPP.add(mpc, x, y)
         elif isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
@@ -561,6 +569,7 @@ class Internal:
         else: compile_error("Invalid secure operands")
 
     def secure_sub(mpc, x, y):
+        mpc.stats.secure_sub_count += 1
         if isinstance(x, MPP) or isinstance(y, MPP):
             return InternalMPP.sub(mpc, x, y)
         elif isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
@@ -570,6 +579,7 @@ class Internal:
         else: compile_error("Invalid secure operands")
 
     def secure_mul(mpc, x, y):
+        mpc.stats.secure_mul_count += 1
         if isinstance(x, MPP) or isinstance(y, MPP):
             return InternalMPP.mul(mpc, x, y)
         elif isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
@@ -579,6 +589,7 @@ class Internal:
         else: compile_error("Invalid secure operands")
     
     def secure_matmul(mpc, x, y):
+        mpc.stats.secure_matmul_count += 1
         return Internal.matmul(mpc, x, y)
 
     def secure_pow(mpc, x_, p):
@@ -627,7 +638,6 @@ class Internal:
         return InternalMPC.sqrt_inv(mpc, x, y)
     
     def secure_evalp(mpc, x_, coefs_, exps_):
-        assert isinstance(x_, SharedTensor), "Secure polynomial evaluation is enabled only for SharedTensor"
         return InternalMPC.evalp(mpc, x_, coefs_, exps_)
 
     def dot(mpc, x, y):

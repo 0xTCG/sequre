@@ -9,6 +9,7 @@ from ..utils.param import *
 from ..utils.utils import shapeof
 from ..types.utils import fp_to_double
 
+from stats import MPCStats
 from randomness import MPCRandomness
 from ..network.socket import CSocket
 from ..network.connect import open_channel, connect
@@ -19,8 +20,7 @@ class MPCComms[TP]:
     pid: int
     hub_pid: int
     sockets: dict[int, CSocket]
-    bytes_sent: int
-    requests_sent: int
+    stats: MPCStats
     randomness: MPCRandomness
     local: bool
     number_of_parties: int
@@ -28,19 +28,19 @@ class MPCComms[TP]:
     def __init__(self: MPCComms[TP], randomness: MPCRandomness, local: bool, expect_data_sharing: bool):
         self.pid = randomness.pid
         self.hub_pid = 1
+        self.stats = randomness.stats
         self.randomness = randomness
         self.local = local
         self.sockets = dict[int, CSocket]()
-        self.bytes_sent = 0
-        self.requests_sent = 0
 
         self.__setup_channels(expect_data_sharing)
         self.number_of_parties = len(self.sockets) + 1
+        self.reset_stats()
 
     def send[CT](self: MPCComms[TP], data: CT, to_pid: int) -> int:
         bytes_sent = send_to_socket(self.sockets[to_pid], data)
-        self.bytes_sent += bytes_sent
-        self.requests_sent += 1
+        self.stats.bytes_sent += bytes_sent
+        self.stats.requests_sent += 1
         return bytes_sent
     
     def receive[T](self, from_pid: int, shape = False):
@@ -75,23 +75,32 @@ class MPCComms[TP]:
         received_jar = receive_jar(self.sockets[from_pid].sock_fd, msg_len)
         return unpickle(received_jar, False, T)
     
-    def share(self, value, modulus):
-        if self.pid == 0:
-            self.randomness.switch_seed(1)
-            r = value.rand(modulus)
-            self.randomness.restore_seed(1)
+    def share_from(self, data, source_pid: int, modulus):
+        from_dealer = source_pid == 0
 
-            blinded_value = value.sub_mod(r, modulus)
+        if self.pid == source_pid:
+            r = data.zeros()
+            
+            for p in range(2 if from_dealer else 1, self.number_of_parties):
+                if p != source_pid:
+                    with self.randomness.seed_switch(p):
+                        r += data.rand(modulus)
 
-            self.send(blinded_value, 2)
-            return value.zeros()
-        elif self.pid == 2:
-            return self.receive(0, shapeof(value), T=type(modulus))
+            blinded_data = data.sub_mod(r, modulus)
+
+            if from_dealer:
+                self.send_as_jar(blinded_data, 1)
+                return data.zeros()
+
+            return blinded_data
+        elif self.pid == 1 and from_dealer:
+            return self.receive_as_jar(0, T=type(data))
         else:
-            self.randomness.switch_seed(0)
-            r = value.rand(modulus)
-            self.randomness.restore_seed(0)
-            return r
+            with self.randomness.seed_switch(source_pid):
+                return data.rand(modulus)
+    
+    def share_from_trusted_dealer(self, data, modulus):
+        return self.share_from(data, 0, modulus)
 
     def reveal(self, value, modulus):
         if self.pid == 0:
@@ -188,14 +197,14 @@ class MPCComms[TP]:
 
     def sync_parties(self: MPCComms[TP], control_elem = 1):
         if (self.pid == 0):
-            from_1 = self.receive(1, T=type(control_elem))
-            from_2 = self.receive(2, T=type(control_elem))
+            from_1 = self.receive_as_jar(1, T=type(control_elem))
+            from_2 = self.receive_as_jar(2, T=type(control_elem))
             if DEBUG: assert from_1 == from_2 == control_elem
-            self.send(from_1, 1)
-            self.send(from_2, 2)
+            self.send_as_jar(from_1, 1)
+            self.send_as_jar(from_2, 2)
         else:
-            self.send(control_elem, 0)
-            return_elem = self.receive(0, T=type(control_elem))
+            self.send_as_jar(control_elem, 0)
+            return_elem = self.receive_as_jar(0, T=type(control_elem))
             if DEBUG: assert return_elem == control_elem
     
     def clean_up(self: MPCComms[TP]):
@@ -203,15 +212,10 @@ class MPCComms[TP]:
             close_socket(socket.sock_fd)
     
     def print_stats(self: MPCComms[TP], file_stream = None):
-        bandwidth_message = f'Total bytes sent from CP{self.pid}: {self.bytes_sent}.'
-        requests_message = f'Total send requests at CP{self.pid}: {self.requests_sent}.'
-        if file_stream is not None:
-            file_stream.write(f'{bandwidth_message}\n{requests_message}\n')
-        print(f'{bandwidth_message}\n{requests_message}')
+        self.stats.print_comms_stats(file_stream)
     
     def reset_stats(self: MPCComms[TP]):
-        self.bytes_sent = 0
-        self.requests_sent = 0
+        self.stats.reset_comms_stats()
     
     def print_fp(self, value, modulus, debug = False, message = ""):
         if self.pid == 0:

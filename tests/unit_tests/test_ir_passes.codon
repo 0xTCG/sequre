@@ -1,0 +1,212 @@
+import secure_operator
+
+from numpy.create import array
+
+from sequre import sequre, mpc_poly_opt, mhe_cipher_opt
+from sequre.mpc.env import MPCEnv
+from sequre.lattiseq.ckks import Ciphertext, Plaintext
+from sequre.types.shared_tensor import SharedTensor
+from sequre.types.cipher_tensor import CipherTensor
+from sequre.types.multiparty_partition import MPP
+from sequre.utils.io import write_ndarray, read_ndarray
+from sequre.utils.utils import __rand_mat
+from sequre.utils.param import FIELD_SIZE, RING_SIZE
+
+from ..utils import assert_eq, assert_eq_approx, random_floats, random_ints
+
+
+@mpc_poly_opt
+def sequre_poly_foo(mpc, a, b, c):
+    d = (a + b) * a
+    e = d ** 2 * c
+    f = e * c * b
+    return f
+
+
+def classic_poly_foo(a, b, c):
+    # TODO: Check for types in mpc_poly_opt to enable running sequre_poly_foo on top of raw data
+    d = (a + b) * a
+    e = d ** 2 * c
+    f = e * c * b
+    return f
+
+
+@sequre
+@mhe_cipher_opt
+def cipher_plain_foo(mpc, a, b, c, d):
+    return a * c + a * d + b * c + b * d
+
+
+@sequre
+@mhe_cipher_opt
+def cipher_plain_foo_split(mpc, a, b, c, d):
+    e = a * c + a * d
+    f = b * c + b * d
+    return e + f
+
+
+@sequre
+@mhe_cipher_opt
+def cipher_plain_foo_redundant(mpc, a, b, c, d):
+    # Forcing redundancy of (c + d)
+    e = a * (c + d)
+    f = b * (c + d)
+    h = secure_operator.identity(e)  # Force usage of variable e to avoid code elimination
+    return h + f
+
+
+@sequre
+@mhe_cipher_opt
+def matmul_foo(mpc, a, b, c):
+    b_t = b.T
+    return a @ (b_t @ c)
+
+
+@sequre
+@mhe_cipher_opt
+def cipher_plain_reorder_foo(mpc, a, b, c, d):
+    return a * b + a * c + a * d
+
+
+def test_mpc_poly_opt[TP](mpc: MPCEnv[TP], modulus: TP):
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    print(f'CP{mpc.pid}:\tTesting MPC polynomial optimization pass on {alg_struct} ... \n')
+    size = 1
+
+    with mpc.randomness.seed_switch(-1):
+        values_a = random_ints((size,))[0]
+        values_b = random_ints((size,))[0]
+        values_c = random_ints((size,))[0]
+    
+    stensor_a = SharedTensor.enc(mpc, values_a, 0, modulus)
+    stensor_b = SharedTensor.enc(mpc, values_b, 0, modulus)
+    stensor_c = SharedTensor.enc(mpc, values_c, 0, modulus)
+
+    mpc.arithmetic.reset_stats()
+    classic_result = classic_poly_foo(values_a, values_b, values_c)
+    sequre_result = sequre_poly_foo(mpc, stensor_a, stensor_b, stensor_c)
+
+    if mpc.pid:
+        assert_eq_approx(f'CP{mpc.pid}:\tMPC polynomial optimization IR pass: correctness on {alg_struct}', sequre_result.print(mpc), classic_result.to_float())
+        assert_eq_approx(f'CP{mpc.pid}:\tMPC polynomial optimization IR pass: Beaver partitions count on {alg_struct}', mpc.stats.partitions_count, 3)
+
+
+def test_mhe_cipher_opt(mpc, msg):
+    print(f'CP{mpc.pid}:\tTesting MHE cipher-plain optimization pass on Ciphertensors ({msg}) ... \n')
+    rows, cols = 4, 32
+
+    with mpc.randomness.seed_switch(-1):
+        values_a = random_floats((rows, cols))
+        values_b = random_floats((rows, cols))
+        values_c = random_floats((rows, cols))
+        values_d = random_floats((rows, cols))
+    
+    ctensor_a = CipherTensor[Ciphertext].enc(mpc, values_a)
+    ctensor_b = CipherTensor[Ciphertext].enc(mpc, values_b)
+    ctensor_c = CipherTensor[Ciphertext].enc(mpc, values_c)
+    ctensor_d = CipherTensor[Ciphertext].enc(mpc, values_d)
+
+    mpc.stats.reset_security_stats()
+    if msg == "compact":
+        sequre_result = cipher_plain_foo(mpc, ctensor_a, ctensor_b, ctensor_c, ctensor_d)
+    elif msg == "split":
+        sequre_result = cipher_plain_foo_split(mpc, ctensor_a, ctensor_b, ctensor_c, ctensor_d)
+    # elif msg == "redundant":
+    #     sequre_result = cipher_plain_foo_redundant(mpc, ctensor_a, ctensor_b, ctensor_c, ctensor_d)
+    else:
+        raise ValueError("Invalid evaluator")
+
+    expected_mul_count = 2 if msg == "redundant" else 1
+    expected_add_count = 2
+    
+    if mpc.pid:
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization IR pass on Ciphertensors ({msg}): correctness', sequre_result.reveal(mpc, T=float).tolist(), (values_a + values_b) * (values_c + values_d))
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization IR pass on Ciphertensors ({msg}): multiplications count', mpc.stats.secure_mul_count, expected_mul_count)
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization IR pass on Ciphertensors ({msg}): additions count', mpc.stats.secure_add_count, expected_add_count)
+
+
+def test_mhe_cipher_reorder_opt(mpc):
+    print(f'CP{mpc.pid}:\tTesting MHE cipher-plain-reorder optimization pass on Ciphertensors ... \n')
+    rows, cols = 4, 32
+
+    with mpc.randomness.seed_switch(-1):
+        values_a = random_floats((rows, cols))
+        values_b = random_floats((rows, cols))
+        values_c = random_floats((rows, cols))
+        values_d = random_floats((rows, cols))
+    
+    ctensor_a = CipherTensor[Ciphertext].enc(mpc, values_a)
+    ctensor_b = CipherTensor[Ciphertext].enc(mpc, values_b)
+    ctensor_c = CipherTensor[Plaintext].enc(mpc, values_c)
+    ctensor_d = CipherTensor[Plaintext].enc(mpc, values_d)
+
+    mpc.stats.reset_security_stats()
+    sequre_result = cipher_plain_reorder_foo(mpc, ctensor_a, ctensor_b, ctensor_c, ctensor_d)
+
+    if mpc.pid:
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain-reorder optimization IR pass on Ciphertensors: correctness', sequre_result.reveal(mpc, T=float).tolist(), values_a * (values_b + values_c + values_d))
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain-reorder optimization IR pass on Ciphertensors: multiplications count', mpc.stats.secure_mul_count, 1)
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain-reorder optimization IR pass on Ciphertensors: additions count', mpc.stats.secure_add_count, 2)
+
+
+def test_mhe_mpp_opt(mpc, modulus):
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    print(f'CP{mpc.pid}:\tTesting MHE cipher-plain optimization pass on MPPs on {alg_struct} ... \n')
+    rows, cols = 4, 32
+    a_partition_path = "tests/data/mhe/a_partition.bin"
+    b_partition_path = "tests/data/mhe/b_partition.bin"
+    c_partition_path = "tests/data/mhe/c_partition.bin"
+    d_partition_path = "tests/data/mhe/d_partition.bin"
+
+    mpc.comms.sync_parties()
+    if mpc.pid == 0:
+        with open(a_partition_path, "wb") as f: write_ndarray(f, array(__rand_mat([rows, cols], 100, TP=int)), binary=True)
+        with open(b_partition_path, "wb") as f: write_ndarray(f, array(__rand_mat([rows, cols], 100, TP=int)), binary=True)
+        with open(c_partition_path, "wb") as f: write_ndarray(f, array(__rand_mat([rows, cols], 100, TP=int)), binary=True)
+        with open(d_partition_path, "wb") as f: write_ndarray(f, array(__rand_mat([rows, cols], 100, TP=int)), binary=True)
+    mpc.comms.sync_parties()
+        
+    a_partition = read_ndarray(open(a_partition_path), (rows, cols), True, dtype=int)
+    b_partition = read_ndarray(open(b_partition_path), (rows, cols), True, dtype=int)
+    c_partition = read_ndarray(open(c_partition_path), (rows, cols), True, dtype=int)
+    d_partition = read_ndarray(open(d_partition_path), (rows, cols), True, dtype=int)
+
+    raw_a = [a_partition for _ in range(mpc.comms.number_of_parties - 1)].unfence()
+    raw_b = [b_partition for _ in range(mpc.comms.number_of_parties - 1)].unfence()
+    raw_c = [c_partition for _ in range(mpc.comms.number_of_parties - 1)].unfence()
+    raw_d = [d_partition for _ in range(mpc.comms.number_of_parties - 1)].unfence()
+
+    mpp_a = MPP.collective_load(mpc, a_partition_path, rows=rows, cols=cols, binary=True, modulus=modulus, dtype=int)
+    mpp_b = MPP.collective_load(mpc, b_partition_path, rows=rows, cols=cols, binary=True, modulus=modulus, dtype=int)
+    mpp_c = MPP.collective_load(mpc, c_partition_path, rows=rows, cols=cols, binary=True, modulus=modulus, dtype=int)
+    mpp_d = MPP.collective_load(mpc, d_partition_path, rows=rows, cols=cols, binary=True, modulus=modulus, dtype=int)
+
+    mpc.stats.reset_security_stats()
+    sequre_result = cipher_plain_foo(mpc, mpp_a, mpp_b, mpp_c, mpp_d)
+
+    if mpc.pid:
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization IR pass on MPPs on {alg_struct}: correctness', sequre_result.reveal(mpc), (raw_a + raw_b) * (raw_c + raw_d))
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization IR pass on MPPs on {alg_struct}: multiplications count', mpc.stats.secure_mul_count, 1)
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization IR pass on MPPs on {alg_struct}: additions count', mpc.stats.secure_add_count, 2)
+
+    mpc.stats.reset_security_stats()
+    sequre_result = matmul_foo(mpc, mpp_a, mpp_b, mpp_c)
+
+    if mpc.pid:
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE matmul reorder optimization IR pass on MPPs on {alg_struct}: correctness', sequre_result.reveal(mpc), raw_a @ raw_b.T @ raw_c)
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE matmul reorder optimization IR pass on MPPs on {alg_struct}: multiplications complexity', mpc.stats.secure_matmul_complexity, 4096)
+
+
+def test_ir_passes[TP](mpc: MPCEnv[TP]):
+    print(f'CP{mpc.pid}:\tTesting IR passes ... \n')
+
+    test_mpc_poly_opt(mpc, FIELD_SIZE)
+    test_mpc_poly_opt(mpc, RING_SIZE)
+    test_mhe_cipher_opt(mpc, "compact")
+    test_mhe_cipher_opt(mpc, "split")
+    # test_mhe_cipher_opt(mpc, "redundant")
+    test_mhe_cipher_reorder_opt(mpc)
+    test_mhe_mpp_opt(mpc, FIELD_SIZE)
+    test_mhe_mpp_opt(mpc, RING_SIZE)
+
+    print(f'CP{mpc.pid}:\tIR passes passed.\n')
