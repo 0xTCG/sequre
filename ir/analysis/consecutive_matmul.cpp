@@ -6,17 +6,15 @@ namespace sequre {
 using namespace codon::ir;
 
 void parseConsecutiveMatmulArgs( Value *instruction, std::vector<Value *> &args ) {
+    // This procedure assumes that instruction is a consecutive matmul
     auto usedValues = instruction->getUsedValues();
 
     for ( auto i = 0; i < 2; ++i ) {
         auto *usedValue = usedValues[i];
-        if ( util::getVar(usedValue) ) args.push_back(usedValue);
-        else if ( isCallOfName(usedValue, Module::MATMUL_MAGIC_NAME) )
+        if ( isCallOfName(usedValue, Module::MATMUL_MAGIC_NAME) )
             parseConsecutiveMatmulArgs(usedValue, args);
-        else { // Not a consecutive matmul, abort
-            args.clear();
-            return;
-        }
+        else
+            args.push_back(usedValue);
     }
 }
 
@@ -36,10 +34,8 @@ bool transformSingleOrderedMatmul( Value *instruction, std::set<Value *> &visite
     std::vector<Value *> matmulArgs;
     parseConsecutiveMatmulArgs( matmulInstruction, matmulArgs);
 
-    if ( matmulArgs.empty() || matmulArgs.size() > 10 ) {
-        // No consecutive matrices found or
-        // too many matrices to optimize
-        // (until we implement faster matmul_reordering below in Codon)
+    if ( matmulArgs.empty() ) {
+        // No consecutive matrices found
         visitAllNodes(matmulInstruction, visited);
         return transformSingleOrderedMatmul(instruction, visited, mpcValue);
     }
