@@ -156,6 +156,13 @@ class CipherTensor[ctype]:
     def mask(self, mpc, i: int) -> CipherTensor[ctype]:
         assert self.ndim == 1, "CipherTensor: Only one-dimensional CipherTensors can be masked."
         return self.mul(mpc, array(one_hot_vector(i, self.shape[0], TP=float)))
+    
+    def mask(self, mpc, mask: CipherTensor, trim: int = 0) -> CipherTensor[ctype]:
+        assert self.shape == mask.shape, "CipherTensor: Mask shape mismatch"
+        assert trim < self.shape[-1], "CipherTensor: Cannot trim more than len of ciphertensor"
+        ct = self.mul(mpc, mask)
+        ct.shape[-1] -= trim
+        return ct
 
     @staticmethod
     def _count(shape):
@@ -414,18 +421,19 @@ class CipherTensor[ctype]:
             slots=self.slots,
             _transposed=self._transposed)
 
-    def reduce_add(self, mpc, new_size: int) -> CipherTensor[ctype]:
+    def reduce_add(self, mpc, new_size: int = 0) -> CipherTensor[ctype]:
         assert self.ndim == 1, "CipherTensor: Addition reduction can be applied only to 1-dimensional tensors"
 
+        size = new_size if new_size else self.shape[-1]
         if isinstance(ctype, Plaintext):
             # TODO: Read dtype (T) from other (add dtype static to CipherTensor class)
             _sum: float = self.decode(mpc, T=float).sum()
-            return CipherTensor[Plaintext].enc(mpc, [_sum for _ in range((new_size + self.slots - 1) // self.slots)])
+            return CipherTensor[Plaintext].enc(mpc, [_sum for _ in range(size)])
 
         assert not self._transposed, "Ciphertensor: Addition reduction of transposed ciphertensor is not implemented yet"
         return CipherTensor[ctype](
             _data=mpc.he.reduce_add(self._data, self.shape[-1], new_size),
-            shape=[new_size],
+            shape=[size],
             slots=self.slots)
     
     def matmul(self, mpc, other, debug=True):
@@ -474,24 +482,26 @@ class CipherTensor[ctype]:
         M1 method from https://arxiv.org/pdf/2304.00129.pdf
         """
         if debug: print("Using M1 method for ciphertensor matrix multiplication")
-        assert self.shape[1] == other.shape[1], f"CipherTensor: Invalid matrix dimentions for M1 matmul {self.shape} x {other.shape}"
+        self_shape = self.shape
+        other_shape = other.shape
+        assert self_shape[1] == other_shape[1], f"CipherTensor: Invalid matrix dimentions for M1 matmul {self_shape} x {other_shape}"
         assert other._transposed, "CipherTensor: Ciphertensor should be lazily transposed prior to M1 matrix multiplication by it"
 
         if isinstance(ctype, Plaintext) and isinstance(other.ctype, Plaintext):
             # TODO: Read dtype (T) from other (add dtype static to CipherTensor class)
             return CipherTensor[Plaintext].enc(mpc, self.decode(mpc, T=float) @ other.decode(mpc, T=float).T)
 
-        masks = CipherTensor[Plaintext].enc(mpc, [one_hot_vector(i, other.shape[0], TP=float) for i in range(other.shape[0])])
+        masks = CipherTensor[Plaintext].enc(mpc, [one_hot_vector(i, other_shape[1], TP=float) for i in range(other_shape[0])])
         
         new_cipher_tensor = CipherTensor[Ciphertext](
-                shape=[0, other.shape[0]],
+                shape=[0, other_shape[0]],
                 slots=self.slots)
-        for i in range(self.shape[0]):
-            new_row = CipherTensor[Ciphertext].zeros(mpc, [other.shape[0]])
+        for i in range(self_shape[0]):
+            new_row = CipherTensor[Ciphertext].zeros(mpc, [other_shape[0]])
 
-            for j in range(other.shape[0]):
-                new_row.iadd(mpc, self[i].mul(mpc, other[j]).reduce_add(mpc, new_size=other.shape[0]).mul(mpc, masks[j]))
-                if debug: print(f"CipherTensor M1 matmul: {i + 1}/{self.shape[0]} -- {j + 1}/{other.shape[0]}")
+            for j in range(other_shape[0]):
+                new_row.iadd(mpc, self[i].mul(mpc, other[j]).reduce_add(mpc).mask(mpc, masks[j], other_shape[1] - other_shape[0]))
+                if debug: print(f"CipherTensor M1 matmul: {i + 1}/{self_shape[0]} -- {j + 1}/{other_shape[0]}")
             if debug: print("----------------------")
             
             new_cipher_tensor.append(new_row)
@@ -503,21 +513,23 @@ class CipherTensor[ctype]:
         M2 method from https://arxiv.org/pdf/2304.00129.pdf
         """
         if debug: print("Using M2 method for ciphertensor matrix multiplication")
-        assert self.shape[1] == other.shape[0], f"CipherTensor: Invalid matrix dimentions for M2 matmul {self.shape} x {other.shape}"
+        self_shape = self.shape
+        other_shape = other.shape
+        assert self_shape[1] == other_shape[0], f"CipherTensor: Invalid matrix dimentions for M2 matmul {self_shape} x {other_shape}"
         assert not other._transposed, "CipherTensor: Ciphertensor should not be lazily transposed prior to M2 matrix multiplication by it"
 
         if isinstance(ctype, Plaintext) and isinstance(other.ctype, Plaintext):
             # TODO: Read dtype (T) from other (add dtype static to CipherTensor class)
             return CipherTensor[Plaintext].enc(mpc, self.decode(mpc, T=float) @ other.decode(mpc, T=float))
 
-        new_cipher_tensor = CipherTensor[ctype].zeros(mpc, [self.shape[0], other.shape[1]])
+        new_cipher_tensor = CipherTensor[ctype].zeros(mpc, [self_shape[0], other_shape[1]])
 
-        for i in range(self.shape[0]):
-            if debug: print(f"CipherTensor M2 matmul: Computing row {i + 1}/{self.shape[0]} ...")
+        for i in range(self_shape[0]):
+            if debug: print(f"CipherTensor M2 matmul: Computing row {i + 1}/{self_shape[0]} ...")
             new_row = new_cipher_tensor[i]
             self_row = self[i]
-            for j in range(self.shape[1]):
-                other_elem_duplicated = self_row.getitemdup(mpc, j, other.shape[1])
+            for j in range(self_shape[1]):
+                other_elem_duplicated = self_row.getitemdup(mpc, j, other_shape[1])
                 new_row.iadd(mpc, other[j].mul(mpc, other_elem_duplicated))
         
         return new_cipher_tensor
