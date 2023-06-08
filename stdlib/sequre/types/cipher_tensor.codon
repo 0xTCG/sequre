@@ -96,7 +96,7 @@ class CipherTensor[ctype]:
     def T(self) -> CipherTensor[ctype]:
         return CipherTensor[ctype](
             _data=self._data.copy(),
-            shape=self.shape,
+            shape=self.shape.copy(),
             slots=self.slots,
             _chunk_size=self._chunk_size,
             _transposed=self._transposed ^ True)
@@ -151,18 +151,44 @@ class CipherTensor[ctype]:
 
     def getitemdup(self, mpc, i: int, new_size: int) -> CipherTensor[ctype]:
         assert self.ndim == 1, "CipherTensor: getitemdup can be only from one-dimensional CipherTensor."
-        return self.mask(mpc, i).reduce_add(mpc, new_size)
+        _data = []
+        
+        target_cipher_idx = i // self.slots
+        target_offset = i % self.slots
+        mask = mpc.he.enc_vector(one_hot_vector(target_offset, self.slots, TP=float), T=Plaintext)
+        dedup_single = mpc.he.mul([self._data[target_cipher_idx]], mask)[0]
+
+        ciphers_count = self.cipher_shape[-1]
+        if ciphers_count > 1:
+            dedup_base = dedup_single.copy()
+            mpc.he.crypto_params.evaluator.reduce_add(dedup_base, self.slots)
+        
+            for _ in range(ciphers_count - 1):
+                _data.append(dedup_base.copy())
+
+        new_size_offset = new_size % self.slots
+        if new_size_offset:
+            dedup_edge = dedup_single.copy()
+            distance = target_offset - new_size_offset + 1
+            initial_rotation = distance if distance > 0 else (self.slots + distance)
+            mpc.he.rotate_inplace([dedup_edge], initial_rotation)
+            mpc.he.crypto_params.evaluator.reduce_add(dedup_edge, new_size_offset)
+            _data.append(dedup_edge)
+        elif len(_data):
+            _data.append(_data[-1].copy())
+        elif new_size:
+            dedup_base = dedup_single.copy()
+            mpc.he.crypto_params.evaluator.reduce_add(dedup_base, self.slots)
+            _data.append(dedup_base)
+        
+        return CipherTensor[ctype](
+            _data=_data,
+            shape=[new_size],
+            slots=self.slots)
     
     def mask(self, mpc, i: int) -> CipherTensor[ctype]:
         assert self.ndim == 1, "CipherTensor: Only one-dimensional CipherTensors can be masked."
         return self.mul(mpc, array(one_hot_vector(i, self.shape[0], TP=float)))
-    
-    def mask(self, mpc, mask: CipherTensor, trim: int = 0) -> CipherTensor[ctype]:
-        assert self.shape == mask.shape, "CipherTensor: Mask shape mismatch"
-        assert trim < self.shape[-1], "CipherTensor: Cannot trim more than len of ciphertensor"
-        ct = self.mul(mpc, mask)
-        ct.shape[-1] -= trim
-        return ct
 
     @staticmethod
     def _count(shape):
@@ -223,14 +249,14 @@ class CipherTensor[ctype]:
         
         return CipherTensor[Ciphertext](
             _data=[mpc.he.zero_cipher() for _ in range(number_of_elements)],
-            shape=shape,
+            shape=shape.copy(),
             slots=slots)
 
     def decrypt(self, mpc) -> CipherTensor[Plaintext]:
         assert isinstance(ctype, Ciphertext), "Ciphertensor: Data already decrypted"
         return CipherTensor[Plaintext](
             _data=mpc.he.collective_decrypt_vector(self._data, mpc.comms.hub_pid),
-            shape=self.shape,
+            shape=self.shape.copy(),
             slots=self.slots,
             _transposed=self._transposed)
     
@@ -317,6 +343,26 @@ class CipherTensor[ctype]:
             shape=_shape,
             slots=self.slots)
     
+    def resize(self, mpc, shape: list[int]) -> CipherTensor[ctype]:
+        assert self.ndim == 1 and len(shape) == 1, "Not implemented error: Can resize only 1-dim to 1-dim ciphertensors"
+        
+        other_cipher_shape = (shape[-1] + self.slots - 1) // self.slots
+        if self.shape == shape or (self.shape[-1] < shape[-1] and self.cipher_shape[-1] == other_cipher_shape):
+            return CipherTensor[ctype](
+                _data=self._data.copy(),
+                shape=shape.copy(),
+                slots=self.slots)
+        elif self.shape[-1] < shape[-1]:
+            return self.concat(mpc, CipherTensor[ctype].zeros(mpc, [shape[-1] - self.shape[-1]]), axis=0)
+        else:
+            mask = CipherTensor[Plaintext].enc(mpc, [(1.0 if i < shape[-1] else 0.0) for i in range(self.shape[-1])])
+            resized = self.mul(mpc, mask)
+
+            return CipherTensor[ctype](
+                _data=resized._data[:other_cipher_shape],
+                shape=shape.copy(),
+                slots=self.slots)
+    
     def iadd(self, mpc, other) -> CipherTensor[Ciphertext]:
         assert not isinstance(ctype, Plaintext), "Ciphertensor: Cannot add to plaintext inplace"
         other_cipher = self._check_other_operand_elem_wise(mpc, other)
@@ -352,7 +398,7 @@ class CipherTensor[ctype]:
 
         return CipherTensor[Ciphertext](
             _data=mpc.he.add(self._data, other_cipher._data),
-            shape=self.shape,
+            shape=self.shape.copy(),
             slots=self.slots,
             _transposed=self._transposed)
 
@@ -366,7 +412,7 @@ class CipherTensor[ctype]:
 
         return CipherTensor[Ciphertext](
             _data=mpc.he.sub(self._data, other_cipher._data),
-            shape=self.shape,
+            shape=self.shape.copy(),
             slots=self.slots,
             _transposed=self._transposed)
     
@@ -381,14 +427,14 @@ class CipherTensor[ctype]:
 
         return CipherTensor[Ciphertext](
             _data=mpc.he.mul(self._data, other_cipher._data),
-            shape=self.shape,
+            shape=self.shape.copy(),
             slots=self.slots,
             _transposed=self._transposed)
 
     def rotate(self, mpc, step: int) -> CipherTensor[Ciphertext]:
         return CipherTensor[Ciphertext](
             _data=mpc.he.rotate(self._data, step),
-            shape=self.shape,
+            shape=self.shape.copy(),
             slots=self.slots,
             _transposed=self._transposed)
 
@@ -421,19 +467,18 @@ class CipherTensor[ctype]:
             slots=self.slots,
             _transposed=self._transposed)
 
-    def reduce_add(self, mpc, new_size: int = 0) -> CipherTensor[ctype]:
+    def reduce_add(self, mpc) -> CipherTensor[ctype]:
         assert self.ndim == 1, "CipherTensor: Addition reduction can be applied only to 1-dimensional tensors"
-
-        size = new_size if new_size else self.shape[-1]
+        
         if isinstance(ctype, Plaintext):
             # TODO: Read dtype (T) from other (add dtype static to CipherTensor class)
             _sum: float = self.decode(mpc, T=float).sum()
-            return CipherTensor[Plaintext].enc(mpc, [_sum for _ in range(size)])
+            return CipherTensor[Plaintext].enc(mpc, [_sum for _ in range(self.shape[-1])])
 
         assert not self._transposed, "Ciphertensor: Addition reduction of transposed ciphertensor is not implemented yet"
         return CipherTensor[ctype](
-            _data=mpc.he.reduce_add(self._data, self.shape[-1], new_size),
-            shape=[size],
+            _data=mpc.he.reduce_add(self._data, self.shape[-1]),
+            shape=[self.shape[-1]],
             slots=self.slots)
     
     def matmul(self, mpc, other, debug=True):
@@ -491,7 +536,8 @@ class CipherTensor[ctype]:
             # TODO: Read dtype (T) from other (add dtype static to CipherTensor class)
             return CipherTensor[Plaintext].enc(mpc, self.decode(mpc, T=float) @ other.decode(mpc, T=float).T)
 
-        masks = CipherTensor[Plaintext].enc(mpc, [one_hot_vector(i, other_shape[1], TP=float) for i in range(other_shape[0])])
+        masks = [mpc.he.enc_vector(one_hot_vector(i % self.slots, self.slots, TP=float), T=Plaintext) for i in range(other_shape[0])]
+        row_base = [mpc.he.zero_cipher() for _ in range(other.cipher_shape[-1])]
         
         new_cipher_tensor = CipherTensor[Ciphertext](
                 shape=[0, other_shape[0]],
@@ -500,7 +546,9 @@ class CipherTensor[ctype]:
             new_row = CipherTensor[Ciphertext].zeros(mpc, [other_shape[0]])
 
             for j in range(other_shape[0]):
-                new_row.iadd(mpc, self[i].mul(mpc, other[j]).reduce_add(mpc).mask(mpc, masks[j], other_shape[1] - other_shape[0]))
+                raw_reduction = mpc.he.reduce_add(self[i].mul(mpc, other[j])._data, self_shape[1])
+                row_base[-1] = mpc.he.mul(raw_reduction, masks[j])[0]
+                mpc.he.iadd(new_row._data, row_base)
                 if debug: print(f"CipherTensor M1 matmul: {i + 1}/{self_shape[0]} -- {j + 1}/{other_shape[0]}")
             if debug: print("----------------------")
             
@@ -594,8 +642,9 @@ class ndarray:
     
     def matmul[ctype](self, mpc, other: CipherTensor[ctype], debug: bool = True) -> CipherTensor[ctype]:
         if other._transposed:
-            assert self.shape[1] == other.shape[1], f"CipherTensor: Invalid matrix dimentions for reversed matmul: {self.shape} x {other.shape[::-1]}"
-            return CipherTensor[Plaintext].enc(mpc, self).matmul(mpc, other)
+            # assert self.shape[1] == other.shape[1], f"CipherTensor: Invalid matrix dimentions for reversed matmul: {self.shape} x {other.shape[::-1]}"
+            # return CipherTensor[Plaintext].enc(mpc, self).matmul(mpc, other)
+            raise NotImplementedError("The best approach for ndarray @ cipher.T case needs to be figured out")
 
         assert self.ndim == other.ndim == 2, f"CipherTensor: At least one of the tensors is not a matrix. Self shape: {self.shape}, other shape: {other.shape}. Ciphertensor matmul supports only matrices at the moment"
         assert self.shape[1] == other.shape[0], f"CipherTensor: Invalid matrix dimentions for reversed matmul: {self.shape} x {other.shape}"
