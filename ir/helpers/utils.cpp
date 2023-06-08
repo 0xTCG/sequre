@@ -38,6 +38,10 @@ bool isMPP( types::Type *t ) {
   return t->getName().find(MPPTypeName) != std::string::npos;
 }
 
+bool isSecureContainer( types::Type *t ) {
+  return isSharedTensor(t) || isCipherTensor(t) || isMPP(t);
+}
+
 bool isMPC( Value *value, types::Generic generic ) {
   auto *M = value->getModule();
   auto *mpcType = M->getOrRealizeType("MPCEnv", { generic }, "std.sequre.mpc.env");
