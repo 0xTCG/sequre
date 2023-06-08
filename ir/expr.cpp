@@ -55,8 +55,8 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
     }
   }
 
-  bool lhs_is_secure_container = isSharedTensor(lhsType) || isCipherTensor(lhsType) || isMPP(lhsType);
-  bool rhs_is_secure_container = isSharedTensor(rhsType) || isCipherTensor(rhsType) || isMPP(rhsType);
+  bool lhs_is_secure_container = isSecureContainer(lhsType);
+  bool rhs_is_secure_container = isSecureContainer(rhsType);
   if ( !lhs_is_secure_container && !rhs_is_secure_container ) return;
 
   bool lhs_is_int = lhsType->is(M->getIntType());
