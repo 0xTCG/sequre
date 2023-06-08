@@ -6,6 +6,7 @@ from pickler import pickle, unpickle
 
 from sequre.lattiseq.ckks import Ciphertext, Plaintext
 from sequre.utils.utils import one_hot_vector
+from sequre.utils.constants import HE_MUL_COST_ESTIMATE, HE_ROT_COST_ESTIMATE
 
 
 class CipherTensor[ctype]:
@@ -148,13 +149,13 @@ class CipherTensor[ctype]:
             shape=shape,
             slots=self.slots)
 
-    def getitemdup(self, mpc, i: int) -> CipherTensor[ctype]:
+    def getitemdup(self, mpc, i: int, new_size: int) -> CipherTensor[ctype]:
         assert self.ndim == 1, "CipherTensor: getitemdup can be only from one-dimensional CipherTensor."
-        return self.mask(mpc, i).reduce_add(mpc, self.shape[0])
+        return self.mask(mpc, i).reduce_add(mpc, new_size)
     
     def mask(self, mpc, i: int) -> CipherTensor[ctype]:
         assert self.ndim == 1, "CipherTensor: Only one-dimensional CipherTensors can be masked."
-        return self.mul(mpc, one_hot_vector(i, self.shape[0], TP=float))
+        return self.mul(mpc, array(one_hot_vector(i, self.shape[0], TP=float)))
 
     @staticmethod
     def _count(shape):
@@ -423,38 +424,74 @@ class CipherTensor[ctype]:
 
         assert not self._transposed, "Ciphertensor: Addition reduction of transposed ciphertensor is not implemented yet"
         return CipherTensor[ctype](
-            _data=mpc.he.reduce_add(self._data, min(self.slots, self.shape[-1]), new_size),
+            _data=mpc.he.reduce_add(self._data, self.shape[-1], new_size),
             shape=[new_size],
             slots=self.slots)
     
     def matmul(self, mpc, other, debug=True):
-        return self._matmul_v1(mpc, other, debug)
+        assert self.ndim == other.ndim == 2, f"CipherTensor: At least one of the tensors is not a matrix. Self shape: {self.shape}, other shape: {other.shape}. Ciphertensor matmul supports only matrices at the moment."
+        assert not self._transposed, "CipherTensor: Ciphertensor should not be lazily transposed prior to M1 matrix multiplication"
+
+        if isinstance(other, CipherTensor):
+            return self._matmul_v1(mpc, other, debug) if other._transposed else self._matmul_v2(mpc, other, debug)
+
+        return self._switch_matmul_by_cost(mpc, other, debug)
     
-    def _matmul_v1(self, mpc, other, debug=True):
+    def _get_matmul_v1_cost(self, other):
+        slots = self.slots
+        self_shape = self.shape
+        other_shape = other.shape
+
+        cost_per_cipher = (self_shape[1] + slots - 1) // slots
+        output_size = self_shape[0] * other_shape[1]
+
+        return ((cost_per_cipher + 1) * output_size * HE_MUL_COST_ESTIMATE +
+                output_size * cost_per_cipher * (slots - 1).bitlen() * HE_ROT_COST_ESTIMATE)
+
+    def _get_matmul_v2_cost(self, other):
+        slots = self.slots
+        self_shape = self.shape
+        other_shape = other.shape
+
+        cost_per_cipher = (self_shape[1] + slots - 1) // slots
+        self_size = self_shape[0] * self_shape[1]
+
+        return (cost_per_cipher * self_size * HE_MUL_COST_ESTIMATE +
+                self_size * (min(other_shape[1], slots) - 1).bitlen() * HE_ROT_COST_ESTIMATE)
+    
+    def _switch_matmul_by_cost(self, mpc, other, debug):
+        assert isinstance(other, ndarray) or isinstance(other, list), "Ciphertensor: Invalid plain operand."
+        
+        if self._get_matmul_v1_cost(other) < self._get_matmul_v2_cost(other):
+            other_cipher = CipherTensor[Plaintext].enc(mpc, other.T if isinstance(other, ndarray) else other.transpose())
+            other_cipher._transposed = True
+            return self._matmul_v1(mpc, other_cipher, debug)
+        else:
+            return self._matmul_v1(mpc, CipherTensor[Plaintext].enc(mpc, other), debug)
+    
+    def _matmul_v1(self, mpc, other: CipherTensor, debug=True):
         """
         M1 method from https://arxiv.org/pdf/2304.00129.pdf
         """
         if debug: print("Using M1 method for ciphertensor matrix multiplication")
-        other_cipher = self._check_other_operand_matmul(mpc, other)
-        assert self.ndim == other_cipher.ndim == 2, f"CipherTensor: At least one of the tensors is not a matrix. Self shape: {self.shape}, other shape: {other_cipher.shape}. Ciphertensor matmul supports only matrices at the moment."
-        assert self.shape[1] == other_cipher.shape[1], f"CipherTensor: Invalid matrix dimentions for M1 matmul {self.shape} x {other_cipher.shape}"
-        assert other_cipher._transposed, "CipherTensor: Ciphertensor should be lazily transposed prior to M1 matrix multiplication by it"
+        assert self.shape[1] == other.shape[1], f"CipherTensor: Invalid matrix dimentions for M1 matmul {self.shape} x {other.shape}"
+        assert other._transposed, "CipherTensor: Ciphertensor should be lazily transposed prior to M1 matrix multiplication by it"
 
-        if isinstance(ctype, Plaintext) and isinstance(other_cipher.ctype, Plaintext):
+        if isinstance(ctype, Plaintext) and isinstance(other.ctype, Plaintext):
             # TODO: Read dtype (T) from other (add dtype static to CipherTensor class)
             return CipherTensor[Plaintext].enc(mpc, self.decode(mpc, T=float) @ other.decode(mpc, T=float).T)
 
-        masks = CipherTensor[Plaintext].enc(mpc, [one_hot_vector(i, other_cipher.shape[0], TP=float) for i in range(other_cipher.shape[0])])
+        masks = CipherTensor[Plaintext].enc(mpc, [one_hot_vector(i, other.shape[0], TP=float) for i in range(other.shape[0])])
         
         new_cipher_tensor = CipherTensor[Ciphertext](
-                shape=[0, other_cipher.shape[0]],
+                shape=[0, other.shape[0]],
                 slots=self.slots)
         for i in range(self.shape[0]):
-            new_row = CipherTensor[Ciphertext].zeros(mpc, [other_cipher.shape[0]])
+            new_row = CipherTensor[Ciphertext].zeros(mpc, [other.shape[0]])
 
-            for j in range(other_cipher.shape[0]):
-                new_row.iadd(mpc, self[i].mul(mpc, other_cipher[j]).reduce_add(mpc, new_size=other_cipher.shape[0]).mul(mpc, masks[j]))
-                if debug: print(f"CipherTensor M1 matmul: {i + 1}/{self.shape[0]} -- {j + 1}/{other_cipher.shape[0]}")
+            for j in range(other.shape[0]):
+                new_row.iadd(mpc, self[i].mul(mpc, other[j]).reduce_add(mpc, new_size=other.shape[0]).mul(mpc, masks[j]))
+                if debug: print(f"CipherTensor M1 matmul: {i + 1}/{self.shape[0]} -- {j + 1}/{other.shape[0]}")
             if debug: print("----------------------")
             
             new_cipher_tensor.append(new_row)
@@ -466,7 +503,6 @@ class CipherTensor[ctype]:
         M2 method from https://arxiv.org/pdf/2304.00129.pdf
         """
         if debug: print("Using M2 method for ciphertensor matrix multiplication")
-        assert self.ndim == other.ndim == 2, f"CipherTensor: At least one of the tensors is not a matrix. Self shape: {self.shape}, other shape: {other.shape}. Ciphertensor matmul supports only matrices at the moment."
         assert self.shape[1] == other.shape[0], f"CipherTensor: Invalid matrix dimentions for M2 matmul {self.shape} x {other.shape}"
         assert not other._transposed, "CipherTensor: Ciphertensor should not be lazily transposed prior to M2 matrix multiplication by it"
 
@@ -481,19 +517,21 @@ class CipherTensor[ctype]:
             new_row = new_cipher_tensor[i]
             self_row = self[i]
             for j in range(self.shape[1]):
-                other_elem_duplicated = self_row.getitemdup(j)
+                other_elem_duplicated = self_row.getitemdup(mpc, j, other.shape[1])
                 new_row.iadd(mpc, other[j].mul(mpc, other_elem_duplicated))
         
         return new_cipher_tensor
 
     def _handle_plaintext_case(self, mpc, other, op) -> CipherTensor[Plaintext]:
-        # TODO: Read dtype on decoding (T) from other (add dtype static to CipherTensor class)
-        if not isinstance(other, CipherTensor):
-            return CipherTensor[Plaintext].enc(mpc, op(self.decode(mpc, T=float), other))
-        elif isinstance(other.ctype, Plaintext):
-            return CipherTensor[Plaintext].enc(mpc, op(self.decode(mpc, T=float), other.decode(mpc, T=float)))
-        else:
-            compile_error("Invalid type for plaintext case elem-wise operand")
+        # # TODO: Read dtype on decoding (T) from other (add dtype static to CipherTensor class)
+        # if not isinstance(other, CipherTensor):
+        #     return CipherTensor[Plaintext].enc(mpc, op(self.decode(mpc, T=float), other))
+        # elif isinstance(other.ctype, Plaintext):
+        #     return CipherTensor[Plaintext].enc(mpc, op(self.decode(mpc, T=float), other.decode(mpc, T=float)))
+        # else:
+        #     compile_error("Invalid type for plaintext case elem-wise operand")
+        raise NotImplementedError("Plaintext-plaintext elem-wise operations not implemented yet. Decoding is too expensive.")
+        return CipherTensor[Plaintext]()
 
     def _check_other_operand_elem_wise(self, mpc, other):
         if isinstance(other, CipherTensor):
@@ -515,20 +553,6 @@ class CipherTensor[ctype]:
         else:
             compile_error("Invalid operand for CipherTensor")
     
-    def _check_other_operand_matmul(self, mpc, other):
-        if isinstance(other, CipherTensor):
-            assert other._transposed, "Ciphertensor: Other ciphertensor operand should be transposed on matrix multiplication"
-            ct = other
-        elif isinstance(other, ndarray):
-            ct = CipherTensor[Plaintext].enc(mpc, other.T.tolist())
-        elif isinstance(other, List):
-            ct = CipherTensor[Plaintext].enc(mpc, other.transpose())
-        else:
-            compile_error("Invalid operand for CipherTensor")
-        
-        ct._transposed = True
-        return ct
-
     def _reset_chunk_size(self):
         self._chunk_size = 1 if len(self.shape) <= 1 else CipherTensor._count(self.cipher_shape[1:])
 
