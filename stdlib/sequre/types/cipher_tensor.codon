@@ -1,8 +1,9 @@
 import operator
 
 from numpy.ndarray import ndarray
-from numpy.create import array
+from numpy.create import array, zeros
 from pickler import pickle, unpickle
+from helpers import argmin
 
 from sequre.lattiseq.ckks import Ciphertext, Plaintext
 from sequre.utils.utils import one_hot_vector
@@ -431,8 +432,12 @@ class CipherTensor[ctype]:
             slots=self.slots,
             _transposed=self._transposed)
 
-    def rotate(self, mpc, step: int) -> CipherTensor[Ciphertext]:
-        return CipherTensor[Ciphertext](
+    def rotate_inplace(self, mpc, step: int) -> CipherTensor[ctype]:
+        mpc.he.rotate_inplace(self._data, step)
+        return self
+    
+    def rotate(self, mpc, step: int) -> CipherTensor[ctype]:
+        return CipherTensor[ctype](
             _data=mpc.he.rotate(self._data, step),
             shape=self.shape.copy(),
             slots=self.slots,
@@ -445,7 +450,7 @@ class CipherTensor[ctype]:
         Example: [] - CipherTensor, () - Single ciphertext
             [(1, 2, 3, 4), (5, 6, 7, 8)].shift(2) -> [(0, 0, 1, 2), (3, 4, 5, 6), (7, 8, 0, 0)]
         """
-        assert step <= self.slots, "Ciphertensor: Shifting requires step to be less than the number of slots per each cipher"
+        assert step < self.slots, "Ciphertensor: Shifting requires step to be less than the number of slots per each cipher"
 
         rotated_tensor = self.rotate(mpc, step)
         
@@ -467,6 +472,60 @@ class CipherTensor[ctype]:
             slots=self.slots,
             _transposed=self._transposed)
 
+    def broadcast(self, mpc, new_size: int):
+        """
+        Examples: [] - CipherTensor, () - Single ciphertext
+            [(1, 2, 3, 4), (5, 6, 0, 0)].broadcast(7) -> [(1, 2, 3, 4), (5, 6, 1, 0)]
+            [(1, 2, 3, 4), (5, 6, 0, 0)].broadcast(8) -> [(1, 2, 3, 4), (5, 6, 1, 2)]
+            [(1, 2, 3, 4), (5, 6, 0, 0)].broadcast(9) -> [(1, 2, 3, 4), (5, 6, 1, 2), (3, 0, 0, 0)]
+            [(1, 2, 3, 4), (5, 6, 0, 0)].broadcast(10) -> [(1, 2, 3, 4), (5, 6, 1, 2), (3, 4, 0, 0)]
+        """
+        assert 0 < self.ndim < 3, "CipherTensor: Broadcasting can be applied only to 1-dim and 2-dim tensors"
+        assert self.shape[-1] < new_size, "CipherTensor: Can only broadcast to larger array. Use CipherTensor.resize() for trimming."
+
+        broadcast_tensor = self.copy()
+
+        if self.ndim == 2:
+            new_cipher_tensor = CipherTensor[ctype](
+                shape=[0, new_size],
+                slots=self.slots)
+
+            for i in range(self.shape[0]):
+                new_cipher_tensor.append(broadcast_tensor[i].broadcast(mpc, new_size))
+            
+            return new_cipher_tensor
+
+        while broadcast_tensor.shape[0] < new_size:
+            offset = broadcast_tensor.shape[0] % self.slots
+            if offset:
+                shifted_tensor_data = broadcast_tensor.shift(mpc, self.slots - offset)._data
+
+                if broadcast_tensor.shape[0] <= self.slots - offset:
+                    # Last cipher in shifted tensor is all zeros
+                    shifted_tensor_data.pop()
+
+                mpc.he.crypto_params.evaluator.add(
+                    broadcast_tensor._data[-1],
+                    shifted_tensor_data[0],
+                    broadcast_tensor._data[-1])
+                
+                broadcast_tensor._data.extend(shifted_tensor_data[1:])
+            else:
+                broadcast_tensor._data.extend(broadcast_tensor._data.copy())
+            broadcast_tensor.shape[0] <<= 1
+
+        for _ in range(len(broadcast_tensor._data) - (new_size + self.slots - 1) // self.slots):
+            broadcast_tensor._data.pop()
+
+        offset = new_size % self.slots
+        if offset and ((new_size >> (new_size.__cttz__())) != self.shape[0]):  # if offset or self.shape[0] != new_size // 2^k
+            mask = mpc.he.enc_vector([(1.0 if i < offset else 0.0) for i in range(self.slots)], T=Plaintext)
+            broadcast_tensor._data[-1] = mpc.he.mul([broadcast_tensor._data[-1]], mask)[0]
+
+        broadcast_tensor.shape = [new_size]
+
+        return broadcast_tensor
+    
     def reduce_add(self, mpc) -> CipherTensor[ctype]:
         assert self.ndim == 1, "CipherTensor: Addition reduction can be applied only to 1-dimensional tensors"
         
@@ -479,6 +538,45 @@ class CipherTensor[ctype]:
         return CipherTensor[ctype](
             _data=mpc.he.reduce_add(self._data, self.shape[-1]),
             shape=[self.shape[-1]],
+            slots=self.slots)
+
+    def reduce_add_tiled(self, mpc, tile_size: int) -> CipherTensor[ctype]:
+        assert 0 < self.ndim < 3, "CipherTensor: Tiled addition reduction can be applied only to 1-dim and 2-dim tensors"
+
+        if self.ndim == 2:
+            new_cipher_tensor = CipherTensor[ctype](
+                shape=[0, tile_size],
+                slots=self.slots)
+
+            for i in range(self.shape[0]):
+                new_cipher_tensor.append(self[i].reduce_add_tiled(mpc, tile_size))
+            
+            return new_cipher_tensor
+
+        size = self.shape[0]
+        tail = size % tile_size
+        cipher_offset = size % self.slots
+        tile_offset = self.slots % tile_size
+        if tile_size > self.slots or tail or tile_offset or (cipher_offset and len(self._data) > 1):
+            raise NotImplementedError("(Internal TODO) CipherTensor: Tiled addition reduction case not implemented yet")
+        
+        cipher = self._data[0].copy()
+
+        for i in range(1, len(self._data)):
+            mpc.he.crypto_params.evaluator.add(cipher, self._data[i], cipher)
+
+        rotation_step = tile_size
+        while rotation_step < size:
+            mpc.he.crypto_params.evaluator.add(
+                cipher,
+                mpc.he.crypto_params.evaluator.rotate_new(cipher, rotation_step),
+                cipher)
+            rotation_step <<= 1
+        
+        mask = mpc.he.enc_vector([(1.0 if i < tile_size else 0.0) for i in range(self.slots)], T=Plaintext)
+        return CipherTensor[ctype](
+            _data=mpc.he.mul([cipher], mask),
+            shape=[tile_size],
             slots=self.slots)
     
     def matmul(self, mpc, other, debug=True):
@@ -512,6 +610,17 @@ class CipherTensor[ctype]:
         return (cost_per_cipher * self_size * HE_MUL_COST_ESTIMATE +
                 self_size * (min(other_shape[1], slots) - 1).bitlen() * HE_ROT_COST_ESTIMATE)
     
+    def _get_matmul_v3_cost(self, other):
+        slots = self.slots
+        self_shape = self.shape
+        other_shape = other.shape
+
+        cost_per_cipher = (max(max(self_shape), max(other_shape)) + slots - 1) // slots
+        iter_count = self_shape[0] * min(other_shape)
+
+        return (cost_per_cipher * iter_count * (HE_MUL_COST_ESTIMATE + HE_ROT_COST_ESTIMATE) +
+                (max(other_shape) - 1).bitlen() * HE_ROT_COST_ESTIMATE)
+
     def _switch_matmul_by_cost(self, mpc, other, debug):
         assert isinstance(other, ndarray) or isinstance(other, list), "Ciphertensor: Invalid plain operand."
         
@@ -579,6 +688,53 @@ class CipherTensor[ctype]:
             for j in range(self_shape[1]):
                 other_elem_duplicated = self_row.getitemdup(mpc, j, other_shape[1])
                 new_row.iadd(mpc, other[j].mul(mpc, other_elem_duplicated))
+        
+        return new_cipher_tensor
+
+    def _matmul_v3(self, mpc, other: ndarray, debug=True):
+        """
+        M3 method from https://arxiv.org/pdf/2304.00129.pdf
+        """
+        if debug: print("Using M3 method for ciphertensor matrix multiplication")
+        self_shape = self.shape
+        other_shape = other.shape
+        assert self_shape[1] == other_shape[0], f"CipherTensor: Invalid matrix dimentions for M2 matmul {self_shape} x {other_shape}"
+        assert self_shape[1] <= self.slots, "Not implemented yet: CipherTensor matmul v3 expects common dimension to fit into a single cipher until global rotation (across multiple ciphers) is implemented"
+
+        if isinstance(ctype, Plaintext):
+            # TODO: Read dtype (T) from other (add dtype static to CipherTensor class)
+            return CipherTensor[Plaintext].enc(mpc, self.decode(mpc, T=float) @ other)
+
+        if self_shape[1] < other_shape[1]:
+            broadcast_self = self.broadcast(mpc, other_shape[1])
+        else:
+            broadcast_self = self.copy()
+        
+        semi_slot = broadcast_self.shape[-1] < self.slots
+        diagonals = []
+        for i in range(other_shape[0]):
+            cyc_diag = other.cyclic_diag(i)
+            if semi_slot: cyc_diag.extend(zeros((broadcast_self.shape[-1],), dtype=float))
+            diagonals.append(CipherTensor[Plaintext].enc(mpc, cyc_diag))
+
+        if semi_slot:
+            broadcast_self = broadcast_self.broadcast(mpc, broadcast_self.shape[-1] * 2)
+
+        new_cipher_tensor = CipherTensor[ctype](
+                shape=[0, broadcast_self.shape[-1]],
+                slots=self.slots)
+        
+        for row in broadcast_self:
+            new_row = CipherTensor[ctype].zeros(mpc, [broadcast_self.shape[-1]])
+            
+            for i in range(min(other_shape)):
+                if i: row.rotate_inplace(mpc, 1)
+                new_row.iadd(mpc, row.mul(mpc, diagonals[i]))
+            
+            new_cipher_tensor.append(new_row)
+        
+        if other_shape[1] < self_shape[1]:
+            return new_cipher_tensor.reduce_add_tiled(mpc, other_shape[1])
         
         return new_cipher_tensor
 
