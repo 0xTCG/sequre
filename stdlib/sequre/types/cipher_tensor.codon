@@ -581,7 +581,7 @@ class CipherTensor[ctype]:
     
     def matmul(self, mpc, other, debug=True):
         assert self.ndim == other.ndim == 2, f"CipherTensor: At least one of the tensors is not a matrix. Self shape: {self.shape}, other shape: {other.shape}. Ciphertensor matmul supports only matrices at the moment."
-        assert not self._transposed, "CipherTensor: Ciphertensor should not be lazily transposed prior to M1 matrix multiplication"
+        assert not self._transposed, "CipherTensor: Ciphertensor should not be lazily transposed prior to matrix multiplication as a fisrt operand"
 
         if isinstance(other, CipherTensor):
             return self._matmul_v1(mpc, other, debug) if other._transposed else self._matmul_v2(mpc, other, debug)
@@ -622,14 +622,31 @@ class CipherTensor[ctype]:
                 (max(other_shape) - 1).bitlen() * HE_ROT_COST_ESTIMATE)
 
     def _switch_matmul_by_cost(self, mpc, other, debug):
-        assert isinstance(other, ndarray) or isinstance(other, list), "Ciphertensor: Invalid plain operand."
-        
-        if self._get_matmul_v1_cost(other) < self._get_matmul_v2_cost(other):
-            other_cipher = CipherTensor[Plaintext].enc(mpc, other.T if isinstance(other, ndarray) else other.transpose())
-            other_cipher._transposed = True
-            return self._matmul_v1(mpc, other_cipher, debug)
+        if isinstance(other, ndarray):
+            arr = other
+        elif isinstance(other, list):
+            arr = array(other)
         else:
-            return self._matmul_v1(mpc, CipherTensor[Plaintext].enc(mpc, other), debug)
+            compile_error("Ciphertensor: Invalid plain operand.")
+        
+        costs = (self._get_matmul_v1_cost(arr),
+                 self._get_matmul_v2_cost(arr),
+                 self._get_matmul_v3_cost(arr))
+        
+        if debug:
+            print(f"\nMatmul costs:\n\tM1: {costs[0]}\n\tM2: {costs[1]}\n\tM3: {costs[2]}\n")
+        
+        match argmin(costs):
+            case 0:
+                other_cipher = CipherTensor[Plaintext].enc(mpc, arr.T)
+                other_cipher._transposed = True
+                return self._matmul_v1(mpc, other_cipher, debug)
+            case 1:
+                return self._matmul_v2(mpc, CipherTensor[Plaintext].enc(mpc, arr), debug)
+            case 2:
+                return self._matmul_v3(mpc, arr, debug)
+            case _:
+                raise ValueError("Invalid cost index")
     
     def _matmul_v1(self, mpc, other: CipherTensor, debug=True):
         """
@@ -691,19 +708,18 @@ class CipherTensor[ctype]:
         
         return new_cipher_tensor
 
-    def _matmul_v3(self, mpc, other: ndarray, debug=True):
+    def _matmul_v3[dtype](self, mpc, other: ndarray[Tuple[int, int], dtype], debug=True):
         """
         M3 method from https://arxiv.org/pdf/2304.00129.pdf
         """
         if debug: print("Using M3 method for ciphertensor matrix multiplication")
         self_shape = self.shape
         other_shape = other.shape
-        assert self_shape[1] == other_shape[0], f"CipherTensor: Invalid matrix dimentions for M2 matmul {self_shape} x {other_shape}"
+        assert self_shape[1] == other_shape[0], f"CipherTensor: Invalid matrix dimentions for M3 matmul {self_shape} x {other_shape}"
         assert self_shape[1] <= self.slots, "Not implemented yet: CipherTensor matmul v3 expects common dimension to fit into a single cipher until global rotation (across multiple ciphers) is implemented"
 
         if isinstance(ctype, Plaintext):
-            # TODO: Read dtype (T) from other (add dtype static to CipherTensor class)
-            return CipherTensor[Plaintext].enc(mpc, self.decode(mpc, T=float) @ other)
+            return CipherTensor[Plaintext].enc(mpc, self.decode(mpc, T=dtype) @ other)
 
         if self_shape[1] < other_shape[1]:
             broadcast_self = self.broadcast(mpc, other_shape[1])
@@ -714,7 +730,7 @@ class CipherTensor[ctype]:
         diagonals = []
         for i in range(other_shape[0]):
             cyc_diag = other.cyclic_diag(i)
-            if semi_slot: cyc_diag.extend(zeros((broadcast_self.shape[-1],), dtype=float))
+            if semi_slot: cyc_diag.extend(zeros((broadcast_self.shape[-1],), dtype=dtype))
             diagonals.append(CipherTensor[Plaintext].enc(mpc, cyc_diag))
 
         if semi_slot:
@@ -724,7 +740,12 @@ class CipherTensor[ctype]:
                 shape=[0, broadcast_self.shape[-1]],
                 slots=self.slots)
         
+        debug_counter = 0
         for row in broadcast_self:
+            if debug:
+                debug_counter += 1
+                print(f"CipherTensor M3 matmul: Computing row {debug_counter}/{self_shape[0]} ...")
+            
             new_row = CipherTensor[ctype].zeros(mpc, [broadcast_self.shape[-1]])
             
             for i in range(min(other_shape)):
