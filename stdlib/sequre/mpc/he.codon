@@ -66,6 +66,11 @@ class MPCHE[TP]:
     crp_gen: UniformSampler
     crypto_params: CryptoParams
 
+    # Bootstrap safety params
+    bootstrap_min_level: int
+    bootstrap_log_bound: int
+    boostrap_safe: bool
+
     def __init__(self, comms: MPCComms[TP]):
         self.pid = comms.pid
         self.randomness = comms.randomness
@@ -87,6 +92,11 @@ class MPCHE[TP]:
 
         self.crp_gen = crp_gen
         self.crypto_params = CryptoParams(params)
+
+        self.bootstrap_min_level, self.bootstrap_log_bound, self.boostrap_safe = get_minimum_level_for_bootstrapping(
+            128, params.default_scale, self.comms.number_of_parties - 1, params.q())
+        
+        assert self.boostrap_safe, "MPCHE: Colletive bootstrapping is unsafe for selected HE parametrization and number of computing parties. Aborting ..."
     
     def aggregate_pub_key_shares(self, poly: CKGShare) -> CKGShare:
         out = CKGShare()
@@ -311,6 +321,7 @@ class MPCHE[TP]:
 
         print(f"CP{self.pid}:\tInitializing MHE ... ")
         self.crypto_params.initialize(sk_shard, pk, rlk, rtks, prec)
+
         print(f"CP{self.pid}:\tMHE setup complete.")
     
     def precision_stats(self, result: list, expected: list) -> PrecisionStats:
@@ -387,7 +398,7 @@ class MPCHE[TP]:
 
         return out
 
-    def collective_decrypt(self, cps: CryptoParams, ct: Ciphertext, hub_pid: int) -> Plaintext:
+    def collective_decrypt(self, ct: Ciphertext, hub_pid: int) -> Plaintext:
         if self.pid == 0:
             return Plaintext()
         
@@ -395,14 +406,14 @@ class MPCHE[TP]:
         if not self.comms.is_broadcast(ct):
             tmp = self.comms.broadcast_from(ct, hub_pid)
         
-        parameters = cps.params
+        parameters = self.crypto_params.params
 
         zero_pk = new_public_key(parameters)
 
         pcks_protocol = new_pcks_protocol(parameters, 6.36)
         dec_share = pcks_protocol.allocate_share(tmp.level())
 
-        pcks_protocol._mm_gen_share(cps.sk_shard, zero_pk, tmp.value[1], dec_share)
+        pcks_protocol._mm_gen_share(self.crypto_params.sk_shard, zero_pk, tmp.value[1], dec_share)
         dec_agg = self.aggregate_decrypt_shares(dec_share, tmp.level())
 
         ciphertext_switched = new_ciphertext(parameters, 1, tmp.level(), tmp.scale)
@@ -573,10 +584,10 @@ class MPCHE[TP]:
         parameters = self.crypto_params.params
         level_start = ct.level()
 
-        min_level, log_bound, ok = get_minimum_level_for_bootstrapping(
-            128, parameters.default_scale, self.comms.number_of_parties - 1, parameters.q())
-
-        assert ok and min_level <= level_start and min_level < parameters.max_level(), "Bootstrapping: Not enough levels to ensure correctness and 128 security."
+        assert (self.boostrap_safe and
+                self.bootstrap_min_level <= level_start and
+                self.bootstrap_min_level < parameters.max_level()
+                ), f"Bootstrapping: Not enough levels to ensure correctness and 128 security.\n\tCurrent cipher level {level_start}.\n\tMin required level {self.bootstrap_min_level}.\n\tMax possible level for the selected parameters: {parameters.max_level()}\n"
 
         ref_protocol = new_refresh_protocol(parameters, 256, 6.36)
         ref_share = ref_protocol.allocate_share(level_start, parameters.max_level())
@@ -584,7 +595,7 @@ class MPCHE[TP]:
 
         ref_protocol.gen_share(
             self.crypto_params.sk_shard,
-            log_bound,
+            self.bootstrap_log_bound,
             parameters.log_slots,
             ct.value[1],
             ct.scale,
@@ -593,7 +604,6 @@ class MPCHE[TP]:
         
         ref_agg = self.aggregate_refresh_share(ref_protocol, ref_share)
         ref_protocol.finalize(ct, parameters.log_slots, crp, ref_agg, ct)
-        if self.pid != hub_pid: ct.clear()
     
     def cipher_to_additive_plaintext(self, ct: Ciphertext, hub_pid: int) -> AdditiveShareBigint:
         parameters = self.crypto_params.params
@@ -608,11 +618,12 @@ class MPCHE[TP]:
 
         level_start = ct.level()
 
-        min_level, log_bound, ok = get_minimum_level_for_bootstrapping(
-            128, parameters.default_scale, self.comms.number_of_parties - 1, parameters.q())
-
-        assert ok and min_level <= level_start and min_level < parameters.max_level(), "E2S: Not enough levels to ensure correctness and 128 security."
-        self.crypto_params.evaluator.drop_level(ct, ct.level() - min_level - 1)
+        assert (self.boostrap_safe and
+                self.bootstrap_min_level <= level_start and
+                self.bootstrap_min_level < parameters.max_level()
+                ), f"E2S: Not enough levels to ensure correctness and 128 security.\n\tCurrent cipher level {level_start}.\n\tMin required level {self.bootstrap_min_level}.\n\tMax possible level for the selected parameters: {parameters.max_level()}\n"
+        
+        self.crypto_params.evaluator.drop_level(ct, ct.level() - self.bootstrap_min_level - 1)
 
         e2s_protocol = new_e2s_protocol(parameters, 3.2)
         public_e2s_share = e2s_protocol.allocate_share(level_start)
@@ -620,7 +631,7 @@ class MPCHE[TP]:
         
         e2s_protocol.gen_share(
             self.crypto_params.sk_shard,
-            log_bound,
+            self.bootstrap_log_bound,
             parameters.log_slots,
             ct.value[1],
             secret_share,
@@ -641,10 +652,10 @@ class MPCHE[TP]:
         parameters = self.crypto_params.params
         cipher_level = parameters.max_level()
 
-        min_level, _, ok = get_minimum_level_for_bootstrapping(
-            128, parameters.default_scale, self.comms.number_of_parties - 1, parameters.q())
-
-        assert ok and min_level <= cipher_level and min_level < parameters.max_level(), "S2E: Not enough levels to ensure correctness and 128 security."
+        assert (self.boostrap_safe and
+                self.bootstrap_min_level <= cipher_level and
+                self.bootstrap_min_level < parameters.max_level()
+                ), f"E2S: Not enough levels to ensure correctness and 128 security.\n\tCurrent cipher level {cipher_level}.\n\tMin required level {self.bootstrap_min_level}.\n\tMax possible level for the selected parameters: {parameters.max_level()}\n"
 
         crp = self.crp_gen._mm_read_new(parameters).q
         s2e_protocol = new_s2e_protocol(parameters, 3.2)
@@ -681,7 +692,7 @@ class MPCHE[TP]:
         size = self.comms.broadcast_from(len(enc), hub_pid)
         if not enc:
             enc = [Ciphertext() for _ in range(size)]
-        return [self.collective_decrypt(self.crypto_params, cipher, hub_pid) for cipher in enc]
+        return [self.collective_decrypt(cipher, hub_pid) for cipher in enc]
     
     def decode_vector[DTP=complex](self, enc: list[Plaintext]) -> list[DTP]:
         data_decoded = []
