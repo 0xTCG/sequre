@@ -242,6 +242,22 @@ class CipherTensor[ctype]:
             _data=_data,
             shape=shape,
             slots=slots)
+    
+    @staticmethod
+    def enc_broadcast(mpc, value, shape: list[int]) -> CipherTensor[ctype]:
+        if not (isinstance(value, int) or isinstance(value, float)):
+            compile_error("Ciphertensor: Invalid value type to broadcast")
+        
+        slots = mpc.he.crypto_params.params.slots()
+        enc_row = mpc.he.enc_vector([value for _ in range(shape[-1])], T=ctype)
+        new_tensor_data = []
+        for _ in range(shape[:-1].reduce_mul()):
+            new_tensor_data.extend(enc_row.copy())
+        
+        return CipherTensor[ctype](
+            _data=new_tensor_data,
+            shape=shape,
+            slots=slots)
 
     @staticmethod
     def zeros(mpc, shape: List[int]) -> CipherTensor[Ciphertext]:
@@ -253,6 +269,10 @@ class CipherTensor[ctype]:
             shape=shape.copy(),
             slots=slots)
 
+    def level(self) -> int:
+        assert len(self._data), "Ciphertensor: Cannot get level of an empty tensor"
+        return self._data[0].level()
+    
     def decrypt(self, mpc) -> CipherTensor[Plaintext]:
         assert isinstance(ctype, Ciphertext), "Ciphertensor: Data already decrypted"
         return CipherTensor[Plaintext](
@@ -280,6 +300,14 @@ class CipherTensor[ctype]:
     def reveal[T](self, mpc) -> ndarray:
         plain = self.decrypt(mpc) if isinstance(ctype, Ciphertext) else self
         return plain.decode(mpc, T=T)
+    
+    def bootstrap(self, mpc):
+        mpc.stats.secure_bootstrap_count += 1
+        if not isinstance(ctype, Ciphertext):
+            compile_error("Ciphertensor: Cannot bootstrap plaintext")
+        
+        for cipher in self._data:
+            mpc.he.collective_bootstrap(cipher, mpc.comms.hub_pid)
     
     def append(self, other: CipherTensor[ctype]):
         assert not self._transposed and not other._transposed, "Ciphertensor: Appending transposed ciphertensors is not implemented yet"
@@ -426,11 +454,16 @@ class CipherTensor[ctype]:
         other_cipher = self._check_other_operand_elem_wise(mpc, other)
         assert self.shape == other_cipher.shape, f"CipherTensor.mul: Shapes mismatch: {self.shape} != {other_cipher.shape}"
 
-        return CipherTensor[Ciphertext](
+        ctensor = CipherTensor[Ciphertext](
             _data=mpc.he.mul(self._data, other_cipher._data),
             shape=self.shape.copy(),
             slots=self.slots,
             _transposed=self._transposed)
+        
+        if ctensor.level() == mpc.he.bootstrap_min_level:
+            ctensor.bootstrap(mpc)
+        
+        return ctensor
 
     def rotate_inplace(self, mpc, step: int) -> CipherTensor[ctype]:
         mpc.he.rotate_inplace(self._data, step)
@@ -582,6 +615,9 @@ class CipherTensor[ctype]:
     def matmul(self, mpc, other, debug=True):
         assert self.ndim == other.ndim == 2, f"CipherTensor: At least one of the tensors is not a matrix. Self shape: {self.shape}, other shape: {other.shape}. Ciphertensor matmul supports only matrices at the moment."
         assert not self._transposed, "CipherTensor: Ciphertensor should not be lazily transposed prior to matrix multiplication as a fisrt operand"
+        
+        m, n = self.shape
+        assert m.popcnt() == n.popcnt() == 1, "CipherTensor: Temporary constraint. Matmul dimensions need to be power of 2 for now. This is soon to be fixed."
 
         if isinstance(other, CipherTensor):
             return self._matmul_v1(mpc, other, debug) if other._transposed else self._matmul_v2(mpc, other, debug)
@@ -797,7 +833,7 @@ class CipherTensor[ctype]:
         #     compile_error("Invalid type for plaintext case elem-wise operand")
         raise NotImplementedError("Plaintext-plaintext elem-wise operations not implemented yet. Decoding is too expensive.")
         return CipherTensor[Plaintext]()
-
+    
     def _check_other_operand_elem_wise(self, mpc, other):
         if isinstance(other, CipherTensor):
             assert not (self._transposed ^ other._transposed), "Ciphertensor: Elem-wise op on transposed ciphertensors is not implemented yet"
@@ -809,12 +845,9 @@ class CipherTensor[ctype]:
             operand = other.transpose() if self._transposed else other
             return CipherTensor[Plaintext].enc(mpc, operand)
         elif isinstance(other, int) or isinstance(other, float):
-            new_tensor_flattened = [other for _ in range(self.shape.reduce_mul())]
-            new_cipher = CipherTensor[Plaintext].enc(mpc, new_tensor_flattened)
-            new_cipher.shape = self.shape
-            new_cipher._transposed = self._transposed
-            new_cipher._reset_chunk_size()
-            return new_cipher
+            ptensor = CipherTensor[Plaintext].enc_broadcast(mpc, other, self.shape)
+            ptensor._transposed = self._transposed
+            return ptensor
         else:
             compile_error("Invalid operand for CipherTensor")
     
