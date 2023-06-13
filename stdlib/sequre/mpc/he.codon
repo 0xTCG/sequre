@@ -54,12 +54,14 @@ from ..types.utils import double_to_fp, fp_to_double
 from ..utils.utils import zeros_vec, one_hot_vector
 from ..utils.param import int_t
 
+from stats import MPCStats
 from randomness import MPCRandomness
 from comms import MPCComms
 
 
 class MPCHE[TP]:
     pid: int
+    stats: MPCStats
     randomness: MPCRandomness
     comms: MPCComms[TP]
 
@@ -73,6 +75,7 @@ class MPCHE[TP]:
 
     def __init__(self, comms: MPCComms[TP]):
         self.pid = comms.pid
+        self.stats = comms.stats
         self.randomness = comms.randomness
         self.comms = comms
     
@@ -421,72 +424,90 @@ class MPCHE[TP]:
 
         return ciphertext_switched.plaintext()
 
-    def iadd(self, x: list, y: list) -> list[Ciphertext]:
+    def rescale(self, x: list[Ciphertext], target_scale: float) -> list[Ciphertext]:
+        self.stats.secure_rescale_count += len(x)
+        for cipher in x:
+            self.crypto_params.evaluator.rescale(cipher, target_scale, cipher)
+        
+        return x
+    
+    def bootstrap(self, x: list[Ciphertext]) -> list[Ciphertext]:
+        self.stats.secure_bootstrap_count += len(x)
+        
+        for cipher in x:
+            self.collective_bootstrap(cipher, self.comms.hub_pid)
+        
+        return x
+    
+    def refresh(self, x: list[Ciphertext]) -> list[Ciphertext]:
+        if not len(x):
+            return x
+        
+        default_scale = self.crypto_params.params.default_scale
+        
+        if x[0].scale > default_scale:
+            self.rescale(x, default_scale)
+        if x[0].level() == self.bootstrap_min_level:
+            self.bootstrap(x)
+        
+        return x
+    
+    def iadd(self, x: list, y: list) -> list:
         assert len(x) == len(y), "Ciphervector lenghts differ"
         
         for i in range(len(x)):
 			# TODO: Check level
             self.crypto_params.evaluator.add(x[i], y[i], x[i])
+        
+        return x
     
-    def isub(self, x: list, y: list) -> list[Ciphertext]:
+    def isub(self, x: list, y: list) -> list:
         assert len(x) == len(y), "Ciphervector lenghts differ"
         
         for i in range(len(x)):
 			# TODO: Check level
             self.crypto_params.evaluator.sub(x[i], y[i], x[i])
+        
+        return x
     
-    def imul(self, x: list[Ciphertext], y: list) -> list[Ciphertext]:
-        max_len = max(len(x), len(y))
+    def imul[T](self, x: list[Ciphertext], y: list[T]) -> list[Ciphertext]:
+        if not (isinstance(T, Ciphertext) or isinstance(T, Plaintext)):
+            compile_error("Invalid cipher type")
         
-        if isinstance(y, List[Ciphertext]):
-            for i in range(max_len):
-                self.crypto_params.evaluator.mul_relin(x[i], y[i], True, x[i])
-                self.crypto_params.evaluator.rescale(x[i], self.crypto_params.params.default_scale, x[i])
-        elif isinstance(y, List[Plaintext]):
-            for i in range(max_len):
-                self.crypto_params.evaluator.mul_relin(x[i], y[i], False, x[i])
-                self.crypto_params.evaluator.rescale(x[i], self.crypto_params.params.default_scale, x[i])
-
-    def add(self, x: list, y: list) -> list[Ciphertext]:
         assert len(x) == len(y), "Ciphervector lenghts differ"
-        res = list[Ciphertext](len(x))
+
+        if not len(x):
+            return x
         
-        for i in range(len(x)):
-			# TODO: Check level
-            res.append(self.crypto_params.evaluator.add_new(x[i], y[i]))
-
-        return res
-
-    def sub(self, x: list, y: list) -> list[Ciphertext]:
-        assert len(x) == len(y), "Ciphervector lenghts differ"
-        res = list[Ciphertext](len(x))
-        
-        for i in range(len(x)):
-			# TODO: Check level
-            res.append(self.crypto_params.evaluator.sub_new(x[i], y[i]))
-
-        return res
-    
-    def mul(self, x: list[Ciphertext], y: list) -> list[Ciphertext]:
         max_len = max(len(x), len(y))
-        res = list[Ciphertext](max_len)
-        mul_func = self.crypto_params.evaluator.mul_relin_new if isinstance(y, List[Ciphertext]) else self.crypto_params.evaluator.mul_new
-        
+        relin = True if isinstance(T, Ciphertext) else False
+
+        self.refresh(x)
+        if isinstance(T, Ciphertext):
+            self.refresh(y)
+
         for i in range(max_len):
-            res.append(mul_func(x[i], y[i]))
-            self.crypto_params.evaluator.rescale(res[i], self.crypto_params.params.default_scale, res[i])
+            self.crypto_params.evaluator.mul_relin(x[i], y[i], relin, x[i])
         
-        return res
+        return x
     
-    def rotate_inplace(self, x: list[Ciphertext], k: int):
+    def irotate(self, x: list[Ciphertext], k: int) -> list[Ciphertext]:
         for i in range(len(x)):
             self.crypto_params.evaluator.rotate(x[i], k, x[i])
+        
+        return x
+
+    def add(self, x: list, y: list) -> list:
+        return self.iadd(x.copy(), y)
+
+    def sub(self, x: list, y: list) -> list:
+        return self.isub(x.copy(), y)
+    
+    def mul(self, x: list[Ciphertext], y: list) -> list[Ciphertext]:
+        return self.imul(x.copy(), y)
     
     def rotate(self, x: list[Ciphertext], k: int) -> list[Ciphertext]:
-        res = x.copy()
-        self.rotate_inplace(res, k)
-
-        return res
+        return self.irotate(x.copy(), k)
     
     def reduce_add(self, x: list[Ciphertext], size: int) -> list[Ciphertext]:
         slots = self.crypto_params.params.slots()
@@ -508,8 +529,8 @@ class MPCHE[TP]:
                 mirror_cipher = self.crypto_params.evaluator.rotate_new(reduced_cipher, slots - size)
                 self.crypto_params.evaluator.add(reduced_cipher, mirror_cipher, reduced_cipher)
                 
-            mask = self.enc_vector([(1.0 if i < offset else 0.0) for i in range(slots)], T=Plaintext)[0]
-            self.crypto_params.evaluator.mul(reduced_cipher, mask, reduced_cipher)
+            mask = self.enc_vector([(1.0 if i < offset else 0.0) for i in range(slots)], T=Plaintext)
+            self.imul([reduced_cipher], mask)
             reduced_vector.append(reduced_cipher)
         
         return reduced_vector
