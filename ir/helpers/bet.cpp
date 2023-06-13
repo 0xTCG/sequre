@@ -34,6 +34,10 @@ bool BETNode::checkIsCipherTensor() {
   return isCipherTensor(getOrRealizeIRType());
 }
 
+bool BETNode::checkIsSecureContainer() {
+  return isSecureContainer(getOrRealizeIRType());
+}
+
 bool BETNode::checkIsCiphertext() {
   if ( !checkIsCipherTensor() ) return false;
   return getOrRealizeIRType()->getName().find("Ciphertext") != std::string::npos;
@@ -214,14 +218,14 @@ bool BET::swapPriorities( BETNode *root, BETNode *child ) {
   assert ( (lc == child || rc == child) && "Invalid parameters for BET::swapPriorities (second parameter has to be child of the first parameter)" );
   
   auto *sibling = ( lc == child ? rc : lc);
-  if ( sibling->checkIsCiphertext() ) return false;
+  if ( sibling->checkIsSecureContainer() ) return false;
 
   auto *lcc = child->getLeftChild();
   auto *rcc = child->getRightChild();
 
-  if ( lcc->checkIsCiphertext() && rcc->checkIsCiphertext() ) return false;
+  if ( lcc->checkIsSecureContainer() && rcc->checkIsSecureContainer() ) return false;
 
-  auto *cipherGrandChild = ( lcc->checkIsCiphertext() ? lcc : rcc );
+  auto *cipherGrandChild = ( lcc->checkIsSecureContainer() ? lcc : rcc );
 
   if ( cipherGrandChild == lcc ) child->setLeftChild(sibling);
   else child->setRightChild(sibling);
@@ -235,7 +239,7 @@ bool BET::swapPriorities( BETNode *root, BETNode *child ) {
 }
 
 bool BET::reorderPriority( BETNode *node ) {
-  if ( node->isLeaf() || !node->checkIsCiphertext() ) return false;
+  if ( node->isLeaf() || !node->checkIsSecureContainer() ) return false;
 
   auto *lc = node->getLeftChild();
   auto *rc = node->getRightChild();

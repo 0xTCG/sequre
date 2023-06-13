@@ -54,20 +54,28 @@ from ..types.utils import double_to_fp, fp_to_double
 from ..utils.utils import zeros_vec, one_hot_vector
 from ..utils.param import int_t
 
+from stats import MPCStats
 from randomness import MPCRandomness
 from comms import MPCComms
 
 
 class MPCHE[TP]:
     pid: int
+    stats: MPCStats
     randomness: MPCRandomness
     comms: MPCComms[TP]
 
     crp_gen: UniformSampler
     crypto_params: CryptoParams
 
+    # Bootstrap safety params
+    bootstrap_min_level: int
+    bootstrap_log_bound: int
+    boostrap_safe: bool
+
     def __init__(self, comms: MPCComms[TP]):
         self.pid = comms.pid
+        self.stats = comms.stats
         self.randomness = comms.randomness
         self.comms = comms
     
@@ -87,6 +95,11 @@ class MPCHE[TP]:
 
         self.crp_gen = crp_gen
         self.crypto_params = CryptoParams(params)
+
+        self.bootstrap_min_level, self.bootstrap_log_bound, self.boostrap_safe = get_minimum_level_for_bootstrapping(
+            128, params.default_scale, self.comms.number_of_parties - 1, params.q())
+        
+        assert self.boostrap_safe, "MPCHE: Colletive bootstrapping is unsafe for selected HE parametrization and number of computing parties. Aborting ..."
     
     def aggregate_pub_key_shares(self, poly: CKGShare) -> CKGShare:
         out = CKGShare()
@@ -311,6 +324,7 @@ class MPCHE[TP]:
 
         print(f"CP{self.pid}:\tInitializing MHE ... ")
         self.crypto_params.initialize(sk_shard, pk, rlk, rtks, prec)
+
         print(f"CP{self.pid}:\tMHE setup complete.")
     
     def precision_stats(self, result: list, expected: list) -> PrecisionStats:
@@ -318,8 +332,8 @@ class MPCHE[TP]:
         result_flattened = result.flatten()
         expected_flattened = expected.flatten()
         
-        print(f"CP{self.pid}:\tValues computed [0:4]: {result_flattened[:4]} ...\n")
-        print(f"CP{self.pid}:\tValues expected [0:4]: {expected_flattened[:4]} ...\n")
+        print(f"CP{self.pid}:\tValues computed [0:10]: {result_flattened[:10]} ...\n")
+        print(f"CP{self.pid}:\tValues expected [0:10]: {expected_flattened[:10]} ...\n")
 
         precision_stats = evaluate_precision(result_flattened.to_complex(), expected_flattened.to_complex())
         print(precision_stats)
@@ -354,7 +368,7 @@ class MPCHE[TP]:
             else: compile_error("Invalid cipher/plaintext type.")
             
             _arr.append(_text)
-            elements_enc = elements_enc + (end - start)
+            elements_enc += (end - start)
 
         return _arr
     
@@ -387,7 +401,7 @@ class MPCHE[TP]:
 
         return out
 
-    def collective_decrypt(self, cps: CryptoParams, ct: Ciphertext, hub_pid: int) -> Plaintext:
+    def collective_decrypt(self, ct: Ciphertext, hub_pid: int) -> Plaintext:
         if self.pid == 0:
             return Plaintext()
         
@@ -395,14 +409,14 @@ class MPCHE[TP]:
         if not self.comms.is_broadcast(ct):
             tmp = self.comms.broadcast_from(ct, hub_pid)
         
-        parameters = cps.params
+        parameters = self.crypto_params.params
 
         zero_pk = new_public_key(parameters)
 
         pcks_protocol = new_pcks_protocol(parameters, 6.36)
         dec_share = pcks_protocol.allocate_share(tmp.level())
 
-        pcks_protocol._mm_gen_share(cps.sk_shard, zero_pk, tmp.value[1], dec_share)
+        pcks_protocol._mm_gen_share(self.crypto_params.sk_shard, zero_pk, tmp.value[1], dec_share)
         dec_agg = self.aggregate_decrypt_shares(dec_share, tmp.level())
 
         ciphertext_switched = new_ciphertext(parameters, 1, tmp.level(), tmp.scale)
@@ -410,97 +424,116 @@ class MPCHE[TP]:
 
         return ciphertext_switched.plaintext()
 
-    def iadd(self, x: list, y: list) -> list[Ciphertext]:
+    def rescale(self, x: list[Ciphertext], target_scale: float) -> list[Ciphertext]:
+        self.stats.secure_rescale_count += len(x)
+        for cipher in x:
+            self.crypto_params.evaluator.rescale(cipher, target_scale, cipher)
+        
+        return x
+    
+    def bootstrap(self, x: list[Ciphertext]) -> list[Ciphertext]:
+        self.stats.secure_bootstrap_count += len(x)
+        
+        for cipher in x:
+            self.collective_bootstrap(cipher, self.comms.hub_pid)
+        
+        return x
+    
+    def refresh(self, x: list[Ciphertext]) -> list[Ciphertext]:
+        if not len(x):
+            return x
+        
+        default_scale = self.crypto_params.params.default_scale
+        
+        if x[0].scale > default_scale:
+            self.rescale(x, default_scale)
+        if x[0].level() == self.bootstrap_min_level:
+            self.bootstrap(x)
+        
+        return x
+    
+    def iadd(self, x: list, y: list) -> list:
         assert len(x) == len(y), "Ciphervector lenghts differ"
         
         for i in range(len(x)):
 			# TODO: Check level
             self.crypto_params.evaluator.add(x[i], y[i], x[i])
+        
+        return x
     
-    def isub(self, x: list, y: list) -> list[Ciphertext]:
+    def isub(self, x: list, y: list) -> list:
         assert len(x) == len(y), "Ciphervector lenghts differ"
         
         for i in range(len(x)):
 			# TODO: Check level
             self.crypto_params.evaluator.sub(x[i], y[i], x[i])
+        
+        return x
     
-    def imul(self, x: list[Ciphertext], y: list) -> list[Ciphertext]:
+    def imul[T](self, x: list[Ciphertext], y: list[T]) -> list[Ciphertext]:
+        if not (isinstance(T, Ciphertext) or isinstance(T, Plaintext)):
+            compile_error("Invalid cipher type")
+        
+        assert len(x) == len(y), "Ciphervector lenghts differ"
+
+        if not len(x):
+            return x
+        
         max_len = max(len(x), len(y))
-        
-        if isinstance(y, List[Ciphertext]):
-            for i in range(max_len):
-                self.crypto_params.evaluator.mul_relin(x[i], y[i], True, x[i])
-                self.crypto_params.evaluator.rescale(x[i], self.crypto_params.params.default_scale, x[i])
-        elif isinstance(y, List[Plaintext]):
-            for i in range(max_len):
-                self.crypto_params.evaluator.mul_relin(x[i], y[i], False, x[i])
-                self.crypto_params.evaluator.rescale(x[i], self.crypto_params.params.default_scale, x[i])
+        relin = True if isinstance(T, Ciphertext) else False
 
-    def add(self, x: list, y: list) -> list[Ciphertext]:
-        assert len(x) == len(y), "Ciphervector lenghts differ"
-        res = list[Ciphertext](len(x))
+        self.refresh(x)
+        if isinstance(T, Ciphertext):
+            self.refresh(y)
+
+        for i in range(max_len):
+            self.crypto_params.evaluator.mul_relin(x[i], y[i], relin, x[i])
         
+        return x
+    
+    def irotate(self, x: list[Ciphertext], k: int) -> list[Ciphertext]:
         for i in range(len(x)):
-			# TODO: Check level
-            res.append(self.crypto_params.evaluator.add_new(x[i], y[i]))
-
-        return res
-
-    def sub(self, x: list, y: list) -> list[Ciphertext]:
-        assert len(x) == len(y), "Ciphervector lenghts differ"
-        res = list[Ciphertext](len(x))
+            self.crypto_params.evaluator.rotate(x[i], k, x[i])
         
-        for i in range(len(x)):
-			# TODO: Check level
-            res.append(self.crypto_params.evaluator.sub_new(x[i], y[i]))
+        return x
 
-        return res
+    def add(self, x: list, y: list) -> list:
+        return self.iadd(x.copy(), y)
+
+    def sub(self, x: list, y: list) -> list:
+        return self.isub(x.copy(), y)
     
     def mul(self, x: list[Ciphertext], y: list) -> list[Ciphertext]:
-        max_len = max(len(x), len(y))
-        res = list[Ciphertext](max_len)
-        mul_func = self.crypto_params.evaluator.mul_relin_new if isinstance(y, List[Ciphertext]) else self.crypto_params.evaluator.mul_new
-        
-        for i in range(max_len):
-            res.append(mul_func(x[i], y[i]))
-            self.crypto_params.evaluator.rescale(res[i], self.crypto_params.params.default_scale, res[i])
-        
-        return res
+        return self.imul(x.copy(), y)
     
     def rotate(self, x: list[Ciphertext], k: int) -> list[Ciphertext]:
-        res = list[Ciphertext](len(x))
-        
-        for i in range(len(x)):
-            res.append(self.crypto_params.evaluator.rotate_new(x[i], k))
-
-        return res
+        return self.irotate(x.copy(), k)
     
-    def reduce_add(self, x: list[Ciphertext], cols_per_cipher: int, new_size: int) -> list[Ciphertext]:
-        assert cols_per_cipher > 0, "MPCHE.reduce_add: Invalid number of columns per cipher"
+    def reduce_add(self, x: list[Ciphertext], size: int) -> list[Ciphertext]:
         slots = self.crypto_params.params.slots()
-        reduced_vector = x.copy()
-        rotation_step = 1
+        assert 0 < size, "MPCHE.reduce_add: Invalid number of columns per cipher"
 
-        for _ in range((cols_per_cipher - 1).bitlen()):
-            self.iadd(reduced_vector, self.rotate(reduced_vector, rotation_step))
-            rotation_step <<= 1
-
-        if cols_per_cipher < slots:
-            assert len(x) == 1, "Non-mandatory safety check failed: There should be only one ciphertext in ciphervector if cols_per_cipher < slots"
-            mask = self.enc_vector(one_hot_vector(0, slots, TP=float), T=Plaintext)
-            reduced_vector = self.rotate(self.mul(reduced_vector, mask), slots - cols_per_cipher + 1)
-
-            rotation_step = 1
-            for _ in range((cols_per_cipher - 1).bitlen()):
-                self.iadd(reduced_vector, self.rotate(reduced_vector, rotation_step))
-                rotation_step <<= 1
-        
-        reduced_cipher = reduced_vector[0]
-
+        reduced_cipher = x[0].copy()
         for i in range(1, len(x)):
-            self.crypto_params.evaluator.add(reduced_cipher, reduced_vector[i], reduced_cipher)
+            self.crypto_params.evaluator.add(reduced_cipher, x[i], reduced_cipher)
+
+        self.crypto_params.evaluator.reduce_add(reduced_cipher, min(slots, size))
         
-        return [reduced_cipher.copy() for _ in range((new_size + slots - 1) // slots)]
+        reduced_vector = []
+        for _ in range(size // slots):
+            reduced_vector.append(reduced_cipher.copy())
+        
+        offset = size % slots
+        if offset:
+            if size <= (slots >> 1):
+                mirror_cipher = self.crypto_params.evaluator.rotate_new(reduced_cipher, slots - size)
+                self.crypto_params.evaluator.add(reduced_cipher, mirror_cipher, reduced_cipher)
+                
+            mask = self.enc_vector([(1.0 if i < offset else 0.0) for i in range(slots)], T=Plaintext)
+            self.imul([reduced_cipher], mask)
+            reduced_vector.append(reduced_cipher)
+        
+        return reduced_vector
     
     def drop_level(self, a: list[list[Ciphertext]], out_level: int) -> list[list[Ciphertext]]:
         out = list[list[Ciphertext]](len(a))
@@ -572,10 +605,10 @@ class MPCHE[TP]:
         parameters = self.crypto_params.params
         level_start = ct.level()
 
-        min_level, log_bound, ok = get_minimum_level_for_bootstrapping(
-            128, parameters.default_scale, self.comms.number_of_parties - 1, parameters.q())
-
-        assert ok and min_level <= level_start and min_level < parameters.max_level(), "Bootstrapping: Not enough levels to ensure correctness and 128 security."
+        assert (self.boostrap_safe and
+                self.bootstrap_min_level <= level_start and
+                self.bootstrap_min_level < parameters.max_level()
+                ), f"Bootstrapping: Not enough levels to ensure correctness and 128 security.\n\tCurrent cipher level {level_start}.\n\tMin required level {self.bootstrap_min_level}.\n\tMax possible level for the selected parameters: {parameters.max_level()}\n"
 
         ref_protocol = new_refresh_protocol(parameters, 256, 6.36)
         ref_share = ref_protocol.allocate_share(level_start, parameters.max_level())
@@ -583,7 +616,7 @@ class MPCHE[TP]:
 
         ref_protocol.gen_share(
             self.crypto_params.sk_shard,
-            log_bound,
+            self.bootstrap_log_bound,
             parameters.log_slots,
             ct.value[1],
             ct.scale,
@@ -592,7 +625,6 @@ class MPCHE[TP]:
         
         ref_agg = self.aggregate_refresh_share(ref_protocol, ref_share)
         ref_protocol.finalize(ct, parameters.log_slots, crp, ref_agg, ct)
-        if self.pid != hub_pid: ct.clear()
     
     def cipher_to_additive_plaintext(self, ct: Ciphertext, hub_pid: int) -> AdditiveShareBigint:
         parameters = self.crypto_params.params
@@ -607,11 +639,12 @@ class MPCHE[TP]:
 
         level_start = ct.level()
 
-        min_level, log_bound, ok = get_minimum_level_for_bootstrapping(
-            128, parameters.default_scale, self.comms.number_of_parties - 1, parameters.q())
-
-        assert ok and min_level <= level_start and min_level < parameters.max_level(), "E2S: Not enough levels to ensure correctness and 128 security."
-        self.crypto_params.evaluator.drop_level(ct, ct.level() - min_level - 1)
+        assert (self.boostrap_safe and
+                self.bootstrap_min_level <= level_start and
+                self.bootstrap_min_level < parameters.max_level()
+                ), f"E2S: Not enough levels to ensure correctness and 128 security.\n\tCurrent cipher level {level_start}.\n\tMin required level {self.bootstrap_min_level}.\n\tMax possible level for the selected parameters: {parameters.max_level()}\n"
+        
+        self.crypto_params.evaluator.drop_level(ct, ct.level() - self.bootstrap_min_level - 1)
 
         e2s_protocol = new_e2s_protocol(parameters, 3.2)
         public_e2s_share = e2s_protocol.allocate_share(level_start)
@@ -619,7 +652,7 @@ class MPCHE[TP]:
         
         e2s_protocol.gen_share(
             self.crypto_params.sk_shard,
-            log_bound,
+            self.bootstrap_log_bound,
             parameters.log_slots,
             ct.value[1],
             secret_share,
@@ -640,10 +673,10 @@ class MPCHE[TP]:
         parameters = self.crypto_params.params
         cipher_level = parameters.max_level()
 
-        min_level, _, ok = get_minimum_level_for_bootstrapping(
-            128, parameters.default_scale, self.comms.number_of_parties - 1, parameters.q())
-
-        assert ok and min_level <= cipher_level and min_level < parameters.max_level(), "S2E: Not enough levels to ensure correctness and 128 security."
+        assert (self.boostrap_safe and
+                self.bootstrap_min_level <= cipher_level and
+                self.bootstrap_min_level < parameters.max_level()
+                ), f"E2S: Not enough levels to ensure correctness and 128 security.\n\tCurrent cipher level {cipher_level}.\n\tMin required level {self.bootstrap_min_level}.\n\tMax possible level for the selected parameters: {parameters.max_level()}\n"
 
         crp = self.crp_gen._mm_read_new(parameters).q
         s2e_protocol = new_s2e_protocol(parameters, 3.2)
@@ -680,7 +713,7 @@ class MPCHE[TP]:
         size = self.comms.broadcast_from(len(enc), hub_pid)
         if not enc:
             enc = [Ciphertext() for _ in range(size)]
-        return [self.collective_decrypt(self.crypto_params, cipher, hub_pid) for cipher in enc]
+        return [self.collective_decrypt(cipher, hub_pid) for cipher in enc]
     
     def decode_vector[DTP=complex](self, enc: list[Plaintext]) -> list[DTP]:
         data_decoded = []

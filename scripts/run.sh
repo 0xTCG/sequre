@@ -19,9 +19,48 @@ else
     cp $CP_OPTIONS $SEQURE_STDLIB/network/inet_socket.codon $SEQURE_STDLIB/network/socket.codon
 fi
 
-echo "Numpy plugin searched at $SEQURE_NUMPY_PATH ..."
-echo "Seq plugin searched at $SEQURE_SEQ_PATH ..."
-echo "Sequre plugin searched at $SEQURE_PATH ..."
+if [[ -z "${SEQURE_CODON_PATH}" ]]; then
+    echo "Error! SEQURE_CODON_PATH env variable not set" >&2
+    exit 1
+fi
+
+if [[ -z "${SEQURE_SEQ_PATH}" ]]; then
+    echo "Error! SEQURE_SEQ_PATH env variable not set" >&2
+    exit 1
+fi
+
+if [[ -z "${SEQURE_NUMPY_PATH}" ]]; then
+    echo "Error! SEQURE_NUMPY_PATH env variable not set" >&2
+    exit 1
+fi
+
+if [[ -z "${SEQURE_PATH}" ]]; then
+    echo "Error! SEQURE_PATH env variable not set" >&2
+    exit 1
+fi
+
+if [ ! -d "${SEQURE_CODON_PATH}/install" ]
+then
+    echo "Codon not installed at ${SEQURE_CODON_PATH}" >&2
+    exit 1
+fi
+
+if [ ! -d "${SEQURE_SEQ_PATH}/install" ]
+then
+    echo "Seq-lang not installed at ${SEQURE_SEQ_PATH}" >&2
+    exit 1
+fi
+
+if [ ! -d "${SEQURE_NUMPY_PATH}/build" ]
+then
+    echo "Codon-numpy not installed at ${SEQURE_NUMPY_PATH}" >&2
+    exit 1
+fi
+
+echo "Codon found at $SEQURE_CODON_PATH ..."
+echo "Seq-lang plugin found at $SEQURE_SEQ_PATH ..."
+echo "Numpy plugin found at $SEQURE_NUMPY_PATH ..."
+echo "Sequre plugin found at $SEQURE_PATH ..."
 echo "Compiling $2 in $1 mode ..."
 OMP_PROC_BIND=close GC_INITIAL_HEAP_SIZE=8179869184 codon run -plugin $SEQURE_PATH -plugin $SEQURE_SEQ_PATH -plugin $SEQURE_NUMPY_PATH $1 scripts/invoke.codon run-$2 ${*:3}
 

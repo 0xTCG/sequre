@@ -2,6 +2,7 @@
 Ported from https://github.com/tuneinsight/lattigo/tree/master/ckks
 """
 import math
+from numpy.create import array
 
 from pickler import pickle, unpickle
 
@@ -325,13 +326,24 @@ class Plaintext(Static[rlwe.Plaintext]):
     
     def get_rlwe_plaintext(self):
         return rlwe.Plaintext(value=self.value)
+    
+    def copy(self):
+        return Plaintext(self.value.copy(), self.scale)
 
 
 # Ciphertext is *ring.Poly array representing a polynomial of degree > 0 with coefficients in R_Q.
 class Ciphertext(Static[rlwe.Ciphertext]):
     scale: float
 
-    def __init__(self, ciphertext, scale):
+    def __init__(self, poly: ring.Poly, scale: float):
+        self.value = poly
+        self.scale = scale
+    
+    def __init__(self, ciphertext: rlwe.Ciphertext, scale: float):
+        self.value = ciphertext.value
+        self.scale = scale
+
+    def __init__(self, ciphertext: Ciphertext, scale: float):
         self.value = ciphertext.value
         self.scale = scale
     
@@ -383,7 +395,7 @@ class Ciphertext(Static[rlwe.Ciphertext]):
             scale=self.scale)
     
     def copy(self) -> Ciphertext:
-        return Ciphertext(self.get_rlwe_ciphertext().copy(), self.scale)
+        return Ciphertext(self.value.copy(), self.scale)
 
 
 # Extending Plaintext to add Ciphertext related methods.
@@ -1254,19 +1266,13 @@ class PrecisionStats:
     cdf_resol: int
 
     def __repr__(self) -> str:
-        return f"""
-            ┌─────────┬───────┬───────┬───────┐
-            │    Log2 │ REAL  │ IMAG  │ l2    │
-            ├─────────┼───────┼───────┼───────┤
-            │MIN Prec │ {round(self.min_precision.real, 2)} │ {round(self.min_precision.imag, 2)} │ {round(self.min_precision.l2, 2)} │
-            │MAX Prec │ {round(self.max_precision.real, 2)} │ {round(self.max_precision.imag, 2)} │ {round(self.max_precision.l2, 2)} │
-            │AVG Prec │ {round(self.mean_precision.real, 2)} │ {round(self.mean_precision.imag, 2)} │ {round(self.mean_precision.l2, 2)} │
-            │MED Prec │ {round(self.median_precision.real, 2)} │ {round(self.median_precision.imag, 2)} │ {round(self.median_precision.l2, 2)} │
-            └─────────┴───────┴───────┴───────┘
-
-            Err STD Slots  : {math.log2(self.std_freq)} Log2
-            Err STD coeffs : {math.log2(self.std_time)} Log2
-        """
+        results_arr = array([
+            [round(self.min_precision.real, 2), round(self.min_precision.imag, 2), round(self.min_precision.l2, 2)],
+            [round(self.max_precision.real, 2), round(self.max_precision.imag, 2), round(self.max_precision.l2, 2)],
+            [round(self.mean_precision.real, 2), round(self.mean_precision.imag, 2), round(self.mean_precision.l2, 2)],
+            [round(self.median_precision.real, 2), round(self.median_precision.imag, 2), round(self.median_precision.l2, 2)]])
+        
+        return f"\n(Log2)\n(MIN prec, MAX prec, AVG prec, MED prec) x (real, imag, l2)\n{results_arr}\n"
     
     def calc_cdf(self, precs: list[float], res: list[dict[str, float]]):
         sorted_precs = sorted(precs)
@@ -1818,7 +1824,7 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers], Static[rlwe.Eva
                 self._mm_gadget_product(level, c2, self.rlk.keys[0].gadget_ciphertext(), self.buff_qp[1].q, self.buff_qp[2].q)
                 ring_q._mm_add_lvl(level, c0, self.buff_qp[1].q, c0)
                 ring_q._mm_add_lvl(level, c1, self.buff_qp[2].q, c1)
-        elif isinstance(op_1, Plaintext): # Case Plaintext (x) Ciphertext or Ciphertext (x) Plaintext
+        elif isinstance(op_1, Plaintext): # Case Ciphertext (x) Plaintext
             if ct_out.degree() < ct_in.degree():
                 ct_out.resize(ct_in.degree(), level)
             else:
@@ -1845,6 +1851,16 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers], Static[rlwe.Eva
         self._mm_automorphism(ct_0.get_rlwe_ciphertext(), self.params.galois_element_for_column_rotation_by(k), ct_out.get_rlwe_ciphertext())
         ct_out.scale = ct_0.scale
     
+    def reduce_add(self, ct_0: Ciphertext, cols_in_cipher: int):
+        slots = self.ckks_params.slots()
+        assert 0 < cols_in_cipher <= slots, "CKKS.Evaluator.reduce_add: Invalid number of columns in cipher"
+
+        rotation_step = 1
+        for _ in range((cols_in_cipher - 1).bitlen()):
+            rotated_cipher = self.rotate_new(ct_0, rotation_step)
+            self.add(ct_0, rotated_cipher, ct_0)
+            rotation_step <<= 1
+    
     # Rescale divides ct0 by the last modulus in the moduli chain, and repeats this
     # procedure (consuming one level each time) until the scale reaches the original scale or before it goes below it, and returns the result
     # in ct_out. Since all the moduli in the moduli chain are generated to be close to the
@@ -1856,7 +1872,7 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers], Static[rlwe.Eva
 
         if min_scale <= 0: raise ValueError("cannot Rescale: min_scale is 0")
         if ct_in.scale == 0: raise ValueError("cannot Rescale: ciphertext scale is 0")
-        if ct_in.level() == 0: raise ValueError("cannot Rescale: input Ciphertext already at level 0")
+        if ct_in.level() == 0: raise ValueError("cannot Rescale: Ciphertext at level 0 --- needs bootstrapping")
         if ct_out.degree() != ct_in.degree(): raise ValueError("cannot Rescale: ct_in.degree() != ct_out.degree()")
 
         ct_out.scale = ct_in.scale

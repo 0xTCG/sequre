@@ -15,6 +15,7 @@ bool isMatmulReorderOptFunc ( Func * );
 bool isSharedTensor( types::Type * );
 bool isCipherTensor( types::Type * );
 bool isMPP( types::Type * );
+bool isSecureContainer( types::Type * );
 bool isMPC( Value *, types::Generic );
 
 types::Type *getTupleType( int, types::Type *, Module * );
