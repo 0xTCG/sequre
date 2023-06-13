@@ -62,6 +62,7 @@ public:
   bool checkIsTypeable()               const { return bool(value->getType()); }
   bool checkIsSameTree( BETNode * )    const;
   bool checkIsConsecutiveCommutative() const;
+  bool checkIsSecureContainer();
   bool checkIsCipherTensor();
   bool checkIsCiphertext();
   bool checkIsPlaintext();
