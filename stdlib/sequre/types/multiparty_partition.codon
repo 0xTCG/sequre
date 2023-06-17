@@ -179,7 +179,7 @@ class MPP[S, dtype]:
     def collect(self, mpc) -> CipherTensor[Ciphertext]:
         if mpc.pid == 0:
             return CipherTensor[Ciphertext]()
-        return self.gather_partitions(mpc).unfence()
+        return self.gather_partitions(mpc).unfence(mpc)
     
     def collect_at(self, mpc, target_pid: int) -> CipherTensor[Ciphertext]:
         if mpc.pid == 0:
@@ -188,13 +188,15 @@ class MPP[S, dtype]:
         enc = self._encryption_unified.copy()
         partitions = mpc.comms.collect_at(enc, target_pid)
         if mpc.pid == target_pid:
-            ct = partitions.unfence()
+            ct = partitions.unfence(mpc)
             mpc.comms.send_to_all_from(ct.shape, target_pid)
             return ct
         return CipherTensor[Ciphertext](
             shape=mpc.comms.receive_as_jar(target_pid, type(enc.shape)),
             slots=enc.slots,
-            _transposed=enc._transposed)
+            _transposed=enc._transposed,
+            _diagonal_contiguous=enc._diagonal_contiguous,
+            _skinny=enc._skinny)
     
     def reveal(self, mpc) -> ndarray[S, dtype]:
         if mpc.pid == 0:
@@ -235,73 +237,101 @@ class MPP[S, dtype]:
             _local_data=_local_data,
             _encryption_unified=_encryption_unified)
     
+    def matmul(self, mpc, other) -> MPP[S, dtype]:
+        assert self.ndim == other.ndim == 2, f"MPP: Invalid dimensions for matmul. {self.ndim} != {other.ndim}"
+        assert self.shape[1] == other.shape[0], f"MPP: Invalid shapes for matmul. {self.shape} x {other.shape}"
+                
+        if isinstance(other, ndarray):
+            return MPP.matmul_public(mpc, self, other)
+        
+        if self._transposed and other._transposed:
+            return MPP._matmul_case_tt(mpc, self, other)
+        if self._transposed and not other._transposed:
+            return MPP._matmul_case_tnt(mpc, self, other)
+        if not self._transposed and other._transposed:
+            return MPP._matmul_case_ntt(mpc, self, other)
+        
+        # Case not self._transposed and not other._transposed:
+        return MPP._matmul_case_ntnt(mpc, self, other)
+        
     @sequre
-    def matmul(mpc, first: MPP[S, dtype], other) -> MPP[S, dtype]:
+    def _matmul_case_ntnt(mpc, first: MPP[S, dtype], other: MPP[S, dtype]) -> MPP[S, dtype]:
+        other_partitions = other.gather_partitions(mpc)
+
+        if first.is_local():
+            _encryption_unified = first._local_data @ other_partitions.unfence(mpc)
+        else:
+            first.unify_encryption(mpc)
+            _encryption_unified = first._encryption_unified @ other_partitions.unfence(mpc)
+        
+        return MPP[S, dtype](
+            modulus=first.modulus,
+            _ratios=first._ratios,
+            _encryption_unified=_encryption_unified)
+
+    @sequre
+    def _matmul_case_tt(mpc, first: MPP[S, dtype], other: MPP[S, dtype]) -> MPP[S, dtype]:
+        return (other.to_mpc(mpc) @ first.to_mpc(mpc)).T.to_mpp(mpc, first._ratios)
+
+    @sequre
+    def _matmul_case_tnt(mpc, first: MPP[S, dtype], other: MPP[S, dtype]) -> MPP[S, dtype]:
+        if mpc.pid == 0:
+            return MPP[S, dtype](
+                modulus=first.modulus,
+                _local_data=zeros((first._local_data.shape[1], other._local_data.shape[1]), dtype=dtype))
+
+        if not first.is_local():
+            first.unify_encryption(mpc)
+        if not other.is_local():
+            other.unify_encryption(mpc)
+        
+        if first.is_local() and other.is_local():
+            enc = CipherTensor[Ciphertext].enc(mpc, first._local_data.T @ other._local_data)
+        elif first.is_local():
+            enc = first._local_data.T @ other._encryption_unified
+        else:
+            enc = first._encryption_unified.T @ other._encryption_unified
+
+        return mpc.comms.collect_at(enc, mpc.comms.hub_pid).sum(mpc).to_mpp(mpc, first._ratios, first.modulus, S=S, dtype=dtype)
+
+    @sequre
+    def _matmul_case_ntt(mpc, first: MPP[S, dtype], other: MPP[S, dtype]) -> MPP[S, dtype]:
+        if mpc.pid == 0:
+            return MPP[S, dtype](
+                modulus=first.modulus,
+                _local_data=zeros((first._local_data.shape[0], other._local_data.shape[0]), dtype=dtype))
+
         _local_data = ndarray[S, dtype]()
         _encryption_left = CipherTensor[Ciphertext]()
         _encryption_right = CipherTensor[Ciphertext]()
         _encryption_unified = CipherTensor[Ciphertext]()
+
+        other_partitions = other.gather_partitions(mpc)
+        reference_pid = mpc.pid - 1  # Avoid CP0
         
-        assert first.ndim == other.ndim == 2, f"MPP: Invalid dimensions for matmul. {first.ndim} != {other.ndim}"
-                
-        if isinstance(other, ndarray):
-            return MPP.matmul_public(mpc, first, other)
-        
-        if not (first._transposed ^ other._transposed):
-            if first._transposed:
-                return (other.to_mpc(mpc) @ first.to_mpc(mpc)).T.to_mpp(mpc, first._ratios)
-            return (first.to_mpc(mpc) @ other.to_mpc(mpc)).to_mpp(mpc, first._ratios)
-        
-        assert first.shape[1] == other.shape[0], f"MPP: Invalid shapes for matmul. {first.shape} x {other.shape}"
+        if other.is_local():
+            other_encryption_left = other_partitions[:reference_pid].unfence(mpc) if reference_pid else CipherTensor[Ciphertext]()
+            other_encryption_right = other_partitions[reference_pid + 1:].unfence(mpc) if not mpc.pid == mpc.comms.number_of_parties - 1 else CipherTensor[Ciphertext]()
 
-        if first._transposed and not other._transposed:
-            if mpc.pid == 0:
-                return MPP[S, dtype](
-                    modulus=first.modulus,
-                    _local_data=zeros((first._local_data.shape[1], other._local_data.shape[1]), dtype=dtype))
-
-            if first.is_local() and other.is_local():
-                enc = CipherTensor[Ciphertext].enc(mpc, first._local_data.T @ other._local_data)
-            elif first.is_local():
-                other.unify_encryption(mpc)
-                enc = first._local_data.T @ other._encryption_unified
-            else:
-                raise NotImplementedError("MPP: Cannot matmul encrypted transpose yet")
-
-            return mpc.comms.collect_at(enc, mpc.comms.hub_pid).sum(mpc).to_mpp(mpc, first._ratios, first.modulus, S=S, dtype=dtype)
-
-        if not first._transposed and other._transposed:
-            if mpc.pid == 0:
-                return MPP[S, dtype](
-                    modulus=first.modulus,
-                    _local_data=zeros((first._local_data.shape[0], other._local_data.shape[0]), dtype=dtype))
-
-            other_partitions = other.gather_partitions(mpc)
-            reference_pid = mpc.pid - 1  # Avoid CP0
-            
-            if other.is_local():
-                other_encryption_left = other_partitions[:reference_pid].unfence() if reference_pid else CipherTensor[Ciphertext]()
-                other_encryption_right = other_partitions[reference_pid + 1:].unfence() if not mpc.pid == mpc.comms.number_of_parties - 1 else CipherTensor[Ciphertext]()
-
-                if first.is_local():
-                    if other_encryption_left: _encryption_left = first._local_data @ other_encryption_left.T
-                    _local_data = first._local_data @ other._local_data.T
-                    if other_encryption_right: _encryption_right = first._local_data @ other_encryption_right.T
-                else:
-                    first.unify_encryption(mpc)
-                    _encryption_unified_enclosed = []
-                    if other_encryption_left:
-                        _encryption_unified_enclosed.append(first._encryption_unified @ other_encryption_left.T)
-                    _encryption_unified_enclosed.append(first._encryption_unified @ other._local_data.T)
-                    if other_encryption_right:
-                        _encryption_unified_enclosed.append(first._encryption_unified @ other_encryption_right.T)
-                    _encryption_unified = _encryption_unified_enclosed.unfence()
-            elif first.is_local():
-                _encryption_unified = first._local_data @ other_partitions.unfence().T
+            if first.is_local():
+                if other_encryption_left: _encryption_left = first._local_data @ other_encryption_left.T
+                _local_data = first._local_data @ other._local_data.T
+                if other_encryption_right: _encryption_right = first._local_data @ other_encryption_right.T
             else:
                 first.unify_encryption(mpc)
-                _encryption_unified = first._encryption_unified @ other_partitions.unfence().T
-            
+                _encryption_unified_enclosed = []
+                if other_encryption_left:
+                    _encryption_unified_enclosed.append(first._encryption_unified @ other_encryption_left.T)
+                _encryption_unified_enclosed.append(first._encryption_unified @ other._local_data.T)
+                if other_encryption_right:
+                    _encryption_unified_enclosed.append(first._encryption_unified @ other_encryption_right.T)
+                _encryption_unified = _encryption_unified_enclosed.unfence(mpc)
+        elif first.is_local():
+            _encryption_unified = first._local_data @ other_partitions.unfence(mpc).T
+        else:
+            first.unify_encryption(mpc)
+            _encryption_unified = first._encryption_unified @ other_partitions.unfence(mpc).T
+        
         return MPP[S, dtype](
             modulus=first.modulus,
             _ratios=first._ratios,

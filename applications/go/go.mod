@@ -32,8 +32,4 @@ require (
 
 replace github.com/ldsec/lattigo/v2 => github.com/hcholab/lattigo/v2 v2.1.2-0.20230123224332-e8d68c24b94a
 
-replace github.com/hhcho/sfgwas-private => ../../../../../go/src/hhcho/sfgwas-private
-
-//replace github.com/hhcho/mpc-core => ../../../go/src/hhcho/mpc-core
-
-//replace github.com/ldsec/lattigo/v2 => ../../../go/src/hhcho/lattigo
+replace github.com/hhcho/sfgwas-private => ../../../../libs/go/src/hhcho/sfgwas-private
