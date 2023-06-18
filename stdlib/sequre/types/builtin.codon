@@ -3,7 +3,7 @@ import math
 from internal.gc import sizeof, atomic, alloc
 from experimental.simd import Vec, bitcast_scatter, bitcast_vectorize
 from numpy.ndarray import ndarray
-from numpy.create import zeros
+from numpy.create import zeros, array
 
 from pickler import pickle, unpickle, _write_raw, _read_raw
 from pickle import pickle as native_pickle, unpickle as native_unpickle
@@ -1264,11 +1264,6 @@ class List:
             print("WARNING: Transposing 1-dimensional list returns the same 1-dimensional list")
             return self
 
-    def generate_vectors(self: list[T]):
-        if isinstance(T, list):
-            for row in self: yield from row.generate_vectors()
-        else: yield self
-
     def flatten(self: list[T]):
         if isinstance(T, list[list]):
             compile_error("List.flatten: Cannot flatten dimension larger than 2")
@@ -1277,10 +1272,10 @@ class List:
         else:
             return [e for row in self for e in row]
 
-    def unfence(self: list[T]):
+    def unfence(self: list[T], *args):
         unfenced = self[0]
         for i in range(1, len(self)):
-            unfenced.extend(self[i])
+            unfenced.extend(*args, self[i])
 
         return unfenced
 
@@ -1335,7 +1330,22 @@ class List:
 
             return new_mat
     
+    def irotate(self: list[T], step: int) -> list[T]:
+        step = (len(self) + step) % len(self)
+
+        if step == 0:
+            return self
+
+        self.extend(self[:step])
+        del self[:step]
+        
+        return self
+
     def rotate(self: list[T], step: int) -> list[T]:
+        if step == 0:
+            return self.copy()
+
+        step = (len(self) + step) % len(self)
         new_list = self[step:]
         new_list.extend(self[:step])
         return new_list
@@ -1479,7 +1489,7 @@ class List:
         new_list = list[T](len(self))
 
         for e in self:
-            new_list.append(e.copy())
+            new_list.append(e if isinstance(e, ByVal) else e.copy())
         
         return new_list
     
@@ -1618,6 +1628,16 @@ class List:
     def vectorize_bitcast(self: List[List[u64]]) -> List[List[u64xN]]:
         return [row.vectorize_bitcast() for row in self]
     
+    def diagonal_contig(self, antidiagonal: bool = False) -> List[T]:
+        return [col.rotate(-i if antidiagonal else i) for (i, col) in enumerate(self.transpose())].transpose()
+
+    def patch_copy(self: List[T], new_size: int) -> List[T]:
+        if isinstance(T, list):
+            return [row.patch_copy(new_size) for row in self]
+        
+        assert isinstance(T, ByVal), "Cannot patch-copy an n-dim list"
+        return [self[i % len(self)] for i in range(new_size)]
+    
 
 @extend
 class ndarray:
@@ -1712,11 +1732,39 @@ class ndarray:
             raise NotImplementedError("ndarray: can resize only 1-dim and 2-dim ndarrays at the moment")
         
         return new_array
+    
+    def pad(self, padding: int, axis: Static[int]) -> ndarray[S, T]:
+        if staticlen(S) <= axis:
+            compile_error("ndarray: axis does not exist (too large)")
+
+        _chunk_size = self.size if axis == 0 else self.strides[axis - 1] // self.itemsize
+        new_shape = (*self.shape[:axis], self.shape[axis] + padding, *self.shape[axis + 1:])
+
+        new_arr = zeros(new_shape, dtype=T)
+        idx = 0
+
+        for e in self.flatten():
+            if idx == 0 or idx % _chunk_size:
+                new_arr._data[idx] = e
+                idx += 1
+            else:
+                idx += self.strides[axis] * padding
+        
+        return new_arr
 
     def copy(self) -> ndarray[S, T]:
         _data_bytes = Ptr[byte](self.nbytes)
         str.memcpy(_data_bytes, self._data.as_byte(), self.nbytes)
         return ndarray[S, T](self.shape, self.strides, Ptr[T](_data_bytes), self.flags)
+    
+    def patch_copy(self, new_size: int) -> ndarray[Tuple[int], T]:
+        new_array = zeros((new_size,), T)
+        flat_data = self.flatten()
+        
+        for i in range(new_size):
+            new_array[i] = flat_data[i % flat_data.size]
+        
+        return new_array
     
     def to_list(self) -> List:
         assert staticlen(self.shape) <= 2, "Bitcast to_list is supported only for ndarrays of dimension less than 3 at the moment."
@@ -1747,19 +1795,11 @@ class ndarray:
         
         return ndarray[Tuple[int], T]._new_contig((size,), diagonal)
     
-    def irotate(self, step: int) -> ndarray[S, T]:
-        _size = step * sizeof(T)
-        _temp = alloc(_size)
-        _loc = (self._data + (self.size - step)).as_byte()
-        
-        str.memcpy(_temp, self._data.as_byte(), _size)
-        str.memcpy(self._data.as_byte(), _loc, _size)
-        str.memcpy(_loc, _temp, _size)
-
-        return self
+    def diagonal_contig(self, antidiagonal: bool = False) -> ndarray[S, T]:
+        return array(self.tolist().diagonal_contig(antidiagonal))
     
-    def rotate(self, step: int) -> ndarray[S, T]:
-        return self.copy().irotate(step)
+    def shift_like_cipher(self, step: int, slots: int, cols: int) -> ndarray[S, T]:
+        return array(self.tolist().shift_like_cipher(step, slots, cols))
     
     @property
     def cohort_shape(self) -> S:
