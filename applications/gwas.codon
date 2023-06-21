@@ -5,8 +5,9 @@ from sequre.utils.io import read_filtered_matrix, read_vector, read_matrix
 from sequre.types.shared_tensor import SharedTensor
 
 from sequre.types.internal import Internal as sq
-from sequre.stdlib.lin_alg import orthonormal_basis, eigen_decomp
+from sequre.stdlib.lin_alg import orthonormal_basis
 
+from sequre.stdlib.learn.pca import random_pca
 from utils.param import *
 from utils.data_sharing import shares_paths
 
@@ -203,69 +204,15 @@ def linkage_disequilibrium_filter(mpc, snp_pos, miss, dosage, geno_mean, geno_st
 
 
 @sequre
-def pca_random_sketch(mpc, top_components, oversampling_count, miss, dosage, geno_mean):
-    kp = top_components + oversampling_count
-    sketch = SharedTensor.zeros(kp, len(geno_mean), geno_mean.modulus)
-    sketch_adjustment = SharedTensor.zeros(kp, len(geno_mean), geno_mean.modulus)
-    bucket_count = [0 for _ in range(kp)]
-
-    for dosage_row, miss_row in zip(dosage, miss):
-        mpc.randomness.switch_seed(-1)
-        bucket_index = kp.rand(kp) - 1
-        rand_sign = (kp.rand(2) - 1) * 2 - 1
-        mpc.randomness.restore_seed(-1)
-
-        # Flip miss bits so it points to places where g_mean should be subtracted
-        flip_miss = (1 - miss_row)
-        if rand_sign == -1:
-            flip_miss = -flip_miss
-            sketch[bucket_index] += -dosage_row
-        else: sketch[bucket_index] += dosage_row
-        sketch_adjustment[bucket_index] += flip_miss * geno_mean
-        bucket_count[bucket_index] += 1
-
-    # Subtract the adjustment factor
-    sketch = sketch.to_fp() - sketch_adjustment
-
-    # Get rid of empty buckets and normalize nonempty ones. Loop will be removed after #49 is fixed.
-    for i, bc in enumerate(bucket_count): sketch[i] = sketch[i] / bc
-    sketch.filter(bucket_count)
-
-    print(f"Initial sketch obtained at CP{mpc.pid}.")
-    return sketch
-
-
-@sequre
-def pca_powers(mpc, iterations_count, random_sketch, miss, dosage, geno_mean, geno_std_inv):
-    Q = orthonormal_basis(mpc, random_sketch * geno_std_inv)
-    hit = 1 - miss
-
-    for pit in range(iterations_count + 1):
-        Q_scaled = Q * geno_std_inv
-        Q_scaled_gmean = Q_scaled * geno_mean
-
-        Q = dosage @ Q_scaled.T - hit @ Q_scaled_gmean.T
-        if pit == iterations_count: break
-
-        ortho_Q = orthonormal_basis(mpc, Q.T)
-        Q = orthonormal_basis(mpc, (ortho_Q @ dosage - ortho_Q @ hit * geno_mean) * geno_std_inv)
-        print(f"Iter {pit + 1}. complete at CP{mpc.pid}.")
-
-    print(f"Power iteration complete at CP{mpc.pid}.")
-    return Q
-
-
-@sequre
-def random_pca(mpc, top_components, oversampling_count, power_iterations,
+def population_stratification_analysis(mpc, top_components, oversampling_count, power_iterations,
         snp_pos, cov, geno_mean, geno_std_inv, ind_keep, gkeep, miss, dosage):
+    
     miss, dosage, geno_mean, geno_std_inv = linkage_disequilibrium_filter(
         mpc, snp_pos, miss, dosage, geno_mean, geno_std_inv, ind_keep, gkeep)
     
-    pca_sketch = pca_random_sketch(mpc, top_components, oversampling_count, miss, dosage, geno_mean)
-    Q = pca_powers(mpc, power_iterations, pca_sketch, miss, dosage, geno_mean, geno_std_inv)
-    Z = Q.T / len(snp_pos)
-    U = eigen_decomp(mpc, Z @ Z.T)[0][:top_components, :len(pca_sketch)]
-
+    U, Z = random_pca(mpc, dosage, geno_mean, geno_std_inv, top_components,
+                      oversampling_count, power_iterations, miss, len(snp_pos))
+    
     print(f"Selected {top_components} eigenvectors at CP{mpc.pid}.")
     return orthonormal_basis(mpc, (U @ Z).extend(cov.T.to_fp()))
 
@@ -301,7 +248,7 @@ def gwas_protocol(mpc, test_run, modulus):
     ikeep, gwas_snp_keep_mask) = quality_control(
         mpc, NUM_INDS, NUM_SNPS, snp_pos, pheno, cov, g, miss, dosage)
     
-    components = random_pca(mpc, PCA_COMPONENTS, PCA_OVERSAMPLES, PCA_POWER_ITERATIONS,
+    components = population_stratification_analysis(mpc, PCA_COMPONENTS, PCA_OVERSAMPLES, PCA_POWER_ITERATIONS,
             snp_pos, cov, g_mean, g_std_bern_inv, ikeep, gwas_snp_keep_mask, miss, dosage)
     
     return cochran_armitage(mpc, components, pheno, dosage.filter(ikeep).T.filter(gwas_snp_keep_mask).T)

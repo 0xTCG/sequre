@@ -1,0 +1,67 @@
+from numpy.create import zeros
+
+from sequre.attributes import sequre
+from sequre.stdlib.lin_alg import orthonormal_basis, eigen_decomp
+
+
+@sequre
+def pca_random_sketch[T](mpc, data: T, data_mean, filtered_data_mask, top_components_count, oversampling_count):
+    kp = top_components_count + oversampling_count
+    sketch = T.zeros((kp, len(data_mean)), data_mean.modulus)
+    sketch_adjustment = T.zeros((kp, len(data_mean)), data_mean.modulus).astype(float)
+    bucket_count = zeros((kp,), dtype=int)
+
+    for data_row, miss_row in zip(data, filtered_data_mask):
+        with mpc.randomness.seed_switch(-1):
+            bucket_index = kp.rand(kp) - 1
+            rand_sign = (kp.rand(2) - 1) * 2 - 1
+
+        # Flip miss bits so it points to places where g_mean should be subtracted
+        flip_miss = (1 - miss_row)
+        if rand_sign == -1:
+            flip_miss = -flip_miss
+            sketch[bucket_index] -= data_row
+        else:
+            sketch[bucket_index] += data_row
+        
+        sketch_adjustment[bucket_index] += flip_miss * data_mean
+        bucket_count[bucket_index] += 1
+
+    # Subtract the adjustment factor
+    sketch = sketch.to_fp() - sketch_adjustment
+
+    # Get rid of empty buckets and normalize nonempty ones. Loop will be removed after #49 is fixed.
+    for i, bc in enumerate(bucket_count): sketch[i] /= bc
+    sketch = sketch.filter(bucket_count)
+
+    print(f"Initial sketch obtained at CP{mpc.pid}.")
+    return sketch
+
+
+@sequre
+def pca_powers(mpc, pca_sketch, data, data_mean, data_std_inv, filtered_data_mask, iterations_count):
+    Q = orthonormal_basis(mpc, pca_sketch * data_std_inv)
+    hit = (1 - filtered_data_mask).astype(float)
+
+    for pit in range(iterations_count + 1):
+        Q_scaled = Q * data_std_inv
+        Q_scaled_gmean = Q_scaled * data_mean
+
+        Q = data.astype(float) @ Q_scaled.T - hit @ Q_scaled_gmean.T
+        if pit == iterations_count: break
+
+        ortho_Q = orthonormal_basis(mpc, Q.T)
+        Q = orthonormal_basis(mpc, (ortho_Q @ data.astype(float) - ortho_Q @ hit * data_mean) * data_std_inv)
+        print(f"Iter {pit + 1}. complete at CP{mpc.pid}.")
+
+    print(f"Power iteration complete at CP{mpc.pid}.")
+    return Q
+
+
+@sequre
+def random_pca(mpc, data, data_mean, data_std_inv, top_components_count, oversampling_count, power_iterations_count, filtered_data_mask, filtered_data_size):
+    pca_sketch = pca_random_sketch(mpc, data, data_mean, filtered_data_mask, top_components_count, oversampling_count)
+    Q = pca_powers(mpc, pca_sketch, data, data_mean, data_std_inv, filtered_data_mask, power_iterations_count)
+    Z = Q.T / filtered_data_size
+    U = eigen_decomp(mpc, Z @ Z.T)[0][:top_components_count, :len(pca_sketch)]
+    return U, Z
