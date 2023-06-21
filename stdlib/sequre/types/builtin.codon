@@ -3,7 +3,8 @@ import math
 from internal.gc import sizeof, atomic, alloc
 from experimental.simd import Vec, bitcast_scatter, bitcast_vectorize
 from numpy.ndarray import ndarray
-from numpy.create import zeros, array
+from numpy.create import zeros, array, identity
+from numpy.linalg import *
 
 from pickler import pickle, unpickle, _write_raw, _read_raw
 from pickle import pickle as native_pickle, unpickle as native_unpickle
@@ -81,6 +82,8 @@ class bool:
     @staticmethod
     def _pickle_size() -> int:
         return bool.nbytes()
+    def astype[t](self) -> t:
+        return t(self)
 
 
 @extend
@@ -133,6 +136,9 @@ class float:
     def __mul__[TP](self, other: SharedTensor[TP]) -> SharedTensor[TP]:
         return other * self
     
+    def astype[t](self) -> t:
+        return t(self)
+    
     @llvm
     def raw_int(self: float) -> int:
         %0 = bitcast double %self to i64
@@ -176,6 +182,8 @@ class int:
     def __mod__(self: int, other: int) -> int:
         # TODO: #138 Check why performance gets worsened with the fast modulus enabled (Note: naive_mod includes ring check)OND_FIELD_SIZE, SECOND_MOD_CONST)
         return self.__naive_mod(other)
+    def astype[t](self) -> t:
+        return t(self)
     def bitlen(self: int) -> int:
         if self >> 63: self = -self
         return int(u64(self).bitlen())
@@ -540,7 +548,7 @@ class UInt:
                 if isinstance(other, UInt[N]): return modular_mul_u192u192(self, other)
                 if isinstance(other, u64): return modular_mul_u192u64(self, other)
                 if isinstance(other, int): return modular_mul_u192u64(self, u64(other))
-            else: compile_error(f"Invalid type of a factor in modular multiplication: {modulus}")
+            else: compile_error("Invalid type of a factor in modular multiplication")
         if DEBUG:
             assert self == int(self), f"Factor {self} is not within the length of 64 bits.\nIt must be no longer than 64 bits if the modulus differs the size of field/ring."
             assert other == int(other), f"Factor {other} is not within the length of 64 bits.\nIt must be no longer than 64 bits if the modulus differs the size of field/ring."
@@ -1109,6 +1117,9 @@ class List:
 
         return True
     
+    def astype(self, t: type):
+        return [e.astype(float) for e in self]
+    
     def neg_mod(self: list[T], modulus) -> list[T]:
         l = list[T](len(self))
         for s in self: l.append(s.neg_mod(modulus))
@@ -1450,7 +1461,7 @@ class List:
         if isinstance(self, list[list[int]]) and isinstance(value, int):
             return [[value for _ in range(len(self[0]))] for _ in range(len(self))]
         
-        compile_error(f'Invalid type within a fixed value method')
+        compile_error('Invalid type within a fixed value method')
     
     def zeros(self: list[T]) -> list[T]:
         if isinstance(self, list[int_t]):
@@ -1462,7 +1473,7 @@ class List:
         if isinstance(self, list[list[int]]):
             return [[0 for _ in range(len(self[0]))] for _ in range(len(self))]
         
-        compile_error(f'Invalid type within zeros method')
+        compile_error('Invalid type within zeros method')
     
     def zeros_float(self: list[T]):
         if isinstance(self, list[list[list]]):
@@ -1483,7 +1494,7 @@ class List:
         if isinstance(self, list[list[int]]):
             return [[1 for _ in range(len(self[0]))] for _ in range(len(self))]
         
-        compile_error(f'Invalid type within ones method')
+        compile_error('Invalid type within ones method')
     
     def copy(self: list[T]):
         new_list = list[T](len(self))
@@ -1641,6 +1652,17 @@ class List:
 
 @extend
 class ndarray:
+    def __setitem__(self, s: Tuple[slice, slice], other: ndarray[S, T]):
+        if not staticlen(S) == 2:
+            compile_error("ndarray: can only do sliced 2-dim setitem on 2-dim arrays")
+        
+        rs, cs = s
+        start, stop, _, _ = rs.adjust_indices(self.shape[0])
+        o_idx = 0
+        for i in range(start, stop):
+            self[i][cs] = other[o_idx][:]
+            o_idx += 1
+
     def __mul__[dtype](self: ndarray[S, dtype], other: ndarray[S, bool]) -> ndarray[S, dtype]:
         return self * other.astype(dtype)
     
@@ -1701,6 +1723,16 @@ class ndarray:
         
         raise ValueError(f"ndarray: Cannot broadcast shape {self.shape} into {target_shape}")
 
+    def expand_dims(self, axis: int = 0):
+        if staticlen(S) == 1:
+            new_shape = (1, self.shape[0]) if axis == 0 else (self.shape[0], 1)
+            return ndarray[Tuple[int, int], T]._new_contig(new_shape, self._data)
+        elif staticlen(S) == 2:
+            new_shape = (1, *self.shape) if axis == 0 else (*self.shape, 1)
+            return ndarray[Tuple[int, int, int], T]._new_contig(new_shape, self._data)
+        else:
+            compile_error("Invalid ndarray shape (not supported yet for expand_dims)")
+    
     def extend(self, other: ndarray[S, T], axis: int = 0) -> ndarray[S, T]:
         assert axis == 0, "ndarray: Only axis=0 supported for extension at the moment"
         assert self.shape[1:] == other.shape[1:], "ndarray: Shapes mismatch while extending over 0 axis"
@@ -1754,6 +1786,12 @@ class ndarray:
                 idx += self.strides[axis] * padding
         
         return new_arr
+    
+    def pad_left(self, padding: int) -> ndarray[S, T]:
+        return zeros((padding, *self.shape[1:]), dtype=T).extend(self)
+    
+    def pad_right(self, padding: int) -> ndarray[S, T]:
+        return self.copy().extend(zeros((padding, *self.shape[1:]), dtype=T))
 
     def copy(self) -> ndarray[S, T]:
         _data_bytes = Ptr[byte](self.nbytes)
@@ -1804,9 +1842,50 @@ class ndarray:
     def shift_like_cipher(self, step: int, slots: int, cols: int) -> ndarray[S, T]:
         return array(self.tolist().shift_like_cipher(step, slots, cols))
     
+    def diag(self, value: T) -> ndarray[S, T]:
+        if not staticlen(S) == 2:
+            compile_error("ndarray: can compute diag only for 2-dim ndarray")
+        
+        diag_arr = self.zeros()
+        for i in range(len(self)):
+            diag_arr[i][i] = value
+        return diag_arr
+    
+    def sqrt(self) -> ndarray[S, float]:
+        return self._propagate_call(math.sqrt)
+
+    def _propagate_call(self, _call):
+        # TODO: Write an IR pass that will call this automatically to enable bar.foo(ndarray) for any byVal-arg foo in bar
+        new_arr = self.zeros()
+        for i in range(self.size):
+            new_arr._data[i] = _call(self._data[i])
+        return new_arr
+    
+    # Mock methods (to match the interface of secure containers: SharedTensor and MPP)
+    @property
+    def I(self):
+        return self.diag(T(1))
+    
     @property
     def cohort_shape(self) -> S:
         return self.shape
+    
+    @property
+    def modulus(self) -> T:
+        return T(0)
+    
+    @staticmethod
+    def zeros(shape: S, *args) -> ndarray[S, T]:
+        return zeros(shape, dtype=T)
+    
+    def zeros(self: ndarray[S, T]) -> ndarray[S, T]:
+        return zeros(self.shape, dtype=T)
+    
+    def to_fp(self) -> ndarray[S, float]:
+        return self.astype(float)
+    
+    def filter(self, mask: ndarray):
+        return array([e.tolist() for e, m in zip(self, mask) if bool(m)])
 
 
 print(f"Sequre setup:\n\t Galois field size: {FIELD_SIZE.__repr__()}\n\t Z_(2^k) ring size: {RING_SIZE.__repr__()}")
