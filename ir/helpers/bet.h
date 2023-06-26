@@ -64,8 +64,8 @@ public:
   bool checkIsConsecutiveCommutative() const;
   bool checkIsSecureContainer();
   bool checkIsCipherTensor();
-  bool checkIsCiphertext();
-  bool checkIsPlaintext();
+  bool checkIsCipherCipherTensor();
+  bool checkIsPlainCipherTensor();
   
   void swapChildren() { std::swap(leftChild, rightChild); }
   void replace( BETNode * );

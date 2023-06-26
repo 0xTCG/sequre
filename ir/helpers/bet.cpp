@@ -38,14 +38,14 @@ bool BETNode::checkIsSecureContainer() {
   return isSecureContainer(getOrRealizeIRType());
 }
 
-bool BETNode::checkIsCiphertext() {
+bool BETNode::checkIsCipherCipherTensor() {
   if ( !checkIsCipherTensor() ) return false;
-  return getOrRealizeIRType()->getName().find("Ciphertext") != std::string::npos;
+  return hasCKKSCiphertext(getOrRealizeIRType());
 }
 
-bool BETNode::checkIsPlaintext() {
+bool BETNode::checkIsPlainCipherTensor() {
   if ( !checkIsCipherTensor() ) return false;
-  return getOrRealizeIRType()->getName().find("Plaintext") != std::string::npos;
+  return hasCKKSPlaintext(getOrRealizeIRType());
 }
 
 bool BETNode::checkIsSameTree( BETNode *other ) const {
@@ -103,10 +103,10 @@ types::Type *BETNode::getOrRealizeIRType( bool force ) {
   assert( lcType && "Crypto type realization error (left child type could not be realized)" );
   assert( rcType && "Crypto type realization error (left child type could not be realized)" );
 
-  if ( lc->checkIsCiphertext() ) irType = lcType;
-  else if ( rc->checkIsCiphertext() ) irType = rcType;
-  else if ( lc->checkIsPlaintext() ) irType = lcType;
-  else if ( rc->checkIsPlaintext() ) irType = rcType;
+  if ( lc->checkIsCipherCipherTensor() ) irType = lcType;
+  else if ( rc->checkIsCipherCipherTensor() ) irType = rcType;
+  else if ( lc->checkIsPlainCipherTensor() ) irType = lcType;
+  else if ( rc->checkIsPlainCipherTensor() ) irType = rcType;
   else irType = lcType;
 
   assert( irType && "Cannot realize crypto type" );
@@ -408,9 +408,19 @@ Value *generateExpression( Module *M, BETNode *node ) {
   auto *opFunc = M->getOrRealizeMethod(
     lopType, node->getOperationIRName(), {lopType, ropType});
 
-  std::string const errMsg =
-      node->getOperationIRName() + " not found in type " + lopType->getName();
-  assert(opFunc && errMsg.c_str());
+  if ( !opFunc ) {
+    std::cout << "ERROR: "
+              << node->getOperationIRName()
+              << " not found in type "
+              << lopType->getName()
+              << " with arguments ("
+              << lopType->getName()
+              << ", "
+              << ropType->getName()
+              << ")"
+              << std::endl;
+    assert(false);
+  }
 
   auto *lop = generateExpression(M, lc);
   assert(lop);
