@@ -16,16 +16,16 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
   auto *f = util::getFunc(v->getCallee());
   if ( !f ) return;
   
-  bool isEq      = f->getName().find(Module::EQ_MAGIC_NAME) != std::string::npos;
-  bool isGt      = f->getName().find(Module::GT_MAGIC_NAME) != std::string::npos;
-  bool isLt      = f->getName().find(Module::LT_MAGIC_NAME) != std::string::npos;
-  bool isAdd     = f->getName().find(Module::ADD_MAGIC_NAME) != std::string::npos;
-  bool isSub     = f->getName().find(Module::SUB_MAGIC_NAME) != std::string::npos;
-  bool isMul     = f->getName().find(Module::MUL_MAGIC_NAME) != std::string::npos;
-  bool isMatMul  = f->getName().find(Module::MATMUL_MAGIC_NAME) != std::string::npos;
-  bool isDiv     = f->getName().find(Module::TRUE_DIV_MAGIC_NAME) != std::string::npos;
-  bool isPow     = f->getName().find(Module::POW_MAGIC_NAME) != std::string::npos;
-  bool isGetItem = false; // Uncomment after ciphertensor migrated to static shape // f->getName().find(Module::GETITEM_MAGIC_NAME) != std::string::npos;
+  bool isEq      = f->getUnmangledName() == Module::EQ_MAGIC_NAME;
+  bool isGt      = f->getUnmangledName() == Module::GT_MAGIC_NAME;
+  bool isLt      = f->getUnmangledName() == Module::LT_MAGIC_NAME;
+  bool isAdd     = f->getUnmangledName() == Module::ADD_MAGIC_NAME;
+  bool isSub     = f->getUnmangledName() == Module::SUB_MAGIC_NAME;
+  bool isMul     = f->getUnmangledName() == Module::MUL_MAGIC_NAME;
+  bool isMatMul  = f->getUnmangledName() == Module::MATMUL_MAGIC_NAME;
+  bool isDiv     = f->getUnmangledName() == Module::TRUE_DIV_MAGIC_NAME;
+  bool isPow     = f->getUnmangledName() == Module::POW_MAGIC_NAME;
+  bool isGetItem = false; // Uncomment after ciphertensor migrated to static shape // f->getUnmangledName() == Module::GETITEM_MAGIC_NAME;
   
   if ( !isEq &&
        !isGt &&
@@ -53,7 +53,7 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
     if ( sqrtInstr ) {
       auto *sqrtFunc = util::getFunc(sqrtInstr->getCallee());
       if ( sqrtFunc )
-        isSqrtInv = sqrtFunc->getName().find("sqrt") != std::string::npos;
+        isSqrtInv = sqrtFunc->getUnmangledName() == "sqrt";
     }
   }
 
