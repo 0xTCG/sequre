@@ -2,7 +2,7 @@ import math
 
 import prg, secure_operator
 
-from numpy.create import zeros
+from numpy.create import zeros, _extract_shape
 from numpy.ndarray import ndarray
 
 from helpers import argmin
@@ -28,7 +28,7 @@ class SharedTensor:
         
         # Pad shape if ciphertexts are not fully utilized
         new_shape = self.shape.copy()
-        new_shape[-1] = max(slots, new_shape[-1])
+        new_shape[-1] = (self.shape[-1] + slots - 1) // slots * slots
         share = self.share
         if new_shape[-1] != self.shape[-1]:
             share = self.share.resize(new_shape)
@@ -37,21 +37,15 @@ class SharedTensor:
 
         return CipherTensor(ciphervector, self.shape, slots)
 
-    def to_mpp[S, dtype](self, mpc, ratios: list[int], transpose_encryption: bool = False) -> MPP[S, dtype]:
-        if staticlen(S) == 2:
-            shape = (self.shape[0], self.shape[1])
-        elif staticlen(S) == 1:
-            shape = (self.shape[0],)
-        else:
-            compile_error("MPP supports only 1-dim and 2-dim arrays at the momemt")
-        
+    def to_mpp[dtype](self, mpc, ratios: list[int], transpose_encryption: bool = False) -> MPP:
+        shape = _extract_shape(self.share)
         n = shape[0]
         s = ratios.sum()
         assert n % s == 0, f"Sharedtensor: Cannot distribute partitions by the given proportion. Shape: {shape}. Ratios: {ratios}"
         new_ratios = ratios * (n // s)
         
         if mpc.pid == 0:
-            return MPP[S, dtype](
+            return MPP[type(shape), dtype](
                 modulus=self.modulus,
                 _ratios=new_ratios,
                 _local_data=zeros(shape, dtype=dtype))
@@ -65,7 +59,7 @@ class SharedTensor:
         encrypted_partition = partition.to_mhe(mpc)
         encrypted_partition._transposed = transpose_encryption
 
-        return MPP[S, dtype](
+        return MPP[type(shape), dtype](
             modulus=self.modulus,
             _ratios=new_ratios,
             _encryption_unified=encrypted_partition)            
@@ -73,42 +67,52 @@ class SharedTensor:
 
 @extend
 class CipherTensor:
-    def to_mpc[dtype](self, mpc, modulus: int_t = RING_SIZE) -> SharedTensor:
-        if mpc.pid == 0:
-            raise NotImplementedError("CipherTensor.to_mpc should not be called at trusted dealer")
+    def to_mpc[S, dtype](self, mpc, modulus: int_t = RING_SIZE) -> SharedTensor:
+        padded_cipher_shape = self.cipher_shape
+        padded_cipher_shape[-1] *= self.slots
         
-        cipher_shape = self.cipher_shape
-        cipher_shape[-1] *= self.slots
-        share = mpc.he.ciphervector_to_additive_share_vector(
-            self._data, self.cipher_shape.reduce_mul() * self.slots, modulus, dtype=dtype).reshape(cipher_shape).resize(self.shape)
-        stensor = SharedTensor(share, modulus)
+        share: list[int_t] = mpc.he.ciphervector_to_additive_share_vector(
+            self._data, len(self._data) * self.slots, modulus, dtype=dtype)
+        
+        if staticlen(S) == 0:
+            stensor = SharedTensor(share[0], modulus)
+        elif staticlen(S) == 1:
+            stensor = SharedTensor(share, modulus).resize(self.shape)
+        elif staticlen(S) == 2:
+            stensor = SharedTensor(share.reshape(padded_cipher_shape).resize(self.shape), modulus)
+        else:
+            compile_error("Ciphertensor: invalid shape in MPC conversion")
+    
         if isinstance(dtype, float):
             stensor.fp = True
+    
         return stensor
     
     def to_mpp[S, dtype](self, mpc, ratios: list[int], modulus: int_t) -> MPP[S, dtype]:
-        if mpc.pid == 0:
-            if staticlen(S) == 2:
-                shape = (self.shape[0], self.shape[1])
-            elif staticlen(S) == 1:
-                shape = (self.shape[0],)
-            else:
-                compile_error("MPP supports only 1-dim and 2-dim arrays at the momemt")
+        if mpc.pid and mpc.pid != mpc.comms.hub_pid:
+            return MPP[S, dtype](
+                modulus=modulus,
+                _ratios=mpc.comms.receive_as_jar(mpc.comms.hub_pid, list[int]),
+                _encryption_unified=mpc.comms.receive_as_jar(mpc.comms.hub_pid, CipherTensor[ctype]))
 
+        if staticlen(S) == 0:
+            shape = (1,)
+        elif staticlen(S) == 1:
+            shape = (self.shape[0],)
+        elif staticlen(S) == 2:
+            shape = (self.shape[0], self.shape[1])
+        else:
+            compile_error("MPP supports only 0-dim, 1-dim and 2-dim arrays at the momemt")
+        
+        if mpc.pid == 0:
             return MPP[S, dtype](
                 modulus=modulus,
                 _ratios=ratios,
                 _local_data=zeros(shape, dtype=dtype))
         
-        if mpc.pid != mpc.comms.hub_pid:
-            return MPP[S, dtype](
-                modulus=modulus,
-                _ratios=mpc.comms.receive_as_jar(mpc.comms.hub_pid, list[int]),
-                _encryption_unified=mpc.comms.receive_as_jar(mpc.comms.hub_pid, CipherTensor[ctype]))
-        
-        n = self.shape[0]
+        n = shape[0]
         s = ratios.sum()
-        assert n % s == 0, f"Ciphertensor Cannot distribute partitions by the given proportion. Shape: {self.shape}. Ratios: {ratios}"
+        assert n % s == 0, f"Ciphertensor Cannot distribute partitions by the given proportion. Shape: {shape}. Ratios: {ratios}"
         new_ratios = ratios * (n // s)
         
         for p in range(1, mpc.comms.number_of_parties):
@@ -133,7 +137,7 @@ class MPP:
     def to_mpc(self, mpc) -> SharedTensor:
         if mpc.pid == 0:
             return SharedTensor(self._local_data.tolist().to_int_t(self.modulus), self.modulus)
-        return self.collect(mpc).to_mpc(mpc, self.modulus, dtype=dtype)
+        return self.collect(mpc).to_mpc(mpc, self.modulus, S=S, dtype=dtype)
 
 
 class InternalMPC:
@@ -511,22 +515,12 @@ class InternalMHE:
         return x.matmul(mpc, y)
     
     def gt(mpc, x, y):
-        if isinstance(x, CipherTensor): x_shared = x.to_mpc(mpc, mpc.base_modulus)
-        else: x_shared = x
-        
-        if isinstance(y, CipherTensor): y_shared = y.to_mpc(mpc, mpc.base_modulus)
-        else: y_shared = y
-        
-        return InternalMPC.gt(mpc, x_shared, y_shared).to_mhe(mpc)
+        raise NotImplementedError()
+        return x  # To avoid typechecker error
 
     def lt(mpc, x, y):
-        if isinstance(x, CipherTensor): x_shared = x.to_mpc(mpc, mpc.base_modulus)
-        else: x_shared = x
-        
-        if isinstance(y, CipherTensor): y_shared = y.to_mpc(mpc, mpc.base_modulus)
-        else: y_shared = y
-        
-        return InternalMPC.lt(mpc, x_shared, y_shared).to_mhe(mpc)
+        raise NotImplementedError()
+        return x  # To avoid typechecker error
 
     def eq(mpc, x, y):
         return x == y
@@ -564,7 +558,7 @@ class InternalMPP:
         else:
             compile_error("At least one operand should be MPP")
         
-        return InternalMPC.gt(mpc, x_shared, y_shared).to_mpp(mpc, ratios=ref_mpp._ratios, S=ref_mpp.S, dtype=ref_mpp.dtype)
+        return InternalMPC.gt(mpc, x_shared, y_shared).to_mpp(mpc, ratios=ref_mpp._ratios, dtype=ref_mpp.dtype)
 
     def lt(mpc, x, y):
         if isinstance(x, MPP):
@@ -578,13 +572,13 @@ class InternalMPP:
         else:
             compile_error("At least one operand should be MPP")
         
-        return InternalMPC.lt(mpc, x_shared, y_shared).to_mpp(mpc, ratios=ref_mpp._ratios, S=ref_mpp.S, dtype=ref_mpp.dtype)
+        return InternalMPC.lt(mpc, x_shared, y_shared).to_mpp(mpc, ratios=ref_mpp._ratios, dtype=ref_mpp.dtype)
 
     def eq(mpc, x, y):
         return x._do_elem_wise_op(mpc, y, MPP._elem_wise_eq)
     
     def sqrt(mpc, x):
-        return InternalMPC.sqrt(mpc, x.to_mpc(mpc)).to_mpp(mpc, ratios=x._ratios, S=x.S, dtype=x.dtype)
+        return InternalMPC.sqrt(mpc, x.to_mpc(mpc)).to_mpp(mpc, ratios=x._ratios, dtype=x.dtype)
 
 
 class Internal:
