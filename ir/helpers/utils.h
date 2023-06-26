@@ -12,6 +12,11 @@ bool isPolyOptFunc( Func * );
 bool isCipherOptFunc( Func * );
 bool isMatmulReorderOptFunc ( Func * ); 
 
+bool hasCKKSPlaintext( types::Type * );
+bool hasCKKSCiphertext( types::Type * );
+
+bool isCKKSPlaintext( types::Type * );
+bool isCKKSCiphertext( types::Type * );
 bool isSharedTensor( types::Type * );
 bool isCipherTensor( types::Type * );
 bool isMPP( types::Type * );

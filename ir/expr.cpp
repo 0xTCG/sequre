@@ -25,7 +25,7 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
   bool isMatMul  = f->getUnmangledName() == Module::MATMUL_MAGIC_NAME;
   bool isDiv     = f->getUnmangledName() == Module::TRUE_DIV_MAGIC_NAME;
   bool isPow     = f->getUnmangledName() == Module::POW_MAGIC_NAME;
-  bool isGetItem = false; // Uncomment after ciphertensor migrated to static shape // f->getUnmangledName() == Module::GETITEM_MAGIC_NAME;
+  bool isGetItem = f->getUnmangledName() == Module::GETITEM_MAGIC_NAME;
   
   if ( !isEq &&
        !isGt &&

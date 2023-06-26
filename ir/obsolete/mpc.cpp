@@ -776,17 +776,15 @@ bool isReveal(int op) { return op == BET_REVEAL_OP; }
 
 int getOperator(CallInstr *callInstr) {
   auto *f = util::getFunc(callInstr->getCallee());
-  auto instrName = f->getName();
-  if (instrName.find("__add__") != std::string::npos)
-    return BET_ADD_OP;
-  if (instrName.find("__mul__") != std::string::npos)
-    return BET_MUL_OP;
-  if (instrName.find("__pow__") != std::string::npos)
-    return BET_POW_OP;
-  if (instrName.find("matmul") != std::string::npos)
-    return BET_MATMUL_OP;
-  if (instrName.find("secure_reveal") != std::string::npos)
+  auto instrName = f->getUnmangledName();
+  if ( instrName == Module::ADD_MAGIC_NAME ) return BET_ADD_OP;
+  if ( instrName == Module::MUL_MAGIC_NAME ) return BET_MUL_OP;
+  if ( instrName == Module::POW_MAGIC_NAME ) return BET_POW_OP;
+  if ( instrName == Module::MATMUL_MAGIC_NAME ) return BET_MATMUL_OP;
+  
+  if (instrName.rfind("secure_reveal", 0) != std::string::npos)
     return BET_REVEAL_OP;
+  
   return BET_OTHER_OP;
 }
 

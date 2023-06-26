@@ -5,9 +5,11 @@ namespace sequre {
 
 using namespace codon::ir;
 
-const std::string sharedTensorTypeName = "SharedTensor";
-const std::string cipherTensorTypeName = "CipherTensor";
-const std::string MPPTypeName = "MPP";
+const std::string ckksPlaintextTypeName = "std.sequre.lattiseq.ckks.Ciphertext";
+const std::string ckksCiphertextTypeName = "std.sequre.lattiseq.ckks.Plaintext";
+const std::string sharedTensorTypeName = "std.sequre.types.shared_tensor.SharedTensor";
+const std::string cipherTensorTypeName = "std.sequre.types.cipher_tensor.CipherTensor";
+const std::string MPPTypeName = "std.sequre.types.multiparty_partition.MPP";
 
 
 bool isSequreFunc( Func *f ) {
@@ -26,16 +28,32 @@ bool isCipherOptFunc( Func *f ) {
   return bool(f) && util::hasAttribute(f, "std.sequre.attributes.mhe_cipher_opt");
 }
 
+bool hasCKKSPlaintext( types::Type *t ) {
+  return t->getName().find(ckksPlaintextTypeName) != std::string::npos;
+}
+
+bool hasCKKSCiphertext( types::Type *t ) {
+  return t->getName().find(ckksCiphertextTypeName) != std::string::npos;
+}
+
+bool isCKKSPlaintext( types::Type *t ) {
+  return t->getName().rfind(ckksPlaintextTypeName, 0) != std::string::npos;
+}
+
+bool isCKKSCiphertext( types::Type *t ) {
+  return t->getName().rfind(ckksCiphertextTypeName, 0) != std::string::npos;
+}
+
 bool isSharedTensor( types::Type *t ) {
-  return t->getName().find(sharedTensorTypeName) != std::string::npos;
+  return t->getName().rfind(sharedTensorTypeName, 0) != std::string::npos;
 }
 
 bool isCipherTensor( types::Type *t ) {
-  return t->getName().find(cipherTensorTypeName) != std::string::npos;
+  return t->getName().rfind(cipherTensorTypeName, 0) != std::string::npos;
 }
 
 bool isMPP( types::Type *t ) {
-  return t->getName().find(MPPTypeName) != std::string::npos;
+  return t->getName().rfind(MPPTypeName, 0) != std::string::npos;
 }
 
 bool isSecureContainer( types::Type *t ) {
@@ -130,12 +148,12 @@ bool isArithmeticOperation( Operation op ) { return op == add || op == mul || op
 
 Operation getOperation( CallInstr *callInstr ) {
   auto *f        = util::getFunc(callInstr->getCallee());
-  auto instrName = f->getName();
+  auto instrName = f->getUnmangledName();
   
-  if ( instrName.find(Module::ADD_MAGIC_NAME) != std::string::npos ) return add;
-  if ( instrName.find(Module::MUL_MAGIC_NAME) != std::string::npos ) return mul;
-  if ( instrName.find(Module::POW_MAGIC_NAME) != std::string::npos ) return power;
-  if ( instrName.find(Module::MATMUL_MAGIC_NAME)  != std::string::npos ) return matmul;
+  if ( instrName == Module::ADD_MAGIC_NAME ) return add;
+  if ( instrName == Module::MUL_MAGIC_NAME ) return mul;
+  if ( instrName == Module::POW_MAGIC_NAME ) return power;
+  if ( instrName == Module::MATMUL_MAGIC_NAME ) return matmul;
   
   return noop;
 }
