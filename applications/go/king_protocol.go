@@ -188,9 +188,9 @@ func (pi *KingProtocolInfo) KingProtocol() map[int][][]float64 {
 						log.LLvl1(pid, ": start minimum computation")
 						//concatCvec := mpc_core.RVec{}
 						log.LLvl1(" [DEBUG] start CMatToSS ", pi.Prot.MpcObj[otherPid].GetRType(),
-							distance, otherPid, len(distance), len(distance[0]), allPidsNbrRows[pid])
+							distance, otherPid, len(distance), len(distance[0]), allPidsNbrRows[otherPid])
 						localThresSS := pi.Prot.MpcObj[otherPid].CMatToSS(cps, pi.Prot.MpcObj[otherPid].GetRType(),
-							distance, otherPid, len(distance), len(distance[0]), allPidsNbrRows[pid])
+							distance, otherPid, len(distance), len(distance[0]), allPidsNbrRows[otherPid])
 
 						//for l := 0; l < len(localThresSS); l++ {
 						//	concatCvec = append(concatCvec, localThresSS[l]...)
@@ -298,7 +298,7 @@ func (pi *KingProtocolInfo) KingProtocol() map[int][][]float64 {
 		log.LLvl1("XXOne ", mat.Formatted(XXOne))
 
 		// compute matrix of number of ones per row (i.e., nbr of heterozygous)
-		hetx := mat.NewDense(rowsOther, rowsLocal, nil)
+		hetx := mat.NewDense(rowsLocal, rowsOther, nil)
 		for r := 0; r < rowsLocal; r++ {
 			hetRow := 0.0
 			for c := 0; c < cols; c++ {
@@ -343,9 +343,9 @@ func (pi *KingProtocolInfo) KingProtocol() map[int][][]float64 {
 			hetxMinushety[h] = cryptobasics.CPAdd(cps, Yhet[h], hetxEncoded[h])
 		}
 		log.LLvl1("start CMatToSS ", pi.Prot.MpcObj[pid].GetRType(),
-			hetxMinushety, pid, len(hetxMinushety), len(hetxMinushety[0]), allPidsNbrRows[otherPid])
+			hetxMinushety, pid, len(hetxMinushety), len(hetxMinushety[0]), allPidsNbrRows[pid])
 		hetxMinushetySS := pi.Prot.MpcObj[pid].CMatToSS(cps, pi.Prot.MpcObj[pid].GetRType(),
-			hetxMinushety, pid, len(hetxMinushety), len(hetxMinushety[0]), allPidsNbrRows[otherPid])
+			hetxMinushety, pid, len(hetxMinushety), len(hetxMinushety[0]), allPidsNbrRows[pid])
 
 		// TODO: there is probably a better way of doing this
 		prec := pi.Prot.MpcObj[0].GetDataBits()
@@ -370,7 +370,7 @@ func (pi *KingProtocolInfo) KingProtocol() map[int][][]float64 {
 		for o := 0; o < rowsOther*rowsLocal; o++ {
 			onesForHet[o] = -1
 		}
-		onesHetDense := mat.NewDense(rowsOther, rowsLocal, onesForHet)
+		onesHetDense := mat.NewDense(rowsLocal, rowsOther, onesForHet)
 		onesHetEncoded := cryptobasics.EncodeDense(cps, onesHetDense)
 
 		hetxMinushetySSsign := pi.Prot.MpcObj[pid].SSToCMat(cps, backToRmat)
@@ -389,7 +389,7 @@ func (pi *KingProtocolInfo) KingProtocol() map[int][][]float64 {
 		decryptedMatrix := make([][]float64, len(distanceDecrypt))
 		for d := 0; d < len(distanceDecrypt); d++ {
 			distanceDecode := libspindle.DecodeFloatVector(cps, distanceDecrypt[d])
-			decryptedMatrix[d] = distanceDecode[:allPidsNbrRows[otherPid]]
+			decryptedMatrix[d] = distanceDecode[:allPidsNbrRows[pid]]
 			//log.LLvl1("distanceDecrypt FINAL : ", distanceDecode[:2*allPidsNbrRows[otherPid]])
 		}
 		comparisonResults[otherPid] = decryptedMatrix

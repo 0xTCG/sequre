@@ -61,7 +61,7 @@ func TestKingProtocol(t *testing.T) {
 					minhet, localHet, otherHet := minNumberOfOnes(localInput[l], otherData[o])
 					log.LLvl1("minhet:", minhet, localHet, otherHet)
 					exp_value := squaredNormDistance(localInput[l], otherData[o]) / float64(minhet)
-					obt_value := matrices[v[0]][l][o]
+					obt_value := matrices[v[0]][o][l]
 					log.LLvl1(l, o, "exp_value:", exp_value)
 					log.LLvl1(l, o, "obt_value:", obt_value)
 					log.LLvl1("Expected value:", exp_value, "Obtained value:", obt_value)
