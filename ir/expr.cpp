@@ -26,6 +26,7 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
   bool isDiv     = f->getUnmangledName() == Module::TRUE_DIV_MAGIC_NAME;
   bool isPow     = f->getUnmangledName() == Module::POW_MAGIC_NAME;
   bool isGetItem = f->getUnmangledName() == Module::GETITEM_MAGIC_NAME;
+  bool isSetItem = false;  // f->getUnmangledName() == Module::SETITEM_MAGIC_NAME;
   
   if ( !isEq &&
        !isGt &&
@@ -60,7 +61,7 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
   bool lhs_is_secure_container = isSecureContainer(lhsType);
   bool rhs_is_secure_container = isSecureContainer(rhsType);
   if ( !lhs_is_secure_container && !rhs_is_secure_container ) return;
-  if ( isSharedTensor(lhsType) && isGetItem ) return;
+  if ( isSharedTensor(lhsType) && (isGetItem || isSetItem) ) return;
 
   bool lhs_is_int = lhsType->is(M->getIntType());
   bool rhs_is_int = rhsType->is(M->getIntType());

@@ -23,7 +23,10 @@ class MPP[S, dtype]:
     _transposed: bool
 
     def __getitem__(self, idx: int):
-        raise NotImplementedError("MPP: cannot getitem from 1-dimensional MPP without IR pass enabled")
+        raise NotImplementedError("MPP: cannot getitem without IR pass enabled")
+    
+    def __setitem__(self, idx: int, value: MPP):
+        raise NotImplementedError("MPP: cannot setitem without IR pass enabled")
 
     @staticmethod
     def like[T](other: T, arr: ndarray) -> T:
@@ -595,6 +598,14 @@ class MPP[S, dtype]:
         else:
             compile_error("MPP: invalid shape")
     
+    def _setitem(self, mpc, idx: int, value: MPP):
+        if staticlen(S) == 1:
+            return self._setitem_1_dim(mpc, idx, value)
+        elif staticlen(S) == 2:
+            return self._setitem_2_dim(mpc, idx, value)
+        else:
+            compile_error("MPP: invalid shape")
+
     def _getitem_1_dim(self, mpc, idx: int) -> MPP[S, dtype]:
         if staticlen(S) != 1: compile_error("MPP: cannot do 1-dim getitem from non-1-dim MPP")
         assert self._ratios.sum() == 1, "MPP: 1-dimensional MPP should be present at one party only"
@@ -696,3 +707,108 @@ class MPP[S, dtype]:
             _encryption_left=_encryption_left,
             _encryption_right=_encryption_right,
             _encryption_unified=_encryption_unified)
+    
+    def _setitem_1_dim(self, mpc, idx: int, value: MPP):
+        assert staticlen(S) == staticlen(value.S) == 1, "MPP: 1-dim setitem expects 1-dim operands"
+        assert self._ratios == value._ratios, "MPP: partitioning missmatch in 1-dim setitem"
+        assert self._ratios.sum() == value._ratios.sum(), "MPP: invalid partition ratios for 1-dim setitem"
+        
+        reference_pid = mpc.pid - 1  # Skip CP0
+
+        if reference_pid == argmax(value._ratios):
+            assert value.shape == (1,), "MPP: 1-dim setitem operand should contain a single value"
+            assert not value.is_semi_encrypted(), "MPP: single-element setitem value should not be semi-encrypted"
+
+            if self.is_full_encrypted() or value.is_full_encrypted():
+                self.unify_encryption(mpc)
+                _value_cp = value.copy()
+                _value_cp.unify_encryption(mpc)
+                self._encryption_unified._setitem(mpc, idx, _value_cp._encryption_unified)
+            else:
+                assert self.is_local() or self.is_semi_encrypted(), "MPP: ivalid self operand in 1-dim setitem"
+                assert value.is_local(), "MPP: ivalid value operand in 1-dim setitem"
+                
+                border = 0
+                if self._encryption_left:
+                    border = self._encryption_left.shape[-1]
+                    if idx < border:
+                        _value_cp = value.copy()
+                        _value_cp.unify_encryption(mpc)
+                        self._encryption_left._setitem(mpc, idx, _value_cp._encryption_unified)
+                        return
+                
+                if idx < border + self._local_data.shape[-1]:
+                    self._local_data[idx - border] = value._local_data[0]
+                    return
+                border += self._local_data.shape[-1]
+
+                assert bool(self._encryption_right) and idx < border + self._encryption_right.shape[-1], "MPP: 1-dim setitem index out of bound"
+                _value_cp = value.copy()
+                _value_cp.unify_encryption(mpc)
+                self._encryption_right._setitem(mpc, idx - border, _value_cp._encryption_unified)
+    
+    def _setitem_2_dim(self, mpc, idx: int, value: MPP):
+        if staticlen(S) != 2 or staticlen(value.S) != 1:
+            compile_error("MPP: invalid shapes for setitem")
+
+        assert not self._transposed, "Not implemented yet: setitem for transposed MPP"
+        assert value._ratios.sum() == 1, "Not implemented yet: setitem operands should be at the same partition/party for now"
+        
+        reference_pid = mpc.pid - 1  # Skip CP0
+        
+        if reference_pid == argmax(value._ratios):
+            adjusted_idx = idx - self._ratios[:reference_pid].sum()
+            assert 0 <= adjusted_idx < self._ratios[reference_pid], "MPP: setitem index out of bound"
+
+            if self.is_full_encrypted() or value.is_full_encrypted():
+                _value_cp = value.copy()
+                self.unify_encryption(mpc)
+                _value_cp.unify_encryption(mpc)
+                self._encryption_unified._setitem(mpc, adjusted_idx, _value_cp._encryption_unified)
+            elif self.is_local() and value.is_local():
+                self._local_data[adjusted_idx] = value._local_data
+            else:
+                value_enc_left, value_local, value_enc_right = self._align_semi_encryptions(mpc, value)
+                if self._encryption_left: self._encryption_left._setitem(mpc, adjusted_idx, value_enc_left)
+                self._local_data[adjusted_idx] = value_local
+                if self._encryption_right: self._encryption_right._setitem(mpc, adjusted_idx, value_enc_right)
+    
+    def _align_semi_encryptions(self, mpc, other: MPP) -> Tuple[CipherTensor[Ciphertext], ndarray, CipherTensor[Ciphertext]]:
+        assert self.is_semi_encrypted() or other.is_semi_encrypted(), "MPP: at least on of the MPPs needs to be semi-encrypted to align the semi ancryptions"
+
+        if self.is_semi_encrypted() and other.is_semi_encrypted():
+            if self._encryption_left:
+                assert bool(other._encryption_left) and self._encryption_left.shape[-1] == other._encryption_left.shape[-1], "MPP: left semi encryption shape missmatch"
+            if self._encryption_right:
+                assert bool(other._encryption_right) and self._encryption_right.shape[-1] == other._encryption_right.shape[-1], "MPP: right semi encryption shape missmatch"
+            
+            assert self.has_local_data() and other.has_local_data(), "MPP: semi-encrypted MPP should have local data"
+            return other._encryption_left, other._local_data, other._encryption_right
+        
+        elif self.is_local():
+            if other._encryption_left:
+                left_border = other._encryption_left.shape[-1]
+                self._encryption_left = CipherTensor[Ciphertext].enc(mpc, self._local_data._slice_cols(0, left_border))
+                self._local_data = self._local_data._slice_cols(left_border, self._local_data.shape[-1])
+            if other._encryption_right:
+                right_border = -other._encryption_right.shape[-1]
+                self._encryption_right = CipherTensor[Ciphertext].enc(mpc, self._local_data._slice_cols(right_border, self._local_data.shape[-1]))
+                self._local_data = self._local_data._slice_cols(0, right_border)
+            
+            return other._encryption_left, other._local_data, other._encryption_right
+        
+        else:  # other is local
+            _encryption_left = CipherTensor[Ciphertext]()
+            _local_data = other._local_data
+            _encryption_right = CipherTensor[Ciphertext]()
+
+            if self._encryption_left:
+                left_border = self._encryption_left.shape[-1]
+                _encryption_left = CipherTensor[Ciphertext].enc(mpc, other._local_data._slice_cols(0, left_border))
+                _local_data = _local_data._slice_cols(left_border, _local_data.shape[-1])
+            if self._encryption_right:
+                right_border = -self._encryption_right.shape[-1]
+                _encryption_right = CipherTensor[Ciphertext].enc(mpc, _local_data._slice_cols(right_border, _local_data.shape[-1]))
+                _local_data = _local_data._slice_cols(0, right_border)
+            
+            return _encryption_left, _local_data, _encryption_right
