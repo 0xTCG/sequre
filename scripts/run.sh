@@ -3,22 +3,6 @@
 echo "Cleaning up sockets ..."
 find  . -name 'sock.*' -exec rm {} \;
 
-echo "Setting up Sequre ..."
-SEQURE_PATH=$(pwd)
-SEQURE_STDLIB=$SEQURE_PATH/stdlib/sequre
-
-if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    export CP_OPTIONS=-uf
-elif [[ "$OSTYPE" == "darwin"* ]]; then
-    export CP_OPTIONS=-f
-fi
-
-if [[ ${*:3} == *"--local"* ]]; then
-    cp $CP_OPTIONS $SEQURE_STDLIB/network/unix_socket.codon $SEQURE_STDLIB/network/socket.codon
-else
-    cp $CP_OPTIONS $SEQURE_STDLIB/network/inet_socket.codon $SEQURE_STDLIB/network/socket.codon
-fi
-
 if [[ -z "${SEQURE_CODON_PATH}" ]]; then
     echo "Error! SEQURE_CODON_PATH env variable not set" >&2
     exit 1
