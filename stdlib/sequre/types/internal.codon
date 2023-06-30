@@ -5,7 +5,7 @@ import prg, secure_operator
 from numpy.create import zeros, _extract_shape
 from numpy.ndarray import ndarray
 
-from helpers import argmin
+from helpers import argmin, argmax
 
 from shared_tensor import SharedTensor
 from cipher_tensor import CipherTensor
@@ -26,43 +26,70 @@ class SharedTensor:
             raise NotImplementedError("SharedTensor.to_mhe should not be called at trusted dealer")
         slots = mpc.he.crypto_params.params.slots()
         
+        if isinstance(self.share, ByVal): _self = self.expand_dims()
+        else: _self = self
+        
         # Pad shape if ciphertexts are not fully utilized
-        new_shape = self.shape.copy()
-        new_shape[-1] = (self.shape[-1] + slots - 1) // slots * slots
-        share = self.share
-        if new_shape[-1] != self.shape[-1]:
-            share = self.share.resize(new_shape)
+        new_shape = _self.shape.copy()
+        new_shape[-1] = (_self.shape[-1] + slots - 1) // slots * slots
+        share = _self.share
+        if new_shape[-1] != _self.shape[-1]:
+            share = _self.share.resize(new_shape)
 
-        ciphervector = mpc.he.additive_share_vector_to_ciphervector(share.flatten(), self.modulus)
+        ciphervector = mpc.he.additive_share_vector_to_ciphervector(share.flatten(), _self.modulus)
 
-        return CipherTensor(ciphervector, self.shape, slots)
+        return CipherTensor(ciphervector, _self.shape, slots)
 
     def to_mpp[dtype](self, mpc, ratios: list[int], transpose_encryption: bool = False) -> MPP:
-        shape = _extract_shape(self.share)
-        n = shape[0]
-        s = ratios.sum()
-        assert n % s == 0, f"Sharedtensor: Cannot distribute partitions by the given proportion. Shape: {shape}. Ratios: {ratios}"
-        new_ratios = ratios * (n // s)
-        
-        if mpc.pid == 0:
+        if isinstance(self.share, list[list]):
+            shape = _extract_shape(self.share)
+            n = shape[0]
+            s = ratios.sum()
+            assert n % s == 0, f"Sharedtensor: cannot distribute partitions by the given proportion. Shape: {shape}. Ratios: {ratios}"
+            new_ratios = ratios * (n // s)
+            
+            if mpc.pid == 0:
+                return MPP[type(shape), dtype](
+                    modulus=self.modulus,
+                    _ratios=new_ratios,
+                    _local_data=zeros(shape, dtype=dtype))
+
+            reference_pid = mpc.pid - 1
+            start = new_ratios[:reference_pid].sum()
+            end = start + new_ratios[reference_pid]
+
+            partition = self[start:end]
+            if transpose_encryption: partition = partition.T
+            encrypted_partition = partition.to_mhe(mpc)
+            encrypted_partition._transposed = transpose_encryption
+
             return MPP[type(shape), dtype](
                 modulus=self.modulus,
                 _ratios=new_ratios,
-                _local_data=zeros(shape, dtype=dtype))
+                _encryption_unified=encrypted_partition)
+        
+        elif isinstance(self.share, list) or isinstance(self.share, ByVal):
+            assert ratios.sum() == 1, "Sharedtensor: invalid ratios for 1-dim MPC -> MPP conversion"
+            shape = (self.shape[0],) if isinstance(self.share, list) else (1,)
+            
+            if mpc.pid == 0:
+                return MPP[Tuple[int], dtype](
+                    modulus=self.modulus,
+                    _ratios=ratios,
+                    _local_data=zeros(shape, dtype=dtype))
 
-        reference_pid = mpc.pid - 1
-        start = new_ratios[:reference_pid].sum()
-        end = start + new_ratios[reference_pid]
+            new_mpp = MPP[Tuple[int], dtype](
+                modulus=self.modulus,
+                _ratios=ratios)
+            
+            _encryption_unified = self.to_mhe(mpc)
+            if mpc.pid - 1 == argmax(ratios):
+                new_mpp._encryption_unified = _encryption_unified
 
-        partition = self[start:end]
-        if transpose_encryption: partition = partition.T
-        encrypted_partition = partition.to_mhe(mpc)
-        encrypted_partition._transposed = transpose_encryption
+            return new_mpp
 
-        return MPP[type(shape), dtype](
-            modulus=self.modulus,
-            _ratios=new_ratios,
-            _encryption_unified=encrypted_partition)            
+        else:
+            compile_error("Invalid shape for MPC -> MPP conversion")
 
 
 @extend
@@ -77,7 +104,7 @@ class CipherTensor:
         if staticlen(S) == 0:
             stensor = SharedTensor(share[0], modulus)
         elif staticlen(S) == 1:
-            stensor = SharedTensor(share, modulus).resize(self.shape)
+            stensor = SharedTensor(share.resize(self.shape), modulus)
         elif staticlen(S) == 2:
             stensor = SharedTensor(share.reshape(padded_cipher_shape).resize(self.shape), modulus)
         else:
@@ -136,7 +163,9 @@ class CipherTensor:
 class MPP:
     def to_mpc(self, mpc) -> SharedTensor:
         if mpc.pid == 0:
-            return SharedTensor(self._local_data.tolist().to_int_t(self.modulus), self.modulus)
+            stensor = SharedTensor(self._local_data.tolist().to_int_t(self.modulus), self.modulus)
+            if isinstance(dtype, float): stensor.fp = True
+            return stensor
         return self.collect(mpc).to_mpc(mpc, self.modulus, S=S, dtype=dtype)
 
 
@@ -585,6 +614,9 @@ class InternalMPP:
     
     def sqrt(mpc, x):
         return InternalMPC.sqrt(mpc, x.to_mpc(mpc)).to_mpp(mpc, ratios=x._ratios, dtype=x.dtype)
+    
+    def sqrt_inv(mpc, x, y):
+        return InternalMPP.mul(mpc, x, InternalMPC.sqrt_inv(mpc, 1, y.to_mpc(mpc)).to_mpp(mpc, ratios=y._ratios, dtype=y.dtype))
 
 
 class Internal:
@@ -597,9 +629,9 @@ class Internal:
     
     def secure_setitem(mpc, x, idx: int, value):
         if isinstance(x, MPP):
-            return InternalMPP.getitem(mpc, x, idx, value)
+            return InternalMPP.setitem(mpc, x, idx, value)
         elif isinstance(x, CipherTensor):
-            return InternalMHE.getitem(mpc, x, idx, value)
+            return InternalMHE.setitem(mpc, x, idx, value)
         else: compile_error("Invalid secure operands")
 
     def secure_add(mpc, x, y):
@@ -678,7 +710,11 @@ class Internal:
         else: compile_error("Invalid secure operands")
 
     def secure_sqrt_inv(mpc, x, y):
-        if isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
+        if isinstance(x, MPP) or isinstance(y, MPP):
+            return InternalMPP.sqrt_inv(mpc, x, y)
+        elif isinstance(x, CipherTensor) or isinstance(y, CipherTensor):
+            return InternalMHE.sqrt_inv(mpc, x, y)
+        elif isinstance(x, SharedTensor) or isinstance(y, SharedTensor):
             return InternalMPC.sqrt_inv(mpc, x, y)
         else: compile_error("Invalid secure operands")
     

@@ -26,7 +26,7 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
   bool isDiv     = f->getUnmangledName() == Module::TRUE_DIV_MAGIC_NAME;
   bool isPow     = f->getUnmangledName() == Module::POW_MAGIC_NAME;
   bool isGetItem = f->getUnmangledName() == Module::GETITEM_MAGIC_NAME;
-  bool isSetItem = false;  // f->getUnmangledName() == Module::SETITEM_MAGIC_NAME;
+  bool isSetItem = f->getUnmangledName() == Module::SETITEM_MAGIC_NAME;
   
   if ( !isEq &&
        !isGt &&
@@ -37,20 +37,29 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
        !isMatMul && 
        !isPow && 
        !isDiv &&
-       !isGetItem )
+       !isGetItem &&
+       !isSetItem )
     return;
 
   auto *M        = v->getModule();
-  auto *self     = M->Nr<VarValue>(pf->arg_front());
-  auto *selfType = self->getType();
-  auto *lhs      = v->front();
-  auto *rhs      = v->back();
-  auto *lhsType  = lhs->getType();
-  auto *rhsType  = rhs->getType();
+  auto *mpc      = M->Nr<VarValue>(pf->arg_front());
+  assert( isMPC(mpc) && "ERROR: The first argument of sequre function should be the MPC instance" );
+  
+  std::vector<Value *> args;
+  std::vector<types::Type *> types;
+  
+  for ( auto it = v->begin(); it != v->end(); it++ ) {
+    auto *arg = *it;
+    args.push_back(arg);
+    types.push_back(arg->getType());
+  }
 
+  bool isVoid    = isSetItem;
+  auto *nodeType = isVoid ? types.front() : v->getType();
+  
   bool isSqrtInv = false;
   if ( isDiv ) { // Special case where 1 / sqrt(x) is called
-    auto *sqrtInstr = cast<CallInstr>(rhs);
+    auto *sqrtInstr = cast<CallInstr>(args.back());
     if ( sqrtInstr ) {
       auto *sqrtFunc = util::getFunc(sqrtInstr->getCallee());
       if ( sqrtFunc )
@@ -58,19 +67,18 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
     }
   }
 
-  bool lhs_is_secure_container = isSecureContainer(lhsType);
-  bool rhs_is_secure_container = isSecureContainer(rhsType);
-  if ( !lhs_is_secure_container && !rhs_is_secure_container ) return;
-  if ( isSharedTensor(lhsType) && (isGetItem || isSetItem) ) return;
+  if ( !isSecureContainer(nodeType) ) return;
+  if ( isSharedTensor( nodeType ) ) {
+    bool lhsIsInt = types.front()->is(M->getIntType());
+    bool rhsIsInt = types.back()->is(M->getIntType());
 
-  bool lhs_is_int = lhsType->is(M->getIntType());
-  bool rhs_is_int = rhsType->is(M->getIntType());
-
-  if ( isMul && lhs_is_int ) return;
-  if ( isMul && rhs_is_int ) return;
-  if ( isDiv && lhs_is_int && !isSqrtInv ) return;
-  if ( isPow && lhs_is_int ) return;
-  if ( isPow && !rhs_is_int ) return;
+    if ( isGetItem || isSetItem ) return;
+    if ( isMul && lhsIsInt ) return;
+    if ( isMul && rhsIsInt ) return;
+    if ( isDiv && lhsIsInt && !isSqrtInv ) return;
+    if ( isPow && lhsIsInt ) return;
+    if ( isPow && !rhsIsInt ) return;
+  }
 
   std::string methodName = isEq        ? "secure_eq"
                            : isGt      ? "secure_gt"
@@ -83,19 +91,23 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
                            : isDiv     ? "secure_div"
                            : isPow     ? "secure_pow"
                            : isGetItem ? "secure_getitem"
+                           : isSetItem ? "secure_setitem"
                                        : "invalid_operation";
   if ( isSqrtInv ) {
-    rhs = cast<CallInstr>(rhs)->back();
-    rhsType = rhs->getType();
+    args.back() = cast<CallInstr>(args.back())->back();
+    types.back() = args.back()->getType();
   }
 
-  auto *method = getOrRealizeSequreInternalMethod(M, methodName, {selfType, lhsType, rhsType}, {});
+  args.insert(args.begin(), mpc);
+  types.insert(types.begin(), mpc->getType());
+
+  auto *method = getOrRealizeSequreInternalMethod(M, methodName, types, {});
   if ( !method ) {
     std::cout << "Called within " << pf->getName() << std::endl;
-    return;
+    assert(false && "Aborting due to unsuccessful method realization ...");
   }
 
-  auto *func = util::call(method, {self, lhs, rhs});
+  auto *func = util::call(method, args);
   v->replaceAll(func);
 }
 

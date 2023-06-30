@@ -60,9 +60,11 @@ bool isSecureContainer( types::Type *t ) {
   return isSharedTensor(t) || isCipherTensor(t) || isMPP(t);
 }
 
-bool isMPC( Value *value, types::Generic generic ) {
+bool isMPC( Value *value ) {
+  auto generics = value->getType()->getGenerics();
+  assert( generics.size() == 1 && "ERROR: While testing if value is the MPC instance. It should have one and only one generic type." );
   auto *M = value->getModule();
-  auto *mpcType = M->getOrRealizeType("MPCEnv", { generic }, "std.sequre.mpc.env");
+  auto *mpcType = M->getOrRealizeType("MPCEnv", { generics[0] }, "std.sequre.mpc.env");
   assert(mpcType);
   return value->getType()->is(mpcType);
 }
