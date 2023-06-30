@@ -21,7 +21,7 @@ bool isSharedTensor( types::Type * );
 bool isCipherTensor( types::Type * );
 bool isMPP( types::Type * );
 bool isSecureContainer( types::Type * );
-bool isMPC( Value *, types::Generic );
+bool isMPC( Value * );
 
 types::Type *getTupleType( int, types::Type *, Module * );
 types::Type *getTupleType( std::vector<Value *>, Module * );
