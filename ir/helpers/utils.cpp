@@ -8,7 +8,7 @@ using namespace codon::ir;
 const std::string ckksPlaintextTypeName = "std.sequre.lattiseq.ckks.Ciphertext";
 const std::string ckksCiphertextTypeName = "std.sequre.lattiseq.ckks.Plaintext";
 const std::string sharedTensorTypeName = "std.sequre.types.shared_tensor.SharedTensor";
-const std::string cipherTensorTypeName = "std.sequre.types.cipher_tensor.CipherTensor";
+const std::string cipherTensorTypeName = "std.sequre.types.cipher_tensor.Ciphertensor";
 const std::string MPPTypeName = "std.sequre.types.multiparty_partition.MPP";
 
 
@@ -48,7 +48,7 @@ bool isSharedTensor( types::Type *t ) {
   return t->getName().rfind(sharedTensorTypeName, 0) != std::string::npos;
 }
 
-bool isCipherTensor( types::Type *t ) {
+bool isCiphertensor( types::Type *t ) {
   return t->getName().rfind(cipherTensorTypeName, 0) != std::string::npos;
 }
 
@@ -57,7 +57,7 @@ bool isMPP( types::Type *t ) {
 }
 
 bool isSecureContainer( types::Type *t ) {
-  return isSharedTensor(t) || isCipherTensor(t) || isMPP(t);
+  return isSharedTensor(t) || isCiphertensor(t) || isMPP(t);
 }
 
 bool isMPC( Value *value ) {

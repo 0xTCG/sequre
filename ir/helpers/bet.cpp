@@ -30,21 +30,21 @@ BETNode *BETNode::copy() const {
   return newNode;
 }
 
-bool BETNode::checkIsCipherTensor() {
-  return isCipherTensor(getOrRealizeIRType());
+bool BETNode::checkIsCiphertensor() {
+  return isCiphertensor(getOrRealizeIRType());
 }
 
 bool BETNode::checkIsSecureContainer() {
   return isSecureContainer(getOrRealizeIRType());
 }
 
-bool BETNode::checkIsCipherCipherTensor() {
-  if ( !checkIsCipherTensor() ) return false;
+bool BETNode::checkIsCipherCiphertensor() {
+  if ( !checkIsCiphertensor() ) return false;
   return hasCKKSCiphertext(getOrRealizeIRType());
 }
 
-bool BETNode::checkIsPlainCipherTensor() {
-  if ( !checkIsCipherTensor() ) return false;
+bool BETNode::checkIsPlainCiphertensor() {
+  if ( !checkIsCiphertensor() ) return false;
   return hasCKKSPlaintext(getOrRealizeIRType());
 }
 
@@ -103,10 +103,10 @@ types::Type *BETNode::getOrRealizeIRType( bool force ) {
   assert( lcType && "Crypto type realization error (left child type could not be realized)" );
   assert( rcType && "Crypto type realization error (left child type could not be realized)" );
 
-  if ( lc->checkIsCipherCipherTensor() ) irType = lcType;
-  else if ( rc->checkIsCipherCipherTensor() ) irType = rcType;
-  else if ( lc->checkIsPlainCipherTensor() ) irType = lcType;
-  else if ( rc->checkIsPlainCipherTensor() ) irType = rcType;
+  if ( lc->checkIsCipherCiphertensor() ) irType = lcType;
+  else if ( rc->checkIsCipherCiphertensor() ) irType = rcType;
+  else if ( lc->checkIsPlainCiphertensor() ) irType = lcType;
+  else if ( rc->checkIsPlainCiphertensor() ) irType = rcType;
   else irType = lcType;
 
   assert( irType && "Cannot realize crypto type" );
