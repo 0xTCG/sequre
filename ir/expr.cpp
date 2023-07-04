@@ -68,7 +68,8 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
   }
 
   if ( !isSecureContainer(nodeType) ) return;
-  if ( isSharedTensor( nodeType ) ) {
+  if ( isMPP(nodeType) && !isSqrtInv ) return;
+  if ( isSharedTensor(nodeType) ) {
     bool lhsIsInt = types.front()->is(M->getIntType());
     bool rhsIsInt = types.back()->is(M->getIntType());
 
