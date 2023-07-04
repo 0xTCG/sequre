@@ -17,7 +17,7 @@ bool hasCKKSCiphertext( types::Type * );
 
 bool isCKKSPlaintext( types::Type * );
 bool isCKKSCiphertext( types::Type * );
-bool isSharedTensor( types::Type * );
+bool isSharetensor( types::Type * );
 bool isCiphertensor( types::Type * );
 bool isMPP( types::Type * );
 bool isSecureContainer( types::Type * );
