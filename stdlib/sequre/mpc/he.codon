@@ -422,9 +422,8 @@ class MPCHE[TP]:
             return Plaintext()
         
         tmp = ct
-        if not self.comms.is_broadcast(ct):
+        if hub_pid > -1:  # If ct is not already broadcast to all parties
             tmp = self.comms.broadcast_from(ct, hub_pid)
-        
         parameters = self.crypto_params.params
 
         zero_pk = new_public_key(parameters)
@@ -439,7 +438,10 @@ class MPCHE[TP]:
         pcks_protocol.key_switch(tmp, dec_agg, ciphertext_switched)
 
         return ciphertext_switched.plaintext()
-
+    
+    def decrypt(self, x: list[Ciphertext], mirrored: bool = False) -> list[Plaintext]:
+        return self._collective_op(x, MPCHE.collective_decrypt, mirrored)
+    
     def rescale(self, x: list[Ciphertext], target_scale: float) -> list[Ciphertext]:
         for cipher in x:
             if cipher.scale > target_scale:
@@ -452,7 +454,6 @@ class MPCHE[TP]:
         for cipher in x:
             if cipher.level() == self.bootstrap_min_level:
                 self.collective_bootstrap(cipher, self.comms.hub_pid)
-                self.stats.secure_bootstrap_count += 1
         
         return x
     
@@ -610,11 +611,11 @@ class MPCHE[TP]:
         return share_out
 
     def collective_bootstrap(self, ct: Ciphertext, hub_pid: int):
-        # if hub_pid == 0, assume cm is already shared across parties
+        self.stats.secure_bootstrap_count += 1
+        
         if self.pid == 0:
             return
 
-        # hub_pid broadcasts ct to other parties for collective decryption
         if not self.comms.is_broadcast(ct):
             ct = self.comms.broadcast_from(ct, hub_pid)
 
@@ -645,13 +646,10 @@ class MPCHE[TP]:
     def cipher_to_additive_plaintext(self, ct: Ciphertext, hub_pid: int) -> AdditiveShareBigint:
         parameters = self.crypto_params.params
         
-        # if hub_pid == 0, assume cm is already shared across parties
         if self.pid == 0:
             return new_additive_share_bigint(parameters, parameters.log_slots)
 
-        # hub_pid broadcasts ct to other parties for collective decryption
-        if not self.comms.is_broadcast(ct):
-            ct = self.comms.broadcast_from(ct, hub_pid)
+        ct = self.comms.broadcast_from(ct, hub_pid)
 
         level_start = ct.level()
 
@@ -714,22 +712,8 @@ class MPCHE[TP]:
         ct_rec = new_ciphertext(parameters, 1, cipher_level, parameters.default_scale)
         if self.pid == hub_pid:
             s2e_protocol.get_encryption(public_s2e_share, crp, ct_rec)
-        else:
-            ct_rec.clear()
         
         return ct_rec
-
-    def collective_decrypt_vector(self, enc: list[Ciphertext], hub_pid: int) -> list[Plaintext]:
-        if self.pid == 0:
-            return []
-        
-        if self.pid == hub_pid:
-            assert enc, "Empty ciphervector. Nothing to decrypt."
-
-        size = self.comms.broadcast_from(len(enc), hub_pid)
-        if not enc:
-            enc = [Ciphertext() for _ in range(size)]
-        return [self.collective_decrypt(cipher, hub_pid) for cipher in enc]
     
     def decode_vector[DTP=complex](self, enc: list[Plaintext]) -> list[DTP]:
         data_decoded = []
@@ -902,7 +886,7 @@ class MPCHE[TP]:
         if self.pid == 0:
             return zeros_vec(number_of_elements, TP=type(modulus))
         
-        decrypted_vector = self.collective_decrypt_vector(ciphervector, self.comms.hub_pid)
+        decrypted_vector = self.decrypt(ciphervector, mirrored=True)
         if self.pid == self.comms.hub_pid:
             decoded_values = self.decode_vector(decrypted_vector, DTP=dtype)
             if isinstance(dtype, float):
@@ -932,3 +916,14 @@ class MPCHE[TP]:
             return [(fill_cipher.copy() if i != target_cipher_idx else masked_cipher) for i in range(len(x))]
         else:
             compile_error("Invalid input to mask")
+    
+    def _collective_op(self, x: list[Ciphertext], collective_op, mirrored: bool = False):
+        if mirrored or self.pid == 0:
+            return [collective_op(self, cipher, -1) for cipher in x]
+        
+        collection = self.comms.collect(x)
+        plain_vectors = [
+            [collective_op(self, cipher, pid) for cipher in collection[pid - 1]]
+            for pid in range(1, self.comms.number_of_parties)]
+        
+        return plain_vectors[self.pid - 1]
