@@ -104,7 +104,8 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
 
   auto *method = getOrRealizeSequreInternalMethod(M, methodName, types, {});
   if ( !method ) {
-    std::cout << "Called within " << pf->getName() << std::endl;
+    std::cout << "Called at " << v->getSrcInfo() << std::endl;
+    std::cout << "within " << pf->getName() << std::endl;
     assert(false && "Aborting due to unsuccessful method realization ...");
   }
 
