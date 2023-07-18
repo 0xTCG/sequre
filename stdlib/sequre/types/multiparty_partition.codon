@@ -66,11 +66,12 @@ class MPP[S, dtype]:
             return _shape
         
         if self.has_unified_encryption():
-            cols = self._encryption_unified.actual_shape[-1]
+            enc_shape = self._encryption_unified.actual_shape
             if staticlen(S) == 2:
-                _shape = (self._rows_count(), cols)
+                rows, cols = enc_shape
+                _shape = (rows, cols)
             elif staticlen(S) == 1:
-                _shape = (cols, )
+                _shape = (enc_shape[-1], )
             else:
                 compile_error("MPP: dimension has to be less than 3")
             
@@ -93,11 +94,20 @@ class MPP[S, dtype]:
     
     @property
     def cohort_shape(self) -> S:
+        mpc = self._mpc
+        
         if staticlen(S) == 1:
-            return S(self._mpc.comms.broadcast_from(self.shape, argmax(self._ratios) + 1)[-1])
+            cols = self.shape[0] if len(self.shape) else 0
+            return (mpc.comms.broadcast_from(cols, argmax(self._ratios) + 1),)
         
         _shape = self.shape[::-1] if self._transposed else self.shape
-        _shape = (self._ratios.sum(), *_shape[1:])
+
+        if mpc.council(self.is_empty()).any():
+            cols = max(mpc.comms.collect(_shape[-1]))
+        else:
+            cols = _shape[-1]
+
+        _shape = (self._ratios.sum(), cols)
         if self._transposed:
             _shape = _shape[::-1]
         
@@ -116,6 +126,13 @@ class MPP[S, dtype]:
     @property
     def I(self) -> MPP[S, dtype]:
         id_mat = ndarray[S, dtype].diag(self.cohort_shape, dtype(1))
+        
+        if self._mpc.pid == 0:
+            return MPP[S, dtype](
+                _mpc=self._mpc,
+                _ratios=self._ratios.copy(),
+                _local_data=id_mat)
+        
         reference_pid = self._mpc.pid - 1
         start = self._ratios[:reference_pid].sum()
         end = start + self._ratios[reference_pid]
@@ -322,6 +339,11 @@ class MPP[S, dtype]:
             _diagonal_contiguous=enc._diagonal_contiguous,
             _skinny=enc._skinny)
     
+    def align_ratios(self, ratios: List[int]) -> MPP[S, dtype]:
+        assert self._ratios.sum() == ratios.sum(), f"MPP: cannot align partitions {self._ratios} to {ratios}"
+        source_pid = argmax(self._ratios) + 1
+        return self.join_at(source_pid).to_mpp(self._mpc, ratios, source_pid=source_pid, S=S, dtype=dtype)
+    
     def broadcast_from(self, source_pid: int):
         mpc = self._mpc
         self._ratios = mpc.comms.broadcast_from(self._ratios, source_pid)
@@ -403,8 +425,8 @@ class MPP[S, dtype]:
     def matmul(self, other) -> MPP[S, dtype]:
         mpc = self._mpc
         assert self.ndim == other.ndim == 2, f"MPP: Invalid dimensions for matmul. {self.ndim} != {other.ndim}"
-        if mpc.pid: assert self.cohort_shape[1] == other.cohort_shape[0], f"MPP: Invalid shapes for matmul. {self.cohort_shape} x {other.cohort_shape}"
-        else: assert self.shape[1] == other.shape[0], f"MPP: Invalid shapes for matmul. {self.shape} x {other.shape}"
+        if mpc.pid: assert self.cohort_shape[1] == other.cohort_shape[0], f"MPP: Invalid shapes for matmul at CP{mpc.pid}. {self.cohort_shape} x {other.cohort_shape}"
+        else: assert self.shape[1] == other.shape[0], f"MPP: Invalid shapes for matmul at CP0. {self.shape} x {other.shape}"
                 
         if isinstance(other, ndarray):
             return MPP._matmul_public(mpc, self, other)
@@ -413,8 +435,6 @@ class MPP[S, dtype]:
             return MPP._matmul_case_tt(mpc, self, other)
         if not self._transposed and not other._transposed:
             return MPP._matmul_case_ntnt(mpc, self, other)
-
-        assert self.shape[1] == other.shape[0], f"MPP: Invalid shapes for per-partition matmul. {self.shape} x {other.shape}"
 
         if self._transposed and not other._transposed:
             return MPP._matmul_case_tnt(mpc, self, other)
@@ -483,6 +503,12 @@ class MPP[S, dtype]:
             _encryption_right=_encryption_right,
             _encryption_unified=_encryption_unified,
             _transposed=self._transposed)
+    
+    @staticmethod
+    def apply_ratios(ratios: List[int], target_size: int):
+        s = ratios.sum()
+        assert target_size % s == 0, f"MPP: cannot distribute partitions by the given proportion. Target number of rows: {target_size}. Ratios: {ratios}"
+        return ratios * (target_size // s)
 
     def _autocast(self, other):
         assert isinstance(other, MPP) or isinstance(other, ndarray), "MPP: Autocasting can be done only between MPPs or ndarrays for now"
@@ -535,7 +561,7 @@ class MPP[S, dtype]:
         if mpc.pid == 0:
             return MPP[S, dtype](
                 _mpc=first._mpc,
-                _ratios=first._ratios.copy(),
+                _ratios=MPP.apply_ratios(first._ratios, first._local_data.shape[1]),
                 _local_data=zeros((first._local_data.shape[1], other._local_data.shape[1]), dtype=dtype))
 
         assert not (first.is_empty() ^ other.is_empty()), "MPP: all or none of the partitions should be empty"
@@ -543,6 +569,8 @@ class MPP[S, dtype]:
         enc = Ciphertensor[Ciphertext]()
         
         with first.partition_aligner(), other.partition_aligner():
+            assert first.shape[1] == other.shape[0], f"MPP: Invalid shapes for per-partition matmul. {first.shape} x {other.shape}"
+
             if not first.is_empty():
                 if not first.is_local():
                     first.unify_encryption()
@@ -558,7 +586,14 @@ class MPP[S, dtype]:
                 else:
                     enc = first._encryption_unified.T @ other._encryption_unified
 
-        return mpc.comms.collect_at(enc, mpc.comms.hub_pid).sum(mpc).to_mpp(mpc, first._ratios, S=S, dtype=dtype)
+        # TODO: Temporary solution. Inefficient.
+        if mpc.council(enc._diagonal_contiguous).any():
+            joined_sum = mpc.comms.collect(enc).sum(mpc)
+            return joined_sum.to_mpc(
+                mpc, modulus=mpc.base_modulus, mirrored=True, S=S, dtype=dtype).diagonal_contig(antidiagonal=True).to_mpp(
+                    mpc, ratios=first._ratios, dtype=dtype)
+        
+        return mpc.comms.collect_at(enc, mpc.comms.hub_pid).sum(mpc).to_mpp(mpc, first._ratios, source_pid=mpc.comms.hub_pid, S=S, dtype=dtype)
 
     @sequre
     def _matmul_case_ntt(mpc, first: MPP[S, dtype], other: MPP[S, dtype]) -> MPP[S, dtype]:
@@ -676,385 +711,72 @@ class MPP[S, dtype]:
                 _ratios=_self._ratios.copy(),
                 _local_data=_self._local_data)
         
-        self_aligner = _self.partition_aligner()
-        other_aligner = _other.partition_aligner() if isinstance(_other, MPP) else EmptyWith()
+        if isinstance(_other, MPP):
+            if _self._ratios != _other._ratios:
+                _other = _other.align_ratios(_self._ratios)
         
-        if MUL == 1:
-            self_aligner.__enter__()
-            other_aligner.__enter__()
-
         _local_data = ndarray[S, ac_type]()
         _encryption_left = Ciphertensor[Ciphertext]()
         _encryption_right = Ciphertensor[Ciphertext]()
         _encryption_unified = Ciphertensor[Ciphertext]()
         
-        if not _self.is_empty():
-            other_broadcast = _other.check_broadcast(_self.shape)
-            
-            if isinstance(other_broadcast, ndarray):
-                _local_data, _encryption_left, _encryption_right, _encryption_unified = _self._do_elem_wise_op_public(other_broadcast, elem_wise_op)
-            elif isinstance(other_broadcast, MPP):
-                assert not other_broadcast.is_empty(), "MPP: cannot do elem-wise operation with an empty partition"
+        with _self.partition_aligner() as aligner, (_other.partition_aligner() if isinstance(_other, MPP) else EmptyWith()):
+            if not _self.is_empty():
+                other_broadcast = _other.check_broadcast(_self.shape)
+                
+                if isinstance(other_broadcast, ndarray):
+                    _local_data, _encryption_left, _encryption_right, _encryption_unified = _self._do_elem_wise_op_public(other_broadcast, elem_wise_op)
+                elif isinstance(other_broadcast, MPP):
+                    assert not other_broadcast.is_empty(), "MPP: cannot do elem-wise operation with an empty partition"
 
-                if staticlen(S) > 1:
-                    assert _self.cohort_shape == other_broadcast.cohort_shape, f"MPP: Shapes mismatch in elem-wise operation. {_self.cohort_shape} != {other_broadcast.cohort_shape}"
-                else:
-                    assert _self.shape == other_broadcast.shape, f"MPP: Shapes mismatch in elem-wise operation. {_self.shape} != {other_broadcast.shape}"
+                    if staticlen(S) == 1:
+                        assert _self.shape == other_broadcast.shape, f"MPP: Shapes mismatch in elem-wise operation. {_self.shape} != {other_broadcast.shape}"
 
-                if _self._transposed ^ other_broadcast._transposed:
-                    transpose_encryption = False
-                    if not _self.is_local():
-                        _self.unify_encryption()
-                        transpose_encryption = _self._encryption_unified._transposed
-                    
-                    other_encryption_unified = other_broadcast.to_mpc().T.to_mpp(mpc, _self._ratios, transpose_encryption=transpose_encryption, dtype=ac_type)._encryption_unified
-                    
-                    if _self.is_local():
-                        _encryption_unified = elem_wise_op(mpc, _self._local_data, other_encryption_unified)
-                    else:
-                        _encryption_unified = elem_wise_op(mpc, _self._encryption_unified, other_encryption_unified)
-                elif _self.is_local() and other_broadcast.is_local():
-                    _local_data = elem_wise_op(mpc, _self._local_data, other_broadcast._local_data)
-                elif other_broadcast.is_local():
-                    _local_data, _encryption_left, _encryption_right, _encryption_unified = _self._do_elem_wise_op_public(other_broadcast._local_data, elem_wise_op)
-                elif _self.is_local():
-                    _local_data, _encryption_left, _encryption_right, _encryption_unified = _self._local_data._do_elem_wise_op_public(other_broadcast, elem_wise_op)
-                elif _self.has_unified_encryption() and not other_broadcast.has_unified_encryption():
-                    assert other_broadcast.is_semi_encrypted(), "MPP: Operand expected to be semi-encrypted"
-                    other_broadcast.unify_encryption()
-                    _encryption_unified = elem_wise_op(mpc, _self._encryption_unified, other_broadcast._encryption_unified)
-                elif not _self.has_unified_encryption() and other_broadcast.has_unified_encryption():
-                    assert _self.is_semi_encrypted(), "MPP: Operand expected to be semi-encrypted"
-                    _self.unify_encryption()
-                    _encryption_unified = elem_wise_op(mpc, _self._encryption_unified, other_broadcast._encryption_unified)
-                else:
-                    if _self.has_local_data() and other_broadcast.has_local_data():
+                    if _self._transposed ^ other_broadcast._transposed:
+                        transpose_encryption = False
+                        if not _self.is_local():
+                            _self.unify_encryption()
+                            transpose_encryption = _self._encryption_unified._transposed
+                        
+                        other_encryption_unified = other_broadcast.to_mpc().T.to_mpp(mpc, _self._ratios, transpose_encryption=transpose_encryption, dtype=ac_type)._encryption_unified
+                        
+                        if _self.is_local():
+                            _encryption_unified = elem_wise_op(mpc, _self._local_data, other_encryption_unified)
+                        else:
+                            _encryption_unified = elem_wise_op(mpc, _self._encryption_unified, other_encryption_unified)
+                    elif _self.is_local() and other_broadcast.is_local():
                         _local_data = elem_wise_op(mpc, _self._local_data, other_broadcast._local_data)
-                    if _self._encryption_left and other_broadcast._encryption_left:
-                        _encryption_left = elem_wise_op(mpc, _self._encryption_left, other_broadcast._encryption_left)
-                    if _self._encryption_right and other_broadcast._encryption_right:
-                        _encryption_right = elem_wise_op(mpc, _self._encryption_right, other_broadcast._encryption_right)
-                    if _self.has_unified_encryption() and other_broadcast.has_unified_encryption():
+                    elif other_broadcast.is_local():
+                        _local_data, _encryption_left, _encryption_right, _encryption_unified = _self._do_elem_wise_op_public(other_broadcast._local_data, elem_wise_op)
+                    elif _self.is_local():
+                        _local_data, _encryption_left, _encryption_right, _encryption_unified = _self._local_data._do_elem_wise_op_public(other_broadcast, elem_wise_op)
+                    elif _self.has_unified_encryption() and not other_broadcast.has_unified_encryption():
+                        assert other_broadcast.is_semi_encrypted(), "MPP: Operand expected to be semi-encrypted"
+                        other_broadcast.unify_encryption()
                         _encryption_unified = elem_wise_op(mpc, _self._encryption_unified, other_broadcast._encryption_unified)
-            else:
-                compile_error("Invalid operand type for MPP elem-wise operation")
+                    elif not _self.has_unified_encryption() and other_broadcast.has_unified_encryption():
+                        assert _self.is_semi_encrypted(), "MPP: Operand expected to be semi-encrypted"
+                        _self.unify_encryption()
+                        _encryption_unified = elem_wise_op(mpc, _self._encryption_unified, other_broadcast._encryption_unified)
+                    else:
+                        if _self.has_local_data() and other_broadcast.has_local_data():
+                            _local_data = elem_wise_op(mpc, _self._local_data, other_broadcast._local_data)
+                        if _self._encryption_left and other_broadcast._encryption_left:
+                            _encryption_left = elem_wise_op(mpc, _self._encryption_left, other_broadcast._encryption_left)
+                        if _self._encryption_right and other_broadcast._encryption_right:
+                            _encryption_right = elem_wise_op(mpc, _self._encryption_right, other_broadcast._encryption_right)
+                        if _self.has_unified_encryption() and other_broadcast.has_unified_encryption():
+                            _encryption_unified = elem_wise_op(mpc, _self._encryption_unified, other_broadcast._encryption_unified)
+                else:
+                    compile_error("Invalid operand type for MPP elem-wise operation")
         
-        if MUL == 1:
-            self_aligner.__exit__()
-            other_aligner.__exit__()
-        
-            return self_aligner.new_mpp(
+            return aligner.new_mpp(
                 _local_data=_local_data,
                 _encryption_left=_encryption_left,
                 _encryption_right=_encryption_right,
                 _encryption_unified=_encryption_unified)
 
-        return MPP[S, ac_type](
-            _mpc=_self._mpc,
-            _ratios=_self._ratios.copy(),
-            _local_data=_local_data,
-            _encryption_left=_encryption_left,
-            _encryption_right=_encryption_right,
-            _encryption_unified=_encryption_unified,
-            _transposed=_self._transposed)
     
-    @sequre
-    def _getitem_2_dim_core[S1](mpc, mpp: MPP[S, dtype], adjusted_idx, ratios: List[int]) -> MPP[S1, dtype]:
-        _local_data = ndarray[S1, dtype]()
-        _encryption_left = Ciphertensor[Ciphertext]()
-        _encryption_right = Ciphertensor[Ciphertext]()
-        _encryption_unified = Ciphertensor[Ciphertext]()
-        
-        if mpp.is_local():
-            _local_data = mpp._local_data[adjusted_idx]
-        elif mpp.is_semi_encrypted():
-            assert not mpp._encryption_left._transposed and not mpp._encryption_right._transposed, "Not implemented yet: getitem from transposed ciphertensor"
-            _local_data = mpp._local_data[adjusted_idx]
-            _encryption_left = mpp._encryption_left[adjusted_idx]
-            _encryption_right = mpp._encryption_right[adjusted_idx]
-        else:
-            assert mpp.has_unified_encryption(), "MPP: must have unified encryption if not local and semi encrypted"
-            assert not mpp._encryption_unified._transposed, "Not implemented yet: getitem from transposed ciphertensor"
-            _encryption_unified = mpp._encryption_unified[adjusted_idx]
-        
-        return MPP[S1, dtype](
-            _mpc=mpc,
-            _ratios=ratios,
-            _local_data=_local_data,
-            _encryption_left=_encryption_left,
-            _encryption_right=_encryption_right,
-            _encryption_unified=_encryption_unified)
-    
-    @sequre
-    def _setitem_2_dim_core(mpc, mpp: MPP[S, dtype], adjusted_idx, value: MPP):
-        if mpp.is_full_encrypted() or value.is_full_encrypted():
-            _value_cp = value.copy()
-            mpp.unify_encryption()
-            _value_cp.unify_encryption()
-            mpp._encryption_unified[adjusted_idx] = _value_cp._encryption_unified
-        elif mpp.is_local() and value.is_local():
-            mpp._local_data[adjusted_idx] = value._local_data
-        else:
-            value_enc_left, value_local, value_enc_right = mpp._align_semi_encryptions(value)
-            if mpp._encryption_left: mpp._encryption_left[adjusted_idx] = value_enc_left
-            mpp._local_data[adjusted_idx] = value_local
-            if mpp._encryption_right: mpp._encryption_right[adjusted_idx] = value_enc_right
-    
-    def _getitem_2_dim(self, idx: int) -> MPP[Tuple[int], dtype]:
-        mpc = self._mpc
-        assert self.ndim == 2, "MPP: cannot do 2-dim-getitem from non-2-dimensional MPP"
-        assert not self._transposed, "Not implemented yet: getitem from transposed MPP"
-        assert 0 <= idx < self._ratios.sum(), "MPP: getitem - index out of bound"
-
-        _ratio_idx = self._find_idx_in_ratios(idx)
-        _ratios = one_hot_vector(idx=_ratio_idx, size=len(self._ratios), TP=int)
-
-        if mpc.pid == 0:
-            return MPP[Tuple[int], dtype](
-                _mpc=self._mpc,
-                _ratios=_ratios,
-                _local_data=self._local_data[idx])
-
-        if mpc.pid == _ratio_idx + 1:
-            adjusted_idx = idx - self._ratios[:_ratio_idx].sum()
-            return MPP._getitem_2_dim_core(mpc, self, adjusted_idx, _ratios, S1=Tuple[int])
-            
-        return MPP[Tuple[int], dtype](
-            _mpc=self._mpc,
-            _ratios=_ratios)
-    
-    def _getitem_2_dim(self, s: slice) -> MPP[S, dtype]:
-        mpc = self._mpc
-        assert self.ndim == 2, "MPP: cannot do 2-dim-getitem from non-2-dimensional MPP"
-        assert not self._transposed, "Not implemented yet: getitem from transposed MPP"
-
-        start, stop, _, _ = s.adjust_indices(self.cohort_shape[0])
-        
-        _start_ratio_idx = self._find_idx_in_ratios(start)
-        _stop_ratio_idx = self._find_idx_in_ratios(stop)
-        _ratios = self._get_sliced_ratios(_start_ratio_idx, _stop_ratio_idx, start, stop)
-
-        if mpc.pid == 0:
-            return MPP[S, dtype](
-                _mpc=self._mpc,
-                _ratios=_ratios,
-                _local_data=self._local_data[s])
-
-        reference_pid = mpc.pid - 1
-        if _start_ratio_idx <= reference_pid <= _stop_ratio_idx:
-            adjusted_slice = self._adjust_row_slice(start, stop)
-            return MPP._getitem_2_dim_core(mpc, self, adjusted_slice, _ratios, S1=S)
-            
-        return MPP[S, dtype](
-            _mpc=self._mpc,
-            _ratios=_ratios)
-    
-    def _getitem_2_dim(self, slices: Tuple[slice, slice]) -> MPP[S, dtype]:
-        mpc = self._mpc
-        assert self.ndim == 2, "MPP: cannot do 2-dim-getitem from non-2-dimensional MPP"
-        assert not self._transposed, "Not implemented yet: getitem from transposed MPP"
-
-        rs, cs = slices
-        start, stop, _, _ = rs.adjust_indices(self.cohort_shape[0])
-        
-        _start_ratio_idx = self._find_idx_in_ratios(start)
-        _stop_ratio_idx = self._find_idx_in_ratios(stop)
-        _ratios = self._get_sliced_ratios(_start_ratio_idx, _stop_ratio_idx, start, stop)
-
-        if mpc.pid == 0:
-            return MPP[S, dtype](
-                _mpc=self._mpc,
-                _ratios=_ratios,
-                _local_data=self._local_data[slices])
-
-        reference_pid = mpc.pid - 1
-        if _start_ratio_idx <= reference_pid <= _stop_ratio_idx:
-            adjusted_rs = self._adjust_row_slice(start, stop)
-            return MPP._getitem_2_dim_core(mpc, self, (adjusted_rs, cs), _ratios, S1=S)
-            
-        return MPP[S, dtype](
-            _mpc=self._mpc,
-            _ratios=_ratios)
-    
-    def _getitem_2_dim(self, slices: Tuple[slice, int]) -> MPP[S, dtype]:
-        mpc = self._mpc
-        assert self.ndim == 2, "MPP: cannot do 2-dim-getitem from non-2-dimensional MPP"
-        assert not self._transposed, "Not implemented yet: getitem from transposed MPP"
-
-        rs, c_idx = slices
-        cs = slice(start=c_idx, stop=c_idx + 1, step=1)
-        start, stop, _, _ = rs.adjust_indices(self.cohort_shape[0])
-        
-        _start_ratio_idx = self._find_idx_in_ratios(start)
-        _stop_ratio_idx = self._find_idx_in_ratios(stop)
-        _ratios = self._get_sliced_ratios(_start_ratio_idx, _stop_ratio_idx, start, stop)
-
-        if mpc.pid == 0:
-            return MPP[S, dtype](
-                _mpc=self._mpc,
-                _ratios=_ratios,
-                _local_data=self._local_data[rs, cs])
-
-        reference_pid = mpc.pid - 1
-        if _start_ratio_idx <= reference_pid <= _stop_ratio_idx:
-            adjusted_rs = self._adjust_row_slice(start, stop)
-            return MPP._getitem_2_dim_core(mpc, self, (adjusted_rs, cs), _ratios, S1=S)
-            
-        return MPP[S, dtype](
-            _mpc=self._mpc,
-            _ratios=_ratios)
-    
-    def _getitem_2_dim(self, slices: Tuple[int, slice]) -> MPP[Tuple[int], dtype]:
-        mpc = self._mpc
-        assert self.ndim == 2, "MPP: cannot do 2-dim-getitem from non-2-dimensional MPP"
-        assert not self._transposed, "Not implemented yet: getitem from transposed MPP"
-
-        r_idx, cs = slices
-        
-        assert 0 <= r_idx < self._ratios.sum(), "MPP: getitem - index out of bound"
-
-        _ratio_idx = self._find_idx_in_ratios(r_idx)
-        _ratios = one_hot_vector(idx=_ratio_idx, size=len(self._ratios), TP=int)
-
-        if mpc.pid == 0:
-            return MPP[Tuple[int], dtype](
-                _mpc=self._mpc,
-                _ratios=_ratios,
-                _local_data=self._local_data[slices])
-
-        if mpc.pid == _ratio_idx + 1:
-            adjusted_idx = r_idx - self._ratios[:_ratio_idx].sum()
-            return MPP._getitem_2_dim_core(mpc, self, (adjusted_idx, cs), _ratios, S1=Tuple[int])
-            
-        return MPP[Tuple[int], dtype](
-            _mpc=self._mpc,
-            _ratios=_ratios)
-    
-    def _getitem_2_dim(self, slices: Tuple[int, int]) -> MPP[Tuple[int], dtype]:
-        mpc = self._mpc
-        assert self.ndim == 2, "MPP: cannot do 2-dim-getitem from non-2-dimensional MPP"
-        assert not self._transposed, "Not implemented yet: getitem from transposed MPP"
-
-        r_idx, c_idx = slices
-        cs = slice(start=c_idx, stop=c_idx + 1, step=1)
-        
-        assert 0 <= r_idx < self._ratios.sum(), "MPP: getitem - index out of bound"
-
-        _ratio_idx = self._find_idx_in_ratios(r_idx)
-        _ratios = one_hot_vector(idx=_ratio_idx, size=len(self._ratios), TP=int)
-
-        if mpc.pid == 0:
-            return MPP[Tuple[int], dtype](
-                _mpc=self._mpc,
-                _ratios=_ratios,
-                _local_data=self._local_data[r_idx, cs])
-
-        if mpc.pid == _ratio_idx + 1:
-            adjusted_idx = r_idx - self._ratios[:_ratio_idx].sum()
-            return MPP._getitem_2_dim_core(mpc, self, (adjusted_idx, cs), _ratios, S1=Tuple[int])
-            
-        return MPP[Tuple[int], dtype](
-            _mpc=self._mpc,
-            _ratios=_ratios)
-        
-    def _setitem_2_dim(self, idx: int, value: MPP):
-        mpc = self._mpc
-        if staticlen(S) != 2 or staticlen(value.S) != 1:
-            compile_error("MPP: invalid shapes for setitem")
-
-        assert not self._transposed, "Not implemented yet: setitem for transposed MPP"
-        assert value._ratios.sum() == 1, "Not implemented yet: setitem operands should be at the same partition/party for now"
-        
-        reference_pid = mpc.pid - 1  # Skip CP0
-        
-        if reference_pid == argmax(value._ratios):
-            adjusted_idx = idx - self._ratios[:reference_pid].sum()
-            assert 0 <= adjusted_idx < self._ratios[reference_pid], "MPP: setitem index out of bound"
-            MPP._setitem_2_dim_core(mpc, self, adjusted_idx, value)
-    
-    def _setitem_2_dim(self, s: slice, value: MPP):
-        mpc = self._mpc
-        if staticlen(S) != 2 or staticlen(value.S) != 2:
-            compile_error("MPP: invalid shapes for setitem")
-
-        assert not self._transposed, "Not implemented yet: setitem for transposed MPP"
-        
-        start, stop, _, _ = s.adjust_indices(self.cohort_shape[0])
-        _start_ratio_idx = self._find_idx_in_ratios(start)
-        _stop_ratio_idx = self._find_idx_in_ratios(stop)
-        reference_pid = mpc.pid - 1
-        
-        if _start_ratio_idx <= reference_pid <= _stop_ratio_idx:
-            adjusted_slice = self._adjust_row_slice(start, stop)
-            MPP._setitem_2_dim_core(mpc, self, adjusted_slice, value)
-    
-    def _setitem_2_dim(self, s: Tuple[slice, slice], value: MPP):
-        mpc = self._mpc
-        if staticlen(S) != 2 or staticlen(value.S) != 2:
-            compile_error("MPP: invalid shapes for setitem")
-
-        assert not self._transposed, "Not implemented yet: setitem for transposed MPP"
-        
-        rs, cs = s
-        start, stop, _, _ = rs.adjust_indices(self.cohort_shape[0])
-        _start_ratio_idx = self._find_idx_in_ratios(start)
-        _stop_ratio_idx = self._find_idx_in_ratios(stop)
-        reference_pid = mpc.pid - 1
-        
-        if _start_ratio_idx <= reference_pid <= _stop_ratio_idx:
-            adjusted_rs = self._adjust_row_slice(start, stop)
-            MPP._setitem_2_dim_core(mpc, self, (adjusted_rs, cs), value)
-    
-    def _setitem_2_dim(self, s: Tuple[slice, int], value: MPP):
-        mpc = self._mpc
-        if staticlen(S) != 2 or staticlen(value.S) != 2:
-            compile_error("MPP: invalid shapes for setitem")
-
-        assert not self._transposed, "Not implemented yet: setitem for transposed MPP"
-        
-        rs, c_idx = s
-        start, stop, _, _ = rs.adjust_indices(self.cohort_shape[0])
-        _start_ratio_idx = self._find_idx_in_ratios(start)
-        _stop_ratio_idx = self._find_idx_in_ratios(stop)
-        reference_pid = mpc.pid - 1
-        
-        if _start_ratio_idx <= reference_pid <= _stop_ratio_idx:
-            adjusted_rs = self._adjust_row_slice(start, stop)
-            MPP._setitem_2_dim_core(mpc, self, (adjusted_rs, c_idx), value)
-    
-    def _setitem_2_dim(self, s: Tuple[int, slice], value: MPP):
-        mpc = self._mpc
-        if staticlen(S) != 2 or staticlen(value.S) != 1:
-            compile_error("MPP: invalid shapes for setitem")
-
-        assert not self._transposed, "Not implemented yet: setitem for transposed MPP"
-        assert value._ratios.sum() == 1, "Not implemented yet: setitem operands should be at the same partition/party for now"
-        
-        r_idx, cs = s
-        reference_pid = mpc.pid - 1  # Skip CP0
-        
-        if reference_pid == argmax(value._ratios):
-            adjusted_r_idx = r_idx - self._ratios[:reference_pid].sum()
-            assert 0 <= adjusted_r_idx < self._ratios[reference_pid], "MPP: setitem index out of bound"
-            MPP._setitem_2_dim_core(mpc, self, (adjusted_r_idx, cs), value)
-    
-    def _setitem_2_dim(self, s: Tuple[int, int], value: MPP):
-        mpc = self._mpc
-        if staticlen(S) != 2 or staticlen(value.S) != 1:
-            compile_error("MPP: invalid shapes for setitem")
-
-        assert not self._transposed, "Not implemented yet: setitem for transposed MPP"
-        assert value._ratios.sum() == 1, "Not implemented yet: setitem operands should be at the same partition/party for now"
-        
-        r_idx, c_idx = s
-        reference_pid = mpc.pid - 1  # Skip CP0
-        
-        if reference_pid == argmax(value._ratios):
-            adjusted_r_idx = r_idx - self._ratios[:reference_pid].sum()
-            assert 0 <= adjusted_r_idx < self._ratios[reference_pid], "MPP: setitem index out of bound"
-            cs = slice(start=c_idx, stop=c_idx + 1, step=1)
-            MPP._setitem_2_dim_core(mpc, self, (adjusted_r_idx, cs), value)
-
     def _getitem_1_dim(self, indices) -> MPP[S, dtype]:
         if isinstance(indices, slice):
             compile_error("MPP: slicing 1-dim MPP is not implemented yet")
@@ -1124,6 +846,136 @@ class MPP[S, dtype]:
                 _local_data=_local_data,
                 _encryption_unified=_encryption_unified)
     
+    @sequre
+    def _getitem_core[S1](mpc, mpp: MPP[S, dtype], adjusted_idx, ratios: List[int]) -> MPP[S1, dtype]:
+        assert not mpp.is_empty(), "MPP: _getitem_core should be called on top of a non-empty partition"
+
+        _local_data = ndarray[S1, dtype]()
+        _encryption_left = Ciphertensor[Ciphertext]()
+        _encryption_right = Ciphertensor[Ciphertext]()
+        _encryption_unified = Ciphertensor[Ciphertext]()
+        
+        if mpp.is_local():
+            _local_data = mpp._local_data[adjusted_idx]
+        elif mpp.is_semi_encrypted():
+            assert not staticlen(S) == 1 and not isinstance(adjusted_idx, tuple), "Not implemented yet: slicing along 1-axis semi-encrypted MPP via _getitem_core"
+            _local_data = mpp._local_data[adjusted_idx]
+            _encryption_left = mpp._encryption_left[adjusted_idx]
+            _encryption_right = mpp._encryption_right[adjusted_idx]
+        else:
+            assert mpp.has_unified_encryption(), "MPP: must have unified encryption if not local and semi encrypted"
+            _encryption_unified = mpp._encryption_unified[adjusted_idx]
+        
+        return MPP[S1, dtype](
+            _mpc=mpc,
+            _ratios=ratios,
+            _local_data=_local_data,
+            _encryption_left=_encryption_left,
+            _encryption_right=_encryption_right,
+            _encryption_unified=_encryption_unified)
+    
+    def _getitem_2_dim(self, idx: int) -> MPP[Tuple[int], dtype]:
+        mpc = self._mpc
+        assert self.ndim == 2, "MPP: cannot do 2-dim-getitem from non-2-dimensional MPP"
+        assert not self._transposed, "Not implemented yet: getitem from transposed MPP"
+        assert 0 <= idx < self._ratios.sum(), f"MPP: getitem - index out of bound --- {idx} not in [0, {self._ratios.sum()})"
+
+        _ratio_idx = self._find_idx_in_ratios(idx)
+        _ratios = one_hot_vector(idx=_ratio_idx, size=len(self._ratios), TP=int)
+
+        if mpc.pid == 0:
+            return MPP[Tuple[int], dtype](
+                _mpc=self._mpc,
+                _ratios=_ratios,
+                _local_data=self._local_data[idx])
+
+        if mpc.pid == _ratio_idx + 1:
+            adjusted_idx = idx - self._ratios[:_ratio_idx].sum()
+            return MPP._getitem_core(mpc, self, adjusted_idx, _ratios, S1=Tuple[int])
+            
+        return MPP[Tuple[int], dtype](
+            _mpc=self._mpc,
+            _ratios=_ratios)
+    
+    def _getitem_2_dim(self, s: slice) -> MPP[S, dtype]:
+        mpc = self._mpc
+        assert self.ndim == 2, "MPP: cannot do 2-dim-getitem from non-2-dimensional MPP"
+        assert not self._transposed, "Not implemented yet: getitem from transposed MPP"
+
+        start, stop, _, _ = s.adjust_indices(self.cohort_shape[0])
+        
+        _start_ratio_idx = self._find_idx_in_ratios(start)
+        _stop_ratio_idx = self._find_idx_in_ratios(stop)
+        _ratios = self._get_sliced_ratios(_start_ratio_idx, _stop_ratio_idx, start, stop)
+
+        if mpc.pid == 0:
+            return MPP[S, dtype](
+                _mpc=self._mpc,
+                _ratios=_ratios,
+                _local_data=self._local_data[s])
+
+        reference_pid = mpc.pid - 1
+        if _ratios[reference_pid]:
+            adjusted_slice = self._adjust_row_slice(start, stop)
+            return MPP._getitem_core(mpc, self, adjusted_slice, _ratios, S1=S)
+            
+        return MPP[S, dtype](
+            _mpc=self._mpc,
+            _ratios=_ratios)
+    
+    def _getitem_2_dim_tuple[T1](self, slices: Tuple[T1, slice]) -> MPP:
+        mpc = self._mpc
+        rs = slices[0]
+        row_sliced_self = self._getitem_2_dim(rs)
+        _ratios = row_sliced_self._ratios
+        
+        if mpc.pid == 0:
+            return MPP[row_sliced_self.S, dtype](
+                _mpc=self._mpc,
+                _ratios=_ratios,
+                _local_data=self._local_data[slices])
+
+        with row_sliced_self.partition_aligner() as aligner:
+            if not row_sliced_self.is_empty():
+                adjusted_idx = MPP._adjust_col_slice_tuple(slices[1], T1=T1)
+                col_sliced_self = MPP._getitem_core(mpc, row_sliced_self, adjusted_idx, _ratios, S1=row_sliced_self.S)
+
+                return aligner.new_mpp(
+                    _local_data=col_sliced_self._local_data,
+                    _encryption_left=col_sliced_self._encryption_left,
+                    _encryption_right=col_sliced_self._encryption_right,
+                    _encryption_unified=col_sliced_self._encryption_unified)
+
+        return MPP[row_sliced_self.S, dtype](
+            _mpc=self._mpc,
+            _ratios=_ratios)
+    
+    def _getitem_2_dim(self, slices: Tuple[slice, slice]) -> MPP[S, dtype]:
+        assert self.ndim == 2, "MPP: cannot do 2-dim-getitem from non-2-dimensional MPP"
+        assert not self._transposed, "Not implemented yet: getitem from transposed MPP"
+        return self._getitem_2_dim_tuple(slices)
+    
+    def _getitem_2_dim(self, slices: Tuple[slice, int]) -> MPP[S, dtype]:
+        assert self.ndim == 2, "MPP: cannot do 2-dim-getitem from non-2-dimensional MPP"
+        assert not self._transposed, "Not implemented yet: getitem from transposed MPP"
+
+        rs, c_idx = slices
+        cs = slice(start=c_idx, stop=c_idx + 1, step=1)
+        return self._getitem_2_dim_tuple((rs, cs))
+    
+    def _getitem_2_dim(self, slices: Tuple[int, slice]) -> MPP[Tuple[int], dtype]:
+        assert self.ndim == 2, "MPP: cannot do 2-dim-getitem from non-2-dimensional MPP"
+        assert not self._transposed, "Not implemented yet: getitem from transposed MPP"
+        return self._getitem_2_dim_tuple(slices)
+    
+    def _getitem_2_dim(self, slices: Tuple[int, int]) -> MPP[Tuple[int], dtype]:
+        assert self.ndim == 2, "MPP: cannot do 2-dim-getitem from non-2-dimensional MPP"
+        assert not self._transposed, "Not implemented yet: getitem from transposed MPP"
+
+        r_idx, c_idx = slices
+        cs = slice(start=c_idx, stop=c_idx + 1, step=1)
+        return self._getitem_2_dim_tuple((r_idx, cs))
+    
     def _setitem_1_dim(self, indices, value: MPP):
         if isinstance(indices, slice):
             compile_error("MPP: slicing 1-dim MPP is not implemented yet")
@@ -1173,7 +1025,119 @@ class MPP[S, dtype]:
                     _value_cp = value.copy()
                     _value_cp.unify_encryption()
                     self._encryption_right._setitem(mpc, idx - border, _value_cp._encryption_unified)
+    
+    @sequre
+    def _setitem_core(mpc, mpp: MPP[S, dtype], adjusted_idx, value: MPP):
+        assert not mpp.is_empty() and not value.is_empty(), "MPP: _setitem_core should be called on top of non-empty partitions"
+        
+        if mpp.is_full_encrypted() or value.is_full_encrypted():
+            _value_cp = value.copy()
+            mpp.unify_encryption()
+            _value_cp.unify_encryption()
+            mpp._encryption_unified[adjusted_idx] = _value_cp._encryption_unified
+            mpp._local_data = ndarray[S, dtype]()
+        elif mpp.is_local() and value.is_local():
+            mpp._local_data[adjusted_idx] = value._local_data
+        else:
+            assert not staticlen(S) == 1 and not isinstance(adjusted_idx, tuple), "Not implemented yet: slicing along 1-axis semi-encrypted MPP within _setitem_core"
+            value_enc_left, value_local, value_enc_right = mpp._align_semi_encryptions(value)
+            if mpp._encryption_left: mpp._encryption_left[adjusted_idx] = value_enc_left
+            mpp._local_data[adjusted_idx] = value_local
+            if mpp._encryption_right: mpp._encryption_right[adjusted_idx] = value_enc_right
 
+    def _setitem_2_dim(self, idx: int, value: MPP[Tuple[int], dtype]):
+        mpc = self._mpc
+        if staticlen(S) != 2 or staticlen(value.S) != 1:
+            compile_error("MPP: invalid shapes for setitem")
+
+        assert not self._transposed, "Not implemented yet: setitem for transposed MPP"
+        assert value._ratios.sum() == max(value._ratios) == 1, "Not implemented yet: setitem value should be at one partition/party for now"
+        
+        reference_pid = mpc.pid - 1  # Skip CP0
+        
+        if reference_pid == argmax(value._ratios):
+            adjusted_idx = idx - self._ratios[:reference_pid].sum()
+            assert 0 <= adjusted_idx < self._ratios[reference_pid], "MPP: setitem index out of bound"
+            MPP._setitem_core(mpc, self, adjusted_idx, value)
+    
+    def _setitem_2_dim(self, s: slice, value: MPP[S, dtype]):
+        mpc = self._mpc
+        if staticlen(S) != 2 or staticlen(value.S) != 2:
+            compile_error("MPP: invalid shapes for setitem")
+
+        assert not self._transposed, "Not implemented yet: setitem for transposed MPP"
+
+        start, stop, _, _ = s.adjust_indices(self.cohort_shape[0])
+        assert value._ratios.sum() == stop - start, f"MPP: setitem value does not match the slice size {value._ratios.sum()} != {stop - start}"
+        
+        _start_ratio_idx = self._find_idx_in_ratios(start)
+        _stop_ratio_idx = self._find_idx_in_ratios(stop)
+        reference_pid = mpc.pid - 1
+        
+        if not self._ratios[reference_pid]:
+            return
+        
+        if _start_ratio_idx <= reference_pid <= _stop_ratio_idx:
+            adjusted_slice = self._adjust_row_slice(start, stop)
+            assert value._ratios[reference_pid] == adjusted_slice.stop - adjusted_slice.start, "MPP: setitem value does not match the adjusted slice size"
+            MPP._setitem_core(mpc, self, adjusted_slice, value)
+    
+    def _setitem_2_dim_tuple[T1, T2](self, s: Tuple[T1, T2], value: MPP):
+        mpc = self._mpc
+        
+        if mpc.pid == 0:
+            return
+        
+        rs = s[0]
+        rows_to_set = self._getitem_2_dim(rs)
+
+        with rows_to_set.partition_aligner(), value.partition_aligner():
+            if rows_to_set.is_empty():
+                assert value.is_empty(), "MPP: alligner error while setting item"
+            if not rows_to_set.is_empty():
+                adjusted_idx = MPP._adjust_col_slice_tuple(s[1], T1=T1)
+                MPP._setitem_core(mpc, rows_to_set, adjusted_idx, value)
+
+        self._setitem_2_dim(rs, rows_to_set)
+    
+    def _setitem_2_dim[T1, T2](self, s: Tuple[T1, T2], value: MPP):
+        if staticlen(S) != 2:
+            compile_error("MPP: invalid shapes for setitem")
+        
+        rs, cs = s
+        cohort_shape = self.cohort_shape
+        
+        if isinstance(T1, slice):
+            if staticlen(value.S) != 2:
+                compile_error("MPP: invalid shapes for setitem")
+
+            start, stop, _, _ = s[0].adjust_indices(cohort_shape[0])
+            assert not self._transposed, "Not implemented yet: setitem for transposed MPP"
+            assert value._ratios.sum() == stop - start, f"MPP: setitem value does not match the slice size {value._ratios.sum()} != {stop - start}"
+            adjusted_cs = cs
+        elif isinstance(T1, int):
+            _rows_count = cohort_shape[0]
+            assert rs < _rows_count, "MPP: invalid setitem indices"
+            rs = (rs + _rows_count) % _rows_count
+            
+            if staticlen(value.S) != 1:
+                compile_error("MPP: invalid shapes for setitem")
+
+            assert not self._transposed, "Not implemented yet: setitem for transposed MPP"
+            assert value._ratios.sum() == max(value._ratios) == 1, "Not implemented yet: setitem operands should be at the same partition/party for now"
+
+            if isinstance(T2, int):
+                _cols_count = cohort_shape[1]
+                assert cs < _cols_count, "MPP: invalid setitem indices"
+                cs = (cs + _cols_count) % _cols_count
+                adjusted_cs = slice(start=cs, stop=cs + 1, step=1)
+            else:
+                adjusted_cs = cs
+        else:
+            compile_error("MPP: invalid index --- should be either slice or int")
+
+        self._setitem_2_dim_tuple((rs, adjusted_cs), value)
+    
     def _align_semi_encryptions(self, other: MPP) -> Tuple[Ciphertensor[Ciphertext], ndarray, Ciphertensor[Ciphertext]]:
         mpc = self._mpc
         assert self.is_semi_encrypted() or other.is_semi_encrypted(), "MPP: at least on of the MPPs needs to be semi-encrypted to align the semi ancryptions"
@@ -1235,25 +1199,40 @@ class MPP[S, dtype]:
         adjusted_start = max(start - ratios_sum, 0)
         adjusted_stop = min(stop - ratios_sum, self._ratios[reference_pid])
 
-        assert 0 <= adjusted_start < self._ratios[reference_pid], "MPP: index out of bound"
-        assert 0 <= adjusted_stop <= self._ratios[reference_pid], "MPP: index out of bound"
+        assert 0 <= adjusted_start < self._ratios[reference_pid], f"MPP: index out of bound --- {adjusted_start} not in [0, {self._ratios[reference_pid]})"
+        assert 0 <= adjusted_stop <= self._ratios[reference_pid], f"MPP: index out of bound --- {adjusted_start} not in [0, {self._ratios[reference_pid]}]"
         
         return slice(start=adjusted_start, stop=adjusted_stop, step=1)
     
+    @staticmethod
+    def _adjust_col_slice_tuple[T1](cs):
+        whole_slice = slice(start=None, stop=None, step=1)
+                
+        if isinstance(T1, slice):
+            return (whole_slice, cs)
+        elif isinstance(T1, int):
+            return cs
+        else:
+            compile_error("MPP: invalid index --- should be either slice or int")
+    
     def _get_sliced_ratios(self, _start_ratio_idx: int, _stop_ratio_idx: int, start: int, stop: int) -> List[int]:
         _ratios = []
-        _ratios_sum = 0
+        _ratios_start_sum = 0
+        _ratios_stop_sum = 0
         
         for i, ratio in enumerate(self._ratios):
-            _ratios_sum += ratio
+            _ratios_start_sum += ratio
             if i < _start_ratio_idx or i > _stop_ratio_idx:
                 _ratios.append(0)
+            elif i == _start_ratio_idx == _stop_ratio_idx:
+                _ratios.append(stop - start)
             elif i == _start_ratio_idx:
-                _ratios.append(start - _ratios_sum)
+                _ratios.append(_ratios_start_sum - start)
             elif i == _stop_ratio_idx:
-                _ratios.append(stop - _ratios_sum)
+                _ratios.append(stop - _ratios_stop_sum)
             else:
                 _ratios.append(self._ratios[i])
+            _ratios_stop_sum += ratio
         
         return _ratios
     
@@ -1284,6 +1263,8 @@ class MPPAligner[S, dtype]:
             _encryption_right=Ciphertensor[Ciphertext](),
             _encryption_unified=Ciphertensor[Ciphertext]()) -> MPP[S, dtype]:
         
+        if not _local_data.is_empty():
+            _local_data = MPPAligner._revert_local_data(self.mpp._mpc, _local_data, self.mpp._ratios)
         if _encryption_left:
             _encryption_left = MPPAligner._revert_encryption(self.mpp._mpc, _encryption_left, self.mpp._ratios, S=self.mpp.S)
         if _encryption_right:
@@ -1303,6 +1284,8 @@ class MPPAligner[S, dtype]:
     @staticmethod
     def _align(mpp: MPP[S, dtype]):
         mpc = mpp._mpc
+        if mpc.council(not mpp._local_data.is_empty()).any():
+            mpp._local_data = MPPAligner._align_local_data(mpc, mpp._local_data, mpp._ratios)
         if mpc.council(mpp._encryption_unified).any():
             mpp._encryption_unified = MPPAligner._align_encryption(mpc, mpp._encryption_unified, mpp._ratios, S=S)
         if mpc.council(mpp._encryption_left).any():
@@ -1313,12 +1296,34 @@ class MPPAligner[S, dtype]:
     @staticmethod
     def _revert(mpp: MPP[S, dtype]):
         mpc = mpp._mpc
+        if not mpp._local_data.is_empty():
+            mpp._local_data = MPPAligner._revert_local_data(mpc, mpp._local_data, mpp._ratios)
         if mpp._encryption_unified:
             mpp._encryption_unified = MPPAligner._revert_encryption(mpc, mpp._encryption_unified, mpp._ratios, S=S)
         if mpp._encryption_left:
             mpp._encryption_left = MPPAligner._revert_encryption(mpc, mpp._encryption_left, mpp._ratios, S=S)
         if mpp._encryption_right:
             mpp._encryption_right = MPPAligner._revert_encryption(mpc, mpp._encryption_right, mpp._ratios, S=S)
+    
+    @staticmethod
+    def _align_local_data[S, dtype](mpc, data: ndarray[S, dtype], ratios: List[int]):
+        assert ratios.sum() > 0, "MPPAligner: nothing to align -- MPP empty"
+        ref_pid = argmax(ratios) + 1
+        cols = mpc.comms.broadcast_from(list(data.shape), ref_pid)[-1]
+        
+        if staticlen(S) == 1:
+            return data if mpc.pid == ref_pid else zeros((cols,), dtype=dtype)
+        
+        if staticlen(S) != 2:
+            compile_error("MPPAligner: invalid dimension")
+
+        if ratios[mpc.pid - 1] == max(ratios):
+            return data
+        
+        if data.is_empty():
+            return zeros((max(ratios), cols), dtype=dtype)
+        
+        return data.pad(max(ratios) - ratios[mpc.pid - 1], axis=0)
     
     @staticmethod
     def _align_encryption[S](mpc, encryption: Ciphertensor[Ciphertext], ratios: List[int]):
@@ -1346,6 +1351,24 @@ class MPPAligner[S, dtype]:
         return _encryption_placeholder
     
     @staticmethod
+    def _revert_local_data[S, dtype](mpc, data: ndarray[S, dtype], ratios: List[int]):
+        assert ratios.sum() > 0, "MPPAligner: nothing to align -- MPP empty"
+        ref_pid = argmax(ratios) + 1
+        
+        if staticlen(S) == 1:
+            return data if mpc.pid == ref_pid else ndarray[S, dtype]()
+        
+        if staticlen(S) != 2:
+            compile_error("MPPAligner: invalid dimension")
+        
+        if ratios[mpc.pid - 1] == max(ratios):
+            return data
+        if ratios[mpc.pid - 1] == 0:
+            return ndarray[S, dtype]()
+
+        return data[:ratios[mpc.pid - 1]]
+
+    @staticmethod
     def _revert_encryption[S](mpc, encryption: Ciphertensor[Ciphertext], ratios: List[int]):
         assert ratios.sum() > 0, "MPPAligner: nothing to align -- MPP empty"
         ref_pid = argmax(ratios) + 1
@@ -1361,7 +1384,7 @@ class MPPAligner[S, dtype]:
         if ratios[mpc.pid - 1] == 0:
             return Ciphertensor[Ciphertext]()
 
-        return encryption[:ratios[mpc.pid - 1]]
+        return encryption._get_rows_raw(slice(start=0, stop=ratios[mpc.pid - 1], step=1))
 
 
 @extend
@@ -1372,9 +1395,60 @@ class MPP:
 
 @extend
 class ndarray:
+    def __add__(self, other: MPP[S, T]) -> MPP[S, T]:
+        return self._do_elem_wise_op(other, secure_operator.add)
+    
+    def __sub__(self, other: MPP[S, T]) -> MPP[S, T]:
+        return self._do_elem_wise_op(other, secure_operator.sub)
+    
+    def __mul__(self, other: MPP[S, T]) -> MPP[S, T]:
+        return self._do_elem_wise_op(other, secure_operator.mul, MUL=1)
+    
+    def _do_elem_wise_op(self, other: MPP[S, T], elem_wise_op) -> MPP[S, T]:
+        mpc = other._mpc
+        
+        _other, _self = other._check_binary_operands(self)
+        ac_type = _other.dtype
+        _self = _self.T if _other._transposed else _self
+
+        if mpc.pid == 0:
+            return MPP[S, ac_type](
+                _mpc=mpc,
+                _ratios=_other._ratios.copy(),
+                _local_data=_other._local_data)
+
+        _local_data = ndarray[S, ac_type]()
+        _encryption_left = Ciphertensor[Ciphertext]()
+        _encryption_right = Ciphertensor[Ciphertext]()
+        _encryption_unified = Ciphertensor[Ciphertext]()
+
+        if staticlen(S) == 2:
+            if _self.shape[0] == _other._ratios.sum():
+                reference_pid = mpc.pid - 1  # Avoid CP0
+                start = _other._ratios[:reference_pid].sum()
+                end = start + _other._ratios[reference_pid]
+                _self = _self[start:end]
+
+                # Align partitions for the downstream computation
+                padding = max(_other._ratios) - _other._ratios[reference_pid]
+                if padding:
+                    _self = _self.pad(padding, axis=0)
+            elif not _self.shape[0] == _other.shape[0]:
+                raise ValueError(f"ndarray: shapes missmatch in public elem-wise MPP operation {_self.shape} vs {_other.shape} at CP{mpc.pid}")
+        
+        with _other.partition_aligner() as aligner:
+            if not _other.is_empty():
+                _local_data, _encryption_left, _encryption_right, _encryption_unified = _self._do_elem_wise_op_public(_other, elem_wise_op)
+
+            return aligner.new_mpp(
+                _local_data=_local_data,
+                _encryption_left=_encryption_left,
+                _encryption_right=_encryption_right,
+                _encryption_unified=_encryption_unified)
+
     def _do_elem_wise_op_public(self, other_mpp: MPP[S, T], elem_wise_op) -> Tuple[ndarray[S, T], Ciphertensor[Ciphertext], Ciphertensor[Ciphertext], Ciphertensor[Ciphertext]]:
         mpc = other_mpp._mpc
-        assert self.shape[-1] == other_mpp.shape[-1], "ndarray: shapes missmatch in public elem-wise MPP operation"
+        assert self.shape[-1] == other_mpp.shape[-1], f"ndarray: shapes missmatch in public elem-wise MPP operation {self.shape} vs {other_mpp.shape}"
         _local_data = ndarray[S, T]()
         _encryption_left = Ciphertensor[Ciphertext]()
         _encryption_right = Ciphertensor[Ciphertext]()
@@ -1382,15 +1456,6 @@ class ndarray:
 
         if mpc.pid == 0:
             return (self, _encryption_left, _encryption_right, _encryption_unified)
-
-        if staticlen(S) == 2:
-            if self.shape[0] == other_mpp._ratios.sum():
-                reference_pid = mpc.pid - 1  # Avoid CP0
-                start = other_mpp._ratios[:reference_pid].sum()
-                end = start + other_mpp._ratios[reference_pid]
-                self = self[start:end]
-            elif not self.shape[0] == other_mpp.shape[0]:
-                raise ValueError("ndarray: shapes missmatch in public elem-wise MPP operation")
         
         col_end = 0
         if other_mpp.is_local():
