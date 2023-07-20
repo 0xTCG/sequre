@@ -10,9 +10,10 @@ from sequre.attributes import sequre
 from sequre.lattiseq.ckks import Ciphertext
 from sequre.types.builtin import int_t
 from sequre.types.ciphertensor import Ciphertensor
+from sequre.types.sharetensor import Sharetensor
 from sequre.types.utils import EmptyWith
 from sequre.utils.io import read_ndarray
-from sequre.utils.constants import C_CONTIG, D_CONTIG, MHE_MUL_TO_ADD_THRESHOLD
+from sequre.utils.constants import C_CONTIG, D_CONTIG, MHE_MUL_TO_ADD_THRESHOLD, MHE_MPC_SWITCH_COST_ESTIMATE, HE_ENC_COST_ESTIMATE
 from sequre.utils.utils import one_hot_vector
 
 
@@ -165,13 +166,7 @@ class MPP[S, dtype]:
             for e in self._local_data: yield e
     
     def __len__(self):
-        cohort_shape = self.cohort_shape
-        if staticlen(S) == 1:
-            return cohort_shape
-        elif staticlen(S) == 2:
-            return cohort_shape[0]
-        else:
-            compile_error("MPP: invalid shape")    
+        return self.cohort_shape[0]
     
     def __add__(self, other) -> MPP[S, dtype]:
         self._mpc.stats.secure_add_count += 1
@@ -510,6 +505,20 @@ class MPP[S, dtype]:
         assert target_size % s == 0, f"MPP: cannot distribute partitions by the given proportion. Target number of rows: {target_size}. Ratios: {ratios}"
         return ratios * (target_size // s)
 
+    def get_matmul_cost(self, other):
+        if isinstance(other, ndarray):
+            return MPP._get_matmul_public_cost(self, other)
+        
+        if self._transposed and other._transposed:
+            return MPP._get_matmul_case_tt_cost(self, other)
+        if not self._transposed and not other._transposed:
+            return MPP._get_matmul_case_ntnt_cost(self, other)
+
+        if self._transposed and not other._transposed:
+            return MPP._get_matmul_case_tnt_cost(self, other)
+        else: # case not self._transposed and other._transposed
+            return MPP._get_matmul_case_ntt_cost(self, other)
+    
     def _autocast(self, other):
         assert isinstance(other, MPP) or isinstance(other, ndarray), "MPP: Autocasting can be done only between MPPs or ndarrays for now"
         
@@ -521,6 +530,87 @@ class MPP[S, dtype]:
             return self, other.astype(float)
         
         compile_error("Cannot autocast dtypes")
+    
+    @staticmethod
+    def _get_matmul_public_cost(first: MPP, other: ndarray) -> float:
+        if first.is_empty() or first._mpc.pid == 0:
+            cost = 0.0
+        elif first.is_local():
+            cost = first._local_data.get_matmul_cost(other)
+        else:
+            cost = first._encryption_unified.get_matmul_cost(other)
+        
+        return max(first._mpc.comms.collect(cost, True))
+    
+    @staticmethod
+    def _get_matmul_case_ntnt_cost(first: MPP, other: MPP) -> float:
+        slots = first._mpc.he.crypto_params.params.slots()
+        shape_1 = first.shape
+        shape_2 = other.shape
+        return (Ciphertensor._count_ciphers(shape_1, slots) + Ciphertensor._count_ciphers(shape_2, slots)) * MHE_MPC_SWITCH_COST_ESTIMATE + Sharetensor.get_matmul_cost_for_shapes(shape_1, shape_2)
+
+    @staticmethod
+    def _get_matmul_case_tt_cost(first: MPP, other: MPP) -> float:
+        return MPP._get_matmul_case_ntnt_cost(first, other)
+    
+    @staticmethod
+    def _get_matmul_case_tnt_cost(first: MPP, other: MPP) -> float:
+        if first.is_empty() or other.is_empty() or first._mpc.pid == 0:
+            matmul_cost = 0.0
+        elif first.is_local() and other.is_local():
+            matmul_cost = first._local_data.T.get_matmul_cost(other._local_data) + HE_ENC_COST_ESTIMATE
+        elif first.is_local():
+            matmul_cost = first._local_data.T.get_matmul_cost(other._encryption_unified)
+        elif other.is_local():
+            matmul_cost = first._encryption_unified.T.get_matmul_cost(other._local_data)
+        else:
+            matmul_cost = first._encryption_unified.T.get_matmul_cost(other._encryption_unified)
+        
+        matmul_cost = max(first._mpc.comms.collect(matmul_cost, True))
+
+        slots = first._mpc.he.crypto_params.params.slots()
+        result_shape = (first.shape[1], other.shape[1])
+        return matmul_cost + MHE_MPC_SWITCH_COST_ESTIMATE * Ciphertensor._count_ciphers(result_shape, slots)
+    
+    @staticmethod
+    def _get_matmul_case_ntt_cost(first: MPP, other: MPP) -> float:
+        slots = first._mpc.he.crypto_params.params.slots()
+        reference_pid = first._mpc.pid - 1
+        cost = 0.0
+        
+        if first.is_empty() or other.is_empty() or first._mpc.pid == 0:
+            pass
+        elif other.is_local():
+            other_encryption_left_shape = (other._ratios[:reference_pid].sum(), other.shape[-1])
+            other_encryption_right_shape = (other._ratios[reference_pid + 1:].sum(), other.shape[-1])
+            other_encryption_left = Ciphertensor[Ciphertext](
+                shape=list(other_encryption_left_shape),
+                slots=slots)
+            other_encryption_right = Ciphertensor[Ciphertext](
+                shape=list(other_encryption_right_shape),
+                slots=slots)
+
+            if first.is_local():
+                if ndarray._count(other_encryption_left_shape): cost += first._local_data.get_matmul_cost(other_encryption_left.T)
+                cost += first._local_data.get_matmul_cost(other._local_data.T)
+                if ndarray._count(other_encryption_right_shape): cost += first._local_data.get_matmul_cost(other_encryption_right.T)
+            else:
+                if ndarray._count(other_encryption_left_shape):
+                    cost += first._encryption_unified.get_matmul_cost(other_encryption_left.T)
+                cost += first._encryption_unified.get_matmul_cost(other._local_data.T)
+                if ndarray._count(other_encryption_right_shape):
+                    cost += first._encryption_unified.get_matmul_cost(other_encryption_right.T)
+        else:
+            other_encryption = Ciphertensor[Ciphertext](
+                shape=[other._ratios.sum(), other.shape[-1]],
+                slots=slots)
+        
+            if first.is_local():
+                cost = first._local_data.get_matmul_cost(other_encryption.T)
+            else:
+                cost = first._encryption_unified.get_matmul_cost(other_encryption.T)
+    
+        return max(first._mpc.comms.collect(cost, True))
     
     @sequre
     def _matmul_public(mpc, first: MPP[S, dtype], other: ndarray[S, dtype]) -> MPP[S, dtype]:
@@ -1309,7 +1399,7 @@ class MPPAligner[S, dtype]:
     def _align_local_data[S, dtype](mpc, data: ndarray[S, dtype], ratios: List[int]):
         assert ratios.sum() > 0, "MPPAligner: nothing to align -- MPP empty"
         ref_pid = argmax(ratios) + 1
-        cols = mpc.comms.broadcast_from(list(data.shape), ref_pid)[-1]
+        cols = mpc.comms.broadcast_from(0 if data.is_empty() else data.shape[-1], ref_pid)
         
         if staticlen(S) == 1:
             return data if mpc.pid == ref_pid else zeros((cols,), dtype=dtype)
@@ -1330,7 +1420,7 @@ class MPPAligner[S, dtype]:
         assert ratios.sum() > 0, "MPPAligner: nothing to align -- MPP empty"
         slots = mpc.he.crypto_params.params.slots()
         ref_pid = argmax(ratios) + 1
-        cols = mpc.comms.broadcast_from(encryption.shape, ref_pid)[-1]
+        cols = mpc.comms.broadcast_from(encryption.shape[-1] if encryption else 0, ref_pid)
         
         if staticlen(S) == 1:
             return encryption if mpc.pid == ref_pid else Ciphertensor[Ciphertext].placeholder([cols], slots)
@@ -1477,3 +1567,6 @@ class ndarray:
             raise ValueError("ndarray: invalid MPP partition")
 
         return (_local_data, _encryption_left, _encryption_right, _encryption_unified)
+
+    def matmul_cost(self, other: MPP) -> float:
+        raise NotImplementedError("ndarray: matmul with MPP")
