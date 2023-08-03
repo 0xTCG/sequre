@@ -12,11 +12,16 @@ bool isPolyOptFunc( Func * );
 bool isCipherOptFunc( Func * );
 bool isMatmulReorderOptFunc ( Func * ); 
 
-bool isSharedTensor( types::Type * );
-bool isCipherTensor( types::Type * );
+bool hasCKKSPlaintext( types::Type * );
+bool hasCKKSCiphertext( types::Type * );
+
+bool isCKKSPlaintext( types::Type * );
+bool isCKKSCiphertext( types::Type * );
+bool isSharetensor( types::Type * );
+bool isCiphertensor( types::Type * );
 bool isMPP( types::Type * );
 bool isSecureContainer( types::Type * );
-bool isMPC( Value *, types::Generic );
+bool isMPC( Value * );
 
 types::Type *getTupleType( int, types::Type *, Module * );
 types::Type *getTupleType( std::vector<Value *>, Module * );

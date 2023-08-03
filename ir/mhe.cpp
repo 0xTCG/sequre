@@ -68,9 +68,7 @@ void applyCipherPlainOptimizations( CallInstr *v ) {
   assert( v->numArgs() > 0 && "Compile error: The first argument of the mhe_cipher_opt annotated function should be the MPC instance (annotated function has no args)" );
 
   auto *mpcValue = M->Nr<VarValue>(f->arg_front());
-  auto mpcGenerics = mpcValue->getType()->getGenerics();
-  assert( mpcGenerics.size() == 1 && "Compile error: The first argument of the mhe_cipher_opt annotated function should be the MPC instance with one and only one generic type" );
-  assert(  isMPC(mpcValue, mpcGenerics[0]) && "Compile error: The first argument of the mhe_cipher_opt annotated function should be the MPC instance" );
+  assert(  isMPC(mpcValue) && "Compile error: The first argument of the mhe_cipher_opt annotated function should be the MPC instance" );
   
   transformExpressions(M, cast<SeriesFlow>(cast<BodiedFunc>(f)->getBody()), mpcValue);
 }

@@ -16,15 +16,17 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
   auto *f = util::getFunc(v->getCallee());
   if ( !f ) return;
   
-  bool isEq     = f->getName().find(Module::EQ_MAGIC_NAME) != std::string::npos;
-  bool isGt     = f->getName().find(Module::GT_MAGIC_NAME) != std::string::npos;
-  bool isLt     = f->getName().find(Module::LT_MAGIC_NAME) != std::string::npos;
-  bool isAdd    = f->getName().find(Module::ADD_MAGIC_NAME) != std::string::npos;
-  bool isSub    = f->getName().find(Module::SUB_MAGIC_NAME) != std::string::npos;
-  bool isMul    = f->getName().find(Module::MUL_MAGIC_NAME) != std::string::npos;
-  bool isMatMul = f->getName().find(Module::MATMUL_MAGIC_NAME) != std::string::npos;
-  bool isDiv    = f->getName().find(Module::TRUE_DIV_MAGIC_NAME) != std::string::npos;
-  bool isPow    = f->getName().find(Module::POW_MAGIC_NAME) != std::string::npos;
+  bool isEq      = f->getUnmangledName() == Module::EQ_MAGIC_NAME;
+  bool isGt      = f->getUnmangledName() == Module::GT_MAGIC_NAME;
+  bool isLt      = f->getUnmangledName() == Module::LT_MAGIC_NAME;
+  bool isAdd     = f->getUnmangledName() == Module::ADD_MAGIC_NAME;
+  bool isSub     = f->getUnmangledName() == Module::SUB_MAGIC_NAME;
+  bool isMul     = f->getUnmangledName() == Module::MUL_MAGIC_NAME;
+  bool isMatMul  = f->getUnmangledName() == Module::MATMUL_MAGIC_NAME;
+  bool isDiv     = f->getUnmangledName() == Module::TRUE_DIV_MAGIC_NAME;
+  bool isPow     = f->getUnmangledName() == Module::POW_MAGIC_NAME;
+  bool isGetItem = f->getUnmangledName() == Module::GETITEM_MAGIC_NAME;
+  bool isSetItem = f->getUnmangledName() == Module::SETITEM_MAGIC_NAME;
   
   if ( !isEq &&
        !isGt &&
@@ -34,39 +36,50 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
        !isMul && 
        !isMatMul && 
        !isPow && 
-       !isDiv )
+       !isDiv &&
+       !isGetItem &&
+       !isSetItem )
     return;
 
   auto *M        = v->getModule();
-  auto *self     = M->Nr<VarValue>(pf->arg_front());
-  auto *selfType = self->getType();
-  auto *lhs      = v->front();
-  auto *rhs      = v->back();
-  auto *lhsType  = lhs->getType();
-  auto *rhsType  = rhs->getType();
+  auto *mpc      = M->Nr<VarValue>(pf->arg_front());
+  assert( isMPC(mpc) && "ERROR: The first argument of sequre function should be the MPC instance" );
+  
+  std::vector<Value *> args;
+  std::vector<types::Type *> types;
+  
+  for ( auto it = v->begin(); it != v->end(); it++ ) {
+    auto *arg = *it;
+    args.push_back(arg);
+    types.push_back(arg->getType());
+  }
 
+  bool isVoid    = isSetItem;
+  auto *nodeType = isVoid ? types.front() : v->getType();
+  
   bool isSqrtInv = false;
   if ( isDiv ) { // Special case where 1 / sqrt(x) is called
-    auto *sqrtInstr = cast<CallInstr>(rhs);
+    auto *sqrtInstr = cast<CallInstr>(args.back());
     if ( sqrtInstr ) {
       auto *sqrtFunc = util::getFunc(sqrtInstr->getCallee());
       if ( sqrtFunc )
-        isSqrtInv = sqrtFunc->getName().find("sqrt") != std::string::npos;
+        isSqrtInv = sqrtFunc->getUnmangledName() == "sqrt";
     }
   }
 
-  bool lhs_is_secure_container = isSecureContainer(lhsType);
-  bool rhs_is_secure_container = isSecureContainer(rhsType);
-  if ( !lhs_is_secure_container && !rhs_is_secure_container ) return;
+  if ( !isSecureContainer(nodeType) ) return;
+  if ( isMPP(nodeType) && !isSqrtInv ) return;
+  if ( isSharetensor(nodeType) ) {
+    bool lhsIsInt = types.front()->is(M->getIntType());
+    bool rhsIsInt = types.back()->is(M->getIntType());
 
-  bool lhs_is_int = lhsType->is(M->getIntType());
-  bool rhs_is_int = rhsType->is(M->getIntType());
-
-  if ( isMul && lhs_is_int ) return;
-  if ( isMul && rhs_is_int ) return;
-  if ( isDiv && lhs_is_int && !isSqrtInv ) return;
-  if ( isPow && lhs_is_int ) return;
-  if ( isPow && !rhs_is_int ) return;
+    if ( isGetItem || isSetItem ) return;
+    if ( isMul && lhsIsInt ) return;
+    if ( isMul && rhsIsInt ) return;
+    if ( isDiv && lhsIsInt && !isSqrtInv ) return;
+    if ( isPow && lhsIsInt ) return;
+    if ( isPow && !rhsIsInt ) return;
+  }
 
   std::string methodName = isEq        ? "secure_eq"
                            : isGt      ? "secure_gt"
@@ -78,19 +91,25 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
                            : isSqrtInv ? "secure_sqrt_inv"
                            : isDiv     ? "secure_div"
                            : isPow     ? "secure_pow"
+                           : isGetItem ? "secure_getitem"
+                           : isSetItem ? "secure_setitem"
                                        : "invalid_operation";
   if ( isSqrtInv ) {
-    rhs = cast<CallInstr>(rhs)->back();
-    rhsType = rhs->getType();
+    args.back() = cast<CallInstr>(args.back())->back();
+    types.back() = args.back()->getType();
   }
 
-  auto *method = getOrRealizeSequreInternalMethod(M, methodName, {selfType, lhsType, rhsType}, {});
+  args.insert(args.begin(), mpc);
+  types.insert(types.begin(), mpc->getType());
+
+  auto *method = getOrRealizeSequreInternalMethod(M, methodName, types, {});
   if ( !method ) {
-    std::cout << "Called within " << pf->getName() << std::endl;
-    return;
+    std::cout << "Called at " << v->getSrcInfo() << std::endl;
+    std::cout << "within " << pf->getName() << std::endl;
+    assert(false && "Aborting due to unsuccessful method realization ...");
   }
 
-  auto *func = util::call(method, {self, lhs, rhs});
+  auto *func = util::call(method, args);
   v->replaceAll(func);
 }
 

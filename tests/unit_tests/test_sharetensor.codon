@@ -1,0 +1,220 @@
+from numpy.create import array, ones, zeros
+
+from ..utils import assert_eq_approx, assert_eq
+
+from sequre.utils.param import *
+from sequre.types.utils import double_to_fp
+from sequre.utils.utils import zeros_vec
+from sequre.mpc.env import MPCEnv
+from sequre.stdlib.lin_alg import *
+from sequre.stdlib.fp import *
+from sequre.stdlib.protocols import bit_add as bit_add_protocol, bit_decomposition as bit_decomposition_protocol
+from sequre.types.internal import Internal as sq
+from sequre.types.sharetensor import Sharetensor
+from sequre.attributes import sequre
+
+
+def test_sequre_bitwise_operations[TP](mpc, modulus: TP):
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    print(f'CP{mpc.pid}:\tTesting Sequre MPC bitwise operations on {alg_struct} ... \n')
+    
+    a_bits = [TP(1), TP(0), TP(1), TP(0), TP(1), TP(0), TP(0)]
+    b_bits = [TP(0), TP(0), TP(1), TP(0), TP(1), TP(0), TP(0)]
+    shared_a_bits = mpc.comms.share_from_trusted_dealer([a_bits], modulus)
+    shared_b_bits = mpc.comms.share_from_trusted_dealer([b_bits], modulus)
+    Sharetensor_a_bits = Sharetensor(shared_a_bits, modulus)
+    Sharetensor_b_bits = Sharetensor(shared_b_bits, modulus)
+    Sharetensor_b_bits_public = Sharetensor([b_bits], modulus)
+    Sharetensor_b_bits_public.public = True
+    
+    bit_addition = bit_add_protocol(mpc, Sharetensor_a_bits, Sharetensor_b_bits).share
+    revealed_bit_add_results = mpc.comms.reveal(bit_addition, modulus)
+    if mpc.pid != 0:
+        assert_eq(
+            'Sequre bit add private',
+            revealed_bit_add_results,
+            [[TP(1), TP(0), TP(0), TP(1), TP(0), TP(1), TP(0), TP(0)]])
+    
+    bit_addition = bit_add_protocol(mpc, Sharetensor_a_bits, Sharetensor_b_bits_public).share
+    revealed_bit_add_results = mpc.comms.reveal(bit_addition, modulus)
+    if mpc.pid != 0:
+        assert_eq(
+            'Sequre bit add public',
+            revealed_bit_add_results,
+            [[TP(1), TP(0), TP(0), TP(1), TP(0), TP(1), TP(0), TP(0)]])
+    
+    expected_decomposition_1 = zeros_vec(MODULUS_BITS, TP=int)
+    expected_decomposition_2 = zeros_vec(MODULUS_BITS, TP=int)
+    expected_decomposition_2[0] = 1
+    expected_decomposition_3 = zeros_vec(MODULUS_BITS, TP=int)
+    small_modulus = SECOND_RING_SIZE if modulus.popcnt() == 1 else SECOND_FIELD_SIZE
+    for i in range(3): expected_decomposition_3[i] = 1
+    bit_decomp_input = Sharetensor(mpc.comms.share_from_trusted_dealer([TP(0), TP(1), TP(7)], modulus), modulus)
+    bit_decomposition = bit_decomposition_protocol(
+        mpc, bit_decomp_input, bitlen=MODULUS_BITS, small_modulus=small_modulus, modulus=modulus)
+    revealed_bit_decomposition = mpc.comms.reveal(bit_decomposition.share.to_int(), small_modulus)
+    expected_decomposition = [expected_decomposition_1, expected_decomposition_2, expected_decomposition_3]
+    if mpc.pid != 0:
+        assert_eq(
+            'Sequre bit decomposition',
+            revealed_bit_decomposition,
+            expected_decomposition)
+    
+
+@sequre
+def test_sequre_basic_arithmetic(mpc, elem):
+    alg_struct = "ring" if elem.modulus.popcnt() == 1 else "field"
+    print(f'CP{mpc.pid}:\tTesting Sequre MPC basic arithmetic on {alg_struct} ... \n')
+
+    for _ in range(10000):
+        mpc.randomness.switch_seed(-1)
+        rand_elem_1 = (elem.share.to_int().rand(1 << (NBIT_K // 2 - 1)) - elem.share.to_int().rand(1 << (NBIT_K // 2 - 1))).to_float() / (1 << (NBIT_F // 2))
+        rand_elem_2 = (elem.share.to_int().rand(1 << (NBIT_K // 2 - 1)) - elem.share.to_int().rand(1 << (NBIT_K // 2 - 1))).to_float() / (1 << (NBIT_F // 2))
+        mpc.randomness.restore_seed(-1)
+
+        rand_elem_1_shared = mpc.comms.share_from_trusted_dealer(rand_elem_1.to_fp(elem.modulus), elem.modulus)
+        rand_elem_2_shared = mpc.comms.share_from_trusted_dealer(rand_elem_2.to_fp(elem.modulus), elem.modulus)
+
+        Sharetensor_1 = Sharetensor(rand_elem_1_shared, elem.modulus)
+        Sharetensor_2 = Sharetensor(rand_elem_2_shared, elem.modulus)
+        Sharetensor_1.fp = True
+        Sharetensor_2.fp = True
+
+        sum_ = Sharetensor_1 + Sharetensor_2
+        sub_ = Sharetensor_1 - Sharetensor_2
+        mul_ = Sharetensor_1 * Sharetensor_2
+
+        if mpc.pid != 0:
+            assert_eq(f"{_}: Sequre addition for elems {rand_elem_1} and {rand_elem_1}", sum_.reveal(mpc), rand_elem_1 + rand_elem_2, True)
+            assert_eq(f"{_}: Sequre subtraction for elems {rand_elem_1} and {rand_elem_1}", sub_.reveal(mpc), rand_elem_1 - rand_elem_2, True)
+            assert_eq(f"{_}: Sequre multiplication for elems {rand_elem_1} and {rand_elem_1}", mul_.reveal(mpc), rand_elem_1 * rand_elem_2, True)
+
+
+def test_sequre_sqrt(mpc, elem):
+    alg_struct = "ring" if elem.modulus.popcnt() == 1 else "field"
+    print(f'CP{mpc.pid}:\tTesting Sequre MPC square root on {alg_struct} ... \n')
+    
+    modulus = elem.modulus
+    fp_elem = elem.to_fp()
+    expected_sqrt, expected_sqrt_inv = mpc.fp.fp_sqrt(fp_elem.share, modulus)
+    sqrt, sqrt_inv = fp_sqrt(mpc, fp_elem)
+    if mpc.pid != 0:
+        assert_eq_approx("Sequre sqrt", mpc.comms.print_fp(sqrt.share, modulus), mpc.comms.print_fp(expected_sqrt, modulus))
+        assert_eq_approx("Sequre sqrt_inv", mpc.comms.print_fp(sqrt_inv.share, modulus), mpc.comms.print_fp(expected_sqrt_inv, modulus))
+    
+
+@sequre
+def test_sequre_division(mpc, elem_1, elem_2):
+    assert elem_1.modulus == elem_2.modulus
+    alg_struct = "ring" if elem_1.modulus.popcnt() == 1 else "field"
+    print(f'CP{mpc.pid}:\tTesting Sequre MPC divison on {alg_struct} ... \n')
+
+    modulus = elem_1.modulus
+    fp_elem_1 = elem_1.to_fp()
+    fp_elem_2 = elem_2.to_fp()
+    factor = 1000
+    div = fp_elem_1 / factor
+    if mpc.pid != 0:
+        assert_eq_approx("Sequre division 1", mpc.comms.print_fp((div * factor).share, modulus), mpc.comms.print_fp(fp_elem_1.share, modulus))
+        # TODO: #61 Find a way to reuse partitions in truncation
+        # assert_eq_approx("Sequre division partitions", (div * factor).beaver_reveal(mpc), mpc.comms.print_fp(fp_elem.share))
+    
+    div = fp_elem_1 / fp_elem_2
+    res = div * fp_elem_2
+    if mpc.pid != 0:
+        # TODO: #87 Figure out why code commented bellow does not work.
+        # assert_eq_approx("Sequre division 2", (div * fp_elem_2).reveal(mpc), mpc.comms.print_fp(fp_elem_1.share))
+        assert_eq_approx("Sequre division 2", res.reveal(mpc), array(mpc.comms.print_fp(fp_elem_1.share, modulus)))
+    
+
+@sequre
+def test_sequre_comparisons(mpc, vec):
+    alg_struct = "ring" if vec.modulus.popcnt() == 1 else "field"
+    print(f'CP{mpc.pid}:\tTesting Sequre MPC comparisons on {alg_struct} ... \n')
+
+    ones_vector = ones(len(vec), dtype=float)
+    zeros_vector = zeros(len(vec), dtype=float)
+    vec_larger = vec + 1
+    elem = vec[0]
+
+    eq = vec == vec
+    lt = vec < vec_larger
+    gt = vec_larger > vec
+
+    not_eq = vec == vec_larger
+    not_lt = vec_larger < vec
+    not_gt = vec > vec_larger
+
+    not_lt_2 = vec < vec
+    not_gt_2 = vec > vec
+
+    # Equality tests
+    for _ in range(1000):
+        mpc.randomness.switch_seed(-1)
+        rand_elem_1 = (elem.share.to_int().rand(1 << ((NBIT_K + NBIT_F) // 2 - 1)) - elem.share.to_int().rand(1 << ((NBIT_K + NBIT_F) // 2 - 1))).to_float() / (1 << NBIT_F)
+        rand_elem_2 = (elem.share.to_int().rand(1 << ((NBIT_K + NBIT_F) // 2 - 1)) - elem.share.to_int().rand(1 << ((NBIT_K + NBIT_F) // 2 - 1))).to_float() / (1 << NBIT_F)
+        mpc.randomness.restore_seed(-1)
+
+        rand_elem_1_shared = mpc.comms.share_from_trusted_dealer(rand_elem_1.to_fp(elem.modulus), elem.modulus)
+        rand_elem_2_shared = mpc.comms.share_from_trusted_dealer(rand_elem_2.to_fp(elem.modulus), elem.modulus)
+
+        Sharetensor_1 = Sharetensor(rand_elem_1_shared, elem.modulus)
+        Sharetensor_2 = Sharetensor(rand_elem_2_shared, elem.modulus)
+        Sharetensor_1.fp = True
+        Sharetensor_2.fp = True
+
+        is_pos_1 = (Sharetensor_1 - Sharetensor_1) > 0
+        is_pos_2 = (Sharetensor_2 - Sharetensor_2) > 0
+        is_pos_3 = (Sharetensor_1 - Sharetensor_2) > 0
+        
+        eq_1 = Sharetensor_1 == Sharetensor_1
+        eq_2 = Sharetensor_2 == Sharetensor_2
+        eq_3 = Sharetensor_1 == Sharetensor_2
+
+        if mpc.pid != 0:
+            assert_eq(f"{_}: Sequre is gt for elems {rand_elem_1} and {rand_elem_1}", is_pos_1.reveal(mpc), 0.0, True)
+            assert_eq(f"{_}: Sequre is gt for elems {rand_elem_2} and {rand_elem_2}", is_pos_2.reveal(mpc), 0.0, True)
+            assert_eq(
+                f"{_}: Sequre is gt for elems {rand_elem_1} and {rand_elem_2}",
+                is_pos_3.reveal(mpc), 1.0 if rand_elem_1 > rand_elem_2 else 0.0, True)
+            assert_eq(f"{_}: Sequre eq for elems {rand_elem_1} and {rand_elem_1}", eq_1.reveal(mpc), 1.0, True)
+            assert_eq(f"{_}: Sequre eq for elems {rand_elem_2} and {rand_elem_2}", eq_2.reveal(mpc), 1.0, True)
+            assert_eq(
+                f"{_}: Sequre eq for elems {rand_elem_1} and {rand_elem_2}",
+                eq_3.reveal(mpc), 1.0 if rand_elem_1 == rand_elem_2 else 0.0, True)
+
+    if mpc.pid != 0:
+        assert_eq("Sequre eq", eq.reveal(mpc), ones_vector)
+        assert_eq("Sequre lt", lt.reveal(mpc), ones_vector)
+        assert_eq("Sequre get", gt.reveal(mpc), ones_vector)
+        assert_eq("Sequre not eq", not_eq.reveal(mpc), zeros_vector)
+        assert_eq("Sequre not lt", not_lt.reveal(mpc), zeros_vector)
+        assert_eq("Sequre not gt", not_gt.reveal(mpc), zeros_vector)
+        assert_eq("Sequre not lt 2", not_lt_2.reveal(mpc), zeros_vector)
+        assert_eq("Sequre not gt 2", not_gt_2.reveal(mpc), zeros_vector)
+
+
+def test_sharetensor[TP](mpc: MPCEnv[TP], modulus: TP):
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    print(f'CP{mpc.pid}:\tTesting shared tensor on {alg_struct} ... \n')
+
+    a_vec = [
+        double_to_fp(1.5, modulus),
+        double_to_fp(0.5, modulus),
+        double_to_fp(2.5, modulus)]
+    sv_vec = Sharetensor(a_vec, modulus)
+    sv_vec.fp = True
+    sv_vec.set_partitions(mpc.arithmetic.__beaver_partition(sv_vec.share, modulus))
+    
+    sv_elem = Sharetensor(int_t(18350080), modulus)
+    sv_elem.fp = True
+    sv_elem.set_partitions(mpc.arithmetic.__beaver_partition(sv_elem.share, modulus))
+    
+    test_sequre_bitwise_operations(mpc, modulus)
+    test_sequre_basic_arithmetic(mpc, sv_elem)
+    test_sequre_division(mpc, sv_vec * 2, sv_vec)
+    test_sequre_sqrt(mpc, sv_elem)
+    test_sequre_sqrt(mpc, sv_vec)
+    test_sequre_comparisons(mpc, sv_vec)
+    
+    print(f'CP{mpc.pid}:\tShared tensor tests on {alg_struct} passed.\n')
