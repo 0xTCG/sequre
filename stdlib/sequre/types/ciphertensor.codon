@@ -8,7 +8,6 @@ from helpers import argmin
 from sequre.lattiseq.ckks import Ciphertext, Plaintext
 from sequre.utils.utils import one_hot_vector
 from sequre.utils.constants import HE_MUL_COST_ESTIMATE, HE_ROT_COST_ESTIMATE, MHE_MPC_SWITCH_COST_ESTIMATE, C_CONTIG, D_CONTIG
-from sequre.settings import DEBUG
 
 
 class Ciphertensor[ctype]:
@@ -423,6 +422,23 @@ class Ciphertensor[ctype]:
         plain = self.decrypt(mpc, mirrored) if isinstance(ctype, Ciphertext) else self
         return plain.decode(mpc, T=T)
     
+    def filter(self, mask: ndarray[Tuple[int], int]) -> Ciphertensor[ctype]:
+        assert self.ndim > 1, "Ciphertensor: cannot filter 1-dimensional ciphertensor"
+        assert self.shape[0] == mask.shape[0], "Ciphertensor: data and filter size mismatch"
+        
+        new_data = []
+        new_shape = self.shape.copy()
+        new_shape[0] = 0
+        for i, row in enumerate(self):
+            if mask[i]:
+                new_data.extend(row._data)
+                new_shape[0] += 1
+        
+        return Ciphertensor[ctype](
+            _data=new_data,
+            shape=new_shape,
+            slots=self.slots)
+    
     def append(self, other: Ciphertensor[ctype]):
         assert not self._diagonal_contiguous and not other._diagonal_contiguous, "Ciphertensor: appending diagonal-contiguous ciphertensors is not implemented yet"
         assert not self._transposed and not other._transposed, "Ciphertensor: appending transposed ciphertensors is not implemented yet"
@@ -777,23 +793,29 @@ class Ciphertensor[ctype]:
                 _skinny=self._diagonal_contiguous and self.shape[0] < tile_size)
         
         size = self.shape[0]
-        tail = size % tile_size
         cipher_offset = size % self.slots
         tile_offset = self.slots % tile_size
-        if tile_size > self.slots or tail or tile_offset or (cipher_offset and len(self._data) > 1):
-            raise NotImplementedError("(Internal TODO) Ciphertensor: tiled addition reduction case not implemented yet")
+        if size > self.slots or tile_size > self.slots // 2 or ((cipher_offset or tile_offset) and len(self._data) > 1):
+            raise NotImplementedError(
+                f"CP{mpc.pid}: Ciphertensor: tiled addition reduction case not implemented yet:\n"
+                f"\tCipher size: {size}\n"
+                f"\tTile size: {tile_size}\n"
+                f"\tTile size greater than slots: {tile_size > self.slots}\n"
+                f"\tTile offset: {tile_offset}\n"
+                f"\tCipher offset: {cipher_offset}")
         
         cipher = self._data[0].copy()
-
+        
         for i in range(1, len(self._data)):
             mpc.he.crypto_params.evaluator.add(cipher, self._data[i], cipher)
 
         rotation_step = tile_size
         while rotation_step < size:
-            mpc.he.crypto_params.evaluator.add(
-                cipher,
-                mpc.he.crypto_params.evaluator.rotate_new(cipher, rotation_step),
-                cipher)
+            rotated_cipher = mpc.he.crypto_params.evaluator.rotate_new(cipher, rotation_step)
+            if rotation_step > self.slots // 2:
+                mask = mpc.he.enc_vector([(1.0 if i < (self.slots - rotation_step) else 0.0) for i in range(self.slots)], T=Plaintext)
+                mpc.he.imul([rotated_cipher], mask)
+            mpc.he.crypto_params.evaluator.add(cipher, rotated_cipher, cipher)
             rotation_step <<= 1
         
         mask = mpc.he.enc_vector([(1.0 if i < tile_size else 0.0) for i in range(self.slots)], T=Plaintext)
@@ -865,16 +887,14 @@ class Ciphertensor[ctype]:
         if self.ndim < 2:
             return self
         
+        if self._transposed:
+            return self.T
+        
         if isinstance(ctype, Plaintext):
             # TODO: Read dtype from self (add dtype static to Ciphertensor class)
             return Ciphertensor[Plaintext].enc(mpc, self.decode(mpc, dtype=float).T)
         
-        def _mpc_transpose(stensor, _diagonal_contiguous):
-            if _diagonal_contiguous:
-                stensor = stensor.diagonal_contig(antidiagonal=True)
-            return stensor.T
-        
-        return self.via_mpc(mpc, _mpc_transpose, self._diagonal_contiguous)
+        return self.via_mpc(mpc, lambda stensor: stensor.T)
     
     def via_mpc(self, mpc, foo, *args):
         ctensors = mpc.comms.collect(self)
@@ -978,6 +998,12 @@ class Ciphertensor[ctype]:
                  Ciphertensor._get_matmul_v2_cost(self, other),
                  Ciphertensor._get_matmul_v3_cost(self, other))
         
+        m, n = other.shape
+        if not m.popcnt() == n.popcnt() == 1:
+            # TODO: temporary constraint: matmul dimensions need to be power of 2 for v3 matmul for now"
+            from math import inf
+            costs = (*costs[:-1], inf)
+        
         if debug:
             print(f"\nMatmul costs:\n\tM1: {costs[0]}\n\tM2: {costs[1]}\n\tM3: {costs[2]}\n")
                 
@@ -1053,8 +1079,8 @@ class Ciphertensor[ctype]:
         
         return new_ciphertensor
 
-    def _matmul_v3(self, mpc, other: Ciphertensor, debug=True):
-        m, n = self.shape
+    def _matmul_v3(self, mpc, other: Ciphertensor, debug=True) -> Ciphertensor[ctype]:        
+        m, n = other.shape
         assert m.popcnt() == n.popcnt() == 1, "Ciphertensor: temporary constraint --- matmul dimensions need to be power of 2 for now --- this is soon to be fixed"
         
         if self._diagonal_contiguous and other._diagonal_contiguous:

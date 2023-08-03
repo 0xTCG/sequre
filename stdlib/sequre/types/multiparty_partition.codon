@@ -27,6 +27,20 @@ class MPP[S, dtype]:
     _encryption_unified: Ciphertensor[Ciphertext]
     _transposed: bool
 
+    def __init__(self, mpc, local_data: ndarray[S, dtype]):
+        """
+        Note: must be called at all parties (including trusted dealer)
+        """
+        self._ratios = mpc.comms.collect(local_data.shape[0], include_trusted_dealer=True)[1:]
+        _local_data = zeros((self._ratios.sum(), *local_data.shape[1:]), dtype=dtype) if mpc.pid == 0 else local_data
+        
+        self._mpc = mpc
+        self._local_data = _local_data
+        self._encryption_left = Ciphertensor[Ciphertext]()
+        self._encryption_right = Ciphertensor[Ciphertext]()
+        self._encryption_unified = Ciphertensor[Ciphertext]()
+        self._transposed = False
+    
     @staticmethod
     def like[T](other: T, arr: ndarray) -> T:
         if isinstance(T, ndarray):
@@ -48,6 +62,14 @@ class MPP[S, dtype]:
             _encryption_right=self._encryption_right.copy(),
             _encryption_unified=self._encryption_unified.copy(),
             _transposed=self._transposed)
+
+    def set(self, other: MPP[S, dtype]):
+        self._ratios = other._ratios.copy()
+        self._local_data = other._local_data
+        self._encryption_left = other._encryption_left
+        self._encryption_right = other._encryption_right
+        self._encryption_unified = other._encryption_unified
+        self._transposed = other._transposed
     
     @property
     def modulus(self) -> int_t:
@@ -168,6 +190,16 @@ class MPP[S, dtype]:
     def __len__(self):
         return self.cohort_shape[0]
     
+    def __neg__(self) -> MPP[S, dtype]:
+        return MPP(
+            _mpc=self._mpc,
+            _ratios=self._ratios.copy(),
+            _local_data=-self._local_data,
+            _encryption_left=self._encryption_left.neg(self._mpc),
+            _encryption_right=self._encryption_right.neg(self._mpc),
+            _encryption_unified=self._encryption_unified.neg(self._mpc),
+            _transposed=self._transposed)
+    
     def __add__(self, other) -> MPP[S, dtype]:
         self._mpc.stats.secure_add_count += 1
         return self._do_elem_wise_op(other, secure_operator.add)
@@ -186,7 +218,9 @@ class MPP[S, dtype]:
         return self.matmul(other)
     
     def __truediv__(self, other) -> MPP[S, dtype]:
-        raise NotImplementedError("MPPs cannot be divided yet")
+        if isinstance(other, ByVal):
+            return self * (1 / other)
+        raise NotImplementedError("MPPs cannot be divided by secure value yet")
     
     def __gt__(self, other) -> MPP[S, dtype]:
         if isinstance(other, MPP) or isinstance(other, Ciphertensor):
@@ -266,6 +300,67 @@ class MPP[S, dtype]:
             _encryption_unified=self._encryption_unified,
             _transposed=self._transposed)
     
+    def to_fp(self) -> MPP[S, float]:
+        return self.astype(float)
+    
+    def filter(self, mask: ndarray[Tuple[int], int]) -> MPP[S, dtype]:
+        assert self.shape[0] == len(mask), f"MPP: partition and filter mask size mismatch: {self.shape[0]} != {len(mask)}"
+        assert not self._transposed, "Not implemented yet: filtering transposed MPP"
+        
+        mpc = self._mpc
+        _local_data = self._local_data.filter(mask)
+        _ratios = mpc.comms.collect(_local_data.shape[0], include_trusted_dealer=True)[1:]
+
+        return MPP(
+            _mpc=mpc,
+            _ratios=_ratios,
+            _local_data=_local_data)
+    
+    def cohort_filter(self, mask: ndarray[Tuple[int], int]) -> MPP[S, dtype]:
+        if staticlen(S) == 1:
+            compile_error("MPP: cannot filter 1-dimensional MPP")
+        
+        mpc = self._mpc
+
+        adjusted_ratios = self._ratios.zeros()
+        for i, flag in enumerate(mask):
+            adjusted_ratios[self._find_idx_in_ratios(i)] += int(bool(flag))
+        
+        if mpc.pid == 0:
+            return MPP(
+                _mpc=self._mpc,
+                _ratios=adjusted_ratios,
+                _local_data=self._local_data.filter(mask))
+
+        ref_pid = mpc.pid - 1
+        slice_start = self._ratios[:ref_pid].sum()
+        adjusted_mask = mask[slice_start:slice_start + self._ratios[ref_pid]]
+
+        assert self.shape[0] == len(adjusted_mask), f"MPP: partition and filter mask size mismatch: {self.shape[0]} != {len(adjusted_mask)}"
+        assert not self._transposed, "Not implemented yet: filtering transposed MPP"
+        
+        if self.is_empty():
+            return self.copy()
+                
+        if self.is_local():
+            return MPP(
+                _mpc=self._mpc,
+                _ratios=adjusted_ratios,
+                _local_data=self._local_data.filter(adjusted_mask))
+        elif self.is_semi_encrypted():
+            return MPP[S, dtype](
+                _mpc=self._mpc,
+                _ratios=adjusted_ratios,
+                _encryption_left=self._encryption_left.filter(adjusted_mask),
+                _encryption_right=self._encryption_right.filter(adjusted_mask))
+        elif self.is_full_encrypted():
+            return MPP[S, dtype](
+                _mpc=self._mpc,
+                _ratios=adjusted_ratios,
+                _encryption_unified=self._encryption_unified.filter(adjusted_mask))
+        else:
+            raise ValueError("MPP: invalid partition")
+    
     def unify_encryption(self):
         mpc = self._mpc
         if staticlen(S) > 2:
@@ -310,6 +405,86 @@ class MPP[S, dtype]:
         self.unify_encryption()
         return mpc.comms.collect(self._encryption_unified.copy())
     
+    def collect_and_execute_at(self, target_pid: int, op) -> Ciphertensor[Ciphertext]:
+        mpc = self._mpc
+        if mpc.pid == 0:
+            return Ciphertensor[Ciphertext]()
+        
+        self.unify_encryption()
+        enc = self._encryption_unified.copy()
+        partitions = mpc.comms.collect_at(enc, target_pid)
+        if mpc.pid == target_pid:
+            ct = op(partitions, mpc)
+            mpc.comms.send_to_all_from(ct.shape, target_pid)
+            return ct
+        
+        return Ciphertensor[Ciphertext](
+            shape=mpc.comms.receive_as_jar(target_pid, type(enc.shape)),
+            slots=enc.slots,
+            _transposed=enc._transposed,
+            _diagonal_contiguous=enc._diagonal_contiguous,
+            _skinny=enc._skinny)
+    
+    def aggregate(self) -> MPP[S, dtype]:
+        mpc = self._mpc
+
+        if mpc.pid == 0:
+            _local_data = zeros((max(self._ratios), *self.shape[1:]), dtype=dtype)
+            
+            if staticlen(S) == 1:
+                _ratios = self._ratios.copy()
+            elif staticlen(S) == 2:
+                _ratios = MPP.apply_ratios(self._ratios, max(self._ratios))
+            else:
+                compile_error("MPP: invalid shape")
+
+            return MPP[S, dtype](
+                _mpc=mpc,
+                _ratios=_ratios,
+                _local_data=_local_data,
+                _transposed=self._transposed)
+
+        if staticlen(S) == 1:
+            _ratios = self._ratios.copy()
+            self.unify_encryption()
+            _encryption_unified = self._encryption_unified
+        elif staticlen(S) == 2:
+            self_scaled = self * (1 / (mpc.comms.number_of_parties - 1))
+            _encryption_unified=self_scaled.collect().sum(mpc)
+            _ratios = MPP.apply_ratios(self_scaled._ratios, _encryption_unified.shape[0])
+            start = _ratios[:mpc.pid - 1].sum()
+            stop = start + _ratios[mpc.pid - 1]
+            _encryption_unified=_encryption_unified._getitem(mpc, slice(start=start, stop=stop, step=1))
+        else:
+            compile_error("MPP: invalid shape")
+        
+        return MPP[S, dtype](
+            _mpc=mpc,
+            _ratios=_ratios,
+            _encryption_unified=_encryption_unified,
+            _transposed=self._transposed)
+    
+    def aggregate_at(self, target_pid: int) -> MPP[S, dtype]:
+        mpc = self._mpc
+        if mpc.pid == 0:
+            return self.copy()
+        
+        self.unify_encryption()
+        enc = self._encryption_unified.copy()
+        _ratios = [0 if p != target_pid else enc.shape[0] for p in range(1, mpc.comms.number_of_parties)]
+        partitions = mpc.comms.collect_at(enc, target_pid)
+        if mpc.pid == target_pid:
+            return MPP[S, dtype](
+                _mpc=mpc,
+                _ratios=_ratios,
+                _encryption_unified=partitions.sum(mpc),
+                _transposed=self._transposed)
+        
+        return MPP[S, dtype](
+            _mpc=mpc,
+            _ratios=_ratios,
+            _transposed=self._transposed)
+    
     def join(self) -> Ciphertensor[Ciphertext]:
         mpc = self._mpc
         if mpc.pid == 0:
@@ -317,22 +492,7 @@ class MPP[S, dtype]:
         return self.collect().unfence(mpc)
     
     def join_at(self, target_pid: int) -> Ciphertensor[Ciphertext]:
-        mpc = self._mpc
-        if mpc.pid == 0:
-            return Ciphertensor[Ciphertext]()
-        self.unify_encryption()
-        enc = self._encryption_unified.copy()
-        partitions = mpc.comms.collect_at(enc, target_pid)
-        if mpc.pid == target_pid:
-            ct = partitions.unfence(mpc)
-            mpc.comms.send_to_all_from(ct.shape, target_pid)
-            return ct
-        return Ciphertensor[Ciphertext](
-            shape=mpc.comms.receive_as_jar(target_pid, type(enc.shape)),
-            slots=enc.slots,
-            _transposed=enc._transposed,
-            _diagonal_contiguous=enc._diagonal_contiguous,
-            _skinny=enc._skinny)
+        return self.collect_and_execute_at(target_pid, List.unfence)
     
     def align_ratios(self, ratios: List[int]) -> MPP[S, dtype]:
         assert self._ratios.sum() == ratios.sum(), f"MPP: cannot align partitions {self._ratios} to {ratios}"
@@ -375,6 +535,13 @@ class MPP[S, dtype]:
         
         else:
             compile_error("MPP: can only be 1-dimensional and 2-dimensional")
+    
+    def actual_itranspose(self) -> MPP[S, dtype]:
+        self.set(self.to_mpc().T.to_mpp(self._mpc, self._ratios, dtype=dtype))
+        return self
+    
+    def actual_transpose(self) -> MPP[S, dtype]:
+        return self.copy().actual_itranspose()
     
     def dot(self) -> MPP[S, dtype]:
         if staticlen(S) != 2 and staticlen(S) != 1:
@@ -469,6 +636,31 @@ class MPP[S, dtype]:
         else:
             compile_error("MPP: Incompatible shapes for broadcast")
 
+    def zeros[S1](self, shape: S1) -> MPP[S1, dtype]:
+        mpc = self._mpc
+        ref_pid = mpc.pid - 1
+
+        if staticlen(S1) == 1:
+            _local_data = zeros(shape, dtype=dtype) if (mpc.pid == 0 or ref_pid == argmax(self._ratios)) else ndarray[S1, dtype]()
+            return MPP[S1, dtype](
+                _mpc=mpc,
+                _ratios=self._ratios.copy(),
+                _local_data=_local_data)
+        
+        adjusted_ratios = MPP.apply_ratios(self._ratios, shape[0])
+        adjusted_shape = (adjusted_ratios[ref_pid], *shape[1:])
+        
+        if mpc.pid == 0:
+            return MPP[S1, dtype](
+                _mpc=mpc,
+                _ratios=adjusted_ratios,
+                _local_data=zeros(shape, dtype=dtype))
+
+        return MPP[S1, dtype](
+            _mpc=mpc,
+            _ratios=adjusted_ratios,
+            _local_data=zeros(adjusted_shape, dtype=dtype))
+    
     def zeros(self) -> MPP[S, dtype]:
         return MPP[S, dtype](
             _mpc=self._mpc,
@@ -500,10 +692,23 @@ class MPP[S, dtype]:
             _transposed=self._transposed)
     
     @staticmethod
-    def apply_ratios(ratios: List[int], target_size: int):
+    def apply_ratios(ratios: List[int], target_size: int, approximate: bool = True) -> List[int]:
         s = ratios.sum()
-        assert target_size % s == 0, f"MPP: cannot distribute partitions by the given proportion. Target number of rows: {target_size}. Ratios: {ratios}"
-        return ratios * (target_size // s)
+        
+        if not approximate:
+            new_ratios = []
+            for r in ratios:
+                scaled_r = r * target_size
+                assert scaled_r % s == 0, f"MPP: cannot distribute partitions by the given proportion. Target number of rows: {target_size}. Ratios: {ratios}"
+                new_ratios.append(scaled_r // s)
+            return new_ratios
+        
+        new_ratios = [int(r * target_size / s) for r in ratios]
+        offset = target_size - new_ratios.sum()
+        if offset:
+            new_ratios[-1] += offset
+        
+        return new_ratios
 
     def get_matmul_cost(self, other):
         if isinstance(other, ndarray):
@@ -680,7 +885,7 @@ class MPP[S, dtype]:
         if mpc.council(enc._diagonal_contiguous).any():
             joined_sum = mpc.comms.collect(enc).sum(mpc)
             return joined_sum.to_mpc(
-                mpc, modulus=mpc.base_modulus, mirrored=True, S=S, dtype=dtype).diagonal_contig(antidiagonal=True).to_mpp(
+                mpc, modulus=mpc.base_modulus, mirrored=True, S=S, dtype=dtype).to_mpp(
                     mpc, ratios=first._ratios, dtype=dtype)
         
         return mpc.comms.collect_at(enc, mpc.comms.hub_pid).sum(mpc).to_mpp(mpc, first._ratios, source_pid=mpc.comms.hub_pid, S=S, dtype=dtype)
@@ -1484,7 +1689,16 @@ class MPP:
 
 
 @extend
+class Sharetensor:
+    def aggregate(self):
+        return self
+
+
+@extend
 class ndarray:
+    def aggregate(self):
+        return self
+
     def __add__(self, other: MPP[S, T]) -> MPP[S, T]:
         return self._do_elem_wise_op(other, secure_operator.add)
     
@@ -1570,3 +1784,18 @@ class ndarray:
 
     def matmul_cost(self, other: MPP) -> float:
         raise NotImplementedError("ndarray: matmul with MPP")
+
+
+@extend
+class int:
+    def __add__(self, other: MPP) -> MPP:
+        return other + self
+
+    def __sub__(self, other: MPP) -> MPP:
+        return -other + self
+
+    def __mul__(self, other: MPP) -> MPP:
+        return other * self
+
+    def __truediv__(self, other: MPP) -> MPP:
+        raise NotImplementedError("Cannot divide by secure value without IR passes enabled.")
