@@ -63,9 +63,9 @@ public:
   bool checkIsSameTree( BETNode * )    const;
   bool checkIsConsecutiveCommutative() const;
   bool checkIsSecureContainer();
-  bool checkIsCipherTensor();
-  bool checkIsCiphertext();
-  bool checkIsPlaintext();
+  bool checkIsCiphertensor();
+  bool checkIsCipherCiphertensor();
+  bool checkIsPlainCiphertensor();
   
   void swapChildren() { std::swap(leftChild, rightChild); }
   void replace( BETNode * );
