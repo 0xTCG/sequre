@@ -1,7 +1,8 @@
-from numpy.create import zeros
+from numpy.create import zeros, array
 
 from sequre.attributes import sequre
-from sequre.stdlib.lin_alg import orthonormal_basis, eigen_decomp
+from sequre.stdlib.lin_alg import orthonormalize, eigen_decomp
+from sequre.utils.utils import random_ints
 
 
 @sequre
@@ -34,13 +35,13 @@ def pca_random_sketch(mpc, data, miss, data_mean, top_components_count, oversamp
     for i, bc in enumerate(bucket_count): sketch[i] /= bc
     sketch = sketch.filter(bucket_count)
 
-    print(f"Initial sketch obtained at CP{mpc.pid}.")
+    print(f"CP{mpc.pid}:\tPCA Initial sketch obtained.")
     return sketch
 
 
 @sequre
-def pca_powers(mpc, pca_sketch, data, miss, data_mean, data_std_inv, iterations_count):
-    Q = orthonormal_basis(mpc, pca_sketch * data_std_inv)
+def pca_powers_std(mpc, pca_sketch, data, miss, data_mean, data_std_inv, iterations_count):
+    Q = orthonormalize(mpc, pca_sketch * data_std_inv)
     hit = (1 - miss).astype(float)
 
     for pit in range(iterations_count + 1):
@@ -49,54 +50,45 @@ def pca_powers(mpc, pca_sketch, data, miss, data_mean, data_std_inv, iterations_
 
         Q = data.astype(float) @ Q_scaled.T - hit @ Q_scaled_gmean.T
         if pit == iterations_count: break
+        print(f"CP{mpc.pid}:\tPCA power iteration {pit + 1}/{iterations_count} ...")
 
-        ortho_Q = orthonormal_basis(mpc, Q.T)
-        Q = orthonormal_basis(mpc, (ortho_Q @ data.astype(float) - ortho_Q @ hit * data_mean) * data_std_inv)
-        print(f"Iter {pit + 1}. complete at CP{mpc.pid}.")
+        ortho_Q = orthonormalize(mpc, Q.T)
+        Q = orthonormalize(mpc, (ortho_Q @ data.astype(float) - ortho_Q @ hit * data_mean) * data_std_inv)
 
-    print(f"Power iteration complete at CP{mpc.pid}.")
     return Q
 
 
 @sequre
-def random_pca(mpc, data, miss, data_mean, data_std_inv, top_components_count, oversampling_count, power_iterations_count, filtered_data_size):
+def random_pca_std(mpc, data, miss, data_mean, data_std_inv, top_components_count, oversampling_count, power_iterations_count, filtered_data_size):
     pca_sketch = pca_random_sketch(mpc, data, miss, data_mean, top_components_count, oversampling_count)
-    Q = pca_powers(mpc, pca_sketch, data, miss, data_mean, data_std_inv, power_iterations_count)
+    Q = pca_powers_std(mpc, pca_sketch, data, miss, data_mean, data_std_inv, power_iterations_count)
     Z = Q.T / filtered_data_size
     U = eigen_decomp(mpc, Z @ Z.T)[0][:top_components_count, :len(pca_sketch)]
     return U, Z
 
 
-"""
-Temp solution: PCA addapted for multiparty-partition type (MPP).
-Ideally, we want to avoid this and have same, non-secure, code for any secure type.
-"""
-from sequre.types.multiparty_partition import MPP
-from numpy.ndarray import ndarray
-@sequre
-def pca_powers_mpp(mpc, pca_sketch, data, miss, data_mean, data_std_inv, iterations_count):
-    Q = orthonormal_basis(mpc, pca_sketch * data_std_inv)
-    hit = (1 - miss).astype(float)
-
-    for pit in range(iterations_count + 1):
-        Q_scaled = Q * data_std_inv
-        Q_scaled_gmean = Q_scaled * data_mean
-
-        Q = data.astype(float) @ Q_scaled.T - hit @ Q_scaled_gmean.T
-        if pit == iterations_count: break
-
-        ortho_Q = orthonormal_basis(mpc, Q.actual_transpose())
-        Q = orthonormal_basis(mpc, (ortho_Q @ data.astype(float) - ortho_Q @ hit * data_mean) * data_std_inv)
-        print(f"Iter {pit + 1}. complete at CP{mpc.pid}.")
-
-    print(f"Power iteration complete at CP{mpc.pid}.")
-    return Q
+def generate_sketch_matrix(shape):
+    sketch_matrix = array(random_ints(shape, upper_limit=1))
+    return sketch_matrix / sketch_matrix.sum(axis=1).expand_dims(axis=1)
 
 
 @sequre
-def random_pca_mpp(mpc, data: MPP, miss: MPP, data_mean: ndarray, data_std_inv: ndarray, top_components_count: int, oversampling_count: int, power_iterations_count: int, filtered_data_size: int) -> Tuple[MPP, MPP]:
-    pca_sketch = MPP(mpc, pca_random_sketch(mpc, data._local_data, miss._local_data, data_mean, top_components_count, oversampling_count)).aggregate() / 2
-    Q = pca_powers_mpp(mpc, pca_sketch, data, miss, data_mean, data_std_inv, power_iterations_count)
-    Z = (Q / filtered_data_size).T
-    U = eigen_decomp(mpc, (Z @ Z.T).to_mpc())[0][:top_components_count, :len(pca_sketch)].to_mpp(mpc, Z._ratios, dtype=float)
-    return U, Z
+def pca_powers_non_std(mpc, pca_sketch, data, iterations_count):
+    for pit in range(iterations_count):
+        print(f"CP{mpc.pid}:\tPCA power iteration {pit + 1}/{iterations_count} ...")
+        pca_sketch = orthonormalize(mpc, pca_sketch @ data.T) @ data
+    
+    return pca_sketch @ data.T
+
+
+@sequre
+def random_pca_non_std(mpc, data, data_mean, top_components_count, oversampling_count, power_iterations_count):
+    sketch_size = top_components_count + oversampling_count
+    sketch_matrix = generate_sketch_matrix((sketch_size, len(data)))
+    mean_cntr_data = data.astype(float) - data_mean
+    pca_sketch = sketch_matrix @ mean_cntr_data
+    
+    P = pca_powers_non_std(mpc, pca_sketch, mean_cntr_data, power_iterations_count)
+    Z = P @ P.T
+    
+    return Z.via_mpc(lambda stensor: eigen_decomp(mpc, stensor)[0][:top_components_count, :sketch_size])
