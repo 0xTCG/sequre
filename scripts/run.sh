@@ -5,40 +5,40 @@ find  . -name 'sock.*' -exec rm {} \;
 
 if [[ -z "${SEQURE_CODON_PATH}" ]]; then
     echo "Error! SEQURE_CODON_PATH env variable not set" >&2
-    exit 1
+    return
 fi
 
 if [[ -z "${SEQURE_SEQ_PATH}" ]]; then
     echo "Error! SEQURE_SEQ_PATH env variable not set" >&2
-    exit 1
+    return
 fi
 
 if [[ -z "${SEQURE_NUMPY_PATH}" ]]; then
     echo "Error! SEQURE_NUMPY_PATH env variable not set" >&2
-    exit 1
+    return
 fi
 
 if [[ -z "${SEQURE_PATH}" ]]; then
     echo "Error! SEQURE_PATH env variable not set" >&2
-    exit 1
+    return
 fi
 
 if [ ! -d "${SEQURE_CODON_PATH}/install" ]
 then
     echo "Codon not installed at ${SEQURE_CODON_PATH}" >&2
-    exit 1
+    return
 fi
 
 if [ ! -d "${SEQURE_SEQ_PATH}/install" ]
 then
     echo "Seq-lang not installed at ${SEQURE_SEQ_PATH}" >&2
-    exit 1
+    return
 fi
 
 if [ ! -d "${SEQURE_NUMPY_PATH}/build" ]
 then
     echo "Codon-numpy not installed at ${SEQURE_NUMPY_PATH}" >&2
-    exit 1
+    return
 fi
 
 echo "Codon found at $SEQURE_CODON_PATH"
