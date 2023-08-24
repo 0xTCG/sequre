@@ -37,23 +37,23 @@ bool hasCKKSCiphertext( types::Type *t ) {
 }
 
 bool isCKKSPlaintext( types::Type *t ) {
-  return t->getName().rfind(ckksPlaintextTypeName, 0) != std::string::npos;
+  return t->getName().rfind(ckksPlaintextTypeName, 0) == 0;
 }
 
 bool isCKKSCiphertext( types::Type *t ) {
-  return t->getName().rfind(ckksCiphertextTypeName, 0) != std::string::npos;
+  return t->getName().rfind(ckksCiphertextTypeName, 0) == 0;
 }
 
 bool isSharetensor( types::Type *t ) {
-  return t->getName().rfind(sharetensorTypeName, 0) != std::string::npos;
+  return t->getName().rfind(sharetensorTypeName, 0) == 0;
 }
 
 bool isCiphertensor( types::Type *t ) {
-  return t->getName().rfind(cipherTensorTypeName, 0) != std::string::npos;
+  return t->getName().rfind(cipherTensorTypeName, 0) == 0;
 }
 
 bool isMPP( types::Type *t ) {
-  return t->getName().rfind(MPPTypeName, 0) != std::string::npos;
+  return t->getName().rfind(MPPTypeName, 0) == 0;
 }
 
 bool isSecureContainer( types::Type *t ) {
