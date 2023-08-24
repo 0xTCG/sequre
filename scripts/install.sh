@@ -8,7 +8,7 @@ then
     echo "CMake version ok."
 else
     echo "Error! CMake version invalid. Make sure to use CMake version >3.20.0" >&2
-    exit 1
+    return
 fi
 
 if [[ -z "${SEQURE_LLVM_PATH}" ]]; then
@@ -50,7 +50,7 @@ else
         echo "LLVM built."
     else
         echo "Error! LLVM build failed" >&2
-        exit 1
+        return
     fi
 
     cmake --build build
@@ -58,7 +58,7 @@ else
         echo "LLVM installed."
     else
         echo "Error! LLVM installation failed" >&2
-        exit 1
+        return
     fi
 
     cmake --install build
@@ -66,7 +66,7 @@ else
         echo "LLVM exported."
     else
         echo "Error! LLVM export failed" >&2
-        exit 1
+        return
     fi
 fi
 
@@ -89,7 +89,7 @@ else
         echo "Codon built."
     else
         echo "Error! Codon build failed" >&2
-        exit 1
+        return
     fi
 
     cmake --build build --config Release
@@ -97,7 +97,7 @@ else
         echo "Codon installed."
     else
         echo "Error! Codon installation failed" >&2
-        exit 1
+        return
     fi
 
     cmake --install build --prefix="${SEQURE_CODON_PATH}/install"
@@ -105,7 +105,7 @@ else
         echo "Codon exported."
     else
         echo "Error! Codon export failed" >&2
-        exit 1
+        return
     fi
 
 fi
@@ -130,7 +130,7 @@ else
         echo "Seq-lang built."
     else
         echo "Error! Seq-lang build failed" >&2
-        exit 1
+        return
     fi
 
     cmake --build build --config Release
@@ -138,7 +138,7 @@ else
         echo "Seq-lang installed."
     else
         echo "Error! Seq-lang installation failed" >&2
-        exit 1
+        return
     fi
 
     cmake --install build --prefix="${SEQURE_SEQ_PATH}/install"
@@ -146,7 +146,7 @@ else
         echo "Seq-lang exported."
     else
         echo "Error! Seq-lang export failed" >&2
-        exit 1 1
+        return
     fi
 
 fi
@@ -165,7 +165,7 @@ if [ $? -eq 0 ]; then
     echo "Sequre built."
 else
     echo "Error! Sequre build failed" >&2
-    exit 1
+    return
 fi
 
 cmake --build build --config Release
@@ -173,5 +173,5 @@ if [ $? -eq 0 ]; then
     echo "Sequre installed."
 else
     echo "Error! Sequre installation failed" >&2
-    exit 1
+    return
 fi

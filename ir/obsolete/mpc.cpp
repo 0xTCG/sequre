@@ -782,7 +782,7 @@ int getOperator(CallInstr *callInstr) {
   if ( instrName == Module::POW_MAGIC_NAME ) return BET_POW_OP;
   if ( instrName == Module::MATMUL_MAGIC_NAME ) return BET_MATMUL_OP;
   
-  if (instrName.rfind("secure_reveal", 0) != std::string::npos)
+  if (instrName.rfind("secure_reveal", 0) == 0)
     return BET_REVEAL_OP;
   
   return BET_OTHER_OP;

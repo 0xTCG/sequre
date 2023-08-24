@@ -1,102 +1,184 @@
-from numpy.create import zeros
+from numpy.create import zeros, array
 
 from sequre.attributes import sequre
-from sequre.stdlib.lin_alg import orthonormal_basis, eigen_decomp
+from sequre.stdlib.lin_alg import orthonormalize, eigen_decomp
+from sequre.types.internal import Internal
+from sequre.utils.utils import random_ints
 
 
-@sequre
-def pca_random_sketch(mpc, data, miss, data_mean, top_components_count, oversampling_count):
-    kp = top_components_count + oversampling_count
-    sketch = data_mean.zeros((kp, len(data_mean)))
-    sketch_adjustment = data_mean.zeros((kp, len(data_mean)))
-    bucket_count = zeros((kp,), dtype=int)
+class RandomSketching:
+    @sequre
+    def iterative(mpc, data, miss, data_mean, top_components_count, oversampling_count):
+        kp = top_components_count + oversampling_count
+        sketch = data_mean.zeros((kp, len(data_mean)))
+        sketch_adjustment = data_mean.zeros((kp, len(data_mean)))
+        bucket_count = zeros((kp,), dtype=int)
 
-    for data_row, miss_row in zip(data, miss):
-        with mpc.randomness.seed_switch(-1):
-            bucket_index = kp.rand(kp) - 1
-            rand_sign = (kp.rand(2) - 1) * 2 - 1
+        for data_row, miss_row in zip(data, miss):
+            with mpc.randomness.seed_switch(-1):
+                bucket_index = kp.rand(kp) - 1
+                rand_sign = (kp.rand(2) - 1) * 2 - 1
 
-        # Flip miss bits so it points to places where g_mean should be subtracted
-        flip_miss = (1 - miss_row)
-        if rand_sign == -1:
-            flip_miss = -flip_miss
-            sketch[bucket_index] -= data_row
-        else:
-            sketch[bucket_index] += data_row
+            # Flip miss bits so it points to places where g_mean should be subtracted
+            flip_miss = (1 - miss_row)
+            if rand_sign == -1:
+                flip_miss = -flip_miss
+                sketch[bucket_index] -= data_row
+            else:
+                sketch[bucket_index] += data_row
+            
+            sketch_adjustment[bucket_index] += flip_miss * data_mean
+            bucket_count[bucket_index] += 1
+
+        # Subtract the adjustment factor
+        sketch = sketch.to_fp() - sketch_adjustment
+
+        # Get rid of empty buckets and normalize nonempty ones. Loop will be removed after #49 is fixed.
+        for i, bc in enumerate(bucket_count): sketch[i] /= bc
+        sketch = sketch.filter(bucket_count)
+
+        print(f"CP{mpc.pid}:\tPCA Initial sketch obtained.")
+        return sketch
+
+    @sequre
+    def vectorized(mpc, data, sketch_size):
+        sketch_matrix = RandomSketching.generate_sketch_matrix((sketch_size, len(data)))
+        return sketch_matrix @ data
+    
+    def generate_sketch_matrix(shape):
+        sketch_matrix = array(random_ints(shape, upper_limit=1))
+        return sketch_matrix / sketch_matrix.sum(axis=1).expand_dims(axis=1)
+
+
+class PowersStep:
+    @sequre
+    def with_lazy_norm(mpc, pca_sketch, data, miss, data_mean, data_std_inv, iterations_count):
+        Q = orthonormalize(mpc, pca_sketch * data_std_inv)
+        hit = (1 - miss).astype(float)
+
+        for pit in range(iterations_count + 1):
+            Q_scaled = Q * data_std_inv
+            Q_scaled_gmean = Q_scaled * data_mean
+
+            Q = data.astype(float) @ Q_scaled.T - hit @ Q_scaled_gmean.T
+            if pit == iterations_count: break
+            print(f"CP{mpc.pid}:\tPCA powers iteration {pit + 1}/{iterations_count} ...")
+
+            ortho_Q = orthonormalize(mpc, Q.T)
+            Q = orthonormalize(mpc, (ortho_Q @ data.astype(float) - ortho_Q @ hit * data_mean) * data_std_inv)
+
+        return Q
+
+    @sequre
+    def without_norm(mpc, pca_sketch, data, iterations_count):
+        for pit in range(iterations_count):
+            print(f"CP{mpc.pid}:\tPCA powers iteration {pit + 1}/{iterations_count} ...")
+            pca_sketch = orthonormalize(mpc, pca_sketch @ data.T) @ data
         
-        sketch_adjustment[bucket_index] += flip_miss * data_mean
-        bucket_count[bucket_index] += 1
-
-    # Subtract the adjustment factor
-    sketch = sketch.to_fp() - sketch_adjustment
-
-    # Get rid of empty buckets and normalize nonempty ones. Loop will be removed after #49 is fixed.
-    for i, bc in enumerate(bucket_count): sketch[i] /= bc
-    sketch = sketch.filter(bucket_count)
-
-    print(f"Initial sketch obtained at CP{mpc.pid}.")
-    return sketch
+        return pca_sketch @ data.T
 
 
 @sequre
-def pca_powers(mpc, pca_sketch, data, miss, data_mean, data_std_inv, iterations_count):
-    Q = orthonormal_basis(mpc, pca_sketch * data_std_inv)
-    hit = (1 - miss).astype(float)
-
-    for pit in range(iterations_count + 1):
-        Q_scaled = Q * data_std_inv
-        Q_scaled_gmean = Q_scaled * data_mean
-
-        Q = data.astype(float) @ Q_scaled.T - hit @ Q_scaled_gmean.T
-        if pit == iterations_count: break
-
-        ortho_Q = orthonormal_basis(mpc, Q.T)
-        Q = orthonormal_basis(mpc, (ortho_Q @ data.astype(float) - ortho_Q @ hit * data_mean) * data_std_inv)
-        print(f"Iter {pit + 1}. complete at CP{mpc.pid}.")
-
-    print(f"Power iteration complete at CP{mpc.pid}.")
-    return Q
-
-
-@sequre
-def random_pca(mpc, data, miss, data_mean, data_std_inv, top_components_count, oversampling_count, power_iterations_count, filtered_data_size):
-    pca_sketch = pca_random_sketch(mpc, data, miss, data_mean, top_components_count, oversampling_count)
-    Q = pca_powers(mpc, pca_sketch, data, miss, data_mean, data_std_inv, power_iterations_count)
+def random_pca_with_norm(mpc, data, miss, data_mean, data_std_inv, top_components_count, oversampling_count, power_iterations_count, filtered_data_size):
+    pca_sketch = RandomSketching.iterative(mpc, data, miss, data_mean, top_components_count, oversampling_count)
+    Q = PowersStep.with_lazy_norm(mpc, pca_sketch, data, miss, data_mean, data_std_inv, power_iterations_count)
     Z = Q.T / filtered_data_size
     U = eigen_decomp(mpc, Z @ Z.T)[0][:top_components_count, :len(pca_sketch)]
     return U, Z
 
 
-"""
-Temp solution: PCA addapted for multiparty-partition type (MPP).
-Ideally, we want to avoid this and have same, non-secure, code for any secure type.
-"""
-from sequre.types.multiparty_partition import MPP
-from numpy.ndarray import ndarray
 @sequre
-def pca_powers_mpp(mpc, pca_sketch, data, miss, data_mean, data_std_inv, iterations_count):
-    Q = orthonormal_basis(mpc, pca_sketch * data_std_inv)
-    hit = (1 - miss).astype(float)
+def random_pca_without_norm(mpc, data, data_mean, top_components_count, oversampling_count, power_iterations_count):
+    sketch_size = top_components_count + oversampling_count
+    mean_cntr_data = data.astype(float) - data_mean
 
-    for pit in range(iterations_count + 1):
-        Q_scaled = Q * data_std_inv
-        Q_scaled_gmean = Q_scaled * data_mean
-
-        Q = data.astype(float) @ Q_scaled.T - hit @ Q_scaled_gmean.T
-        if pit == iterations_count: break
-
-        ortho_Q = orthonormal_basis(mpc, Q.actual_transpose())
-        Q = orthonormal_basis(mpc, (ortho_Q @ data.astype(float) - ortho_Q @ hit * data_mean) * data_std_inv)
-        print(f"Iter {pit + 1}. complete at CP{mpc.pid}.")
-
-    print(f"Power iteration complete at CP{mpc.pid}.")
-    return Q
+    pca_sketch = RandomSketching.vectorized(mpc, mean_cntr_data, sketch_size)
+    P = PowersStep.without_norm(mpc, pca_sketch, mean_cntr_data, power_iterations_count)
+    Z = P @ P.T
+    
+    return Z.via_mpc(lambda stensor: eigen_decomp(mpc, stensor)[0][:top_components_count, :sketch_size])
 
 
 @sequre
-def random_pca_mpp(mpc, data: MPP, miss: MPP, data_mean: ndarray, data_std_inv: ndarray, top_components_count: int, oversampling_count: int, power_iterations_count: int, filtered_data_size: int) -> Tuple[MPP, MPP]:
-    pca_sketch = MPP(mpc, pca_random_sketch(mpc, data._local_data, miss._local_data, data_mean, top_components_count, oversampling_count)).aggregate() / 2
-    Q = pca_powers_mpp(mpc, pca_sketch, data, miss, data_mean, data_std_inv, power_iterations_count)
-    Z = (Q / filtered_data_size).T
-    U = eigen_decomp(mpc, (Z @ Z.T).to_mpc())[0][:top_components_count, :len(pca_sketch)].to_mpp(mpc, Z._ratios, dtype=float)
-    return U, Z
+def dhh_experimental(mpc, x):
+    """
+    Algorithm 2 from https://arxiv.org/abs/2304.00129
+    """
+    x_dot = x.dot(mpc, axis=0).aggregate(mpc)
+    x_dot_share = x_dot.to_sharetensor(mpc, modulus=mpc.base_modulus, mirrored=True, S=type(()), dtype=float)
+    x_share = x.to_sharetensor(mpc, modulus=mpc.base_modulus, S=Tuple[int], dtype=float)
+    shift_share = Internal.sqrt(mpc, x_dot_share) * ((x_share[0] > 0).astype(int) * 2 - 1)
+    v_share = x_share.copy()
+    v_share[0] += shift_share
+    return (v_share / Internal.sqrt(mpc, (x_dot_share + x_share[0] * shift_share) * 2)).to_ciphertensor(mpc)
+
+
+@sequre
+def dqr_experimental(mpc, v_local):
+    """
+    Algorithm 3 from https://arxiv.org/abs/2304.00129
+    """
+    delta, h = v_local.shape
+    h_local = v_local.copy()
+    
+    for i in range(delta):
+        print(f"CP{mpc.pid}:\tDQR^T forward step {i + 1} ...")
+        v = dhh_experimental(mpc, v_local[0])
+        h_local[i] = v
+        v_prime = (v_local @ v.expand_dims().T).aggregate(mpc)
+        
+        for j in range(delta - i):
+            v_prime_j = v_prime[j]
+            v_prime_j.shape = [h]  # Lazy extend to match shapes downstream
+            v_local[j] -= v * v_prime_j * 2
+        
+        for j in range(delta - i - 1):
+            v_local[j] = v_local[j + i].rotate(mpc, 1)
+    
+    q_local = v_local.I(mpc)
+
+    for i in range(delta - 1, -1, -1):
+        print(f"CP{mpc.pid}:\tDQR^T backward step {i + 1} ...")
+        h_i = h_local[i].rotate(mpc, -i)
+        h_prime = (q_local @ h_i.expand_dims().T).aggregate(mpc)
+        
+        for j in range(delta):
+            h_prime_j = h_prime[j]
+            h_prime_j.shape = [h]  # Lazy extend to match shapes downstream
+            q_local[j] -= h_i * h_prime_j * 2
+    
+    return q_local
+
+
+@sequre
+def random_pca_experimental(mpc, local_data, top_components_count, oversampling_count, power_iterations_count):
+    """
+    Algorithm 1 from https://arxiv.org/abs/2304.00129
+
+    local_data is (A-tilde - o) in the algorithm
+    top_components_count is phi in the algorithm
+    oversampling_count is alpha in the algorithm
+    """
+    from sequre.types.ciphertensor import Ciphertensor
+    from sequre.lattiseq.ckks import Ciphertext
+
+    # Steps 1 and 2 are skipped: local data is mean centered
+    rho = top_components_count + oversampling_count
+    
+    # Step 3:
+    pi_local = RandomSketching.generate_sketch_matrix((rho, len(local_data)))  # rho x n_i
+    p = Ciphertensor[Ciphertext].enc(mpc, pi_local @ local_data).aggregate(mpc)  # rho x m
+
+    # Step 4 (Seq):
+    for _ in range(power_iterations_count):
+        print(f"CP{mpc.pid}:\tPCA powers iteration {_ + 1}/{power_iterations_count} ...")
+        # DQR:
+        r_local = dqr_experimental(mpc, p @ local_data.T)  # rho x n_i
+        p = (r_local @ local_data).aggregate(mpc)  # rho x m
+    
+    # Step 5 (Seq):
+    z_local = p @ local_data.T  # rho x n_i
+    z_cov = (z_local @ z_local.T).aggregate(mpc)  # rho x rho
+    
+    # Step 6
+    return z_cov.via_mpc(mpc, lambda stensor: eigen_decomp(mpc, stensor)[0][:top_components_count, :rho], mirrored=True)

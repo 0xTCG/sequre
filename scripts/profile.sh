@@ -4,12 +4,6 @@ echo "Setting up Sequre ..."
 SEQURE_PATH=$(pwd)
 SEQURE_STDLIB=$SEQURE_PATH/stdlib/sequre
 
-if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    export CP_OPTIONS=-uf
-elif [[ "$OSTYPE" == "darwin"* ]]; then
-    export CP_OPTIONS=-f
-fi
-
 echo "Seq plugin searched at $SEQ_PATH ..."
 echo "Sequre plugin searched at $SEQURE_PATH ..."
 echo "Building $1 ..."
