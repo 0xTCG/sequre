@@ -1,3 +1,5 @@
+// 188 of compressed LOC
+
 package king
 
 import (
