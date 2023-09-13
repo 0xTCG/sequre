@@ -8,12 +8,14 @@ from sequre.settings import DEBUG
 
 class LinReg[T]:
     coef_: T
+    optimizer: str
 
-    def __init__(self, initial_weights: T):
+    def __init__(self, initial_weights: T, optimizer: str = "bgd"):
         self.coef_ = initial_weights.copy()
+        self.optimizer = optimizer
     
     def fit(self, mpc, X: T, Y: T, step: float, epochs: int) -> LinReg[T]:
-        self.coef_ = LinReg._fit(mpc, X, Y, self.coef_, step, epochs)
+        self.coef_ = LinReg._fit(mpc, X, Y, self.coef_, step, epochs, self.optimizer)
         return self
     
     def predict(self, mpc, X: T, error: float = 0.0) -> T:
@@ -28,19 +30,24 @@ class LinReg[T]:
         ref_max = ndarray.max(train.T @ test)
         return max(1 / (1 << 20), 1 / max(cov_max, ref_max))
     
-    def _fit(mpc, X: T, Y: T, initial_w: T, step: float, epochs: int, debug: Static[int] = DEBUG) -> T:
+    def _fit(mpc, X: T, Y: T, initial_w: T, step: float, epochs: int, optimizer: str, debug: Static[int] = DEBUG) -> T:
         # Adding bias
         X_tilde = X.pad_with_value(1, 1, 1, mpc)
 
         # Gradient descent
-        return LinReg._bgd(mpc, X_tilde, Y, initial_w, step, epochs, debug)
+        if optimizer == "bgd":
+            return LinReg._bgd(mpc, X_tilde, Y, initial_w, step, epochs, debug)
+        if optimizer == "mbgd":
+            return LinReg._mbgd(mpc, X_tilde, Y, initial_w, step, epochs, 10, debug)
+        else:
+            raise ValueError(f"LinReg: invalid optimizer passed: {optimizer}")
     
     @sequre
     def _bgd(mpc, X_tilde: T, Y: T, initial_w: T, step: float, epochs: int, debug: Static[int] = DEBUG) -> T:
         if debug:
             print(f"CP{mpc.pid}:\tLin. reg. BGD step size:", step)
         
-        # Pre-computing invariants
+        # Pre-compute invariants
         cov = X_tilde.T @ X_tilde  # n x n
         ref = X_tilde.T @ Y  # n x 1
 
@@ -55,6 +62,43 @@ class LinReg[T]:
                 print(f"CP{mpc.pid}:\tLin. reg. BGD epoch {_ + 1}/{epochs} | weigts avg {ndarray.mean(w.reveal(mpc))} | loss: {LinReg._loss(mpc, X_tilde, Y, w).reveal(mpc)[0, 0]}")
             w += (ref - cov @ w) * step
         
+        return w
+    
+    @sequre
+    def _mbgd(mpc, X_tilde: T, Y: T, initial_w: T, step: float, epochs: int, batches: int, debug: Static[int] = DEBUG) -> T:
+        if debug:
+            print(f"CP{mpc.pid}:\tLin. reg. BGD step size:", step)
+        
+        batch_size = len(X_tilde) // batches
+
+        # Compute mini-batches
+        X_mini_batches = [X_tilde[i * batch_size:(i + 1) * batch_size] for i in range(batches)]
+        Y_mini_batches = [Y[i * batch_size:(i + 1) * batch_size] for i in range(batches)]
+        
+        # Pre-compute invariants
+        covs = []
+        refs = []
+        for i in range(batches):
+            X_mini_batch = X_mini_batches[i]
+            Y_mini_batch = Y_mini_batches[i]
+            
+            cov = X_mini_batch.T @ X_mini_batch
+            ref = X_mini_batch.T @ Y_mini_batch
+            if debug:
+                print(f"CP{mpc.pid}:\tLin. reg. MBGD cov avg {i + 1}/{batches}:", ndarray.mean(cov.reveal(mpc)))
+                print(f"CP{mpc.pid}:\tLin. reg. MBGD ref avg {i + 1}/{batches}:", ndarray.mean(ref.reveal(mpc)))
+            
+            covs.append(cov)
+            refs.append(ref)
+        
+        # Mini-batched gradient descent
+        w = initial_w
+        for _ in range(epochs):
+            for i in range(batches):
+                if debug:
+                    print(f"CP{mpc.pid}:\tLin. reg. MBGD epoch {_ + 1}/{epochs} -- batch {i + 1} | weigts avg {ndarray.mean(w.reveal(mpc))} | loss: {LinReg._loss(mpc, X_mini_batches[i], Y_mini_batches[i], w).reveal(mpc)[0, 0]}")
+                w += (refs[i] - covs[i] @ w) * step
+
         return w
     
     @sequre
