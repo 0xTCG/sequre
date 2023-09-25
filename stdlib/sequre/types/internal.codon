@@ -11,6 +11,7 @@ from sharetensor import Sharetensor
 from ciphertensor import Ciphertensor, ndcipher
 from multiparty_partition import MPP
 from multiparty_aggregate import MPA
+from multiparty_union import MPU
 from utils import double_to_fp
 
 from ..stdlib.fp import fp_div, fp_sqrt
@@ -52,14 +53,19 @@ class Sharetensor:
                     _ratios=new_ratios,
                     _local_data=zeros(shape, dtype=dtype))
 
-            reference_pid = mpc.pid - 1
-            start = new_ratios[:reference_pid].sum()
-            end = start + new_ratios[reference_pid]
-
-            if transpose_encryption: self = self.T
-            encrypted_self = self.to_ciphertensor(mpc)
-            encrypted_partition = encrypted_self._get_rows_raw(slice(start=start, stop=end, step=1))
-            encrypted_partition._transposed = transpose_encryption
+            if transpose_encryption:
+                encrypted_partitions = []
+                for p in range(1, mpc.comms.number_of_parties):
+                    start, end = MPP.get_relative_indices(p, new_ratios)
+                    partition = self[start:end].T
+                    encrypted_partitions.append(partition.to_ciphertensor(mpc))
+                
+                encrypted_partition = encrypted_partitions[mpc.pid - 1]
+                encrypted_partition._transposed = transpose_encryption
+            else:
+                start, end = MPP.get_relative_indices(mpc.pid, new_ratios)
+                encrypted_self = self.to_ciphertensor(mpc)
+                encrypted_partition = encrypted_self._get_rows_raw(slice(start=start, stop=end, step=1))
 
             return MPP[type(shape), dtype](
                 _mpc=mpc,
@@ -89,13 +95,25 @@ class Sharetensor:
         else:
             compile_error("Invalid shape for MPC -> MPP conversion")
     
-    def to_mpa[dtype](self, mpc):
+    def to_mpa[dtype](self, mpc) -> MPA:
         shape = (1,) if isinstance(self.share, ByVal) else _extract_shape(self.share)
         
         if mpc.pid == 0:
             return MPA(mpc, zeros(shape, dtype=dtype))
         
         return MPA[type(shape), dtype](mpc, self.to_ciphertensor(mpc), aggregate=True)
+    
+    def to_mpu[dtype](self, mpc, ratios: list[int] = list[int]()) -> MPU:
+        if ratios:
+            mpp = self.to_mpp(mpc, ratios, dtype=dtype)
+            return MPU[mpp.S, dtype](
+                _mpp=mpp,
+                _mpa=MPA[mpp.S, dtype](mpc))
+        
+        mpa = self.to_mpa(mpc, dtype=dtype)
+        return MPU[mpa.S, dtype](
+            _mpp=MPP[mpa.S, dtype](mpc),
+            _mpa=mpa)
 
 
 @extend
@@ -172,6 +190,7 @@ class MPP:
             stensor = Sharetensor(self._local_data.tolist().to_int_t(self.modulus), self.modulus)
             if isinstance(dtype, float): stensor.fp = True
             return stensor
+        
         return self.join().to_sharetensor(mpc, self.modulus, source_pid=-1, S=S, dtype=dtype)
 
 
@@ -186,6 +205,16 @@ class MPA:
         
         self.aggregate()
         return self._aggregate.to_sharetensor(mpc, self.modulus, source_pid=-2, S=S, dtype=dtype)
+
+
+@extend
+class MPU:
+    def to_sharetensor(self) -> Sharetensor:
+        self.check_valid()
+        
+        if self.is_mpa():
+            return self._mpa.to_sharetensor()
+        return self._mpp.to_sharetensor()
 
 
 class InternalMPC:

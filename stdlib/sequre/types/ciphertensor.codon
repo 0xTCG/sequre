@@ -145,6 +145,12 @@ class Ciphertensor[ctype]:
     def astype(self, t: type) -> Ciphertensor[ctype]:
         # TODO: Add dtype to Ciphertensor
         return self.copy()
+    
+    # Internal typechecker hack
+    @property
+    def _internal_type(self) -> float:
+        # TODO: Add dtype to Ciphertensor
+        return float()
 
     @property
     def actual_shape(self):
@@ -428,9 +434,11 @@ class Ciphertensor[ctype]:
         assert 0 <= self.ndim < 3, "Ciphertensor: only 0-dim, 1-dim and 2-dim ciphertensors can be revealed at the moment"
 
         decoded_vector = mpc.he.decode_vector(self._data, DTP=T)
-        assert (decoded_vector.size() + self.slots - 1) // self.slots == len(self._data) == self.cipher_shape.reduce_mul(), f"Ciphertensor: Input data shapes do not match encryption/encoding shape. Input shape: {decoded_vector.shape}. Enc vector len: {len(self._data)}. Slots: {self.slots}. Cipher shape: {self.cipher_shape}"
-
+        assert (decoded_vector.size() + self.slots - 1) // self.slots == len(self._data) == (self.cipher_shape.reduce_mul() if self.cipher_shape else 0), f"Ciphertensor: Input data shapes do not match encryption/encoding shape. Input shape: {decoded_vector.shape}. Enc vector len: {len(self._data)}. Slots: {self.slots}. Cipher shape: {self.cipher_shape}"
+        
         # TODO: Remove the shapes adjustments after Ciphertensor is reimplemented to have a static shape
+        if decoded_vector.size() == 0:
+            return zeros(Tuple[int, int](0), dtype=T)
         new_shape = self.cipher_shape
         new_shape[-1] *= self.slots
         new_shape_tuple = (new_shape[0], new_shape[1]) if self.ndim == 2 else (1, new_shape[0])
@@ -935,6 +943,15 @@ class Ciphertensor[ctype]:
         else:
             compile_error("Invalid matmul operand type")
 
+    def get_actual(self, mpc) -> Ciphertensor[ctype]:
+        assert self.ndim == 2, "Not implemented yet: getting non 2-dimensional acutal ciphertensor"
+        
+        if isinstance(ctype, Plaintext):
+            # TODO: Read dtype from self (add dtype static to Ciphertensor class)
+            return Ciphertensor[Plaintext].enc(mpc, self.decode(mpc, T=float))
+        
+        return self.via_mpc(mpc, lambda stensor: stensor, S=Tuple[int, int])
+    
     def actual_transpose(self, mpc) -> Ciphertensor[ctype]:
         if self.ndim < 2:
             return self
@@ -944,7 +961,7 @@ class Ciphertensor[ctype]:
         
         if isinstance(ctype, Plaintext):
             # TODO: Read dtype from self (add dtype static to Ciphertensor class)
-            return Ciphertensor[Plaintext].enc(mpc, self.decode(mpc, dtype=float).T)
+            return Ciphertensor[Plaintext].enc(mpc, self.decode(mpc, T=float).T)
         
         return self.via_mpc(mpc, lambda stensor: stensor.T, S=Tuple[int, int])
     
@@ -1309,9 +1326,16 @@ class Ciphertensor[ctype]:
     def _check_other_operand_elem_wise(self, mpc, other):
         enc_mode = D_CONTIG if self._diagonal_contiguous else C_CONTIG
         if isinstance(other, Ciphertensor):
-            assert not (self._transposed ^ other._transposed), "Not implemented yet: elem-wise op on transposed to non-transposed ciphertensor"
             assert not (self._diagonal_contiguous ^ other._diagonal_contiguous), "Not implemented yet: elem-wise op on diagonal-contiguous to non-diagonal-contiguous ciphertensor"
-            pt = other
+            
+            # TODO: Temp and ad-hoc solution for self._transposed ^ other._transposed case.
+            # Check for a better way.
+            # It can be improved at lease for the case where both ciphers are cyclic diagonal.
+            if self._transposed ^ other._transposed:
+                pt = other.get_actual(mpc) if other._transposed else other.actual_transpose(mpc)
+                pt._transposed = self._transposed
+            else:
+                pt = other
         elif isinstance(other, ndarray):
             operand = other.T if self._transposed else other
             pt = Ciphertensor[Plaintext].enc(mpc, operand, mode=enc_mode)
@@ -1339,13 +1363,18 @@ class Ciphertensor[ctype]:
         offset = first.shape[0] % slots
         _data = []
         
-        _data.extend(first._data)
+        _data.extend(first._data.copy())
         if offset == 0:
             _data.extend(other._data)
+        elif other.shape[0] + offset < slots:
+            # TODO: Potential problem if first has non-zero data beyond first.shape[0]
+            rotated_cipher = mpc.he.crypto_params.evaluator.rotate_new(other._data[0], slots - offset)
+            mpc.he.iadd([_data[-1]], [rotated_cipher])
         else:
             rotated_other = other.shift(mpc, slots - offset)
             mask = mpc.he.enc_vector([(1.0 if i < offset else 0.0) for i in range(slots)], T=Plaintext)
             mpc.he.imul([_data[-1]], mask)
+            # TODO: mpc.he.iadd is buggy (possibly due to different scales/levels of the operands)
             mpc.he.iadd([_data[-1]], [rotated_other._data[0]])
             _data.extend(rotated_other._data[1:])
 
@@ -1361,7 +1390,9 @@ class Ciphertensor[ctype]:
         assert self.shape[0] == other.shape[0], "Ciphertensor: shapes missmatch while concatenating along axis 1"
         
         _data = []
-        for self_row, other_row in zip(self, other):
+        for i in range(self.shape[0]):
+            self_row = self._get_rows_raw(i)
+            other_row = other._get_rows_raw(i)
             _data.extend(Ciphertensor._concat_1_dim_raw(mpc, self_row, other_row)._data)
         
         self._data = _data
@@ -1625,7 +1656,7 @@ class ndarray:
     
     def _switch_matmul_by_cost[ctype](self, mpc, other: Ciphertensor[ctype], debug: Static[int]) -> Ciphertensor[ctype]:
         # TODO: Implement cost calculation
-        return self._matmul_via_transposing(mpc, other, lazy=False, debug=debug)
+        return self._matmul_via_transposing(mpc, other, lazy=True, debug=debug)
     
     @staticmethod
     def _get_matmul_v2_cost(first: ndarray, other: Ciphertensor, transposed=False):
