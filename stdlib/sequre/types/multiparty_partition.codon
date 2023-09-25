@@ -29,6 +29,15 @@ class MPP[S, dtype]:
     _encryption_unified: Ciphertensor[Ciphertext]
     _transposed: bool
 
+    def __init__(self, mpc: MPCEnv[int_t]):
+        self._mpc = mpc
+        self._ratios = list[int]()
+        self._local_data = ndarray[S, dtype]()
+        self._encryption_left = Ciphertensor[Ciphertext]()
+        self._encryption_right = Ciphertensor[Ciphertext]()
+        self._encryption_unified = Ciphertensor[Ciphertext]()
+        self._transposed = bool()
+
     def __init__(self, mpc, local_data: ndarray[S, dtype]):
         """
         Note: must be called at all parties (including trusted dealer)
@@ -44,10 +53,7 @@ class MPP[S, dtype]:
         self._transposed = False
     
     def __init__(self, mpc, local_data: ndarray[S, dtype], ratios: List[int]):
-        """
-        Note: must be called at all parties (including trusted dealer)
-        """
-        self._ratios = ratios
+        self._ratios = ratios.copy()
         _local_data = zeros((self._ratios.sum(), *local_data.shape[1:]), dtype=dtype) if mpc.pid == 0 else local_data
         
         self._mpc = mpc
@@ -61,8 +67,22 @@ class MPP[S, dtype]:
         """
         Note: must be called at all parties (including trusted dealer)
         """
+        assert encryption.ndim == 2, "Not implemented yet: ciphertensor should be 2-dimensional if initializing MPP until shape of ciphertensor is made static"
         self._ratios = mpc.comms.collect(encryption.shape[0], include_trusted_dealer=True)[1:]
-        _local_data = zeros((self._ratios.sum(), *encryption.shape[1:]), dtype=dtype) if mpc.pid == 0 else ndarray[S, dtype]()
+        _local_data = zeros((self._ratios.sum(), encryption.shape[1]), dtype=dtype) if mpc.pid == 0 else ndarray[S, dtype]()
+        _encryption_unified = Ciphertensor[Ciphertext]() if mpc.pid == 0 else encryption
+        
+        self._mpc = mpc
+        self._local_data = _local_data
+        self._encryption_left = Ciphertensor[Ciphertext]()
+        self._encryption_right = Ciphertensor[Ciphertext]()
+        self._encryption_unified = _encryption_unified
+        self._transposed = False
+    
+    def __init__(self, mpc, encryption: Ciphertensor[Ciphertext], ratios: List[int]):
+        assert encryption.ndim == 2, "Not implemented yet: ciphertensor should be 2-dimensional if initializing MPP until shape of ciphertensor is made static"
+        self._ratios = ratios.copy()
+        _local_data = zeros((self._ratios.sum(), encryption.shape[1]), dtype=dtype) if mpc.pid == 0 else ndarray[S, dtype]()
         _encryption_unified = Ciphertensor[Ciphertext]() if mpc.pid == 0 else encryption
         
         self._mpc = mpc
@@ -192,10 +212,7 @@ class MPP[S, dtype]:
                 _ratios=self._ratios.copy(),
                 _local_data=id_mat)
         
-        reference_pid = self._mpc.pid - 1
-        start = self._ratios[:reference_pid].sum()
-        end = start + self._ratios[reference_pid]
-        
+        start, end = self.get_relative_indices()
         return MPP[S, dtype](
             _mpc=self._mpc,
             _ratios=self._ratios.copy(),
@@ -227,7 +244,10 @@ class MPP[S, dtype]:
         if self.has_local_data():
             for e in self._local_data: yield e
     
-    def __len__(self):
+    def __bool__(self) -> bool:
+        return bool(self._ratios)
+    
+    def __len__(self) -> int:
         return self.cohort_shape[0]
     
     def __neg__(self) -> MPP[S, dtype]:
@@ -574,7 +594,8 @@ class MPP[S, dtype]:
             if mpc.council(self.is_local()).any():
                 arr = mpc.comms.collect(self._local_data.copy()).unfence()
             else:
-                arr = self.join().reveal(mpc, T=dtype)
+                self.unify_encryption()
+                arr = mpc.comms.collect(self._encryption_unified.reveal(mpc, T=dtype)).unfence()
     
             return arr.T if self._transposed else arr
         
@@ -737,6 +758,19 @@ class MPP[S, dtype]:
             _transposed=self._transposed)
     
     @staticmethod
+    def get_relative_indices(pid: int, ratios: List[int]) -> Tuple[int, int]:
+        ref_pid = pid - 1
+        start = ratios[:ref_pid].sum()
+        stop = start + ratios[ref_pid]
+        return start, stop
+    
+    def get_relative_indices(self) -> Tuple[int, int]:
+        ref_pid = self._mpc.pid - 1
+        start = self._ratios[:ref_pid].sum()
+        stop = start + self._ratios[ref_pid]
+        return start, stop
+    
+    @staticmethod
     def apply_ratios(ratios: List[int], target_size: int, approximate: bool = True) -> List[int]:
         s = ratios.sum()
         
@@ -872,10 +906,8 @@ class MPP[S, dtype]:
         assert first.ndim == other.ndim == 2, f"MPP: Invalid dimensions for matmul. {first.ndim} != {other.ndim}"
 
         if first._transposed:
-            ref_pid = mpc.pid - 1
-            start = first._ratios[:ref_pid].sum()
-            stop = start + first._ratios[ref_pid]
-            return MPP._matmul_case_tnt(mpc, first, MPP(mpc, other[start:stop], first._ratios))
+            start, stop = first.get_relative_indices()
+            return MPP._matmul_case_tnt(mpc, first, MPP[S, dtype](mpc, other[start:stop], first._ratios))
         
         assert first.shape[1] == other.shape[0], f"MPP: Invalid shapes for public matmul. {first.shape} x {other.shape}"
         
@@ -1013,9 +1045,7 @@ class MPP[S, dtype]:
 
         if staticlen(S) == 2:
             if other_data.shape[0] == self._ratios.sum():
-                reference_pid = mpc.pid - 1  # Avoid CP0
-                start = self._ratios[:reference_pid].sum()
-                end = start + self._ratios[reference_pid]
+                start, end = self.get_relative_indices()
                 other_data = other_data[start:end]
             elif not other_data.shape[0] == self.shape[0]:
                 raise ValueError("MPP: shapes missmatch in public elem-wise operation")
@@ -1092,7 +1122,8 @@ class MPP[S, dtype]:
                             _self.unify_encryption()
                             transpose_encryption = _self._encryption_unified._transposed
                         
-                        other_encryption_unified = other_broadcast.to_sharetensor().T.to_mpp(mpc, _self._ratios, transpose_encryption=transpose_encryption, dtype=ac_type)._encryption_unified
+                        other_broadcast_t = other_broadcast.to_sharetensor().T.to_mpp(mpc, _self._ratios, transpose_encryption=transpose_encryption, dtype=ac_type)
+                        other_encryption_unified = other_broadcast_t._encryption_unified
                         
                         if _self.is_local():
                             _encryption_unified = elem_wise_op(mpc, _self._local_data, other_encryption_unified)
@@ -1781,13 +1812,11 @@ class ndarray:
 
         if staticlen(S) == 2:
             if _self.shape[0] == _other._ratios.sum():
-                reference_pid = mpc.pid - 1  # Avoid CP0
-                start = _other._ratios[:reference_pid].sum()
-                end = start + _other._ratios[reference_pid]
+                start, end = _other.get_relative_indices()
                 _self = _self[start:end]
 
                 # Align partitions for the downstream computation
-                padding = max(_other._ratios) - _other._ratios[reference_pid]
+                padding = max(_other._ratios) - _other._ratios[mpc.pid - 1]
                 if padding:
                     _self = _self.pad(padding, axis=0)
             elif not _self.shape[0] == _other.shape[0]:
