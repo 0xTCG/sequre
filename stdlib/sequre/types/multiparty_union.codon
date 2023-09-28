@@ -23,7 +23,17 @@ class MPU[S, dtype]:
             self._mpp = MPP[S, dtype](mpc)
             self._mpa = MPA[S, dtype](mpc, plain)
         else:
-            compile_error("MPU: invalid collective type")
+            compile_error("MPU: invalid collective type. Should be either partition or aggregate.")
+
+    def __init__(self: MPU[S, dtype], mpc, encryption: Ciphertensor[Ciphertext], collective_type: Static[str]):
+        if collective_type == "partition":
+            self._mpp = MPP[S, dtype](mpc, encryption)
+            self._mpa = MPA[S, dtype](mpc)
+        elif collective_type == "aggregate":
+            self._mpp = MPP[S, dtype](mpc)
+            self._mpa = MPA[S, dtype](mpc, encryption)
+        else:
+            compile_error("MPU: invalid collective type. Should be either partition or aggregate.")
 
     def __len__(self) -> int:
         self.check_valid()
@@ -171,6 +181,17 @@ class MPU[S, dtype]:
     
     def check_valid(self):
         assert self.is_valid(), f"MPU: invalid MPU---should contain either MPP or MPA exclusively. MPP found: {self.is_mpp()}. MPA found: {self.is_mpa()}."
+    
+    def encrypt(self) -> MPU[S, dtype]:
+        self.check_valid()
+        
+        if self.is_mpa():
+            if self._mpa.is_plain():
+                self._mpa.encrypt()
+        else:
+            self._mpp.encrypt()
+
+        return self
     
     def reveal(self, *args) -> ndarray[S, dtype]:
         self.check_valid()
@@ -422,11 +443,41 @@ class MPU[S, dtype]:
             _mpa=MPA[S, dtype](mpc))
     
     def _matmul_mpa_mpp(mpc, mpa: MPA[S, dtype], mpp: MPP[S, dtype]) -> MPU[S, dtype]:
+        if mpp._transposed:
+            return MPU[S, dtype](
+                _mpp=MPU._matmul_mpa_mpp_t(mpc, mpa, mpp),
+                _mpa=MPA[S, dtype](mpc))
+        
         return MPU._matmul_mpp_mpa(mpc, mpp.T, mpa.T).T
     
     @sequre
+    def _matmul_mpa_mpp_t(mpc, mpa: MPA[S, dtype], mpp: MPP[S, dtype]) -> MPP[S, dtype]:
+        assert mpp._transposed, "MPU: MPP expected to be tranposed in transposed x MPA matmul case"
+        
+        if mpc.pid == 0:
+            return MPP[S, dtype](
+                _mpc=mpp._mpc,
+                _ratios=mpp._ratios.copy(),
+                _local_data=zeros((mpp._local_data.shape[0], mpa.shape[0]), dtype=dtype),
+                _transposed=True)
+        
+        mpa.aggregate()
+        _encryption = Ciphertensor[Ciphertext]()
+        with mpp.partition_aligner() as aligner:
+            if not mpp.is_empty():
+                if mpp.is_local():
+                    _encryption = mpa._aggregate @ mpp._local_data.T
+                else:
+                    mpp.unify_encryption()
+                    _encryption = mpa._aggregate @ mpp._encryption_unified.T
+            
+            _encryption._transposed ^= True
+            return aligner.new_mpp(
+                _encryption_unified=_encryption)
+    
+    @sequre
     def _matmul_mpp_t_mpa(mpc, mpp: MPP[S, dtype], mpa: MPA[S, dtype]) -> MPA[S, dtype]:
-        assert mpp._transposed, "MPP: MPP expected to be tranposed in transposed x MPA matmul case"
+        assert mpp._transposed, "MPU: MPP expected to be tranposed in transposed x MPA matmul case"
         
         if mpc.pid == 0:
             return MPA[S, dtype](mpc, zeros((mpp._local_data.shape[1], mpa._plain.shape[1]), dtype=dtype))
@@ -450,7 +501,7 @@ class MPU[S, dtype]:
     
     @sequre
     def _matmul_mpp_nt_mpa(mpc, mpp: MPP[S, dtype], mpa: MPA[S, dtype]) -> MPP[S, dtype]:
-        assert not mpp._transposed, "MPP: MPP expected not to be tranposed in transposed x MPA matmul case"
+        assert not mpp._transposed, "MPU: MPP expected not to be tranposed in transposed x MPA matmul case"
         
         if mpc.pid == 0:
             return MPP[S, dtype](
@@ -479,13 +530,13 @@ class MPU[S, dtype]:
                 _mpc=first._mpc,
                 _plain=zeros((first._local_data.shape[1], other._local_data.shape[1]), dtype=dtype))
 
-        assert not (first.is_empty() ^ other.is_empty()), "MPP: all or none of the partitions should be empty"
+        assert not (first.is_empty() ^ other.is_empty()), "MPU: all or none of the partitions should be empty"
 
         plain = ndarray[S, dtype]()
         enc = Ciphertensor[Ciphertext]()
         
         with first.partition_aligner(), other.partition_aligner():
-            assert first.shape[1] == other.shape[0], f"MPP: Invalid shapes for per-partition matmul. {first.shape} x {other.shape}"
+            assert first.shape[1] == other.shape[0], f"MPU: Invalid shapes for per-partition matmul. {first.shape} x {other.shape}"
 
             if not first.is_empty():
                 if not first.is_local():
@@ -506,6 +557,25 @@ class MPU[S, dtype]:
             _mpc=first._mpc,
             _plain=plain,
             _encryption=enc)
+    
+    # Temporaty helpers
+    def slice_local(self, i: int) -> MPU[S, dtype]:
+        self.check_valid()
+        if self.is_mpa():
+            raise NotImplementedError()
+        
+        return MPU[S, dtype](
+            _mpp=self._mpp.slice_local(i),
+            _mpa=MPA[S, dtype](self._mpp._mpc))
+    
+    def rotate_local(self, i: int) -> MPU[S, dtype]:
+        self.check_valid()
+        if self.is_mpa():
+            raise NotImplementedError()
+        
+        return MPU[S, dtype](
+            _mpp=self._mpp.rotate_local(i),
+            _mpa=MPA[S, dtype](self._mpp._mpc))
 
 
 @extend

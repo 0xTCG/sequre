@@ -448,7 +448,10 @@ class Ciphertensor[ctype]:
         arr = arr.diagonal_contig(antidiagonal=True) if self._diagonal_contiguous else arr
         return arr.T if self._transposed else arr
     
-    def reveal[T](self, mpc, source_pid: int = -2) -> ndarray:
+    def reveal[T](self, mpc, source_pid: int = -2) -> ndarray[Tuple[int, int], T]:
+        if not bool(self):
+            return ndarray[Tuple[int, int], T]()
+        
         plain = self.decrypt(mpc, source_pid) if isinstance(ctype, Ciphertext) else self
         return plain.decode(mpc, T=T)
     
@@ -560,11 +563,15 @@ class Ciphertensor[ctype]:
                 slots=self.slots)
     
     def expand_dims(self, axis=0) -> Ciphertensor[ctype]:
-        assert self.ndim == 1 and axis == 0, "Not implemented yet: expanding ciphertensor over secondary axes"
-        assert not self._transposed and not self._diagonal_contiguous, "Not implemented yet: expanding transposed or diag-contig ciphertensor"
+        assert not self._diagonal_contiguous, "Not implemented yet: expanding transposed or diag-contig ciphertensor"
+        
+        if self._transposed:
+            axis ^= 1
+
         new_ctensor = self.copy()
         new_ctensor.shape.insert(axis, 1)
         new_ctensor._reset_chunk_size()
+        
         return new_ctensor
 
     def ineg(self, mpc) -> Ciphertensor[Ciphertext]:
@@ -804,13 +811,15 @@ class Ciphertensor[ctype]:
         if isinstance(ctype, Plaintext):
             # TODO: Read dtype (T) from other (add dtype static to Ciphertensor class)
             _sum: float = self.decode(mpc, T=float).sum()
-            return Ciphertensor[Plaintext].enc(mpc, [_sum for _ in range(self.shape[-1])])
-
-        assert not self._transposed, "Ciphertensor: addition reduction of transposed ciphertensor is not implemented yet"
-        return Ciphertensor[ctype](
-            _data=mpc.he.reduce_add(self._data, self.shape[-1]),
-            shape=[self.shape[-1]],
-            slots=self.slots)
+            cipher = Ciphertensor[Plaintext].enc(mpc, [_sum for _ in range(self.shape[-1])])
+        else:
+            cipher = Ciphertensor[ctype](
+                _data=mpc.he.reduce_add(self._data, self.shape[-1]),
+                shape=[self.shape[-1]],
+                slots=self.slots)
+        
+        cipher._transposed = self._transposed
+        return cipher
 
     def reduce_add_tiled(self, mpc, tile_size: int) -> Ciphertensor[ctype]:
         assert mpc.pid, "Not implemented yet: reduce_add_tiled at CP0"
@@ -944,7 +953,7 @@ class Ciphertensor[ctype]:
             compile_error("Invalid matmul operand type")
 
     def get_actual(self, mpc) -> Ciphertensor[ctype]:
-        assert self.ndim == 2, "Not implemented yet: getting non 2-dimensional acutal ciphertensor"
+        assert self.ndim == 2, "Not implemented yet: getting non 2-dimensional actual ciphertensor"
         
         if isinstance(ctype, Plaintext):
             # TODO: Read dtype from self (add dtype static to Ciphertensor class)
@@ -1074,7 +1083,7 @@ class Ciphertensor[ctype]:
                      ndarray._get_matmul_v2_cost(other, self, transposed=True))
             
             if debug:
-                print(f"\nCP{mpc.pid}:\tMatmul costs for transposed case:\n\tM1: {costs[0]}\n\tM2: {costs[1]}\n")
+                print(f"\nCP{mpc.pid}:\tMatmul costs for transposed case:\n\tTNT: {costs[0]}\n\tM2: {costs[1]}\n")
             
             match argmin(costs):
                 case 0:
@@ -1400,8 +1409,16 @@ class Ciphertensor[ctype]:
     def _getitem(self, mpc, indices) -> Ciphertensor[ctype]:
         if isinstance(indices, tuple) or self.ndim > 1:
             tuple_indices, _ = self._coerce_tuple_indices(indices)
-            row_idx = indices[0] if isinstance(indices, tuple) else indices
-            pack_dim = True if isinstance(row_idx, int) else False
+            
+            pack_dim = False
+            if isinstance(indices, int):
+                pack_dim = True
+            elif isinstance(indices, tuple):
+                if isinstance(indices[0], int):
+                    pack_dim = not self._transposed
+                elif isinstance(indices[1], int):
+                    pack_dim = self._transposed
+            
             return self._get_slices_raw(mpc, tuple_indices, pack_dim)
         
         assert self.ndim == 1, f"Ciphertensor: invalid indices for 1-dimensional getitem: {indices}"
@@ -1412,7 +1429,7 @@ class Ciphertensor[ctype]:
         start, stop = self._adjust_col_indices(indices)
         
         if stop - start == 0:
-            return Ciphertensor[ctype](slots=self.slots)
+            return Ciphertensor[ctype](slots=self.slots, _transposed=self._transposed)
         if start == 0 and stop == self.shape[-1]:
             return self
         
@@ -1436,7 +1453,8 @@ class Ciphertensor[ctype]:
         return Ciphertensor[ctype](
             _data=_data,
             shape=[stop - start],
-            slots=self.slots)
+            slots=self.slots,
+            _transposed=self._transposed)
     
     def _get_rows_raw(self, indices) -> Ciphertensor[ctype]:
         assert self.ndim > 1, "Ciphertensor: cannot get rows from one-dimensional ciphertensor"
@@ -1465,9 +1483,7 @@ class Ciphertensor[ctype]:
         if new_ciphertensor.ndim > 1 and new_ciphertensor.shape[0] == 1 and pack_dim:
             new_ciphertensor.shape = new_ciphertensor.shape[1:]
         
-        if new_ciphertensor.ndim > 1:
-            new_ciphertensor._transposed = self._transposed
-        
+        new_ciphertensor._transposed = self._transposed
         return new_ciphertensor
 
     def _setitem(self, mpc, indices, value: Ciphertensor[ctype]):
