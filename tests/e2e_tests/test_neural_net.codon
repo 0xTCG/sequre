@@ -1,0 +1,83 @@
+from numpy.create import array, zeros_like
+
+from ..utils import assert_eq, assert_eq_approx
+
+from sequre.types.sharetensor import Sharetensor
+from sequre.types.multiparty_union import MPU
+from sequre.utils.utils import random_floats, random_ints
+from sequre.mpc.env import MPCEnv
+from sequre.stdlib.learn.neural_net.model import Sequential
+from sequre.stdlib.learn.neural_net.layers import Input, Dense
+
+
+def test_neural_net[TP](mpc: MPCEnv[TP], modulus: TP):
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    print(f'CP{mpc.pid}:\tTesting Sequre neural net on {alg_struct} ... \n')
+
+    input_size = 16
+    output_size = 1
+    n_neurons = 32
+    step_size = 0.001
+    epochs = 2
+    
+    rows_per_party = 4
+    rows = (mpc.comms.number_of_parties - 1) * rows_per_party
+    cols = input_size
+    with mpc.randomness.seed_switch(-1):
+        X = array(random_floats((rows, cols), scale=1.0))
+        y = (array(random_ints((rows, output_size), upper_limit=1)) * 2 - 1).astype(float)
+
+    mpc_X = Sharetensor.enc(mpc, X, 0, modulus)
+    mpc_y = Sharetensor.enc(mpc, y, 0, modulus)
+    
+    partition_X = zeros_like(X) if mpc.pid == 0 else X[(mpc.pid - 1) * rows_per_party:mpc.pid * rows_per_party]
+    partition_y = zeros_like(y) if mpc.pid == 0 else y[(mpc.pid - 1) * rows_per_party:mpc.pid * rows_per_party]
+    
+    mpu_X = MPU(mpc, partition_X, "partition")
+    mpu_y = MPU(mpc, partition_y, "partition")
+
+    mpc.comms.sequential(lambda: print(f"CP{mpc.pid}:\tNeural net train data for debugging on {alg_struct}:", X), False)
+    if mpc.pid > 0:
+        assert_eq_approx(f"CP{mpc.pid}:\tSafe-checking neural net data loading (MPC) on {alg_struct}", mpc_X.reveal(mpc), X)
+        assert_eq_approx(f"CP{mpc.pid}:\tSafe-checking neural net data loading (MPU) on {alg_struct}", mpu_X.reveal(mpc), X)
+    
+    raw_layers = (
+        Input[type(X)](input_size),
+        Dense[type(X)]("relu", n_neurons),
+        Dense[type(X)]("linear", output_size))
+    mpc.randomness.reset_seed(-1, hash('global'))
+    with mpc.randomness.seed_switch(-1):
+        raw_model = Sequential(raw_layers).compile(mpc, loss="hinge", optimizer="bgd")
+    raw_model.fit(mpc, X=X, y=y, step=step_size, epochs=epochs)
+    raw_w = raw_model.layers[1].weights
+
+    mpc_layers = (
+        Input[type(mpc_X)](input_size),
+        Dense[type(mpc_X)]("relu", n_neurons),
+        Dense[type(mpc_X)]("linear", output_size))
+    mpc.randomness.reset_seed(-1, hash('global'))
+    with mpc.randomness.seed_switch(-1):
+        mpc_model = Sequential(mpc_layers).compile(mpc, loss="hinge", optimizer="bgd", modulus=modulus)
+    mpc_model.fit(mpc, X=mpc_X, y=mpc_y, step=step_size, epochs=epochs)
+    mpc_w = mpc_model.layers[1].weights
+
+    if mpc.pid == 0:
+        assert_eq(f"CP{mpc.pid}:\tSafe-checking neural net result shape (MPC) on {alg_struct}", mpc_w.shape, list(raw_w.shape))
+    else:
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre neural net (MPC) on {alg_struct}", mpc_w.reveal(mpc), raw_w)
+    
+    mpu_layers = (
+        Input[type(mpu_X)](input_size),
+        Dense[type(mpu_X)]("relu", n_neurons),
+        Dense[type(mpu_X)]("linear", output_size))
+    mpu_model = Sequential(mpu_layers).compile(mpc, loss="hinge", optimizer="bgd")
+    mpu_model.fit(mpc, X=mpu_X, y=mpu_y, step=step_size, epochs=epochs)
+    mpu_w = mpu_model.layers[1].weights
+
+    if mpc.pid == 0:
+        assert_eq(f"CP{mpc.pid}:\tSafe-checking neural net result shape (MPU) on {alg_struct}", mpu_w.shape, raw_w.shape)
+    else:
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre neural net (MPU) on {alg_struct}", mpu_w.reveal(mpc), raw_w)
+
+    print(f'CP{mpc.pid}:\tSequre neural net on {alg_struct} tests passed.\n')
+    

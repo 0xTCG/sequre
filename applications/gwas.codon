@@ -7,7 +7,7 @@ from sequre.types.sharetensor import Sharetensor
 from sequre.types.internal import Internal as sq
 from sequre.stdlib.lin_alg import orthonormalize
 
-from sequre.stdlib.learn.pca import random_pca_with_norm
+from sequre.stdlib.learn.pca import random_pca_with_norm, random_pca_experimental, dqr_experimental
 from utils.param import *
 from utils.data_sharing import shares_paths
 
@@ -220,18 +220,21 @@ def population_stratification_analysis(mpc, top_components, oversampling_count, 
 
 @sequre
 def cochran_armitage(mpc, V, pheno, dosage):
-    p_hat = pheno.expand_dims().to_fp() - pheno.expand_dims() @ V.T @ V
-    sp = p_hat.T.sum()[0]
-    sx = ((1 - V.T.sum().expand_dims() @ V) @ dosage)[0]
-    spp = sq.dot(mpc, p_hat[0])
-    sxp = (p_hat @ dosage)[0]
-    sxx = (dosage * dosage).sum().to_fp() - sq.dot(mpc, V @ dosage)
+    pheno_int = pheno.expand_dims()
+    pheno_float = pheno_int.to_fp()
+    dosage_float = dosage.astype(float)
+    p_hat = pheno_float - pheno_int @ V.T @ V
+    sp = p_hat.sum(axis=1)[0]
+    sx = ((1 - V.T.sum(axis=0).expand_dims() @ V) @ dosage_float)[0]
+    spp = sq.dot(mpc, p_hat[0], axis=0)
+    sxp = (p_hat @ dosage_float)[0]
+    sxx = (dosage * dosage).sum(axis=0).to_fp() - sq.dot(mpc, V @ dosage_float, axis=0)
     norm_sp = sp / len(pheno)
     numer = sxp - sx * norm_sp
     denom = (sxx - sx * sx / len(pheno)) * (spp - sp * norm_sp)
     assoc = numer / sq.sqrt(mpc, denom)
 
-    print(f"Computed associations at CP{mpc.pid}.")
+    print(f"CP{mpc.pid}:\tComputed GWAS associations.")
     return assoc
 
 
@@ -253,3 +256,73 @@ def gwas_protocol(mpc, test_run, modulus):
             snp_pos, cov, g_mean, g_std_bern_inv, ikeep, gwas_snp_keep_mask, miss, dosage)
     
     return cochran_armitage(mpc, components, pheno, dosage.filter(ikeep).T.filter(gwas_snp_keep_mask).T)
+
+
+@sequre
+def sf_psa_experimental(mpc, geno, cov, top_components, oversampling_count, power_iterations, cp_1_size):
+    U = random_pca_experimental(
+        mpc, geno, top_components,
+        oversampling_count, power_iterations, cp_1_size)
+    
+    print(f"Selected {top_components} eigenvectors at CP{mpc.pid}.")
+    return dqr_experimental(mpc, U.extend(cov.T.to_fp()), cp_1_size)
+
+
+def sf_gwas_experimental(mpc, test_run, modulus):
+    (f_pheno, f_cov, f_geno, f_miss,
+     f_geno_mask, f_miss_mask) = open_input_files(mpc, test_run)
+    snp_pos, pheno, cov = load_phenotypes_and_covariates(mpc, f_pheno, f_cov, test_run, modulus)
+    g, miss, dosage = load_dosage(
+        mpc, f_geno, f_geno_mask, f_miss, f_miss_mask,
+        [int_t(1) for _ in range(NUM_INDS)],
+        [int_t(1) for _ in range(NUM_SNPS)],
+        NUM_INDS, NUM_SNPS, modulus)
+
+    (snp_pos, pheno, cov, g_mean, g_std_bern_inv,
+    ikeep, gwas_snp_keep_mask) = quality_control(
+        mpc, NUM_INDS, NUM_SNPS, snp_pos, pheno, cov, g, miss, dosage)
+    
+    indv_per_party = 8
+    cov_count = 2
+    snps_count = 8192
+    top_components_count = 2
+    oversampling_count = 2
+    power_iterations_count = 1
+    
+    # Revealing for testing
+    raw_geno = dosage.reveal(mpc) - g_mean.reveal(mpc)
+    raw_geno = raw_geno.patch_copy(snps_count)
+    # raw_geno = raw_geno.filter(ikeep).T.filter(gwas_snp_keep_mask).T
+    raw_cov = cov.reveal(mpc)
+    raw_pheno = pheno.reveal(mpc)
+    assert raw_pheno.ndim == 1
+    assert raw_cov.ndim == 2
+    assert raw_geno.ndim == 2
+
+    from numpy.create import zeros
+    from sequre.types.multiparty_union import MPU
+    
+    def _get_partition(mpc, data, indv_per_party, snps_count):
+        dealer_data = zeros(((mpc.comms.number_of_parties - 1) * indv_per_party, snps_count))
+        return data[(mpc.pid - 1) * indv_per_party: mpc.pid * indv_per_party, :snps_count] if mpc.pid else dealer_data
+
+    def _get_partition_1_dim(mpc, data, indv_per_party):
+        dealer_data = zeros(((mpc.comms.number_of_parties - 1) * indv_per_party,))
+        return data[(mpc.pid - 1) * indv_per_party: mpc.pid * indv_per_party] if mpc.pid else dealer_data
+    
+    partition_geno = _get_partition(mpc, raw_geno, indv_per_party, snps_count)
+    partition_cov = _get_partition(mpc, raw_cov, indv_per_party, cov_count)
+    partition_pheno = _get_partition_1_dim(mpc, raw_pheno, indv_per_party)
+    
+    mpu_geno = MPU(mpc, partition_geno, "partition")
+    mpu_cov = MPU(mpc, partition_cov, "partition")
+    mpu_pheno = MPU(mpc, partition_pheno, "partition").T
+
+    import time
+    s = time.time()
+    mpu_components = sf_psa_experimental(mpc, mpu_geno, mpu_cov, top_components_count, oversampling_count, power_iterations_count, indv_per_party)
+    ca = cochran_armitage(mpc, mpu_components, mpu_pheno, mpu_geno)
+    e = time.time()
+    print(f"CP{mpc.pid}:\tTemp counter: GWAS PSA and CA done in {e - s}s")
+
+    return ca

@@ -20,6 +20,9 @@ bool isCKKSCiphertext( types::Type * );
 bool isSharetensor( types::Type * );
 bool isCiphertensor( types::Type * );
 bool isMPP( types::Type * );
+bool isMPA( types::Type * );
+bool isMPU( types::Type * );
+bool isMP( types::Type * );
 bool isSecureContainer( types::Type * );
 bool isMPC( Value * );
 
