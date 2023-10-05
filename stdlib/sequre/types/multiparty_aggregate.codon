@@ -1,0 +1,632 @@
+import secure_operator
+
+from numpy.ndarray import ndarray
+from numpy.create import array, zeros, zeros_like, ones
+
+from sequre.attributes import sequre
+from sequre.mpc.env import MPCEnv
+from sequre.lattiseq.ckks import Ciphertext
+from sequre.types.builtin import int_t
+from sequre.types.ciphertensor import Ciphertensor
+
+
+# Multiparty aggregate
+class MPA[S, dtype]:
+    _mpc: MPCEnv[int_t]
+    _plain: ndarray[S, dtype]
+    _encryption: Ciphertensor[Ciphertext]
+    _aggregate: Ciphertensor[Ciphertext]
+
+    def __init__(self: MPA[S, dtype], mpc: MPCEnv[int_t]):
+        self._mpc = mpc
+        self._plain = ndarray[S, dtype]()
+        self._encryption = Ciphertensor[Ciphertext]()
+        self._aggregate = Ciphertensor[Ciphertext]()
+    
+    def __init__(self: MPA[S, dtype], mpc: MPCEnv[int_t], plain: ndarray[S, dtype]):
+        self._mpc = mpc
+        self._plain = plain if mpc.pid else zeros_like(plain)
+        self._encryption = Ciphertensor[Ciphertext]()
+        self._aggregate = Ciphertensor[Ciphertext]()
+    
+    def __init__(self: MPA[S, dtype], mpc: MPCEnv[int_t], encryption: Ciphertensor[Ciphertext], aggregate: bool = False):
+        assert mpc.pid, "MPA: encrypted MPA should be separatelly initialized at CP0 for now"
+        self._mpc = mpc
+        self._plain = ndarray[S, dtype]()
+        self._encryption = Ciphertensor[Ciphertext]() if aggregate else encryption
+        self._aggregate = encryption if aggregate else Ciphertensor[Ciphertext]()
+    
+    def __len__(self) -> int:
+        return self.shape[0]
+    
+    def __getitem__(self, index) -> MPA:
+        adj_index = self._adjust_indices(index)
+        
+        if isinstance(type(self._plain[adj_index]), ByVal):
+            _plain = ndarray[Tuple[int], dtype]()
+        else:
+            _plain = type(self._plain[adj_index])()
+    
+        if self.has_plain():
+            _plain_val = self._plain[adj_index]
+            _plain = array([_plain_val]) if isinstance(_plain_val, ByVal) else _plain_val
+
+        mpc = self._mpc
+        if mpc.pid == 0:
+            return MPA[_plain.S, dtype](mpc, _plain)
+        
+        return MPA[_plain.S, dtype](
+            _mpc=self._mpc,
+            _plain=_plain,
+            _encryption=self._encryption._getitem(mpc, adj_index) if self.has_encryption() else Ciphertensor[Ciphertext](),
+            _aggregate=self._aggregate._getitem(mpc, adj_index) if self.has_aggregate() else Ciphertensor[Ciphertext]())
+
+    def __setitem__(self, index, other: MPA):
+        mpc = self._mpc
+        if mpc.pid == 0:
+            return
+        
+        adj_index = self._adjust_indices(index)
+        
+        if other.has_plain():
+            assert self.has_plain(), "MPA: cannot set MPA with plain value into MPA without plain value"
+            self._plain[adj_index] = other._plain
+        
+        if other.has_encryption():
+            assert self.has_encryption(), "MPA: cannot set MPA with encryption into MPA without encryption"
+            self._encryption._setitem(mpc, adj_index, other._encryption)
+        
+        if other.has_aggregate():
+            assert self.has_aggregate(), "MPA: cannot set MPA with aggregate into MPA without aggregate"
+            self._aggregate._setitem(mpc, adj_index, other._aggregate)
+    
+    def __gt__(self, other) -> MPA[S, dtype]:
+        if isinstance(other, MPA) or isinstance(other, Ciphertensor):
+            compile_error("Not implemented yet: Comparison between MPAs and Ciphertensors")
+        
+        return self.via_mpc(lambda stensor: secure_operator.gt(self._mpc, stensor, other))
+
+    def __lt__(self, other) -> MPA[S, dtype]:
+        if isinstance(other, MPA) or isinstance(other, Ciphertensor):
+            compile_error("Not implemented yet: Comparison between MPAs and Ciphertensors")
+
+        return self.via_mpc(lambda stensor: secure_operator.lt(self._mpc, stensor, other))
+
+    def __bool__(self) -> bool:
+        return not self.is_empty()
+    
+    def __neg__(self) -> MPA[S, dtype]:
+        return MPA[S, dtype](
+            _mpc=self._mpc,
+            _plain=-self._plain,
+            _encryption=self._encryption.neg(self._mpc),
+            _aggregate=self._aggregate.neg(self._mpc))
+    
+    def __add__(self, other):
+        _self, _other = self._check_binary_operands(other)
+        return MPA[S, _self.dtype]._add(self._mpc, _self, _other)
+    
+    def __sub__(self, other):
+        _self, _other = self._check_binary_operands(other)
+        return MPA[S, _self.dtype]._sub(self._mpc, _self, _other)
+    
+    def __mul__(self, other):
+        _self, _other = self._check_binary_operands(other)
+        return MPA[S, _self.dtype]._mul(self._mpc, _self, _other)
+    
+    def __matmul__(self, other):
+        _self, _other = self._check_binary_operands(other)
+        return MPA[S, _self.dtype]._matmul(self._mpc, _self, _other)
+    
+    def __truediv__(self, other) -> MPA[S, dtype]:
+        if isinstance(other, ByVal):
+            return self * (1 / other)
+        raise NotImplementedError("MPAs cannot be divided by secure value yet")
+
+    def copy(self) -> MPA[S, dtype]:
+        return MPA[S, dtype](
+            _mpc=self._mpc,
+            _plain=self._plain.copy(),
+            _encryption=self._encryption.copy(),
+            _aggregate=self._aggregate.copy())
+    
+    def astype(self, t: type) -> MPA[S, t]:
+        if isinstance(dtype, float) and isinstance(t, int):
+            compile_error("Not implemented yet: casting MPA[float] to MPA[int]")
+        
+        return MPA[S, t](
+            _mpc=self._mpc,
+            _plain=self._plain.astype(t),
+            _encryption=self._encryption.astype(t),
+            _aggregate=self._aggregate.astype(t))
+    
+    def to_fp(self) -> MPA[S, float]:
+        return self.astype(float)
+    
+    def expand_dims(self, axis: int = 0) -> MPA[Tuple[int, int], dtype]:
+        if staticlen(S) != 1:
+            compile_error("MPA: only 1-dim MPPs can be expanded")
+        assert axis == 0, "Not implemented yet: MPA dim expansion over secondary axes"
+        
+        _plain = ndarray[Tuple[int, int], dtype]()
+        _encryption = Ciphertensor[Ciphertext]()
+        _aggregate = Ciphertensor[Ciphertext]()
+        
+        if self.has_plain(): _plain = self._plain.expand_dims(axis=axis)
+        if self.has_encryption(): _encryption = self._encryption.expand_dims(axis=axis)
+        if self.has_aggregate(): _aggregate = self._aggregate.expand_dims(axis=axis)
+
+        return MPA[Tuple[int, int], dtype](
+            _mpc=self._mpc,
+            _plain=_plain,
+            _encryption=_encryption,
+            _aggregate=_aggregate)
+    
+    @property
+    def ndim(self) -> int:
+        return staticlen(S)
+    
+    @property
+    def shape(self):
+        if self.has_plain():
+            return self._plain.shape
+        
+        if self.has_encryption():
+            enc = self._encryption
+        else:
+            assert self.has_aggregate(), "MPA: cannot get shape of empty MPA"
+            enc = self._aggregate
+        
+        if staticlen(S) == 1:
+            return (enc.shape[0],)
+        elif staticlen(S) == 2:
+            m, n = enc.shape
+            return (m, n)
+        else:
+            compile_error()
+    
+    @property
+    def T(self):
+        return MPA[S, dtype](
+            _mpc=self._mpc,
+            _plain=self._plain.T if self.has_plain() else self._plain,
+            _encryption=self._encryption.T,
+            _aggregate=self._aggregate.T)
+    
+    @property
+    def I(self):
+        mpc = self._mpc
+        id_mat = ndarray[S, dtype].diag(self.shape, dtype(1))
+        return MPA[S, dtype](mpc, id_mat if mpc.pid == mpc.comms.hub_pid else zeros_like(id_mat))
+    
+    @property
+    def modulus(self) -> int_t:
+        return self._mpc.base_modulus
+    
+    def has_plain(self):
+        return not self._plain.is_empty()
+    
+    def has_encryption(self) -> bool:
+        return bool(self._encryption)
+    
+    def has_distributed(self) -> bool:
+        return self.has_plain() or self.has_encryption()
+    
+    def has_aggregate(self) -> bool:
+        return bool(self._aggregate)
+    
+    def is_plain(self) -> bool:
+        return self.has_plain() and not self.has_encryption() and not self.has_aggregate()
+    
+    def is_distributed(self) -> bool:
+        return self.has_distributed() and not self.has_aggregate()
+    
+    def is_aggregate(self) -> bool:
+        return self.has_aggregate() and not self.has_distributed()
+    
+    def is_empty(self) -> bool:
+        return not self.has_distributed() and not self.has_aggregate()
+
+    def encrypt(self):
+        mpc = self._mpc
+        if mpc.pid == 0 or self.has_encryption():
+            return
+        
+        if self.has_aggregate():
+            self._encryption = self._aggregate if mpc.pid == mpc.comms.hub_pid else Ciphertensor[Ciphertext].zeros(mpc, self._aggregate.shape)
+        
+        assert self.has_plain(), "MPA: Cannot encrypt empty MPA"
+        self._encryption = Ciphertensor[Ciphertext].enc(mpc, self._plain)
+    
+    def aggregate(self):
+        mpc = self._mpc
+        if mpc.pid == 0 or self.has_aggregate():
+            return
+        
+        if self.has_encryption():
+            enc = self._encryption
+        else:
+            assert self.has_plain(), "MPA: Cannot aggregate empty MPA"
+            enc = Ciphertensor[Ciphertext].enc(mpc, self._plain)
+        
+        self._aggregate = enc.aggregate(mpc)
+    
+    def reveal(self, *args) -> ndarray[S, dtype]:
+        mpc = self._mpc
+        if mpc.pid == 0:
+            return self._plain
+        
+        if self.has_plain():
+            print(f"CP{mpc.pid}: WARNING! Revealing local data")
+            return mpc.comms.collect(self._plain).sum()
+        
+        self.aggregate()
+        revealed_matrix = self._aggregate.reveal(mpc, T=dtype)
+        
+        # Ciphertensor.reveal always reveals a matrix at the moment due to legacy work (this should be fixed)
+        if staticlen(S) == 1:
+            return revealed_matrix[0]
+        elif staticlen(S) == 2:
+            return revealed_matrix
+        else:
+            compile_error("MPA reveal: invalid shape")
+    
+    def reveal_local(self, *args) -> ndarray[S, dtype]:
+        mpc = self._mpc
+        if self.has_distributed():
+            print(f"CP{mpc.pid}: INFO: Revealing local MPA share")
+        elif self.has_aggregate():
+            print(f"CP{mpc.pid}: INFO: Revealing aggregated MPA")
+        else:
+            raise ValueError("MPA: empty MPA share")
+        
+        if mpc.pid == 0 or self.has_plain():
+            return self._plain
+        
+        if self.has_encryption():
+            revealed_matrix = self._encryption.reveal(mpc, T=dtype)
+        else:
+            revealed_matrix = self._aggregate.reveal(mpc, source_pid=-1, T=dtype)
+        
+        # Ciphertensor.reveal always reveals a matrix at the moment due to legacy code therein (this should be fixed after Ciphertensor.shape is made static)
+        if staticlen(S) == 1:
+            return revealed_matrix[0]
+        elif staticlen(S) == 2:
+            return revealed_matrix
+        else:
+            compile_error("MPA reveal: invalid shape")
+    
+    def extend(self, other: MPA[S, dtype]) -> MPA[S, dtype]:
+        raise NotImplementedError("MPA: extend")
+    
+    def sum(self, axis: int) -> MPA[Tuple[int], dtype]:
+        if staticlen(S) != 2 and staticlen(S) != 1:
+            compile_error("MPA: invalid shape for sum")
+        
+        mpc = self._mpc
+        if mpc.pid == 0:
+            return MPA[Tuple[int], dtype](mpc, self._plain.sum_axis(axis=axis))
+        
+        if self.has_plain():
+            return MPA[Tuple[int], dtype](mpc, self._plain.sum_axis(axis=axis)) 
+        elif self.has_encryption():
+            return MPA[Tuple[int], dtype](mpc, self._encryption.sum(mpc, axis=axis))
+        elif self.has_aggregate():
+            return MPA[Tuple[int], dtype](mpc, self._aggregate.sum(mpc, axis=axis), aggregate=True)
+        else: # MPA is empty
+            return MPA[Tuple[int], dtype](mpc)
+    
+    def dot(self, axis: int) -> MPA[Tuple[int], dtype]:
+        if staticlen(S) != 2 and staticlen(S) != 1:
+            compile_error("MPA: invalid shape for dot product")
+        
+        return (self * self).sum(axis)
+    
+    def via_mpc(self, foo, *args):
+        return foo(self.to_sharetensor(), *args).to_mpa(self._mpc, dtype=dtype)
+
+    def zeros[S2](self, shape: S2) -> MPA[S2, dtype]:
+        return MPA[S2, dtype](self._mpc, zeros(shape, dtype=dtype))
+    
+    def zeros(self) -> MPA[S, dtype]:
+        return MPA[S, dtype](self._mpc, zeros(self.shape, dtype=dtype))
+    
+    def ones(self, *args) -> MPA[S, dtype]:
+        return MPA[S, dtype](self._mpc, ones(self.shape, dtype=dtype))
+
+    def pad_with_value(self, val, size: int, axis: int, *args) -> MPA[S, dtype]:
+        mpc = self._mpc
+        if staticlen(S) != 2:
+            compile_error("MPA: only 2-dim MPPs can be padded with values")
+        
+        assert axis == 1, "Not implemented yet: MPA pad_with_value over 0-axes"
+        shared_value = val if mpc.pid == 1 else type(val)(0)
+
+        if self.has_plain():
+            return MPA[S, dtype](mpc, self._plain.pad_with_value(shared_value, size, axis))
+        elif self.has_encryption():
+            return MPA[S, dtype](mpc, self._encryption.pad_with_value(shared_value, size, axis, mpc))
+        else:
+            assert self.has_aggregate(), "MPA: empty MPA"
+            return MPA[S, dtype](mpc, self._aggregate.pad_with_value(val, size, axis, mpc))
+
+    @staticmethod
+    def rand(shape: S, mpc, plain: bool = False) -> MPA[S, dtype]:
+        with mpc.randomness.seed_switch(-1):
+            rand_data = ndarray[S, dtype].rand(shape)
+
+        if plain or mpc.pid == 0:
+            return MPA[S, dtype](mpc, rand_data if mpc.pid == 1 else zeros(shape, dtype=dtype))
+        
+        transpose = False
+        if staticlen(S) == 2:
+            transpose = shape[0] > shape[1]
+            if transpose:
+                rand_data = rand_data.T
+
+        enc = Ciphertensor[Ciphertext].enc(mpc, rand_data)
+        if transpose:
+            enc = enc.T
+        
+        return MPA[S, dtype](mpc, enc, aggregate=True)
+
+    # Internal typechecker hack
+    @property
+    def _internal_type(self) -> dtype:
+        return dtype()
+    
+    def _autocast(self, other):
+        if isinstance(other, ByVal):
+            if isinstance(other, dtype):
+                return self, other
+            if isinstance(dtype, int) and isinstance(other, float):
+                return self.astype(float), other
+            if isinstance(dtype, float) and isinstance(other, int):
+                return self, float(other)
+        
+        assert isinstance(other, MPA) or isinstance(other, Ciphertensor) or isinstance(other, ndarray), "MPA: Autocasting can be done only between MPAs or ndarrays for now"
+        
+        if isinstance(dtype, type(other._internal_type)):
+            return self, other
+        if isinstance(dtype, int) and isinstance(type(other._internal_type), float):
+            return self.astype(float), other
+        if isinstance(dtype, float) and isinstance(type(other._internal_type), int):
+            return self, other.astype(float)
+        
+        compile_error("Cannot autocast dtypes")
+    
+    def _check_binary_operands(self, other):
+        assert isinstance(other, MPA) or isinstance(other, Ciphertensor) or isinstance(other, ndarray) or isinstance(other, ByVal), "MPA: Elem-wise operand should be either MPA, Ciphertensor, ndarray or by-value type"
+        return self._autocast(other)
+    
+    def _adjust_indices(self, index):
+        """
+        Secure container indexing should be adapted:
+            - (row_idx: whatever, col_idx: int) -> (row_idx: whatever, slice(col_idx, col_idx + 1))
+            - index -> slice(index, index + 1) (if self is 1-dimensional)
+        """
+        if isinstance(index, tuple):
+            if staticlen(index) != 2:
+                compile_error("MPA indexing error: MPA can be indexed only up to two dimensions")
+            row_idx, col_idx = index
+            if isinstance(col_idx, int):
+                return (row_idx, slice(start=col_idx, stop=col_idx + 1, step=1))
+        
+        if staticlen(S) == 1:
+            if isinstance(index, int):
+                return slice(start=index, stop=index + 1, step=1)
+
+        return index
+
+    @sequre
+    def _add_public[S, dtype](mpc, self: MPA[S, dtype], other) -> MPA[S, dtype]:
+        if mpc.pid == 0:
+            return MPA[S, dtype](mpc, self._plain)
+        
+        if self.has_plain():
+            return MPA[S, dtype](mpc, (self._plain + other) if mpc.pid == mpc.comms.hub_pid else self._plain)
+        
+        if self.has_encryption():
+            return MPA[S, dtype](mpc, (self._encryption + other) if mpc.pid == mpc.comms.hub_pid else self._encryption)
+
+        assert self.has_aggregate(), "MPA: invalid/empty addend"
+        return MPA[S, dtype](mpc, self._aggregate + other, aggregate=True)
+    
+    @sequre
+    def _add_cipher[S, dtype](mpc, self: MPA[S, dtype], other: Ciphertensor) -> MPA[S, dtype]:
+        if mpc.pid == 0:
+            return MPA[S, dtype](mpc, self._plain)
+        
+        if self.is_plain():
+            self.encrypt()
+        
+        if self.has_encryption():
+            return MPA[S, dtype](mpc, (self._encryption + other) if mpc.pid == mpc.comms.hub_pid else self._encryption)
+
+        assert self.has_aggregate(), "MPA: invalid/empty addend"
+        return MPA[S, dtype](mpc, self._aggregate + other, aggregate=True)
+
+    @sequre
+    def _add[S, dtype](mpc, self: MPA[S, dtype], other) -> MPA[S, dtype]:
+        if mpc.pid == 0:
+            return MPA[S, dtype](mpc, self._plain)
+
+        if isinstance(other, ndarray) or isinstance(other, ByVal):
+            return MPA[S, dtype]._add_public(mpc, self, other)
+        
+        if isinstance(other, Ciphertensor):
+            return MPA[S, dtype]._add_cipher(mpc, self, other)
+
+        if self.has_plain() and other.has_plain():
+            return MPA[S, dtype](mpc, self._plain + other._plain)
+        
+        if self.has_aggregate() and other.has_aggregate():
+            return MPA[S, dtype](mpc, self._aggregate + other._aggregate, aggregate=True)
+        
+        if self.has_plain() and not other.has_plain():
+            self.encrypt()
+        if not self.has_plain() and other.has_plain():
+            other.encrypt()
+
+        if self.has_distributed():
+            if other.has_distributed():
+                return MPA[S, dtype](mpc, self._encryption + other._encryption)
+            if other.has_aggregate():
+                return MPA[S, dtype](mpc, (self._encryption + other._aggregate) if mpc.pid == mpc.comms.hub_pid else self._encryption)
+        
+        assert self.has_aggregate() and other.has_encryption(), "MPA: invalid/empty addend"
+        return MPA[S, dtype](mpc, (self._aggregate + other._encryption) if mpc.pid == mpc.comms.hub_pid else other._encryption)
+    
+    @sequre
+    def _sub_public[S, dtype](mpc, self: MPA[S, dtype], other) -> MPA[S, dtype]:
+        if mpc.pid == 0:
+            return MPA[S, dtype](mpc, self._plain)
+        
+        if self.has_plain():
+            return MPA[S, dtype](mpc, (self._plain - other) if mpc.pid == mpc.comms.hub_pid else self._plain)
+        
+        if self.has_encryption():
+            return MPA[S, dtype](mpc, (self._encryption - other) if mpc.pid == mpc.comms.hub_pid else self._encryption)
+
+        assert self.has_aggregate(), "MPA: invalid/empty addend"
+        return MPA[S, dtype](mpc, self._aggregate - other, aggregate=True)
+    
+    @sequre
+    def _sub_cipher[S, dtype](mpc, self: MPA[S, dtype], other: Ciphertensor) -> MPA[S, dtype]:
+        if mpc.pid == 0:
+            return MPA[S, dtype](mpc, self._plain)
+        
+        if self.is_plain():
+            self.encrypt()
+        
+        if self.has_encryption():
+            return MPA[S, dtype](mpc, (self._encryption - other) if mpc.pid == mpc.comms.hub_pid else self._encryption)
+
+        assert self.has_aggregate(), "MPA: invalid/empty addend"
+        return MPA[S, dtype](mpc, self._aggregate - other, aggregate=True)
+
+    @sequre
+    def _sub[S, dtype](mpc, self: MPA[S, dtype], other) -> MPA[S, dtype]:
+        if mpc.pid == 0:
+            return MPA[S, dtype](mpc, self._plain)
+
+        if isinstance(other, ndarray) or isinstance(other, ByVal):
+            return MPA[S, dtype]._sub_public(mpc, self, other)
+        
+        if isinstance(other, Ciphertensor):
+            return MPA[S, dtype]._sub_cipher(mpc, self, other)
+
+        if self.has_plain() and other.has_plain():
+            return MPA[S, dtype](mpc, self._plain - other._plain)
+        
+        if self.has_aggregate() and other.has_aggregate():
+            return MPA[S, dtype](mpc, self._aggregate - other._aggregate, aggregate=True)
+        
+        if self.has_plain() and not other.has_plain():
+            self.encrypt()
+        if not self.has_plain() and other.has_plain():
+            other.encrypt()
+
+        if self.has_distributed():
+            if other.has_distributed():
+                return MPA[S, dtype](mpc, self._encryption - other._encryption)
+            if other.has_aggregate():
+                return MPA[S, dtype](mpc, (self._encryption - other._aggregate) if mpc.pid == mpc.comms.hub_pid else self._encryption)
+        
+        assert self.has_aggregate() and other.has_encryption(), "MPA: invalid/empty addend"
+        return MPA[S, dtype](mpc, (self._aggregate - other._encryption) if mpc.pid == mpc.comms.hub_pid else -other._encryption)
+
+    @sequre
+    def _mul_public[S, dtype](mpc, self: MPA[S, dtype], other) -> MPA[S, dtype]:
+        if mpc.pid == 0:
+            return MPA[S, dtype](mpc, self._plain)
+        
+        if self.has_plain():
+            return MPA[S, dtype](mpc, self._plain * other)
+        
+        if self.has_aggregate():
+            return MPA[S, dtype](mpc, self._aggregate * other, aggregate=True)
+        
+        assert self.has_encryption(), "MPA: invalid/empty factor"
+        return MPA[S, dtype](mpc, self._encryption * other)
+    
+    @sequre
+    def _mul_cipher[S, dtype](mpc, self: MPA[S, dtype], other: Ciphertensor) -> MPA[S, dtype]:
+        if mpc.pid == 0:
+            return MPA[S, dtype](mpc, self._plain)
+        
+        if self.is_plain():
+            self.encrypt()
+        
+        if self.has_aggregate():
+            return MPA[S, dtype](mpc, self._aggregate * other, aggregate=True)
+        
+        assert self.has_encryption(), "MPA: invalid/empty factor"
+        return MPA[S, dtype](mpc, self._encryption * other)
+    
+    @sequre
+    def _mul[S, dtype](mpc, self: MPA[S, dtype], other) -> MPA[S, dtype]:
+        if mpc.pid == 0:
+            return MPA[S, dtype](mpc, self._plain)
+
+        if isinstance(other, ndarray) or isinstance(other, ByVal):
+            return MPA[S, dtype]._mul_public(mpc, self, other)
+        
+        if isinstance(other, Ciphertensor):
+            return MPA[S, dtype]._mul_cipher(mpc, self, other)
+        
+        if __ptr__(self) == __ptr__(other):
+            self.aggregate()
+            return MPA[S, dtype](mpc, self._aggregate * other._aggregate, aggregate=True)
+        
+        if self.has_distributed():
+            self.encrypt()
+            other.aggregate()
+            return MPA[S, dtype](mpc, self._encryption * other._aggregate)
+        
+        if other.has_distributed():
+            other.encrypt()
+            self.aggregate()
+            return MPA[S, dtype](mpc, other._encryption * self._aggregate)
+        
+        assert self.is_aggregate() and other.is_aggregate(), "MPA: invalid/empty factor"
+        return MPA[S, dtype](mpc, other._aggregate * self._aggregate, aggregate=True)
+
+    @sequre
+    def _matmul_public[S, dtype](mpc, self: MPA[S, dtype], other: ndarray[S, dtype]) -> MPA[S, dtype]:
+        if mpc.pid == 0 or self.has_plain():
+            return MPA[S, dtype](mpc, self._plain @ other)
+        
+        if self.has_aggregate():
+            return MPA[S, dtype](mpc, self._aggregate @ other, aggregate=True)
+        
+        assert self.has_encryption(), "MPA: invalid/empty factor"
+        return MPA[S, dtype](mpc, self._encryption @ other)
+    
+    @sequre
+    def _matmul[S, dtype](mpc, self: MPA[S, dtype], other) -> MPA[S, dtype]:
+        if isinstance(other, ndarray):
+            return MPA[S, dtype]._matmul_public(mpc, self, other)
+        
+        if mpc.pid == 0:
+            return MPA[S, dtype](mpc, self._plain @ other._plain)
+        
+        if self.has_distributed():
+            self.encrypt()
+            other.aggregate()
+            return MPA[S, dtype](mpc, self._encryption @ other._aggregate)
+        
+        if other.has_distributed():
+            other.encrypt()
+            self.aggregate()
+            return MPA[S, dtype](mpc, other._encryption @ self._aggregate)
+        
+        assert self.is_aggregate() and other.is_aggregate(), "MPA: invalid/empty factor"
+        return MPA[S, dtype](mpc, other._aggregate @ self._aggregate, aggregate=True)
+
+    # Temporary helpers
+    def slice_local(self, idx: int, *args) -> MPA[S, dtype]:
+        raise NotImplementedError()
+    
+    def rotate_local(self, i: int, *args) -> MPA[S, dtype]:
+        raise NotImplementedError()
