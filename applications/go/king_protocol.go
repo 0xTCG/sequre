@@ -71,7 +71,6 @@ func InitializeKingProtocol(pid int, configFolder string) (relativeProt *KingPro
 			data[j] = data[j][:ConfigKing.NumberOfColumns]
 		}
 		log.LLvl1(pid, " has data with dims:", len(data), len(data[0]))
-		log.LLvl1(pid, " data:", data[0][:64])
 	}
 
 	prot := InitializeProtocol(pid, configFolder)
