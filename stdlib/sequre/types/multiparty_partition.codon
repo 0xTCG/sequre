@@ -13,7 +13,10 @@ from sequre.types.ciphertensor import Ciphertensor
 from sequre.types.sharetensor import Sharetensor
 from sequre.types.utils import EmptyWith
 from sequre.utils.io import read_ndarray
-from sequre.utils.constants import C_CONTIG, D_CONTIG, MHE_MUL_TO_ADD_THRESHOLD, MHE_MPC_SWITCH_COST_ESTIMATE, HE_ENC_COST_ESTIMATE
+from sequre.utils.constants import \
+    C_CONTIG, D_CONTIG, MHE_MUL_TO_ADD_THRESHOLD, \
+    MHE_MPC_SWITCH_COST_ESTIMATE, HE_ENC_COST_ESTIMATE, \
+    CKKS_ERROR
 from sequre.utils.utils import one_hot_vector
 
 from sequre.settings import DEBUG
@@ -211,6 +214,10 @@ class MPP[S, dtype]:
         return _shape
     
     @property
+    def shape_local(self) -> S:
+        return self.shape
+    
+    @property
     def T(self) -> MPP[S, dtype]:
         new_mpp = self.copy()
         new_mpp._transposed ^= True
@@ -309,16 +316,22 @@ class MPP[S, dtype]:
         raise NotImplementedError("MPPs cannot be divided by secure value yet")
     
     def __gt__(self, other) -> MPP[S, dtype]:
-        if isinstance(other, MPP) or isinstance(other, Ciphertensor):
+        if not isinstance(other, ByVal):
             compile_error("Not implemented yet: Comparison between MPPs and Ciphertensors")
         
-        return self.via_mpc(lambda stensor: secure_operator.gt(self._mpc, stensor, other))
+        mpc = self._mpc
+        return self.via_mpc(
+            lambda stensor: secure_operator.gt(
+                mpc, secure_operator.add(mpc, stensor, CKKS_ERROR), other))
 
     def __lt__(self, other) -> MPP[S, dtype]:
-        if isinstance(other, MPP) or isinstance(other, Ciphertensor):
+        if not isinstance(other, ByVal):
             compile_error("Not implemented yet: Comparison between MPPs and Ciphertensors")
 
-        return self.via_mpc(lambda stensor: secure_operator.lt(self._mpc, stensor, other))
+        mpc = self._mpc
+        return self.via_mpc(
+            lambda stensor: secure_operator.lt(
+                mpc, secure_operator.sub(mpc, stensor, CKKS_ERROR), other))
     
     # Partition has either of the encrypted sub-partitions
     def has_partial_encryption(self):
@@ -654,6 +667,18 @@ class MPP[S, dtype]:
         
         return arr.T if self._transposed else arr
 
+    def getitem_local(self, index) -> MPP:
+        if not (self.is_local() and isinstance(index, slice) and not self._transposed):
+            raise NotImplementedError()
+        
+        assert index.stop <= len(self._local_data), f"MPP: index out of bound: {index} > {len(self._local_data)}"
+        size = index.stop - index.start
+        
+        return MPP[S, dtype](
+            _mpc=self._mpc,
+            _ratios=[size for _ in range(len(self._ratios))],
+            _local_data=self._local_data[index])
+
     def actual_itranspose(self) -> MPP[S, dtype]:
         self.set(self.via_mpc(lambda stensor: stensor.T))
         return self
@@ -696,26 +721,34 @@ class MPP[S, dtype]:
         if self.has_local_data():
             _local_data = self._local_data.sum_axis(axis=axis)
         
-        if self.is_local():
-            pass
-        elif self.has_unified_encryption():
-            _encryption_unified = self._encryption_unified.sum(mpc, axis=axis)
-        elif self.is_semi_encrypted():
-            _encryption_unified = Ciphertensor[Ciphertext].enc(mpc, _local_data)
-            
-            if self._encryption_left:
-                _encryption_unified.iadd(mpc, self._encryption_left.sum(mpc, axis=axis))
-            if self._encryption_right:
-                _encryption_unified.iadd(mpc, self._encryption_right.sum(mpc, axis=axis))
-        else:
-            raise ValueError(f"MPP: partition empty at CP{mpc.pid} while computing dot product")
+        if mpc.council(self.is_local()).any():
+            return MPP[Tuple[int], dtype](
+                _mpc=mpc,
+                _ratios=_ratios,
+                _local_data=_local_data,
+                _transposed=self._transposed)
+        
+        with self.partition_aligner() as aligner:
+            if not self.is_empty():
+                if self.has_unified_encryption():
+                    _encryption_unified = self._encryption_unified.sum(mpc, axis=axis)
+                elif self.is_semi_encrypted():
+                    _encryption_unified = Ciphertensor[Ciphertext].enc(mpc, _local_data)
+                    
+                    if self._encryption_left:
+                        _encryption_unified.iadd(mpc, self._encryption_left.sum(mpc, axis=axis))
+                    if self._encryption_right:
+                        _encryption_unified.iadd(mpc, self._encryption_right.sum(mpc, axis=axis))
+                else:
+                    raise ValueError(f"MPP: partition empty at CP{mpc.pid} while computing sum")
 
-        return MPP[Tuple[int], dtype](
-            _mpc=mpc,
-            _ratios=_ratios,
-            _local_data=_local_data,
-            _encryption_unified=_encryption_unified,
-            _transposed=self._transposed)
+            new_mpp = aligner.new_mpp(_encryption_unified=_encryption_unified)
+            
+            return MPP[Tuple[int], dtype](
+                _mpc=mpc,
+                _ratios=new_mpp._ratios,
+                _encryption_unified=new_mpp._encryption_unified,
+                _transposed=new_mpp._transposed)
     
     def dot(self, axis: int) -> MPP[Tuple[int], dtype]:
         if staticlen(S) != 2 and staticlen(S) != 1:
@@ -1286,8 +1319,10 @@ class MPP[S, dtype]:
                             _self.unify_encryption()
                             transpose_encryption = _self._encryption_unified._transposed
                         
-                        other_broadcast_t = other_broadcast.to_sharetensor().T.to_mpp(mpc, _self._ratios, transpose_encryption=transpose_encryption, dtype=ac_type)
-                        other_encryption_unified = other_broadcast_t._encryption_unified
+                        other_stensor = other_broadcast.to_sharetensor()
+                        other_stensor_t = other_stensor if other_broadcast._transposed else other_stensor.T
+                        other_t = other_stensor_t.to_mpp(mpc, _self._ratios, transpose_encryption=transpose_encryption, dtype=ac_type)
+                        other_encryption_unified = other_t._encryption_unified
                         
                         if _self.is_local():
                             _encryption_unified = elem_wise_op(mpc, _self._local_data, other_encryption_unified)

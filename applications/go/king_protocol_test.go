@@ -40,6 +40,28 @@ func TestKingProtocol(t *testing.T) {
 	// TODO loop in prot.ComparisonMap and if pid is in the list, then get the data
 	for i, v := range prot.ComparisonMap {
 		if i == strconv.Itoa(pid) {
+
+			mat := matrices[v[0]]
+			f, err := os.Create("king_go_output.txt")
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer f.Close()
+		
+			for _, row := range mat {
+				for _, elem := range row {
+					_, err := fmt.Fprintln(f, "*", strconv.FormatFloat(elem, 'f', -1, 64), "*")
+					if err != nil {
+						log.Fatal(err)
+					}
+				}
+				
+				_, err := fmt.Fprintln(f, "*", "\n", "*")
+				if err != nil {
+					log.Fatal(err)
+				}
+			}
+
 			log.LLvl1("Test results of comparison with party", v)
 			otherPartyConfig := new(ConfigKingProtocol)
 			if _, err := toml.DecodeFile(filepath.Join("config/", fmt.Sprintf("configLocal.Party%d.toml", v[0])), otherPartyConfig); err != nil {
