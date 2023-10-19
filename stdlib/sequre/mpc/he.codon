@@ -68,6 +68,8 @@ from stats import MPCStats
 from randomness import MPCRandomness
 from comms import MPCComms
 
+from sequre.settings import DEBUG
+
 
 # CryptoParams aggregates all (d)ckks scheme information
 class CryptoParams:
@@ -419,7 +421,7 @@ class MPCHE[TP]:
 
         return rotated_tensor_data
     
-    def reduce_add(self, x: list[Ciphertext], size: int) -> list[Ciphertext]:
+    def reduce_add(self, x: list[Ciphertext], size: int, keep_dims: bool = True) -> list[Ciphertext]:
         slots = self.crypto_params.params.slots()
         assert 0 < size, "MPCHE.reduce_add: Invalid number of columns per cipher"
 
@@ -430,8 +432,10 @@ class MPCHE[TP]:
         self.crypto_params.evaluator.reduce_add(reduced_cipher, min(slots, size))
         
         reduced_vector = []
-        for _ in range(size // slots):
-            reduced_vector.append(reduced_cipher.copy())
+        
+        if keep_dims:
+            for _ in range(size // slots):
+                reduced_vector.append(reduced_cipher.copy())
         
         offset = size % slots
         if offset:
@@ -440,9 +444,12 @@ class MPCHE[TP]:
                 mirror_cipher = self.crypto_params.evaluator.rotate_new(reduced_cipher, slots - butterfly_movement)
                 self.crypto_params.evaluator.add(reduced_cipher, mirror_cipher, reduced_cipher)
                 
-            mask = self.enc_vector([(1.0 if i < offset else 0.0) for i in range(slots)], T=Plaintext)
-            self.imul([reduced_cipher], mask)
             reduced_vector.append(reduced_cipher)
+        
+        if offset or not keep_dims:
+            mask_size = offset if keep_dims else 1
+            mask = self.enc_vector([(1.0 if i < mask_size else 0.0) for i in range(slots)], T=Plaintext)
+            self.imul(reduced_vector[-1:], mask)
         
         return reduced_vector
     
@@ -500,7 +507,7 @@ class MPCHE[TP]:
         self.stats.secure_mhe_mpc_switch_count += 1
         if self.pid == 0: return []
 
-        # mask = shared_vector.rand(modulus)
+        # mask = shared_vector.rand(modulus, "uniform")
         # shared_matrix_mask = self.comms.reveal(shared_vector.copy() - mask, modulus)
         # share = (shared_matrix_mask + mask) if self.pid == self.comms.hub_pid else mask
         # return self._aggregate_cipher_vector(self.enc_vector(values, T=Ciphertext))
@@ -788,7 +795,7 @@ class MPCHE[TP]:
         return RTGShare(share_out_value)
     
     def _collective_rot_key_gen(self, parameters: Parameters, sk_shard: SecretKey,
-            crp_gen: UniformSampler, rot_types: list[RotationType]) -> RotationKeySet:
+            crp_gen: UniformSampler, rot_types: set[RotationType]) -> RotationKeySet:
         slots = parameters.slots()
         sk = sk_shard
 
@@ -805,15 +812,15 @@ class MPCHE[TP]:
         for k in shifts:
             g_elems.append(parameters.galois_element_for_column_rotation_by(k))
 
-        # Need to sortInt otherwise different parties might have different ordering
         g_elems.sort()
-
         rot_keys = new_rotation_key_set(parameters.get_rlwe_params(), g_elems)
 
-        if self.pid == 0: return rot_keys
+        if self.pid == 0:
+            return rot_keys
 
         ring_qp = parameters.ring_qp()
-        for gal_el in g_elems:
+        for i in range(len(g_elems)):
+            gal_el = g_elems[i]
             
             rtg_protocol = new_rot_kg_protocol(parameters)
             rtg_share = rtg_protocol.allocate_share()
@@ -824,6 +831,9 @@ class MPCHE[TP]:
             rtg_protocol._mm_gen_share(sk, gal_el, crp, rtg_share)
             rtg_agg = self._aggregate_rot_key_share(rtg_share)
             rtg_protocol.gen_rotation_key(rtg_agg, crp, rot_keys.keys[gal_el])
+
+            if DEBUG:
+                print(f"CP{self.pid}:\t\t{i + 1}/{len(g_elems)} rotation keys generated")
 
         return rot_keys
     

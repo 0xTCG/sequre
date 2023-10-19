@@ -1,7 +1,7 @@
 from sequre.attributes import sequre
 
 from sequre.utils.param import int_t
-from sequre.utils.io import read_filtered_matrix, read_vector, read_matrix
+from sequre.utils.io import read_vector, read_matrix
 from sequre.types.sharetensor import Sharetensor
 
 from sequre.types.internal import Internal as sq
@@ -10,6 +10,9 @@ from sequre.stdlib.lin_alg import orthonormalize
 from sequre.stdlib.learn.pca import random_pca_with_norm, random_pca_experimental, dqr_experimental
 from utils.param import *
 from utils.data_sharing import shares_paths
+
+from sequre.types.multiparty_union import MPU
+from ..tests.utils import assert_eq_approx
 
 
 def merge_masks(major_mask, minor_mask):
@@ -81,10 +84,10 @@ def locus_distance_filter(snp_pos):
 @sequre
 def load_dosage(mpc, f_geno, f_geno_mask, f_miss, f_miss_mask,
                 imask, jmask, rows, cols, modulus):
-    g = read_filtered_matrix(
+    g = Sharetensor.read_filtered_matrix(
         mpc, f_geno, f_geno_mask, imask, jmask,
         rows, cols, 0, 3, modulus, True)
-    miss = read_filtered_matrix(
+    miss = Sharetensor.read_filtered_matrix(
         mpc, f_miss, f_miss_mask, imask, jmask,
         rows, cols, 0, 1, modulus, True)[0]
     dosage = g[1] + g[2] * 2
@@ -100,12 +103,12 @@ def missing_rates_filter(mpc, num_inds, num_snps, snp_pos, pheno, cov, geno, mis
     filtered_dosage = dosage
 
     if SKIP_QC:
-        print(f"Skipped 1st and 2nd QC at CP{mpc.pid}.")
+        print(f"CP{mpc.pid}:\tSkipped 1st and 2nd QC.")
         return snp_pos, pheno, cov, filtered_miss, filtered_dosage, ind_keep, snp_keep
     
     snp_keep = sq.reveal_to_all(mpc, miss.sum() < int(num_inds * GMISS_UB)).share
     snp_pos = snp_pos.filter(snp_keep)
-    print(f"1st QC filtering done at CP{mpc.pid}. "
+    print(f"CP{mpc.pid}:\t1st QC filtering done. "
           f"Number of selected SNPs: {len(snp_pos)}.")
 
     m = int(snp_keep.sum())
@@ -125,7 +128,7 @@ def missing_rates_filter(mpc, num_inds, num_snps, snp_pos, pheno, cov, geno, mis
     filtered_miss = miss.filter(ind_keep).T.filter(snp_keep).T
     filtered_dosage = dosage.filter(ind_keep).T.filter(snp_keep).T
     
-    print(f"2nd QC filtering done at CP{mpc.pid}. "
+    print(f"CP{mpc.pid}:\t2nd QC filtering done. "
           f"Number of selected individuals: {len(pheno)}.")
     
     return snp_pos, pheno, cov, filtered_miss, filtered_dosage, ind_keep, snp_keep
@@ -137,7 +140,7 @@ def hwe_filter(mpc, snp_pos, pheno, geno, miss, dosage, ind_keep, snp_keep, geno
     snp_keep_2 = snp_pos.raw_ones()
     
     if SKIP_QC:
-        print(f"Skipped 3rd QC at CP{mpc.pid}.")
+        print(f"CP{mpc.pid}:\tSkipped 3rd QC.")
         return gkeep, snp_pos, maf, geno_variance
 
     filtered_g = [e.filter(ind_keep).T.filter(snp_keep).T for e in geno]
@@ -165,7 +168,7 @@ def hwe_filter(mpc, snp_pos, pheno, geno, miss, dosage, ind_keep, snp_keep, geno
     snp_pos = snp_pos.filter(snp_keep_2)
     gkeep = merge_masks(gkeep, snp_keep_2)
 
-    print(f"3rd QC filtering done at CP{mpc.pid}. "
+    print(f"CP{mpc.pid}:\t3rd QC filtering done. "
           f"Number of selected SNPs: {len(snp_pos)}.")
     
     return gkeep, snp_pos, maf, geno_variance
@@ -199,7 +202,7 @@ def linkage_disequilibrium_filter(mpc, snp_pos, miss, dosage, geno_mean, geno_st
     filtered_geno_mean = geno_mean.filter(selected_snps)
     filtered_geno_std_inv = geno_std_inv.filter(selected_snps)
     
-    print(f"PCA filtering done at CP{mpc.pid}. Number of selected SNPs: {snp_keep_mask.to_int().sum()}.")
+    print(f"CP{mpc.pid}:\tPCA filtering done. Number of selected SNPs: {snp_keep_mask.to_int().sum()}.")
     return filtered_miss, filtered_dosage, filtered_geno_mean, filtered_geno_std_inv
 
 
@@ -214,7 +217,7 @@ def population_stratification_analysis(mpc, top_components, oversampling_count, 
         mpc, dosage, miss, geno_mean, geno_std_inv, top_components,
         oversampling_count, power_iterations, len(snp_pos))
     
-    print(f"Selected {top_components} eigenvectors at CP{mpc.pid}.")
+    print(f"CP{mpc.pid}:\tSelected {top_components} eigenvectors.")
     return orthonormalize(mpc, (U @ Z).extend(cov.T.to_fp()))
 
 
@@ -264,11 +267,13 @@ def sf_psa_experimental(mpc, geno, cov, top_components, oversampling_count, powe
         mpc, geno, top_components,
         oversampling_count, power_iterations, cp_1_size)
     
-    print(f"Selected {top_components} eigenvectors at CP{mpc.pid}.")
+    print(f"CP{mpc.pid}:\tSelected {top_components} eigenvectors.")
     return dqr_experimental(mpc, U.extend(cov.T.to_fp()), cp_1_size)
 
 
 def sf_gwas_experimental(mpc, test_run, modulus):
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    
     (f_pheno, f_cov, f_geno, f_miss,
      f_geno_mask, f_miss_mask) = open_input_files(mpc, test_run)
     snp_pos, pheno, cov = load_phenotypes_and_covariates(mpc, f_pheno, f_cov, test_run, modulus)
@@ -282,25 +287,33 @@ def sf_gwas_experimental(mpc, test_run, modulus):
     ikeep, gwas_snp_keep_mask) = quality_control(
         mpc, NUM_INDS, NUM_SNPS, snp_pos, pheno, cov, g, miss, dosage)
     
+    # Experimental run
     indv_per_party = 8
+    indv_count = indv_per_party * (mpc.comms.number_of_parties - 1)
     cov_count = 2
-    snps_count = 8192
     top_components_count = 2
     oversampling_count = 2
+    snps_count = 32
     power_iterations_count = 1
-    
+
     # Revealing for testing
     raw_geno = dosage.reveal(mpc) - g_mean.reveal(mpc)
-    raw_geno = raw_geno.patch_copy(snps_count)
-    # raw_geno = raw_geno.filter(ikeep).T.filter(gwas_snp_keep_mask).T
-    raw_cov = cov.reveal(mpc)
-    raw_pheno = pheno.reveal(mpc)
+    
+    assert SKIP_QC, "Not implemented yet: MHE GWAS QC"
+    # if not SKIP_QC:
+    #     raw_geno = raw_geno.filter(ikeep).T.filter(gwas_snp_keep_mask).T
+    
+    raw_geno = raw_geno[:indv_count, :snps_count]
+    if snps_count > NUM_SNPS:
+        raw_geno = raw_geno.patch_copy(snps_count)
+    raw_cov = cov.reveal(mpc)[:indv_count, :cov_count]
+    raw_pheno = pheno.reveal(mpc)[:indv_count]
     assert raw_pheno.ndim == 1
     assert raw_cov.ndim == 2
     assert raw_geno.ndim == 2
 
+    # MPU
     from numpy.create import zeros
-    from sequre.types.multiparty_union import MPU
     
     def _get_partition(mpc, data, indv_per_party, snps_count):
         dealer_data = zeros(((mpc.comms.number_of_parties - 1) * indv_per_party, snps_count))
@@ -309,22 +322,31 @@ def sf_gwas_experimental(mpc, test_run, modulus):
     def _get_partition_1_dim(mpc, data, indv_per_party):
         dealer_data = zeros(((mpc.comms.number_of_parties - 1) * indv_per_party,))
         return data[(mpc.pid - 1) * indv_per_party: mpc.pid * indv_per_party] if mpc.pid else dealer_data
-    
+
     partition_geno = _get_partition(mpc, raw_geno, indv_per_party, snps_count)
     partition_cov = _get_partition(mpc, raw_cov, indv_per_party, cov_count)
     partition_pheno = _get_partition_1_dim(mpc, raw_pheno, indv_per_party)
+    geno = MPU(mpc, partition_geno, "partition")
+    cov = MPU(mpc, partition_cov, "partition")
+    pheno = MPU(mpc, partition_pheno, "partition").T
     
-    mpu_geno = MPU(mpc, partition_geno, "partition")
-    mpu_cov = MPU(mpc, partition_cov, "partition")
-    mpu_pheno = MPU(mpc, partition_pheno, "partition").T
+    mpc.randomness.reset_seed(-1, hash('global'))
+    raw_components = sf_psa_experimental(
+        mpc, raw_geno, raw_cov, top_components_count,
+        oversampling_count, power_iterations_count, indv_per_party)
+    raw_ca = cochran_armitage(mpc, raw_components, raw_pheno, raw_geno)
 
     import time
     s = time.time()
-    mpu_components = sf_psa_experimental(
-        mpc, mpu_geno, mpu_cov, top_components_count,
+    mpc.randomness.reset_seed(-1, hash('global'))
+    components = sf_psa_experimental(
+        mpc, geno, cov, top_components_count,
         oversampling_count, power_iterations_count, indv_per_party)
-    ca = cochran_armitage(mpc, mpu_components, mpu_pheno, mpu_geno)
+    ca = cochran_armitage(mpc, components, pheno, geno)
     e = time.time()
     print(f"CP{mpc.pid}:\tTemp counter: GWAS PSA and CA done in {e - s}s")
+
+    if mpc.pid:
+        assert_eq_approx(f'CP{mpc.pid}:\tSequre GWAS-MHE ({alg_struct}) test', ca.reveal(mpc), raw_ca, error=0.05)
 
     return ca
