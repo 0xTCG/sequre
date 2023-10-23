@@ -1,7 +1,7 @@
 from tqdm import tqdm
 
 
-folder_path = 'data/gwas/input/lung_reduced/'
+folder_path = 'data/sf-gwas/'
 geno_path = 'geno_raw.txt'
 
 

@@ -1,13 +1,17 @@
+from time import timing
 from datetime import datetime
-from numpy.create import array, zeros
+
+from numpy.create import array, ones
+from numpy.ndarray import ndarray
 
 from perf import perf_timing, perf_print_stats
 
-from ..applications.king import collective_king_protocol
-from ..applications.gwas import gwas_protocol
-from ..applications.dti import dti_protocol
+from ..applications.king import king
+from ..applications.gwas import gwas_protocol, sf_gwas_experimental
+from ..applications.dti import dti_mpc_protocol, dti_mhe_protocol
 from ..applications.opal import sequre_opal as opal
 from ..applications.ganon import sequre_ganon as ganon, FilterConfig
+from ..applications.genotype_imputation import genotype_imputation
 from ..applications.utils.data_sharing import share_all_data
 
 from utils import time_frame
@@ -16,9 +20,12 @@ from ..playground import playground
 import sequre.lattiseq.ckks as ckks
 
 from sequre.stdlib.lin_alg import qr_fact_square, tridiag, eigen_decomp, orthonormalize
+from sequre.stdlib.learn.lin_reg import LinReg
+from sequre.stdlib.learn.mi import MI
 from sequre.stdlib.learn.pca import random_pca_experimental
 from sequre.types.utils import double_to_fp
 from sequre.types.multiparty_partition import MPP
+from sequre.types.multiparty_union import MPU
 from sequre.types.sharetensor import Sharetensor
 from sequre.utils.utils import random_ints
 from sequre.utils.param import int_t
@@ -69,7 +76,6 @@ def lattiseq_mult3_wrapper(mpc, modulus):
         print(f"CP{mpc.pid}: Lattiseq mult3 is benchmarked only at trusted dealer.")
         return
     
-    from time import timing
     with timing("Lattiseq mult3 setup"):
         params, encoder, encryptor, decryptor, evaluator, _ = lattiseq_test_setup()
         x = [float(i) for i in range(params.slots())]
@@ -98,8 +104,8 @@ def lattiseq_mult3_wrapper(mpc, modulus):
     print(f"\tDecoded values [0:3]: {decoded_values[:3]}")
 
 def king_wrapper(mpc, modulus):
-    mpp_data = MPP.collective_load(mpc, "data/king/partition.bin", rows=16, cols=8192, binary=True, dtype=int).astype(float)
-    collective_king_protocol(mpc, mpp_data)
+    mpp_data = MPP.collective_load(mpc, f"data/king/partition_{mpc.pid}.bin", rows=16, cols=8192, binary=True, dtype=int).astype(float)
+    return king(mpc, mpp_data)
 
 def pca_wrapper(mpc, modulus):
     rows_per_party = 8
@@ -116,12 +122,9 @@ def pca_wrapper(mpc, modulus):
     
     local_data = raw_data[(mpc.pid - 1) * rows_per_party:mpc.pid * rows_per_party].astype(float)
     local_data -= raw_data_mean
-
-    if mpc.pid == 0:
-        local_data = zeros((rows_per_party, cols_per_party), dtype=float)
     
-    random_pca_experimental(
-        mpc, local_data, top_components_count, oversampling_count, power_iterations_count)
+    mpu_data = MPU(mpc, local_data, "partition")
+    random_pca_experimental(mpc, mpu_data, top_components_count, oversampling_count, power_iterations_count, rows_per_party)
 
 def lin_alg_wrapper(mpc, modulus, sv_mat):
     qr_fact_square(mpc, sv_mat)
@@ -129,11 +132,93 @@ def lin_alg_wrapper(mpc, modulus, sv_mat):
     eigen_decomp(mpc, sv_mat)
     orthonormalize(mpc, sv_mat)
 
+def mi_wrapper(mpc, modulus):
+    mi_factor = 5
+    im_epochs = 40
+    fm_epochs = 40
+    
+    # Case 1
+    rows_per_party = 125
+    cols_per_party = 15
+    miss_rate = 50
+    im_step_size = 0.001
+    fm_step_size = 0.001
+    im_optimizer = "bgd"
+    fm_optimizer = "bgd"
+    
+    # # Case 2
+    # rows_per_party = 250
+    # cols_per_party = 30
+    # miss_rate = 100
+    # im_step_size = 1 / (1 << 11)
+    # fm_step_size = 1 / (1 << 12)
+    # im_optimizer = "bgd"
+    # fm_optimizer = "bgd"
+    
+    # # Case 3
+    # rows_per_party = 500
+    # cols_per_party = 60
+    # miss_rate = 200
+    # im_step_size = 1 / (1 << 11)
+    # fm_step_size = 1 / (1 << 12)
+    # im_optimizer = "mbgd"
+    # fm_optimizer = "mbgd"
+    
+    im_initial_w = ones((cols_per_party, 1))
+    fm_initial_w = ones((cols_per_party + 1, 1))
+    
+    # # Case 4
+    # rows_per_party = 34144
+    # cols_per_party = 204
+    # miss_rate = 54934
+    # im_step_size = 1 / (1 << 17)
+    # fm_step_size = 1 / (1 << 19)
+    # im_initial_w = ones((cols_per_party, 1)) * (1 / (1 << 10))
+    # fm_initial_w = ones((cols_per_party + 1, 1)) * (1 / (1 << 10))
+    # im_optimizer = "mbgd"
+    # fm_optimizer = "mbgd"
+
+    with mpc.randomness.seed_switch(-1):
+        complete_data = ndarray.rand(((mpc.comms.number_of_parties - 1) * rows_per_party, cols_per_party), "uniform") + 1 / (1 << 10)  # To avoid fp underflow
+        labels = complete_data @ ndarray.rand((cols_per_party, 1), "uniform") + 1.0
+
+    data = complete_data.copy()
+    miss_col = 0
+    miss_val = 0.0
+    
+    miss_rows_set = set[int]()
+    with mpc.randomness.seed_switch(-1):
+        for _ in range(miss_rate):
+            miss_row = int.rand(len(data) - 1, "uniform")
+            data[miss_row][miss_col] = miss_val
+            miss_rows_set.add(miss_row)
+    miss_rows = sorted(list(miss_rows_set))
+
+    mpc_complete_data = Sharetensor.enc(mpc, complete_data, 0, modulus)
+    mpc_data = Sharetensor.enc(mpc, data, 0, modulus)
+    mpc_labels = Sharetensor.enc(mpc, labels, 0, modulus)
+
+    mpc_impute_model = LinReg(Sharetensor.enc(mpc, im_initial_w, 0, modulus), im_optimizer)
+    mpc_fit_model = LinReg(Sharetensor.enc(mpc, fm_initial_w, 0, modulus), fm_optimizer)
+    
+    mpc_mi = MI(mi_factor, mpc_impute_model, mpc_fit_model).fit(
+        mpc, mpc_data, mpc_labels, miss_rows, miss_col,
+        im_step_size, fm_step_size, im_epochs, fm_epochs)
+    
+    predicted_data = mpc_mi.model.predict(mpc, mpc_complete_data).reveal(mpc)
+    stats = labels.hstack(predicted_data)
+    print(f"CP{mpc.pid}:\tSequre MI standard deviation", ndarray.mean(ndarray.std(stats, axis=1)))
+
 def gwas_wrapper(mpc, modulus):
-    gwas_protocol(mpc, True, modulus)
+    # return gwas_protocol(mpc, True, modulus)
+    return sf_gwas_experimental(mpc, True, modulus)
+
+def genotype_imputation_wrapper(mpc, modulus):
+    genotype_imputation(mpc, modulus)
 
 def dti_wrapper(mpc, modulus):
-    dti_protocol(mpc, True, modulus, False)
+    dti_mhe_protocol(mpc)
+    # dti_mpc_protocol(mpc, True, modulus, False)
 
 def opal_wrapper(mpc, modulus, coverage):
     opal(mpc, True, modulus, coverage)[0]
@@ -183,7 +268,7 @@ def benchmark[TP](mpc, benchmark_toggles: dict, modulus: TP):
     sv_mat.fp = True
 
     if not benchmark_toggles[RUN_TOGGLES.DATA_SHARING_SKIP_FLAG]:
-        share_all_data(mpc, True, modulus, TP=int_t)
+        share_all_data(mpc, True, modulus)
     
     mpc.comms.sync_parties()
     run_all = benchmark_toggles[RUN_TOGGLES.RUN_ALL_FLAG]
@@ -197,6 +282,8 @@ def benchmark[TP](mpc, benchmark_toggles: dict, modulus: TP):
         time_frame(mpc, lattiseq_mult3_wrapper, 'Lattiseq mult3', modulus)
     if benchmark_toggles[RUN_TOGGLES.KING_FLAG] or run_all:
         time_frame(mpc, king_wrapper, 'KING', modulus)
+    if benchmark_toggles[RUN_TOGGLES.MI_FLAG] or run_all:
+        time_frame(mpc, mi_wrapper, 'Multiple imputation', modulus)
     if benchmark_toggles[RUN_TOGGLES.PCA_FLAG] or run_all:
         time_frame(mpc, pca_wrapper, 'PCA', modulus)
 
@@ -211,5 +298,7 @@ def benchmark[TP](mpc, benchmark_toggles: dict, modulus: TP):
         time_frame(mpc, opal_wrapper, 'Opal 15x', modulus, 15)
     if benchmark_toggles[RUN_TOGGLES.GANON_FLAG] or run_all:
         time_frame(mpc, ganon_wrapper, 'Ganon', modulus, 100)
+    if benchmark_toggles[RUN_TOGGLES.GENOTYPE_IMPUTATION_FLAG] or run_all:
+        time_frame(mpc, genotype_imputation_wrapper, 'Genotype imputation', modulus)
 
     mpc.comms.sequential(perf_print_stats, False, f"CP{mpc.pid}: ")

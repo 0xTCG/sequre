@@ -40,6 +40,19 @@ func TestKingProtocol(t *testing.T) {
 	// TODO loop in prot.ComparisonMap and if pid is in the list, then get the data
 	for i, v := range prot.ComparisonMap {
 		if i == strconv.Itoa(pid) {
+
+			f_obt, err := os.Create("temp_king_go_obt_output.txt")
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer f_obt.Close()
+
+			f_exp, err := os.Create("temp_king_go_exp_output.txt")
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer f_exp.Close()
+		
 			log.LLvl1("Test results of comparison with party", v)
 			otherPartyConfig := new(ConfigKingProtocol)
 			if _, err := toml.DecodeFile(filepath.Join("config/", fmt.Sprintf("configLocal.Party%d.toml", v[0])), otherPartyConfig); err != nil {
@@ -62,6 +75,16 @@ func TestKingProtocol(t *testing.T) {
 					log.LLvl1("minhet:", minhet, localHet, otherHet)
 					exp_value := squaredNormDistance(localInput[l], otherData[o]) / float64(minhet)
 					obt_value := matrices[v[0]][o][l]
+					
+					_, err := fmt.Fprintln(f_exp, strconv.FormatFloat(exp_value, 'f', -1, 64))
+					if err != nil {
+						log.Fatal(err)
+					}
+					_, err = fmt.Fprintln(f_obt, strconv.FormatFloat(obt_value, 'f', -1, 64))
+					if err != nil {
+						log.Fatal(err)
+					}
+					
 					log.LLvl1(l, o, "exp_value:", exp_value)
 					log.LLvl1(l, o, "obt_value:", obt_value)
 					log.LLvl1("Expected value:", exp_value, "Obtained value:", obt_value)

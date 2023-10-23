@@ -15,7 +15,7 @@ from multiparty_union import MPU
 from utils import double_to_fp
 
 from ..stdlib.fp import fp_div, fp_sqrt
-from ..utils.param import int_t, DEBUG
+from ..utils.param import int_t
 
 
 TP = int_t
@@ -73,23 +73,38 @@ class Sharetensor:
                 _encryption_unified=encrypted_partition)
         
         elif isinstance(self.share, list) or isinstance(self.share, ByVal):
-            assert ratios.sum() == 1, "Sharetensor: invalid ratios for 1-dim MPC -> MPP conversion"
-            shape = (self.shape[0],) if isinstance(self.share, list) else (1,)
+            is_transposed = ratios.sum() > 1
             
             if mpc.pid == 0:
+                shape = (self.shape[0],) if isinstance(self.share, list) else (1,)
                 return MPP[Tuple[int], dtype](
                     _mpc=mpc,
                     _ratios=ratios,
-                    _local_data=zeros(shape, dtype=dtype))
+                    _local_data=zeros(shape, dtype=dtype),
+                    _transposed=is_transposed)
 
             new_mpp = MPP[Tuple[int], dtype](
                 _mpc=mpc,
-                _ratios=ratios)
+                _ratios=ratios,
+                _transposed=is_transposed)
             
-            _encryption_unified = self.to_ciphertensor(mpc)
-            if mpc.pid - 1 == argmax(ratios):
-                new_mpp._encryption_unified = _encryption_unified
-
+            if is_transposed:
+                encrypted_partitions = []
+                for p in range(1, mpc.comms.number_of_parties):
+                    start, end = MPP.get_relative_indices(p, ratios)
+                    partition = self[start:end]
+                    encrypted_partitions.append(partition.to_ciphertensor(mpc))
+                
+                encrypted_partition = encrypted_partitions[mpc.pid - 1]
+                encrypted_partition._transposed = transpose_encryption
+                new_mpp._encryption_unified = encrypted_partition
+            else:
+                assert ratios.sum() == 1, "Sharetensor: invalid ratios for 1-dim MPC -> MPP conversion"
+                _encryption_unified = self.to_ciphertensor(mpc)
+                _encryption_unified._transposed = transpose_encryption
+                if mpc.pid - 1 == argmax(ratios):
+                    new_mpp._encryption_unified = _encryption_unified
+            
             return new_mpp
 
         else:
@@ -189,9 +204,11 @@ class MPP:
         if mpc.pid == 0:
             stensor = Sharetensor(self._local_data.tolist().to_int_t(self.modulus), self.modulus)
             if isinstance(dtype, float): stensor.fp = True
-            return stensor
+        else:
+            ctensor = self.join()
+            stensor = ctensor.to_sharetensor(mpc, self.modulus, source_pid=-1, S=S, dtype=dtype)
         
-        return self.join().to_sharetensor(mpc, self.modulus, source_pid=-1, S=S, dtype=dtype)
+        return stensor.T if self._transposed else stensor
 
 
 @extend
@@ -306,7 +323,7 @@ class InternalMPC:
                 sv.fp = x.is_fp() or y.is_fp()
                 return sv
             
-            if DEBUG: assert x.modulus == y.modulus, f"Non-matching moduli for factors: {x.modulus} != {y.modulus}"
+            assert x.modulus == y.modulus, f"Non-matching moduli for factors: {x.modulus} != {y.modulus}"
             modulus = x.modulus
 
             x_1_r, r_1 = x.get_partitions(mpc, force=False)
@@ -385,7 +402,7 @@ class InternalMPC:
             modulus = x.modulus
             return Sharetensor(mpc.boolean.greater_than_public(x.to_fp().share, double_to_fp(y, modulus), modulus), modulus)
         else:
-            if DEBUG: assert x.modulus == y.modulus
+            assert x.modulus == y.modulus
             modulus = x.modulus
             return Sharetensor(mpc.boolean.greater_than(x.share, y.share, modulus), modulus)
         
@@ -404,7 +421,7 @@ class InternalMPC:
             modulus = x.modulus
             return Sharetensor(mpc.boolean.less_than_public(x.to_fp().share, double_to_fp(y, modulus), modulus), modulus)
         else:
-            if DEBUG: assert x.modulus == y.modulus
+            assert x.modulus == y.modulus
             modulus = x.modulus
             return Sharetensor(mpc.boolean.less_than(x.share, y.share, modulus), modulus)
         
@@ -439,7 +456,7 @@ class InternalMPC:
             # sv.set_partitions(mpc.arithmetic.__beaver_partition(sv.share, modulus))
             return sv * x
         else:
-            if DEBUG: assert x.modulus == y.modulus
+            assert x.modulus == y.modulus
             modulus = x.modulus
             
             x_1_r, r_1 = x.get_partitions(mpc, force=False)
@@ -460,14 +477,14 @@ class InternalMPC:
             
             return sv
 
-    def dot(mpc, x, y):
-        if DEBUG: assert x.modulus == y.modulus
+    def dot(mpc, x, y, axis: int):
+        assert x.modulus == y.modulus
         modulus = x.modulus
 
         x_1_r, r_1 = x.get_partitions(mpc, force=False)
         x_2_r, r_2 = y.get_partitions(mpc, force=False)
 
-        c = mpc.arithmetic.__beaver_dot_prod(x_1_r, r_1, x_2_r, r_2, modulus)
+        c = mpc.arithmetic.__beaver_dot_prod(x_1_r, r_1, x_2_r, r_2, axis, modulus)
         c = mpc.arithmetic.__beaver_reconstruct(c, modulus)
 
         if x.is_fp() and y.is_fp():
@@ -483,11 +500,11 @@ class InternalMPC:
         
         return sv
 
-    def dot(mpc, x):
-        return InternalMPC.dot(mpc, x, x)
+    def dot(mpc, x, axis: int):
+        return InternalMPC.dot(mpc, x, x, axis)
 
     def matmul(mpc, x, y):
-        if DEBUG: assert x.modulus == y.modulus
+        assert x.modulus == y.modulus
         modulus = x.modulus
 
         x_1_r, r_1 = x.get_partitions(mpc, force=False)
@@ -607,31 +624,31 @@ class InternalMHE:
 
 
 class InternalMPP:
-    def dot(x):
-        return x.dot()
+    def dot(x, axis: int):
+        return x.dot(axis)
     
     def matmul(x, y):
         return x.matmul(y)
 
     def sqrt(x):
-        return InternalMPC.sqrt(x._mpc, x.to_sharetensor()).to_mpp(x._mpc, ratios=x._ratios, dtype=x.dtype)
+        return x.via_mpc(lambda stensor: InternalMPC.sqrt(x._mpc, stensor))
     
     def sqrt_inv(x, y):
-        return x * InternalMPC.sqrt_inv(y._mpc, 1, y.to_sharetensor()).to_mpp(y._mpc, ratios=y._ratios, dtype=y.dtype)
+        return x * y.via_mpc(lambda stensor: InternalMPC.sqrt_inv(y._mpc, 1, stensor))
 
 
 class InternalMPU:
-    def dot(x):
-        return x.dot()
+    def dot(x, axis: int):
+        return x.dot(axis)
     
     def matmul(x, y):
         return x @ y
 
     def sqrt(x):
-        return InternalMPC.sqrt(x.mpc, x.to_sharetensor()).to_mpu(x.mpc, dtype=x.dtype)
+        return x.via_mpc(lambda stensor: InternalMPC.sqrt(x.mpc, stensor))
     
     def sqrt_inv(x, y):
-        return x * InternalMPC.sqrt_inv(y.mpc, 1, y.to_sharetensor()).to_mpu(y._mpc, dtype=y.dtype)
+        return x * y.via_mpc(lambda stensor: InternalMPC.sqrt_inv(y.mpc, 1, stensor))
 
 
 class Internal:
@@ -722,26 +739,26 @@ class Internal:
     def secure_evalp(mpc, x_, coefs_, exps_):
         return InternalMPC.evalp(mpc, x_, coefs_, exps_)
 
-    def dot(mpc, x, y):
+    def dot(mpc, x, y, axis: int):
         if isinstance(x, Sharetensor) or isinstance(y, Sharetensor):
-            return InternalMPC.dot(mpc, x, y)
+            return InternalMPC.dot(mpc, x, y, axis)
         elif isinstance(x, Ciphertensor) or isinstance(y, Ciphertensor):
-            return InternalMHE.dot(mpc, x, y)
+            return InternalMHE.dot(mpc, x, y, axis)
         elif isinstance(x, ndarray):
-            return x.dot(y)
+            return x.dot(y, axis)
         else: compile_error("Invalid secure operands")
 
-    def dot(mpc, x):
+    def dot(mpc, x, axis: int):
         if isinstance(x, MPU):
-            return InternalMPU.dot(x)
+            return InternalMPU.dot(x, axis)
         elif isinstance(x, MPP):
-            return InternalMPP.dot(x)
+            return InternalMPP.dot(x, axis)
         elif isinstance(x, Sharetensor):
-            return InternalMPC.dot(mpc, x)
+            return InternalMPC.dot(mpc, x, axis)
         elif isinstance(x, Ciphertensor):
-            return InternalMHE.dot(mpc, x)
+            return InternalMHE.dot(mpc, x, axis)
         elif isinstance(x, ndarray):
-            return x.dot(x)
+            return x.dot(x, axis)
         else: compile_error("Invalid secure operands")
 
     def matmul(mpc, x, y):

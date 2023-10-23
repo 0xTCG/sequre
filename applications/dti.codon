@@ -3,10 +3,11 @@ import prg
 from sequre.utils.param import int_t, DEBUG
 from sequre.utils.io import read_matrix
 from sequre.utils.utils import zeros_mat
+from sequre.utils.stats import score_binary_classificator
 from sequre.types.utils import fp_to_double, double_to_fp
 from sequre.types.sharetensor import Sharetensor as Stensor
 from sequre.attributes import sequre
-from sequre.types.internal import InternalMPC, Internal as sq
+from sequre.types.internal import InternalMPC
 
 from utils.param import *
 from utils.data_sharing import shares_paths
@@ -157,7 +158,12 @@ def gradient_descent(mpc, X, y, W, b, dW, db, vW, vb):
     dscores = y.zeros()
     if (LOSS == "hinge"):
         y = y * 2 - 1
-        dscores = y * ((1 - y * scores) > 0)
+        hinge_loss = 1 - y * scores
+        hinge_loss_reg = (hinge_loss > 0)
+        if DEBUG:
+            _loss = hinge_loss * hinge_loss_reg
+            print(f"CP{mpc.pid}:\t\tTraining loss: {_loss.reveal(mpc).flatten().sum()}")
+        dscores = y * hinge_loss_reg
     else:
         dscores = y - scores
     dscores = dscores / len(X)
@@ -228,10 +234,10 @@ def train_model(mpc, X, y, W, b, dW, db, vW, vb):
                 return W, b
     
 
-def dti_protocol(mpc, test_run, modulus, run_redictions = True):
+def dti_mpc_protocol(mpc, test_run, modulus, run_predictions = True):
     if test_run: prg.seed(0)
     # Initialize model and data structures
-    print(f"Initializing model at CP{mpc.pid}...")
+    print(f"CP{mpc.pid}:\tInitializing model ...")
     W, dW, vW, b, db, vb = initialize_model(mpc, modulus)
 
     # Initialize data matrices
@@ -255,8 +261,93 @@ def dti_protocol(mpc, test_run, modulus, run_redictions = True):
                     fb.write(' '.join([str(e) for e in b_out]))
                     fw.write('\n')
     
-    if run_redictions:
+    if run_predictions:
         # TODO: #163 Organize files in whole project.
         return forward_pass(mpc, load_test_data(modulus), W, b)[-1]
     
     return W[0].zeros()
+
+
+from numpy.create import array, zeros_like
+
+from sequre.stdlib.learn.neural_net.layers import Input, Dense
+from sequre.stdlib.learn.neural_net.model import Sequential
+from sequre.types.multiparty_union import MPU
+
+
+def dti_mhe_protocol(mpc):
+    sample_size_per_party = 64
+    sample_size = (mpc.comms.number_of_parties - 1) * sample_size_per_party
+    sample_test_size_per_party = 16
+    sample_test_size = (mpc.comms.number_of_parties - 1) * sample_test_size_per_party
+
+    n_neurons = 64
+    feature_rank = 8192
+    output_size = 1
+    step_size = 0.2
+    momentum = 0.9
+    epochs = 1
+    batch_size = 64
+    optimizer = "mbgd"
+    loss = "hinge"
+
+    print(f"CP{mpc.pid}:\tMHE DTI: loading data ...")
+    with open("tests/data/dti/input/features.txt") as fx, open("tests/data/dti/input/labels.txt") as fy:
+        raw_X = read_matrix(fx, sample_size, FEATURE_RANK, False, TP=float)
+        raw_y = read_matrix(fy, sample_size, output_size, False, TP=float)
+    
+    with open("tests/data/dti/input/test_features.txt") as fx, open("tests/data/dti/input/test_labels.txt") as fy:
+        raw_test_X = read_matrix(fx, sample_test_size, FEATURE_RANK, False, TP=float)
+        raw_test_y = read_matrix(fy, sample_test_size, output_size, False, TP=float)
+    
+    if feature_rank != FEATURE_RANK:
+        raw_X = raw_X.pad(sample_size, feature_rank)
+        raw_test_X = raw_test_X.pad(sample_size, feature_rank)
+
+    print(f"CP{mpc.pid}:\tMHE DTI: shuffling data ...")
+    mpc.randomness.freeze_seed(-1)
+    prg.shuffle(raw_X)
+    mpc.randomness.unfreeze_seed(-1)
+    prg.shuffle(raw_y)
+    mpc.randomness.restore_seed(-1)
+
+    np_X = array(raw_X)
+    np_y = array(raw_y) * 2 - 1
+    np_test_X = array(raw_test_X)
+
+    # # Plain
+    # X = np_X
+    # y = np_y
+    # test_X = np_test_X
+    
+    # MPU
+    print(f"CP{mpc.pid}:\tMHE DTI: partitioning data ...")
+    X_partition = zeros_like(np_X) if mpc.pid == 0 else np_X[(mpc.pid - 1) * sample_size_per_party:mpc.pid * sample_size_per_party]
+    y_partition = zeros_like(np_y) if mpc.pid == 0 else np_y[(mpc.pid - 1) * sample_size_per_party:mpc.pid * sample_size_per_party]
+    test_X_partition = zeros_like(np_test_X) if mpc.pid == 0 else np_test_X[(mpc.pid - 1) * sample_test_size_per_party:mpc.pid * sample_test_size_per_party]
+    X = MPU(mpc, X_partition, "partition")
+    y = MPU(mpc, y_partition, "partition")
+    test_X = MPU(mpc, test_X_partition, "partition")
+    
+    layers = (
+        Input[type(X)](feature_rank),
+        Dense[type(X)]("relu", n_neurons, "normal", "zeros"),
+        Dense[type(X)]("linear", output_size, "normal", "zeros"))
+    
+    print(f"CP{mpc.pid}:\tMHE DTI: compiling sequential model ...")
+    model = Sequential(layers).compile(mpc, loss=loss, optimizer=optimizer)
+    
+    print(f"CP{mpc.pid}:\tMHE DTI: training sequential model ...")
+    model.fit(mpc, X=X, y=y, step=step_size, epochs=epochs, momentum=momentum, batch_size=batch_size)
+    
+    loss = model.get_loss(mpc, X, y).reveal().sum()
+    print(f"CP{mpc.pid}:\tMHE DTI final training loss: {loss}")
+
+    prediction = model.predict(mpc, test_X).reveal(mpc)
+    accuracy, precision, recall, f1 = score_binary_classificator(prediction.flatten().tolist(), raw_test_y.flatten().astype(int) * 2 - 1)
+    print(
+        f"CP{mpc.pid}:\tMHE DTI accuracy stats:\n"
+        f"\t\tAccuracy: {accuracy}.\n"
+        f"\t\tPrecision: {precision}.\n"
+        f"\t\tRecall: {recall}.\n"
+        f"\t\tF1: {f1}.\n")
