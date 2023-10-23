@@ -1,11 +1,15 @@
+""" Principal component analysis module """
+
 import secure_operator
 
 from numpy.create import zeros, array
 
 from sequre.attributes import sequre, mhe_cipher_opt
-from sequre.stdlib.lin_alg import orthonormalize, eigen_decomp
+from sequre.stdlib.lin_alg import orthonormalize, eigen_decomp, householder
 from sequre.types.internal import Internal
 from sequre.utils.utils import random_ints
+
+from sequre.types.sharetensor import Sharetensor
 
 
 class RandomSketching:
@@ -18,8 +22,8 @@ class RandomSketching:
 
         for data_row, miss_row in zip(data, miss):
             with mpc.randomness.seed_switch(-1):
-                bucket_index = kp.rand(kp) - 1
-                rand_sign = (kp.rand(2) - 1) * 2 - 1
+                bucket_index = kp.rand(kp, "uniform") - 1
+                rand_sign = (kp.rand(2, "uniform") - 1) * 2 - 1
 
             # Flip miss bits so it points to places where g_mean should be subtracted
             flip_miss = (1 - miss_row)
@@ -102,116 +106,55 @@ def random_pca_without_norm(mpc, data, data_mean, top_components_count, oversamp
 
 
 @sequre
-def dhh_experimental(mpc, x):
-    """
-    Algorithm 2 from https://arxiv.org/abs/2304.00129
-    """
-    x_dot = x.dot(mpc, axis=0).aggregate(mpc)
-    x_dot_share = x_dot.to_sharetensor(mpc, modulus=mpc.base_modulus, source_pid=-1, S=type(()), dtype=float)
-    x_share = x.to_sharetensor(mpc, modulus=mpc.base_modulus, source_pid=1, S=Tuple[int], dtype=float)
-    shift_share = Internal.sqrt(mpc, x_dot_share) * ((x_share[0] > 0).astype(float) * 2 - 1)
-    x_share[0] += shift_share
-    divisor_share = 1 / Internal.sqrt(mpc, (x_dot_share + x_share[0] * shift_share) * 2)
-    x_at_first = (x_share * divisor_share).to_ciphertensor(mpc)
-    x_at_other = x.via_mpc(mpc, lambda stensor: secure_operator.mul(mpc, stensor, divisor_share), exclude_parties={1}, S=Tuple[int])
-    return x_at_first if mpc.pid == 1 else x_at_other
-
-
-@sequre
-@mhe_cipher_opt
-def dqr_experimental(mpc, v_local):
+def dqr_experimental(mpc, v_mpp, cp_1_size):
     """
     Algorithm 3 from https://arxiv.org/abs/2304.00129
     """
-    delta, h = v_local.shape
-    h_local = v_local.copy()
-    
-    for i in range(delta):
-        print(f"CP{mpc.pid}:\tDQR^T forward step {i + 1} ...")
-        v = dhh_experimental(mpc, v_local[0])
-        h_local[i] = v
-        v_prime = (v_local @ v.expand_dims().T).aggregate(mpc)
-        
-        for j in range(delta - i):
-            v_prime_j = v_prime[j]
-            v_prime_j.shape = [h]  # Lazy extend to match shapes downstream
-            v_local[j] -= v * v_prime_j * 2
-        
-        for j in range(delta - i - 1):
-            v_local[j] = v_local[j + i].rotate(mpc, 1)
-    
-    q_local = v_local.I(mpc)
+    rho, _ = v_mpp.shape
+    v_cache = []
 
-    for i in range(delta - 1, -1, -1):
-        print(f"CP{mpc.pid}:\tDQR^T backward step {i + 1} ...")
-        h_i = h_local[i].rotate(mpc, -i)
-        h_prime = (q_local @ h_i.expand_dims().T).aggregate(mpc)
-        
-        for j in range(delta):
-            h_prime_j = h_prime[j]
-            h_prime_j.shape = [h]  # Lazy extend to match shapes downstream
-            q_local[j] -= h_i * h_prime_j * 2
+    for i in range(rho):
+        v = householder(mpc, v_mpp[0]).expand_dims()  # 1 x n
+        v_cache.append(v)
+        v_mpp -= v_mpp @ v.T @ v * 2  # rho x n
+
+        v_mpp = v_mpp.slice_local(rho - i - 1, cp_1_size)  # TODO: Figure out a better way to do this step
     
-    return q_local
+    q_mpp = v_mpp.I.encrypt()  # TODO: Remove .encrypt and debug downstream to drastically improve performance
+
+    for i in range(rho - 1, -1, -1):
+        v = v_cache[i].rotate_local(-i, cp_1_size)
+        q_mpp -= q_mpp @ v.T @ v
+    
+    return q_mpp
 
 
 @sequre
-@mhe_cipher_opt
-def random_pca_experimental(mpc, local_data, top_components_count, oversampling_count, power_iterations_count):
+def random_pca_experimental(mpc, data_mpp, top_components_count, oversampling_count, power_iterations_count, cp_1_size):
     """
-    Algorithm 1 from https://arxiv.org/abs/2304.00129
-
-    local_data is (A-tilde - o) in the algorithm
-    top_components_count is phi in the algorithm
-    oversampling_count is alpha in the algorithm
+    Algorithm 1 from https://arxiv.org/abs/2304.00129 via MPP
     """
-    from sequre.types.ciphertensor import Ciphertensor
-    from sequre.lattiseq.ckks import Ciphertext
-
     # Steps 1 and 2 are skipped: local data is mean centered
     rho = top_components_count + oversampling_count
     
     # Step 3:
-    pi_local = RandomSketching.generate_sketch_matrix((rho, len(local_data)))  # rho x n_i
-    p = Ciphertensor[Ciphertext].enc(mpc, pi_local @ local_data).aggregate(mpc)  # rho x m
+    pi_public = RandomSketching.generate_sketch_matrix((rho, len(data_mpp)))  # rho x n
+    p_mpa = pi_public @ data_mpp  # rho x m
 
     # Step 4 (Seq):
     for _ in range(power_iterations_count):
         print(f"CP{mpc.pid}:\tPCA powers iteration {_ + 1}/{power_iterations_count} ...")
         # DQR:
-        r_local = dqr_experimental(mpc, p @ local_data.T)  # rho x n_i
-        p = (r_local @ local_data).aggregate(mpc)  # rho x m
+        r_mpp = dqr_experimental(mpc, p_mpa @ data_mpp.T, cp_1_size)  # rho x n
+        p_mpa = r_mpp @ data_mpp  # rho x m
     
     # Step 5 (Seq):
-    z_local = p @ local_data.T  # rho x n_i
-    z_cov = (z_local @ z_local.T).aggregate(mpc)  # rho x rho
+    z_mpp = p_mpa @ data_mpp.T  # rho x n
+    z_cov_mpa = z_mpp @ z_mpp.T  # / data_mpp.shape[1]  # rho x rho
     
     # Step 6
-    return z_cov.via_mpc(mpc, lambda stensor: eigen_decomp(mpc, stensor)[0][:top_components_count, :rho], mirrored=True, S=Tuple[int, int])
+    u_mpa = z_cov_mpa.via_mpc(
+        lambda stensor: eigen_decomp(mpc, stensor)[0][:top_components_count])  # top_components_count x rho
 
-
-# @sequre
-# def random_pca_mpu(mpc, data_mpp, top_components_count, oversampling_count, power_iterations_count):
-#     """
-#     Algorithm 1 from https://arxiv.org/abs/2304.00129 via MPP
-#     """
-#     # Steps 1 and 2 are skipped: local data is mean centered
-#     rho = top_components_count + oversampling_count
-    
-#     # Step 3:
-#     pi_public = RandomSketching.generate_sketch_matrix((rho, len(data_mpp)))  # rho x n
-#     p_mpa = pi_public @ data_mpp  # rho x m
-
-#     # Step 4 (Seq):
-#     for _ in range(power_iterations_count):
-#         print(f"CP{mpc.pid}:\tPCA powers iteration {_ + 1}/{power_iterations_count} ...")
-#         # DQR:
-#         r_mpp = dqr_mpu(mpc, p_mpa @ data_mpp.T)  # rho x n
-#         p_mpa = r_mpp @ data_mpp  # rho x m
-    
-#     # Step 5 (Seq):
-#     z_mpp = p_mpa @ data_mpp.T  # rho x n
-#     z_cov_mpa = z_mpp @ z_mpp.T  # rho x rho
-    
-#     # Step 6
-#     return z_cov_mpa.via_mpc(mpc, lambda stensor: eigen_decomp(mpc, stensor)[0][:top_components_count, :rho], mirrored=True, S=Tuple[int, int])
+    # Step 7
+    return u_mpa @ z_mpp  # top_components_count x n

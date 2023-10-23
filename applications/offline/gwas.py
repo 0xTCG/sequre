@@ -91,10 +91,14 @@ def offline_gwas(pheno_path, cov_path, snp_pos_path, geno_path, miss_path, num_i
     # TODO: Implement QC
 
     selected = locus_distance_filter(snp_pos, ld_dist_thres)
-
     maf = np.nan_to_num(dosage.sum(axis=0) / ((num_inds - miss.sum(axis=0)) * 2))
+
+    # Mean centered and normalized
     g_std_bern = np.sqrt(maf * (1 - maf))
     standardized_dosage = np.nan_to_num((dosage - (1 - miss) * maf * 2) / g_std_bern)[:,selected]
+
+    # # Mean centered only
+    # standardized_dosage = np.nan_to_num((dosage - (1 - miss) * maf * 2))[:,selected]
 
     print(f'Selected {standardized_dosage.shape[0]} individuals and {standardized_dosage.shape[1]} SNPs.')
 
@@ -116,16 +120,16 @@ def offline_gwas(pheno_path, cov_path, snp_pos_path, geno_path, miss_path, num_i
 
 
 kwargs = {
-    'pheno_path': 'data/gwas/input/lung_reduced/pheno.txt',
-    'cov_path': 'data/gwas/input/lung_reduced/cov.txt',
-    'snp_pos_path': 'data/gwas/input/lung_reduced/pos.txt',
-    'geno_path': 'data/gwas/input/lung_reduced/geno.txt',
-    'miss_path': 'data/gwas/input/lung_reduced/miss.txt',
-    'num_inds': 1000,
-    'num_snps': 30000,
-    'num_covs': 10,
-    'top_components': 3,
-    'ld_dist_thres': 10000
+    'pheno_path': 'data/sf-gwas/pos_pheno.txt',
+    'cov_path': 'data/sf-gwas/cov.txt',
+    'snp_pos_path': 'data/sf-gwas/pos.txt',
+    'geno_path': 'data/sf-gwas/geno.txt',
+    'miss_path': 'data/sf-gwas/miss.txt',
+    'num_inds': 32,
+    'num_snps': 8192,
+    'num_covs': 2,
+    'top_components': 2,
+    'ld_dist_thres': 1
 }
 
 with open('log.txt', 'w') as f:

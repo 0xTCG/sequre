@@ -1,0 +1,117 @@
+import time
+
+from numpy.create import ones, array, zeros_like
+
+from ..utils import assert_eq, assert_eq_approx
+
+from sequre.types.sharetensor import Sharetensor
+from sequre.types.multiparty_partition import MPP
+from sequre.types.multiparty_union import MPU
+from sequre.utils.utils import random_floats
+from sequre.mpc.env import MPCEnv
+from sequre.stdlib.learn.lin_reg import LinReg
+
+
+def test_lin_reg[TP](mpc: MPCEnv[TP], modulus: TP):
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    print(f'CP{mpc.pid}:\tTesting Sequre linear regression on {alg_struct} ... \n')
+
+    rows_per_party = 4
+    cols_per_party = 15
+    with mpc.randomness.seed_switch(-1):
+        X = array(random_floats(((mpc.comms.number_of_parties - 1) * rows_per_party, cols_per_party)))
+        target_w = array(random_floats((cols_per_party, 1), scale=1))
+        target_b = 1.0
+        y = X @ target_w + target_b
+    target_w = target_w.vstack(array([[target_b]]))
+
+    mpc_X = Sharetensor.enc(mpc, X, 0, modulus)
+    mpc_y = Sharetensor.enc(mpc, y, 0, modulus)
+    
+    mpp_X = MPP(mpc, zeros_like(X) if mpc.pid == 0 else X[(mpc.pid - 1) * rows_per_party:mpc.pid * rows_per_party])
+    mpp_y = MPP(mpc, zeros_like(y) if mpc.pid == 0 else y[(mpc.pid - 1) * rows_per_party:mpc.pid * rows_per_party])
+
+    mpu_X = MPU(mpc, mpp_X._local_data, "partition")
+    mpu_y = MPU(mpc, mpp_y._local_data, "partition")
+
+    mpc.comms.sequential(lambda: print(f"CP{mpc.pid}:\tLinear regression train data for debugging on {alg_struct}:", X), False)
+    if mpc.pid > 0:
+        assert_eq_approx(f"CP{mpc.pid}:\tSafe-checking linear regression data loading (MPC) on {alg_struct}", mpc_X.reveal(mpc), X)
+        assert_eq_approx(f"CP{mpc.pid}:\tSafe-checking linear regression data loading (MPP) on {alg_struct}", mpp_X.reveal(mpc), X)
+        assert_eq_approx(f"CP{mpc.pid}:\tSafe-checking linear regression data loading (MPU) on {alg_struct}", mpu_X.reveal(mpc), X)
+
+    step_size = 0.001
+    epochs = 2
+
+    features_size = cols_per_party + 1
+    raw_initial_w = ones((features_size, 1))
+    mpc_initial_w = Sharetensor.enc(mpc, raw_initial_w, 0, modulus)
+    
+    s = time.time()
+    raw_lin_reg = LinReg(raw_initial_w).fit(mpc, X=X, y=y, step=step_size, epochs=epochs)
+    e = time.time()
+    plaintext_time = e - s
+    print(f'CP{mpc.pid}:\tRuntimes:\n\t\tPlaintext: {plaintext_time}s\n')    
+    
+    s = time.time()
+    mpc_lin_reg = LinReg(mpc_initial_w).fit(mpc, X=mpc_X, y=mpc_y, step=step_size, epochs=epochs)
+    e = time.time()
+    mpc_time = e - s
+    print(f'CP{mpc.pid}:\tRuntimes:\n\t\tMPC: {mpc_time}s\n')
+
+    raw_w = raw_lin_reg.coef_
+    mpc_w = mpc_lin_reg.coef_
+
+    if mpc.pid == 0:
+        assert_eq(f"CP{mpc.pid}:\tSafe-checking linear regression result shape (MPC) on {alg_struct}", mpc_w.shape, list(raw_w.shape))
+    else:
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre linear regression (MPC) on {alg_struct}", mpc_w.reveal(mpc), raw_w)
+    
+    mpp_initial_w = MPP(
+        mpc, zeros_like(raw_initial_w) if mpc.pid == 0 else raw_initial_w[
+            (mpc.pid - 1) * features_size // (mpc.comms.number_of_parties - 1):mpc.pid * features_size // (mpc.comms.number_of_parties - 1)])
+    
+    s = time.time()
+    mpp_lin_reg = LinReg(mpp_initial_w.copy()).fit(mpc, X=mpp_X, y=mpp_y, step=step_size, epochs=epochs)
+    e = time.time()
+    mpp_time = e - s
+    print(f'CP{mpc.pid}:\tRuntimes:\n\t\tMPP: {mpp_time}s\n')
+    
+    mpp_w = mpp_lin_reg.coef_
+
+    if mpc.pid == 0:
+        assert_eq(f"CP{mpc.pid}:\tSafe-checking linear regression result shape (MPP) on {alg_struct}", mpp_w.shape, raw_w.shape)
+    else:
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre linear regression (MPP) on {alg_struct}", mpp_w.reveal(mpc), raw_w)
+
+    mpu_initial_w = MPU(mpc, raw_initial_w if mpc.pid == 1 else zeros_like(raw_initial_w), "aggregate")
+    
+    s = time.time()
+    mpu_lin_reg = LinReg(mpu_initial_w).fit(mpc, X=mpu_X, y=mpu_y, step=step_size, epochs=epochs)
+    e = time.time()
+    mpu_via_mpa_time = e - s
+    print(f'CP{mpc.pid}:\tRuntimes:\n\t\tMPU/MPA: {mpu_via_mpa_time}s\n')
+    
+    mpu_w = mpu_lin_reg.coef_
+
+    if mpc.pid == 0:
+        assert_eq(f"CP{mpc.pid}:\tSafe-checking linear regression result shape (MPU via MPA weights) on {alg_struct}", mpu_w.shape, raw_w.shape)
+    else:
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre linear regression (MPU via MPA weights) on {alg_struct}", mpu_w.reveal(mpc), raw_w)
+    
+    mpu_initial_w = MPU(mpc, mpp_initial_w._local_data, "partition")
+    
+    s = time.time()
+    mpu_lin_reg = LinReg(mpu_initial_w).fit(mpc, X=mpu_X, y=mpu_y, step=step_size, epochs=epochs)
+    e = time.time()
+    mpu_via_mpp_time = e - s
+    print(f'CP{mpc.pid}:\tRuntimes:\n\t\tMPU/MPP: {mpu_via_mpp_time}s\n')
+    
+    mpu_w = mpu_lin_reg.coef_
+
+    if mpc.pid == 0:
+        assert_eq(f"CP{mpc.pid}:\tSafe-checking linear regression result shape (MPU via MPP weights) on {alg_struct}", mpu_w.shape, raw_w.shape)
+
+    print(f'CP{mpc.pid}:\tSequre linear regression on {alg_struct} tests passed.\n')
+    print(f'CP{mpc.pid}:\tRuntimes:\n\t\tPlaintext: {plaintext_time}s\n\t\tMPC: {mpc_time}s\n\t\tMPP: {mpp_time}s\n\t\tMPU/MPA: {mpu_via_mpa_time}s\n\t\tMPU/MPP: {mpu_via_mpp_time}s\n')
+    

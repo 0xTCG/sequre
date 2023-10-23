@@ -46,7 +46,7 @@ echo "Seq-lang plugin found at $SEQURE_SEQ_PATH"
 echo "Numpy plugin found at $SEQURE_NUMPY_PATH"
 echo "Sequre plugin found at $SEQURE_PATH"
 echo "Compiling $2 in $1 mode ..."
-GC_INITIAL_HEAP_SIZE=8179869184 codon run -plugin $SEQURE_PATH -plugin $SEQURE_SEQ_PATH -plugin $SEQURE_NUMPY_PATH $1 scripts/invoke.codon run-$2 ${*:3}
+GC_INITIAL_HEAP_SIZE=8179869184 $SEQURE_CODON_PATH/build/codon run -plugin $SEQURE_PATH -plugin $SEQURE_SEQ_PATH -plugin $SEQURE_NUMPY_PATH $1 scripts/invoke.codon run-$2 ${*:3}
 
 echo "Cleaning up sockets ..."
 find  . -name 'sock.*' -exec rm {} \;

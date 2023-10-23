@@ -10,6 +10,8 @@ const std::string ckksCiphertextTypeName = "std.sequre.lattiseq.ckks.Plaintext";
 const std::string sharetensorTypeName = "std.sequre.types.sharetensor.Sharetensor";
 const std::string cipherTensorTypeName = "std.sequre.types.ciphertensor.Ciphertensor";
 const std::string MPPTypeName = "std.sequre.types.multiparty_partition.MPP";
+const std::string MPATypeName = "std.sequre.types.multiparty_aggregate.MPA";
+const std::string MPUTypeName = "std.sequre.types.multiparty_union.MPU";
 
 
 bool isSequreFunc( Func *f ) {
@@ -56,8 +58,20 @@ bool isMPP( types::Type *t ) {
   return t->getName().rfind(MPPTypeName, 0) == 0;
 }
 
+bool isMPA( types::Type *t ) {
+  return t->getName().rfind(MPATypeName, 0) == 0;
+}
+
+bool isMPU( types::Type *t ) {
+  return t->getName().rfind(MPUTypeName, 0) == 0;
+}
+
+bool isMP( types::Type *t ) {
+  return isMPP(t) || isMPA(t) || isMPU(t);
+}
+
 bool isSecureContainer( types::Type *t ) {
-  return isSharetensor(t) || isCiphertensor(t) || isMPP(t);
+  return isSharetensor(t) || isCiphertensor(t) || isMP(t);
 }
 
 bool isMPC( Value *value ) {
