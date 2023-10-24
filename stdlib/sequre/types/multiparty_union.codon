@@ -8,6 +8,7 @@ from sequre.lattiseq.ckks import Ciphertext
 from sequre.types.ciphertensor import Ciphertensor
 from sequre.types.multiparty_partition import MPP
 from sequre.types.multiparty_aggregate import MPA
+from sequre.utils.constants import HE_ENC_COST_ESTIMATE
 
 
 # Multiparty union
@@ -362,6 +363,12 @@ class MPU[S, dtype]:
             _mpp=self._mpp.ones(*args),
             _mpa=MPA[S, dtype](self._mpp._mpc))
     
+    @staticmethod
+    def rand(shape: S, distribution: str, mpc) -> MPU[S, dtype]:
+        return MPU[S, dtype](
+            _mpp=MPP[S, dtype](mpc),
+            _mpa=MPA[S, dtype].rand(shape, distribution, mpc))
+
     def pad_with_value(self, val, size: int, axis: int, *args) -> MPU[S, dtype]:
         self.check_valid()
         
@@ -374,11 +381,111 @@ class MPU[S, dtype]:
             _mpp=self._mpp.pad_with_value(val, size, axis, *args),
             _mpa=MPA[S, dtype](self._mpp._mpc))
 
+    def get_matmul_cost(self, other) -> float:
+        self.check_valid()
+        
+        if isinstance(other, ndarray):
+            return self._get_matmul_public_cost(other)
+
+        if self.is_mpa() and other.is_mpa():
+            return self._mpa.get_matmul_cost(other._mpa)
+        
+        if self.is_mpp() and other.is_mpp():
+            if self._mpp._transposed:
+                return MPU[S, dtype]._get_matmul_mpp_t_mpp_cost(self._mpp, other._mpp)
+
+            return self._mpp.get_matmul_cost(other._mpp)
+        
+        if self.is_mpa():
+            return MPU[S, dtype]._get_matmul_mpa_mpp_cost(self._mpa, other._mpp)
+        
+        return MPU[S, dtype]._get_matmul_mpp_mpa_cost(self._mpp, other._mpa)
+
+    def _get_matmul_public_cost(self, other: ndarray[S, dtype]) -> float:
+        if self.is_mpa():
+            return self._mpa.get_matmul_cost(other)
+        
+        if self._mpp._transposed:
+            start, stop = self._mpp.get_relative_indices()
+            return MPU[S, dtype]._get_matmul_mpp_t_mpp_cost(self._mpp, MPP[S, dtype](self._mpp.mpc, other[start:stop], self._mpp._ratios))
+
+        return self._mpp.get_matmul_cost(other)
+
     @staticmethod
-    def rand(shape: S, distribution: str, mpc) -> MPU[S, dtype]:
-        return MPU[S, dtype](
-            _mpp=MPP[S, dtype](mpc),
-            _mpa=MPA[S, dtype].rand(shape, distribution, mpc))
+    def _get_matmul_mpa_mpp_cost(mpa: MPA[S, dtype], mpp: MPP[S, dtype]) -> float:
+        if mpp._transposed:
+            return MPU[S, dtype]._get_matmul_mpa_mpp_t_cost(mpa, mpp)
+        
+        return MPU[S, dtype]._get_matmul_mpp_mpa_cost(mpp.T, mpa.T)
+    
+    @staticmethod
+    def _get_matmul_mpp_mpa_cost(mpp: MPP[S, dtype], mpa: MPA[S, dtype]) -> float:
+        if mpp._transposed:
+            return MPU[S, dtype]._get_matmul_mpp_t_mpa_cost(mpp, mpa)
+        
+        return MPU[S, dtype]._get_matmul_mpp_nt_mpa_cost(mpp, mpa)
+
+    @staticmethod
+    def _get_matmul_mpp_t_mpp_cost(first: MPP[S, dtype], other: MPP[S, dtype]) -> float:
+        slots = first._mpc.he.crypto_params.params.slots()
+        
+        if first.is_empty() or other.is_empty() or first._mpc.pid == 0:
+            matmul_cost = 0.0
+        elif first.is_local() and other.is_local():
+            matmul_cost = first._local_data.T.get_matmul_cost(other._local_data)
+        elif first.is_local():
+            matmul_cost = first._local_data.T.get_matmul_cost(other._encryption_unified) + HE_ENC_COST_ESTIMATE * Ciphertensor._count_ciphers(first._local_data.shape, slots)
+        elif other.is_local():
+            matmul_cost = first._encryption_unified.T.get_matmul_cost(other._local_data) + HE_ENC_COST_ESTIMATE * Ciphertensor._count_ciphers(other._local_data.shape, slots)
+        else:
+            matmul_cost = first._encryption_unified.T.get_matmul_cost(other._encryption_unified)
+        
+        return max(first._mpc.comms.collect(matmul_cost, True))
+    
+    @staticmethod
+    def _get_matmul_mpa_mpp_t_cost(mpa: MPA[S, dtype], mpp: MPP[S, dtype]) -> float:
+        slots = mpa._mpc.he.crypto_params.params.slots()
+        _agg = Ciphertensor[Ciphertext].placeholder(list(mpa.shape), slots)
+
+        if mpp.is_empty() or mpp._mpc.pid == 0:
+            cost = 0.0
+        elif mpp.is_local():
+            cost = _agg.get_matmul_cost(mpp._local_data.T)
+        else:
+            cost = _agg.get_matmul_cost(mpp._encryption_unified.T)
+
+        return max(mpa._mpc.comms.collect(cost, True)) + HE_ENC_COST_ESTIMATE * Ciphertensor._count_ciphers(mpa.shape, slots)
+
+    @staticmethod
+    def _get_matmul_mpp_t_mpa_cost(mpp: MPP[S, dtype], mpa: MPA[S, dtype]) -> float:
+        mpc = mpp._mpc
+        slots = mpa._mpc.he.crypto_params.params.slots()
+
+        start, stop = mpp.get_relative_indices()
+        other = MPP[S, dtype](mpc, Ciphertensor[Ciphertext].placeholder([stop - start, mpa.shape[1]], slots), mpp._ratios)
+
+        if mpp.is_empty() or mpp._mpc.pid == 0:
+            cost = 0.0
+        elif mpp.is_local():
+            cost = mpp._local_data.T.get_matmul_cost(other._encryption_unified)
+        else:
+            cost = mpp._encryption_unified.T.get_matmul_cost(other._encryption_unified)
+        
+        return max(mpa._mpc.comms.collect(cost, True)) + HE_ENC_COST_ESTIMATE * Ciphertensor._count_ciphers(mpa.shape, slots)
+
+    @staticmethod
+    def _get_matmul_mpp_nt_mpa_cost(mpp: MPP[S, dtype], mpa: MPA[S, dtype]) -> float:
+        slots = mpa._mpc.he.crypto_params.params.slots()
+
+        _agg = Ciphertensor[Ciphertext].placeholder(list(mpa.shape), slots)
+        if mpp.is_empty() or mpp._mpc.pid == 0:
+            cost = 0.0
+        elif mpp.is_local():
+            cost = mpp._local_data.get_matmul_cost(_agg)
+        else:
+            cost = mpp._encryption_unified.get_matmul_cost(_agg)
+        
+        return max(mpa._mpc.comms.collect(cost, True)) + HE_ENC_COST_ESTIMATE * Ciphertensor._count_ciphers(mpa.shape, slots)
 
     def _sum_mpp(self, axis: int) -> MPU[Tuple[int], dtype]:
         assert self.is_mpp(), "MPU: cannot sum empty MPP"
