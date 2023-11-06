@@ -15,130 +15,22 @@ And then run the install script:
 ```bash
 source scripts/install.sh
 ```
-This will:
-- Clone and install a version of [Seq](https://github.com/seq-lang/seq) that contains Sequre-related intermediate representation (IR) transformations.
-- Build the source for both Seq and Sequre.
 
 ### Test run
 
 Execute
 ```bash
-scripts/run.sh benchmarks --playground --local
+scripts/run.sh -release benchmarks --playground --local
 ```
 to run the sample code from [playground.codon](playground.codon) that contains the benchmarks from [Hastings _et al._](https://github.com/MPC-SoK/frameworks).
 
 This run will execute the code in a local, single machine, environment over inter-process communication channels (AF_UNIX). For running the codebase in a different environment, see [run instructions](#run-instructions).
 
-## Run instructions
-
-Use `./sequre` script to execute Sequre both on server and client end.
-
-Server run command: _(`<pid>` denotes the ID of the computing party: 0, 1, 2, 3, ...)_
-```bash
-./sequre foo.codon <pid>
-```
-
-Client run command:
-```bash
-./sequre bar.codon
-```
-
-See the [example](#running-the-example) for a sample run at the `localhost`.
-
-## Running the example
-
-The [example](example) folder contains the running example of a typical multiparty computation use-case in Sequre. It implements a secure variant of [PlassClass](https://github.com/Shamir-Lab/PlasClass)---a binary classification tool for distinguishing whether a genomic sequence
-originates from a plasmid sequence or a chromosomal segment.
-
-Folder contains:
-- `client.codon` - Local source code executed by each client (data owner) locally. It contains a data processing step, followed by a secret sharing routine that initiates secure computing on the servers.
-- `server.codon` - Online source code executed by each untrusted computing party. It contains a data pooling routine that gathers the secret-shared data from the clients and conducts secure training of a linear support vector machine on top of it.
-
-### Localhost run
-
-To run the example locally, execute `example/server.codon` in a separate terminal for each computing party `<pid>`:
-```bash
-./sequre example/server.codon <pid>
-```
-
-Finally, initiate the secret sharing of the data and, consequentially, secure training on top of it by running the client's code:
-
-```bash
-./sequre example/client.codon
-```
-
-Example (condensed into a single terminal for simplicity):
-```bash
-./sequre example/server.codon 0 & \
-./sequre example/server.codon 1 & \
-./sequre example/server.codon 2 & \
-./sequre example/client.codon
-```
-**Note:** Expect obfuscated output (and possibly some minor warning messages) if running in a single terminal. Each party will output the results into the same terminal.
-
-### Online run
-
-To run the same procedure on multiple machines, [install Sequre](#quick-start) and reconfigure the network within Sequre's [settings file](dsl/settings.codon) at each machine separately.
-
-Example network configuration (`dsl/settings.codon` --- the IP addresses are fictional):
-```python
-# IPs
-TRUSTED_DEALER = '8.8.8.8'  # Trusted dealer
-COMPUTING_PARTIES = [
-    '9.9.9.9',  # First computing party (CP1)
-    '10.10.10.10'  # Second computing party (CP2)
-    ]
-```
-
-Then at `8.8.8.8` run
-```bash
-./sequre example/server.codon 0
-```
-
-At `9.9.9.9` run:
-```bash
-./sequre example/server.codon 1
-```
-
-At `10.10.10.10` run:
-```bash
-./sequre example/server.codon 2
-```
-
-And finally, at your client's machine, run:
-```bash
-./sequre example/client.codon
-```
-
-**Note:** Make sure to set the same network settings (IP addresses) at each computing party, including the client.
-
-
-## Sequre's network config
-
-Sequre can operate in two network modes:
-- Local: using the inter-process communication (AF_UNIX) sockets.
-- Online: using the TCP (AF_INET) sockets.
-
-If using the online mode, make sure to configure the network within Sequre's [settings file](dsl/settings.codon) at each machine separately.
-
-Example network configuration (`dsl/settings.codon` --- the IP addresses are fictional):
-```python
-# IPs
-TRUSTED_DEALER = '8.8.8.8'  # Trusted dealer
-COMPUTING_PARTIES = [
-    '9.9.9.9',  # First computing party (CP1)
-    '10.10.10.10'  # Second computing party (CP2)
-    ]
-```
-
-**Note:** `./sequre` command operates only in an online setup at the moment.
-
-
 ## Running playground, tests, and benchmarks
 
 For running [tests](#running-tests), [benchmarks](#running-benchmarks), and [playground](#running-playground), we recommend using the `scripts/run.sh` script:
 ```bash
-srcipts/run.sh <program> [<pid>] [--local] [--use-ring] [--unit | --all]
+scripts/run.sh -release <program> [<pid>] [--local] [--use-ring] [--unit | --all]
 ```
 where:
 - `<program>` is either `tests` or `benchmarks`.
@@ -150,9 +42,9 @@ where:
 
 Example invocation of unit tests in a `localhost` in an online network environment: (use multiple terminals for clear output)
 ```bash
-srcipts/run.sh tests --unit 0 & \
-srcipts/run.sh tests --unit 1 & \
-srcipts/run.sh tests --unit 2
+scripts/run.sh -release tests --unit 0 & \
+scripts/run.sh -release tests --unit 1 & \
+scripts/run.sh -release tests --unit 2
 ```
 
 **Note:** Each run bellow is executed in a local setup. Online run is also possible. See [example](#online-run) above for a step-by-step guide and/or [Sequre's network config](#sequres-network-config) for details.
@@ -164,40 +56,58 @@ Use it to quickly explore Sequre and its [features](https://github.com/0xTCG/seq
 
 Example invocation:
 ```bash
-scripts/run.sh benchmarks --local --use-ring --playground
+scripts/run.sh -release benchmarks --local --use-ring --playground
 ```
 
 ### Running tests
 
 To run all [unit tests](tests/unit_tests) execute:
 ```bash
-scripts/run.sh tests --local --unit
+scripts/run.sh -release tests --local --unit
 ```
 
 This will execute all unit tests [locally](#sequres-network-config), on a single machine.
 
 Replace the `--unit` flag with `--all` flag to include the end-to-end tests for genome-wide association study, drug-target interaction inference, and metagenomic classifiers as well:
 ```bash
-scripts/run.sh tests --local --all
+scripts/run.sh -release tests --local --all
 ```
 
 ### Running benchmarks
 
-To benchmark all applications run:
+To benchmark any applications run:
 ```bash
-scripts/run.sh benchmarks --local --all
+scripts/run.sh -release benchmarks --local --<app>
 ```
-
-Include `--use-ring` flag to re-run all benchmarks on rings instead of fields:
-```bash
-scripts/run.sh benchmarks --local --use-ring --all
-```
-
-This will benchmark the following applications in Sequre:
-- Sequre's linear algebra subroutines
-- Genome-wide association study on top of a toy dataset from [Cho _et al._](https://github.com/hhcho/secure-gwas).
-- Drug-target inference on top of a reduced STITCH dataset from [Hie _et al._](https://github.com/brianhie/secure-dti).
-- Opal (metagenomic binning) with 0.1x and 15x coverage of the complete Opal dataset from [Yu _et al._](https://github.com/yunwilliamyu/opal)
-- Ganon (metagenomic binning) on top of a single read from the complete Opal dataset from [Yu _et al._](https://github.com/yunwilliamyu/opal)
+where `<app>` can be:
+- `lattiseq` for running Lattiseq microbenchmarks.
+- `king` for running kinship coefficients estimation on top of a subsampled lung cancer dataset from [Qing _et al._](https://www.nature.com/articles/ng.2456).
+- `pca` for running Sequre's PCA subroutine on top on top of a subsampled lung cancer dataset from [Qing _et al._](https://www.nature.com/articles/ng.2456). **Note:** set `INT_LEN: Static[int] = 192` in [settings](stdlib/sequre/settings.codon) to avoid MPC overflow.
+- `lin-alg` for running Sequre's linear algebra subroutines
+- `gwas` for running genome-wide association study on top of a subsampled lung cancer dataset from [Qing _et al._](https://www.nature.com/articles/ng.2456).
+- `dti` for running drug-target inference on top of a reduced STITCH dataset from [Hie _et al._](https://github.com/brianhie/secure-dti).
+- `opal` for running Opal (metagenomic binning) with 0.1x and 15x coverage of the complete Opal dataset from [Yu _et al._](https://github.com/yunwilliamyu/opal).
+- `ganon`  for running Ganon (metagenomic binning) on top of a single read from the complete Opal dataset from [Yu _et al._](https://github.com/yunwilliamyu/opal).
+- `genotype-imputation` for running genotype imputation on top of 1,500 samples from Idash 2019 competition dataset from [Kim _et al._](https://www.sciencedirect.com/science/article/pii/S240547122100288X).
 
 Benchmark results are stored in the [results](results) folder.
+
+## Sequre's network config
+
+Sequre can operate in two network modes:
+- Local: using the inter-process communication (AF_UNIX) sockets.
+- Online: using the TCP (AF_INET) sockets.
+
+If using the online mode, make sure to configure the network within Sequre's [settings file](stdlib/sequre/settings.codon) at each machine separately.
+
+Example network configuration (`stdlib/sequre/settings.codon` --- the IP addresses are fictional):
+```python
+# IPs
+TRUSTED_DEALER = '8.8.8.8'  # Trusted dealer
+COMPUTING_PARTIES = [
+    '9.9.9.9',  # First computing party (CP1)
+    '10.10.10.10'  # Second computing party (CP2)
+    ]
+```
+
+**Note:** Make sure to set the same network settings (IP addresses) at each computing party.

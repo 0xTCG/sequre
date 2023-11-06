@@ -151,6 +151,47 @@ else
 
 fi
 
+# Build Codon-numpy
+if [ -d "${SEQURE_NUMPY_PATH}/install" ] 
+then
+    echo "Found existing Codon-numpy installation." 
+else
+    echo "Codon-numpy not installed. Proceeding with the installation ..."
+    rm -rf $SEQURE_NUMPY_PATH
+    git clone git@github.com:HarisSmajlovic/codon-numpy.git $SEQURE_NUMPY_PATH
+    cd $SEQURE_NUMPY_PATH
+
+    cmake -S . -B build -G Ninja \
+        -DLLVM_DIR="${SEQURE_LLVM_PATH}/install/lib/cmake/llvm" \
+        -DCODON_PATH="${SEQURE_CODON_PATH}/install" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=$CC \
+        -DCMAKE_CXX_COMPILER=$CXX
+    if [ $? -eq 0 ]; then
+        echo "Codon-numpy built."
+    else
+        echo "Error! Codon-numpy build failed" >&2
+        return
+    fi
+
+    cmake --build build --config Release
+    if [ $? -eq 0 ]; then
+        echo "Codon-numpy installed."
+    else
+        echo "Error! Codon-numpy installation failed" >&2
+        return
+    fi
+
+    cmake --install build --prefix="${SEQURE_NUMPY_PATH}/install"
+    if [ $? -eq 0 ]; then
+        echo "Codon-numpy exported."
+    else
+        echo "Error! Codon-numpy export failed" >&2
+        return
+    fi
+
+fi
+
 # Build Sequre
 cd $SEQURE_PATH
 rm -rf build
