@@ -1,15 +1,15 @@
-# Sequre
+# Sequre-MHE
 
-Sequre is an end-to-end, statically compiled and performance engineered, Pythonic framework for building efficient secure multiparty computation (MPC) pipelines in bioinformatics.
+Sequre-MHE is an end-to-end, statically compiled and performance engineered, Pythonic framework for building efficient secure multiparty computation (MPC), homomorphic encryption (HE), and multiparty homomorphic encryption (MHE) pipelines in bioinformatics.
 
 ## Quick start
 
 ### Install
 
-Sequre can **only** be built from source at the moment.
-To install Sequre, first clone the repository:
+Sequre-MHE can **only** be built from source at the moment.
+To install Sequre-MHE, first clone the repository:
 ```bash
-git clone git@github.com:0xTCG/sequre.git && cd sequre
+git clone git@github.com:0xTCG/sequre-mhe.git && cd sequre-mhe
 ```
 And then run the install script:
 ```bash
