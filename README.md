@@ -82,7 +82,7 @@ scripts/run.sh -release benchmarks --local --<app>
 where `<app>` can be:
 - `lattiseq` for running Lattiseq microbenchmarks.
 - `king` for running kinship coefficients estimation on top of a subsampled lung cancer dataset from [Qing _et al._](https://www.nature.com/articles/ng.2456).
-- `pca` for running Sequre's PCA subroutine on top on top of a subsampled lung cancer dataset from [Qing _et al._](https://www.nature.com/articles/ng.2456). **Note:** set `INT_LEN: Static[int] = 192` in [settings](stdlib/sequre/settings.codon) to avoid MPC overflow.
+- `pca` for running Sequre's PCA subroutine on top on top of a subsampled lung cancer dataset from [Qing _et al._](https://www.nature.com/articles/ng.2456).
 - `lin-alg` for running Sequre's linear algebra subroutines
 - `gwas` for running genome-wide association study on top of a toy dataset from [Cho _et al._](https://github.com/hhcho/secure-gwas).
 - `dti` for running drug-target inference on top of a reduced STITCH dataset from [Hie _et al._](https://github.com/brianhie/secure-dti).
