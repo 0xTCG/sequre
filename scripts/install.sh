@@ -158,15 +158,15 @@ then
 else
     echo "Codon-numpy not installed. Proceeding with the installation ..."
     rm -rf $SEQURE_NUMPY_PATH
-    git clone git@github.com:HarisSmajlovic/codon-numpy.git $SEQURE_NUMPY_PATH
+    git clone https://github.com/HarisSmajlovic/codon-numpy.git $SEQURE_NUMPY_PATH
     cd $SEQURE_NUMPY_PATH
 
     cmake -S . -B build -G Ninja \
         -DLLVM_DIR="${SEQURE_LLVM_PATH}/install/lib/cmake/llvm" \
         -DCODON_PATH="${SEQURE_CODON_PATH}/install" \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_C_COMPILER=$CC \
-        -DCMAKE_CXX_COMPILER=$CXX
+        -DCMAKE_C_COMPILER=gcc \
+        -DCMAKE_CXX_COMPILER=g++
     if [ $? -eq 0 ]; then
         echo "Codon-numpy built."
     else
