@@ -111,3 +111,16 @@ COMPUTING_PARTIES = [
 ```
 
 **Note:** Make sure to set the same network settings (IP addresses) at each computing party.
+
+## Via docker
+**Note:** Docker runs are currently enabled **only** for the [local](#sequres-network-config) network environments.
+[Playground, test, and benchmark runs](#running-playground-tests-and-benchmarks) can be executed via docker:
+```bash
+docker run --privileged --rm hsmile/sequre-mhe:manylinux <command>
+```
+where `<command>` can be any of the (local network) [commands above](#running-playground-tests-and-benchmarks).
+For example:
+```bash
+docker run --privileged --rm -m 16GB hsmile/sequre-mhe:manylinux scripts/run.sh -release tests --unit --local
+```
+will run all the unit tests in the local network environment.
