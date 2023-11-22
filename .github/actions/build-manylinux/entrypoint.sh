@@ -18,6 +18,8 @@ cd $HOME/.codon
 curl -L https://github.com/exaloop/codon/releases/download/v0.16.3/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - --strip-components=1
 cd /
 curl -L https://github.com/exaloop/llvm-project/releases/download/codon-15.0.1/llvm-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf -
+cd $HOME
+curl -L https://github.com/exaloop/seq/releases/download/v0.11.3/seq-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C .codon/lib/codon/plugins
 
 cd $1
 cmake -S . -B build \
@@ -33,5 +35,5 @@ else
   cmake --build build --target sequre
 fi
 cmake --install build --prefix=$HOME/.codon/lib/codon/plugins/sequre
-tar czvf sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz -C $HOME/.codon/lib/codon/plugins sequre
+tar czvf sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz -C $HOME/.codon/lib/codon/plugins sequre seq
 echo "Done"
