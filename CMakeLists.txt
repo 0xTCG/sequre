@@ -52,8 +52,11 @@ separate_arguments(LLVM_DEFINITIONS_LIST NATIVE_COMMAND ${LLVM_DEFINITIONS})
 add_definitions(${LLVM_DEFINITIONS_LIST})
 
 if(NOT CODON_PATH)
-    set(CODON_PATH "$ENV{HOME}/.codon")
+    set(CODON_PATH "$ENV{SEQURE_CODON_PATH}/install")
 endif()
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+  set(CMAKE_INSTALL_PREFIX "${CODON_PATH}/lib/codon/plugins/sequre" CACHE PATH "Use the existing Codon installation" FORCE)
+endif(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
 
 target_include_directories(sequre PRIVATE "${CODON_PATH}/include" ${LLVM_INCLUDE_DIRS})
 target_link_directories(sequre PRIVATE "${CODON_PATH}/lib/codon")
