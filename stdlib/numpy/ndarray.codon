@@ -1,0 +1,1514 @@
+# Copyright (C) 2022-2023 Exaloop Inc. <https://exaloop.io>
+
+import operator
+from numpy.reductions import *
+
+newaxis = None
+
+@tuple
+class ellipsis:
+    def __repr__(self):
+        return 'Ellipsis'
+
+Ellipsis = ellipsis()
+
+_FLAG_C_CONTIGUOUS   : Static[int] = 1
+_FLAG_F_CONTIGUOUS   : Static[int] = 2
+_FLAG_OWNDATA        : Static[int] = 4
+_FLAG_WRITEABLE      : Static[int] = 8
+_FLAG_ALIGNED        : Static[int] = 16
+_FLAG_WRITEBACKIFCOPY: Static[int] = 32
+
+@tuple
+class flagsobj:
+    _flags: u32
+
+    def __new__(f: int):
+        return flagsobj(u32(f))
+
+    def _with(self, f: int):
+        return flagsobj(self._flags | u32(f))
+
+    def _without(self, f: int):
+        return flagsobj(self._flags & ~u32(f))
+
+    def _unown(self):
+        return self._without(_FLAG_OWNDATA)
+
+    @property
+    def c_contiguous(self):
+        return bool(self._flags & u32(_FLAG_C_CONTIGUOUS))
+
+    @property
+    def f_contiguous(self):
+        return bool(self._flags & u32(_FLAG_F_CONTIGUOUS))
+
+    @property
+    def contiguous(self):
+        return self.c_contiguous or self.f_contiguous
+
+    @property
+    def owndata(self):
+        return bool(self._flags & u32(_FLAG_OWNDATA))
+
+    @property
+    def writeable(self):
+        return bool(self._flags & u32(_FLAG_WRITEABLE))
+
+    @property
+    def aligned(self):
+        return bool(self._flags & u32(_FLAG_ALIGNED))
+
+    @property
+    def writebackifcopy(self):
+        return bool(self._flags & u32(_FLAG_WRITEBACKIFCOPY))
+
+    def __str__(self):
+        return (f'  C_CONTIGUOUS : {self.c_contiguous}\n'
+                f'  F_CONTIGUOUS : {self.f_contiguous}\n'
+                f'  OWNDATA : {self.owndata}\n'
+                f'  WRITEABLE : {self.writeable}\n'
+                f'  ALIGNED : {self.aligned}\n'
+                f'  WRITEBACKIFCOPY : {self.writebackifcopy}\n')
+
+    def _contig_match(self, other: flagsobj):
+        a = self._flags & u32(_FLAG_C_CONTIGUOUS | _FLAG_F_CONTIGUOUS)
+        b = other._flags & u32(_FLAG_C_CONTIGUOUS | _FLAG_F_CONTIGUOUS)
+        return (a != u32(0)) and (a == b)
+
+
+class ndarray[S, T]:
+    _shape: S
+    _strides: S
+    _data: Ptr[T]
+    _flags: flagsobj
+
+    def _all_contig(shape):
+        non_one = 0
+        for s in shape:
+            if s <= 0:
+                return True
+            elif s != 1:
+                non_one += 1
+        return non_one <= 1
+
+    def _update_flags_for_contig(flags: flagsobj, shape, strides, itemsize: int):
+        p_shape = Ptr[int](__ptr__(shape).as_byte())
+        p_strides = Ptr[int](__ptr__(strides).as_byte())
+
+        is_c_contig = True
+        sd = itemsize
+        for i in range(len(shape) - 1, -1, -1):
+            dim = p_shape[i]
+            if dim == 0:
+                return flags._with(_FLAG_C_CONTIGUOUS)._with(_FLAG_F_CONTIGUOUS)
+            if dim != 1:
+                if p_strides[i] != sd:
+                    is_c_contig = False
+                sd *= dim
+
+        if is_c_contig:
+            flags = flags._with(_FLAG_C_CONTIGUOUS)
+        else:
+            flags = flags._without(_FLAG_C_CONTIGUOUS)
+
+        sd = itemsize
+        for i in range(len(shape)):
+            dim = p_shape[i]
+            if dim != 1:
+                if p_strides[i] != sd:
+                    return flags._without(_FLAG_F_CONTIGUOUS)
+                sd *= dim
+
+        return flags._with(_FLAG_F_CONTIGUOUS)
+
+    def __init__(self, shape: S, strides: S, data: Ptr[T], flags: flagsobj):
+        self._shape = shape
+        self._strides = strides
+        self._data = data
+        self._flags = flags
+
+    def _new(shape: S, strides: S, data: Ptr[T], flags: flagsobj):
+        itemsize = ndarray._sizeof(T)
+        flags = ndarray._update_flags_for_contig(flags, shape, strides, itemsize)
+        return ndarray(shape, strides, data, flags)
+
+    def _new_contig(shape: S, data: Ptr[T], fcontig: bool = False, flags: Optional[flagsobj] = None):
+        f: flagsobj = flags._unown() if flags is not None else flagsobj(_FLAG_OWNDATA | _FLAG_WRITEABLE | _FLAG_ALIGNED)
+        if ndarray._all_contig(shape):
+            f = f._with(_FLAG_C_CONTIGUOUS)._with(_FLAG_F_CONTIGUOUS)
+        else:
+            if fcontig:
+                f = f._with(_FLAG_F_CONTIGUOUS)
+            else:
+                f = f._with(_FLAG_C_CONTIGUOUS)
+
+        strides = ndarray._default_strides(shape, fcontig, T)
+        return ndarray(shape, strides, data, f)
+
+    def _count(shape):
+        if staticlen(shape) == 0:
+            return 0
+
+        total = 1
+        for i in range(staticlen(shape)):
+            total *= shape[i]
+        return total
+
+    def _sizeof(X: type):
+        from internal.gc import sizeof
+        return sizeof(X)
+
+    def _default_flags() -> flagsobj:
+        return flagsobj(_FLAG_OWNDATA | _FLAG_WRITEABLE | _FLAG_ALIGNED)
+    
+    def _default_strides(shape, forder: bool, X: type):
+        strides = ndarray._zero_tuple(staticlen(shape))
+        p = Ptr[int](__ptr__(strides).as_byte())
+        n = len(shape)
+        curr = ndarray._sizeof(X)
+
+        for i in range(n):
+            j = i if forder else n - 1 - i
+            p[j] = curr
+            curr *= shape[j]
+
+        return strides
+
+    @property
+    def shape(self):
+        return self._shape
+
+    @property
+    def strides(self):
+        return self._strides
+
+    @property
+    def flags(self):
+        return self._flags
+
+    @property
+    def data(self):
+        return self._data
+
+    @property
+    def ndim(self):
+        return len(self.shape)
+
+    @property
+    def size(self):
+        return ndarray._count(self.shape)
+
+    @property
+    def itemsize(self):
+        return ndarray._sizeof(T)
+
+    @property
+    def nbytes(self):
+        return self.size * self.itemsize
+
+    def transpose(self):
+        flags = self.flags._unown()
+        if flags.c_contiguous and not flags.f_contiguous:
+            flags = flags._without(_FLAG_C_CONTIGUOUS)._with(_FLAG_F_CONTIGUOUS)
+        elif flags.f_contiguous and not flags.c_contiguous:
+            flags = flags._without(_FLAG_F_CONTIGUOUS)._with(_FLAG_C_CONTIGUOUS)
+        return ndarray(self.shape[::-1], self.strides[::-1], self._data, flags)
+
+    @property
+    def T(self):
+        return self.transpose()
+
+    def _fix_reshape_shape(self, shape):
+        if staticlen(shape) == 0:
+            return shape
+        elif staticlen(shape) == 1:
+            if shape[0] < 0:
+                return (self.size,)
+            else:
+                return shape
+
+        neg = 0
+        for a in shape:
+            if a < 0:
+                neg += 1
+        if neg == 0:
+            return shape
+        if neg > 1:
+            raise ValueError('can only specify one unknown dimension')
+
+        prod = 1
+        for a in shape:
+            if a >= 0:
+                prod *= a
+
+        unknown = self.size // prod
+        return tuple(a if a >= 0 else unknown for a in shape)
+
+    def reshape(self, *shape):
+        if staticlen(shape) == 1 and isinstance(shape[0], Tuple):
+            return self.reshape(*shape[0])
+
+        if staticlen(shape) == staticlen(self.shape):
+            if shape == self.shape:
+                return self
+
+        if self.flags.c_contiguous:
+            shape = self._fix_reshape_shape(shape)
+            a, b = self.size, ndarray._count(shape)
+            if a != b:
+                raise ValueError(f'cannot reshape array of size {a} into shape {shape}')
+            flags = self.flags
+            if not ndarray._all_contig(shape):
+                flags = flags._without(_FLAG_F_CONTIGUOUS)
+            return ndarray._new_contig(shape, self._data, flags=flags)
+        else:
+            return self.flatten().reshape(shape)
+
+    def _contiguous(self):
+        if self.flags.c_contiguous:
+            return self._data
+        else:
+            n = self.size
+            p = Ptr[T](n)
+            i = 0
+            for idx in ndarray._multirange(self.shape):
+                q = self._ptr_for_index(idx, check=False)
+                p[i] = q[0]
+                i += 1
+            return p
+
+    def flatten(self):
+        if self.flags.c_contiguous:
+            return ndarray._new_contig((self.size,), self._data, flags=self.flags)
+        else:
+            return ndarray._new_contig((self.size,), self._contiguous())
+
+    def tolist(self):
+        if staticlen(self.shape) == 0:
+            return List[T]()
+        elif staticlen(self.shape) == 1:
+            return [a for a in self]
+        else:
+            return [a.tolist() for a in self]
+
+    def _static_tuple(elem, n: Static[int]):
+        if n <= 0:
+            return ()
+        else:
+            return (elem, *ndarray._static_tuple(elem, n - 1))
+
+    def _zero_tuple(n: Static[int]):
+        return ndarray._static_tuple(0, n)
+
+    def _normalize_index(idx: int, axis: int, n: int):
+        idx0 = idx
+        if idx < 0:
+            idx += n
+        if idx < 0 or idx >= n:
+            raise IndexError(f'index {idx0} is out of bounds for axis {axis} with size {n}')
+        return idx
+
+    def _ptr_for_index(self, indexes, check: Static[int] = True, broadcast: Static[int] = False):
+        s = self.shape
+        strides = self.strides
+        pshape = Ptr[int](__ptr__(s).as_byte())
+        pindex = Ptr[int](__ptr__(indexes).as_byte())
+        pstride = Ptr[int](__ptr__(strides).as_byte())
+
+        offset = 0
+        for i in range(len(indexes)):
+            idx = pindex[i]
+
+            if  staticlen(indexes) > staticlen(self.shape):
+                i -= staticlen(indexes) - staticlen(self.shape)
+                if i < 0:
+                    continue
+
+            n = pshape[i]
+            if broadcast:
+                if n == 1:
+                    continue
+            if check:
+                idx = ndarray._normalize_index(idx, i, n)
+            offset += idx * pstride[i]
+
+        return Ptr[T](self._data.as_byte() + offset)
+
+    def _getset(self, indexes, item = None):
+        def multiindex(indexes, shape, index: int = 0):
+            if staticlen(indexes) != staticlen(shape):
+                compile_error('[internal error] bad multi-index')
+
+            if staticlen(indexes) == 0:
+                return ()
+
+            idx = indexes[0]
+            n = shape[0]
+            rest = multiindex(indexes[1:], shape[1:], index + 1)
+
+            if isinstance(idx, int):
+                idx = ndarray._normalize_index(idx, index, n)
+                return ((idx, idx + 1, 1, 1), *rest)
+            else:
+                return (idx.adjust_indices(n), *rest)
+
+        def keep_axes(indexes, index: int = 0):
+            if staticlen(indexes) == 0:
+                return ()
+
+            idx = indexes[0]
+            rest = keep_axes(indexes[1:], index + 1)
+
+            if isinstance(idx, int):
+                return rest
+            else:
+                return (index, *rest)
+
+        def base_offset(mindices, strides):
+            offset = 0
+            for i in range(len(mindices)):
+                offset += mindices[i][0] * strides[i]
+            return offset
+
+        def new_shape(mindex, keep):
+            return tuple(mindex[i][3] for i in keep)
+
+        def new_strides(mindex, strides, keep):
+            return tuple(mindex[i][2] * strides[i] for i in keep)
+
+        def extract_special(indexes):
+            if staticlen(indexes) == 0:
+                return (), ()
+
+            idx = indexes[0]
+            rest_newaxis, rest_ellipsis = extract_special(indexes[1:])
+
+            if isinstance(idx, type(newaxis)):
+                return (idx, *rest_newaxis), rest_ellipsis
+            elif isinstance(idx, type(Ellipsis)):
+                return rest_newaxis, (idx, *rest_ellipsis)
+            else:
+                return rest_newaxis, rest_ellipsis
+
+        def expand_ellipsis(indexes, n: Static[int], k: Static[int] = 1):
+            if k == 0:
+                return indexes
+
+            if staticlen(indexes) == 0:
+                return ()
+
+            idx = indexes[0]
+            rest = expand_ellipsis(indexes[1:], n)
+
+            if isinstance(idx, type(Ellipsis)):
+                s = slice(None, None, None)
+                return (*ndarray._static_tuple(s, n), *rest)
+            else:
+                return (idx, *rest)
+
+        def expand_remainder(indexes, n: Static[int]):
+            if n > 0:
+                s = slice(None, None, None)
+                return (*indexes, *ndarray._static_tuple(s, n))
+            else:
+                return indexes
+
+        def expand_newaxis(indexes, shape, strides):
+            if staticlen(indexes) == 0:
+                return (), (), ()
+
+            idx = indexes[0]
+            if isinstance(idx, type(newaxis)):
+                rest_indexes, rest_shape, rest_strides = expand_newaxis(indexes[1:], shape, strides)
+                return (slice(None, None, None), *rest_indexes), (1, *rest_shape), (0, *rest_strides)
+            else:
+                rest_indexes, rest_shape, rest_strides = expand_newaxis(indexes[1:], shape[1:], strides[1:])
+                return (idx, *rest_indexes), (shape[0], *rest_shape), (strides[0], *rest_strides)
+
+        if not isinstance(indexes, Tuple):
+            return self._getset((indexes,), item)
+
+        newaxis_tuple, ellipsis_tuple = extract_special(indexes)
+
+        if staticlen(ellipsis_tuple) > 1:
+            compile_error("an index can only have a single ellipsis ('...')")
+
+        if staticlen(indexes) - staticlen(newaxis_tuple) - staticlen(ellipsis_tuple) > staticlen(self.shape):
+            compile_error('too many indices for array')
+
+        indexes = expand_ellipsis(indexes,
+                                  staticlen(self.shape)
+                                    - staticlen(indexes)
+                                    - staticlen(newaxis_tuple)
+                                    + staticlen(ellipsis_tuple),
+                                  staticlen(ellipsis_tuple))
+        indexes = expand_remainder(indexes,
+                                   staticlen(self.shape)
+                                     - staticlen(indexes)
+                                     + staticlen(newaxis_tuple))
+        indexes, shape, strides = expand_newaxis(indexes, self.shape, self.strides)
+        mindex = multiindex(indexes, shape)
+        keep = keep_axes(indexes)
+        p = Ptr[T](self._data.as_byte() + base_offset(mindex, strides))
+
+        if staticlen(keep) == 0:
+            if item is None:
+                return p[0]
+            else:
+                p[0] = item
+
+        ans_shape = new_shape(mindex, keep)
+        ans_strides = new_strides(mindex, strides, keep)
+        flags = self.flags._unown()
+
+        if item is None:
+            return ndarray._new(ans_shape, ans_strides, p, flags)
+        elif isinstance(item, ndarray):
+            if ndarray._count(ans_shape) == item.size and flags._contig_match(item._flags):
+                q = item._data
+                for i in range(item.size):
+                    p[i] = q[i]
+            else:
+                sub = ndarray._new(ans_shape, ans_strides, p, flags)
+                for idx in ndarray._multirange(sub.shape):
+                    a = sub._ptr_for_index(idx, check=False)
+                    b = item._ptr_for_index(idx, check=True)
+                    a[0] = b[0]
+        else:
+            sub = ndarray._new(ans_shape, ans_strides, p, flags)
+            if sub.flags.contiguous:
+                for i in range(ndarray._count(ans_shape)):
+                    p[i] = item
+            else:
+                for idx in ndarray._multirange(sub.shape):
+                    a = sub._ptr_for_index(idx, check=False)
+                    a[0] = item
+
+    def __getitem__(self, indexes):
+        return self._getset(indexes)
+
+    def __getitem__(self, idx: int):
+        return self[idx,]
+
+    def __getitem__(self, other: ndarray[S,bool]):
+        count = 0
+        if self.shape != other.shape:
+            raise IndexError('shape mismatch in boolean array index')
+        n = self.size
+
+        if other.flags.contiguous:
+            p = other._data
+            for i in range(n):
+                if p[i]:
+                    count += 1
+        else:
+            for idx in ndarray._multirange(self.shape):
+                p = other._ptr_for_index(idx, check=False)
+                if p[0]:
+                    count += 1
+
+        q = Ptr[T](count)
+        k = 0
+
+        if self.flags._contig_match(other.flags):
+            a = self._data
+            b = other._data
+            for i in range(n):
+                if b[i]:
+                    q[k] = a[i]
+                    k += 1
+        else:
+            for idx in ndarray._multirange(self.shape):
+                pa = self._ptr_for_index(idx, check=False)
+                pb = other._ptr_for_index(idx, check=False)
+                if pb[0]:
+                    q[k] = pa[0]
+                    k += 1
+
+        return ndarray._new_contig((count,), q)
+
+    def __setitem__(self, indexes, item):
+        self._getset(indexes, item=item)
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __iter__(self):
+        for i in range(self.shape[0]):
+            yield self[i]
+
+    def __repr__(self):
+        return f'array({repr(self.tolist())})'
+
+    def _str_2d(shape, front: ndarray[S,X], back: Optional[ndarray[S,X]] = None, S: type, X: type):
+        BOX_VL = '│'
+        BOX_HL = '─'
+        BOX_TR = '╮'
+        BOX_BR = '╯'
+        BOX_TL = '╭'
+        BOX_BL = '╰'
+        MID_N = '┬'
+        MID_E = '┤'
+        MID_S = '┴'
+        MID_W = '├'
+        INNER_VL = '│'
+        INNER_HL = '─'
+        INNER_CR = '┼'
+        TRUNC = '...'
+
+        LIMIT = 10
+        TRUNC_LEN = 3
+
+        if staticlen(front.shape) != 2:
+            compile_error('[internal error] wrong array shape passed to str2d')
+
+        x, y = front.shape
+        v = _strbuf()
+
+        if ndarray._count(shape) == 0:
+            v.append(str(shape[0]))
+            for a in shape[1:]:
+                v.append(' × ')
+                v.append(str(a))
+            v.append(' array of ')
+            v.append(X.__name__)
+            v.append('\n')
+            v.append('<empty>')
+            return v.__str__()
+
+        trunc_x = x > LIMIT
+        trunc_y = y > LIMIT
+        if not trunc_x and not trunc_y:
+            items = [str(front[i,j]) for i in range(x) for j in range(y)]
+        else:
+            x_real = x
+            y_real = y
+
+            if trunc_x:
+                x_real = 2*TRUNC_LEN + 1
+            if trunc_y:
+                y_real = 2*TRUNC_LEN + 1
+
+            items = []
+            i = 0
+            while i < x:
+                if trunc_x and (TRUNC_LEN <= i < x - TRUNC_LEN ):
+                    i = x - TRUNC_LEN
+                    for _ in range(y_real):
+                        items.append(TRUNC)
+                    continue
+
+                j = 0
+                while j < y:
+                    if trunc_y and (TRUNC_LEN <= j < y - TRUNC_LEN):
+                        j = y - TRUNC_LEN
+                        items.append(TRUNC)
+                        continue
+                    items.append(str(front[i,j]))
+                    j += 1
+
+                i += 1
+
+            if trunc_x:
+                x = 2*TRUNC_LEN + 1
+            if trunc_y:
+                y = 2*TRUNC_LEN + 1
+
+        back_items = []
+        W = max(len(s) for s in items)
+
+        if back is not None:
+            back_x, back_y = back.shape
+            i = 0
+            while i < back_x:
+                if trunc_x and (TRUNC_LEN <= i < back_x - TRUNC_LEN):
+                    i = back_x - TRUNC_LEN
+                    back_items.append(TRUNC)
+                    continue
+                back_items.append(str(back[i, back_y - 1]))
+                i += 1
+
+            W = max(W, max(len(s) for s in back_items))
+
+        # tag
+        v.append(str(shape[0]))
+        for a in shape[1:]:
+            v.append(' × ')
+            v.append(str(a))
+        v.append(' array of ')
+        v.append(X.__name__)
+        v.append('\n')
+
+        # top border
+        v.append(BOX_TL)
+        for i in range(y):
+            for k in range(W + 2):
+                v.append(BOX_HL)
+            if i != y - 1:
+                v.append(MID_N)
+        v.append(BOX_TR)
+        v.append('\n')
+
+        k, k2 = 0, 0
+        for i in range(x):
+            # row itself
+            v.append(BOX_VL)
+            for j in range(y):
+                e = items[k].rjust(W)
+                k += 1
+                v.append(' ')
+                v.append(e)
+                v.append(' ')
+                if j != y - 1:
+                    v.append(INNER_VL)
+            v.append(BOX_VL)
+
+            # behind array
+            if back is not None:
+                for _ in range(W + 2):
+                    v.append(INNER_HL)
+                v.append(BOX_TR if i == 0 else MID_E)
+
+            v.append('\n')
+            if i != x - 1:
+                # inner border
+                v.append(MID_W)
+                for j in range(y):
+                    for k in range(W + 2):
+                        v.append(INNER_HL)
+                    if j != y - 1:
+                        v.append(INNER_CR)
+                v.append(MID_E)
+
+                # behind array
+                if back is not None:
+                    e = back_items[k2].rjust(W)
+                    k2 += 1
+                    v.append(' ')
+                    v.append(e)
+                    v.append(' ')
+                    v.append(BOX_VL)
+
+                v.append('\n')
+
+        # bottom border
+        v.append(BOX_BL)
+        for j in range(y):
+            for k in range(W+2):
+                v.append(BOX_HL)
+            if j != y - 1:
+                v.append(MID_S)
+        v.append(BOX_BR)
+
+        # behind array
+        if back is not None:
+            e = back_items[k2].rjust(W)
+            v.append(' ')
+            v.append(e)
+            v.append(' ')
+            v.append(BOX_VL)
+
+            v.append('\n')
+            if W >= 1:
+                v.append(' ···')
+                for _ in range(W - 1):
+                    v.append(' ')
+            else:
+                v.append(' ··')
+                for _ in range(W):
+                    v.append(' ')
+            v.append(BOX_BL)
+            for i in range(y):
+                if i > 0:
+                    v.append(MID_S)
+                for _ in range(W + 2):
+                    v.append(INNER_HL)
+            v.append(BOX_BR)
+
+        return v.__str__()
+
+    def __str__(self):
+        if staticlen(self.shape) == 0:
+            return '∅'
+        elif staticlen(self.shape) == 1:
+            return ndarray._str_2d(self.shape, self.reshape((1, self.size)))
+        elif staticlen(self.shape) == 2:
+            return ndarray._str_2d(self.shape, self)
+        else:
+            if self.size == 0:
+                return ndarray._str_2d(self.shape, self.reshape((0, 0)))
+
+            rem = self.shape[:-2]
+            top_idx = tuple(0 for _ in rem)
+            bot_idx = tuple(i - 1 for i in rem)
+            top = self[top_idx]
+            bot = self[bot_idx]
+
+            if ndarray._count(rem) == 1:
+                return ndarray._str_2d(self.shape, top)
+            else:
+                return ndarray._str_2d(self.shape, top, bot)
+
+    def _check_order(order: str):
+        if order not in ('C', 'F', 'A', 'K'):
+            raise ValueError(f"order must be one of 'C', 'F', 'A', or 'K' (got {repr(order)})")
+
+    def astype(self, dtype: type, order: str = 'C', copy: bool = True):
+        ndarray._check_order(order)
+        if dtype is T:
+            x = self
+            if copy:
+                a = self._data
+                n = self.size
+                b = Ptr[dtype](n)
+
+                if ((order == 'C' and self.flags.c_contiguous) or
+                    (order == 'F' and self.flags.f_contiguous)):
+                    fcontig = self.flags.f_contiguous and not self.flags.c_contiguous
+                    str.memcpy(b.as_byte(), a.as_byte(), n * self.itemsize)
+                    x = ndarray._new_contig(self.shape, b, fcontig=fcontig)
+                else:
+                    fcontig = False
+                    if order == 'F':
+                        fcontig = True
+                    elif order == 'A' or order == 'K':
+                        fcontig = self.flags.f_contiguous
+
+                    x = ndarray._new_contig(self.shape, b, fcontig=fcontig)
+                    for idx in ndarray._multirange(self.shape):
+                        p = self._ptr_for_index(idx, check=False)
+                        q = x._ptr_for_index(idx, check=False)
+                        q[0] = p[0]
+            return x
+
+        a = self._data
+        n = self.size
+        b = Ptr[dtype](n)
+
+        fcontig = False
+        if order == 'F':
+            fcontig = True
+        elif order == 'A' or order == 'K':
+            fcontig = self.flags.f_contiguous
+
+        other = ndarray._new_contig(self.shape, b, fcontig=fcontig)
+        for idx in ndarray._multirange(self.shape):
+            p = self._ptr_for_index(idx, check=False)
+            q = other._ptr_for_index(idx, check=False)
+            q[0] = dtype(p[0])
+        return other
+
+    def copy(self, order: str = 'C'):
+        return self.astype(dtype=T, order=order, copy=True)
+
+    def __copy__(self):
+        return self.copy()
+
+    def _broadcast_shape(shape1, shape2):
+        D1: Static[int] = staticlen(shape1)
+        D2: Static[int] = staticlen(shape2)
+        Dmin: Static[int] = D1 if D1 < D2 else D2
+        Dmax: Static[int] = D1 if D1 > D2 else D2
+        Diff: Static[int] = Dmax - Dmin
+        t1 = shape1[-Dmin:]
+        t2 = shape2[-Dmin:]
+
+        ans = ndarray._zero_tuple(Dmax)
+        p = Ptr[int](__ptr__(ans).as_byte())
+
+        for i in range(Diff):
+            if D1 > D2:
+                p[i] = shape1[i]
+            else:
+                p[i] = shape2[i]
+
+        for i in range(Dmin):
+            a = t1[i]
+            b = t2[i]
+            dim = a
+            if a == 1:
+                dim = b
+            elif b != 1 and a != b:
+                raise ValueError(f'operands could not be broadcast together with shapes {shape1} {shape2}')
+            p[i + Diff] = dim
+
+        return ans
+
+    def _shape_equal(shape1, shape2):
+        if staticlen(shape1) != staticlen(shape2):
+            return False
+        return shape1 == shape2
+
+    def _op_elemwise(self, other: ndarray, op):
+        if self.flags._contig_match(other.flags) and ndarray._shape_equal(self.shape, other.shape):
+            a = self._data
+            b = other._data
+            n = self.size
+            c = Ptr(n)
+            ans = ndarray._new_contig(self.shape, c, fcontig=(not self.flags.c_contiguous))
+
+            for i in range(n):
+                c[i] = op(a[i], b[i])
+
+            return ans
+        else:
+            ans_shape = ndarray._broadcast_shape(self.shape, other.shape)
+            n = ndarray._count(ans_shape)
+            T = type(op(self._data[0], other._data[0]))
+            c = Ptr[T](n)
+            ans = ndarray._new_contig(ans_shape, c)
+
+            for idx in ndarray._multirange(ans_shape):
+                p = self._ptr_for_index(idx, check=False, broadcast=True)
+                q = other._ptr_for_index(idx, check=False, broadcast=True)
+                r = ans._ptr_for_index(idx, check=False)
+                r[0] = op(p[0], q[0])
+
+            return ans
+
+    def _op_scalar(self, b, op):
+        n = self.size
+        a = self._data
+        c = Ptr(n)
+        other = ndarray._new_contig(self.shape, c)
+
+        if self.flags.contiguous:
+            for i in range(n):
+                c[i] = op(a[i], b)
+        else:
+            for idx in ndarray._multirange(self.shape):
+                p = self._ptr_for_index(idx, check=False)
+                q = other._ptr_for_index(idx, check=False)
+                q[0] = op(p[0], b)
+
+        return other
+
+    def _iop_elemwise(self, other: ndarray, op):
+        if self.flags._contig_match(other.flags) and ndarray._shape_equal(self.shape, other.shape):
+            a = self._data
+            b = other._data
+            n = self.size
+
+            for i in range(n):
+                a[i] = op(a[i], b[i])
+        else:
+            ans_shape = ndarray._broadcast_shape(self.shape, other.shape)
+            if not ndarray._shape_equal(ans_shape, self.shape):
+                raise ValueError(f"non-broadcastable output operand with shape {self.shape} doesn't match the broadcast shape {ans_shape}")
+
+            for idx in ndarray._multirange(self.shape):
+                p = self._ptr_for_index(idx, check=False, broadcast=True)
+                q = other._ptr_for_index(idx, check=False, broadcast=True)
+                p[0] = op(p[0], q[0])
+
+        return self
+
+    def _iop_scalar(self, b, op):
+        n = self.size
+        a = self._data
+
+        if self.flags.contiguous:
+            for i in range(n):
+                a[i] = op(a[i], b)
+        else:
+            for idx in ndarray._multirange(self.shape):
+                p = self._ptr_for_index(idx, check=False)
+                p[0] = op(p[0], b)
+
+        return self
+
+    def _rop_scalar(self, b, op):
+        n = self.size
+        a = self._data
+        c = Ptr(n)
+        other = ndarray._new_contig(self.shape, c)
+
+        if self.flags.contiguous:
+            for i in range(n):
+                c[i] = op(b, a[i])
+        else:
+            for idx in ndarray._multirange(self.shape):
+                p = self._ptr_for_index(idx, check=False)
+                q = other._ptr_for_index(idx, check=False)
+                q[0] = op(b, p[0])
+
+        return other
+
+    def _op_unary(self, op):
+        n = self.size
+        a = self._data
+        b = Ptr(n)
+        other = ndarray._new_contig(self.shape, b)
+
+        if self.flags.contiguous:
+            for i in range(n):
+                b[i] = op(a[i])
+        else:
+            for idx in ndarray._multirange(self.shape):
+                p = self._ptr_for_index(idx, check=False)
+                q = other._ptr_for_index(idx, check=False)
+                q[0] = op(p[0])
+
+        return other
+
+    def _iop_unary(self, op):
+        n = self.size
+        a = self._data
+
+        if self.flags.contiguous:
+            for i in range(n):
+                a[i] = op(a[i])
+        else:
+            for idx in ndarray._multirange(self.shape):
+                p = self._ptr_for_index(idx, check=False)
+                p[0] = op(p[0])
+
+        return self
+
+    def __add__(self, other):
+        return self._op_scalar(other, operator.add)
+
+    def __add__(self, other: ndarray):
+        return self._op_elemwise(other, operator.add)
+
+    def __radd__(self, other):
+        return self._rop_scalar(other, operator.add)
+
+    def __iadd__(self, other):
+        return self._iop_scalar(other, operator.add)
+
+    def __iadd__(self, other: ndarray):
+        return self._iop_elemwise(other, operator.add)
+
+    def __sub__(self, other):
+        return self._op_scalar(other, operator.sub)
+
+    def __sub__(self, other: ndarray):
+        return self._op_elemwise(other, operator.sub)
+
+    def __rsub__(self, other):
+        return self._rop_scalar(other, operator.sub)
+
+    def __isub__(self, other):
+        return self._iop_scalar(other, operator.sub)
+
+    def __isub__(self, other: ndarray):
+        return self._iop_elemwise(other, operator.sub)
+
+    def __mul__(self, other):
+        return self._op_scalar(other, operator.mul)
+
+    def __mul__(self, other: ndarray):
+        return self._op_elemwise(other, operator.mul)
+
+    def __rmul__(self, other):
+        return self._rop_scalar(other, operator.mul)
+
+    def __imul__(self, other):
+        return self._iop_scalar(other, operator.mul)
+
+    def __imul__(self, other: ndarray):
+        return self._iop_elemwise(other, operator.mul)
+
+    def __mod__(self, other):
+        return self._op_scalar(other, operator.mod)
+
+    def __mod__(self, other: ndarray):
+        return self._op_elemwise(other, operator.mod)
+
+    def __rmod__(self, other):
+        return self._rop_scalar(other, operator.mod)
+
+    def __imod__(self, other):
+        return self._iop_scalar(other, operator.mod)
+
+    def __imod__(self, other: ndarray):
+        return self._iop_elemwise(other, operator.mod)
+
+    def __pow__(self, other):
+        return self._op_scalar(other, operator.pow)
+
+    def __pow__(self, other: ndarray):
+        return self._op_elemwise(other, operator.pow)
+
+    def __rpow__(self, other):
+        return self._rop_scalar(other, operator.pow)
+
+    def __ipow__(self, other):
+        return self._iop_scalar(other, operator.pow)
+
+    def __ipow__(self, other: ndarray):
+        return self._iop_elemwise(other, operator.pow)
+
+    def __truediv__(self, other):
+        return self._op_scalar(other, operator.truediv)
+
+    def __truediv__(self, other: ndarray):
+        return self._op_elemwise(other, operator.truediv)
+
+    def __rtruediv__(self, other):
+        return self._rop_scalar(other, operator.truediv)
+
+    def __itruediv__(self, other):
+        return self._iop_scalar(other, operator.truediv)
+
+    def __itruediv__(self, other: ndarray):
+        return self._iop_elemwise(other, operator.truediv)
+
+    def __floordiv__(self, other):
+        return self._op_scalar(other, operator.floordiv)
+
+    def __floordiv__(self, other: ndarray):
+        return self._op_elemwise(other, operator.floordiv)
+
+    def __rfloordiv__(self, other):
+        return self._rop_scalar(other, operator.floordiv)
+
+    def __ifloordiv__(self, other):
+        return self._iop_scalar(other, operator.floordiv)
+
+    def __ifloordiv__(self, other: ndarray):
+        return self._iop_elemwise(other, operator.floordiv)
+
+    def __lshift__(self, other):
+        return self._op_scalar(other, operator.lshift)
+
+    def __lshift__(self, other: ndarray):
+        return self._op_elemwise(other, operator.lshift)
+
+    def __rlshift__(self, other):
+        return self._rop_scalar(other, operator.lshift)
+
+    def __ilshift__(self, other):
+        return self._iop_scalar(other, operator.lshift)
+
+    def __ilshift__(self, other: ndarray):
+        return self._iop_elemwise(other, operator.lshift)
+
+    def __rshift__(self, other):
+        return self._op_scalar(other, operator.rshift)
+
+    def __rshift__(self, other: ndarray):
+        return self._op_elemwise(other, operator.rshift)
+
+    def __rrshift__(self, other):
+        return self._rop_scalar(other, operator.rshift)
+
+    def __irshift__(self, other):
+        return self._iop_scalar(other, operator.rshift)
+
+    def __irshift__(self, other: ndarray):
+        return self._iop_elemwise(other, operator.rshift)
+
+    def __and__(self, other):
+        return self._op_scalar(other, operator.and_)
+
+    def __and__(self, other: ndarray):
+        return self._op_elemwise(other, operator.and_)
+
+    def __rand__(self, other):
+        return self._rop_scalar(other, operator.and_)
+
+    def __iand__(self, other):
+        return self._iop_scalar(other, operator.and_)
+
+    def __iand__(self, other: ndarray):
+        return self._iop_elemwise(other, operator.and_)
+
+    def __or__(self, other):
+        return self._op_scalar(other, operator.or_)
+
+    def __or__(self, other: ndarray):
+        return self._op_elemwise(other, operator.or_)
+
+    def __ror__(self, other):
+        return self._rop_scalar(other, operator.or_)
+
+    def __ior__(self, other):
+        return self._iop_scalar(other, operator.or_)
+
+    def __ior__(self, other: ndarray):
+        return self._iop_elemwise(other, operator.or_)
+
+    def __xor__(self, other):
+        return self._op_scalar(other, operator.xor)
+
+    def __xor__(self, other: ndarray):
+        return self._op_elemwise(other, operator.xor)
+
+    def __rxor__(self, other):
+        return self._rop_scalar(other, operator.xor)
+
+    def __ixor__(self, other):
+        return self._iop_scalar(other, operator.xor)
+
+    def __ixor__(self, other: ndarray):
+        return self._iop_elemwise(other, operator.xor)
+
+    def __pos__(self):
+        return self._op_unary(operator.pos)
+
+    def __neg__(self):
+        return self._op_unary(operator.neg)
+
+    def __invert__(self):
+        return self._op_unary(operator.neg)
+
+    def __abs__(self):
+        return self._op_unary(operator.abs)
+
+    def __eq__(self, other):
+        return self._op_scalar(other, operator.eq)
+
+    def __eq__(self, other: ndarray):
+        return self._op_elemwise(other, operator.eq)
+
+    def __ne__(self, other):
+        return self._op_scalar(other, operator.ne)
+
+    def __ne__(self, other: ndarray):
+        return self._op_elemwise(other, operator.ne)
+
+    def __lt__(self, other):
+        return self._op_scalar(other, operator.lt)
+
+    def __lt__(self, other: ndarray):
+        return self._op_elemwise(other, operator.lt)
+
+    def __le__(self, other):
+        return self._op_scalar(other, operator.le)
+
+    def __le__(self, other: ndarray):
+        return self._op_elemwise(other, operator.le)
+
+    def __gt__(self, other):
+        return self._op_scalar(other, operator.gt)
+
+    def __gt__(self, other: ndarray):
+        return self._op_elemwise(other, operator.gt)
+
+    def __ge__(self, other):
+        return self._op_scalar(other, operator.ge)
+
+    def __ge__(self, other: ndarray):
+        return self._op_elemwise(other, operator.ge)
+
+    def map(self, fn, inplace: Static[int] = False):
+        if inplace:
+            return self._iop_unary(fn)
+        else:
+            return self._op_unary(fn)
+
+    def _ensure_no_duplicates(axis):
+        for i in range(len(axis)):
+            for j in range(i):
+                if axis[i] == axis[j]:
+                    raise ValueError("duplicate value in 'axis'")
+
+    def _normalize_axis(a: int, dim: int):
+        a0 = a
+        if a < 0:
+            a += dim
+        if not (0 <= a < dim):
+            raise ValueError(f"axis {a0} is out of bounds for array of dimension {dim}")
+        return a
+
+    def _multirange(limits):
+        if staticlen(limits) == 1:
+            x = limits[0]
+            for i in range(x):
+                yield (i,)
+        elif staticlen(limits) == 2:
+            x, y = limits
+            for i in range(x):
+                for j in range(y):
+                    yield (i, j)
+        elif staticlen(limits) == 3:
+            x, y, z = limits
+            for i in range(x):
+                for j in range(y):
+                    for k in range(z):
+                        yield (i, j, k)
+        else:
+            N: Static[int] = staticlen(limits)
+            curr = ndarray._zero_tuple(N)
+            s = Ptr[int](__ptr__(limits).as_byte())
+            p = Ptr[int](__ptr__(curr).as_byte())
+            idx = 0
+            limit = ndarray._count(limits)
+
+            for _ in range(limit):
+                yield curr
+                p[N - 1] += 1
+
+                for i in range(N - 1, -1, -1):
+                    if p[i] >= s[i]:
+                        p[i] = 0
+                        p[max(i - 1, 0)] += 1
+                    else:
+                        break
+
+    def _reconstruct_index(t1, t2, mask):
+        if staticlen(t1) + staticlen(t2) != staticlen(mask):
+            compile_error('[internal error] bad index reconstruction')
+
+        t = ndarray._zero_tuple(staticlen(mask))
+        p1 = Ptr[int](__ptr__(t1).as_byte())
+        p2 = Ptr[int](__ptr__(t2).as_byte())
+        p = Ptr[int](__ptr__(t).as_byte())
+        m = Ptr[bool](__ptr__(mask).as_byte())
+        k1, k2 = 0, 0
+        for i in range(staticlen(mask)):
+            if m[i]:
+                p[i] = p1[k1]
+                k1 += 1
+            else:
+                p[i] = p2[k2]
+                k2 += 1
+        return t
+
+    def _reduce_all(self, R: type, keepdims: Static[int] = False):
+        n = self.size
+        p = self._data
+
+        if n == 0:
+            R.empty()
+
+        redux = R()
+
+        if self.flags.contiguous:
+            i = 0
+            while i < n:
+                redux.accept(p[i], i)
+                if redux.done():
+                    break
+                i += 1
+        else:
+            i = 0
+            for idx in ndarray._multirange(self.shape):
+                redux.accept(self._ptr_for_index(idx, check=False)[0], i)
+                if redux.done():
+                    break
+                i += 1
+        ans = redux.result(i)
+
+        if keepdims:
+            p = Ptr[type(ans)](1)
+            shape = ndarray._static_tuple(1, staticlen(self.shape))
+            return ndarray._new_contig(shape, ans)
+        else:
+            return ans
+
+    def _reduce(self, axis, R: type, keepdims: Static[int] = False):
+        data = self._data
+        shape = self.shape
+        axis = tuple(ndarray._normalize_axis(a, len(shape)) for a in axis)
+        ndarray._ensure_no_duplicates(axis)
+
+        if staticlen(axis) == staticlen(shape):
+            return self._reduce_all(R)
+
+        if self.size == 0:
+            R.empty()
+
+        new_shape = ndarray._zero_tuple(staticlen(shape) - staticlen(axis))
+        idx_bound = ndarray._zero_tuple(staticlen(axis))
+        mask = ndarray._static_tuple(False, staticlen(shape))
+        ptr_new_shape = Ptr[int](__ptr__(new_shape).as_byte())
+        ptr_idx_bound = Ptr[int](__ptr__(idx_bound).as_byte())
+        ptr_mask = Ptr[bool](__ptr__(mask).as_byte())
+
+        shape_size = 1
+        bound_size = 1
+        a = 0
+        b = 0
+
+        for i in range(len(shape)):
+            s = shape[i]
+
+            if i in axis:
+                bound_size *= s
+                ptr_idx_bound[a] = s
+                ptr_mask[i] = False
+                a += 1
+            else:
+                shape_size *= s
+                ptr_new_shape[b] = s
+                ptr_mask[i] = True
+                b += 1
+
+        out_type = type(R().result(0))
+        result = ndarray._new_contig(new_shape, Ptr[out_type](shape_size))
+
+        for t1 in ndarray._multirange(new_shape):
+            redux = R()
+            k = 0
+            for t2 in ndarray._multirange(idx_bound):
+                idx = ndarray._reconstruct_index(t1, t2, mask)
+                e = self._ptr_for_index(idx, check=0)[0]
+                redux.accept(e, k)
+                if redux.done():
+                    break
+                k += 1
+            result._ptr_for_index(t1, check=0)[0] = redux.result(k)
+
+        if keepdims:
+            ones = ndarray._static_tuple(1, staticlen(idx_bound))
+            ans_shape = ndarray._reconstruct_index(new_shape, ones, mask)
+            return result.reshape(ans_shape)
+        else:
+            return result
+
+    def sum(self, axis, keepdims: Static[int] = False):
+        return self._reduce(axis, SumRedux[T], keepdims=keepdims)
+
+    def sum(self, axis: int, keepdims: Static[int] = False):
+        return self.sum(axis=(axis,), keepdims=keepdims)
+
+    def sum(self, keepdims: Static[int] = False):
+        return self._reduce_all(SumRedux[T], keepdims=keepdims)
+
+    def prod(self, axis, keepdims: Static[int] = False):
+        return self._reduce(axis, ProdRedux[T], keepdims=keepdims)
+
+    def prod(self, axis: int, keepdims: Static[int] = False):
+        return self.prod(axis=(axis,), keepdims=keepdims)
+
+    def prod(self, keepdims: Static[int] = False):
+        return self._reduce_all(ProdRedux[T], keepdims=keepdims)
+
+    def mean(self, axis, keepdims: Static[int] = False):
+        return self._reduce(axis, MeanRedux[T], keepdims=keepdims)
+
+    def mean(self, axis: int, keepdims: Static[int] = False):
+        return self.mean(axis=(axis,), keepdims=keepdims)
+
+    def mean(self, keepdims: Static[int] = False):
+        return self._reduce_all(MeanRedux[T], keepdims=keepdims)
+
+    def var(self, axis, keepdims: Static[int] = False):
+        return self._reduce(axis, VarRedux[T], keepdims=keepdims)
+
+    def var(self, axis: int, keepdims: Static[int] = False):
+        return self.var(axis=(axis,), keepdims=keepdims)
+
+    def var(self, keepdims: Static[int] = False):
+        return self._reduce_all(VarRedux[T], keepdims=keepdims)
+
+    def std(self, axis, keepdims: Static[int] = False):
+        return self._reduce(axis, StdRedux[T], keepdims=keepdims)
+
+    def std(self, axis: int, keepdims: Static[int] = False):
+        return self.std(axis=(axis,), keepdims=keepdims)
+
+    def std(self, keepdims: Static[int] = False):
+        return self._reduce_all(StdRedux[T], keepdims=keepdims)
+
+    def min(self, axis, keepdims: Static[int] = False):
+        return self._reduce(axis, MinRedux[T], keepdims=keepdims)
+
+    def min(self, axis: int, keepdims: Static[int] = False):
+        return self.min(axis=(axis,), keepdims=keepdims)
+
+    def min(self, keepdims: Static[int] = False):
+        return self._reduce_all(MinRedux[T], keepdims=keepdims)
+
+    def max(self, axis, keepdims: Static[int] = False):
+        return self._reduce(axis, MaxRedux[T], keepdims=keepdims)
+
+    def max(self, axis: int, keepdims: Static[int] = False):
+        return self.max(axis=(axis,), keepdims=keepdims)
+
+    def max(self, keepdims: Static[int] = False):
+        return self._reduce_all(MaxRedux[T], keepdims=keepdims)
+
+    def ptp(self, axis, keepdims: Static[int] = False):
+        return self._reduce(axis, PTPRedux[T], keepdims=keepdims)
+
+    def ptp(self, axis: int, keepdims: Static[int] = False):
+        return self.ptp(axis=(axis,), keepdims=keepdims)
+
+    def ptp(self, keepdims: Static[int] = False):
+        return self._reduce_all(PTPRedux[T], keepdims=keepdims)
+
+    def argmin(self, axis: int, keepdims: Static[int] = False):
+        return self._reduce((axis,), ArgMinRedux[T], keepdims=keepdims)
+
+    def argmin(self, keepdims: Static[int] = False):
+        return self._reduce_all(ArgMinRedux[T], keepdims=keepdims)
+
+    def argmax(self, axis: int, keepdims: Static[int] = False):
+        return self._reduce((axis,), ArgMaxRedux[T], keepdims=keepdims)
+
+    def argmax(self, keepdims: Static[int] = False):
+        return self._reduce_all(ArgMaxRedux[T], keepdims=keepdims)
+
+    def any(self, axis, keepdims: Static[int] = False):
+        return self._reduce(axis, AnyRedux[T], keepdims=keepdims)
+
+    def any(self, axis: int, keepdims: Static[int] = False):
+        return self.any(axis=(axis,), keepdims=keepdims)
+
+    def any(self, keepdims: Static[int] = False):
+        return self._reduce_all(AnyRedux[T], keepdims=keepdims)
+
+    def all(self, axis, keepdims: Static[int] = False):
+        return self._reduce(axis, AllRedux[T], keepdims=keepdims)
+
+    def all(self, axis: int, keepdims: Static[int] = False):
+        return self.all(axis=(axis,), keepdims=keepdims)
+
+    def all(self, keepdims: Static[int] = False):
+        return self._reduce_all(AllRedux[T], keepdims=keepdims)
+
+    def clip(self, min = None, max = None):
+        maxf = lambda a, b: a if a > b else b
+        minf = lambda a, b: a if a < b else b
+
+        if min is None and max is None:
+            raise ValueError('One of max or min must be given')
+        elif min is not None and max is not None:
+            return self._op_unary(lambda a: minf(max, maxf(a, min)))
+        elif max is None:
+            return self._op_unary(lambda a: maxf(a, min))
+        else:
+            return self._op_unary(lambda a: minf(a, max))
+
+    def _size1_error():
+        raise ValueError('only size-1 arrays can be converted to scalars')
+
+    def __int__(self):
+        if self.size != 1:
+            ndarray._size1_error()
+        return int(self._data[0])
+
+    def __float__(self):
+        if self.size != 1:
+            ndarray._size1_error()
+        return float(self._data[0])
+
+    def __complex__(self):
+        if self.size != 1:
+            ndarray._size1_error()
+        return complex(self._data[0])
+
+    def __bool__(self):
+        if self.size != 1:
+            raise ValueError('The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()')
+        return bool(self._data[0])
+
+    @property
+    def real(self):
+        if hasattr(T(), 'real'):
+            return self._op_unary(lambda a: a.real)
+        else:
+            return self
+
+    @property
+    def imag(self):
+        if hasattr(T(), 'imag'):
+            return self._op_unary(lambda a: a.imag)
+        else:
+            zero = T()
+            return self._op_unary(lambda a: zero)
