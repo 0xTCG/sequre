@@ -6,7 +6,7 @@ Sequre-MHE is an end-to-end, statically compiled and performance engineered, Pyt
 
 ### Installation
 
-You need [Codon](https://github.com/exaloop/codon) for Seq to work. Assuming that Codon is installed in `$HOME/.codon`, run:
+You need [Codon](https://github.com/exaloop/codon) for Sequre to work. Assuming that Codon is installed in `$HOME/.codon`, run:
 ```bash
 curl -L https://github.com/0xTCG/sequre-mhe/releases/download/v0.0.1-beta/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon/lib/codon/plugins
 ```
