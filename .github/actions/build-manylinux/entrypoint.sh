@@ -23,9 +23,9 @@ cd $1
 cmake -S . -B build \
   -DCMAKE_BUILD_TYPE=Release \
   -DCODON_PATH=$HOME/.codon \
-  -DLLVM_DIR=/opt/llvm-codon/lib/cmake/llvm \
-  -DCMAKE_C_COMPILER=/opt/llvm-codon/bin/clang \
-  -DCMAKE_CXX_COMPILER=/opt/llvm-codon/bin/clang++
+  -DLLVM_DIR=$OPT/llvm-codon/lib/cmake/llvm \
+  -DCMAKE_C_COMPILER=$OPT/llvm-codon/bin/clang \
+  -DCMAKE_CXX_COMPILER=$OPT/llvm-codon/bin/clang++
 if [ $TEST -eq 1 ]
 then
   cmake --build build
