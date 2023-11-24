@@ -32,26 +32,37 @@ Check the code in the [examples](examples/) for quick insight into Sequre.
 
 ### Online run
 
-At trusted dealer (CP0):
+At each party run:
+```bash
+sequre examples/online_run.codon <pid>
+```
+where `<pid>` denotes the ID of an underlying party.
+
+For example, in a two-party setup with a trusted dealer, run:
 ```bash
 sequre examples/online_run.codon 0
 ```
+at a trusted dealer (CP0).
 
-At first computing party (CP1):
 ```bash
 sequre examples/online_run.codon 1
 ```
+at the first party (CP1).
 
-At second computing party (CP2):
 ```bash
 sequre examples/online_run.codon 2
 ```
+at the second party (CP2).
 
 ### Local run
+
+To simulate the run on a single machine over multiple processes run:
 
 ```bash
 sequre examples/local_run.codon --skip-mhe-setup
 ```
+
+This will simulate the run in a two-party setup with a trusted dealer.
 
 _**Note:** `--skip-mhe-setup` flag disables the homomorphic encryption setup since `playground.codon` does not require homomorphic encryption._
 
