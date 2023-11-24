@@ -13,7 +13,7 @@ mkdir $HOME/.codon && curl -L https://github.com/0xTCG/sequre-mhe/releases/downl
 
 Then install Sequre:
 ```bash
-curl -L https://github.com/0xTCG/sequre-mhe/releases/download/v0.0.2-alpha/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon/lib/codon/plugins
+curl -L https://github.com/0xTCG/sequre-mhe/releases/download/v0.0.3-alpha/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon/lib/codon/plugins
 ```
 
 Afterwards, add alias for sequre command:
