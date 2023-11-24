@@ -18,7 +18,7 @@ curl -L https://github.com/0xTCG/sequre-mhe/releases/download/v0.0.1-beta/sequre
 
 Afterwards, add alias for sequre command:
 ```bash
-alias sequre="find  . -name 'sock.*' -exec rm {} \; && $HOME/.codon/bin/codon run -plugin sequre -plugin seq"
+alias sequre="find . -name 'sock.*' -exec rm {} \; && $HOME/.codon/bin/codon run -plugin sequre -plugin seq"
 ```
 
 Finally, you can run Sequre as:
@@ -28,7 +28,7 @@ sequre examples/local_run.codon
 
 ## Examples
 
-Check the code in [examples](examples/) for insight on how Sequre operates.
+Check the code in the [examples](examples/) for quick insight into Sequre.
 
 ### Online run
 
