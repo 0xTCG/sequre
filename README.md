@@ -2,9 +2,7 @@
 
 Sequre-MHE is an end-to-end, statically compiled and performance engineered, Pythonic framework for building efficient secure multiparty computation (MPC), homomorphic encryption (HE), and multiparty homomorphic encryption (MHE) pipelines in bioinformatics.
 
-## Quick start
-
-### Installation
+## Installation
 
 **Note:** Sequre runs only on Linux at the moment.
 
@@ -25,20 +23,45 @@ alias sequre="find  . -name 'sock.*' -exec rm {} \; && $HOME/.codon/bin/codon ru
 
 Finally, you can run Sequre as:
 ```bash
-sequre playground.codon
+sequre examples/local_run.codon
 ```
 
-### Test run
+## Examples
 
-Run
+Check the code in [examples](examples/) for insight on how Sequre operates.
+
+### Online run
+
+At trusted dealer (CP0):
 ```bash
-sequre -debug playground.codon --skip-mhe-setup
+sequre examples/online_run.codon 0
 ```
-to run the sample code from [playground.codon](playground.codon) that contains the benchmarks from [Hastings _et al._](https://github.com/MPC-SoK/frameworks).
 
-`playground.codon` is executed in a local, single machine, environment over inter-process communication channels (AF_UNIX). For running the codebase in a different environment, see [run instructions](#run-instructions).
+At first computing party (CP1):
+```bash
+sequre examples/online_run.codon 1
+```
+
+At second computing party (CP2):
+```bash
+sequre examples/online_run.codon 2
+```
+
+### Local run
+
+```bash
+sequre examples/local_run.codon --skip-mhe-setup
+```
 
 _**Note:** `--skip-mhe-setup` flag disables the homomorphic encryption setup since `playground.codon` does not require homomorphic encryption._
+
+### Release mode
+
+For (much) better performance but without debugging features such as backtrace, add `-release` flag immediatelly after `sequre` command:
+
+```bash
+sequre -release examples/local_run.codon --skip-mhe-setup
+```
 
 ## Sequre's network config
 
