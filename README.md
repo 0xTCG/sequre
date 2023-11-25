@@ -8,12 +8,12 @@ Sequre-MHE is an end-to-end, statically compiled and performance engineered, Pyt
 
 Install [Codon](https://github.com/exaloop/codon) first:
 ```bash
-mkdir $HOME/.codon && curl -L https://github.com/0xTCG/sequre/releases/download/v0.0.2-alpha/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon --strip-components=1
+mkdir $HOME/.codon && curl -L https://github.com/0xTCG/sequre-mhe/releases/download/v0.0.2-alpha/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon --strip-components=1
 ```
 
 Then install Sequre:
 ```bash
-curl -L https://github.com/0xTCG/sequre/releases/download/v0.0.2-alpha/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon/lib/codon/plugins
+curl -L https://github.com/0xTCG/sequre-mhe/releases/download/v0.0.4-alpha/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon/lib/codon/plugins
 ```
 
 Afterwards, add alias for sequre command:
