@@ -17,6 +17,7 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
   if ( !f ) return;
   
   bool isEq      = f->getUnmangledName() == Module::EQ_MAGIC_NAME;
+  bool isNe      = f->getUnmangledName() == Module::NE_MAGIC_NAME;
   bool isGt      = f->getUnmangledName() == Module::GT_MAGIC_NAME;
   bool isLt      = f->getUnmangledName() == Module::LT_MAGIC_NAME;
   bool isAdd     = f->getUnmangledName() == Module::ADD_MAGIC_NAME;
@@ -29,6 +30,7 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
   bool isSetItem = f->getUnmangledName() == Module::SETITEM_MAGIC_NAME;
   
   if ( !isEq &&
+       !isNe &&
        !isGt &&
        !isLt && 
        !isAdd && 
@@ -82,6 +84,7 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
   }
 
   std::string methodName = isEq        ? "secure_eq"
+                           : isNe      ? "secure_ne"
                            : isGt      ? "secure_gt"
                            : isLt      ? "secure_lt"
                            : isAdd     ? "secure_add"
