@@ -197,14 +197,9 @@ CallInstr *revealCall( Var *var, VarValue *mpc ) {
     throw "ERROR: Reveal call called on top of non-secure container";
   
   auto *M          = var->getModule();
-  std::string name = namePath.substr(1, namePath.rfind('.'));
-  std::string path = namePath.substr(0, namePath.rfind('.'));
-  auto *type       = M->getOrRealizeType(name, {}, path);
-  auto *method     = M->getOrRealizeMethod(type, "reveal", { varType, mpc->getType() }, {});
-  
+  auto *method     = M->getOrRealizeMethod(varType, "reveal", { varType, mpc->getType() }, {});
   if ( !method )
-    std::cout << "\nSEQURE TYPE REALIZATION ERROR: Could not realize reveal method for " << name << "\n";
-  
+    std::cout << "\nSEQURE TYPE REALIZATION ERROR: Could not realize reveal method for " << varType->getName() << "\n";
   return util::call(method, { M->Nr<VarValue>(var), mpc });
 }
 

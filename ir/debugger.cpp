@@ -16,23 +16,24 @@ public:
     return inst;
   }
   Var *get( Var *secureVar ) {
-    auto it = map.find(secureVar->getId());
+    auto *M  = secureVar->getModule();
+    auto  it = map.find(secureVar->getId());
     
     if ( it != map.end() )
-      return it->second;
+      return M->getVar(it->second);
     
     return nullptr;
   }
   void insert( codon::ir::id_t varId, Var *var ) {
-    map.insert({varId, var});
+    map.insert({varId, var->getId()});
   }
 private:
   SecureVarsSingleton() = default;
   ~SecureVarsSingleton() = default;
-  std::unordered_map<codon::ir::id_t, Var*> map;
+  std::unordered_map<codon::ir::id_t, codon::ir::id_t> map;
 };
 
-void Debugger::replaceVars( Value *v ) {
+void Debugger::replaceVars( Value *v, VarValue *mpc ) {
   auto *var = util::getVar(v);
   
   if ( var ) {
@@ -41,7 +42,7 @@ void Debugger::replaceVars( Value *v ) {
 
       if ( !rawVar ) {
         auto *M         = v->getModule();
-        auto *reveal    = revealCall(var);
+        auto *reveal    = revealCall(var, mpc);
         rawVar          = M->Nr<Var>(reveal->getType());
         auto *rawAssign = M->Nr<AssignInstr>(rawVar, reveal);
 
@@ -53,7 +54,7 @@ void Debugger::replaceVars( Value *v ) {
     }
   } else {
     for ( auto *val : v->getUsedValues() )
-      replaceVars(val);
+      replaceVars(val, mpc);
   }
 }
 
@@ -73,16 +74,17 @@ void Debugger::attachDebugger( AssignInstr *v ) {
   auto *body   = cast<SeriesFlow>(parent->getBody());
 
   auto it = body->begin();
-  while ( *it != v ) ++it;
+  while ( *it != v && it != body->end() ) ++it;
 
   auto *mpc = M->Nr<VarValue>(pf->arg_front());
   assert( isMPC(mpc) && "ERROR: The first argument of sequre function should be the MPC instance" );
 
   util::CloneVisitor cv(M);
   auto *rawRhs = cv.clone(rhs);
-  replaceVars(rawRhs);
+  replaceVars(rawRhs, mpc);
 
-  auto *rawLhs    = M->Nr<Var>(rawRhs->getType());
+  auto *revealLhs = revealCall(lhs, mpc);
+  auto *rawLhs    = M->Nr<Var>(revealLhs->getType());
   auto *rawAssign = M->Nr<AssignInstr>(rawLhs, rawRhs);
   SecureVarsSingleton::instance().insert(lhs->getId(), rawLhs);
 
@@ -90,14 +92,15 @@ void Debugger::attachDebugger( AssignInstr *v ) {
 
   auto *assertFunc = M->getOrRealizeFunc(
     "assert_eq_approx",
-    {M->getStringType(), rawLhs->getType(), rawLhs->getType()}, {},
+    {M->getStringType(), rawLhs->getType(), rawLhs->getType(), M->getFloatType(), M->getBoolType()}, {},
     "std.sequre.utils.testing");
+  assert ( assertFunc && "SEQURE TYPE REALIZATION ERROR: Could not realize std.sequre.utils.testing.assert_eq_approx" );
   
   auto srcInfo     = v->getSrcInfo();
   auto srcPath     = srcInfo.file + ":" + std::to_string(srcInfo.line);
   auto *assertCall = util::call(
     assertFunc,
-    {M->getString(srcPath), M->Nr<VarValue>(rawLhs), revealCall(lhs)});
+    {M->getString(srcPath), M->Nr<VarValue>(rawLhs), revealLhs});
   body->insert(it++, assertCall);
 }
 

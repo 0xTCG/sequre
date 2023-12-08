@@ -12,7 +12,7 @@ class Debugger : public codon::ir::transform::OperatorPass {
   void handle( codon::ir::AssignInstr * ) override;
   
   void attachDebugger( codon::ir::AssignInstr * );
-  void replaceVars( codon::ir::Value * );
+  void replaceVars( codon::ir::Value *, codon::ir::VarValue * );
 };
 
 } // namespace sequre

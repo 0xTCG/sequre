@@ -46,6 +46,6 @@ bool isArithmeticOperation( Operation );
 Operation getOperation( CallInstr * );
 
 // Secure calls
-CallInstr *revealCall( Var * );
+CallInstr *revealCall( Var *, VarValue * );
 
 } // namespace sequre
