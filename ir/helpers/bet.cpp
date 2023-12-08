@@ -135,7 +135,7 @@ std::string const BETNode::getConstStr() const {
   return "Non-constant";
 }
 
-void BETNode::print( int level = 0, int maxLevel = 100) const {
+void BETNode::print( int level = 0, int maxLevel = 100 ) const {
   if ( level >= maxLevel ) return;
 
   for (int i = 0; i < level; ++i)
@@ -172,7 +172,7 @@ bool BET::reduceLvl( BETNode *node, bool cohort = false ) {
 
   std::vector<BETNode *> visited;
   std::unordered_map<BETNode *, std::vector<BETNode *>> metadata;
-  std::pair<BETNode *, BETNode*> factors = findFactorizationNodes(node, visited, metadata);
+  std::pair<BETNode *, BETNode *> factors = findFactorizationNodes(node, visited, metadata);
   if ( !factors.first || !factors.second ) return false;
 
   BETNode *factor               = factors.first;
