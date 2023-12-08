@@ -14,20 +14,24 @@ const std::string MPATypeName = "std.sequre.types.multiparty_aggregate.MPA";
 const std::string MPUTypeName = "std.sequre.types.multiparty_union.MPU";
 
 
-bool isSequreFunc( Func *f ) {
+bool hasSequreAttr( Func *f ) {
   return bool(f) && util::hasAttribute(f, "std.sequre.attributes.sequre");
 }
 
-bool isPolyOptFunc( Func *f ) {
+bool hasPolyOptAttr( Func *f ) {
   return bool(f) && util::hasAttribute(f, "std.sequre.attributes.mpc_poly_opt");
 }
 
-bool isMatmulReorderOptFunc( Func *f ) {
+bool hasMatmulReorderOptAttr( Func *f ) {
   return bool(f) && util::hasAttribute(f, "std.sequre.attributes.reorder_matmul");
 }
 
-bool isCipherOptFunc( Func *f ) {
+bool hasCipherOptAttr( Func *f ) {
   return bool(f) && util::hasAttribute(f, "std.sequre.attributes.mhe_cipher_opt");
+}
+
+bool hasDebugAttr( Func *f ) {
+  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.debug");
 }
 
 bool hasCKKSPlaintext( types::Type *t ) {
@@ -105,7 +109,7 @@ Func *getOrRealizeSequreInternalMethod( Module *M, std::string const &methodName
     std::cout << "\nSEQURE TYPE REALIZATION ERROR: Could not realize internal method: " << methodName
               << "\n\tfor parameters ";
     
-    for (auto arg : args)
+    for ( auto arg : args )
       std::cout << "\n\t\t" << arg->getName();
               
     std::cout << std::endl;
@@ -123,7 +127,7 @@ Func *getOrRealizeSequreHelper( Module *M, std::string const &funcName,
     std::cout << "\nSEQURE TYPE REALIZATION ERROR: Could not realize helper func: " << funcName
               << "\n\tfor parameters ";
     
-    for (auto arg : args)
+    for ( auto arg : args )
       std::cout << "\n\t\t" << arg->getName();
               
     std::cout << std::endl;
@@ -144,7 +148,7 @@ bool isCallOfName( const Value *value, const std::string &name ) {
   return false;
 }
 
-Value *findCallByName ( Value *value, const std::string &name, std::set<Value *> visited = {} ) {
+Value *findCallByName( Value *value, const std::string &name, std::set<Value *> visited = {} ) {
   if ( visited.count(value) ) return nullptr;
   if ( isCallOfName(value, name) ) return value;
 
@@ -172,6 +176,36 @@ Operation getOperation( CallInstr *callInstr ) {
   if ( instrName == Module::MATMUL_MAGIC_NAME ) return matmul;
   
   return noop;
+}
+
+CallInstr *revealCall( Var *var, VarValue *mpc ) {
+  assert( isSecureContainer(var->getType()) && "ERROR: Reveal call called on top of non-secure container" );
+  auto *varType = var->getType();
+
+  std::string namePath;
+  if ( isSharetensor(varType) )
+    namePath = sharetensorTypeName;
+  else if ( isCiphertensor(varType) )
+    namePath = cipherTensorTypeName;
+  else if ( isMPP(varType) )
+    namePath = MPPTypeName;
+  else if ( isMPA(varType) )
+    namePath = MPATypeName;
+  else if ( isMPU(varType) )
+    namePath = MPUTypeName;
+  else
+    throw "ERROR: Reveal call called on top of non-secure container";
+  
+  auto *M          = var->getModule();
+  std::string name = namePath.substr(1, namePath.rfind('.'));
+  std::string path = namePath.substr(0, namePath.rfind('.'));
+  auto *type       = M->getOrRealizeType(name, {}, path);
+  auto *method     = M->getOrRealizeMethod(type, "reveal", { varType, mpc->getType() }, {});
+  
+  if ( !method )
+    std::cout << "\nSEQURE TYPE REALIZATION ERROR: Could not realize reveal method for " << name << "\n";
+  
+  return util::call(method, { M->Nr<VarValue>(var), mpc });
 }
 
 } // namespace sequre

@@ -43,6 +43,8 @@ set(SEQURE_FILES
     ir/mhe.h
     ir/expr.cpp
     ir/expr.h
+    ir/debugger.cpp
+    ir/debugger.h
     ir/sequre.cpp
     ir/sequre.h)
 add_library(sequre SHARED ${SEQURE_FILES})

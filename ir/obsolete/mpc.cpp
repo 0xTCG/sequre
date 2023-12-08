@@ -1129,7 +1129,7 @@ void applyFactorizationOptimizations(CallInstr *v) {
 
 void applyPolynomialOptimizations(CallInstr *v) {
   auto *f = util::getFunc(v->getCallee());
-  if (!isPolyOptFunc(f) || isSequreFunc(f))
+  if (!hasPolyOptAttr(f) || hasSequreAttr(f))
     return;
 
   auto *bf = cast<BodiedFunc>(f);

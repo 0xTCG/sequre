@@ -11,7 +11,7 @@ using namespace codon::ir;
 
 void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
   auto *pf = getParentFunc();
-  if ( !isSequreFunc(pf) ) return;
+  if ( !hasSequreAttr(pf) ) return;
   
   auto *f = util::getFunc(v->getCallee());
   if ( !f ) return;
