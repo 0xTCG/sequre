@@ -6,12 +6,14 @@ namespace sequre {
 
 using namespace codon::ir;
 
-// Secure types helpers
-bool isSequreFunc( Func * );
-bool isPolyOptFunc( Func * );
-bool isCipherOptFunc( Func * );
-bool isMatmulReorderOptFunc ( Func * ); 
+// Attribute checks
+bool hasSequreAttr( Func * );
+bool hasPolyOptAttr( Func * );
+bool hasCipherOptAttr( Func * );
+bool hasMatmulReorderOptAttr ( Func * ); 
+bool hasDebugAttr( Func * );
 
+// Secure types helpers
 bool hasCKKSPlaintext( types::Type * );
 bool hasCKKSCiphertext( types::Type * );
 
@@ -42,5 +44,8 @@ void   visitAllNodes( Value *, std::set<Value *> & );
 // BET helpers
 bool isArithmeticOperation( Operation );
 Operation getOperation( CallInstr * );
+
+// Secure calls
+CallInstr *revealCall( Var *, VarValue * );
 
 } // namespace sequre

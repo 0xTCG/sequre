@@ -1,6 +1,6 @@
-# Sequre-MHE
+# Sequre
 
-Sequre-MHE is an end-to-end, statically compiled and performance engineered, Pythonic framework for building efficient secure multiparty computation (MPC), homomorphic encryption (HE), and multiparty homomorphic encryption (MHE) pipelines in bioinformatics.
+Sequre is an end-to-end, statically compiled and performance engineered, Pythonic framework for building efficient secure multiparty computation (MPC), homomorphic encryption (HE), and multiparty homomorphic encryption (MHE) pipelines in bioinformatics.
 
 ## Installation
 
@@ -64,7 +64,7 @@ sequre examples/local_run.codon --skip-mhe-setup
 
 This will simulate the run in a two-party setup with a trusted dealer.
 
-_**Note:** `--skip-mhe-setup` flag disables the homomorphic encryption setup since `playground.codon` does not require homomorphic encryption._
+_**Note:** `--skip-mhe-setup` flag disables the homomorphic encryption setup since `examples/local_run.codon` does not require homomorphic encryption._
 
 ### Release mode
 

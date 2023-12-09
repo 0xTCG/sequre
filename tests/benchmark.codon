@@ -1,7 +1,10 @@
+import math
+import prg
+
 from time import timing
 from datetime import datetime
 
-from numpy.create import array, ones
+from numpy.create import array, ones, zeros
 from numpy.ndarray import ndarray
 
 from perf import perf_timing, perf_print_stats
@@ -18,6 +21,7 @@ import sequre.lattiseq.ckks as ckks
 
 from sequre.stdlib.lin_alg import qr_fact_square, tridiag, eigen_decomp, orthonormalize
 from sequre.stdlib.learn.lin_reg import LinReg
+from sequre.stdlib.learn.log_reg import LogReg
 from sequre.stdlib.learn.mi import MI
 from sequre.stdlib.learn.pca import random_pca_experimental
 from sequre.types.utils import double_to_fp
@@ -25,16 +29,22 @@ from sequre.types.multiparty_partition import MPP
 from sequre.types.multiparty_union import MPU
 from sequre.types.sharetensor import Sharetensor
 from sequre.utils.testing import time_frame
-from sequre.utils.param import int_t
 from sequre.utils.constants import RUN_TOGGLES
 from sequre.utils.io import read_matrix
 
 from unit_tests.test_he import lattiseq_test_setup
 
 
+@python
+def bernoulli(n: int, p: list[float], seed: int) -> List[int]:
+    import numpy as np
+    np.random.seed(seed)
+    return np.random.binomial(n, p).tolist()
+
+
 ################################### Helpers #####################################
 def generate_mi_data(mpc, case: int):
-    # Case 0 loads data from data/mi/input_matrix.txt
+    # Case -1 loads data from data/mi/lin_input_matrix.txt
     # Other cases generate random data from uniform distribution
     miss_rows = []
 
@@ -127,6 +137,63 @@ def generate_mi_data(mpc, case: int):
     return (data, labels, complete_data, miss_rows, miss_col,
         im_initial_w, fm_initial_w, im_step_size, fm_step_size,
         im_optimizer, fm_optimizer)
+
+def generate_paper_mi_data(mpc, case: int, type: str):
+    # Generate data as in https://www.nature.com/articles/s41467-020-19270-2
+    assert type in {"linear", "logistic"}, f"Invalid type of MI data {type}"
+
+    if case == 0:
+        rows_per_party = 500
+        rows = rows_per_party * (mpc.comms.number_of_parties - 1)
+        im_step_size = 1 / (1 << 11)
+        fm_step_size = 1 / (1 << 12)
+        im_optimizer = "mbgd"
+        fm_optimizer = "mbgd"
+    else:
+        raise ValueError("Invalid case")
+
+    feature_count = 2
+
+    with mpc.randomness.seed_switch(-1):
+        # x_2 is from U(-3, 3)
+        x_2 = ndarray.rand((rows,), "uniform") * 6 - 3
+    
+        if type == "linear":
+            # Linear x_1 is from normal(mu=0.2 - 0.5*x_2, sigma=1.0)
+            x_1 = array([prg.gauss(mu=0.2 - 0.5 * x, sigma=1.0) for x in x_2.tolist()])
+        else:
+            # Logistic x_1 is from bernoulli(n=1, p=1 / (1 + exp(-0.2 + 0.5*x_2)))
+            x_1 = array(bernoulli(1, [(1 / (1 + math.exp(-0.2 + 0.5 * x))) for x in x_2.tolist()], prg.randint(0, 100)), dtype=float)
+    
+    complete_data = zeros((rows, 2), dtype=float)
+    for i in range(rows):
+        complete_data[i, 0] = x_1[i]
+        complete_data[i, 1] = x_2[i]
+    
+    miss_col = 0
+    miss_val = 0.0
+    
+    miss_rows = []
+    complete_data += 1 / (1 << 10)  # To avoid MPC fp underflow
+    data = complete_data.copy()
+    with mpc.randomness.seed_switch(-1):
+        labels = complete_data @ ones((feature_count, 1)) + 1.0  # Weights and bias are ones
+        labels += ndarray.rand(labels.shape, "normal")  # Add some noise
+        for i in range(rows):
+            # The variable is missing with probability 1 / (1 + math.exp(-0.3 + 0.2 * labels[i][0] - 0.1 * x_2[i]))
+            if (1 / (1 + math.exp(-0.3 + 0.2 * labels[i][0] - 0.1 * x_2[i]))) > prg.random():
+                data[i][miss_col] = miss_val
+                miss_rows.append(i)
+
+    im_initial_w = ones((feature_count, 1))
+    fm_initial_w = ones((feature_count + 1, 1))
+
+    print(f"CP{mpc.pid}:\tLogistic regression missing rate: {len(miss_rows)}/{len(complete_data)}")
+
+    return (data, labels, complete_data, miss_rows, miss_col,
+        im_initial_w, fm_initial_w, im_step_size, fm_step_size,
+        im_optimizer, fm_optimizer)
+
 
 ################################### Wrappers #####################################
 def lattiseq_wrapper(mpc, modulus):
@@ -224,7 +291,7 @@ def lin_alg_wrapper(mpc, modulus, sv_mat):
     eigen_decomp(mpc, sv_mat)
     orthonormalize(mpc, sv_mat)
 
-def mi_wrapper(mpc, modulus):
+def linear_mi_wrapper(mpc, modulus):
     mi_factor = 10
     im_epochs = 40
     fm_epochs = 40
@@ -246,7 +313,31 @@ def mi_wrapper(mpc, modulus):
     
     predicted_data = mpc_mi.model.predict(mpc, mpc_complete_data).reveal(mpc)
     stats = labels.hstack(predicted_data)
-    print(f"CP{mpc.pid}:\tSequre MI standard deviation", ndarray.mean(ndarray.std(stats, axis=1)))
+    print(f"CP{mpc.pid}:\tSequre MI standard deviation (linear regression)", ndarray.mean(ndarray.std(stats, axis=1)))
+
+def logistic_mi_wrapper(mpc, modulus):
+    mi_factor = 5
+    im_epochs = 40
+    fm_epochs = 40
+    
+    (data, labels, complete_data, miss_rows, miss_col,
+     im_initial_w, fm_initial_w, im_step_size, fm_step_size,
+     im_optimizer, fm_optimizer) = generate_paper_mi_data(mpc, case=0, type="logistic")
+
+    mpc_complete_data = Sharetensor.enc(mpc, complete_data, 0, modulus)
+    mpc_data = Sharetensor.enc(mpc, data, 0, modulus)
+    mpc_labels = Sharetensor.enc(mpc, labels, 0, modulus)
+
+    mpc_impute_model = LogReg(Sharetensor.enc(mpc, im_initial_w, 0, modulus), im_optimizer)
+    mpc_fit_model = LogReg(Sharetensor.enc(mpc, fm_initial_w, 0, modulus), fm_optimizer)
+    
+    mpc_mi = MI(mi_factor, mpc_impute_model, mpc_fit_model).fit(
+        mpc, mpc_data, mpc_labels, miss_rows, miss_col,
+        im_step_size, fm_step_size, im_epochs, fm_epochs, "batched")
+    
+    predicted_data = mpc_mi.model.predict(mpc, mpc_complete_data).reveal(mpc)
+    stats = labels.hstack(predicted_data)
+    print(f"CP{mpc.pid}:\tSequre MI standard deviation (logistic regression)", ndarray.mean(ndarray.std(stats, axis=1)))
 
 def gwas_wrapper(mpc, modulus):
     # return gwas_protocol(mpc, True, modulus)
@@ -288,19 +379,6 @@ def ganon_wrapper(mpc, modulus, read_limit):
 
 
 def benchmark[TP](mpc, benchmark_toggles: dict, modulus: TP):
-    a = Sharetensor(mpc.comms.share_from_trusted_dealer([int_t(i) for i in range(10)], modulus), modulus)
-    b = Sharetensor(mpc.comms.share_from_trusted_dealer(
-        [int_t(1), int_t(2), int_t(1), int_t(2), int_t(3),
-         int_t(4), int_t(3), int_t(4), int_t(1), int_t(5)], modulus), modulus)
-    c = Sharetensor(mpc.comms.share_from_trusted_dealer([int_t(i) for i in range(10)], modulus), modulus)
-    d = Sharetensor(mpc.comms.share_from_trusted_dealer(
-        [int_t(1), int_t(2), int_t(1), int_t(2), int_t(3),
-         int_t(4), int_t(3), int_t(4), int_t(1), int_t(5)], modulus), modulus)
-    e = Sharetensor(mpc.comms.share_from_trusted_dealer([int_t(i) for i in range(100000)], modulus), modulus)
-    f = Sharetensor(mpc.comms.share_from_trusted_dealer(int_t(7), modulus), modulus)
-    g = Sharetensor(mpc.comms.share_from_trusted_dealer(int_t(13), modulus), modulus)
-    h = Sharetensor(mpc.comms.share_from_trusted_dealer(int_t(19), modulus), modulus)
-
     h_mat = [[double_to_fp(float(i + j), modulus) for i in range(50)] for j in range(50)]
     sv_mat = Sharetensor(h_mat, modulus)
     sv_mat.get_partitions(mpc)
@@ -318,8 +396,10 @@ def benchmark[TP](mpc, benchmark_toggles: dict, modulus: TP):
         time_frame(mpc, lattiseq_mult3_wrapper, 'Lattiseq mult3', modulus)
     if benchmark_toggles[RUN_TOGGLES.KING_FLAG] or run_all:
         time_frame(mpc, king_wrapper, 'KING', modulus)
-    if benchmark_toggles[RUN_TOGGLES.MI_FLAG] or run_all:
-        time_frame(mpc, mi_wrapper, 'Multiple imputation', modulus)
+    if benchmark_toggles[RUN_TOGGLES.LINEAR_MI_FLAG] or run_all:
+        time_frame(mpc, linear_mi_wrapper, 'Multiple imputation (linear)', modulus)
+    if benchmark_toggles[RUN_TOGGLES.LOGISTIC_MI_FLAG] or run_all:
+        time_frame(mpc, logistic_mi_wrapper, 'Multiple imputation (logistic)', modulus)
     if benchmark_toggles[RUN_TOGGLES.PCA_FLAG] or run_all:
         time_frame(mpc, pca_wrapper, 'PCA', modulus)
 

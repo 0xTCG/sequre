@@ -64,7 +64,7 @@ void transformExpressions( Module *M, SeriesFlow *series, Value *mpcValue ) {
 void applyCipherPlainOptimizations( CallInstr *v ) {
   auto *M = v->getModule();
   auto *f = util::getFunc(v->getCallee());
-  if ( !isCipherOptFunc(f) ) return;
+  if ( !hasCipherOptAttr(f) ) return;
   assert( v->numArgs() > 0 && "Compile error: The first argument of the mhe_cipher_opt annotated function should be the MPC instance (annotated function has no args)" );
 
   auto *mpcValue = M->Nr<VarValue>(f->arg_front());

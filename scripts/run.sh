@@ -34,7 +34,7 @@ echo "Codon path: $SEQURE_CODON_PATH"
 echo "Seq-lang plugin path: $SEQURE_SEQ_PATH"
 echo "Sequre plugin path: $SEQURE_PATH"
 echo "Compiling $2 in $1 mode ..."
-GC_INITIAL_HEAP_SIZE=8179869184 $SEQURE_CODON_PATH/bin/codon run -plugin $SEQURE_PATH -plugin $SEQURE_SEQ_PATH $1 scripts/invoke.codon run-$2 ${*:3}
+GC_INITIAL_HEAP_SIZE=8179869184 $SEQURE_CODON_PATH/build/codon run -plugin $SEQURE_PATH -plugin $SEQURE_SEQ_PATH $1 scripts/invoke.codon run-$2 ${*:3}
 
 echo "Cleaning up sockets ..."
 find . -name 'sock.*' -exec rm {} \;
