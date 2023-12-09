@@ -43,7 +43,7 @@ void Debugger::replaceVars( Value *v, VarValue *mpc ) {
       if ( !rawVar ) {
         auto *M         = v->getModule();
         auto *reveal    = revealCall(var, mpc);
-        rawVar          = M->Nr<Var>(reveal->getType());
+        rawVar          = M->Nr<Var>(reveal->getType(), false, false, "raw_" + var->getName());
         auto *rawAssign = M->Nr<AssignInstr>(rawVar, reveal);
 
         insertBefore(rawAssign);
@@ -73,9 +73,6 @@ void Debugger::attachDebugger( AssignInstr *v ) {
   auto *parent = cast<BodiedFunc>(pf);
   auto *body   = cast<SeriesFlow>(parent->getBody());
 
-  auto it = body->begin();
-  while ( *it != v && it != body->end() ) ++it;
-
   auto *mpc = M->Nr<VarValue>(pf->arg_front());
   assert( isMPC(mpc) && "ERROR: The first argument of sequre function should be the MPC instance" );
 
@@ -84,10 +81,12 @@ void Debugger::attachDebugger( AssignInstr *v ) {
   replaceVars(rawRhs, mpc);
 
   auto *revealLhs = revealCall(lhs, mpc);
-  auto *rawLhs    = M->Nr<Var>(revealLhs->getType());
+  auto *rawLhs    = M->Nr<Var>(revealLhs->getType(), false, false, "raw_" + lhs->getName());
   auto *rawAssign = M->Nr<AssignInstr>(rawLhs, rawRhs);
   SecureVarsSingleton::instance().insert(lhs->getId(), rawLhs);
 
+  auto it = body->begin();
+  while ( *it != v && it != body->end() ) ++it;
   body->insert(it++, rawAssign);
 
   auto *assertFunc = M->getOrRealizeFunc(
@@ -100,7 +99,7 @@ void Debugger::attachDebugger( AssignInstr *v ) {
   auto srcPath     = srcInfo.file + ":" + std::to_string(srcInfo.line);
   auto *assertCall = util::call(
     assertFunc,
-    {M->getString(srcPath), M->Nr<VarValue>(rawLhs), revealLhs});
+    {M->getString(srcPath), M->Nr<VarValue>(rawLhs), revealLhs, M->getFloat(0.02), M->getBool(false)});
   body->insert(it++, assertCall);
 }
 
