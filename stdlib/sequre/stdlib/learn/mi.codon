@@ -110,6 +110,19 @@ class Imputer[M]:
 
         return imputed_data
     
+    def impute_inplace(self, mpc, data, mask, miss_col, error):
+        if mask.sum() == 0:  # Nothing to impute --- no missing data
+            return
+        
+        reference_data = data[:, :miss_col].hstack(data[:, miss_col+1:])
+        imputed_y = self.model.predict(mpc, reference_data.filter(mask), error)
+
+        idx = 0
+        for i in range(len(mask)):
+            if mask[i]:
+                data[i, miss_col] = imputed_y[idx, 0]
+                idx += 1
+    
 
 class MI[IM, FM]:
     imputer: Imputer[IM]
@@ -166,3 +179,47 @@ class MI[IM, FM]:
     @sequre
     def _rubin(mpc, weights: List):
         return weights.sum() / len(weights)
+
+
+class BatchMI[IM, FM]:
+    imputers: List[Imputer[IM]]
+    model: FM
+    factor: int
+
+    def __init__(self, factor: int, impute_models: List[IM], fit_model: FM):
+        self.imputers = [Imputer(impute_model) for impute_model in impute_models]
+        self.model = fit_model
+        self.factor = factor
+
+    def fit(
+            self, mpc, incomplete_data, complete_data, labels, miss_rows,
+            im_step, fm_step, im_epochs, fm_epochs):
+
+        with mpc.randomness.seed_switch(-1):
+            error = prg.gauss(0.0, 0.5)
+        
+        miss_col = 0
+        for imputer in self.imputers:
+            train_data = complete_data[:, :miss_col].hstack(complete_data[:, miss_col+1:])
+            train_labels = complete_data[:, miss_col:miss_col+1]
+            
+            imputer.fit(mpc, complete_data=train_data, complete_labels=train_labels,
+                        step=im_step, epochs=im_epochs, mode="batched")
+            miss_col += 1
+        
+        weights = []
+        for _ in tqdm(range(self.factor), desc=f"CP{mpc.pid}:\tMI fitting"):
+            self.impute_inplace(mpc, incomplete_data, miss_rows, error)
+            self.model.fit(mpc, X=incomplete_data, y=labels, step=fm_step, epochs=fm_epochs)
+            weights.append(self.model.coef_.copy())
+        
+        self.model.coef_ = MI.rubin(mpc, weights)
+        return self
+    
+    def impute_inplace(self, mpc, incomplete_data, miss_rows, error):
+        miss_col = 0
+        for imputer in self.imputers:
+            imputer.impute_inplace(
+                mpc, data=incomplete_data,
+                mask=miss_rows[miss_col], miss_col=miss_col, error=error)
+            miss_col += 1

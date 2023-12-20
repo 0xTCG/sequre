@@ -22,7 +22,7 @@ import sequre.lattiseq.ckks as ckks
 from sequre.stdlib.lin_alg import qr_fact_square, tridiag, eigen_decomp, orthonormalize
 from sequre.stdlib.learn.lin_reg import LinReg
 from sequre.stdlib.learn.log_reg import LogReg
-from sequre.stdlib.learn.mi import MI
+from sequre.stdlib.learn.mi import MI, BatchMI
 from sequre.stdlib.learn.pca import random_pca_experimental
 from sequre.types.utils import double_to_fp
 from sequre.types.multiparty_partition import MPP
@@ -194,6 +194,31 @@ def generate_paper_mi_data(mpc, case: int, type: str):
         im_initial_w, fm_initial_w, im_step_size, fm_step_size,
         im_optimizer, fm_optimizer)
 
+def load_paper_mi_data():
+    with open("data/mi/incomplete_data.txt") as f:
+        incomplete_data = array(read_matrix(f, 86322, 15, binary=False, TP=float))
+    with open("data/mi/complete_data.txt") as f:
+        complete_data = array(read_matrix(f, 14940, 15, binary=False, TP=float))
+    with open("data/mi/labels.txt") as f:
+        labels = array(read_matrix(f, 86322, 1, binary=False, TP=float))
+    with open("data/mi/miss_rows.txt") as f:
+        miss_rows = read_matrix(f, 15, 86322, binary=False, TP=int)
+    with open("data/mi/col_types.txt") as f:
+        col_types = [line.strip() for line in f.readlines()]
+    
+    feature_count = len(col_types)
+    im_step_size = 1 / (1 << 17)
+    fm_step_size = 1 / (1 << 19)
+    im_initial_w = ones((feature_count, 1)) * (1 / (1 << 10))
+    fm_initial_w = ones((feature_count + 1, 1)) * (1 / (1 << 10))
+    im_optimizer = "mbgd"
+    fm_optimizer = "mbgd"
+
+    return (incomplete_data, complete_data, labels,
+        miss_rows, col_types,
+        im_initial_w, fm_initial_w, im_step_size, fm_step_size,
+        im_optimizer, fm_optimizer)
+
 
 ################################### Wrappers #####################################
 def lattiseq_wrapper(mpc, modulus):
@@ -339,6 +364,39 @@ def logistic_mi_wrapper(mpc, modulus):
     stats = labels.hstack(predicted_data)
     print(f"CP{mpc.pid}:\tSequre MI standard deviation (logistic regression)", ndarray.mean(ndarray.std(stats, axis=1)))
 
+def batch_mi_wrapper(mpc, modulus):
+    def _match_model(t, mpc_im_initial_w, im_optimizer) -> Union:
+        if t == "log":
+            return LogReg(mpc_im_initial_w.copy(), im_optimizer)
+        else:
+            return LinReg(mpc_im_initial_w.copy(), im_optimizer)
+    
+    mi_factor = 5
+    im_epochs = 40
+    fm_epochs = 40
+
+    (incomplete_data, complete_data, labels,
+     miss_rows, col_types,
+     im_initial_w, fm_initial_w, im_step_size, fm_step_size,
+     im_optimizer, fm_optimizer) = load_paper_mi_data()
+
+    mpc_incomplete_data = Sharetensor.enc(mpc, incomplete_data, 0, modulus)
+    mpc_complete_data = Sharetensor.enc(mpc, complete_data, 0, modulus)
+    mpc_labels = Sharetensor.enc(mpc, labels, 0, modulus)
+    mpc_im_initial_w = Sharetensor.enc(mpc, im_initial_w, 0, modulus)
+    mpc_fm_initial_w = Sharetensor.enc(mpc, fm_initial_w, 0, modulus)
+    
+    mpc_impute_models = [_match_model(col_type, mpc_im_initial_w, im_optimizer) for col_type in col_types]
+    mpc_fit_model = LinReg(mpc_fm_initial_w, fm_optimizer)
+    
+    mpc_mi = BatchMI(mi_factor, mpc_impute_models, mpc_fit_model).fit(
+        mpc, mpc_incomplete_data, mpc_complete_data, mpc_labels, miss_rows,
+        im_step_size, fm_step_size, im_epochs, fm_epochs)
+    
+    predicted_data = mpc_mi.model.predict(mpc, mpc_incomplete_data).reveal(mpc)
+    stats = labels.hstack(predicted_data)
+    print(f"CP{mpc.pid}:\tSequre MI standard deviation (real data)", ndarray.mean(ndarray.std(stats, axis=1)))
+
 def gwas_wrapper(mpc, modulus):
     # return gwas_protocol(mpc, True, modulus)
     return sf_gwas_experimental(mpc, True, modulus)
@@ -400,6 +458,8 @@ def benchmark[TP](mpc, benchmark_toggles: dict, modulus: TP):
         time_frame(mpc, linear_mi_wrapper, 'Multiple imputation (linear)', modulus)
     if benchmark_toggles[RUN_TOGGLES.LOGISTIC_MI_FLAG] or run_all:
         time_frame(mpc, logistic_mi_wrapper, 'Multiple imputation (logistic)', modulus)
+    if benchmark_toggles[RUN_TOGGLES.BATCH_MI_FLAG] or run_all:
+        time_frame(mpc, batch_mi_wrapper, 'Multiple imputation (batch)', modulus)
     if benchmark_toggles[RUN_TOGGLES.PCA_FLAG] or run_all:
         time_frame(mpc, pca_wrapper, 'PCA', modulus)
 
