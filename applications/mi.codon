@@ -1,0 +1,376 @@
+""" Multiple imputation experiments from https://www.nature.com/articles/s41467-020-19270-2 """
+
+import math
+import prg
+
+from tqdm import tqdm
+
+from numpy.ndarray import ndarray
+from numpy.create import array, zeros, ones, ones_like
+
+from sequre.stdlib.learn.log_reg import LogReg
+from sequre.stdlib.learn.lin_reg import LinReg
+from sequre.stdlib.learn.mi import MI, BatchMI
+from sequre.types.sharetensor import Sharetensor
+from sequre.utils.io import read_vector, read_matrix, log
+
+
+def _match_model(scenario, mpc_im_initial_w, im_optimizer) -> Union:
+    if scenario == "scenario_2" or scenario == "log":
+        return LogReg(mpc_im_initial_w.copy(), im_optimizer)
+    elif scenario == "scenario_1" or scenario == "lin":
+        return LinReg(mpc_im_initial_w.copy(), im_optimizer)
+    else:
+        raise ValueError(f"Invalid scenario: {scenario}")
+
+
+def _generate_random_mi_data(mpc, case: int):
+    # Case -1 loads data from data/mi/lin_input_matrix.txt
+    # Other cases generate random data from uniform distribution
+    miss_rows = []
+
+    if case == -1:
+        rows_per_party = 500
+        cols_per_party = 10
+        im_step_size = 1 / (1 << 11)
+        fm_step_size = 1 / (1 << 12)
+        im_optimizer = "mbgd"
+        fm_optimizer = "mbgd"
+        miss_rows = list(range(333))
+    elif case == 0:
+        rows_per_party = 50
+        cols_per_party = 10
+        im_step_size = 0.001
+        fm_step_size = 0.001
+        im_optimizer = "bgd"
+        fm_optimizer = "bgd"
+        miss_rows = list(range(10))
+    elif case == 1:
+        rows_per_party = 125
+        cols_per_party = 15
+        miss_rate = 50
+        im_step_size = 0.001
+        fm_step_size = 0.001
+        im_optimizer = "bgd"
+        fm_optimizer = "bgd"
+    elif case == 2:
+        rows_per_party = 250
+        cols_per_party = 30
+        miss_rate = 100
+        im_step_size = 1 / (1 << 11)
+        fm_step_size = 1 / (1 << 12)
+        im_optimizer = "bgd"
+        fm_optimizer = "bgd"
+    elif case == 3:
+        rows_per_party = 500
+        cols_per_party = 60
+        miss_rate = 200
+        im_step_size = 1 / (1 << 11)
+        fm_step_size = 1 / (1 << 12)
+        im_optimizer = "mbgd"
+        fm_optimizer = "mbgd"
+    else:
+        assert case == 4, "Invalid case"
+    
+    im_initial_w = ones((cols_per_party, 1))
+    fm_initial_w = ones((cols_per_party + 1, 1))
+    
+    if case == 4:
+        rows_per_party = 34144
+        cols_per_party = 204
+        miss_rate = 54934
+        im_step_size = 1 / (1 << 17)
+        fm_step_size = 1 / (1 << 19)
+        im_initial_w = ones((cols_per_party, 1)) * (1 / (1 << 10))
+        fm_initial_w = ones((cols_per_party + 1, 1)) * (1 / (1 << 10))
+        im_optimizer = "mbgd"
+        fm_optimizer = "mbgd"
+
+    miss_col = 0
+    miss_val = 0.0
+
+    if case > 0:  # Generate data
+        with mpc.randomness.seed_switch(-1):
+            complete_data = ndarray.rand(((mpc.comms.number_of_parties - 1) * rows_per_party, cols_per_party), "uniform")
+    else:  # Load data
+        with open("data/mi/input_matrix.txt") as f:
+            complete_data = array(read_matrix(f, rows_per_party * (mpc.comms.number_of_parties - 1), cols_per_party, False, TP=float))
+    
+    data = complete_data.copy()
+    
+    if miss_rows:
+        for i in miss_rows:
+            data[i][miss_col] = miss_val
+    else:
+        miss_rows_set = set[int]()
+        with mpc.randomness.seed_switch(-1):
+            for _ in range(miss_rate):
+                miss_row = int.rand(len(data) - 1, "uniform")
+                data[miss_row][miss_col] = miss_val
+                miss_rows_set.add(miss_row)
+        miss_rows = sorted(list(miss_rows_set))
+    
+    complete_data += 1 / (1 << 10)  # To avoid MPC fp underflow
+    with mpc.randomness.seed_switch(-1):
+        labels = complete_data @ ndarray.rand((cols_per_party, 1), "uniform") + 1.0
+        labels += ndarray.rand(labels.shape, "normal")  # Add some noise
+    
+    return (data, labels, complete_data, miss_rows, miss_col,
+        im_initial_w, fm_initial_w, im_step_size, fm_step_size,
+        im_optimizer, fm_optimizer)
+
+
+def _generate_scenario_mi_data(mpc, case: int, type: str):
+    @python
+    def bernoulli(n: int, p: list[float], seed: int) -> List[int]:
+        import numpy as np
+        np.random.seed(seed)
+        return np.random.binomial(n, p).tolist()
+    
+    # Generate data as in https://www.nature.com/articles/s41467-020-19270-2
+    assert type in {"linear", "logistic"}, f"Invalid type of MI data {type}"
+
+    if case == 0:
+        rows_per_party = 500
+        rows = rows_per_party * (mpc.comms.number_of_parties - 1)
+        im_step_size = 1 / (1 << 11)
+        fm_step_size = 1 / (1 << 12)
+        im_optimizer = "mbgd"
+        fm_optimizer = "mbgd"
+    else:
+        raise ValueError("Invalid case")
+
+    feature_count = 2
+
+    with mpc.randomness.seed_switch(-1):
+        # x_2 is from U(-3, 3)
+        x_2 = ndarray.rand((rows,), "uniform") * 6 - 3
+    
+        if type == "linear":
+            # Linear x_1 is from normal(mu=0.2 - 0.5*x_2, sigma=1.0)
+            x_1 = array([prg.gauss(mu=0.2 - 0.5 * x, sigma=1.0) for x in x_2.tolist()])
+        else:
+            # Logistic x_1 is from bernoulli(n=1, p=1 / (1 + exp(-0.2 + 0.5*x_2)))
+            x_1 = array(bernoulli(1, [(1 / (1 + math.exp(-0.2 + 0.5 * x))) for x in x_2.tolist()], prg.randint(0, 100)), dtype=float)
+    
+    complete_data = zeros((rows, 2), dtype=float)
+    for i in range(rows):
+        complete_data[i, 0] = x_1[i]
+        complete_data[i, 1] = x_2[i]
+    
+    miss_col = 0
+    miss_val = 0.0
+    
+    miss_rows = []
+    complete_data += 1 / (1 << 10)  # To avoid MPC fp underflow
+    data = complete_data.copy()
+    with mpc.randomness.seed_switch(-1):
+        labels = complete_data @ ones((feature_count, 1)) + 1.0  # Weights and bias are ones
+        labels += ndarray.rand(labels.shape, "normal")  # Add some noise
+        for i in range(rows):
+            # The variable is missing with probability 1 / (1 + math.exp(-0.3 + 0.2 * labels[i][0] - 0.1 * x_2[i]))
+            if (1 / (1 + math.exp(-0.3 + 0.2 * labels[i][0] - 0.1 * x_2[i]))) > prg.random():
+                data[i][miss_col] = miss_val
+                miss_rows.append(i)
+
+    im_initial_w = ones((feature_count, 1))
+    fm_initial_w = ones((feature_count + 1, 1))
+
+    print(f"CP{mpc.pid}:\tGenerated data missing rate: {len(miss_rows)}/{len(complete_data)}")
+
+    return (data, labels, complete_data, miss_rows, miss_col,
+        im_initial_w, fm_initial_w, im_step_size, fm_step_size,
+        im_optimizer, fm_optimizer)
+
+
+def load_scenario_mi_data(scenario, rows_count):
+    with open(f"data/mi/{scenario}/tampered_data.txt") as f:
+        incomplete_data = array(read_matrix(f, rows_count, 2, binary=False, TP=float))
+    with open(f"data/mi/{scenario}/non_tampered_data.txt") as f:
+        complete_data = array(read_matrix(f, rows_count, 2, binary=False, TP=float))
+    with open(f"data/mi/{scenario}/non_tampered_labels.txt") as f:
+        labels = array(read_matrix(f, rows_count, 1, binary=False, TP=float))
+    with open(f"data/mi/{scenario}/miss_rows.txt") as f:
+        miss_rows = read_vector(f, rows_count, binary=False, TP=int)
+    
+    feature_count = 2
+    im_step_size = 1 / (1 << 11)
+    fm_step_size = 1 / (1 << 12)
+    im_initial_w = ones((feature_count, 1))
+    fm_initial_w = ndarray.rand((feature_count + 1, 1), "uniform")
+    im_optimizer = "mbgd"
+    fm_optimizer = "mbgd"
+    
+    return (incomplete_data, complete_data, labels, miss_rows,
+        im_initial_w, fm_initial_w, im_step_size, fm_step_size,
+        im_optimizer, fm_optimizer)
+
+
+def load_real_mi_data(rows_count=86322, complete_data_size=14940, feature_count=15):
+    with open("data/mi/real/incomplete_data.txt") as f:
+        incomplete_data = array(read_matrix(f, rows_count, feature_count, binary=False, TP=float))
+    with open("data/mi/real/complete_data.txt") as f:
+        complete_data = array(read_matrix(f, complete_data_size, feature_count, binary=False, TP=float))
+    with open("data/mi/real/labels.txt") as f:
+        labels = array(read_matrix(f, rows_count, 1, binary=False, TP=float))
+    with open("data/mi/real/miss_rows.txt") as f:
+        miss_rows = read_matrix(f, feature_count, rows_count, binary=False, TP=int)
+    with open("data/mi/real/col_types.txt") as f:
+        col_types = [line.strip() for line in f.readlines()]
+    
+    im_step_size = 1 / (1 << 17)
+    fm_step_size = 1 / (1 << 19)
+    im_initial_w = ones((feature_count, 1)) * (1 / (1 << 10))
+    fm_initial_w = ones((feature_count + 1, 1)) * (1 / (1 << 10))
+    im_optimizer = "mbgd"
+    fm_optimizer = "mbgd"
+
+    return (incomplete_data, complete_data, labels, miss_rows, col_types,
+        im_initial_w, fm_initial_w, im_step_size, fm_step_size,
+        im_optimizer, fm_optimizer)
+
+
+def evaluate_scenario(
+        mpc, msg: Static[str], scenario, im_epochs, fm_epochs,
+        mi_factor, miss_col, dump_data, verbose, modulus):
+    (data, complete_data, labels, miss_rows,
+     im_initial_w, fm_initial_w, im_step_size, fm_step_size,
+     im_optimizer, fm_optimizer) = scenario
+    
+    mpc_complete_data = Sharetensor.enc(mpc, complete_data, 0, modulus)
+    mpc_data = Sharetensor.enc(mpc, data, 0, modulus)
+    mpc_labels = Sharetensor.enc(mpc, labels, 0, modulus)
+
+    mpc_impute_model = _match_model(msg, Sharetensor.enc(mpc, im_initial_w, 0, modulus), im_optimizer)
+    mpc_fit_model = LinReg(Sharetensor.enc(mpc, fm_initial_w, 0, modulus), fm_optimizer)
+
+    mpc_mi, imputed_datasets = MI(mi_factor, mpc_impute_model, mpc_fit_model).fit(
+        mpc, mpc_data, mpc_labels, miss_rows, miss_col,
+        im_step_size, fm_step_size, im_epochs, fm_epochs, "stochastic", verbose=verbose)
+
+    if dump_data:
+        for i, data in enumerate(imputed_datasets):
+            revealed_data = data.reveal(mpc).tolist()
+            if mpc.pid == 2:
+                log("", revealed_data,
+                    path=f'data/mi/dump/sequre_imputed_dataset_{msg}_{i + 1}.txt',
+                    mode='w', separator=' ')
+
+    predicted_data = mpc_mi.model.predict(mpc, mpc_complete_data, noise=False).reveal(mpc)
+    stats = labels.hstack(predicted_data)
+    bias = math.sqrt((predicted_data - labels).flatten().dot(axis=0))
+    sd = ndarray.mean(ndarray.std(stats, axis=1))
+
+    return mpc_mi.model.coef_.reveal(mpc), bias, sd
+
+
+def benchmark_scenario(mpc, msg: Static[str], runs_count, scenario, im_epochs,
+                       fm_epochs, mi_factor, miss_col, dump_data, verbose, modulus):
+    coefs = zeros((runs_count, 2))
+    biases = zeros((runs_count,))
+    sds = zeros((runs_count,))
+    
+    for i in tqdm(mpc, range(runs_count), "Evaluating scenario"):
+        coef, bias, sd = evaluate_scenario(
+            mpc, msg, scenario, im_epochs, fm_epochs,
+            mi_factor, miss_col, dump_data, verbose, modulus)
+        coefs[i] = coef
+        biases[i] = bias
+        sds[i] = sd
+    
+    return coefs, biases, sds
+
+
+def evaluate_real_setup(mpc, real_data, mi_factor, im_epochs, fm_epochs, dump_data, verbose, modulus):
+    (incomplete_data, complete_data, labels,
+     miss_row_masks, col_types,
+     im_initial_w, fm_initial_w, im_step_size, fm_step_size,
+     im_optimizer, fm_optimizer) = real_data
+
+    mpc_incomplete_data = Sharetensor.enc(mpc, incomplete_data, 0, modulus)
+    mpc_complete_data = Sharetensor.enc(mpc, complete_data, 0, modulus)
+    mpc_labels = Sharetensor.enc(mpc, labels, 0, modulus)
+    mpc_im_initial_w = Sharetensor.enc(mpc, im_initial_w, 0, modulus)
+    mpc_fm_initial_w = Sharetensor.enc(mpc, fm_initial_w, 0, modulus)
+    
+    mpc_impute_models = [_match_model(col_type, mpc_im_initial_w, im_optimizer) for col_type in col_types]
+    mpc_fit_model = LinReg(mpc_fm_initial_w, fm_optimizer)
+    
+    mpc_mi, imputed_datasets = BatchMI(mi_factor, mpc_impute_models, mpc_fit_model).fit(
+        mpc, mpc_incomplete_data, mpc_complete_data, mpc_labels, miss_row_masks,
+        im_step_size, fm_step_size, im_epochs, fm_epochs, verbose=verbose)
+    
+    if dump_data:
+        for i, data in enumerate(imputed_datasets):
+            revealed_data = data.reveal(mpc).tolist()
+            if mpc.pid == 2:
+                log("", revealed_data, path=f'data/mi/dump/sequre_imputed_dataset_real_{i + 1}.txt', mode='w', separator=' ')
+    
+    predicted_data = mpc_mi.model.predict(mpc, mpc_incomplete_data, noise=False).reveal(mpc)
+    stats = labels.hstack(predicted_data)
+    bias = math.sqrt((predicted_data - labels).flatten().dot(axis=0))
+    sd = ndarray.mean(ndarray.std(stats, axis=1))
+
+    return bias, sd
+
+
+def benchmark_real_setup(mpc, runs_count, real_data, mi_factor, im_epochs, fm_epochs, dump_data, verbose, modulus):
+    biases = zeros((runs_count,))
+    sds = zeros((runs_count,))
+    
+    for i in tqdm(mpc, range(runs_count), "Evaluating real setup"):
+        bias, sd = evaluate_real_setup(mpc, real_data, mi_factor, im_epochs, fm_epochs, dump_data, verbose, modulus)
+        biases[i] = bias
+        sds[i] = sd
+    
+    return zeros((runs_count, 15)), biases, sds
+
+
+def print_stats(mpc, msg: Static[str], coefs, biases, sds):
+    print(f"\tCP{mpc.pid}: {msg} | Sequre MI bias/rMSE w.r.t. ground truth | mean: {biases.mean()}, min: {biases.min()}, max: {biases.max()}")
+    print(f"\tCP{mpc.pid}: {msg} | Sequre MI SD w.r.t. ground truth | mean: {sds.mean()}, min: {sds.min()}, max: {sds.max()}")
+    
+    if msg.lower().startswith("scenario"):
+        coefs_truth = ones_like(coefs[0])
+        coefs_bias = math.sqrt((ndarray.mean(coefs, axis=0) - coefs_truth).flatten().dot(axis=0))
+        coefs_sd = ndarray.mean(ndarray.std(coefs, axis=0))
+        coefs_rmse = ndarray.mean(ndarray.sum((coefs - coefs_truth) ** 2, axis=1))
+
+        print(f"\tCP{mpc.pid}: {msg} | Sequre MI coefs bias: {coefs_bias}")
+        print(f"\tCP{mpc.pid}: {msg} | Sequre MI coefs SD: {coefs_sd}")
+        print(f"\tCP{mpc.pid}: {msg} | Sequre MI coefs rMSE: {coefs_rmse}")
+
+
+def benchmark_mi(mpc, mi_factor, im_epochs, fm_epochs, dump_data,
+                 scenarios_runs_count, scenarios_rows,
+                 scenarios_miss_col, real_setup_runs_count,
+                 verbose, run_scenarios, run_real_setup, modulus):
+    if run_scenarios:
+        # Scenario 1
+        sc1 = load_scenario_mi_data("scenario_1", scenarios_rows)
+        # Scenario 2
+        sc2 = load_scenario_mi_data("scenario_2", scenarios_rows)
+        
+        sc1_stats = benchmark_scenario(
+            mpc, "scenario_1", scenarios_runs_count, sc1,
+            im_epochs, fm_epochs, mi_factor,
+            scenarios_miss_col, dump_data, verbose, modulus)
+        
+        print_stats(mpc, "Scenario 1", *sc1_stats)
+
+        sc2_stats = benchmark_scenario(
+            mpc, "scenario_2", scenarios_runs_count, sc2,
+            im_epochs, fm_epochs, mi_factor,
+            scenarios_miss_col, dump_data, verbose, modulus)
+        
+        print_stats(mpc, "Scenario 2", *sc2_stats)
+    
+    if run_real_setup:
+        # Real data
+        real = load_real_mi_data()
+        
+        real_stats = benchmark_real_setup(
+            mpc, real_setup_runs_count, real, mi_factor,
+            im_epochs, fm_epochs, dump_data, verbose, modulus)
+
+        print_stats(mpc, "Real data", *real_stats)
