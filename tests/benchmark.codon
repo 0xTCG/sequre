@@ -1,14 +1,11 @@
-import math
-import prg
-
 from time import timing
 from datetime import datetime
 
-from numpy.create import array, ones, zeros
-from numpy.ndarray import ndarray
+from numpy.create import array
 
 from perf import perf_timing, perf_print_stats
 
+from ..applications.mi import benchmark_mi
 from ..applications.king import king
 from ..applications.gwas import gwas_protocol, sf_gwas_experimental
 from ..applications.dti import dti_mpc_protocol, dti_mhe_protocol
@@ -20,9 +17,6 @@ from ..applications.utils.data_sharing import share_all_data
 import sequre.lattiseq.ckks as ckks
 
 from sequre.stdlib.lin_alg import qr_fact_square, tridiag, eigen_decomp, orthonormalize
-from sequre.stdlib.learn.lin_reg import LinReg
-from sequre.stdlib.learn.log_reg import LogReg
-from sequre.stdlib.learn.mi import MI, BatchMI
 from sequre.stdlib.learn.pca import random_pca_experimental
 from sequre.types.utils import double_to_fp
 from sequre.types.multiparty_partition import MPP
@@ -33,191 +27,6 @@ from sequre.utils.constants import RUN_TOGGLES
 from sequre.utils.io import read_matrix
 
 from unit_tests.test_he import lattiseq_test_setup
-
-
-@python
-def bernoulli(n: int, p: list[float], seed: int) -> List[int]:
-    import numpy as np
-    np.random.seed(seed)
-    return np.random.binomial(n, p).tolist()
-
-
-################################### Helpers #####################################
-def generate_mi_data(mpc, case: int):
-    # Case -1 loads data from data/mi/lin_input_matrix.txt
-    # Other cases generate random data from uniform distribution
-    miss_rows = []
-
-    if case == -1:
-        rows_per_party = 500
-        cols_per_party = 10
-        im_step_size = 1 / (1 << 11)
-        fm_step_size = 1 / (1 << 12)
-        im_optimizer = "mbgd"
-        fm_optimizer = "mbgd"
-        miss_rows = list(range(333))
-    elif case == 0:
-        rows_per_party = 50
-        cols_per_party = 10
-        im_step_size = 0.001
-        fm_step_size = 0.001
-        im_optimizer = "bgd"
-        fm_optimizer = "bgd"
-        miss_rows = list(range(10))
-    elif case == 1:
-        rows_per_party = 125
-        cols_per_party = 15
-        miss_rate = 50
-        im_step_size = 0.001
-        fm_step_size = 0.001
-        im_optimizer = "bgd"
-        fm_optimizer = "bgd"
-    elif case == 2:
-        rows_per_party = 250
-        cols_per_party = 30
-        miss_rate = 100
-        im_step_size = 1 / (1 << 11)
-        fm_step_size = 1 / (1 << 12)
-        im_optimizer = "bgd"
-        fm_optimizer = "bgd"
-    elif case == 3:
-        rows_per_party = 500
-        cols_per_party = 60
-        miss_rate = 200
-        im_step_size = 1 / (1 << 11)
-        fm_step_size = 1 / (1 << 12)
-        im_optimizer = "mbgd"
-        fm_optimizer = "mbgd"
-    else:
-        assert case == 4, "Invalid case"
-    
-    im_initial_w = ones((cols_per_party, 1))
-    fm_initial_w = ones((cols_per_party + 1, 1))
-    
-    if case == 4:
-        rows_per_party = 34144
-        cols_per_party = 204
-        miss_rate = 54934
-        im_step_size = 1 / (1 << 17)
-        fm_step_size = 1 / (1 << 19)
-        im_initial_w = ones((cols_per_party, 1)) * (1 / (1 << 10))
-        fm_initial_w = ones((cols_per_party + 1, 1)) * (1 / (1 << 10))
-        im_optimizer = "mbgd"
-        fm_optimizer = "mbgd"
-
-    miss_col = 0
-    miss_val = 0.0
-
-    if case > 0:  # Generate data
-        with mpc.randomness.seed_switch(-1):
-            complete_data = ndarray.rand(((mpc.comms.number_of_parties - 1) * rows_per_party, cols_per_party), "uniform")
-    else:  # Load data
-        with open("data/mi/input_matrix.txt") as f:
-            complete_data = array(read_matrix(f, rows_per_party * (mpc.comms.number_of_parties - 1), cols_per_party, False, TP=float))
-    
-    data = complete_data.copy()
-    
-    if miss_rows:
-        for i in miss_rows:
-            data[i][miss_col] = miss_val
-    else:
-        miss_rows_set = set[int]()
-        with mpc.randomness.seed_switch(-1):
-            for _ in range(miss_rate):
-                miss_row = int.rand(len(data) - 1, "uniform")
-                data[miss_row][miss_col] = miss_val
-                miss_rows_set.add(miss_row)
-        miss_rows = sorted(list(miss_rows_set))
-    
-    complete_data += 1 / (1 << 10)  # To avoid MPC fp underflow
-    with mpc.randomness.seed_switch(-1):
-        labels = complete_data @ ndarray.rand((cols_per_party, 1), "uniform") + 1.0
-        labels += ndarray.rand(labels.shape, "normal")  # Add some noise
-    
-    return (data, labels, complete_data, miss_rows, miss_col,
-        im_initial_w, fm_initial_w, im_step_size, fm_step_size,
-        im_optimizer, fm_optimizer)
-
-def generate_paper_mi_data(mpc, case: int, type: str):
-    # Generate data as in https://www.nature.com/articles/s41467-020-19270-2
-    assert type in {"linear", "logistic"}, f"Invalid type of MI data {type}"
-
-    if case == 0:
-        rows_per_party = 500
-        rows = rows_per_party * (mpc.comms.number_of_parties - 1)
-        im_step_size = 1 / (1 << 11)
-        fm_step_size = 1 / (1 << 12)
-        im_optimizer = "mbgd"
-        fm_optimizer = "mbgd"
-    else:
-        raise ValueError("Invalid case")
-
-    feature_count = 2
-
-    with mpc.randomness.seed_switch(-1):
-        # x_2 is from U(-3, 3)
-        x_2 = ndarray.rand((rows,), "uniform") * 6 - 3
-    
-        if type == "linear":
-            # Linear x_1 is from normal(mu=0.2 - 0.5*x_2, sigma=1.0)
-            x_1 = array([prg.gauss(mu=0.2 - 0.5 * x, sigma=1.0) for x in x_2.tolist()])
-        else:
-            # Logistic x_1 is from bernoulli(n=1, p=1 / (1 + exp(-0.2 + 0.5*x_2)))
-            x_1 = array(bernoulli(1, [(1 / (1 + math.exp(-0.2 + 0.5 * x))) for x in x_2.tolist()], prg.randint(0, 100)), dtype=float)
-    
-    complete_data = zeros((rows, 2), dtype=float)
-    for i in range(rows):
-        complete_data[i, 0] = x_1[i]
-        complete_data[i, 1] = x_2[i]
-    
-    miss_col = 0
-    miss_val = 0.0
-    
-    miss_rows = []
-    complete_data += 1 / (1 << 10)  # To avoid MPC fp underflow
-    data = complete_data.copy()
-    with mpc.randomness.seed_switch(-1):
-        labels = complete_data @ ones((feature_count, 1)) + 1.0  # Weights and bias are ones
-        labels += ndarray.rand(labels.shape, "normal")  # Add some noise
-        for i in range(rows):
-            # The variable is missing with probability 1 / (1 + math.exp(-0.3 + 0.2 * labels[i][0] - 0.1 * x_2[i]))
-            if (1 / (1 + math.exp(-0.3 + 0.2 * labels[i][0] - 0.1 * x_2[i]))) > prg.random():
-                data[i][miss_col] = miss_val
-                miss_rows.append(i)
-
-    im_initial_w = ones((feature_count, 1))
-    fm_initial_w = ones((feature_count + 1, 1))
-
-    print(f"CP{mpc.pid}:\tGenerated data missing rate: {len(miss_rows)}/{len(complete_data)}")
-
-    return (data, labels, complete_data, miss_rows, miss_col,
-        im_initial_w, fm_initial_w, im_step_size, fm_step_size,
-        im_optimizer, fm_optimizer)
-
-def load_paper_mi_data():
-    with open("data/mi/incomplete_data.txt") as f:
-        incomplete_data = array(read_matrix(f, 86322, 15, binary=False, TP=float))
-    with open("data/mi/complete_data.txt") as f:
-        complete_data = array(read_matrix(f, 14940, 15, binary=False, TP=float))
-    with open("data/mi/labels.txt") as f:
-        labels = array(read_matrix(f, 86322, 1, binary=False, TP=float))
-    with open("data/mi/miss_rows.txt") as f:
-        miss_rows = read_matrix(f, 15, 86322, binary=False, TP=int)
-    with open("data/mi/col_types.txt") as f:
-        col_types = [line.strip() for line in f.readlines()]
-    
-    feature_count = len(col_types)
-    im_step_size = 1 / (1 << 17)
-    fm_step_size = 1 / (1 << 19)
-    im_initial_w = ones((feature_count, 1)) * (1 / (1 << 10))
-    fm_initial_w = ones((feature_count + 1, 1)) * (1 / (1 << 10))
-    im_optimizer = "mbgd"
-    fm_optimizer = "mbgd"
-
-    return (incomplete_data, complete_data, labels,
-        miss_rows, col_types,
-        im_initial_w, fm_initial_w, im_step_size, fm_step_size,
-        im_optimizer, fm_optimizer)
 
 
 ################################### Wrappers #####################################
@@ -316,86 +125,26 @@ def lin_alg_wrapper(mpc, modulus, sv_mat):
     eigen_decomp(mpc, sv_mat)
     orthonormalize(mpc, sv_mat)
 
-def linear_mi_wrapper(mpc, modulus):
-    mi_factor = 5
+def mi_wrapper(mpc, modulus):
     im_epochs = 40
     fm_epochs = 40
-    
-    (data, labels, complete_data, miss_rows, miss_col,
-     im_initial_w, fm_initial_w, im_step_size, fm_step_size,
-     im_optimizer, fm_optimizer) = generate_paper_mi_data(mpc, case=0, type="linear")
-
-    mpc_complete_data = Sharetensor.enc(mpc, complete_data, 0, modulus)
-    mpc_data = Sharetensor.enc(mpc, data, 0, modulus)
-    mpc_labels = Sharetensor.enc(mpc, labels, 0, modulus)
-
-    mpc_impute_model = LinReg(Sharetensor.enc(mpc, im_initial_w, 0, modulus), im_optimizer)
-    mpc_fit_model = LinReg(Sharetensor.enc(mpc, fm_initial_w, 0, modulus), fm_optimizer)
-    
-    mpc_mi = MI(mi_factor, mpc_impute_model, mpc_fit_model).fit(
-        mpc, mpc_data, mpc_labels, miss_rows, miss_col,
-        im_step_size, fm_step_size, im_epochs, fm_epochs, "stochastic")
-    
-    predicted_data = mpc_mi.model.predict(mpc, mpc_complete_data).reveal(mpc)
-    stats = labels.hstack(predicted_data)
-    print(f"CP{mpc.pid}:\tSequre MI standard deviation (linear regression)", ndarray.mean(ndarray.std(stats, axis=1)))
-
-def logistic_mi_wrapper(mpc, modulus):
     mi_factor = 5
-    im_epochs = 40
-    fm_epochs = 40
-    
-    (data, labels, complete_data, miss_rows, miss_col,
-     im_initial_w, fm_initial_w, im_step_size, fm_step_size,
-     im_optimizer, fm_optimizer) = generate_paper_mi_data(mpc, case=0, type="logistic")
+    dump_data = True
 
-    mpc_complete_data = Sharetensor.enc(mpc, complete_data, 0, modulus)
-    mpc_data = Sharetensor.enc(mpc, data, 0, modulus)
-    mpc_labels = Sharetensor.enc(mpc, labels, 0, modulus)
+    scenarios_runs_count = 2
+    scenarios_rows = 500
+    scenarios_miss_col = 0
 
-    mpc_impute_model = LogReg(Sharetensor.enc(mpc, im_initial_w, 0, modulus), im_optimizer)
-    mpc_fit_model = LogReg(Sharetensor.enc(mpc, fm_initial_w, 0, modulus), fm_optimizer)
-    
-    mpc_mi = MI(mi_factor, mpc_impute_model, mpc_fit_model).fit(
-        mpc, mpc_data, mpc_labels, miss_rows, miss_col,
-        im_step_size, fm_step_size, im_epochs, fm_epochs, "batched")
-    
-    predicted_data = mpc_mi.model.predict(mpc, mpc_complete_data).reveal(mpc)
-    stats = labels.hstack(predicted_data)
-    print(f"CP{mpc.pid}:\tSequre MI standard deviation (logistic regression)", ndarray.mean(ndarray.std(stats, axis=1)))
+    real_setup_runs_count = 1
 
-def batch_mi_wrapper(mpc, modulus):
-    def _match_model(t, mpc_im_initial_w, im_optimizer) -> Union:
-        if t == "log":
-            return LogReg(mpc_im_initial_w.copy(), im_optimizer)
-        else:
-            return LinReg(mpc_im_initial_w.copy(), im_optimizer)
+    verbose = False
+    run_scenarios = True
+    run_real_setup = True
     
-    mi_factor = 5
-    im_epochs = 40
-    fm_epochs = 40
-
-    (incomplete_data, complete_data, labels,
-     miss_rows, col_types,
-     im_initial_w, fm_initial_w, im_step_size, fm_step_size,
-     im_optimizer, fm_optimizer) = load_paper_mi_data()
-
-    mpc_incomplete_data = Sharetensor.enc(mpc, incomplete_data, 0, modulus)
-    mpc_complete_data = Sharetensor.enc(mpc, complete_data, 0, modulus)
-    mpc_labels = Sharetensor.enc(mpc, labels, 0, modulus)
-    mpc_im_initial_w = Sharetensor.enc(mpc, im_initial_w, 0, modulus)
-    mpc_fm_initial_w = Sharetensor.enc(mpc, fm_initial_w, 0, modulus)
-    
-    mpc_impute_models = [_match_model(col_type, mpc_im_initial_w, im_optimizer) for col_type in col_types]
-    mpc_fit_model = LinReg(mpc_fm_initial_w, fm_optimizer)
-    
-    mpc_mi = BatchMI(mi_factor, mpc_impute_models, mpc_fit_model).fit(
-        mpc, mpc_incomplete_data, mpc_complete_data, mpc_labels, miss_rows,
-        im_step_size, fm_step_size, im_epochs, fm_epochs)
-    
-    predicted_data = mpc_mi.model.predict(mpc, mpc_incomplete_data).reveal(mpc)
-    stats = labels.hstack(predicted_data)
-    print(f"CP{mpc.pid}:\tSequre MI standard deviation (real data)", ndarray.mean(ndarray.std(stats, axis=1)))
+    benchmark_mi(mpc, mi_factor, im_epochs, fm_epochs, dump_data,
+                 scenarios_runs_count, scenarios_rows,
+                 scenarios_miss_col, real_setup_runs_count,
+                 verbose, run_scenarios, run_real_setup, modulus)
 
 def gwas_wrapper(mpc, modulus):
     # return gwas_protocol(mpc, True, modulus)
@@ -454,12 +203,8 @@ def benchmark[TP](mpc, benchmark_toggles: dict, modulus: TP):
         time_frame(mpc, lattiseq_mult3_wrapper, 'Lattiseq mult3', modulus)
     if benchmark_toggles[RUN_TOGGLES.KING_FLAG] or run_all:
         time_frame(mpc, king_wrapper, 'KING', modulus)
-    if benchmark_toggles[RUN_TOGGLES.LINEAR_MI_FLAG] or run_all:
-        time_frame(mpc, linear_mi_wrapper, 'Multiple imputation (linear)', modulus)
-    if benchmark_toggles[RUN_TOGGLES.LOGISTIC_MI_FLAG] or run_all:
-        time_frame(mpc, logistic_mi_wrapper, 'Multiple imputation (logistic)', modulus)
-    if benchmark_toggles[RUN_TOGGLES.BATCH_MI_FLAG] or run_all:
-        time_frame(mpc, batch_mi_wrapper, 'Multiple imputation (batch)', modulus)
+    if benchmark_toggles[RUN_TOGGLES.MI_FLAG] or run_all:
+        time_frame(mpc, mi_wrapper, 'Multiple imputation', modulus)
     if benchmark_toggles[RUN_TOGGLES.PCA_FLAG] or run_all:
         time_frame(mpc, pca_wrapper, 'PCA', modulus)
 

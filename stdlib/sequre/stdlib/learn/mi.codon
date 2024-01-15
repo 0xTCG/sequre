@@ -53,7 +53,7 @@ class Imputer[M]:
         return X, X_complement, y
     
     @staticmethod
-    def split_train_test(mpc, data, target_col: int, miss_rows: List[int]):
+    def split_train_test(data, target_col: int, miss_rows: List[int]):
         m, n = data.shape
         miss_count = len(miss_rows)
 
@@ -76,20 +76,20 @@ class Imputer[M]:
         
         return complete_rows, incomplete_rows, complete_labels
     
-    def fit(self, mpc, complete_data, complete_labels, step, epochs, mode):
+    def fit(self, mpc, complete_data, complete_labels, step, epochs, mode, verbose=False):
         assert mode in {MI_BATCHED_MODE, MI_STOCHASTIC_MODE}, f"MI: Invalid imputation model training mode: {mode}. Should be either {MI_BATCHED_MODE} or {MI_STOCHASTIC_MODE}."
         if mode == MI_STOCHASTIC_MODE:
             self.model.randomize_weights(mpc)
-        self.model.fit(mpc, X=complete_data, y=complete_labels, step=step, epochs=epochs)
+        self.model.fit(mpc, X=complete_data, y=complete_labels, step=step, epochs=epochs, verbose=verbose)
     
-    def impute(self, mpc, data, miss_rows: List[int], miss_col: int, step: float, epochs: int, error: float):
+    def impute(self, mpc, data, miss_rows: List[int], miss_col: int, step: float, epochs: int, noise: bool):
         complete_data, incomplete_data, complete_labels = Imputer.split_train_test(mpc, data, miss_col, miss_rows)
         
         if len(incomplete_data) == 0:
             return complete_data.copy()
         
         self.model.fit(mpc, X=complete_data, y=complete_labels, step=step, epochs=epochs)
-        imputed_y = self.model.predict(mpc, incomplete_data, error)
+        imputed_y = self.model.predict(mpc, incomplete_data, noise)
 
         idx = 0
         imputed_data = data.copy()
@@ -99,8 +99,8 @@ class Imputer[M]:
 
         return imputed_data
     
-    def impute(self, mpc, data, incomplete_data, miss_rows, miss_col, error):
-        imputed_y = self.model.predict(mpc, incomplete_data, error)
+    def impute(self, mpc, data, incomplete_data, miss_rows, miss_col, noise):
+        imputed_y = self.model.predict(mpc, incomplete_data, noise)
 
         idx = 0
         imputed_data = data.copy()
@@ -110,12 +110,12 @@ class Imputer[M]:
 
         return imputed_data
     
-    def impute_inplace(self, mpc, data, mask, miss_col, error):
+    def impute_inplace(self, mpc, data, mask, miss_col, noise):
         if mask.sum() == 0:  # Nothing to impute --- no missing data
             return
         
         reference_data = data[:, :miss_col].hstack(data[:, miss_col+1:])
-        imputed_y = self.model.predict(mpc, reference_data.filter(mask), error)
+        imputed_y = self.model.predict(mpc, reference_data.filter(mask), noise)
 
         idx = 0
         for i in range(len(mask)):
@@ -138,29 +138,26 @@ class MI[IM, FM]:
     def rubin(mpc, weights: List):
         return MI._rubin(mpc, weights)
     
-    def fit(self, mpc, data, labels, miss_rows, miss_col, im_step, fm_step, im_epochs, fm_epochs, mode, dump_imputed_data=False):
+    def fit(self, mpc, data, labels, miss_rows, miss_col, im_step, fm_step, im_epochs, fm_epochs, mode, dump_imputed_data=False, verbose=False):
         assert mode in {MI_BATCHED_MODE, MI_STOCHASTIC_MODE}, f"MI: Invalid imputation model training mode: {mode}. Should be either {MI_BATCHED_MODE} or {MI_STOCHASTIC_MODE}."
-        with mpc.randomness.seed_switch(-1):
-            error = prg.gauss(0.0, 0.5)
-        
-        complete_data, incomplete_data, complete_labels = Imputer.split_train_test(mpc, data, miss_col, miss_rows)
+        complete_data, incomplete_data, complete_labels = Imputer.split_train_test(data, miss_col, miss_rows)
         
         imputed_data = []
         if mode == MI_BATCHED_MODE:
             self.imputer.fit(mpc, complete_data=complete_data, complete_labels=complete_labels,
-                            step=im_step, epochs=im_epochs, mode=mode)
+                            step=im_step, epochs=im_epochs, mode=mode, verbose=verbose)
             
             imputed_data = [self.imputer.impute(
                 mpc, data=data, incomplete_data=incomplete_data,
-                miss_rows=miss_rows, miss_col=miss_col, error=error) for _ in range(self.factor)]
+                miss_rows=miss_rows, miss_col=miss_col, noise=True) for _ in range(self.factor)]
         elif mode == MI_STOCHASTIC_MODE:
             for _ in range(self.factor):
                 self.imputer.fit(mpc, complete_data=complete_data, complete_labels=complete_labels,
-                    step=im_step, epochs=im_epochs, mode=mode)
+                    step=im_step, epochs=im_epochs, mode=mode, verbose=verbose)
                 
                 imputed_data.append(self.imputer.impute(
                     mpc, data=data, incomplete_data=incomplete_data,
-                    miss_rows=miss_rows, miss_col=miss_col, error=error))
+                    miss_rows=miss_rows, miss_col=miss_col, noise=True))
         
         if dump_imputed_data:
             for i, data in enumerate(imputed_data):
@@ -169,12 +166,12 @@ class MI[IM, FM]:
                     log("", revealed_data, path=f'data/mi/sequre_output_{i + 1}.txt', mode='w', separator=' ')
         
         weights = []
-        for data in tqdm(imputed_data, desc=f"CP{mpc.pid}:\tMI fitting"):
+        for data in imputed_data:
             self.model.fit(mpc, X=data, y=labels, step=fm_step, epochs=fm_epochs)
             weights.append(self.model.coef_.copy())
         
         self.model.coef_ = MI.rubin(mpc, weights)
-        return self
+        return self, imputed_data
     
     @sequre
     def _rubin(mpc, weights: List):
@@ -191,41 +188,39 @@ class BatchMI[IM, FM]:
         self.model = fit_model
         self.factor = factor
 
-    def fit(
-            self, mpc, incomplete_data, complete_data, labels, miss_rows,
-            im_step, fm_step, im_epochs, fm_epochs, dump_imputed_data=False):
-
-        with mpc.randomness.seed_switch(-1):
-            error = prg.gauss(0.0, 0.5)
-        
+    def fit(self, mpc, incomplete_data, complete_data, labels, miss_row_masks,
+            im_step, fm_step, im_epochs, fm_epochs, dump_imputed_data=False, verbose=False):
         miss_col = 0
         for imputer in self.imputers:
             train_data = complete_data[:, :miss_col].hstack(complete_data[:, miss_col+1:])
             train_labels = complete_data[:, miss_col:miss_col+1]
             
             imputer.fit(mpc, complete_data=train_data, complete_labels=train_labels,
-                        step=im_step, epochs=im_epochs, mode="batched")
+                        step=im_step, epochs=im_epochs, mode="batched", verbose=verbose)
             miss_col += 1
         
+        imputed_data = []
         weights = []
-        for _ in tqdm(range(self.factor), desc=f"CP{mpc.pid}:\tMI fitting"):
-            self.impute_inplace(mpc, incomplete_data, miss_rows, error)
+        for _ in range(self.factor):
+            inter_imputed_data = incomplete_data.copy()
+            self.impute_inplace(mpc, inter_imputed_data, miss_row_masks, noise=True)
+            imputed_data.append(inter_imputed_data)
             
             if dump_imputed_data:
-                revealed_data = incomplete_data.reveal(mpc).tolist()
+                revealed_data = inter_imputed_data.reveal(mpc).tolist()
                 if mpc.pid == 2:
-                    log("", revealed_data, path=f'data/mi/output_{_ + 1}.txt', mode='w', separator=' ')
+                    log("", revealed_data, path=f'data/mi/batch_mi_output_{_ + 1}.txt', mode='w', separator=' ')
             
-            self.model.fit(mpc, X=incomplete_data, y=labels, step=fm_step, epochs=fm_epochs)
+            self.model.fit(mpc, X=inter_imputed_data, y=labels, step=fm_step, epochs=fm_epochs)
             weights.append(self.model.coef_.copy())
         
         self.model.coef_ = MI.rubin(mpc, weights)
-        return self
+        return self, imputed_data
     
-    def impute_inplace(self, mpc, incomplete_data, miss_rows, error):
+    def impute_inplace(self, mpc, incomplete_data, miss_row_masks, noise):
         miss_col = 0
         for imputer in self.imputers:
             imputer.impute_inplace(
                 mpc, data=incomplete_data,
-                mask=miss_rows[miss_col], miss_col=miss_col, error=error)
+                mask=miss_row_masks[miss_col], miss_col=miss_col, noise=noise)
             miss_col += 1
