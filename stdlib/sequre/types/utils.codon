@@ -3,6 +3,24 @@ from numpy.ndarray import ndarray
 
 from ..utils.param import *
 
+from llvm import *
+from constants import *
+
+
+@extend
+class float:
+    def ieee_754(self):
+        if self == 0.0:
+            return 0, 0, 0
+
+        other_raw_int = self.bitcast_to_int()
+        
+        sign = other_raw_int.__lhsr__(63)
+        exponent = ((other_raw_int << 1).__lhsr__(IEEE_754_MANTISSA_SIZE + 1)) - IEEE_754_EXPONENT_HALF_RANGE
+        mantissa = (1 << IEEE_754_MANTISSA_SIZE) | ((other_raw_int << (IEEE_754_EXPONENT_SIZE + 1)).__lhsr__(IEEE_754_EXPONENT_SIZE + 1))
+        
+        return sign, exponent, mantissa
+
 
 class EmptyWith:
     def __init__(self):
@@ -14,63 +32,52 @@ class EmptyWith:
 
 
 def __int_to_fp[TP](a: int, modulus: TP, k: int = NBIT_K, f: int = NBIT_F) -> TP:
+    if a.bitlen() > k - f - 1:
+        raise ValueError(f"MPC overflow detected: {k - f - 1} bits not enough to store {a.bitlen()}-bit number {a}. Increase INT_LEN in settings to enable larger numbers.")
+    
     sn = 1 if a >= 0 else -1
 
-    az_shift = TP(a << f)
+    az_shift = TP(a) << f
     az_trunc = az_shift & ((1 << (k - 1)) - 1)
 
     return az_trunc.mul_mod(sn, modulus)
 
 
 def __double_to_fp[TP](x: float, modulus: TP, k: int = NBIT_K, f: int = NBIT_F) -> TP:
-    negative = False
+    if x == 0.0:
+        return TP(0)
     
-    if x < 0:
-        x = -x
-        negative = True
-
-    x_fp = (TP(int(x)) << f) & ((1 << (k - 1)) - 1)
-
-    x_frac = x - int(x)
-    for fbit in range(f - 1, -1, -1):
-        x_frac *= 2
-        if (x_frac >= 1):
-            x_frac -= int(x_frac)
-            x_fp = x_fp | (1 << fbit)
+    if x == float("inf"):
+        print(f"WARNING: inf detected. It will be treated as a largest possible FP value: {(TP(1) << k) - 1}")
+        return ((TP(1) << (k - 1)) - 1) ^ ((TP(1) << f) - 1)
     
-    return x_fp.neg_mod(modulus) if negative else x_fp
+    if x == float("-inf"):
+        print(f"WARNING: -inf detected. It will be treated as a lowest possible FP value: -{(TP(1) << k) - 1}")
+        return modulus - ((TP(1) << (k - 1)) - 1) ^ ((TP(1) << f) - 1)
+    
+    sign, exponent, mantissa = x.ieee_754()
+    frac_len = IEEE_754_MANTISSA_SIZE - mantissa.__cttz__() - exponent
+    
+    if DEBUG and frac_len > f:
+        print(f"WARNING: MPC underflow detected. Mantissa of size {IEEE_754_MANTISSA_SIZE} is truncated by {frac_len - f} bits.")
+        
+    if exponent + 1 > k - f - 1:
+        raise ValueError(f"MPC overflow detected: {k - f - 1} bits not enough to store {exponent + 1}-bit number {x}.\nIncrease INT_LEN in settings to enable larger numbers.")
+    
+    x_fp = TP(mantissa) >> (IEEE_754_MANTISSA_SIZE - exponent - f)
+    return x_fp.neg_mod(modulus) if sign else x_fp
 
 
-def __fp_to_double_mat[TP](a: list[list[TP]], modulus: TP, k: int, f: int) -> list[list[float]]:
-    rows, cols = a.shape
-    twokm1 = TP(1) << (k - 1)
+def __fp_to_double[TP](x_fp: TP, modulus: TP, k: int, f: int) -> float:
+    sign = int(x_fp > (TP(1) << (k - 1)))
+    x = x_fp.neg_mod(modulus) if sign else x_fp
+    x_trunc = x & ((TP(1) << (k - 1)) - 1)
+    bitlen = int(x_trunc.bitlen())
+    exponent = bitlen - f - 1
+    mantissa = int(x_trunc << (IEEE_754_MANTISSA_SIZE - bitlen + 1))
+    mantissa ^= (1 << IEEE_754_MANTISSA_SIZE)
 
-    double_mat = [[0.0 for _ in range(cols)] for _ in range(rows)]
-    for i in range(rows):
-        for j in range(cols):
-            sn = (-1.0 if a[i][j] > twokm1 else 1.0)
-            x = a[i][j].neg_mod(modulus) if a[i][j] > twokm1 else a[i][j]
-            x_trunc = x & ((TP(1) << (k - 1)) - 1)
-            x_int = x_trunc >> f
-            x_float = float(x_int)
-
-            # TODO: consider better ways of doing this
-            x_frac = 0.0
-            for bi in range(f):
-                x_frac = x_frac + 1 if (x_trunc & (TP(1) << bi)) != 0 else x_frac
-                x_frac /= 2
-            
-            double_mat[i][j] = (x_float + x_frac) * sn
-
-    return double_mat
-
-
-def __fp_to_double_vec[TP](a: list[TP], modulus: TP, k: int, f: int) -> list[float]:
-    return __fp_to_double_mat([a], modulus, k, f, TP=TP)[0]
-
-
-def __fp_to_double_elem[TP](a: TP, modulus: TP, k: int, f: int) -> float:
-    return __fp_to_double_mat([[a]], modulus, k, f, TP=TP)[0][0]
+    return ((sign << 63) | ((exponent + IEEE_754_EXPONENT_HALF_RANGE) << IEEE_754_MANTISSA_SIZE) | mantissa).bitcast_to_float()
 
 
 def int_to_fp[TP](x, modulus: TP, k: int = NBIT_K, f: int = NBIT_F):
@@ -90,17 +97,17 @@ def double_to_fp[TP](x, modulus: TP, k: int = NBIT_K, f: int = NBIT_F):
         return [__double_to_fp(e, modulus, k, f) for e in x]
     elif isinstance(x, float):
         return __double_to_fp(x, modulus, k, f)
-    compile_error(f"Invalid type of {x}.\n It should be either, float, list[float] or list[list[float]]")
+    compile_error("Invalid type. It should be either, float, list[float] or list[list[float]]")
 
 
-def fp_to_double(a, modulus, k = NBIT_K, f = NBIT_F):
-    if isinstance(a, list[list[int_t]]):
-        return __fp_to_double_mat(a, modulus, k, f)
-    if isinstance(a, list[int_t]):
-        return __fp_to_double_vec(a, modulus, k, f)
-    if isinstance(a, int_t):
-        return __fp_to_double_elem(a, modulus, k, f)
-    compile_error(f"Invalid type of {a}.\n It should be either, UInt[N], list[UInt[N]] or list[list[UInt[N]]]")
+def fp_to_double[TP](x, modulus: TP, k = NBIT_K, f = NBIT_F):
+    if isinstance(x, list[list[TP]]):
+        return [[__fp_to_double(e, modulus, k, f) for e in row] for row in x]
+    elif isinstance(x, list[TP]):
+        return [__fp_to_double(e, modulus, k, f) for e in x]
+    elif isinstance(x, TP):
+        return __fp_to_double(x, modulus, k, f)
+    compile_error("Invalid type. It should be either, UInt[N], list[UInt[N]] or list[list[UInt[N]]]")
 
 
 def num_to_bits[TP](a: list[TP], bitlen: int, little_end: bool = False) -> list[list[int]]:
