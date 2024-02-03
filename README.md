@@ -2,6 +2,10 @@
 
 Sequre is an end-to-end, statically compiled and performance engineered, Pythonic framework for building efficient secure multiparty computation (MPC), homomorphic encryption (HE), and multiparty homomorphic encryption (MHE) pipelines in bioinformatics.
 
+## Disclaimer
+
+Sequre is an open-source research project still intended for academic use only. For commercial use or any other use that requires attested security, please contact us at hsmajlovic@uvic.ca. 
+
 ## Installation
 
 **Note:** Sequre runs only on Linux at the moment.
