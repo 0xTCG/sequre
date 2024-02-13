@@ -7,12 +7,13 @@ from numpy.create import array
 from pickler import pickle, unpickle
 
 from ..types.builtin import u64xN, f64xN
+from ..utils.stats import PrecisionStats, evaluate_precision
 from ..utils.utils import zeros_vec
-from ..utils.constants import NUM_THREADS
+from ..utils.constants import NUM_THREADS, LATTISEQ_BIG_INT_LEN, LATTISEQ_GALOIS_GEN, LATTISEQ_MIN_LOG_SLOTS
 
 import rlwe, ring, ringqp, utils
 
-from common import BIG_INT_LEN, big_uint, big_int, GALOIS_GEN, MIN_LOG_SLOTS, biguint_mod
+from common import big_uint, big_int, biguint_mod
 
 
 class Parameters(Static[rlwe.Parameters]):
@@ -144,8 +145,8 @@ def new_parameters(rlwe_params, log_slots, default_scale):
 
     max_log_slots = int(rlwe_params.ring_q.nth_root.bitlen()) - 3
 
-    if log_slots > max_log_slots or log_slots < MIN_LOG_SLOTS:
-        raise ValueError(f"logSlot={log_slots} is larger than the logn-1={max_log_slots} or smaller than {MIN_LOG_SLOTS}")
+    if log_slots > max_log_slots or log_slots < LATTISEQ_MIN_LOG_SLOTS:
+        raise ValueError(f"logSlot={log_slots} is larger than the logn-1={max_log_slots} or smaller than {LATTISEQ_MIN_LOG_SLOTS}")
 
     return Parameters(log_slots, default_scale).from_rlwe_params(rlwe_params)
 
@@ -200,6 +201,15 @@ PN14QP438 = ParametersLiteral(
     p=[u64(0x7fffffd8001), u64(0x7fffffc8001)],  # 43, 43
     log_slots=13,
     default_scale=float(1 << 34))
+
+
+# Schemes parameters are created from scratch
+PN14QP425 = ParametersLiteral(
+    logn=14,
+    logq=[55, 40, 40, 40, 40, 40, 40, 40],
+    logp=[45, 45],
+    log_slots=13,
+    default_scale=float(1 << 40))
 
 
 # PN15QP880 is a default parameter set for logN=15 and logQP=880
@@ -632,9 +642,9 @@ def new_decryptor(params: Parameters, sk: rlwe.SecretKey) -> Decryptor:
 def gen_bigint_chain(q: list[u64]) -> list[big_uint]:
     num_bits_total = 1
     for m in q: num_bits_total += int(m.bitlen())
-    assert num_bits_total <= BIG_INT_LEN, (
+    assert num_bits_total <= LATTISEQ_BIG_INT_LEN, (
         f"Moduli product too large for the bigint in use. Increase the bigint size."
-        f" Current bigint size: {BIG_INT_LEN}. Required size: {num_bits_total}")
+        f" Current bigint size: {LATTISEQ_BIG_INT_LEN}. Required size: {num_bits_total}")
 
     bigint_chain = list[big_uint](len(q))
     bigint_chain.append(q[0].ext_to_bigint())
@@ -653,7 +663,7 @@ def new_encoder(params: Parameters) -> Encoder:
 	five_pows = 1
 	for _ in range(m >> 2):
 		rot_group.append(five_pows) 
-		five_pows *= GALOIS_GEN
+		five_pows *= LATTISEQ_GALOIS_GEN
 		five_pows &= (m - 1)
 
 	gaussian_sampler = ring.new_gaussian_sampler(utils.new_prng(), params.ring_q, params.sigma, int(6 * params.sigma))
@@ -1162,8 +1172,8 @@ class EncoderComplex128(Static[Encoder]):
     # The encoding encoding is done at the level of polyOut.
     # Values written on  polyOut are always in the NTT domain.
     def embed(self, values, log_slots: int, scale: float, montgomery: bool, polyOut):
-        if log_slots < MIN_LOG_SLOTS or log_slots > self.params.max_log_slots():
-            raise ValueError(f"cannot embed: log_slots ({log_slots}) must be greater or equal to {MIN_LOG_SLOTS} and smaller than {self.params.max_log_slots()}\n")
+        if log_slots < LATTISEQ_MIN_LOG_SLOTS or log_slots > self.params.max_log_slots():
+            raise ValueError(f"cannot embed: log_slots ({log_slots}) must be greater or equal to {LATTISEQ_MIN_LOG_SLOTS} and smaller than {self.params.max_log_slots()}\n")
 
         slots = 1 << log_slots
         len_values = 0
@@ -1233,8 +1243,8 @@ class EncoderComplex128(Static[Encoder]):
         return self._mm_decode_public(plaintext, log_slots, bound)
     
     def _mm_decode_public(self, plaintext: Plaintext, log_slots: int, sigma: float):
-        if log_slots > self.params.max_log_slots() or log_slots < MIN_LOG_SLOTS:
-            raise ValueError(f"cannot decode: ensure that {MIN_LOG_SLOTS} <= log_slots ({log_slots}) <= {self.params.max_log_slots()}")
+        if log_slots > self.params.max_log_slots() or log_slots < LATTISEQ_MIN_LOG_SLOTS:
+            raise ValueError(f"cannot decode: ensure that {LATTISEQ_MIN_LOG_SLOTS} <= log_slots ({log_slots}) <= {self.params.max_log_slots()}")
 
         if plaintext.value.is_ntt:
             self.params.ring_q._mm_inv_ntt_lvl(plaintext.level(), plaintext.value, self.buff)
@@ -1311,133 +1321,6 @@ def new_encoder_complex(params: Parameters) -> EncoderComplex128:
         roots=roots,
         values=zeros_vec(ecd.m >> 2, TP=complex),
         values_float=zeros_vec(ecd.m >> 1, TP=float))
-
-
-# Stats is a struct storing the real, imaginary and l2 norm (modulus)
-# about the precision of a complex value.
-class Stats:
-    real: float
-    imag: float
-    l2: float
-
-
-# PrecisionStats is a struct storing statistic about the precision of a CKKS plaintext
-class PrecisionStats:
-    max_delta: Stats
-    min_delta: Stats
-    max_precision: Stats
-    min_precision: Stats
-    mean_delta: Stats
-    mean_precision: Stats
-    median_delta: Stats
-    median_precision: Stats
-    std_freq: float
-    std_time: float
-
-    real_dist: list[dict[str, float]]
-    imag_dist: list[dict[str, float]]
-    l2_dist: list[dict[str, float]]
-
-    cdf_resol: int
-
-    def __repr__(self) -> str:
-        results_arr = array([
-            [round(self.min_precision.real, 2), round(self.min_precision.imag, 2), round(self.min_precision.l2, 2)],
-            [round(self.max_precision.real, 2), round(self.max_precision.imag, 2), round(self.max_precision.l2, 2)],
-            [round(self.mean_precision.real, 2), round(self.mean_precision.imag, 2), round(self.mean_precision.l2, 2)],
-            [round(self.median_precision.real, 2), round(self.median_precision.imag, 2), round(self.median_precision.l2, 2)]])
-        
-        return f"\n(Log2)\n(MIN prec, MAX prec, AVG prec, MED prec) x (real, imag, l2)\n{results_arr}\n"
-    
-    def calc_cdf(self, precs: list[float], res: list[dict[str, float]]):
-        sorted_precs = sorted(precs)
-        min_prec = sorted_precs[0]
-        max_prec = sorted_precs[len(sorted_precs)-1]
-        for i in range(self.cdf_resol):
-            cur_prec = min_prec + float(i) * (max_prec - min_prec) / float(self.cdf_resol)
-            for count_smaller, p in enumerate(sorted_precs):
-                if p >= cur_prec:
-                    res[i]["Prec"] = cur_prec
-                    res[i]["Count"] = count_smaller
-                    break
-
-
-def delta_to_precision(c: Stats) -> Stats:
-	return Stats(math.log2(1 / c.real), math.log2(1 / c.imag), math.log2(1 / c.l2))
-
-
-def calc_median(values: list[Stats]) -> Stats:
-    tmp = sorted([v.real for v in values])
-    for i in range(len(values)): values[i].real = tmp[i]
-    for i in range(len(values)): tmp[i] = values[i].imag
-    tmp.sort()
-    for i in range(len(values)): values[i].imag = tmp[i]
-    for i in range(len(values)): tmp[i] = values[i].l2
-    tmp.sort()
-    for i in range(len(values)): values[i].l2 = tmp[i]
-    index = len(values) // 2
-    if len(values) & 1 == 1 or index + 1 == len(values):
-        return Stats(values[index].real, values[index].imag, values[index].l2)
-
-    return Stats((values[index].real + values[index+1].real) / 2,
-		(values[index].imag + values[index+1].imag) / 2,
-		(values[index].l2 + values[index+1].l2) / 2)
-
-
-def evaluate_precision(values_test: list[complex], values_want: list[complex]) -> PrecisionStats:
-    slots = len(values_want)
-    diff = [Stats() for _ in range(slots)]
-
-    prec = PrecisionStats()
-    prec.max_delta = Stats(0, 0, 0)
-    prec.min_delta = Stats(1, 1, 1)
-    prec.mean_delta = Stats(0, 0, 0)
-    prec.cdf_resol = 500
-    prec.real_dist = [{"Prec": 0.0, "Count": 0.0} for _ in range(prec.cdf_resol)]
-    prec.imag_dist = [{"Prec": 0.0, "Count": 0.0} for _ in range(prec.cdf_resol)]
-    prec.l2_dist = [{"Prec": 0.0, "Count": 0.0} for _ in range(prec.cdf_resol)]
-
-    prec_real = [0.0 for _ in range(len(values_want))]
-    prec_imag = [0.0 for _ in range(len(values_want))]
-    prec_l2 = [0.0 for _ in range(len(values_want))]
-
-    for i in range(len(values_want)):
-        delta_real = abs(values_test[i].real - values_want[i].real)
-        delta_imag = abs(values_test[i].imag - values_want[i].imag)
-        delta_l2 = math.sqrt(delta_real * delta_real + delta_imag * delta_imag)
-        prec_real[i] = math.log2(1 / delta_real)
-        prec_imag[i] = math.log2(1 / delta_imag)
-        prec_l2[i] = math.log2(1 / delta_l2)
-
-        diff[i].real = delta_real
-        diff[i].imag = delta_imag
-        diff[i].l2 = delta_l2
-
-        prec.mean_delta.real += delta_real
-        prec.mean_delta.imag += delta_imag
-        prec.mean_delta.l2 += delta_l2
-
-        if delta_real > prec.max_delta.real: prec.max_delta.real = delta_real
-        if delta_imag > prec.max_delta.imag: prec.max_delta.imag = delta_imag
-        if delta_l2 > prec.max_delta.l2: prec.max_delta.l2 = delta_l2
-        if delta_real < prec.min_delta.real: prec.min_delta.real = delta_real
-        if delta_imag < prec.min_delta.imag: prec.min_delta.imag = delta_imag
-        if delta_l2 < prec.min_delta.l2: prec.min_delta.l2 = delta_l2
-
-    prec.calc_cdf(prec_real, prec.real_dist)
-    prec.calc_cdf(prec_imag, prec.imag_dist)
-    prec.calc_cdf(prec_l2, prec.l2_dist)
-    
-    prec.min_precision = delta_to_precision(prec.max_delta)
-    prec.max_precision = delta_to_precision(prec.min_delta)
-    prec.mean_delta.real /= float(slots)
-    prec.mean_delta.imag /= float(slots)
-    prec.mean_delta.l2 /= float(slots)
-    prec.mean_precision = delta_to_precision(prec.mean_delta)
-    prec.median_delta = calc_median(diff)
-    prec.median_precision = delta_to_precision(prec.median_delta)
-
-    return prec
 
 
 # GetPrecisionStats generates a PrecisionStats struct from the reference values and the decrypted values

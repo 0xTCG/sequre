@@ -1,7 +1,5 @@
 import prg
 
-from numpy.ndarray import ndarray
-
 from ..lattiseq.rlwe import \
     SecretKey, \
     PublicKey, \
@@ -14,10 +12,8 @@ from ..lattiseq.ckks import \
     PN14QP438, \
     Parameters, \
     Ciphertext, \
-    PrecisionStats, \
     Plaintext, \
     new_key_generator, \
-    evaluate_precision, \
     new_plaintext, \
     new_public_key, \
     new_ciphertext, \
@@ -63,6 +59,8 @@ from ..lattiseq.utils import new_prng
 from ..types.utils import double_to_fp, fp_to_double
 from ..utils.utils import zeros_vec, ones_vec, one_hot_vector
 from ..utils.param import int_t
+from ..utils.io import is_cached, read_cache, store_cache
+from ..utils.constants import LATTISEQ_DEFAULT_SIGMA
 
 from stats import MPCStats
 from randomness import MPCRandomness
@@ -152,42 +150,20 @@ class MPCHE[TP]:
         print(f"CP{self.pid}:\tMHE generating relinearization key ...")
         rlk = self._collective_relin_key_gen(params, sk_shard, self.crp_gen)
         
-        print(f"CP{self.pid}:\tMHE generating rotation keys ... ")
-        rtks = self._collective_rot_key_gen(
-            params, sk_shard, self.crp_gen,
-            generate_rot_keys(params.slots(), 128, True))
+        if DEBUG and is_cached("_internal_mhe_rtks", self.pid):
+            print(f"CP{self.pid}:\tReading MHE rotation keys from cache ... ")
+            rtks = read_cache("_internal_mhe_rtks", self.pid)
+        else:
+            print(f"CP{self.pid}:\tMHE generating rotation keys ... ")
+            rtks = self._collective_rot_key_gen(
+                params, sk_shard, self.crp_gen,
+                generate_rot_keys(params.slots(), 128, True))
+            if DEBUG: store_cache(rtks, "_internal_mhe_rtks", self.pid)
 
         self.crypto_params.initialize(sk_shard, pk, rlk, rtks, prec)
-        self.refresh_protocol = new_refresh_protocol(params, self.bootstrap_log_bound, 6.36)
+        self.refresh_protocol = new_refresh_protocol(params, self.bootstrap_log_bound, LATTISEQ_DEFAULT_SIGMA)
 
         print(f"CP{self.pid}:\tMHE initialized.")
-    
-    def precision_stats(self, result, expected) -> PrecisionStats:
-        if isinstance(result, ndarray):
-            _result = result.tolist()
-        elif isinstance(result, ByVal):
-            _result = [result]
-        else:
-            _result = result
-        
-        if isinstance(expected, ndarray):
-            _expected = expected.tolist()
-        elif isinstance(expected, ByVal):
-            _expected = [expected]
-        else:
-            _expected = expected
-        
-        assert _result.shape == _expected.shape, f"Result and expected result shapes mismatch while checking MHE precision: {_result.shape} != {_expected.shape}"
-        result_flattened = _result.flatten()
-        expected_flattened = _expected.flatten()
-
-        print(f"CP{self.pid}:\tValues computed [0:10]: {result_flattened[:10]} ...\n")
-        print(f"CP{self.pid}:\tValues expected [0:10]: {expected_flattened[:10]} ...\n")
-
-        precision_stats = evaluate_precision(result_flattened.to_complex(), expected_flattened.to_complex())
-        print(precision_stats)
-
-        return precision_stats
     
     def enc_vector[T](self, values: list) -> list[T]:
         nbr_max_coef = self.crypto_params.params.slots()
@@ -482,6 +458,17 @@ class MPCHE[TP]:
                     raise ValueError(f"DropLevel: requested level {out_level} when input is {a[i][j].level()}")
             out.append(row)
         return out
+    
+    def drop_level(self, a: list[Ciphertext], out_level: int) -> list[Ciphertext]:
+        out = list[Ciphertext](len(a))
+        for i in range(len(a)):
+            if a[i].level() > out_level:
+                out.append(self.crypto_params.evaluator.drop_level_new(a[i], a[i].level() - out_level))
+            elif a[i].level() == out_level:
+                out.append(a[i].copy())
+            else:
+                raise ValueError(f"DropLevel: requested level {out_level} when input is {a[i].level()}")
+        return out
 
     def flatten_levels(self, x: list[list[Ciphertext]]) -> tuple[list[list[Ciphertext]], int]:
         min_level = x[0][0].level()
@@ -652,7 +639,7 @@ class MPCHE[TP]:
     
     def _set_params(self, params: Parameters):
         self.randomness.switch_seed(-1)
-        seed = u32(prg.getrandbits(32))
+        seed = u32(0) if DEBUG else u32(prg.getrandbits(32))
         self.randomness.restore_seed(-1)
 
         ring_qp = params.ring_qp()
@@ -947,7 +934,7 @@ class MPCHE[TP]:
 
         zero_pk = new_public_key(parameters)
 
-        pcks_protocol = new_pcks_protocol(parameters, 6.36)
+        pcks_protocol = new_pcks_protocol(parameters, LATTISEQ_DEFAULT_SIGMA)
         dec_share = pcks_protocol.allocate_share(tmp.level())
 
         pcks_protocol._mm_gen_share(self.crypto_params.sk_shard, zero_pk, tmp.value[1], dec_share)
