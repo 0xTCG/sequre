@@ -60,7 +60,7 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
   auto *nodeType = isVoid ? types.front() : v->getType();
   
   bool isSqrtInv = false;
-  if ( isDiv ) { // Special case where 1 / sqrt(x) is called
+  if ( isDiv ) { // Special case where something / sqrt(x) is called
     auto *sqrtInstr = cast<CallInstr>(args.back());
     if ( sqrtInstr ) {
       auto *sqrtFunc = util::getFunc(sqrtInstr->getCallee());
@@ -78,7 +78,6 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
     if ( isGetItem || isSetItem ) return;
     if ( isMul && lhsIsInt ) return;
     if ( isMul && rhsIsInt ) return;
-    if ( isDiv && lhsIsInt && !isSqrtInv ) return;
     if ( isPow && lhsIsInt ) return;
     if ( isPow && !rhsIsInt ) return;
   }
