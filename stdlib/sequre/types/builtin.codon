@@ -11,19 +11,17 @@ from pickler import pickle, unpickle, _write_raw, _read_raw
 from patch import pickle_tuple_unpasteurized, unpickle_tuple_unpasteurized, tuple_pickle_size
 from pickle import pickle as native_pickle, unpickle as native_unpickle
 
-from ..utils.param import \
-    int_t, FIELD_SIZE, RING_SIZE, RING_MASK, DEBUG, \
-    MODULUS_BITS, MERSENNE_OFFSET, INT_LEN
-from ..utils.utils import __rand_int, __rand_vec, __rand_mat, \
+from sequre.utils.constants import *
+from sequre.utils.utils import __rand_int, __rand_vec, __rand_mat, \
     __rand_bits, __rand_vec_bits, __rand_mat_bits, zeros_vec, zeros_mat
-from ..utils.primitives import mod_pow
-from ..utils.constants import *
+from sequre.utils.primitives import mod_pow
 
+from gmp import *
 from llvm import *
 from utils import double_to_fp
 
-from ..experimental.fast_modular_multiplication.u128_w_llvm_overflow_intrinsic import modular_mul_u128u128_v1, modular_mul_u128u64_v1
-from ..experimental.fast_modular_multiplication.u192_w_llvm_overflow_intrinsic import modular_mul_u192u192, modular_mul_u192u64
+from sequre.experimental.fast_modular_multiplication.u128_w_llvm_overflow_intrinsic import modular_mul_u128u128_v1, modular_mul_u128u64_v1
+from sequre.experimental.fast_modular_multiplication.u192_w_llvm_overflow_intrinsic import modular_mul_u192u192, modular_mul_u192u64
 
 
 # Frequently used vectors
@@ -51,8 +49,8 @@ class bool:
     def all(self) -> bool:
         return self
     
-    def to_int_t(self, modulus: int_t) -> int_t:
-        return int_t(self)
+    def to_int_t(self, modulus: mpc_uint) -> mpc_uint:
+        return mpc_uint(self)
     
     def copy(self) -> bool:
         return bool(self)
@@ -97,10 +95,10 @@ class str:
     def to_int(self) -> int:
         return int(self)
     
-    def to_int_t(self, modulus: int_t) -> int_t:
+    def to_int_t(self, modulus: mpc_uint) -> mpc_uint:
         if self.startswith("-"):
-            return int_t(self[1:]).neg_mod(modulus)
-        return int_t(self) % modulus
+            return mpc_uint(self[1:]).neg_mod(modulus)
+        return mpc_uint(self) % modulus
     
     def nbytes(self) -> int:
         return len(self)
@@ -140,19 +138,19 @@ class complex:
 
 @extend
 class float:
-    def __init__(self, other: int_t):
+    def __init__(self, other: mpc_uint):
         self = other.to_float()
     
     def astype[t](self) -> t:
         return t(self)
 
-    def to_fp(self, modulus) -> int_t:
+    def to_fp(self, modulus) -> mpc_uint:
         return double_to_fp(self, modulus)
     
     def to_int(self) -> int:
         return int(self)
 
-    def to_int_t(self, modulus: int_t) -> int_t:
+    def to_int_t(self, modulus: mpc_uint) -> mpc_uint:
         return double_to_fp(self, modulus)
     
     def to_complex(self) -> complex:
@@ -176,9 +174,15 @@ class float:
     def flatten(self) -> float:
         return self
     
+    def sqrt(self) -> float:
+        return math.sqrt(self)
+    
 
 @extend
 class int:
+    def __truediv__[T](self, other: List[T]) -> List[float]:
+        return [self / other[i] for i in range(len(other))]
+
     def __mod__(self: int, other: int) -> int:
         # TODO: #138 Check why performance gets worsened with the fast modulus enabled (Note: naive_mod includes ring check)OND_FIELD_SIZE, SECOND_MOD_CONST)
         return self.__naive_mod(other)
@@ -214,13 +218,13 @@ class int:
     def lsh_mod(self: int, other: int, modulus: int) -> int:
         return (self << other) % modulus
     
-    def to_fp(self, modulus) -> int_t:
+    def to_fp(self, modulus) -> mpc_uint:
         return double_to_fp(float(self), modulus)
     
     def iter(self):
         for _ in staticrange(1): yield self
     
-    def to_int_t(self, modulus: int_t) -> int_t:
+    def to_int_t(self, modulus: mpc_uint) -> mpc_uint:
         return (modulus + self) % modulus
     
     @staticmethod
@@ -266,6 +270,9 @@ class int:
     
     def flatten(self) -> int:
         return self
+    
+    def sqrt(self) -> float:
+        return math.sqrt(self)
 
 
 @extend
@@ -344,8 +351,8 @@ class UInt:
         return self >> UInt[N](other)
     
     def __mod__(self: UInt[N], other: UInt[N]) -> UInt[N]:
-        if other == RING_SIZE: return self.__fast_mod_ring()
-        elif other == FIELD_SIZE: return self.__fast_mod_field()
+        if other == MPC_RING_SIZE: return self.__fast_mod_ring()
+        elif other == MPC_FIELD_SIZE: return self.__fast_mod_field()
         elif isinstance(self, UInt[192]):
             # Temporary bypass. Until LLVM's urem is fixed for long integers.
             return self.__experimental__truncated_mod(other)
@@ -402,7 +409,7 @@ class UInt:
     def bit_reverse_subset(self: UInt[N], bitlen: int) -> UInt[N]:
         return self.bit_reverse() >> UInt[N](N - bitlen)
     
-    def __fast_mod_mersenne(self: UInt[N], field_size: UInt[N] = FIELD_SIZE):
+    def __fast_mod_mersenne(self: UInt[N], field_size: UInt[N] = MPC_FIELD_SIZE):
         """
         Bit-hack for computing modulus with the field size of the form 2^k - 1 (Mersenne form of a prime).
         There is no explicit check for the shape of the field,
@@ -414,12 +421,12 @@ class UInt:
             m = UInt[N](0)
             while n:
                 m += (n & field_size)
-                n >>= MODULUS_BITS
+                n >>= MPC_MODULUS_BITS
             n = m
         if m == field_size: m = UInt[N](0)
         return m
     
-    def __fast_mod_mersenne_fixed(self: UInt[N], field_size: UInt[N] = FIELD_SIZE):
+    def __fast_mod_mersenne_fixed(self: UInt[N], field_size: UInt[N] = MPC_FIELD_SIZE):
         """
         Bit-hack for computing modulus with the field size equal to 2^127 - 1.
         There is no explicit check for the shape of the field,
@@ -437,7 +444,7 @@ class UInt:
         if m == field_size: return UInt[N](0)
         return m
     
-    def __fast_mod_semi_mersenne(self: UInt[N], field_size: UInt[N] = FIELD_SIZE, ring_mask: UInt[N] = RING_MASK, modulus_bits: int = MODULUS_BITS, s: int = 3):
+    def __fast_mod_semi_mersenne(self: UInt[N], field_size: UInt[N] = MPC_FIELD_SIZE, ring_mask: UInt[N] = MPC_RING_MASK, modulus_bits: int = MPC_MODULUS_BITS, s: int = 3):
         """
         Bit-hack for computing modulus with the field size of the form 2^k - s (semi-Mersenne).
         There is no explicit check for the shape of the field,
@@ -448,7 +455,7 @@ class UInt:
         if m >= field_size: return m - field_size
         return m
     
-    def __fast_mod_semi_mersenne_fixed(self: UInt[N], field_size: UInt[N] = FIELD_SIZE, ring_mask: UInt[N] = RING_MASK):
+    def __fast_mod_semi_mersenne_fixed(self: UInt[N], field_size: UInt[N] = MPC_FIELD_SIZE, ring_mask: UInt[N] = MPC_RING_MASK):
         """
         Bit-hack for computing modulus with the field size of the form 2^174 - 3 (semi-Mersenne).
         There is no explicit check for the shape of the field,
@@ -465,7 +472,7 @@ class UInt:
         return self.__fast_mod_const_field()
     
     def __fast_mod_ring(self: UInt[N]) -> UInt[N]:
-        return self & RING_MASK
+        return self & MPC_RING_MASK
     
     def __fast_mod_aided_64_bits(self, q: u64) -> u64:
         return self.__fast_mod_aided_64_bits_mod_const(q, u64(-1).__naive_mod(q) + 1)
@@ -495,12 +502,12 @@ class UInt:
         return (self + modulus - other) % modulus
     
     def mul_mod(self, other, modulus) -> UInt[N]:
-        if modulus == RING_SIZE:
+        if modulus == MPC_RING_SIZE:
             if not isinstance(self, u64) and isinstance(other, u64):
                 # Assume other is shorter than self
-                return (self * UInt[N].upcast(other)) & RING_MASK
-            else: return (self * other) & RING_MASK
-        if modulus == FIELD_SIZE:
+                return (self * UInt[N].upcast(other)) & MPC_RING_MASK
+            else: return (self * other) & MPC_RING_MASK
+        if modulus == MPC_FIELD_SIZE:
             if isinstance(self, UInt[128]):
                 if isinstance(other, UInt[N]): return modular_mul_u128u128_v1(self, other)
                 if isinstance(other, u64): return modular_mul_u128u64_v1(self, other)
@@ -520,12 +527,12 @@ class UInt:
         return mod_pow(self, other, modulus)
     
     def lsh_mod(self: UInt[N], other: int, modulus) -> UInt[N]:
-        if DEBUG: assert other <= MODULUS_BITS, f'Cannot left shift more than the length of modulus: {MODULUS_BITS}'
-        if modulus == RING_SIZE: return (self << other) & RING_MASK
-        if modulus == FIELD_SIZE:
-            s = (self << other) & RING_MASK
-            s += (self >> (MODULUS_BITS - other)) * MERSENNE_OFFSET
-            return (s & RING_MASK) + (s >> MODULUS_BITS) * MERSENNE_OFFSET
+        if DEBUG: assert other <= MPC_MODULUS_BITS, f'Cannot left shift more than the length of modulus: {MPC_MODULUS_BITS}'
+        if modulus == MPC_RING_SIZE: return (self << other) & MPC_RING_MASK
+        if modulus == MPC_FIELD_SIZE:
+            s = (self << other) & MPC_RING_MASK
+            s += (self >> (MPC_MODULUS_BITS - other)) * MPC_MERSENNE_OFFSET
+            return (s & MPC_RING_MASK) + (s >> MPC_MODULUS_BITS) * MPC_MERSENNE_OFFSET
         raise ValueError(f"Invalid modulus for modular multiplication: {modulus}")
     
     def iter(self: UInt[N]):
@@ -738,7 +745,7 @@ class List:
         i, j = s
         self[i][j] = other
 
-    def __setitem__(self: list[T], s: Tuple[slice, slice], other: int_t):
+    def __setitem__(self: list[T], s: Tuple[slice, slice], other: mpc_uint):
         rs, cs = s
         start_row, stop_row, _, _ = rs.adjust_indices(len(self))
         start_col, stop_col, _, _ = cs.adjust_indices(len(self[0]))
@@ -764,7 +771,7 @@ class List:
         for s, o in zip(self, other): l.append(s + o)
         return l
     
-    def __iadd__(self: list[list[int_t]], other: list[int_t]) -> list[list[int_t]]:
+    def __iadd__(self: list[list[mpc_uint]], other: list[mpc_uint]) -> list[list[mpc_uint]]:
         self_shape = self.shape
         if self_shape[1] != len(other):
             raise ValueError(f"Unsupported dimensions. Trying to add shapes {self_shape} and [{len(other)},]")
@@ -772,8 +779,8 @@ class List:
         for i in range(self_shape[0]): self[i] += other
         return self
 
-    def __add__(self: list[list[int_t]], other: list[int_t]) -> list[list[int_t]]:
-        l = list[list[int_t]](len(self))
+    def __add__(self: list[list[mpc_uint]], other: list[mpc_uint]) -> list[list[mpc_uint]]:
+        l = list[list[mpc_uint]](len(self))
         self_shape = self.shape
         if self_shape[1] != len(other):
             raise ValueError(f"Unsupported dimensions. Trying to add shapes {self_shape} and [{len(other)},]")
@@ -781,12 +788,12 @@ class List:
         for s in self: l.append(s + other)
         return l
     
-    def __iadd__(self: list[T], scalar: int_t) -> list[T]:
+    def __iadd__(self: list[T], scalar: mpc_uint) -> list[T]:
         for i in range(len(self)):
             self[i] += scalar
         return self
 
-    def __add__(self: list[T], scalar: int_t) -> list[T]:
+    def __add__(self: list[T], scalar: mpc_uint) -> list[T]:
         l = list[T](len(self))
         for s in self: l.append(s + scalar)
         return l
@@ -821,12 +828,12 @@ class List:
         for s, o in zip(self, other): l.append(s - o)
         return l
 
-    def __isub__(self: list[T], scalar: int_t) -> list[T]:
+    def __isub__(self: list[T], scalar: mpc_uint) -> list[T]:
         for i in range(len(self)):
             self[i] -= scalar
         return self
 
-    def __sub__(self: list[T], scalar: int_t) -> list[T]:
+    def __sub__(self: list[T], scalar: mpc_uint) -> list[T]:
         l = list[T](len(self))
         for s in self: l.append(s - scalar)
         return l
@@ -874,22 +881,22 @@ class List:
         for s in self: l.append(s * other)
         return l
 
-    def __imul__(self: list[int_t], other: list[int]) -> list[T]:
+    def __imul__(self: list[mpc_uint], other: list[int]) -> list[T]:
         for i, o in enumerate(other):
             self[i] *= o
         return self
 
-    def __mul__(self: list[int_t], other: list[int]) -> list[T]:
+    def __mul__(self: list[mpc_uint], other: list[int]) -> list[T]:
         l = list[T](len(self))
         for s, o in zip(self, other): l.append(s * o)
         return l
     
-    def __imul__(self: list[T], scalar: int_t) -> list[T]:
+    def __imul__(self: list[T], scalar: mpc_uint) -> list[T]:
         for i in range(len(self)):
             self[i] *= scalar
         return self
 
-    def __mul__(self: list[T], scalar: int_t) -> list[T]:
+    def __mul__(self: list[T], scalar: mpc_uint) -> list[T]:
         l = list[T](len(self))
         for s in self: l.append(s * scalar)
         return l
@@ -914,12 +921,12 @@ class List:
         for s in self: l.append(s * scalar)
         return l
     
-    def __itruediv__(self: list[T], scalar: int_t) -> list[T]:
+    def __itruediv__(self: list[T], scalar: mpc_uint) -> list[T]:
         for i in range(len(self)):
             self[i] /= scalar
         return self
 
-    def __truediv__(self: list[T], scalar: int_t) -> list[T]:
+    def __truediv__(self: list[T], scalar: mpc_uint) -> list[T]:
         l = list[T](len(self))
         for s in self: l.append(s / scalar)
         return l
@@ -944,12 +951,12 @@ class List:
         for s, o in zip(self, other): l.append(s // o)
         return l
     
-    def __ifloordiv__(self: list[T], scalar: int_t) -> list[T]:
+    def __ifloordiv__(self: list[T], scalar: mpc_uint) -> list[T]:
         for i in range(len(self)):
             self[i] //= scalar
         return self
 
-    def __floordiv__(self: list[T], scalar: int_t) -> list[T]:
+    def __floordiv__(self: list[T], scalar: mpc_uint) -> list[T]:
         l = list[T](len(self))
         for s in self: l.append(s // scalar)
         return l
@@ -964,12 +971,12 @@ class List:
         for s in self: l.append(s // scalar)
         return l
 
-    def __imod__(self: list[T], scalar: int_t) -> list[T]:
+    def __imod__(self: list[T], scalar: mpc_uint) -> list[T]:
         for i in range(len(self)):
             self[i] %= scalar
         return self
 
-    def __mod__(self: list[T], scalar: int_t) -> list[T]:
+    def __mod__(self: list[T], scalar: mpc_uint) -> list[T]:
         l = list[T](len(self))
         for s in self: l.append(s % scalar)
         return l
@@ -984,12 +991,12 @@ class List:
         for s in self: l.append(s % scalar)
         return l
 
-    def __ipow__(self: list[T], scalar: int_t) -> list[T]:
+    def __ipow__(self: list[T], scalar: mpc_uint) -> list[T]:
         for i in range(len(self)):
             self[i] **= scalar
         return self
 
-    def __pow__(self: list[T], scalar: int_t) -> list[T]:
+    def __pow__(self: list[T], scalar: mpc_uint) -> list[T]:
         l = list[T](len(self))
         for s in self: l.append(s ** scalar)
         return l
@@ -1004,12 +1011,12 @@ class List:
         for s in self: l.append(s ** scalar)
         return l
     
-    def __iand__(self: list[T], scalar: int_t) -> list[T]:
+    def __iand__(self: list[T], scalar: mpc_uint) -> list[T]:
         for i in range(len(self)):
             self[i] &= scalar
         return self
 
-    def __and__(self: list[T], scalar: int_t) -> list[T]:
+    def __and__(self: list[T], scalar: mpc_uint) -> list[T]:
         l = list[T](len(self))
         for s in self: l.append(s & scalar)
         return l
@@ -1044,22 +1051,22 @@ class List:
         for s in self: l.append(s ^ scalar)
         return l
 
-    def __ilshift__(self: list[T], scalar: int_t) -> list[T]:
+    def __ilshift__(self: list[T], scalar: mpc_uint) -> list[T]:
         for i in range(len(self)):
             self[i] <<= scalar
         return self
 
-    def __lshift__(self: list[T], scalar: int_t) -> list[T]:
+    def __lshift__(self: list[T], scalar: mpc_uint) -> list[T]:
         l = list[T](len(self))
         for s in self: l.append(s << scalar)
         return l
 
-    def __irshift__(self: list[T], scalar: int_t) -> list[T]:
+    def __irshift__(self: list[T], scalar: mpc_uint) -> list[T]:
         for i in range(len(self)):
             self[i] >>= scalar
         return self
 
-    def __rshift__(self: list[T], scalar: int_t) -> list[T]:
+    def __rshift__(self: list[T], scalar: mpc_uint) -> list[T]:
         l = list[T](len(self))
         for s in self: l.append(s >> scalar)
         return l
@@ -1480,7 +1487,7 @@ class List:
             for b in v.iter():
                 yield b
     
-    def to_int_t(self: list[T], modulus: int_t):
+    def to_int_t(self: list[T], modulus: mpc_uint):
         return [e.to_int_t(modulus) for e in self]
     
     def pad_vec_inplace(self: list[T], length: int) -> list[T]:
@@ -1562,14 +1569,14 @@ class List:
     def get_identity(self: list[T]) -> list[T]:
         identity = self.zeros()
         for i in range(len(self)):
-            identity[i][i] = int_t(1)
+            identity[i][i] = mpc_uint(1)
         return identity
     
     def fixed_value(self: list[T], value) -> list[T]:
-        if isinstance(self, list[int_t]) and isinstance(value, int_t):
-            return [int_t(value) for _ in range(len(self))]
-        if isinstance(self, list[list[int_t]]) and isinstance(value, int_t):
-            return [[int_t(value) for _ in range(len(self[0]))] for _ in range(len(self))]
+        if isinstance(self, list[mpc_uint]) and isinstance(value, mpc_uint):
+            return [mpc_uint(value) for _ in range(len(self))]
+        if isinstance(self, list[list[mpc_uint]]) and isinstance(value, mpc_uint):
+            return [[mpc_uint(value) for _ in range(len(self[0]))] for _ in range(len(self))]
         if isinstance(self, list[int]) and isinstance(value, int):
             return [value for _ in range(len(self))]
         if isinstance(self, list[list[int]]) and isinstance(value, int):
@@ -1623,7 +1630,7 @@ class List:
         return l
 
     def broadcast_add(self: list[T], other) -> list[T]:
-        l = list[list[int_t]](len(self))
+        l = list[list[mpc_uint]](len(self))
         self_shape = self.shape
         if self_shape[1] != len(other):
             raise ValueError(f"Unsupported dimensions. Trying to add shapes {self_shape} and [{len(other)},]")
@@ -1668,10 +1675,10 @@ class List:
         
         return prod
     
-    def reduce_mul_powers(self: list[T], pows, modulus: int_t) -> T:
+    def reduce_mul_powers(self: list[T], pows, modulus: mpc_uint) -> T:
         result = self[0].ones()
         for s, o in zip(self, pows):
-            result = result.mul_mod(s.pow_mod(int_t(o), modulus), modulus)
+            result = result.mul_mod(s.pow_mod(mpc_uint(o), modulus), modulus)
         return result
     
     def slice_reference(self: list[T], begin: int, end: int) -> list[T]:
@@ -1774,6 +1781,14 @@ class List:
         
         for i in range(len(self)):
             new_arr.append(abs(self[i]))
+        
+        return new_arr
+    
+    def sqrt(self) -> List[float]:
+        new_arr = List[T](len(self))
+        
+        for i in range(len(self)):
+            new_arr.append(self[i].sqrt())
         
         return new_arr
     
@@ -2312,4 +2327,4 @@ class ndarray:
         return new_arr.expand_dims()
 
 
-print(f"Compiled setup:\n\t MPC Galois field size: {FIELD_SIZE.__repr__()}\n\t MPC Z_(2^k) ring size: {RING_SIZE.__repr__()}\n")
+print(f"Compiled setup:\n\t MPC Galois field size: {MPC_FIELD_SIZE.__repr__()}\n\t MPC Z_(2^k) ring size: {MPC_RING_SIZE.__repr__()}\n")
