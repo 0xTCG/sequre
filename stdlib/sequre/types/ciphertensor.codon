@@ -1,4 +1,4 @@
-import operator
+import operator, math
 
 from numpy.ndarray import ndarray
 from numpy.create import array, zeros
@@ -6,8 +6,12 @@ from pickler import pickle, unpickle
 from helpers import argmin
 
 from sequre.lattiseq.ckks import Ciphertext, Plaintext
+from sequre.stdlib.chebyshev import via_chebyshev
 from sequre.utils.utils import one_hot_vector
-from sequre.utils.constants import HE_MUL_COST_ESTIMATE, HE_ROT_COST_ESTIMATE, HE_ENC_COST_ESTIMATE, MHE_MPC_SWITCH_COST_ESTIMATE, C_CONTIG, D_CONTIG
+from sequre.utils.constants import (
+    HE_MUL_COST_ESTIMATE, HE_ROT_COST_ESTIMATE,
+    HE_ENC_COST_ESTIMATE, MHE_MPC_SWITCH_COST_ESTIMATE,
+    C_CONTIG, D_CONTIG, CHEBYSHEV_DEGREE)
 
 from sequre.settings import DEBUG
 
@@ -241,13 +245,13 @@ class Ciphertensor[ctype]:
         
         target_cipher_idx = i // self.slots
         target_offset = i % self.slots
-        mask = mpc.he.enc_vector(one_hot_vector(target_offset, self.slots, TP=float), T=Plaintext)
-        dedup_single = mpc.he.mul([self._data[target_cipher_idx]], mask)[0]
+        mask = mpc.mhe.enc_vector(one_hot_vector(target_offset, self.slots, TP=float), T=Plaintext)
+        dedup_single = mpc.mhe.mul([self._data[target_cipher_idx]], mask)[0]
 
         ciphers_count = self.cipher_shape[-1]
         if ciphers_count > 1:
             dedup_base = dedup_single.copy()
-            mpc.he.crypto_params.evaluator.reduce_add(dedup_base, self.slots)
+            mpc.mhe.crypto_params.evaluator.reduce_add(dedup_base, self.slots)
         
             for _ in range(ciphers_count - 1):
                 _data.append(dedup_base.copy())
@@ -257,14 +261,14 @@ class Ciphertensor[ctype]:
             dedup_edge = dedup_single.copy()
             distance = target_offset - new_size_offset + 1
             initial_rotation = distance if distance > 0 else (self.slots + distance)
-            mpc.he.irotate([dedup_edge], initial_rotation)
-            mpc.he.crypto_params.evaluator.reduce_add(dedup_edge, new_size_offset)
+            mpc.mhe.irotate([dedup_edge], initial_rotation)
+            mpc.mhe.crypto_params.evaluator.reduce_add(dedup_edge, new_size_offset)
             _data.append(dedup_edge)
         elif len(_data):
             _data.append(_data[-1].copy())
         elif new_size:
             dedup_base = dedup_single.copy()
-            mpc.he.crypto_params.evaluator.reduce_add(dedup_base, self.slots)
+            mpc.mhe.crypto_params.evaluator.reduce_add(dedup_base, self.slots)
             _data.append(dedup_base)
         
         return Ciphertensor[ctype](
@@ -310,7 +314,7 @@ class Ciphertensor[ctype]:
             compile_error("Ciphertensor: invalid input for ciphertensor encoding/encryption")
         
         if _data.is_empty():
-            return Ciphertensor[ctype](slots=mpc.he.crypto_params.params.slots())
+            return Ciphertensor[ctype](slots=mpc.mhe.crypto_params.params.slots())
         
         if not isinstance(_data.S, Tuple[int, int]):
             assert mode == C_CONTIG, "Ciphertensor: 2-dimensional tensors can be encoded only in c-contiguous mode"
@@ -326,18 +330,18 @@ class Ciphertensor[ctype]:
     @staticmethod
     def enc_c_contig[S, dtype](mpc, data: ndarray[S, dtype], padding: int = 0) -> Ciphertensor[ctype]:
         if data.is_empty():
-            return Ciphertensor[ctype](slots=mpc.he.crypto_params.params.slots())
+            return Ciphertensor[ctype](slots=mpc.mhe.crypto_params.params.slots())
         
         if padding:
             data = data.pad(padding, axis=(staticlen(S) - 1))
         
-        slots = mpc.he.crypto_params.params.slots()
+        slots = mpc.mhe.crypto_params.params.slots()
         vec_len = data.shape[-1]
         flat_data = data.flatten()
         _data = List[ctype](Ciphertensor._count_ciphers(data.shape, slots))
         
         for i in range(0, flat_data.size, vec_len):
-            _data.extend(mpc.he.enc_vector(flat_data[i:i + vec_len].tolist(), T=ctype))
+            _data.extend(mpc.mhe.enc_vector(flat_data[i:i + vec_len].tolist(), T=ctype))
 
         return Ciphertensor[ctype](
             _data=_data,
@@ -350,7 +354,7 @@ class Ciphertensor[ctype]:
         
         if other.is_empty():
             return Ciphertensor[ctype](
-                slots=mpc.he.crypto_params.params.slots(),
+                slots=mpc.mhe.crypto_params.params.slots(),
                 _diagonal_contiguous=True)
         
         diagonals = zeros((min(other.shape), max(other.shape)), dtype=dtype)
@@ -368,8 +372,8 @@ class Ciphertensor[ctype]:
         if not (isinstance(value, int) or isinstance(value, float)):
             compile_error("Ciphertensor: invalid value type to patch_copy")
         
-        slots = mpc.he.crypto_params.params.slots()
-        enc_row = mpc.he.enc_vector([value for _ in range(shape[-1])], T=ctype)
+        slots = mpc.mhe.crypto_params.params.slots()
+        enc_row = mpc.mhe.enc_vector([value for _ in range(shape[-1])], T=ctype)
         new_tensor_data = []
         for _ in range(shape[:-1].reduce_mul()):
             new_tensor_data.extend(enc_row.copy())
@@ -397,9 +401,9 @@ class Ciphertensor[ctype]:
 
     @staticmethod
     def zeros(mpc, shape: List[int]) -> Ciphertensor[Ciphertext]:
-        slots = mpc.he.crypto_params.params.slots()
+        slots = mpc.mhe.crypto_params.params.slots()
         number_of_elements = Ciphertensor._count_ciphers(shape, slots)
-        zero_cipher = mpc.he.zero_cipher()
+        zero_cipher = mpc.mhe.zero_cipher()
         
         return Ciphertensor[Ciphertext](
             _data=[zero_cipher.copy() for _ in range(number_of_elements)],
@@ -412,6 +416,9 @@ class Ciphertensor[ctype]:
             _data=[ctype.nil_ideal() for _ in range(Ciphertensor._count_ciphers(shape, slots))],
             shape=shape.copy(),
             slots=slots)
+    
+    def zeros(self, mpc) -> Ciphertensor[Ciphertext]:
+        return Ciphertensor[Ciphertext].zeros(mpc, self.shape)
     
     def set(self, other: Ciphertensor[ctype]):
         self._data = other._data
@@ -429,7 +436,7 @@ class Ciphertensor[ctype]:
         if len(self._data):
             return self._data[0].level()
         
-        return 1024  # Until mpc instance is added to self. Then return mpc.he.crypto_params.params.max_level().
+        return 1024  # Until mpc instance is added to self. Then return mpc.mhe.crypto_params.params.max_level().
     
     def decrypt(self, mpc, source_pid: int = -2) -> Ciphertensor[Plaintext]:
         """
@@ -440,7 +447,7 @@ class Ciphertensor[ctype]:
         """
         assert isinstance(ctype, Ciphertext), "Ciphertensor: data already decrypted"
         return Ciphertensor[Plaintext](
-            _data=mpc.he.decrypt(self._data, source_pid),
+            _data=mpc.mhe.decrypt(self._data, source_pid),
             shape=self.shape.copy(),
             slots=self.slots,
             _transposed=self._transposed,
@@ -451,7 +458,7 @@ class Ciphertensor[ctype]:
         assert isinstance(ctype, Plaintext), "Ciphertensor: make sure to decrypt the ciphertensor before decoding it"
         assert 0 <= self.ndim < 3, "Ciphertensor: only 0-dim, 1-dim and 2-dim ciphertensors can be revealed at the moment"
 
-        decoded_vector = mpc.he.decode(self._data, dtype=T)
+        decoded_vector = mpc.mhe.decode(self._data, dtype=T)
         assert (decoded_vector.size() + self.slots - 1) // self.slots == len(self._data) == (self.cipher_shape.reduce_mul() if self.cipher_shape else 0), f"Ciphertensor: Input data shapes do not match encryption/encoding shape. Input shape: {decoded_vector.shape}. Enc vector len: {len(self._data)}. Slots: {self.slots}. Cipher shape: {self.cipher_shape}"
         
         # TODO: Remove the shapes adjustments after Ciphertensor is reimplemented to have a static shape
@@ -611,7 +618,7 @@ class Ciphertensor[ctype]:
         if mpc.pid == 0: return self
         assert not isinstance(ctype, Plaintext), "Ciphertensor: cannot neg plaintext inplace"
 
-        mpc.he.ineg(self._data)
+        mpc.mhe.ineg(self._data)
         return self
     
     def iadd(self, mpc, other) -> Ciphertensor[Ciphertext]:
@@ -619,7 +626,7 @@ class Ciphertensor[ctype]:
         assert not isinstance(ctype, Plaintext), "Ciphertensor: cannot add to plaintext inplace"
         other_cipher = self._check_other_operand_elem_wise(mpc, other)
 
-        mpc.he.iadd(self._data, other_cipher._data)
+        mpc.mhe.iadd(self._data, other_cipher._data)
         return self
 
     def isub(self, mpc, other) -> Ciphertensor[Ciphertext]:
@@ -627,7 +634,7 @@ class Ciphertensor[ctype]:
         assert not isinstance(ctype, Plaintext), "Ciphertensor: cannot subtract from plaintext inplace"
         other_cipher = self._check_other_operand_elem_wise(mpc, other)
 
-        mpc.he.isub(self._data, other_cipher._data)
+        mpc.mhe.isub(self._data, other_cipher._data)
         return self
 
     def imul(self, mpc, other) -> Ciphertensor[Ciphertext]:
@@ -635,7 +642,7 @@ class Ciphertensor[ctype]:
         assert not isinstance(ctype, Plaintext), "Ciphertensor: cannot multiply plaintext inplace"
         other_cipher = self._check_other_operand_elem_wise(mpc, other)
 
-        mpc.he.imul(self._data, other_cipher._data)
+        mpc.mhe.imul(self._data, other_cipher._data)
         return self
     
     def ipow(self, mpc, p: int) -> Ciphertensor[Ciphertext]:
@@ -647,14 +654,14 @@ class Ciphertensor[ctype]:
         tzs = p.__cttz__()
 
         for _ in range(tzs):
-            mpc.he.imul(butterfly_data, butterfly_data)
+            mpc.mhe.imul(butterfly_data, butterfly_data)
         p >>= (tzs + 1)
         self._data = butterfly_data.copy()
 
         while p:
-            mpc.he.imul(butterfly_data, butterfly_data)
+            mpc.mhe.imul(butterfly_data, butterfly_data)
             if p % 2:
-                mpc.he.imul(self._data, butterfly_data)
+                mpc.mhe.imul(self._data, butterfly_data)
             p >>= 1
 
         return self
@@ -687,34 +694,34 @@ class Ciphertensor[ctype]:
             self._data.irotate(step // self.slots)
         # Second-best case scenario. If cipher fits in the number of slots, only one homomorphic rotation is needed.
         elif self.shape[-1] == self.slots:
-            mpc.he.irotate(self._data, step % self.slots)
+            mpc.mhe.irotate(self._data, step % self.slots)
         # Worst case scenario. Either the rotation is done over multiple ciphertexts or encoded data size is less than the number of slots
         else:
             step_offset = step % self.slots % self.shape[-1]
-            mpc.he.irotate(self._data, step_offset)
+            mpc.mhe.irotate(self._data, step_offset)
 
             mask = [(0 if (i < self.slots - step_offset) else 1) for i in range(self.slots)]
-            cipher_mask = mpc.he.enc_vector(mask, T=Plaintext)[0]
-            cipher_mask_inv = mpc.he.enc_vector(mask ^ 1, T=Plaintext)[0]
+            cipher_mask = mpc.mhe.enc_vector(mask, T=Plaintext)[0]
+            cipher_mask_inv = mpc.mhe.enc_vector(mask ^ 1, T=Plaintext)[0]
             mask_enc = [cipher_mask for _ in range(len(self._data))]
             mask_inv_enc = [cipher_mask_inv for _ in range(len(self._data))]
             
-            offset_tensor_data = mpc.he.mul(self._data, mask_enc).irotate(1)
+            offset_tensor_data = mpc.mhe.mul(self._data, mask_enc).irotate(1)
             
             data_offset = self.shape[-1] % self.slots
             if data_offset:
-                mpc.he.irotate([offset_tensor_data[-1]], self.slots - data_offset)
+                mpc.mhe.irotate([offset_tensor_data[-1]], self.slots - data_offset)
             
             if data_offset and data_offset < step_offset:
                 corr_mask = [(0 if (i < self.slots - step_offset + data_offset) else 1) for i in range(self.slots)]
-                corr_cipher_mask = mpc.he.enc_vector(corr_mask, T=Plaintext)
-                corr_cipher_mask_inv = mpc.he.enc_vector(corr_mask ^ 1, T=Plaintext)
-                correction_cipher = mpc.he.mul([offset_tensor_data[-1]], corr_cipher_mask)
-                mpc.he.imul([offset_tensor_data[-1]], corr_cipher_mask_inv)
-                mpc.he.iadd([offset_tensor_data[-2]], correction_cipher)
+                corr_cipher_mask = mpc.mhe.enc_vector(corr_mask, T=Plaintext)
+                corr_cipher_mask_inv = mpc.mhe.enc_vector(corr_mask ^ 1, T=Plaintext)
+                correction_cipher = mpc.mhe.mul([offset_tensor_data[-1]], corr_cipher_mask)
+                mpc.mhe.imul([offset_tensor_data[-1]], corr_cipher_mask_inv)
+                mpc.mhe.iadd([offset_tensor_data[-2]], correction_cipher)
 
-            mpc.he.imul(self._data, mask_inv_enc)
-            mpc.he.iadd(self._data, offset_tensor_data)
+            mpc.mhe.imul(self._data, mask_inv_enc)
+            mpc.mhe.iadd(self._data, offset_tensor_data)
 
             if self.slots < step < self.shape[-1]:
                 self._data.irotate((step + self.slots - 1) // self.slots)
@@ -756,6 +763,27 @@ class Ciphertensor[ctype]:
         
         return self.copy().ipow(mpc, p)
 
+    def approx_mul_inv(self, mpc, interval):
+        op = lambda x: 1 / x
+        if isinstance(ctype, Plaintext):
+            return self._handle_plaintext_case(mpc, op)
+        
+        return via_chebyshev(mpc, self, op, interval, CHEBYSHEV_DEGREE)
+    
+    def approx_sqrt(self, mpc, interval):
+        op = math.sqrt
+        if isinstance(ctype, Plaintext):
+            return self._handle_plaintext_case(mpc, op)
+        
+        return via_chebyshev(mpc, self, op, interval, CHEBYSHEV_DEGREE)
+    
+    def approx_sqrt_inv(self, mpc, interval):
+        op = lambda x: 1 / math.sqrt(x)
+        if isinstance(ctype, Plaintext):
+            return self._handle_plaintext_case(mpc, op)
+        
+        return via_chebyshev(mpc, self, op, interval, CHEBYSHEV_DEGREE)
+    
     def rotate(self, mpc, step: int) -> Ciphertensor[ctype]:
         return self.copy().irotate(mpc, step)
 
@@ -778,7 +806,7 @@ class Ciphertensor[ctype]:
         shape[-1] = (self.cipher_shape[-1] + 1) * self.slots
 
         return Ciphertensor[ctype](
-            _data=mpc.he.shift(self._data, step),
+            _data=mpc.mhe.shift(self._data, step),
             shape=shape,
             slots=self.slots,
             _transposed=self._transposed)
@@ -829,7 +857,7 @@ class Ciphertensor[ctype]:
                     # Last cipher in shifted tensor is all zeros
                     shifted_tensor_data.pop()
 
-                mpc.he.crypto_params.evaluator.add(
+                mpc.mhe.crypto_params.evaluator.add(
                     patch_copy_tensor._data[-1],
                     shifted_tensor_data[0],
                     patch_copy_tensor._data[-1])
@@ -844,8 +872,8 @@ class Ciphertensor[ctype]:
 
         offset = new_size % self.slots
         if offset and ((new_size >> (new_size.__cttz__())) != self.shape[0]):  # if offset or self.shape[0] != new_size // 2^k
-            mask = mpc.he.enc_vector([(1.0 if i < offset else 0.0) for i in range(self.slots)], T=Plaintext)
-            patch_copy_tensor._data[-1] = mpc.he.mul([patch_copy_tensor._data[-1]], mask)[0]
+            mask = mpc.mhe.enc_vector([(1.0 if i < offset else 0.0) for i in range(self.slots)], T=Plaintext)
+            patch_copy_tensor._data[-1] = mpc.mhe.mul([patch_copy_tensor._data[-1]], mask)[0]
 
         patch_copy_tensor.shape = [new_size]
 
@@ -860,10 +888,10 @@ class Ciphertensor[ctype]:
         _data = self._data.copy()
 
         # TODO: There should be no need for masking here
-        mask = mpc.he.enc_vector([(1.0 if i < self.shape[-1] % self.slots else 0.0) for i in range(self.slots)], T=Plaintext)
-        mpc.he.imul([_data[-1]], mask)
+        mask = mpc.mhe.enc_vector([(1.0 if i < self.shape[-1] % self.slots else 0.0) for i in range(self.slots)], T=Plaintext)
+        mpc.mhe.imul([_data[-1]], mask)
 
-        zero_cipher = mpc.he.zero_cipher()
+        zero_cipher = mpc.mhe.zero_cipher()
         _padding = [zero_cipher.copy() for _ in range((new_size - 1) // self.slots)]
         _data.extend(_padding)
         
@@ -884,7 +912,7 @@ class Ciphertensor[ctype]:
             cipher = Ciphertensor[Plaintext].enc(mpc, [_sum for _ in range(size)])
         else:
             cipher = Ciphertensor[ctype](
-                _data=mpc.he.reduce_add(self._data, self.shape[-1], keep_dims=keep_dims),
+                _data=mpc.mhe.reduce_add(self._data, self.shape[-1], keep_dims=keep_dims),
                 shape=[size],
                 slots=self.slots)
         
@@ -927,20 +955,20 @@ class Ciphertensor[ctype]:
         cipher = self._data[0].copy()
         
         for i in range(1, len(self._data)):
-            mpc.he.crypto_params.evaluator.add(cipher, self._data[i], cipher)
+            mpc.mhe.crypto_params.evaluator.add(cipher, self._data[i], cipher)
 
         rotation_step = tile_size
         while rotation_step < size:
-            rotated_cipher = mpc.he.crypto_params.evaluator.rotate_new(cipher, rotation_step)
+            rotated_cipher = mpc.mhe.crypto_params.evaluator.rotate_new(cipher, rotation_step)
             if rotation_step > self.slots // 2:
-                mask = mpc.he.enc_vector([(1.0 if i < (self.slots - rotation_step) else 0.0) for i in range(self.slots)], T=Plaintext)
-                mpc.he.imul([rotated_cipher], mask)
-            mpc.he.crypto_params.evaluator.add(cipher, rotated_cipher, cipher)
+                mask = mpc.mhe.enc_vector([(1.0 if i < (self.slots - rotation_step) else 0.0) for i in range(self.slots)], T=Plaintext)
+                mpc.mhe.imul([rotated_cipher], mask)
+            mpc.mhe.crypto_params.evaluator.add(cipher, rotated_cipher, cipher)
             rotation_step <<= 1
         
-        mask = mpc.he.enc_vector([(1.0 if i < tile_size else 0.0) for i in range(self.slots)], T=Plaintext)
+        mask = mpc.mhe.enc_vector([(1.0 if i < tile_size else 0.0) for i in range(self.slots)], T=Plaintext)
         return Ciphertensor[ctype](
-            _data=mpc.he.mul([cipher], mask),
+            _data=mpc.mhe.mul([cipher], mask),
             shape=[tile_size],
             slots=self.slots)
     
@@ -969,9 +997,9 @@ class Ciphertensor[ctype]:
             
             _sum_data = self._get_rows_raw(0).sum(mpc, axis=0)._data
             for i in range(1, self.shape[0]):
-                mpc.he.iadd(
+                mpc.mhe.iadd(
                     _sum_data,
-                    mpc.he.irotate(
+                    mpc.mhe.irotate(
                         self._get_rows_raw(i).sum(mpc, axis=0)._data,
                         self.slots - i))
             
@@ -1252,7 +1280,7 @@ class Ciphertensor[ctype]:
         assert other._transposed, "Ciphertensor: ciphertensor should be lazily transposed prior to M1 matrix multiplication by it"
         assert not self._diagonal_contiguous and not other._diagonal_contiguous, "Ciphertensor: cannot apply M1 matrix multiplication method to diagonal-contiguous ciphertensors"
 
-        masks = [mpc.he.enc_vector(one_hot_vector(i % self.slots, self.slots, TP=float), T=Plaintext) for i in range(other_shape[0])]
+        masks = [mpc.mhe.enc_vector(one_hot_vector(i % self.slots, self.slots, TP=float), T=Plaintext) for i in range(other_shape[0])]
         
         new_ciphertensor = Ciphertensor[Ciphertext](
                 shape=[0, other_shape[0]],
@@ -1267,9 +1295,9 @@ class Ciphertensor[ctype]:
                     reduction = reduction.patch_copy(mpc, other_shape[0])
 
                 target_cipher = new_row._data[j // self.slots]
-                mpc.he.crypto_params.evaluator.add(
+                mpc.mhe.crypto_params.evaluator.add(
                     target_cipher,
-                    mpc.he.mul([reduction._data[0]], masks[j])[0],
+                    mpc.mhe.mul([reduction._data[0]], masks[j])[0],
                     target_cipher)
                 if debug: print(f"CP{mpc.pid}:\tCiphertensor M1 matmul: {i + 1}/{self_shape[0]} -- {j + 1}/{other_shape[0]}")
             if debug: print(f"CP{mpc.pid}:\t----------------------")
@@ -1348,7 +1376,7 @@ class Ciphertensor[ctype]:
             new_row = row.mul(mpc, other.diagonal(0))
             
             for i in range(1, min(other.shape)):
-                if semi_slot: mpc.he.irotate(row._data, 1)
+                if semi_slot: mpc.mhe.irotate(row._data, 1)
                 else: row.irotate(mpc, 1)
                 new_row.iadd(mpc, row.mul(mpc, other.diagonal(i)))
             
@@ -1419,7 +1447,7 @@ class Ciphertensor[ctype]:
                 debug_counter += 1
                 print(f"CP{mpc.pid}:\tCiphertensor M3 matmul: Computing diagonal {debug_counter}/{diagonals_count} ...")
             
-            if semi_slot and d_idx: mpc.he.irotate(patch_copy_self._data, 1)
+            if semi_slot and d_idx: mpc.mhe.irotate(patch_copy_self._data, 1)
             elif d_idx: patch_copy_self.irotate(mpc, 1)
             new_diagonal = patch_copy_self._get_rows_raw(0).mul(mpc, other_cipher._get_rows_raw(0))
             
@@ -1519,14 +1547,14 @@ class Ciphertensor[ctype]:
             _data.extend(other._data)
         elif other.shape[0] + offset < slots:
             # TODO: Potential problem if first has non-zero data beyond first.shape[0]
-            rotated_cipher = mpc.he.crypto_params.evaluator.rotate_new(other._data[0], slots - offset)
-            mpc.he.iadd([_data[-1]], [rotated_cipher])
+            rotated_cipher = mpc.mhe.crypto_params.evaluator.rotate_new(other._data[0], slots - offset)
+            mpc.mhe.iadd([_data[-1]], [rotated_cipher])
         else:
             rotated_other = other.shift(mpc, slots - offset)
-            mask = mpc.he.enc_vector([(1.0 if i < offset else 0.0) for i in range(slots)], T=Plaintext)
-            mpc.he.imul([_data[-1]], mask)
-            # TODO: mpc.he.iadd is buggy (possibly due to different scales/levels of the operands)
-            mpc.he.iadd([_data[-1]], [rotated_other._data[0]])
+            mask = mpc.mhe.enc_vector([(1.0 if i < offset else 0.0) for i in range(slots)], T=Plaintext)
+            mpc.mhe.imul([_data[-1]], mask)
+            # TODO: mpc.mhe.iadd is buggy (possibly due to different scales/levels of the operands)
+            mpc.mhe.iadd([_data[-1]], [rotated_other._data[0]])
             _data.extend(rotated_other._data[1:])
 
             if other.shape[0] % slots <= slots - offset:
@@ -1568,6 +1596,7 @@ class Ciphertensor[ctype]:
     
     def _getitem_1_dim(self, mpc, indices) -> Ciphertensor[ctype]:
         assert self.ndim == 1, "Ciphertensor: should be 1-dimensional in 1-dim getitem"
+        assert not self._diagonal_contiguous, "Not implemented yet: getitem on diagonal-contiguous ciphertensor"
         start, stop = self._adjust_col_indices(indices)
         
         if stop - start == 0:
@@ -1580,18 +1609,18 @@ class Ciphertensor[ctype]:
 
         start_cipher = self._data[start_cipher_idx]
         upper_limit = stop % self.slots if start_cipher_idx == stop_cipher_idx else self.slots
-        masked_start_cipher = mpc.he.mask_range(start_cipher, start % self.slots, upper_limit)
+        masked_start_cipher = mpc.mhe.mask_range(start_cipher, start % self.slots, upper_limit)
         _data = [masked_start_cipher]
         
         if start_cipher_idx != stop_cipher_idx:
             # stop_cipher = self._data[stop_cipher_idx]
-            # masked_stop_cipher = mpc.he.mask_range(stop_cipher, 0, stop % self.slots)
+            # masked_stop_cipher = mpc.mhe.mask_range(stop_cipher, 0, stop % self.slots)
             # inbetween_ciphers = self._data[start_cipher_idx + 1:stop_cipher_idx - 1].copy()
             # _data.extend(inbetween_ciphers)
             # _data.append(masked_stop_cipher)
             raise NotImplementedError("Bugfix required: getting from 1-dimensonal multicipher ciphertensor")
 
-        if start % self.slots: mpc.he.irotate(_data, start % self.slots)
+        if start % self.slots: mpc.mhe.irotate(_data, start % self.slots)
         
         return Ciphertensor[ctype](
             _data=_data,
@@ -1658,24 +1687,24 @@ class Ciphertensor[ctype]:
         
         if start_offset:
             if start_offset + value.shape[0] > self.slots:
-                addend_data = mpc.he.shift(addend_data, self.slots - start_offset)
+                addend_data = mpc.mhe.shift(addend_data, self.slots - start_offset)
             else:
-                mpc.he.irotate(addend_data, self.slots - start_offset)
+                mpc.mhe.irotate(addend_data, self.slots - start_offset)
 
         start_cipher_idx = start // self.slots
         stop_cipher_idx = stop // self.slots
 
         start_cipher = self._data[start_cipher_idx]
         upper_limit = stop % self.slots if start_cipher_idx == stop_cipher_idx else self.slots
-        masked_start_cipher = mpc.he.mask_range(start_cipher, start % self.slots, upper_limit, complement=True)
+        masked_start_cipher = mpc.mhe.mask_range(start_cipher, start % self.slots, upper_limit, complement=True)
         
-        mpc.he.iadd([masked_start_cipher], addend_data[:1])
+        mpc.mhe.iadd([masked_start_cipher], addend_data[:1])
         self._data[start_cipher_idx] = masked_start_cipher
 
         if start_cipher_idx != stop_cipher_idx:
             stop_cipher = self._data[stop_cipher_idx]
-            masked_stop_cipher = mpc.he.mask_range(stop_cipher, 0, stop % self.slots, complement=True)
-            mpc.he.iadd([masked_stop_cipher], addend_data[-1:])
+            masked_stop_cipher = mpc.mhe.mask_range(stop_cipher, 0, stop % self.slots, complement=True)
+            mpc.mhe.iadd([masked_stop_cipher], addend_data[-1:])
             self._data[stop_cipher_idx] = masked_start_cipher
             self._data[start_cipher_idx + 1:stop_cipher_idx - 1] = addend_data[1:-1]
 
