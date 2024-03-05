@@ -16,7 +16,7 @@ from sequre.utils.io import read_matrix, log
 
 
 def _match_model(scenario: str, mpc_im_initial_w, im_optimizer: str) -> Union:
-    if scenario == "scenario_2" or scenario == "log":
+    if scenario == "scenario_2" or scenario == "log" or scenario == "scenario_siMICE_2":
         return LogReg(mpc_im_initial_w.copy(), im_optimizer)
     elif scenario == "scenario_1" or scenario == "lin" or scenario == "scenario_siMICE_1":
         return LinReg(mpc_im_initial_w.copy(), im_optimizer)
@@ -203,12 +203,12 @@ def load_scenario_mi_data(scenario: str, rows_count: int, cols_count: int):
         miss_rows = read_matrix(f, rows_count, 1, binary=False, TP=int).flatten()
     
     feature_count = cols_count
-    im_step_size = 1 / (1 << 11)
+    im_step_size = 1 / (1 << 11) if "1" in scenario else 1 / (1 << 7)
     fm_step_size = 1 / (1 << 12)
     im_initial_w = ones((feature_count, 1))
     fm_initial_w = ndarray.rand((feature_count + 1, 1), "uniform")
-    im_optimizer = "mbgd"
-    fm_optimizer = "mbgd"
+    im_optimizer = "mbgd" if "1" in scenario else "bgd"
+    fm_optimizer = "mbgd" if "1" in scenario else "bgd"
     
     return (incomplete_data, complete_data, labels, miss_rows,
         im_initial_w, fm_initial_w, im_step_size, fm_step_size,
@@ -273,7 +273,17 @@ def evaluate_scenario(
     y_hat_y_mean = abs_diff.mean()
     y_hat_y_sd = ndarray.std(abs_diff)
 
-    return mpc_mi.model.coef_.reveal(mpc), y_hat_y_mean, y_hat_y_sd
+    imputed_cols = []
+    for imputed_dataset in imputed_datasets:
+        raw_data = imputed_dataset.reveal(mpc)
+        imputed_cols.append(array([raw_data[miss_row, miss_col] for miss_row in miss_rows]))
+    
+    expected_imputation = array([complete_data[miss_row, miss_col] for miss_row in miss_rows])
+    imputation_abs_diff = ([(imputed_col - expected_imputation).abs() for imputed_col in imputed_cols]).sum() / len(imputed_cols)
+    imputation_diff_mean = imputation_abs_diff.mean()
+    imputation_diff_std = imputation_abs_diff.std()
+
+    return mpc_mi.model.coef_.reveal(mpc), y_hat_y_mean, y_hat_y_sd, imputation_diff_mean, imputation_diff_std
 
 
 def benchmark_scenario(mpc, msg: Static[str], runs_count: int, scenario, im_epochs: int,
@@ -282,17 +292,21 @@ def benchmark_scenario(mpc, msg: Static[str], runs_count: int, scenario, im_epoc
     coefs = zeros((runs_count, cols_count))
     y_hat_y_means = zeros((runs_count,))
     y_hat_y_sds = zeros((runs_count,))
+    imp_means = zeros((runs_count,))
+    imp_sds = zeros((runs_count,))
     
     for i in tqdm(mpc, range(runs_count), "Evaluating scenario"):
-        coef, y_hat_y_mean, y_hat_y_sd = evaluate_scenario(
+        coef, y_hat_y_mean, y_hat_y_sd, imp_mean, imp_sd = evaluate_scenario(
             mpc, msg, scenario, im_epochs, fm_epochs, noise_scale,
             mi_factor, miss_col, dump_data, verbose, modulus)
 
         coefs[i] = coef
         y_hat_y_means[i] = y_hat_y_mean
         y_hat_y_sds[i] = y_hat_y_sd
+        imp_means[i] = imp_mean
+        imp_sds[i] = imp_sd
     
-    return coefs, y_hat_y_means, y_hat_y_sds
+    return coefs, y_hat_y_means, y_hat_y_sds, imp_means, imp_sds
 
 
 def evaluate_real_setup(mpc, real_data, mi_factor: int, im_epochs: int, fm_epochs: int, noise_scale: float, dump_data: bool, verbose: bool, modulus):
@@ -341,12 +355,14 @@ def benchmark_real_setup(mpc, runs_count: int, real_data, mi_factor: int,
         y_hat_y_means[i] = y_hat_y_mean
         y_hat_y_sds[i] = y_hat_y_sd
     
-    return zeros((runs_count, 15)), y_hat_y_means, y_hat_y_sds
+    return zeros((runs_count, 15)), y_hat_y_means, y_hat_y_sds, zeros((runs_count,)) - 1, zeros((runs_count,)) - 1
 
 
-def print_stats(mpc, msg: Static[str], coefs, biases, sds):
+def print_stats(mpc, msg: Static[str], coefs, biases, sds, imp_biases, imp_sds):
     print(f"\tCP{mpc.pid}: {msg} | Sequre MI y_hat - y mean | mean: {biases.mean()}, min: {biases.min()}, max: {biases.max()}")
     print(f"\tCP{mpc.pid}: {msg} | Sequre MI y_hat - y SD | mean: {sds.mean()}, min: {sds.min()}, max: {sds.max()}")
+    print(f"\tCP{mpc.pid}: {msg} | Sequre MI imputation diff mean | mean: {imp_biases.mean()}, min: {imp_biases.min()}, max: {imp_biases.max()}")
+    print(f"\tCP{mpc.pid}: {msg} | Sequre MI imputation diff SD | mean: {imp_sds.mean()}, min: {imp_sds.min()}, max: {imp_sds.max()}")
     
     if msg.lower().startswith("scenario"):
         coefs_truth = ones_like(coefs[0])
@@ -366,14 +382,23 @@ def benchmark_mi(mpc, mi_factor: int, im_epochs: int, fm_epochs: int, noise_scal
                  run_real_setup: bool, modulus):
     if run_simice_scenarios:
         # Scenario siMICE 1
-        simice = load_scenario_mi_data("scenario_siMICE_1", simice_rows, simice_cols)
+        simice1 = load_scenario_mi_data("scenario_siMICE_1", simice_rows, simice_cols)
+        # Scenario siMICE 2
+        simice2 = load_scenario_mi_data("scenario_siMICE_2", simice_rows, simice_cols)
 
-        simice_stats = benchmark_scenario(
-            mpc, "scenario_siMICE_1", scenarios_runs_count, simice,
+        simice1_stats = benchmark_scenario(
+            mpc, "scenario_siMICE_1", scenarios_runs_count, simice1,
             im_epochs, fm_epochs, noise_scale, mi_factor,
             scenarios_miss_col, dump_data, verbose, modulus)
         
-        print_stats(mpc, "Scenario siMICE 1", *simice_stats)
+        print_stats(mpc, "Scenario siMICE 1", *simice1_stats)
+
+        simice2_stats = benchmark_scenario(
+            mpc, "scenario_siMICE_2", scenarios_runs_count, simice2,
+            im_epochs, fm_epochs, noise_scale, mi_factor,
+            scenarios_miss_col, dump_data, verbose, modulus)
+        
+        print_stats(mpc, "Scenario siMICE 2", *simice2_stats)
     
     if run_paper_scenarios:
         # Scenario 1
