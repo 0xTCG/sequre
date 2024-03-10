@@ -37,7 +37,7 @@ std::pair<Value *, BETNode *> minimizeCipherMult( Module *M, Value *instruction,
 
   auto *callInstr = cast<CallInstr>(instruction);
   if ( callInstr ) {
-    if ( isBinaryArithmeticOperation(getOperation(callInstr)) ) {
+    if ( isBinaryInstr(callInstr) ) {
       auto *betNode  = parseBinaryArithmetic(callInstr);
       bet->expandNode(betNode);
       auto reduced   = bet->reduceAll(betNode);
