@@ -1,4 +1,3 @@
-#include "enums.h"
 #include "codon/cir/util/irtools.h"
 #include "utils.h"
 
@@ -194,18 +193,14 @@ void visitAllNodes( Value *value, std::set<Value *> &visited ) {
   for ( auto *usedValue : value->getUsedValues() ) visitAllNodes(usedValue, visited);
 }
 
-bool isBinaryArithmeticOperation( Operation op ) { return op == add || op == mul || op == matmul || op == power; }
+std::string const getOperation( CallInstr *callInstr ) {
+  auto *callee = callInstr->getCallee();
+  assert(callee);
 
-Operation getOperation( CallInstr *callInstr ) {
-  auto *f        = util::getFunc(callInstr->getCallee());
-  auto instrName = f->getUnmangledName();
-  
-  if ( instrName == Module::ADD_MAGIC_NAME ) return add;
-  if ( instrName == Module::MUL_MAGIC_NAME ) return mul;
-  if ( instrName == Module::POW_MAGIC_NAME ) return power;
-  if ( instrName == Module::MATMUL_MAGIC_NAME ) return matmul;
-  
-  return noop;
+  auto *func = util::getFunc(callee);
+  assert(func);
+
+  return func->getUnmangledName();
 }
 
 CallInstr *revealCall( Var *var, VarValue *mpc ) {

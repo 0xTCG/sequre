@@ -1,6 +1,5 @@
 #pragma once
 
-#include "enums.h"
 #include "codon/cir/transform/pass.h"
 #include "codon/cir/cir.h"
 #include "codon/cir/util/irtools.h"
@@ -13,7 +12,7 @@ using namespace codon::ir;
 class BETNode {
   Value       *value;
   types::Type *irType;
-  Operation    operation;
+  std::string  operation;
   BETNode     *leftChild;
   BETNode     *rightChild;
   bool         expanded;
@@ -21,37 +20,37 @@ class BETNode {
 public:
   BETNode();
   BETNode( Value *value );
-  BETNode( Operation operation, BETNode *leftChild, BETNode *rightChild );
-  BETNode( Value *value, types::Type *irType, Operation operation, bool expanded );
+  BETNode( std::string const operation, BETNode *leftChild, BETNode *rightChild );
+  BETNode( Value *value, types::Type *irType, std::string const operation, bool expanded );
   ~BETNode() {
     if ( leftChild )  delete leftChild;
     if ( rightChild ) delete rightChild;
   }
   BETNode *copy() const;
 
-  Value           *getValue()       const { return value; };
-  Var             *getVariable()    const { return util::getVar(value); }
-  VarValue        *getVarValue()    const { return cast<VarValue>(value); };
-  BETNode         *getLeftChild()   const { return leftChild; }
-  BETNode         *getRightChild()  const { return rightChild; }
-  Operation        getOperation()   const { return operation; }
-  int64_t          getIntConst()    const { return util::getConst<int64_t>(value); };
-  double           getDoubleConst() const { return util::getConst<double>(value); };
-  codon::ir::id_t  getVariableId()  const { return getVariable()->getId(); };
+  Value             *getValue()       const { return value; };
+  Var               *getVariable()    const { return util::getVar(value); }
+  VarValue          *getVarValue()    const { return cast<VarValue>(value); };
+  BETNode           *getLeftChild()   const { return leftChild; }
+  BETNode           *getRightChild()  const { return rightChild; }
+  std::string const  getOperation()   const { return operation; }
+  int64_t            getIntConst()    const { return util::getConst<int64_t>(value); };
+  double             getDoubleConst() const { return util::getConst<double>(value); };
+  codon::ir::id_t    getVariableId()  const { return getVariable()->getId(); };
   
-  void setValue( Value *value )             { this->value = value; }
-  void setIRType( types::Type *irType )     { this->irType = irType; }
-  void setOperation( Operation operation )  { this->operation = operation; }
-  void setLeftChild( BETNode *leftChild )   { this->leftChild = leftChild; }
-  void setRightChild( BETNode *rightChild ) { this->rightChild = rightChild; }
-  void setExpanded()                        { expanded = true; }
+  void setValue( Value *value )                    { this->value = value; }
+  void setIRType( types::Type *irType )            { this->irType = irType; }
+  void setOperation( std::string const operation ) { this->operation = operation; }
+  void setLeftChild( BETNode *leftChild )          { this->leftChild = leftChild; }
+  void setRightChild( BETNode *rightChild )        { this->rightChild = rightChild; }
+  void setExpanded()                               { expanded = true; }
 
   bool isLeaf()        const { return !leftChild && !rightChild; }
-  bool isOperation()   const { return operation != noop; }
-  bool isAdd()         const { return operation == add; }
-  bool isMul()         const { return operation == mul; }
-  bool isMatmul()      const { return operation == matmul; }
-  bool isPow()         const { return operation == power; }
+  bool isOperation()   const { return operation != ""; }
+  bool isAdd()         const { return operation == Module::ADD_MAGIC_NAME; }
+  bool isMul()         const { return operation == Module::MUL_MAGIC_NAME; }
+  bool isMatmul()      const { return operation == Module::MATMUL_MAGIC_NAME; }
+  bool isPow()         const { return operation == Module::POW_MAGIC_NAME; }
   bool isCommutative() const { return isAdd() || isMul(); }
   bool isExpanded()    const { return expanded; }
   
@@ -73,7 +72,6 @@ public:
 
   void elementsCount( int &, int & ) const;
 
-  std::string            const getOperationIRName( bool ) const;
   std::string            const getName() const;
   std::string            const getConstStr() const;
   void print( int, int ) const;

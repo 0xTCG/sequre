@@ -1,7 +1,5 @@
 #pragma once
 
-#include "enums.h"
-
 namespace sequre {
 
 using namespace codon::ir;
@@ -50,8 +48,7 @@ Value *findCallByName ( Value *, const std::string &, std::set<Value *> );
 void   visitAllNodes( Value *, std::set<Value *> & );
 
 // BET helpers
-bool isBinaryArithmeticOperation( Operation );
-Operation getOperation( CallInstr * );
+std::string const getOperation( CallInstr * );
 
 // Secure calls
 CallInstr *revealCall( Var *, VarValue * );
