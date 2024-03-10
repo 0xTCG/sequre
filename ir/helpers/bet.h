@@ -71,6 +71,8 @@ public:
   void replace( BETNode * );
   types::Type *getOrRealizeIRType( bool force = false);
 
+  void elementsCount( int &, int & ) const;
+
   std::string            const getOperationIRName( bool ) const;
   std::string            const getName() const;
   std::string            const getConstStr() const;
@@ -78,14 +80,58 @@ public:
 };
 
 class BET {
-  std::unordered_map<codon::ir::id_t, BETNode *> betPerVar;
+  std::map<codon::ir::id_t, BETNode *> betPerVar;
 
 public:
+  static const codon::ir::id_t BET_NO_VAR_ID = -1;
+  static const codon::ir::id_t BET_RETURN_ID = -2;
+
   BET() {}
   ~BET() { for ( auto &it: betPerVar ) delete it.second; }
 
-  void addBET( Var* var, BETNode *betNode ) { betPerVar[var->getId()] = betNode; }
+  struct Iterator {
+    using iterator_category = std::forward_iterator_tag;
+    using difference_type   = std::ptrdiff_t;
+    using value_type        = BETNode;
+    using pointer           = BETNode*;
+    using reference         = BETNode&;
+
+    Iterator( std::vector<BETNode *> recstack ) : recstack(recstack) {}
+
+    reference operator*() const { return *recstack.back(); }
+    pointer operator->() { return recstack.back(); }
+
+    Iterator& operator++() {
+      if ( !recstack.empty() ) {
+        auto cur = recstack.back();
+        recstack.pop_back();
+        
+        auto leftChild  = cur->getLeftChild();
+        auto rightChild = cur->getRightChild();
+        
+        if ( rightChild ) recstack.push_back(rightChild);
+        if ( leftChild )  recstack.push_back(leftChild);
+      }
+      
+      return *this;
+    }
+    Iterator operator++( int ) { Iterator tmp = *this; ++(*this); return tmp; }
+
+    friend bool operator==( const Iterator& a, const Iterator& b ) { return a.recstack == b.recstack; }
+    friend bool operator!=( const Iterator& a, const Iterator& b ) { return a.recstack != b.recstack; }
+
+  private:
+    std::vector<BETNode *> recstack;
+  };
+  
+  Iterator begin();
+  Iterator end() { return Iterator( {} ); }
+
+  void addBET( codon::ir::id_t var_id, BETNode *betNode ) { betPerVar[var_id] = betNode; }
   void expandNode( BETNode * );
+  
+  BETNode *parseInstruction( Value * );
+  void parseSeries( SeriesFlow * );
 
   bool reduceLvl( BETNode *, bool );
   bool reduceAll( BETNode * );
@@ -96,13 +142,21 @@ public:
 
   void escapePows( BETNode * );
 
+  std::pair<int, int> elementsCount() const;
+
+  types::Type *getNodeEncodingType( Module * )     const;
+  types::Type *getEncodingType( Module * ) const;
+
+  Value *getNodeEncoding( Module *, BETNode *, std::vector<Value *> const & ) const;
+  Value *getEncoding( Module *, std::vector<Value *> const & );
+
 private:
   std::pair<BETNode *, BETNode *>  findFactorizationNodes( BETNode *, std::vector<BETNode *>&, std::unordered_map<BETNode *, std::vector<BETNode *>>& );
   std::pair<BETNode *, BETNode *>  findFactorsInMulTree( BETNode *, std::vector<BETNode *>&, std::unordered_map<BETNode *, std::vector<BETNode *>>&, BETNode *, BETNode *, BETNode * );
   BETNode                         *internalIsVisited( BETNode *, std::vector<BETNode *>&, std::unordered_map<BETNode *, std::vector<BETNode *>>&, BETNode * );
 };
 
-BETNode *parseArithmetic( CallInstr * );
+BETNode *parseBinaryArithmetic( CallInstr * );
 Value   *generateExpression( Module *, BETNode * );
 
 } // namespace sequre

@@ -42,7 +42,7 @@ bool transformSingleOrderedMatmul( Value *instruction, std::set<Value *> &visite
 
     auto *mpcType       = mpcValue->getType();
     auto *argsType      = getTupleType(matmulArgs, M);
-    auto *reorderMethod = getOrRealizeSequreHelper(M, "matmul_reordering", {mpcType, argsType}, {});
+    auto *reorderMethod = getOrRealizeSequreOptimizationHelper(M, "matmul_reordering", {mpcType, argsType}, {});
     assert(reorderMethod);
 
     auto *reorderCall = util::call(reorderMethod, {mpcValue, util::makeTuple(matmulArgs, M)});
