@@ -47,14 +47,9 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
   auto *mpc      = M->Nr<VarValue>(pf->arg_front());
   assert( isMPC(mpc) && "ERROR: The first argument of sequre function should be the MPC instance" );
   
-  std::vector<Value *> args;
-  std::vector<types::Type *> types;
-  
-  for ( auto it = v->begin(); it != v->end(); it++ ) {
-    auto *arg = *it;
-    args.push_back(arg);
-    types.push_back(arg->getType());
-  }
+  auto typedArgs = getTypedArgs(v);
+  auto args      = typedArgs.first;
+  auto types     = typedArgs.second;
 
   bool isVoid    = isSetItem;
   auto *nodeType = isVoid ? types.front() : v->getType();

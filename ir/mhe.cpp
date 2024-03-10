@@ -4,6 +4,7 @@
 #include "analysis/consecutive_matmul.h"
 #include "analysis/dead_code.h"
 #include "codon/cir/util/cloning.h"
+#include "codon/cir/util/operator.h"
 #include "codon/cir/util/irtools.h"
 #include "codon/cir/util/matching.h"
 #include <iterator>
@@ -12,6 +13,8 @@
 namespace sequre {
 
 using namespace codon::ir;
+
+/* Reordering optimizations */
 
 std::pair<Value *, BETNode *> minimizeCipherMult( Module *M, Value *instruction, BET *bet ) {
   auto *retIns = cast<ReturnInstr>(instruction);
@@ -27,15 +30,15 @@ std::pair<Value *, BETNode *> minimizeCipherMult( Module *M, Value *instruction,
     auto *rhs = assIns->getRhs();
     auto transformedInstruction = minimizeCipherMult(M, rhs, bet);
     if ( transformedInstruction.second )
-      bet->addBET(lhs, transformedInstruction.second);
+      bet->addBET(lhs->getId(), transformedInstruction.second);
     assIns->setRhs(transformedInstruction.first);
     return std::make_pair(nullptr, nullptr);
   }
 
   auto *callInstr = cast<CallInstr>(instruction);
   if ( callInstr ) {
-    if ( isArithmeticOperation(getOperation(callInstr)) ) {
-      auto *betNode  = parseArithmetic(callInstr);
+    if ( isBinaryArithmeticOperation(getOperation(callInstr)) ) {
+      auto *betNode  = parseBinaryArithmetic(callInstr);
       bet->expandNode(betNode);
       auto reduced   = bet->reduceAll(betNode);
       auto reordered = bet->reorderPriorities(betNode);
@@ -68,11 +71,48 @@ void applyCipherPlainOptimizations( CallInstr *v ) {
   assert( v->numArgs() > 0 && "Compile error: The first argument of the mhe_cipher_opt annotated function should be the MPC instance (annotated function has no args)" );
 
   auto *mpcValue = M->Nr<VarValue>(f->arg_front());
-  assert(  isMPC(mpcValue) && "Compile error: The first argument of the mhe_cipher_opt annotated function should be the MPC instance" );
+  assert( isMPC(mpcValue) && "Compile error: The first argument of the mhe_cipher_opt annotated function should be the MPC instance" );
   
   transformExpressions(M, cast<SeriesFlow>(cast<BodiedFunc>(f)->getBody()), mpcValue);
 }
 
-void MHEOptimizations::handle( CallInstr *v ) { applyCipherPlainOptimizations(v); }
+/* Encoding optimization */
+
+void applyEncodingOptimization( CallInstr *v ) {
+  auto *M = v->getModule();
+  auto *f = util::getFunc(v->getCallee());
+  if ( !hasEncOptAttr(f) ) return;
+  assert( v->numArgs() > 0 && "Compile error: The first argument of the mhe_enc_opt annotated function should be the MPC instance (annotated function has no args)" );
+
+  auto *mpcValue = M->Nr<VarValue>(f->arg_front());
+  assert( isMPC(mpcValue) && "Compile error: The first argument of the mhe_enc_opt annotated function should be the MPC instance" );
+  
+  auto typedArgs = getTypedArgs(v, 1);
+  auto args      = typedArgs.first;
+  // auto argsTypes = typedArgs.second;
+  
+  auto *bet = new BET();
+  auto *series = cast<SeriesFlow>(cast<BodiedFunc>(f)->getBody());
+  bet->parseSeries(series);
+
+  auto *betEncodingType = bet->getEncodingType(M);
+  // auto *argsTupleType   = M->getTupleType(argsTypes);
+  // auto *betInitHelper   = getOrRealizeSequreOptimizationHelper(M, "bet_init", {betEncodingType, argsTupleType}, {});
+  auto *betInitHelper   = getOrRealizeSequreOptimizationHelper(M, "bet_init", {betEncodingType}, {});
+  assert(betInitHelper);
+
+  // auto *betInitCall = util::call(betInitHelper, {bet->getEncoding(M, args), util::makeTuple(args, M)});
+  auto *betInitCall = util::call(betInitHelper, {bet->getEncoding(M, args)});
+  assert(betInitCall);
+
+  series->insert(series->begin(), betInitCall);
+}
+
+/* Handle */
+
+void MHEOptimizations::handle( CallInstr *v ) {
+  applyCipherPlainOptimizations(v);
+  applyEncodingOptimization(v);
+}
 
 } // namespace sequre
