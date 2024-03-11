@@ -109,7 +109,7 @@ void applyEncodingOptimization( CallInstr *v ) {
 
   auto *betEncodingType = bet->getEncodingType(M);
   auto *argsTupleType   = M->getTupleType(argsTypes);
-  auto *betInitHelper   = getOrRealizeSequreOptimizationHelper(M, "bet_init", {betEncodingType, argsTupleType}, {});
+  auto *betInitHelper   = getOrRealizeSequreOptimizationHelper(M, "bet_enc_init", {betEncodingType, argsTupleType}, {});
   assert(betInitHelper);
 
   auto *betInitCall = util::call(betInitHelper, {bet->getEncoding(M, fargs), util::makeTuple(argvs)});
@@ -118,7 +118,7 @@ void applyEncodingOptimization( CallInstr *v ) {
   auto *treeVarValue = util::makeVar(betInitCall, series, bf, true);
   assert(treeVarValue);
 
-  auto *betOptHelper = getOrRealizeSequreOptimizationHelper(M, "bet_opt", {treeVarValue->getType()}, {});
+  auto *betOptHelper = getOrRealizeSequreOptimizationHelper(M, "bet_enc_opt", {treeVarValue->getType()}, {});
   assert(betInitHelper);
 
   auto *betOptCall = util::call(betOptHelper, {treeVarValue});
