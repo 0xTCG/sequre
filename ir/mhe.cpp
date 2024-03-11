@@ -87,25 +87,45 @@ void applyEncodingOptimization( CallInstr *v ) {
   auto *mpcValue = M->Nr<VarValue>(f->arg_front());
   assert( isMPC(mpcValue) && "Compile error: The first argument of the mhe_enc_opt annotated function should be the MPC instance" );
   
-  auto typedArgs = getTypedArgs(v, 1);
+  auto typedArgs = getTypedArgs(v, 1);  // Skipping MPC arg. Sequre funcs must have MPC instance as a first argument.
   auto args      = typedArgs.first;
-  // auto argsTypes = typedArgs.second;
-  
+  auto argsTypes = typedArgs.second;
+
   auto *bet = new BET();
-  auto *series = cast<SeriesFlow>(cast<BodiedFunc>(f)->getBody());
+  auto *bf  = cast<BodiedFunc>(f);
+  auto *series = cast<SeriesFlow>(bf->getBody());
   bet->parseSeries(series);
 
+  // TODO: Check if there is a better way to access func args within funcs scope in code below.
+  auto *bfm = bf->getModule();
+  std::vector<Var *> fargs;
+  std::vector<Value *> argvs;
+  auto it = f->arg_begin(); ++it;  // Skipping MPC arg. Sequre funcs must have MPC instance as a first argument.
+  for (; it != f->arg_end(); ++it) {
+    auto *var = *it;
+    fargs.push_back(var);
+    argvs.push_back(bfm->Nr<VarValue>(var)->getActual());
+  }
+
   auto *betEncodingType = bet->getEncodingType(M);
-  // auto *argsTupleType   = M->getTupleType(argsTypes);
-  // auto *betInitHelper   = getOrRealizeSequreOptimizationHelper(M, "bet_init", {betEncodingType, argsTupleType}, {});
-  auto *betInitHelper   = getOrRealizeSequreOptimizationHelper(M, "bet_init", {betEncodingType}, {});
+  auto *argsTupleType   = M->getTupleType(argsTypes);
+  auto *betInitHelper   = getOrRealizeSequreOptimizationHelper(M, "bet_init", {betEncodingType, argsTupleType}, {});
   assert(betInitHelper);
 
-  // auto *betInitCall = util::call(betInitHelper, {bet->getEncoding(M, args), util::makeTuple(args, M)});
-  auto *betInitCall = util::call(betInitHelper, {bet->getEncoding(M, args)});
+  auto *betInitCall = util::call(betInitHelper, {bet->getEncoding(M, fargs), util::makeTuple(argvs)});
   assert(betInitCall);
 
-  series->insert(series->begin(), betInitCall);
+  auto *treeVarValue = util::makeVar(betInitCall, series, bf, true);
+  assert(treeVarValue);
+
+  auto *betOptHelper = getOrRealizeSequreOptimizationHelper(M, "bet_opt", {treeVarValue->getType()}, {});
+  assert(betInitHelper);
+
+  auto *betOptCall = util::call(betOptHelper, {treeVarValue});
+  assert(betOptCall);
+
+  auto loc = series->begin(); ++loc;
+  series->insert(loc, betOptCall);
 }
 
 /* Handle */
