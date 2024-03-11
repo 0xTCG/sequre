@@ -145,8 +145,8 @@ public:
   types::Type *getNodeEncodingType( Module * )     const;
   types::Type *getEncodingType( Module * ) const;
 
-  Value *getNodeEncoding( Module *, BETNode *, std::vector<Value *> const & ) const;
-  Value *getEncoding( Module *, std::vector<Value *> const & );
+  Value *getNodeEncoding( Module *, BETNode *, std::vector<Var *> const & ) const;
+  Value *getEncoding( Module *, std::vector<Var *> const & );
 
 private:
   std::pair<BETNode *, BETNode *>  findFactorizationNodes( BETNode *, std::vector<BETNode *>&, std::unordered_map<BETNode *, std::vector<BETNode *>>& );

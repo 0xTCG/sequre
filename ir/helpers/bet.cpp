@@ -487,7 +487,7 @@ types::Type *BET::getEncodingType( Module *M ) const {
   return M->getTupleType(nodeTypes);
 }
 
-Value *BET::getNodeEncoding( Module * M, BETNode *node, std::vector<Value *> const &args ) const {
+Value *BET::getNodeEncoding( Module * M, BETNode *node, std::vector<Var *> const &fargs ) const {
   auto lChild = node->getLeftChild();
   auto rChild = node->getRightChild();
 
@@ -498,15 +498,12 @@ Value *BET::getNodeEncoding( Module * M, BETNode *node, std::vector<Value *> con
   auto varId          = node->checkIsVariable() ? node->getVariableId() : -1;
   auto operatorIrName = node->getOperation();
 
-  if ( node->checkIsVariable() ) {
-    for ( int i = 0; i != args.size(); i++ ) {
-      auto argId = util::getVar(args[i])->getId();
-      if ( argId == varId ) {
-        paramIdx = argId;
+  if ( node->checkIsVariable() )
+    for ( int i = 0; i != fargs.size(); i++ )
+      if ( fargs[i]->getId() == varId ) {
+        paramIdx = i;
         break;
       }
-    }
-  }
   
   auto *idValue             = M->getInt(id);
   auto *lChildIdValue       = M->getInt(lChildId);
@@ -519,11 +516,11 @@ Value *BET::getNodeEncoding( Module * M, BETNode *node, std::vector<Value *> con
     idValue, lChildIdValue, rChildIdValue, paramIdxValue, varIdValue, operatorIrNameValue}, M);
 }
 
-Value *BET::getEncoding( Module * M, std::vector<Value *> const &args ) {
+Value *BET::getEncoding( Module * M, std::vector<Var *> const &fargs ) {
   std::vector<Value *> nodesEncodings;
   
   for ( auto& it : *this )
-    nodesEncodings.push_back(getNodeEncoding(M, &it, args));
+    nodesEncodings.push_back(getNodeEncoding(M, &it, fargs));
 
   return util::makeTuple(nodesEncodings, M);
 }
