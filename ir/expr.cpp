@@ -99,6 +99,37 @@ void ExpressivenessTransformations::enableSecurity( CallInstr *v ) {
   args.insert(args.begin(), mpc);
   types.insert(types.begin(), mpc->getType());
 
+  if ( hasEncOptAttr(pf) && isMatMul ) {
+    auto *bpf    = cast<BodiedFunc>(pf);
+    auto *series = cast<SeriesFlow>(bpf->getBody());
+    auto *assign = cast<AssignInstr>(*series->begin());
+    assert ( assign && "Internal error: Method has mhe_enc_opt decorator but static binary expression tree instantiation was not done or failed." );
+    
+    auto *treeVar = assign->getLhs();
+    auto *tree    = M->Nr<VarValue>(treeVar);
+    
+    assert( args.size() == 3 && "Internal error: Matrix multiplication has more than two arguments" );
+
+    auto *firstArg    = args[1];
+    auto *secondArg   = args[2];
+    auto  firstArgId  = M->getInt(firstArg->getId());
+    auto  secondArgId = M->getInt(secondArg->getId());
+
+    auto *betMatmulHelper = getOrRealizeSequreOptimizationHelper(
+      M, "bet_enc_matmul",
+      {mpc->getType(), firstArg->getType(), secondArg->getType(),
+       tree->getType(), firstArgId->getType(), secondArgId->getType()}, {});
+    assert(betMatmulHelper);
+
+    auto *betMatmulCall = util::call(
+      betMatmulHelper,
+      {mpc, firstArg, secondArg, tree, firstArgId, secondArgId});
+    assert(betMatmulCall);
+
+    v->replaceAll(betMatmulCall);
+    return;
+  }
+
   auto *method = getOrRealizeSequreInternalMethod(M, methodName, types, {});
   if ( !method ) {
     std::cout << "Called at " << v->getSrcInfo() << std::endl;
