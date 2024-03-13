@@ -464,29 +464,6 @@ std::pair<int, int> BET::elementsCount() const {
   return std::make_pair(nodesCount, edgesCount);
 }
 
-types::Type *BET::getNodeEncodingType( Module *M ) const {
-  auto *idType             = M->getIntType();
-  auto *lChildIdType       = M->getIntType();
-  auto *rChildIdType       = M->getIntType();
-  auto *paramIdxType       = M->getIntType();
-  auto *varIdType          = M->getIntType();
-  auto *operatorIrNameType = M->getStringType();
-  
-  return M->getTupleType({
-    idType, lChildIdType, rChildIdType, paramIdxType, varIdType, operatorIrNameType});
-}
-
-types::Type *BET::getEncodingType( Module *M ) const {
-  auto elemCount = elementsCount();
-  
-  auto *nodeType = getNodeEncodingType(M);
-  std::vector<types::Type *> nodeTypes;
-  for ( int i = 0; i != elemCount.first; i++ )
-    nodeTypes.push_back(nodeType);
-  
-  return M->getTupleType(nodeTypes);
-}
-
 Value *BET::getNodeEncoding( Module * M, BETNode *node, std::vector<Var *> const &fargs ) const {
   auto lChild = node->getLeftChild();
   auto rChild = node->getRightChild();
@@ -497,6 +474,7 @@ Value *BET::getNodeEncoding( Module * M, BETNode *node, std::vector<Var *> const
   auto paramIdx       = -1;
   auto varId          = node->checkIsVariable() ? node->getVariableId() : -1;
   auto operatorIrName = node->getOperation();
+  auto irTypeName     = node->getOrRealizeIRType()->getName();
 
   if ( node->checkIsVariable() )
     for ( int i = 0; i != fargs.size(); i++ )
@@ -511,9 +489,13 @@ Value *BET::getNodeEncoding( Module * M, BETNode *node, std::vector<Var *> const
   auto *paramIdxValue       = M->getInt(paramIdx);
   auto *varIdValue          = M->getInt(varId);
   auto *operatorIrNameValue = M->getString(operatorIrName);
+  auto *irTypeNameValue     = M->getString(irTypeName);
   
   return util::makeTuple({
-    idValue, lChildIdValue, rChildIdValue, paramIdxValue, varIdValue, operatorIrNameValue}, M);
+    idValue, lChildIdValue,
+    rChildIdValue, paramIdxValue,
+    varIdValue, operatorIrNameValue,
+    irTypeNameValue}, M);
 }
 
 Value *BET::getEncoding( Module * M, std::vector<Var *> const &fargs ) {

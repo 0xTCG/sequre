@@ -142,9 +142,6 @@ public:
 
   std::pair<int, int> elementsCount() const;
 
-  types::Type *getNodeEncodingType( Module * )     const;
-  types::Type *getEncodingType( Module * ) const;
-
   Value *getNodeEncoding( Module *, BETNode *, std::vector<Var *> const & ) const;
   Value *getEncoding( Module *, std::vector<Var *> const & );
 
