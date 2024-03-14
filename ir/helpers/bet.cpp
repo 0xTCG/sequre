@@ -6,17 +6,17 @@ namespace sequre {
 using namespace codon::ir;
 
 BETNode::BETNode()
-  : value(nullptr), irType(nullptr), operation(noop), leftChild(nullptr), rightChild(nullptr), expanded(false) {}
+  : value(nullptr), irType(nullptr), operation(""), leftChild(nullptr), rightChild(nullptr), expanded(false) {}
 
 BETNode::BETNode( Value *value )
-  : value(value), irType(nullptr), operation(noop), leftChild(nullptr), rightChild(nullptr), expanded(false) {
+  : value(value), irType(nullptr), operation(""), leftChild(nullptr), rightChild(nullptr), expanded(false) {
   getOrRealizeIRType();
 }
 
-BETNode::BETNode( Operation operation, BETNode *leftChild, BETNode *rightChild )
+BETNode::BETNode( std::string const operation, BETNode *leftChild, BETNode *rightChild )
   : value(nullptr), irType(nullptr), operation(operation), leftChild(leftChild), rightChild(rightChild), expanded(false) {}
 
-BETNode::BETNode( Value *value, types::Type *irType, Operation operation, bool expanded )
+BETNode::BETNode( Value *value, types::Type *irType, std::string const operation, bool expanded )
   : value(value), irType(irType), operation(operation), leftChild(nullptr), rightChild(nullptr), expanded(expanded) {}
 
 BETNode *BETNode::copy() const {
@@ -113,17 +113,26 @@ types::Type *BETNode::getOrRealizeIRType( bool force ) {
   return irType;
 }
 
-std::string const BETNode::getOperationIRName( bool restrict = true ) const {
-  if ( isAdd() ) return Module::ADD_MAGIC_NAME;
-  if ( isMul() ) return Module::MUL_MAGIC_NAME;
-  if ( isMatmul() ) return Module::MATMUL_MAGIC_NAME;
-  if ( isPow() ) return Module::POW_MAGIC_NAME;
-  if ( restrict ) assert(false && "BET node operator not supported in MHE IR optimizations.");
-  else return "None";
+void BETNode::elementsCount( int &initNodeCnt, int &initEdgeCnt ) const {
+  initNodeCnt++;
+  if ( isLeaf() ) return;
+
+  auto *lChild = getLeftChild();
+  auto *rChild = getRightChild();
+
+  if ( lChild ) {
+    initEdgeCnt++;
+    lChild->elementsCount(initNodeCnt, initEdgeCnt);
+  }
+
+  if ( rChild ) {
+    initEdgeCnt++;
+    rChild->elementsCount(initNodeCnt, initEdgeCnt);
+  }
 }
 
 std::string const BETNode::getName() const {
-  if ( isOperation() ) return getOperationIRName();
+  if ( isOperation() ) return operation;
   if ( checkIsVariable() ) return getVariable()->getName();
   if ( checkIsConst() )  return getConstStr();
   return "Non-parsable";
@@ -141,7 +150,7 @@ void BETNode::print( int level = 0, int maxLevel = 100 ) const {
   for (int i = 0; i < level; ++i)
     std::cout << "    ";
 
-  std::cout << getOperationIRName(false) << " " << ( checkIsVariable() ? getVariable()->getName() : "Non-variable" )
+  std::cout << operation << " " << ( checkIsVariable() ? getVariable()->getName() : "Non-variable" )
             << ( checkIsConst() ? " Constant " : " Non-constant " )
             << value << std::endl;
 
@@ -149,19 +158,100 @@ void BETNode::print( int level = 0, int maxLevel = 100 ) const {
   if ( rightChild ) rightChild->print(level + 1, maxLevel);
 }
 
-void BET::expandNode( BETNode *betNode ) {
-  if ( betNode->isExpanded() ) return;
+BET::Iterator BET::begin()  {
+  std::vector<BETNode *> recstack;
+
+  for ( auto it = betPerVar.rbegin(); it != betPerVar.rend(); ++it )
+    recstack.push_back(it->second);
+
+  return Iterator(recstack);
+}
+
+void BET::expandNode(BETNode *betNode) {
+  if ( betNode->isExpanded() )
+    return;
 
   if ( betNode->isLeaf() ) {
-    assert(betNode->checkIsVariable() && "Node needs to be a variable for expansion");
+    assert( betNode->checkIsVariable() && "Node needs to be a variable for expansion" );
     auto search = betPerVar.find(betNode->getVariableId());
-    if ( search != betPerVar.end() ) betNode->replace(search->second);
+    
+    if ( search != betPerVar.end() )
+      betNode->replace(search->second);
   } else {
     expandNode(betNode->getLeftChild());
     expandNode(betNode->getRightChild());
   }
 
   betNode->setExpanded();
+}
+
+BETNode *BET::parseInstruction( Value *instr ) {
+  auto *retIns = cast<ReturnInstr>(instr);
+  if ( retIns )
+    return parseInstruction(retIns->getValue());
+  
+  auto *assIns = cast<AssignInstr>(instr);
+  if ( assIns )
+    return parseInstruction(assIns->getRhs());
+
+  auto *callInstr = cast<CallInstr>(instr);
+  auto *betNode   = new BETNode();
+  if (!callInstr)
+    return betNode;
+
+  betNode->setValue(callInstr);
+  betNode->setIRType(callInstr->getType());
+  betNode->setOperation(getOperation(callInstr));
+  
+  if ( isBinaryInstr(callInstr) ) {
+    auto *lhs = callInstr->front();
+    auto *rhs = callInstr->back();
+    
+    auto *lhsInstr = cast<CallInstr>(lhs);
+    auto *rhsInstr = cast<CallInstr>(rhs);
+
+    if ( lhsInstr )
+      betNode->setLeftChild(parseInstruction(lhsInstr));
+    else
+      betNode->setLeftChild(new BETNode(lhs));
+
+    if ( rhsInstr )
+      betNode->setRightChild(parseInstruction(rhsInstr));
+    else
+      betNode->setRightChild(new BETNode(rhs));
+
+    return betNode;
+  } else if ( isUnaryInstr(callInstr) ) {
+    auto *arg      = callInstr->front();
+    auto *argInstr = cast<CallInstr>(arg);
+
+    if ( argInstr )
+      betNode->setLeftChild(parseInstruction(argInstr));
+    else
+      betNode->setLeftChild(new BETNode(arg));
+      
+    return betNode;
+  } else
+    return betNode;
+}
+
+void BET::parseSeries( SeriesFlow *series ) {
+  for ( auto it : *series ) {
+    auto *node = parseInstruction(it);
+    
+    if ( cast<ReturnInstr>(it) ) {
+      addBET(BET_RETURN_ID, node);
+      continue;
+    }
+    
+    auto *assIns = cast<AssignInstr>(it);
+    if ( assIns ) {
+      addBET(assIns->getLhs()->getId(), node);
+      continue;
+    }
+
+    addBET(BET_NO_VAR_ID, node);
+  }
 }
 
 bool BET::reduceLvl( BETNode *node, bool cohort = false ) {
@@ -192,9 +282,9 @@ bool BET::reduceLvl( BETNode *node, bool cohort = false ) {
   firstFactorParent->replace(firstFactorSibling);
 
   // Replace firstFactorAncestor with the new subtree
-  firstFactorAncestor->setRightChild(new BETNode(add, firstFactorAncestor->copy(), secondFactorAncestor));
+  firstFactorAncestor->setRightChild(new BETNode(Module::ADD_MAGIC_NAME, firstFactorAncestor->copy(), secondFactorAncestor));
   firstFactorAncestor->setLeftChild(factor);
-  firstFactorAncestor->setOperation(mul);
+  firstFactorAncestor->setOperation(Module::MUL_MAGIC_NAME);
   firstFactorAncestor->setValue(nullptr);
   
   // Delete the vanishingAdd node
@@ -279,8 +369,8 @@ void BET::escapePows( BETNode *node ) {
     return;
   }
 
-  auto *newMulNode = new BETNode(mul, lc, lc);
-  for (int i = 0; i < rc->getIntConst() - 2; ++i) newMulNode = new BETNode(mul, lc, newMulNode->copy());
+  auto *newMulNode = new BETNode(Module::MUL_MAGIC_NAME, lc, lc);
+  for (int i = 0; i < rc->getIntConst() - 2; ++i) newMulNode = new BETNode(Module::MUL_MAGIC_NAME, lc, newMulNode->copy());
 
   node->replace(newMulNode);
 }
@@ -365,15 +455,68 @@ std::pair<BETNode *, BETNode *> BET::findFactorsInMulTree(
   return factors;
 }
 
-BETNode *parseArithmetic( CallInstr *callInstr ) {
-  Operation operation = getOperation(callInstr);
+std::pair<int, int> BET::elementsCount() const {
+  int nodesCount = 0;
+  int edgesCount = 0;
+  
+  for (auto& it: betPerVar)
+    it.second->elementsCount(nodesCount, edgesCount);
+
+  return std::make_pair(nodesCount, edgesCount);
+}
+
+Value *BET::getNodeEncoding( Module * M, BETNode *node, std::vector<Var *> const &fargs ) const {
+  auto lChild = node->getLeftChild();
+  auto rChild = node->getRightChild();
+
+  auto id             = node->getValue()->getId();
+  auto lChildId       = lChild ? lChild->getValue()->getId() : -1;
+  auto rChildId       = rChild ? rChild->getValue()->getId() : -1;
+  auto paramIdx       = -1;
+  auto varId          = node->checkIsVariable() ? node->getVariableId() : -1;
+  auto operatorIrName = node->getOperation();
+  auto irTypeName     = node->getOrRealizeIRType()->getName();
+
+  if ( node->checkIsVariable() )
+    for ( int i = 0; i != fargs.size(); i++ )
+      if ( fargs[i]->getId() == varId ) {
+        paramIdx = i;
+        break;
+      }
+  
+  auto *idValue             = M->getInt(id);
+  auto *lChildIdValue       = M->getInt(lChildId);
+  auto *rChildIdValue       = M->getInt(rChildId);
+  auto *paramIdxValue       = M->getInt(paramIdx);
+  auto *varIdValue          = M->getInt(varId);
+  auto *operatorIrNameValue = M->getString(operatorIrName);
+  auto *irTypeNameValue     = M->getString(irTypeName);
+  
+  return util::makeTuple({
+    idValue, lChildIdValue,
+    rChildIdValue, paramIdxValue,
+    varIdValue, operatorIrNameValue,
+    irTypeNameValue}, M);
+}
+
+Value *BET::getEncoding( Module * M, std::vector<Var *> const &fargs ) {
+  std::vector<Value *> nodesEncodings;
+  
+  for ( auto& it : *this )
+    nodesEncodings.push_back(getNodeEncoding(M, &it, fargs));
+
+  return util::makeTuple(nodesEncodings, M);
+}
+
+BETNode *parseBinaryArithmetic( CallInstr *callInstr ) {
+  std::string const operation = getOperation(callInstr);
   auto *betNode       = new BETNode();
   
   betNode->setValue(callInstr);
   betNode->setIRType(callInstr->getType());
   betNode->setOperation(operation);
   
-  if ( !isArithmeticOperation(operation) ) {
+  if ( !isBinaryInstr(callInstr) ) {
     betNode->setExpanded();
     return betNode;
   }
@@ -384,10 +527,10 @@ BETNode *parseArithmetic( CallInstr *callInstr ) {
   auto *lhsInstr = cast<CallInstr>(lhs);
   auto *rhsInstr = cast<CallInstr>(rhs);
 
-  if ( lhsInstr ) betNode->setLeftChild(parseArithmetic(lhsInstr));
+  if ( lhsInstr ) betNode->setLeftChild(parseBinaryArithmetic(lhsInstr));
   else betNode->setLeftChild(new BETNode(lhs));
 
-  if ( rhsInstr ) betNode->setRightChild(parseArithmetic(rhsInstr));
+  if ( rhsInstr ) betNode->setRightChild(parseBinaryArithmetic(rhsInstr));
   else betNode->setRightChild(new BETNode(rhs));
 
   return betNode;
@@ -406,11 +549,11 @@ Value *generateExpression( Module *M, BETNode *node ) {
   auto *ropType = rc->getOrRealizeIRType();
 
   auto *opFunc = M->getOrRealizeMethod(
-    lopType, node->getOperationIRName(), {lopType, ropType});
+    lopType, node->getOperation(), {lopType, ropType});
 
   if ( !opFunc ) {
     std::cout << "ERROR: "
-              << node->getOperationIRName()
+              << node->getOperation()
               << " not found in type "
               << lopType->getName()
               << " with arguments ("

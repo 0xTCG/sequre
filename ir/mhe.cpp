@@ -4,6 +4,7 @@
 #include "analysis/consecutive_matmul.h"
 #include "analysis/dead_code.h"
 #include "codon/cir/util/cloning.h"
+#include "codon/cir/util/operator.h"
 #include "codon/cir/util/irtools.h"
 #include "codon/cir/util/matching.h"
 #include <iterator>
@@ -12,6 +13,8 @@
 namespace sequre {
 
 using namespace codon::ir;
+
+/* Reordering optimizations */
 
 std::pair<Value *, BETNode *> minimizeCipherMult( Module *M, Value *instruction, BET *bet ) {
   auto *retIns = cast<ReturnInstr>(instruction);
@@ -27,15 +30,15 @@ std::pair<Value *, BETNode *> minimizeCipherMult( Module *M, Value *instruction,
     auto *rhs = assIns->getRhs();
     auto transformedInstruction = minimizeCipherMult(M, rhs, bet);
     if ( transformedInstruction.second )
-      bet->addBET(lhs, transformedInstruction.second);
+      bet->addBET(lhs->getId(), transformedInstruction.second);
     assIns->setRhs(transformedInstruction.first);
     return std::make_pair(nullptr, nullptr);
   }
 
   auto *callInstr = cast<CallInstr>(instruction);
   if ( callInstr ) {
-    if ( isArithmeticOperation(getOperation(callInstr)) ) {
-      auto *betNode  = parseArithmetic(callInstr);
+    if ( isBinaryInstr(callInstr) ) {
+      auto *betNode  = parseBinaryArithmetic(callInstr);
       bet->expandNode(betNode);
       auto reduced   = bet->reduceAll(betNode);
       auto reordered = bet->reorderPriorities(betNode);
@@ -68,11 +71,68 @@ void applyCipherPlainOptimizations( CallInstr *v ) {
   assert( v->numArgs() > 0 && "Compile error: The first argument of the mhe_cipher_opt annotated function should be the MPC instance (annotated function has no args)" );
 
   auto *mpcValue = M->Nr<VarValue>(f->arg_front());
-  assert(  isMPC(mpcValue) && "Compile error: The first argument of the mhe_cipher_opt annotated function should be the MPC instance" );
+  assert( isMPC(mpcValue) && "Compile error: The first argument of the mhe_cipher_opt annotated function should be the MPC instance" );
   
   transformExpressions(M, cast<SeriesFlow>(cast<BodiedFunc>(f)->getBody()), mpcValue);
 }
 
-void MHEOptimizations::handle( CallInstr *v ) { applyCipherPlainOptimizations(v); }
+/* Encoding optimization */
+
+void applyEncodingOptimization( CallInstr *v ) {
+  auto *M = v->getModule();
+  auto *f = util::getFunc(v->getCallee());
+  if ( !hasEncOptAttr(f) ) return;
+  assert( v->numArgs() > 0 && "Compile error: The first argument of the mhe_enc_opt annotated function should be the MPC instance (annotated function has no args)" );
+
+  auto *mpcValue = M->Nr<VarValue>(f->arg_front());
+  assert( isMPC(mpcValue) && "Compile error: The first argument of the mhe_enc_opt annotated function should be the MPC instance" );
+  
+  auto typedArgs = getTypedArgs(v, 1);  // Skipping MPC arg. Sequre funcs must have MPC instance as a first argument.
+  auto args      = typedArgs.first;
+  auto argsTypes = typedArgs.second;
+
+  auto *bet = new BET();
+  auto *bf  = cast<BodiedFunc>(f);
+  auto *series = cast<SeriesFlow>(bf->getBody());
+  bet->parseSeries(series);
+
+  // TODO: Check if there is a better way to access func args within funcs scope in code below.
+  auto *bfm = bf->getModule();
+  std::vector<Var *> fargs;
+  std::vector<Value *> argvs;
+  auto it = f->arg_begin(); ++it;  // Skipping MPC arg. Sequre funcs must have MPC instance as a first argument.
+  for (; it != f->arg_end(); ++it) {
+    auto *var = *it;
+    fargs.push_back(var);
+    argvs.push_back(bfm->Nr<VarValue>(var)->getActual());
+  }
+
+  auto *betEncoding   = bet->getEncoding(M, fargs);
+  auto *argsTuple     = util::makeTuple(argvs);
+  auto *betInitHelper = getOrRealizeSequreOptimizationHelper(M, "bet_enc_init", {betEncoding->getType(), argsTuple->getType()}, {});
+  assert(betInitHelper);
+
+  auto *betInitCall = util::call(betInitHelper, {betEncoding, argsTuple});
+  assert(betInitCall);
+
+  auto *treeVarValue = util::makeVar(betInitCall, series, bf, true);
+  assert(treeVarValue);
+
+  auto *betOptHelper = getOrRealizeSequreOptimizationHelper(M, "bet_enc_opt", {treeVarValue->getType()}, {});
+  assert(betInitHelper);
+
+  auto *betOptCall = util::call(betOptHelper, {treeVarValue});
+  assert(betOptCall);
+
+  auto loc = series->begin(); ++loc;
+  series->insert(loc, betOptCall);
+}
+
+/* Handle */
+
+void MHEOptimizations::handle( CallInstr *v ) {
+  applyCipherPlainOptimizations(v);
+  applyEncodingOptimization(v);
+}
 
 } // namespace sequre

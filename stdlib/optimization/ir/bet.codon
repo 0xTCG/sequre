@@ -1,0 +1,181 @@
+from sequre.constants import (
+    IR_OPT_ENCODING_OPT_NAME_BRUTE_FORCE,
+    IR_OPT_ENCODING_BRUTE_FORCE_MAX_MATMUL_COUNT,
+    IR_OPT_ENCODING_ROW_WISE_ENUM,
+    IR_OPT_ENCODING_COL_WISE_ENUM,
+    IR_OPT_ENCODING_DIAG_WISE_ENUM)
+
+from common import (
+    Metadata, _update_encoding_relevant_nodes,
+    _resolve_node_metadata, _resolve_tree_metadata)
+from cost_estimator import CostEstimator
+from sequre.types.ciphertensor import Ciphertensor
+
+
+@tuple
+class BETNodeEncoding:
+    node_id: int
+    left_child_id: int
+    right_child_id: int
+    arg_idx: int
+    var_id: int
+    operation: str
+    type_name: str
+
+
+class BETNode:
+    metadata: Metadata
+    id: int
+    var_id: int
+    left_child: Optional[BETNode]
+    right_child: Optional[BETNode]
+    operation: str
+    type_name: str
+
+    def __init__(self, id, var_id, operation, type_name, metadata):
+        self.metadata = metadata
+
+        self.id = id
+        self.var_id = var_id
+        self.left_child = None
+        self.right_child = None
+        self.operation = operation
+        self.type_name = type_name
+    
+    def estimate_cost(self) -> float:
+        if self.left_child is not None and self.right_child is not None:
+            return CostEstimator.estimate_binary_op_by_metadata(
+                op_name=self.operation,
+                lop_type_name=self.left_child.type_name,
+                rop_type_name=self.right_child.type_name,
+                lop_metadata=self.left_child.metadata,
+                rop_metadata=self.right_child.metadata)
+
+        if self.left_child is not None:
+            return CostEstimator.estimate_unary_op_by_metadata(
+                op_name=self.operation,
+                op_type_name=self.left_child.type_name,
+                op_metadata=self.left_child.metadata)
+        
+        return 0.0
+    
+    def cost(self) -> float:
+        total_cost = 0.0
+        
+        if self.left_child is not None:
+            total_cost += self.left_child.cost()
+        if self.right_child is not None:
+            total_cost += self.right_child.cost()
+        
+        total_cost += self.estimate_cost()
+        return total_cost
+    
+    def print(self, level = 0, maxLevel = 100):
+        if level >= maxLevel:
+            return
+
+        print(f"{'\t' * level}{self.operation} {self.var_id} {self.metadata}")
+
+        if self.left_child is not None:
+            self.left_child.print(level + 1, maxLevel)
+        if self.right_child is not None:
+            self.right_child.print(level + 1, maxLevel)
+
+
+class BET:
+    bet_per_var: Dict[int, BETNode]
+    encoding_candidates: Dict[int, BETNode]
+
+    _cost: float
+
+    def __init__(self, bet_encoding, args):
+        self.encoding_candidates = {}
+
+        recstack = []
+        for i in staticrange(staticlen(bet_encoding) -1, -1, -1):
+            node_enc = BETNodeEncoding(*bet_encoding[i])
+
+            metadata = Metadata()
+            if node_enc.arg_idx >= 0:
+                if node_enc.arg_idx >= staticlen(args):
+                    raise ValueError("Arg idx out of range")
+                
+                # Hack to simulate getitem on heterogeneous tuple
+                for j in staticrange(staticlen(args)):
+                    if j == node_enc.arg_idx:
+                        arg = args[j]
+                        if hasattr(arg, 'shape'):
+                            metadata.shape = list(arg.shape)
+                        if isinstance(arg, Ciphertensor):
+                            if arg._transposed:
+                                metadata.shape = metadata.shape[::-1]
+                            
+                            if arg._diagonal_contiguous:
+                                metadata.encoding = IR_OPT_ENCODING_DIAG_WISE_ENUM
+                            elif arg._transposed:
+                                metadata.encoding = IR_OPT_ENCODING_COL_WISE_ENUM
+                            else:
+                                metadata.encoding = IR_OPT_ENCODING_ROW_WISE_ENUM
+            
+            bet_node = BETNode(
+                node_enc.node_id, node_enc.var_id,
+                node_enc.operation, node_enc.type_name, metadata)
+
+            if node_enc.left_child_id != -1:
+                bet_node.left_child = recstack.pop()
+            if node_enc.right_child_id != -1:
+                bet_node.right_child = recstack.pop()
+            
+            _update_encoding_relevant_nodes(bet_node, self.encoding_candidates)
+            _resolve_node_metadata(bet_node)
+            recstack.append(bet_node)
+
+        self.bet_per_var = {node.var_id: node for node in recstack}
+
+    def encoding_opt(self, method: Static[str]):
+        if method == IR_OPT_ENCODING_OPT_NAME_BRUTE_FORCE:
+            self._encoding_opt_brute_force()
+        else:
+            compile_error("BET: invalid encoding optimization method")
+    
+    def cost(self) -> float:
+        total_cost = 0.0
+        
+        for node in self.bet_per_var.values():
+            total_cost += node.cost()
+        
+        return total_cost
+    
+    def _encoding_opt_brute_force(self):
+        matmul_count = len(self.encoding_candidates)
+        assert matmul_count <= IR_OPT_ENCODING_BRUTE_FORCE_MAX_MATMUL_COUNT, "Encoding optimization: Too many matrix multiplications for brute-force optimization"
+
+        if matmul_count == 0:
+            return
+
+        min_encoding = cur_encoding = 0
+        self._encoding_set(cur_encoding)
+        min_cost = self.cost()
+
+        for _ in range(3 ** matmul_count - 1):
+            cur_encoding += 1
+            self._encoding_set(cur_encoding)
+            bet_cost = self.cost()
+            
+            if bet_cost < min_cost:
+                min_cost = bet_cost
+                min_encoding = cur_encoding
+
+        self._encoding_set(min_encoding)
+        self._cost = min_cost
+
+    def _encoding_set(self, encoding: int):
+        for node in self.encoding_candidates.values():
+            node.metadata.encoding = (encoding % 3) + 1
+            encoding //= 3
+        
+        for tree_root in self.bet_per_var.values():
+            _resolve_tree_metadata(tree_root)
+
+    def _encoding_list(self):
+        return [node.metadata.encoding for node in self.encoding_candidates.values()]

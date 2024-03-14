@@ -1,5 +1,5 @@
-#include "enums.h"
 #include "codon/cir/util/irtools.h"
+#include "utils.h"
 
 namespace sequre {
 
@@ -13,6 +13,31 @@ const std::string MPPTypeName = "std.sequre.types.multiparty_partition.MPP";
 const std::string MPATypeName = "std.sequre.types.multiparty_aggregate.MPA";
 const std::string MPUTypeName = "std.sequre.types.multiparty_union.MPU";
 
+
+std::pair<std::vector<Value *>, std::vector<types::Type *>> getTypedArgs( CallInstr *v, int skip) {
+    std::vector<Value *> args;
+    std::vector<types::Type *> types;
+    
+    int idx = 0;
+    for ( auto it = v->begin(); it != v->end(); ++it, ++idx ) {
+      if ( idx < skip )
+        continue;
+      
+      auto *arg = *it;
+      args.push_back(arg);
+      types.push_back(arg->getType());
+    }
+
+    return std::make_pair(args, types);
+}
+
+bool isUnaryInstr(CallInstr *instr) {
+    return instr->numArgs() == 1;
+}
+
+bool isBinaryInstr(CallInstr *instr) {
+    return instr->numArgs() == 2;
+}
 
 bool hasSequreAttr( Func *f ) {
   return bool(f) && util::hasAttribute(f, "std.sequre.attributes.sequre");
@@ -28,6 +53,10 @@ bool hasMatmulReorderOptAttr( Func *f ) {
 
 bool hasCipherOptAttr( Func *f ) {
   return bool(f) && util::hasAttribute(f, "std.sequre.attributes.mhe_cipher_opt");
+}
+
+bool hasEncOptAttr( Func *f ) {
+  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.mhe_enc_opt");
 }
 
 bool hasDebugAttr( Func *f ) {
@@ -118,10 +147,10 @@ Func *getOrRealizeSequreInternalMethod( Module *M, std::string const &methodName
   return method;
 }
 
-Func *getOrRealizeSequreHelper( Module *M, std::string const &funcName,
-                                std::vector<types::Type *> args,
-                                std::vector<types::Generic> generics ) {
-  auto *func = M->getOrRealizeFunc(funcName, args, generics, "std.helpers");
+Func *getOrRealizeSequreOptimizationHelper( Module *M, std::string const &funcName,
+                                            std::vector<types::Type *> args,
+                                            std::vector<types::Generic> generics ) {
+  auto *func = M->getOrRealizeFunc(funcName, args, generics, "std.optimization.ir.__init__");
   
   if ( !func ) {
     std::cout << "\nSEQURE TYPE REALIZATION ERROR: Could not realize helper func: " << funcName
@@ -164,18 +193,14 @@ void visitAllNodes( Value *value, std::set<Value *> &visited ) {
   for ( auto *usedValue : value->getUsedValues() ) visitAllNodes(usedValue, visited);
 }
 
-bool isArithmeticOperation( Operation op ) { return op == add || op == mul || op == matmul || op == power; }
+std::string const getOperation( CallInstr *callInstr ) {
+  auto *callee = callInstr->getCallee();
+  assert(callee);
 
-Operation getOperation( CallInstr *callInstr ) {
-  auto *f        = util::getFunc(callInstr->getCallee());
-  auto instrName = f->getUnmangledName();
-  
-  if ( instrName == Module::ADD_MAGIC_NAME ) return add;
-  if ( instrName == Module::MUL_MAGIC_NAME ) return mul;
-  if ( instrName == Module::POW_MAGIC_NAME ) return power;
-  if ( instrName == Module::MATMUL_MAGIC_NAME ) return matmul;
-  
-  return noop;
+  auto *func = util::getFunc(callee);
+  assert(func);
+
+  return func->getUnmangledName();
 }
 
 CallInstr *revealCall( Var *var, VarValue *mpc ) {
