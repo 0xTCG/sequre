@@ -161,20 +161,21 @@ void BETNode::print( int level = 0, int maxLevel = 100 ) const {
 BET::Iterator BET::begin()  {
   std::vector<BETNode *> recstack;
 
-  for (auto it = betPerVar.rbegin(); it != betPerVar.rend(); ++it)
+  for ( auto it = betPerVar.rbegin(); it != betPerVar.rend(); ++it )
     recstack.push_back(it->second);
 
   return Iterator(recstack);
 }
 
 void BET::expandNode(BETNode *betNode) {
-  if (betNode->isExpanded())
+  if ( betNode->isExpanded() )
     return;
 
-  if (betNode->isLeaf()) {
-    assert(betNode->checkIsVariable() && "Node needs to be a variable for expansion");
+  if ( betNode->isLeaf() ) {
+    assert( betNode->checkIsVariable() && "Node needs to be a variable for expansion" );
     auto search = betPerVar.find(betNode->getVariableId());
-    if (search != betPerVar.end())
+    
+    if ( search != betPerVar.end() )
       betNode->replace(search->second);
   } else {
     expandNode(betNode->getLeftChild());
