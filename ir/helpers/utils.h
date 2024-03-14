@@ -1,15 +1,19 @@
 #pragma once
 
-#include "enums.h"
-
 namespace sequre {
 
 using namespace codon::ir;
+
+// IR internal
+std::pair<std::vector<Value *>, std::vector<types::Type *>> getTypedArgs( CallInstr *, int skip = 0 );
+bool isUnaryInstr( CallInstr * );
+bool isBinaryInstr( CallInstr * );
 
 // Attribute checks
 bool hasSequreAttr( Func * );
 bool hasPolyOptAttr( Func * );
 bool hasCipherOptAttr( Func * );
+bool hasEncOptAttr( Func * );
 bool hasMatmulReorderOptAttr ( Func * ); 
 bool hasDebugAttr( Func * );
 
@@ -30,20 +34,21 @@ bool isMPC( Value * );
 
 types::Type *getTupleType( int, types::Type *, Module * );
 types::Type *getTupleType( std::vector<Value *>, Module * );
-Func        *getOrRealizeSequreInternalMethod( Module *, std::string const &,
-                                        std::vector<types::Type *>,
-                                        std::vector<types::Generic> );
-Func        *getOrRealizeSequreHelper( Module *M, std::string const &,
-                                std::vector<types::Type *>,
-                                std::vector<types::Generic> );
+Func        *getOrRealizeSequreInternalMethod(
+                Module *, std::string const &,
+                std::vector<types::Type *>,
+                std::vector<types::Generic> );
+Func        *getOrRealizeSequreOptimizationHelper(
+                Module *M, std::string const &,
+                std::vector<types::Type *>,
+                std::vector<types::Generic> );
 
 bool   isCallOfName( const Value *, const std::string & );
-Value *findCallByName ( Value *, const std::string &, std::set<Value *> = {} );
+Value *findCallByName ( Value *, const std::string &, std::set<Value *> );
 void   visitAllNodes( Value *, std::set<Value *> & );
 
 // BET helpers
-bool isArithmeticOperation( Operation );
-Operation getOperation( CallInstr * );
+std::string const getOperation( CallInstr * );
 
 // Secure calls
 CallInstr *revealCall( Var *, VarValue * );
