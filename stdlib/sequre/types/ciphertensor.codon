@@ -277,6 +277,9 @@ class Ciphertensor[ctype]:
             slots=self.slots)
     
     def diagonal(self, idx: int) -> Ciphertensor[ctype]:
+        diag_count = min(self.shape)
+        idx %= diag_count
+        
         if not self._diagonal_contiguous:
             raise NotImplementedError("Ciphertensor: getting diagonal of non-diagonal contiguous ciphertensor is not implemented yet")
 
@@ -470,9 +473,11 @@ class Ciphertensor[ctype]:
         shape_tuple = (self.shape[0], self.shape[1]) if self.ndim == 2 else (1, self.shape[0])
 
         arr = array(decoded_vector, dtype=T).reshape(new_shape_tuple).resize(shape_tuple)
-        arr = arr.diagonal_contig(antidiagonal=True) if self._diagonal_contiguous else arr
+        
         if self._diagonal_contiguous and self._skinny:
-            arr = arr.T
+            arr = arr.diagonal_transpose(True).diagonal_contig(antidiagonal=True).T
+        elif self._diagonal_contiguous:
+            arr = arr.diagonal_contig(antidiagonal=True)
         
         return arr.T if self._transposed else arr
     
@@ -1072,9 +1077,38 @@ class Ciphertensor[ctype]:
         
         if isinstance(ctype, Plaintext):
             # TODO: Read dtype from self (add dtype static to Ciphertensor class)
-            return Ciphertensor[Plaintext].enc(mpc, self.decode(mpc, T=float).T)
+            return Ciphertensor[Plaintext].enc(
+                mpc, self.decode(mpc, T=float).T,
+                mode=D_CONTIG if self._diagonal_contiguous else C_CONTIG)
+        
+        if self._diagonal_contiguous:
+            return self.diagonal_transpose(mpc)
         
         return self.via_mpc(mpc, lambda stensor: stensor.T, S=Tuple[int, int])
+
+    def diagonal_transpose(self, mpc):
+        assert self._diagonal_contiguous, "Ciphertensor: diagonal transpose should be called only on diagonal-encoded ciphertensors"
+
+        if self._transposed:
+            return self.T
+        
+        diag_count = min(self.shape)
+        diagonals = [
+            self.diagonal(i).rotate(mpc, -i + diag_count * int(not self._skinny))
+            for i in range(1, diag_count)]
+        diagonals.reverse()
+
+        new_data = self.diagonal(0)._data.copy()
+        for i in range(diag_count - 1):
+            new_data.extend(diagonals[i]._data)
+
+        return Ciphertensor[ctype](
+            _data=new_data,
+            shape=self.shape.copy(),
+            slots=self.slots,
+            _transposed=False,
+            _diagonal_contiguous=True,
+            _skinny=(self._skinny ^ True) and self.shape[0] != self.shape[1])
     
     def diagonal_contig(self, mpc) -> Ciphertensor[ctype]:
         if self.ndim < 2 or self._diagonal_contiguous:
@@ -1182,9 +1216,8 @@ class Ciphertensor[ctype]:
     
     @staticmethod
     def _get_matmul_tnt_cost_by_shape(first_shape, other_shape, slots):
-        first_actual_shape = first_shape[::-1]
-        cost_per_cipher = (max(first_actual_shape[0], max(other_shape)) + slots - 1) // slots
-        iter_count = min(first_actual_shape[0], other_shape[1]) * other_shape[0]
+        cost_per_cipher = (max(first_shape[0], max(other_shape)) + slots - 1) // slots
+        iter_count = min(first_shape[0], other_shape[1]) * other_shape[0]
 
         return cost_per_cipher * iter_count * (HE_MUL_COST_ESTIMATE + HE_ROT_COST_ESTIMATE)
     
@@ -1202,7 +1235,7 @@ class Ciphertensor[ctype]:
     
     @staticmethod
     def _get_matmul_tnt_cost(first, other):
-        return Ciphertensor._get_matmul_tnt_cost_by_shape(first.shape, other.shape, first.slots)
+        return Ciphertensor._get_matmul_tnt_cost_by_shape(first.actual_shape, other.shape, first.slots)
 
     def _switch_matmul_by_cost[dtype](self, mpc, other: ndarray[Tuple[int, int], dtype], debug: Static[int]) -> Ciphertensor[ctype]:
         if isinstance(ctype, Plaintext):
@@ -1332,7 +1365,7 @@ class Ciphertensor[ctype]:
         other_actual_shape = other.actual_shape
         
         if debug: print(f"CP{mpc.pid}:\tUsing M3 method for ciphertensor matrix multiplication for {self_actual_shape} x {other_actual_shape} operands")
-        assert self_actual_shape[1] == other_actual_shape[0], f"Ciphertensor: Invalid matrix dimentions for M3 matmul {self_actual_shape} x {other_actual_shape}"
+        assert self_actual_shape[1] == other_actual_shape[0], f"Ciphertensor: Invalid matrix dimensions for M3 matmul {self_actual_shape} x {other_actual_shape}"
         assert other._diagonal_contiguous, "Ciphertensor: _matmul_v3_01 expects second operand to be diagonal-contiguous"
         assert not self._transposed and not other._transposed, "Not implemented yet: transposed diagonal-contiguous matmul case is not added yet"
 
@@ -1352,7 +1385,7 @@ class Ciphertensor[ctype]:
         for row in patch_copy_self:
             if debug:
                 debug_counter += 1
-                print(f"CP{mpc.pid}:\tCiphertensor M3 matmul: Computing row {debug_counter}/{patch_copy_self.shape[0]} ...")
+                print(f"CP{mpc.pid}:\tCiphertensor M3 matmul v01: Computing row {debug_counter}/{patch_copy_self.shape[0]} ...")
             
             new_row = row.mul(mpc, other.diagonal(0))
             
@@ -1364,9 +1397,9 @@ class Ciphertensor[ctype]:
             new_data.extend(new_row._data)
         
         new_ciphertensor = Ciphertensor[ctype](
-                _data=new_data,
-                shape=patch_copy_self.shape,
-                slots=self.slots)
+            _data=new_data,
+            shape=patch_copy_self.shape,
+            slots=self.slots)
 
         if semi_slot:
             other.shape[1] >>= 1
@@ -1384,8 +1417,127 @@ class Ciphertensor[ctype]:
         return Ciphertensor[ctype]()
     
     def _matmul_v3_11(self, mpc, other: Ciphertensor, debug: Static[int]):
-        raise NotImplementedError("INTERNAL: _matmul_v3_11 case not implemented yet")
-        return Ciphertensor[ctype]()
+        if self._transposed:
+            self_nt = self.T.actual_transpose(mpc)
+        else:
+            self_nt = self
+        
+        if self_nt._skinny:
+            return self_nt._matmul_v3_11_tall(mpc, other, debug)
+
+        return self_nt._matmul_v3_11_wide(mpc, other, debug)
+    
+    def _matmul_v3_11_wide(self, mpc, other: Ciphertensor, debug: Static[int]):        
+        assert not self._skinny, "Ciphertensor: _matmul_v3_11_wide expects first operand to be a wide matrix"
+        assert self.shape == self.actual_shape and self.shape[0] <= self.shape[1], f"Ciphertensor: non skinny matrix does not have apt shape {self.shape}"
+        
+        other_actual_shape = other.actual_shape
+        
+        if debug: print(f"CP{mpc.pid}:\tUsing M3 method for ciphertensor matrix multiplication for {self.shape} x {other_actual_shape} operands")
+        assert self.shape[1] == other_actual_shape[0], f"Ciphertensor: Invalid matrix dimensions for M3 matmul {self.shape} x {other_actual_shape}"
+        assert self._diagonal_contiguous and other._diagonal_contiguous, "Ciphertensor: _matmul_v3_11 expects both operands to be diagonal-contiguous"
+
+        if other._transposed:
+            other_t = other.T
+        else:
+            other_t = other.actual_transpose(mpc)
+        assert not self._transposed and not other_t._transposed, "Ciphertensor: diagonal x diagonal matmul operands must not be lazy-transposed"
+
+        patch_copy_self = self
+        if max(self.shape) < max(other_t.shape):
+            patch_copy_self = self.patch_copy(mpc, max(other_t.shape))
+
+        diag_count = self.shape[0]
+        new_diags = [
+            patch_copy_self.diagonal(i).mul(mpc, other_t.diagonal(0))
+            for i in range(diag_count)]
+
+        debug_counter = 0
+        for i in range(diag_count):
+            if debug:
+                debug_counter += 1
+                print(f"CP{mpc.pid}:\tCiphertensor M3 matmul v11: Computing row {debug_counter}/{patch_copy_self.shape[0]} ...")
+            
+            diag = patch_copy_self.diagonal(i)
+            for j in range(1, min(other_t.shape)):
+                new_diags[(i - j) % diag_count].iadd(mpc, diag.mul(mpc, other_t.diagonal(j)).irotate(mpc, -j))
+        
+        new_data = []
+        for diag in new_diags:
+            new_data.extend(diag._data)
+        
+        new_ciphertensor = Ciphertensor[ctype](
+            _data=new_data,
+            shape=patch_copy_self.shape.copy(),
+            slots=self.slots,
+            _transposed=False,
+            _diagonal_contiguous=True,
+            _skinny=False)
+
+        if other_actual_shape[1] < patch_copy_self.shape[1]:
+            return new_ciphertensor.reduce_add_tiled(mpc, other_actual_shape[1])
+        
+        return new_ciphertensor
+
+    def _matmul_v3_11_tall(self, mpc, other: Ciphertensor, debug: Static[int]):
+        assert self._skinny, "Ciphertensor: _matmul_v3_11_tall expects first operand to be a tall matrix"
+        
+        self_actual_shape = self.actual_shape
+        other_actual_shape = other.actual_shape
+        
+        if debug: print(f"CP{mpc.pid}:\tUsing M3 method for ciphertensor matrix multiplication for {self_actual_shape} x {other_actual_shape} operands")
+        assert self.shape[::-1] == self.actual_shape and self_actual_shape[0] > self_actual_shape[1], f"Ciphertensor: skinny matrix does not have a skinny shape: {self.shape}"
+        assert self_actual_shape[1] == other_actual_shape[0], f"Ciphertensor: Invalid matrix dimensions for M3 matmul {self_actual_shape} x {other_actual_shape}"
+        assert self._diagonal_contiguous and other._diagonal_contiguous, "Ciphertensor: _matmul_v3_11 expects both operands to be diagonal-contiguous"
+        
+        if other._transposed:
+            other_t = other.T
+        else:
+            other_t = other.actual_transpose(mpc)
+        assert not self._transposed and not other_t._transposed, "Ciphertensor: diagonal x diagonal matmul operands must not be lazy-transposed"
+
+        patch_copy_self = self
+        if max(self.shape) != max(other_t.shape):
+            raise NotImplementedError()
+
+        diag_count = self_actual_shape[0]
+        new_diags = {}
+
+        debug_counter = 0
+        
+        for block_idx in range(diag_count // min(self.shape)):
+            for i in range(min(self.shape)):
+                if debug:
+                    debug_counter += 1
+                    print(f"CP{mpc.pid}:\tCiphertensor M3 matmul v11: Computing row {debug_counter}/{diag_count} ...")
+                
+                block_offset = block_idx * min(self.shape)
+                diag = patch_copy_self.diagonal(i).rotate(mpc, block_offset)
+                for j in range(min(other_t.shape)):
+                    diagonal_idx = (i - j + block_offset) % diag_count
+                    partial_diag = diag.mul(mpc, other_t.diagonal(j)).irotate(mpc, -j)
+                    
+                    if diagonal_idx not in new_diags:
+                        new_diags[diagonal_idx] = partial_diag
+                    else:
+                        new_diags[diagonal_idx].iadd(mpc, partial_diag)
+        
+        new_data = []
+        for i in range(diag_count):
+            new_data.extend(new_diags[i]._data)
+        
+        new_ciphertensor = Ciphertensor[ctype](
+            _data=new_data,
+            shape=[self_actual_shape[0], other_actual_shape[1]],
+            slots=self.slots,
+            _transposed=False,
+            _diagonal_contiguous=True,
+            _skinny=False)
+
+        if other_actual_shape[1] < patch_copy_self.shape[1]:
+            raise NotImplementedError()
+        
+        return new_ciphertensor
     
     def _matmul_tnt(self, mpc, other, debug: Static[int]):
         """
