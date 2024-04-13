@@ -1,3 +1,5 @@
+from numpy.create import zeros, loadtxt
+
 from sequre.attributes import sequre
 
 from sequre.utils.testing import assert_eq_approx
@@ -273,21 +275,9 @@ def sf_psa_experimental(mpc, geno, cov, top_components, oversampling_count, powe
 
 def sf_gwas_experimental(mpc, modulus):
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    assert SKIP_QC, "Not implemented yet: MHE GWAS QC"
     
-    (f_pheno, f_cov, f_geno, f_miss,
-     f_geno_mask, f_miss_mask) = open_input_files(mpc)
-    snp_pos, pheno, cov = load_phenotypes_and_covariates(mpc, f_pheno, f_cov, modulus)
-    g, miss, dosage = load_dosage(
-        mpc, f_geno, f_geno_mask, f_miss, f_miss_mask,
-        [mpc_uint(1) for _ in range(NUM_INDS)],
-        [mpc_uint(1) for _ in range(NUM_SNPS)],
-        NUM_INDS, NUM_SNPS, modulus)
-
-    (snp_pos, pheno, cov, g_mean, g_std_bern_inv,
-    ikeep, gwas_snp_keep_mask) = quality_control(
-        mpc, NUM_INDS, NUM_SNPS, snp_pos, pheno, cov, g, miss, dosage)
-    
-    # Experimental run
+    # Experimental run: temp solution for loading data to facilitate easier testing
     indv_per_party = 8  # 16
     indv_count = indv_per_party * (mpc.comms.number_of_parties - 1)
     cov_count = 2
@@ -296,53 +286,41 @@ def sf_gwas_experimental(mpc, modulus):
     snps_count = 32  # 8192
     power_iterations_count = 1 # 10
 
-    # Revealing for testing
-    raw_geno = dosage.reveal(mpc) - g_mean.reveal(mpc)
-    
-    assert SKIP_QC, "Not implemented yet: MHE GWAS QC"
-    # if not SKIP_QC:
-    #     raw_geno = raw_geno.filter(ikeep).T.filter(gwas_snp_keep_mask).T
-    
-    raw_geno = raw_geno[:indv_count, :snps_count]
-    if snps_count > NUM_SNPS:
-        raw_geno = raw_geno.patch_copy(snps_count)
-    raw_cov = cov.reveal(mpc)[:indv_count, :cov_count]
-    raw_pheno = pheno.reveal(mpc)[:indv_count]
-    assert raw_pheno.ndim == 1
-    assert raw_cov.ndim == 2
-    assert raw_geno.ndim == 2
+    path = PRIVATE_DATA_PATH['gwas']
+    raw_pheno = loadtxt(f"{path}/pheno.txt", shape=(indv_count,), dtype=float)
+    raw_cov = loadtxt(f"{path}/cov.txt", shape=(indv_count, cov_count), dtype=float)
+    raw_dosage = loadtxt(f"{path}/geno.txt", shape=(indv_count, snps_count), dtype=float)
+    raw_dosage -= raw_dosage.mean(axis=0)
+        
+    def _get_partition(mpc, data, rows, cols):
+        dealer_data = zeros(((mpc.comms.number_of_parties - 1) * rows, cols))
+        return data[(mpc.pid - 1) * rows: mpc.pid * rows, :cols] if mpc.pid else dealer_data
 
-    # MPU
-    from numpy.create import zeros
-    
-    def _get_partition(mpc, data, indv_per_party, snps_count):
-        dealer_data = zeros(((mpc.comms.number_of_parties - 1) * indv_per_party, snps_count))
-        return data[(mpc.pid - 1) * indv_per_party: mpc.pid * indv_per_party, :snps_count] if mpc.pid else dealer_data
+    def _get_partition_1_dim(mpc, data, rows):
+        dealer_data = zeros(((mpc.comms.number_of_parties - 1) * rows,))
+        return data[(mpc.pid - 1) * rows: mpc.pid * rows] if mpc.pid else dealer_data
 
-    def _get_partition_1_dim(mpc, data, indv_per_party):
-        dealer_data = zeros(((mpc.comms.number_of_parties - 1) * indv_per_party,))
-        return data[(mpc.pid - 1) * indv_per_party: mpc.pid * indv_per_party] if mpc.pid else dealer_data
-
-    partition_geno = _get_partition(mpc, raw_geno, indv_per_party, snps_count)
+    partition_dosage = _get_partition(mpc, raw_dosage, indv_per_party, snps_count)
     partition_cov = _get_partition(mpc, raw_cov, indv_per_party, cov_count)
     partition_pheno = _get_partition_1_dim(mpc, raw_pheno, indv_per_party)
-    geno = MPU(mpc, partition_geno, "partition")
+    
+    dosage = MPU(mpc, partition_dosage, "partition")
     cov = MPU(mpc, partition_cov, "partition")
     pheno = MPU(mpc, partition_pheno, "partition").T
     
     mpc.randomness.reset_seed(-1, hash('global'))
     raw_components = sf_psa_experimental(
-        mpc, raw_geno, raw_cov, top_components_count,
+        mpc, raw_dosage, raw_cov, top_components_count,
         oversampling_count, power_iterations_count, indv_per_party)
-    raw_ca = cochran_armitage(mpc, raw_components, raw_pheno, raw_geno)
+    raw_ca = cochran_armitage(mpc, raw_components, raw_pheno, raw_dosage)
 
     import time
     s = time.time()
     mpc.randomness.reset_seed(-1, hash('global'))
     components = sf_psa_experimental(
-        mpc, geno, cov, top_components_count,
+        mpc, dosage, cov, top_components_count,
         oversampling_count, power_iterations_count, indv_per_party)
-    ca = cochran_armitage(mpc, components, pheno, geno)
+    ca = cochran_armitage(mpc, components, pheno, dosage)
     e = time.time()
     print(f"CP{mpc.pid}:\tTemp counter: GWAS PSA and CA done in {e - s}s")
 
