@@ -1283,6 +1283,55 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers], Static[rlwe.Eva
             c_imag = float(0)
 
         return c_real, c_imag, scale
+
+    # add_const adds the input constant (which can be a u64, i64, float or complex) to ct_in and returns the result in ct_out.
+    def _mm_add_const(self, ct_in: Ciphertext, constant, ct_out: Ciphertext):
+        assert not ct_in._nil_ideal and not ct_out._nil_ideal, "CKKS.Ciphertext: ciphers cannot be nil-ideal in add_const"
+    
+        level = min(ct_in.level(), ct_out.level())
+        c_real, c_imag, _ = self.get_const_and_scale(int(level), constant)
+        ct_out.scale = ct_in.scale
+
+        # Component wise addition of the following vector to the ciphertext:
+        # [a + b*psi_qi^2, ....., a + b*psi_qi^2, a - b*psi_qi^2, ...., a - b*psi_qi^2] mod Qi
+        # [{                  N/2                }{                N/2               }]
+        # Which is equivalent outside of the NTT domain to adding a to the first coefficient of ct_in and b to the N/2-th coefficient of ct_in.
+        ring_q = self.params.ring_q
+        # TODO: Check why parallelizing this loop breaks compiler
+        for i in range(level + 1):
+            qi = ring_q.modulus[i]
+            _mm_qi = ring_q._mm_modulus[i]
+            mred_params = ring_q.mred_params[i]
+
+            scaled_const_real = u64(0)
+            scaled_const_imag = u64(0)
+            scaled_const = u64(0)
+
+            if c_real != 0:
+                scaled_const_real = scale_up_exact(c_real, ct_out.scale, qi)
+                scaled_const = scaled_const_real
+            
+            if c_imag != 0:
+                scaled_const_imag = scale_up_exact(c_imag, ct_out.scale, qi)
+                scaled_const_imag = ring.mred(scaled_const_imag, ring_q.ntt_psi[i][1], qi, mred_params)
+                scaled_const = ring.cred(scaled_const + scaled_const_imag, qi)
+
+            _mm_scaled_const = u64xN(scaled_const)
+            p0_tmp = ct_in.value[0]._mm_coeffs[i]
+            p1_tmp = ct_out.value[0]._mm_coeffs[i]
+
+            ring._mm_add_scalar_vec(
+                p0_tmp.slice_reference(0, ring_q._mm_n >> 1),
+                p1_tmp, _mm_scaled_const, _mm_qi)
+
+            if c_imag != 0:
+                scaled_const = ring.cred(scaled_const_real + (qi - scaled_const_imag), qi)
+                _mm_scaled_const = u64xN(scaled_const)
+
+            ring._mm_add_scalar_vec(
+                p0_tmp.slice_reference(ring_q._mm_n >> 1, ring_q._mm_n),
+                p1_tmp.slice_reference(ring_q._mm_n >> 1, ring_q._mm_n),
+                _mm_scaled_const, _mm_qi)
     
     # mult_by_const multiplies ct_0 by the input constant and returns the result in ct_out.
     # The scale of the output element will depend on the scale of the input element and the constant (if the constant
@@ -1486,6 +1535,26 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers], Static[rlwe.Eva
         self.neg(ct_0, ct_out)
         return ct_out
 
+    def add_const(self, ct_in: Ciphertext, constant, ct_out: Ciphertext):
+        if constant == type(constant)(0):
+            ct_out.set(ct_in)
+            return
+        
+        self._mm_add_const(ct_in, constant, ct_out)
+    
+    def add_const_new(self, ct_in: Ciphertext, constant) -> Ciphertext:
+        ct_out = new_ciphertext(self.ckks_params, ct_in.degree(), ct_in.level(), 0)
+        self.add_const(ct_in, constant, ct_out)
+        return ct_out
+    
+    def sub_const(self, ct_in: Ciphertext, constant, ct_out: Ciphertext):
+        self.add_const(ct_in, -constant, ct_out)
+    
+    def sub_const_new(self, ct_in: Ciphertext, constant) -> Ciphertext:
+        ct_out = new_ciphertext(self.ckks_params, ct_in.degree(), ct_in.level(), 0)
+        self.sub_const(ct_in, constant, ct_out)
+        return ct_out
+
     # add adds op_1 to ct_in and returns the result in ct_out.
     def add(self, ct_in: Ciphertext, op_1, ct_out: Ciphertext):
         if ct_in._nil_ideal:
@@ -1594,6 +1663,22 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers], Static[rlwe.Eva
 
         ct_out = new_ciphertext(self.ckks_params, 1, ct_0.level(), ct_0.scale)
         self.mul_by_i(ct_0, ct_out)
+        return ct_out
+    
+    def mul_const(self, ct_in: Ciphertext, constant, ct_out: Ciphertext):
+        if ct_in._nil_ideal:
+            ct_out.to_nil_ideal()
+            return
+
+        assert not ct_out._nil_ideal, "CKKS.Ciphertext: output cipher cannot be nil-ideal"
+        self._mm_mul_by_const(ct_in, constant, ct_out)
+    
+    def mul_const_new(self, ct_in: Ciphertext, constant) -> Ciphertext:
+        if ct_in._nil_ideal:
+            return Ciphertext.nil_ideal()
+        
+        ct_out = new_ciphertext(self.ckks_params, ct_in.degree(), ct_in.level(), 0)
+        self.mul_const(ct_in, constant, ct_out)
         return ct_out
     
     # mult_new multiplies ct_in with op_1 without relinearization and returns the result in a newly created element.
