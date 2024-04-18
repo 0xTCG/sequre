@@ -2,9 +2,8 @@ from pickler import pickle, unpickle
 from internal.gc import sizeof
 
 from sequre.constants import (
-    P0_P1_SOCKET_PATH, PORT_P0_P1, P0_P2_SOCKET_PATH,
-    PORT_P0_P2, P1_P2_SOCKET_PATH, PORT_P1_P2,
-    TRUSTED_DEALER, COMPUTING_PARTIES, DATA_SHARING_PORTS)
+    DATA_SHARING_PORT, COMMUNICATION_PORT, CP_IPS,
+    NUMBER_OF_PARTIES, AF_UNIX_PREFIX)
 from sequre.types.utils import fp_to_double
 from sequre.network.socket import CSocket
 from sequre.network.connect import connect
@@ -20,19 +19,19 @@ class MPCComms[TP]:
     sockets: dict[int, CSocket]
     stats: MPCStats
     randomness: MPCRandomness
-    local: bool
     number_of_parties: int
+    local: bool
 
     def __init__(self: MPCComms[TP], randomness: MPCRandomness, local: bool, expect_data_sharing: bool):
         self.pid = randomness.pid
         self.hub_pid = 1
         self.stats = randomness.stats
         self.randomness = randomness
-        self.local = local
         self.sockets = dict[int, CSocket]()
+        self.number_of_parties = NUMBER_OF_PARTIES
+        self.local = local
 
         self.__setup_channels(expect_data_sharing)
-        self.number_of_parties = len(self.sockets) + 1
         self.reset_stats()
 
     def send(self, data, to_pid: int):
@@ -99,15 +98,16 @@ class MPCComms[TP]:
             return value
         
         if self.pid == 1:
-            self.send_as_jar(value, 3 - self.pid)
-            received_value = self.receive_as_jar(3 - self.pid, type(value))
+            for i in range(2, self.number_of_parties):
+                value = value.add_mod(self.receive_as_jar(i, type(value)), modulus)
+    
+            for i in range(2, self.number_of_parties):
+                self.send_as_jar(value, i)
             
-            return value.add_mod(received_value, modulus)
+            return value
         
-        received_value = self.receive_as_jar(3 - self.pid, type(value))
-        self.send_as_jar(value, 3 - self.pid)
-
-        return value.add_mod(received_value, modulus)
+        self.send_as_jar(value, 1)
+        return self.receive_as_jar(1, type(value))
     
     def reveal_at(self, value, target_pid, modulus):
         if self.pid == target_pid:
@@ -124,20 +124,21 @@ class MPCComms[TP]:
             return value
         
         if self.pid == 1:
-            self.send_as_jar(value, 3 - self.pid)
-            received_value = self.receive_as_jar(3 - self.pid, type(value))
+            for i in range(2, self.number_of_parties):
+                value = value + self.receive_as_jar(i, type(value))
+    
+            for i in range(2, self.number_of_parties):
+                self.send_as_jar(value, i)
             
-            return value + received_value
+            return value
         
-        received_value = self.receive_as_jar(3 - self.pid, type(value))
-        self.send_as_jar(value, 3 - self.pid)
-
-        return value + received_value
+        self.send_as_jar(value, 1)
+        return self.receive_as_jar(1, type(value))
     
     def reveal_to_all(self, value, modulus):
         revealed_value = self.reveal(value, modulus)
-        if self.pid == 2: self.send(revealed_value, 0)
-        elif self.pid == 0: revealed_value = self.receive(2, T=type(value))
+        if self.pid == 1: self.send(revealed_value, 0)
+        elif self.pid == 0: revealed_value = self.receive(1, T=type(value))
         return revealed_value
     
     def is_broadcast(self, value) -> bool:
@@ -238,7 +239,7 @@ class MPCComms[TP]:
         revealed_value = self.reveal(value, modulus=modulus)
         value_float = fp_to_double(revealed_value, modulus)
 
-        if self.pid == 2 and debug:
+        if self.pid == 1 and debug:
             print(f'{self.pid}: Revealed value -{message}- {revealed_value}')
             print(f'{self.pid}: Float value -{message}- {value_float}')
         
@@ -246,45 +247,38 @@ class MPCComms[TP]:
     
     def sequential(self, func, skip_dealer, *args, **kwargs):
         first_pid = 1 if skip_dealer else 0
-        if self.pid > first_pid: self.receive(self.pid - 1, T=int)
+        if self.pid > first_pid:
+            self.receive(self.pid - 1, T=int)
         func(*args, **kwargs)
-        if self.pid < self.number_of_parties - 1: self.send(1, self.pid + 1)
+        if self.pid < self.number_of_parties - 1:
+            self.send(1, self.pid + 1)
 
     def __setup_channels(self, expect_data_sharing):
         # Sockets are spawned per corresponding party
-        for p_1 in staticrange(2):
-            for p_2 in staticrange(p_1 + 1, 3):
-                if (p_1 != self.pid and p_2 != self.pid):
-                    continue
+        for pid in range(self.number_of_parties):
+            if pid == self.pid:
+                continue
+            
+            min_pid = min(pid, self.pid)
+            max_pid = max(pid, self.pid)
+            offset_major = min_pid * self.number_of_parties - min_pid * (min_pid + 1) // 2
+            offset_minor = max_pid - (min_pid if self.pid == max_pid else self.pid)
 
-                serveraddr_or_port = P0_P1_SOCKET_PATH if self.local else str(PORT_P0_P1)
-                if (p_1 == 0 and p_2 == 1):
-                    serveraddr_or_port = P0_P1_SOCKET_PATH if self.local else str(PORT_P0_P1)
-                elif (p_1 == 0 and p_2 == 2):
-                    serveraddr_or_port = P0_P2_SOCKET_PATH if self.local else str(PORT_P0_P2)
-                elif (p_1 == 1 and p_2 == 2):
-                    serveraddr_or_port = P1_P2_SOCKET_PATH if self.local else str(PORT_P1_P2)
-                else:
-                    raise ValueError('Invalid CP node pairs!')
-                
-                pother = p_1 + p_2 - self.pid
+            port = COMMUNICATION_PORT + offset_major + offset_minor
+            if self.local:
+                self.sockets[pid] = CSocket(unix_file_address=f"{AF_UNIX_PREFIX}{port}")
+            else:
+                ip_address = '0.0.0.0' if self.pid < pid else CP_IPS[pid]
+                self.sockets[pid] = CSocket(ip_address=ip_address, port=str(port))
 
-                if p_1 == self.pid: ip_address = '0.0.0.0'
-                elif pother == 0: ip_address = TRUSTED_DEALER
-                elif pother == 1: ip_address = COMPUTING_PARTIES[0]
-                elif pother == 2: ip_address = COMPUTING_PARTIES[1]
-                else: raise ValueError('Invalid CP node pairs!')
-                
-                self.sockets[pother] = CSocket(unix_file_address=serveraddr_or_port) if self.local else CSocket(ip_address=ip_address, port=serveraddr_or_port)
-
-                if (p_1 == self.pid):
-                    self.sockets[pother].open_channel()
-                else:
-                    if (not connect(self.sockets[pother])):
-                        raise ValueError(f"CP{self.pid} failed to connect to CP{pother}")
+            if self.pid < pid:
+                self.sockets[pid].open_channel()
+            else:
+                if (not connect(self.sockets[pid])):
+                    raise ValueError(f"CP{self.pid} failed to connect to CP{pid}")
 
         if expect_data_sharing:
             assert not self.local, "Local data sharing not supported yet"
             # Data sharing host socket is at self.sockets[self.pid]
-            self.sockets[self.pid] = CSocket(ip_address='0.0.0.0', port=str(DATA_SHARING_PORTS[self.pid]))
+            self.sockets[self.pid] = CSocket(ip_address='0.0.0.0', port=str(DATA_SHARING_PORT + self.pid))
             self.sockets[self.pid].open_channel()
