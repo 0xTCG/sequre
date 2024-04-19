@@ -16,7 +16,7 @@ from utils import double_to_fp
 
 from sequre.stdlib.fp import fp_div, fp_sqrt
 from sequre.stdlib.builtin import sign
-from sequre.constants import mpc_uint
+from sequre.constants import mpc_uint, ENC_COL, ENC_DIAG
 from sequre.decorators import flatten
 from sequre.attributes import sequre
 
@@ -29,21 +29,36 @@ class Sharetensor:
     def to_ciphertensor(self, mpc) -> Ciphertensor:        
         if isinstance(self.share, ByVal): _self = self.expand_dims()
         else: _self = self
-
-        if mpc.pid == 0:
-            return ndcipher.zeros(mpc, _self.shape)
         
-        slots = mpc.mhe.crypto_params.params.slots()
-        # Pad shape if ciphertexts are not fully utilized
-        new_shape = _self.shape.copy()
-        new_shape[-1] = (_self.shape[-1] + slots - 1) // slots * slots
         share = _self.share
-        if new_shape[-1] != _self.shape[-1]:
-            share = _self.share.resize(new_shape)
+        if isinstance(share, list[list]):
+            if mpc.default_ciphertensor_encoding == ENC_COL:
+                share = share.transpose()
+            elif mpc.default_ciphertensor_encoding == ENC_DIAG:
+                share = [share.cyclic_diag(i) for i in range(min(self.shape))]
+        
+        raw_shape = share.shape.copy()
+        if mpc.pid == 0:
+            ct = ndcipher.zeros(mpc, raw_shape)
+        else:
+            slots = mpc.mhe.crypto_params.params.slots()
+            # Pad shape if ciphertexts are not fully utilized
+            new_shape = share.shape.copy()
+            new_shape[-1] = (share.shape[-1] + slots - 1) // slots * slots
+            if new_shape[-1] != share.shape[-1]:
+                share = share.resize(new_shape)
 
-        ciphervector = mpc.mhe.additive_share_vector_to_ciphervector(share.flatten(), _self.modulus, self.fp)
+            ciphervector = mpc.mhe.additive_share_vector_to_ciphervector(share.flatten(), _self.modulus, self.fp)
+            ct = ndcipher(ciphervector, raw_shape, slots)
 
-        return ndcipher(ciphervector, _self.shape, slots)
+        if isinstance(share, list[list]):
+            if mpc.default_ciphertensor_encoding == ENC_COL:
+                ct._transposed = True
+            elif mpc.default_ciphertensor_encoding == ENC_DIAG:
+                ct._diagonal_contiguous = True
+                ct._skinny = _self.shape[1] < _self.shape[0]
+        
+        return ct
 
     def to_mpp[dtype](self, mpc, ratios: list[int], transpose_encryption: bool = False) -> MPP:        
         if isinstance(self.share, list[list]):
@@ -56,19 +71,18 @@ class Sharetensor:
                     _ratios=new_ratios,
                     _local_data=zeros(shape, dtype=dtype))
 
-            if transpose_encryption:
-                encrypted_partitions = []
-                for p in range(1, mpc.comms.number_of_parties):
-                    start, end = MPP.get_relative_indices(p, new_ratios)
-                    partition = self[start:end].T
-                    encrypted_partitions.append(partition.to_ciphertensor(mpc))
+            encrypted_partitions = []
+            for p in range(1, mpc.comms.number_of_parties):
+                start, end = MPP.get_relative_indices(p, new_ratios)
+                partition = self[start:end]
+
+                if transpose_encryption:
+                    partition = partition.T
                 
-                encrypted_partition = encrypted_partitions[mpc.pid - 1]
-                encrypted_partition._transposed = transpose_encryption
-            else:
-                start, end = MPP.get_relative_indices(mpc.pid, new_ratios)
-                encrypted_self = self.to_ciphertensor(mpc)
-                encrypted_partition = encrypted_self._get_rows_raw(slice(start=start, stop=end, step=1))
+                encrypted_partitions.append(partition.to_ciphertensor(mpc))
+            
+            encrypted_partition = encrypted_partitions[mpc.pid - 1]
+            encrypted_partition._transposed = transpose_encryption
 
             return MPP[type(shape), dtype](
                 _mpc=mpc,
@@ -152,7 +166,12 @@ class Ciphertensor:
             stensor = Sharetensor(share.resize(self.shape), modulus)
         elif staticlen(S) == 2:
             stensor = Sharetensor(share.reshape(padded_cipher_shape).resize(self.shape), modulus)
-            stensor = stensor.diagonal_contig(antidiagonal=True) if self._diagonal_contiguous else stensor
+            
+            if self._diagonal_contiguous and self._skinny:
+                stensor = stensor.diagonal_transpose(True).diagonal_contig(antidiagonal=True).T
+            elif self._diagonal_contiguous:
+                stensor = stensor.diagonal_contig(antidiagonal=True)
+            
             stensor = stensor.T if self._transposed else stensor
         else:
             compile_error("Ciphertensor: invalid shape in MPC conversion")
@@ -211,8 +230,10 @@ class MPP:
             stensor = Sharetensor(self._local_data.zeros().tolist().to_int_t(self.modulus), self.modulus)
             if isinstance(dtype, float): stensor.fp = True
         else:
-            ctensor = self.join()
-            stensor = ctensor.to_sharetensor(mpc, self.modulus, source_pid=-1, S=S, dtype=dtype)
+            ctensors = self.collect()
+            stensors = [ctensor.to_sharetensor(mpc, self.modulus, source_pid=-1, S=S, dtype=dtype)
+                        for ctensor in ctensors]
+            stensor = stensors.unfence()
         
         return stensor.T if self._transposed else stensor
 
@@ -227,7 +248,7 @@ class MPA:
             return stensor
         
         self.aggregate()
-        return self._aggregate.to_sharetensor(mpc, self.modulus, source_pid=-2, S=S, dtype=dtype)
+        return self._aggregate.to_sharetensor(mpc, self.modulus, source_pid=-1, S=S, dtype=dtype)
 
 
 @extend
