@@ -1,12 +1,12 @@
 from time import timing
 from datetime import datetime
 
-from numpy.create import loadtxt
+from numpy.create import loadtxt, array, zeros
 
 from perf import perf_timing, perf_print_stats
 
 from ..applications.mi import benchmark_mi
-from ..applications.king import king
+from ..applications.king import king, king_mpc
 from ..applications.gwas import gwas_protocol, sf_gwas_experimental
 from ..applications.dti import dti_mpc_protocol, dti_mhe_protocol
 from ..applications.opal import sequre_opal as opal
@@ -16,7 +16,7 @@ from ..applications.utils.data_sharing import share_data
 
 import sequre.lattiseq.ckks as ckks
 
-from sequre.stdlib.lin_alg import qr_fact_square, tridiag, eigen_decomp, orthonormalize
+from sequre.stdlib.lin_alg import l2, qr_fact_square, tridiag, eigen_decomp, orthonormalize
 from sequre.stdlib.learn.pca import random_pca_experimental
 from sequre.types.utils import double_to_fp
 from sequre.types.multiparty_partition import MPP
@@ -24,8 +24,8 @@ from sequre.types.multiparty_union import MPU
 from sequre.types.sharetensor import Sharetensor
 from sequre.utils.utils import random_floats
 from sequre.utils.testing import time_frame
-from sequre.constants import RUN_TOGGLES, ENC_DIAG
-from sequre.utils.io import read_matrix
+from sequre.constants import RUN_TOGGLES, ENC_DIAG, mpc_uint
+from sequre.utils.io import read_ndarray
 
 from unit_tests.test_he import lattiseq_test_setup
 
@@ -136,36 +136,62 @@ def king_wrapper(mpc, modulus):
     
     mpp_data = MPP.collective_load(
         mpc, f"data/king/1000_genomes_ph_3/partition_small_{mpc.pid}.bin",
-        rows=4, cols=cols, binary=True, dtype=int).astype(float)
-    
+        rows=16, cols=cols, binary=True, dtype=int).astype(float)
+
     return king(mpc, mpp_data)
 
+def king_mpc_wrapper(mpc, modulus):
+    ins_per_party = 16
+    rows = ins_per_party * (mpc.comms.number_of_parties - 1)
+    snps_count = 145443
+    cols = snps_count // 8192 * 8192
+    
+    if mpc.pid:
+        with open(f"data/king/1000_genomes_ph_3/partition_small_{mpc.pid}.bin") as f:
+            raw_data = read_ndarray(f, (ins_per_party, cols), True, dtype=float)
+            raw_het_inv = array([[(1 / row.count(1)) for _ in range(rows)] for row in raw_data], dtype=float)
+    else:
+        raw_data = zeros((ins_per_party, cols), dtype=float)
+        raw_het_inv = zeros((ins_per_party, rows), dtype=float)
+    
+    mpc_data = Sharetensor(list[list[mpc_uint]](rows), modulus)
+    mpc_data.fp = True
+    for p in range(1, mpc.comms.number_of_parties):
+        mpc_data.extend(Sharetensor.enc(mpc, raw_data, p, modulus))
+    
+    mpc_het_inv = Sharetensor(list[list[mpc_uint]](rows), modulus)
+    mpc_het_inv.fp = True
+    for p in range(1, mpc.comms.number_of_parties):
+        mpc_het_inv.extend(Sharetensor.enc(mpc, raw_het_inv, p, modulus))
+    
+    return king_mpc(mpc, mpc_data, mpc_het_inv)
+
 def pca_wrapper(mpc, modulus):
-    rows_per_party = 8
+    rows_per_party = 16
     rows = rows_per_party * (mpc.comms.number_of_parties - 1)
     cols = 8192
 
-    raw_data = loadtxt("data/gwas/lung/dosage.txt", shape=(rows, cols))
-    raw_data_mean = raw_data.mean(axis=0)
-    
     top_components_count = 2
     oversampling_count = 2
     power_iterations_count = 1
+
+    raw_data = loadtxt("data/gwas/lung/filtered_dosage.txt", shape=(rows, cols))
+    raw_data_float = raw_data.astype(float) - raw_data.mean(axis=0)
     
-    local_data = raw_data[(mpc.pid - 1) * rows_per_party:mpc.pid * rows_per_party].astype(float)
-    local_data -= raw_data_mean
-    
+    local_data = raw_data_float[(mpc.pid - 1) * rows_per_party:mpc.pid * rows_per_party] if mpc.pid else raw_data_float.zeros()
     mp_data = MPU(mpc, local_data, "partition")
+
     y = random_pca_experimental(mpc, mp_data, top_components_count, oversampling_count, power_iterations_count, rows_per_party)
 
-    w_raw = orthonormalize(mpc, y.reveal() @ raw_data)
-    return (w_raw @ raw_data.T).T * -1
+    w_raw = orthonormalize(mpc, y.reveal() @ raw_data_float)
+    return (w_raw @ raw_data_float.T).T
 
 def lin_alg_wrapper(mpc, modulus, sv_mat):
-    qr_fact_square(mpc, sv_mat)
-    tridiag(mpc, sv_mat)
-    eigen_decomp(mpc, sv_mat)
-    orthonormalize(mpc, sv_mat)
+    # return qr_fact_square(mpc, sv_mat)
+    # return tridiag(mpc, sv_mat)
+    # return eigen_decomp(mpc, sv_mat)
+    # return orthonormalize(mpc, sv_mat)
+    return l2(mpc, sv_mat)
 
 def mi_wrapper(mpc, modulus):
     im_epochs = 40
@@ -259,6 +285,8 @@ def benchmark[TP](mpc, benchmark_toggles: dict, modulus: TP):
         time_frame(mpc, mhe_wrapper, 'MHE', modulus)
     if benchmark_toggles[RUN_TOGGLES.KING_FLAG] or run_all:
         time_frame(mpc, king_wrapper, 'KING', modulus)
+    if benchmark_toggles[RUN_TOGGLES.KING_MPC_FLAG] or run_all:
+        time_frame(mpc, king_mpc_wrapper, 'KING-MPC', modulus)
     if benchmark_toggles[RUN_TOGGLES.MI_FLAG] or run_all:
         time_frame(mpc, mi_wrapper, 'Multiple imputation', modulus)
     if benchmark_toggles[RUN_TOGGLES.PCA_FLAG] or run_all:
