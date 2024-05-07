@@ -24,6 +24,20 @@ class Ciphertensor[ctype]:
     _diagonal_contiguous: bool
     _skinny: bool
 
+    _is_broadcast: bool
+
+    def __init__(
+            self,
+            _data: list[ctype],
+            shape: list[int],
+            slots: int,
+            _transposed: bool,
+            _diagonal_contiguous: bool,
+            _skinny: bool,
+            _is_broadcast: bool):
+        self.__init__(_data, shape, slots, _transposed, _diagonal_contiguous, _skinny)
+        self._is_broadcast = _is_broadcast
+    
     def __init__(
             self,
             _data: list[ctype],
@@ -69,6 +83,7 @@ class Ciphertensor[ctype]:
         self._data = []
         self.shape = shape
         self.slots = slots
+        self._is_broadcast = False
         self._reset_chunk_size()
     
     def __bool__(self) -> bool:
@@ -143,7 +158,8 @@ class Ciphertensor[ctype]:
             _chunk_size=self._chunk_size,
             _transposed=self._transposed,
             _diagonal_contiguous=self._diagonal_contiguous,
-            _skinny=self._skinny)
+            _skinny=self._skinny,
+            _is_broadcast=self._is_broadcast)
 
     def astype(self, t: type) -> Ciphertensor[ctype]:
         # TODO: Add dtype to Ciphertensor
@@ -236,7 +252,9 @@ class Ciphertensor[ctype]:
     def aggregate(self, mpc) -> Ciphertensor[ctype]:
         if mpc.pid == 0:
             return self
-        return mpc.comms.collect(self).sum(mpc)
+        ct = mpc.comms.collect(self).sum(mpc)
+        # ct._is_broadcast = True
+        return ct
     
     def getitemdup(self, mpc, i: int, new_size: int) -> Ciphertensor[ctype]:
         assert self.ndim == 1, "Ciphertensor: getitemdup can be only from one-dimensional Ciphertensor"
@@ -671,7 +689,7 @@ class Ciphertensor[ctype]:
         assert not isinstance(ctype, Plaintext), "Ciphertensor: cannot multiply plaintext inplace"
         other_cipher = self._check_other_operand_elem_wise(mpc, other)
 
-        mpc.mhe.imul(self._data, other_cipher._data)
+        mpc.mhe.imul(self._data, other_cipher._data, self._is_broadcast, other_cipher._is_broadcast)
         return self
     
     def ipow(self, mpc, p: int) -> Ciphertensor[Ciphertext]:
@@ -987,7 +1005,7 @@ class Ciphertensor[ctype]:
         size = self.shape[0]
         cipher_offset = size % self.slots
         tile_offset = self.slots % tile_size
-        if size > self.slots or tile_size > self.slots // 2 or ((cipher_offset or tile_offset) and len(self._data) > 1):
+        if tile_size > self.slots // 2 or ((cipher_offset or tile_offset) and len(self._data) > 1):
             raise NotImplementedError(
                 f"CP{mpc.pid}: Ciphertensor: tiled addition reduction case not implemented yet:\n"
                 f"\tCipher size: {size}\n"
@@ -1332,8 +1350,8 @@ class Ciphertensor[ctype]:
                  Ciphertensor._get_matmul_v3_cost(self, other))
         
         m, n = other.shape
-        if not m.popcnt() == n.popcnt() == 1:
-            # TODO: temporary constraint: matmul dimensions need to be power of 2 for v3 matmul for now"
+        if m % n and n % m:
+            # TODO: temporary constraint: matmul dimensions need to divisible by each-other in v3 matmul for now"
             from math import inf
             costs = (*costs[:-1], inf)
         
@@ -1414,7 +1432,7 @@ class Ciphertensor[ctype]:
 
     def _matmul_v3(self, mpc, other: Ciphertensor, debug: Static[int]) -> Ciphertensor[ctype]:        
         m, n = other.shape
-        assert m.popcnt() == n.popcnt() == 1, "Ciphertensor: temporary constraint --- matmul dimensions need to be power of 2 for now --- this is soon to be fixed"
+        assert m % n == 0 or n % m == 0, "Ciphertensor: temporary constraint --- matmul dimensions need to be divisible by eachother --- this is soon to be fixed"
         
         if self._diagonal_contiguous and other._diagonal_contiguous:
             return self._matmul_v3_11(mpc, other, debug)
@@ -1433,16 +1451,22 @@ class Ciphertensor[ctype]:
         self_actual_shape = self.actual_shape
         other_actual_shape = other.actual_shape
         
+        self_is_broadcast = self._is_broadcast
+        other_is_broadcast = other._is_broadcast
+        
         if debug: print(f"CP{mpc.pid}:\tUsing M3 method for ciphertensor matrix multiplication for {self_actual_shape} x {other_actual_shape} operands")
         assert self_actual_shape[1] == other_actual_shape[0], f"Ciphertensor: Invalid matrix dimensions for M3 matmul {self_actual_shape} x {other_actual_shape}"
         assert other._diagonal_contiguous, "Ciphertensor: _matmul_v3_01 expects second operand to be diagonal-contiguous"
         assert not self._transposed, "Not implemented yet: col-wise x diagonal-wise matmul case is not added yet"
-
         if other._transposed:
             other = other.T.actual_transpose(mpc)
         assert not other._transposed, "Ciphertensor: internal error"
 
-        if self.shape[1] < other.shape[1]: patch_copy_self = self.patch_copy(mpc, other.shape[1])
+        if self.shape[1] < other.shape[1]:
+            if self.level() - 2 <= mpc.mhe.bootstrap_min_level:
+                mpc.mhe.refresh(self._data, self._is_broadcast, True)
+            
+            patch_copy_self = self.patch_copy(mpc, other.shape[1])
         else: patch_copy_self = self.copy()
 
         semi_slot = patch_copy_self.shape[1] < self.slots >> 1
@@ -1453,6 +1477,12 @@ class Ciphertensor[ctype]:
             # Assume diagonals are trailed by zeros and pad them lazily by expanding shape
             other.shape[1] <<= 1
         
+        if patch_copy_self.level() - 2 <= mpc.mhe.bootstrap_min_level:
+            mpc.mhe.refresh(patch_copy_self._data, self._is_broadcast, True)
+        if isinstance(other, Ciphertensor[Ciphertext]):
+            if other.level() - 2 <= mpc.mhe.bootstrap_min_level:
+                mpc.mhe.refresh(other._data, other._is_broadcast, True)
+        
         new_data = []
         debug_counter = 0
         for row in patch_copy_self:
@@ -1462,13 +1492,19 @@ class Ciphertensor[ctype]:
             
             new_row = row.mul(mpc, other.diagonal(0))
             
+            row._is_broadcast = self_is_broadcast
             for i in range(1, min(other.shape)):
-                if semi_slot: mpc.mhe.irotate(row._data, 1)
-                else: row.irotate(mpc, 1)
-                new_row.iadd(mpc, row.mul(mpc, other.diagonal(i)))
+                rotated_row = row.copy()
+                if semi_slot:
+                    mpc.mhe.irotate(rotated_row._data, i)
+                else:
+                    rotated_row.irotate(mpc, i)
+                other_diag = other.diagonal(i)
+                other_diag._is_broadcast = other_is_broadcast
+                new_row.iadd(mpc, rotated_row.mul(mpc, other_diag))
             
             new_data.extend(new_row._data)
-        
+
         new_ciphertensor = Ciphertensor[ctype](
             _data=new_data,
             shape=patch_copy_self.shape,
@@ -1520,10 +1556,10 @@ class Ciphertensor[ctype]:
 
         patch_copy_self = self
         if max(self.shape) < max(other_t.shape):
-            self._diagonal_contiguous = False
-            patch_copy_self = self.patch_copy(mpc, max(other_t.shape))
+            # TODO: Write test for this case
+            patch_copy_self._diagonal_contiguous = False
+            patch_copy_self = patch_copy_self.patch_copy(mpc, max(other_t.shape))
             patch_copy_self._diagonal_contiguous = True
-            self._diagonal_contiguous = True
 
         diag_count = self.shape[0]
         new_diags = [
@@ -1668,6 +1704,12 @@ class Ciphertensor[ctype]:
             # Assume diagonals are trailed by zeros and pad them lazily by expanding shape
             other_cipher.shape[1] <<= 1
         
+        if patch_copy_self.level() - 2 <= mpc.mhe.bootstrap_min_level:
+            mpc.mhe.refresh(patch_copy_self._data, self._is_broadcast, True)
+        if isinstance(other_cipher, Ciphertensor[Ciphertext]):
+            if other_cipher.level() - 2 <= mpc.mhe.bootstrap_min_level:
+                mpc.mhe.refresh(other_cipher._data, other_cipher._is_broadcast, True)
+        
         new_data = []
         debug_counter = 0
         diagonals_count = min(self_actual_shape[0], other_actual_shape[1])
@@ -1676,12 +1718,15 @@ class Ciphertensor[ctype]:
                 debug_counter += 1
                 print(f"CP{mpc.pid}:\tCiphertensor M3 matmul (tnt): {debug_counter}/{diagonals_count} ...")
             
-            if semi_slot and d_idx: mpc.mhe.irotate(patch_copy_self._data, 1)
-            elif d_idx: patch_copy_self.irotate(mpc, 1)
-            new_diagonal = patch_copy_self._get_rows_raw(0).mul(mpc, other_cipher._get_rows_raw(0))
-            
+            rotated_self = patch_copy_self.copy()
+            if semi_slot and d_idx:
+                mpc.mhe.irotate(rotated_self._data, d_idx)
+            elif d_idx:
+                rotated_self.irotate(mpc, d_idx)
+
+            new_diagonal = rotated_self._get_rows_raw(0).mul(mpc, other_cipher._get_rows_raw(0))
             for i in range(1, other_cipher.shape[0]):
-                new_diagonal.iadd(mpc, patch_copy_self._get_rows_raw(i).mul(mpc, other_cipher._get_rows_raw(i)))
+                new_diagonal.iadd(mpc, rotated_self._get_rows_raw(i).mul(mpc, other_cipher._get_rows_raw(i)))
                 
             new_data.extend(new_diagonal._data)
         
@@ -1833,6 +1878,10 @@ class Ciphertensor[ctype]:
         if start == 0 and stop == self.shape[-1]:
             return self
         
+        # TODO: Bugfix required: mask_range below requires bootstrap check.
+        # Some parties may not reach it because of the checks above. This causes deadlock.
+        # Use mask_range_noboot instead and then change methods upstream to use manual bootstraps and no MPP aligners.
+
         start_cipher_idx = start // self.slots
         stop_cipher_idx = stop // self.slots
 
@@ -1871,6 +1920,26 @@ class Ciphertensor[ctype]:
             shape=shape,
             slots=self.slots,
             _transposed=False if isinstance(indices, int) else self._transposed)
+    
+    def _get_rows_nil_ideal(self, indices) -> Ciphertensor[ctype]:
+        assert self.ndim > 1, "Ciphertensor: cannot get rows from one-dimensional ciphertensor"
+        
+        _data = []
+        _, start, stop = self._adjust_row_indices(indices)
+
+        for _ in range(start):
+            _data.append(ctype.nil_ideal())
+        
+        _data.extend(self._data[start * self._chunk_size:stop * self._chunk_size])
+
+        for _ in range(stop, len(self._data)):
+            _data.append(ctype.nil_ideal())
+        
+        return Ciphertensor[ctype](
+            _data=_data,
+            shape=self.shape.copy(),
+            slots=self.slots,
+            _transposed=self._transposed)
     
     def _get_slices_raw(self, mpc, indices: Tuple[slice, slice], pack_dim: bool = False) -> Ciphertensor[ctype]:
         rs, cs = indices
