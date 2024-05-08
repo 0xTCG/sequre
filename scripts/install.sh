@@ -37,15 +37,13 @@ else
     git clone --depth 1 -b codon https://github.com/exaloop/llvm-project $SEQURE_LLVM_PATH
     cd $SEQURE_LLVM_PATH
     
-    cmake -S llvm -G Ninja -B build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_INCLUDE_TESTS=OFF \
-            -DLLVM_ENABLE_RTTI=ON \
-            -DLLVM_ENABLE_ZLIB=OFF \
-            -DLLVM_ENABLE_TERMINFO=OFF \
-            -DLLVM_TARGETS_TO_BUILD="host;NVPTX" \
-            -DLLVM_BUILD_TOOLS=OFF \
-            -DCMAKE_INSTALL_PREFIX="${SEQURE_LLVM_PATH}/install"
+    cmake -S llvm -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DLLVM_INCLUDE_TESTS=OFF \
+        -DLLVM_ENABLE_RTTI=ON \
+        -DLLVM_ENABLE_ZLIB=OFF \
+        -DLLVM_ENABLE_TERMINFO=OFF \
+        -DLLVM_TARGETS_TO_BUILD=all
     if [ $? -eq 0 ]; then
         echo "LLVM built."
     else
@@ -61,7 +59,7 @@ else
         return
     fi
 
-    cmake --install build
+    cmake --install build --prefix=$SEQURE_LLVM_PATH/install
     if [ $? -eq 0 ]; then
         echo "LLVM exported."
     else
@@ -77,7 +75,7 @@ then
 else
     echo "Codon not installed. Proceeding with the installation ..."
     rm -rf $SEQURE_CODON_PATH
-    git clone --branch sequre https://github.com/HarisSmajlovic/codon.git $SEQURE_CODON_PATH
+    git clone https://github.com/exaloop/codon.git $SEQURE_CODON_PATH
     cd $SEQURE_CODON_PATH
 
     cmake -S . -B build -G Ninja \
