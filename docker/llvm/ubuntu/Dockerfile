@@ -1,5 +1,5 @@
 FROM ubuntu:latest
-LABEL Name=llvm Version=12.0.1
+LABEL Name=llvm
 
 # Install dependencies
 RUN \
@@ -7,9 +7,9 @@ RUN \
     apt-get -y install cmake protobuf-compiler git wget && \
     apt install -y clang
 
-# Build LLVM 12
+# Build LLVM
 RUN \
-    git clone --depth 1 -b codon https://github.com/llvm/llvm-project && \
+    git clone --depth 1 -b codon https://github.com/exaloop/llvm-project && \
     mkdir -p llvm-project/llvm/build && \
     (cd llvm-project/llvm/build && cmake .. \
         -DCMAKE_BUILD_TYPE=Release \

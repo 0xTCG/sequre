@@ -1,9 +1,8 @@
-from numpy.create import array
+from numpy.create import array, zeros_like
 
 from sequre.types.multiparty_partition import MPP
 from sequre.utils.testing import assert_eq, assert_eq_approx
-from sequre.utils.io import write_ndarray, read_ndarray
-from sequre.utils.utils import __rand_mat
+from sequre.utils.utils import random_ints
 from sequre.constants import *
 from sequre.mpc.env import MPCEnv
 from .. import king
@@ -12,29 +11,32 @@ from .. import king
 def test_king[TP](mpc: MPCEnv[TP], modulus: TP):
     print(f'CP{mpc.pid}:\tTesting Sequre KING on {"ring" if modulus.popcnt() == 1 else "field"} ... \n')
 
-    rows_per_partition, cols = 8, 32
-    partition_path = "tests/data/king/partition.bin"
-
-    if mpc.pid == 0:
-        with open(partition_path, "wb") as f: write_ndarray(f, array(__rand_mat([rows_per_partition, cols], 3, TP=int)) - 1, binary=True)
+    het_inv_scale = 1000
+    rows_per_partition, cols = 16, 139264
+    rows = rows_per_partition * (mpc.comms.number_of_parties - 1)
     
-    mpc.comms.sync_parties()
+    # Generate data
+    with mpc.randomness.seed_switch(-1):
+        raw_data = array(random_ints((rows, cols), 0, 2), dtype=float)
+    raw_data_partition = zeros_like(raw_data) if mpc.pid == 0 else raw_data[(mpc.pid - 1) * rows_per_partition:mpc.pid * rows_per_partition]
+    mpp_data = MPP(mpc, raw_data_partition)
     
-    partition = read_ndarray(open(partition_path), (rows_per_partition, cols), True, dtype=int)
-    raw_data = [partition for _ in range(mpc.comms.number_of_parties - 1)].unfence().astype(float)
-    mpp_data = MPP.collective_load(mpc, partition_path, rows=rows_per_partition, cols=cols, binary=True, dtype=int).astype(float)
+    # Upscale het_inv by het_inv_scale to reduce the impact of CKKS noise
+    raw_het_inv = array([[(1 / row.count(1)) for _ in range(rows)] for row in raw_data], dtype=float) * het_inv_scale
+    raw_het_inv_partition = zeros_like(raw_het_inv) if mpc.pid == 0 else raw_het_inv[(mpc.pid - 1) * rows_per_partition:mpc.pid * rows_per_partition]
+    mpp_het_inv = MPP(mpc, raw_het_inv_partition)
     
-    mpc.comms.sequential(lambda: print(f"CP{mpc.pid}: KING test data for debugging:", raw_data), False)
+    mpc.comms.sequential(lambda: print(f"CP{mpc.pid}: KING test data for debugging:", raw_data.tolist().abbrv()), False)
     if mpc.pid > 0:
         assert_eq_approx(f"CP{mpc.pid}:\tSafe-checking KING data loading", mpp_data.reveal(mpc), raw_data)
 
-    classic_king_coefficients = king(mpc, raw_data)
-    sequre_king_coefficients = king(mpc, mpp_data)
+    classic_king_coefficients = king(mpc, raw_data, raw_het_inv)
+    sequre_king_coefficients = king(mpc, mpp_data, mpp_het_inv)
 
     if mpc.pid == 0:
         assert_eq(f"CP{mpc.pid}:\tSafe-checking KING result shape", sequre_king_coefficients.shape, classic_king_coefficients.shape)
     else:
-        assert_eq_approx(f"CP{mpc.pid}:\tSequre KING", sequre_king_coefficients.reveal(mpc), classic_king_coefficients)
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre KING", sequre_king_coefficients.reveal(mpc) / het_inv_scale, classic_king_coefficients / het_inv_scale)
 
     print(f'CP{mpc.pid}:\tSequre KING on {"ring" if modulus.popcnt() == 1 else "field"} tests passed.\n')
     
