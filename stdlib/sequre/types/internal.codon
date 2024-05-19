@@ -26,7 +26,7 @@ TP = mpc_uint
 
 @extend
 class Sharetensor:
-    def to_ciphertensor(self, mpc) -> Ciphertensor:        
+    def to_ciphertensor(self, mpc, target_pid: int = -1) -> Ciphertensor:        
         if isinstance(self.share, ByVal): _self = self.expand_dims()
         else: _self = self
         
@@ -42,7 +42,7 @@ class Sharetensor:
             ct = ndcipher.zeros(mpc, raw_shape)
         else:
             slots = mpc.mhe.crypto_params.params.slots()
-            ciphervector = mpc.mhe.additive_share_vector_to_ciphervector(share, _self.modulus, self.fp)
+            ciphervector = mpc.mhe.additive_share_vector_to_ciphervector(share, _self.modulus, self.fp, target_pid=target_pid)
             ct = ndcipher(ciphervector, raw_shape, slots)
 
         if isinstance(share, list[list]):
@@ -73,7 +73,7 @@ class Sharetensor:
                 if transpose_encryption:
                     partition = partition.T
                 
-                encrypted_partitions.append(partition.to_ciphertensor(mpc))
+                encrypted_partitions.append(partition.to_ciphertensor(mpc, target_pid=p))
             
             encrypted_partition = encrypted_partitions[mpc.pid - 1]
             encrypted_partition._transposed = transpose_encryption
@@ -224,9 +224,14 @@ class MPP:
             stensor = Sharetensor(self._local_data.zeros().tolist().to_int_t(self.modulus), self.modulus)
             if isinstance(dtype, float): stensor.fp = True
         else:
-            ctensors = self.collect()
-            stensors = [ctensor.to_sharetensor(mpc, self.modulus, source_pid=-1, S=S, dtype=dtype)
+            if self.is_local():
+                assert mpc.council(self.is_local()).all(), "MPP: edge-case not implemented yet"
+                stensors = [Sharetensor.enc(mpc, self._local_data, p, self.modulus) for p in range(1, mpc.comms.number_of_parties)]
+            else:
+                ctensors = self.collect()
+                stensors = [ctensor.to_sharetensor(mpc, self.modulus, source_pid=-1, S=S, dtype=dtype)
                         for ctensor in ctensors if ctensor]
+            
             stensor = stensors.unfence()
         
         return stensor.T if self._transposed else stensor
@@ -241,8 +246,13 @@ class MPA:
             if isinstance(dtype, float): stensor.fp = True
             return stensor
         
-        self.aggregate()
-        return self._aggregate.to_sharetensor(mpc, self.modulus, source_pid=-1, S=S, dtype=dtype)
+        if self.is_plain():
+            assert mpc.council(self.is_plain()).all(), "MPA: edge-case not implemented yet"
+            stensors = [Sharetensor.enc(mpc, self._plain, p, self.modulus) for p in range(1, mpc.comms.number_of_parties)]
+            return stensors.sum()
+        else:
+            self.aggregate()
+            return self._aggregate.to_sharetensor(mpc, self.modulus, source_pid=-1, S=S, dtype=dtype)
 
 
 @extend
@@ -509,6 +519,17 @@ class InternalMPC:
         return InternalMPC.dot(mpc, x, x, axis)
 
     def matmul(mpc, x, y):
+        if isinstance(x, ndarray):
+            modulus = y.modulus
+            c = x.to_int_t(modulus) @ y.share
+
+            if y.is_fp() and isinstance(type(x.data[0]), float):
+                c = mpc.fp.trunc(c, modulus)
+            
+            sv = Sharetensor(c, modulus)
+            sv.fp = y.is_fp() or isinstance(type(x.data[0]), float)
+            return sv
+        
         if isinstance(y, ndarray):
             modulus = x.modulus
             c = x.share @ y.to_int_t(modulus)

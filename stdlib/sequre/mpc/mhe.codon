@@ -57,9 +57,9 @@ from sequre.lattiseq.drlwe import \
     CKSShare
 from sequre.lattiseq.utils import new_prng
 from sequre.types.utils import double_to_fp, fp_to_double
-from sequre.utils.utils import zeros_vec, ones_vec, one_hot_vector
+from sequre.utils.utils import zeros_vec, ones_vec, one_hot_vector, zeros_mat
 from sequre.utils.io import is_cached, read_cache, store_cache
-from sequre.constants import LATTISEQ_DEFAULT_SIGMA, mpc_uint
+from sequre.constants import LATTISEQ_DEFAULT_SIGMA, mpc_uint, lattiseq_int, lattiseq_uint
 
 from stats import MPCStats
 from randomness import MPCRandomness
@@ -157,7 +157,7 @@ class MPCMHE[TP]:
             print(f"CP{self.pid}:\tMHE generating rotation keys ... ")
             rtks = self._collective_rot_key_gen(
                 params, sk_shard, self.crp_gen,
-                generate_rot_keys(params.slots(), 128, True))
+                generate_rot_keys(params.slots(), 64))
             if DEBUG: store_cache(rtks, rot_keys_cache_path, self.pid)
 
         self.crypto_params.initialize(sk_shard, pk, rlk, rtks, prec)
@@ -395,7 +395,7 @@ class MPCMHE[TP]:
         if not (isinstance(T, Ciphertext) or isinstance(T, Plaintext)):
             compile_error("Invalid cipher type")
         
-        assert len(x) == len(y), "Ciphervector lenghts differ"
+        assert len(x) == len(y), f"Ciphervector lenghts differ: {len(x)} != {len(y)}"
 
         if not len(x):
             return x
@@ -429,11 +429,40 @@ class MPCMHE[TP]:
         
         return x
     
-    def irotate(self, x: list[Ciphertext], k: int) -> list[Ciphertext]:
-        for i in range(len(x)):
-            self.crypto_params.evaluator.rotate(x[i], k, x[i])
+    def irotate_butterfly(self, x: list[Ciphertext], k: int) -> list[Ciphertext]:
+        slots = self.crypto_params.params.slots()
+        neg = False
+        
+        if k < 0:
+            neg = True
+            k = -k
+        
+        if k > slots:
+            k %= slots
+        if k > (slots >> 1):
+            k = slots - k
+            neg ^= True
+        
+        log_step = 0
+        while k:
+            tzs = k.__cttz__()
+            k >>= (tzs + 1)
+            log_step += tzs
+            step = 1 << log_step
+            log_step += 1
+        
+            for i in range(len(x)):
+                self.crypto_params.evaluator.rotate(x[i], -step if neg else step, x[i])
         
         return x
+    
+    def irotate(self, x: list[Ciphertext], k: int) -> list[Ciphertext]:
+        if k <= 64:
+            for i in range(len(x)):
+                self.crypto_params.evaluator.rotate(x[i], k, x[i])
+            return x
+        
+        return self.irotate_butterfly(x, k)
 
     def neg(self, x: list) -> list:
         return self.ineg(x.copy())
@@ -572,8 +601,8 @@ class MPCMHE[TP]:
         
         for row in x:
             for col in row:
-                if col.level() != min_level:
-                    min_level = min(col.level(), min_level)
+                if col.level() < min_level:
+                    min_level = col.level()
                     not_flat = True
 
         if not not_flat:
@@ -590,104 +619,130 @@ class MPCMHE[TP]:
         self.crypto_params.encryptor._mm_encrypt_zero(ct.get_rlwe_ciphertext())
         return ct
     
-    def additive_share_vector_to_ciphervector(self, shared_tensor, modulus: mpc_uint, is_fp: bool) -> List[Ciphertext]:
-        self.stats.secure_mhe_mpc_switch_count += 1
-        if self.pid == 0: return []
-
-        # mask = shared_vector.rand(modulus, "uniform")
-        # shared_matrix_mask = self.comms.reveal(shared_vector.copy() - mask, modulus)
-        # share = (shared_matrix_mask + mask) if self.pid == self.comms.hub_pid else mask
-        # return self._aggregate_cipher_vector(self.enc_vector(values, T=Ciphertext))
-        
-        # Temp non-secure solution
+    def additive_share_vector_to_ciphervector(self, shared_tensor, modulus: mpc_uint, is_fp: bool, target_pid: int = -1) -> List[Ciphertext]:
         slots = self.crypto_params.params.slots()
-        revealed_share = self.comms.reveal(shared_tensor, modulus)
+        if self.pid == 0:
+            return []
+
+        mask = shared_tensor.zeros()
+        # TODO: Masking is buggy at the moment. Needs to be fixed.
+        # downshift = 3
+        # mask = shared_tensor.rand(modulus, "uniform") >> downshift
+        # for i in range(len(shared_tensor)):
+        #     if mask[i] >= (modulus >> (downshift + 1)):
+        #         mask[i] = mask[i].sub_mod(modulus >> downshift, modulus)
+
+        masked_shared_tensor = self.comms.reveal(shared_tensor.sub_mod(mask, modulus), modulus)
+        share = masked_shared_tensor.add_mod(mask, modulus) if self.pid == self.comms.hub_pid else mask
 
         # Pad shape if ciphertexts are not fully utilized
         shape = shared_tensor.shape
         if shape[-1] % slots:
             new_shape = shape.copy()
             new_shape[-1] = (shape[-1] + slots - 1) // slots * slots
-            revealed_share = revealed_share.resize(new_shape)
+            share = share.resize(new_shape)
 
-        values = fp_to_double(revealed_share, modulus) if is_fp else revealed_share.to_int().astype(float)
-        return self.enc_vector(values.flatten(), T=Ciphertext)
-
+        values = fp_to_double(share, modulus) if is_fp else share.to_int().astype(float)
+        ciphervector = self.enc_vector(values.flatten(), T=Ciphertext)
+        self.stats.secure_mpc_mhe_switch_count += len(ciphervector)
+        return self._aggregate_cipher_vector(ciphervector, target_pid=target_pid)
+        
     def ciphervector_to_additive_share_vector[dtype](self, ciphervector: List[Ciphertext], number_of_elements: int, modulus: mpc_uint, source_pid: int) -> List[mpc_uint]:
-        """
-        If source_pid is:
-            - PID number (0, 1, 2, ...), then only the ciphers at that PID will be decrypted and broadcast to all parties
-            - -2, then each ciphervector will be collectively decrypted at each party one after the other
-            - -1, then the ciphers are expected to be already shared (the same) between the parties
-        """
+        # """
+        # If source_pid is:
+        #     - PID number (0, 1, 2, ...), then only the ciphers at that PID will be decrypted and broadcast to all parties
+        #     - -2, then each ciphervector will be collectively decrypted at each party one after the other
+        #     - -1, then the ciphers are expected to be already shared (the same) between the parties
+        # """
         assert source_pid > -3, f"MPCMHE: Invalid source PID: {source_pid}"
+        self.stats.secure_mhe_mpc_switch_count += len(ciphervector)
         
-        self.stats.secure_mhe_mpc_switch_count += 1
-        # slots = self.crypto_params.params.slots()
-        # shared_vector = zeros_vec(number_of_elements)
-        # if self.pid == 0: return shared_vector
+        return self._temp_mhe_to_mpc_unsecure(
+            ciphervector=ciphervector,
+            number_of_elements=number_of_elements,
+            modulus=modulus,
+            source_pid=source_pid,
+            dtype=dtype)
+    
+    def _temp_mhe_to_mpc_secure[dtype](self, ciphervector: List[Ciphertext], number_of_elements: int, modulus: mpc_uint, source_pid: int) -> List[mpc_uint]:
+        slots = self.crypto_params.params.slots()
+        shared_vector = zeros_vec(number_of_elements)
+        if self.pid == 0:
+            return shared_vector
 
-        # if hub_pid > 0:
-        #     ciphervector = self.comms.collect(ciphervector, hub_pid)
+        if source_pid >= 0:
+            ciphervector = self.comms.broadcast_from(ciphervector, source_pid)
 
-        # ciphermatrix, level_start = self.flatten_levels([ciphervector])
-        # ciphervector = ciphermatrix[0]
+        ciphermatrix, level_start = self.flatten_levels([ciphervector])
+        ciphervector = ciphermatrix[0]
 
-        # params = self.crypto_params.params
-        # ring_q = params.ring_q
-
-        # share_decrypt = [params.ring_q.new_poly_lvl(level_start) for _ in range(len(ciphervector))]
+        params = self.crypto_params.params
+        ring_q = params.ring_q
         
-        # self.randomness.switch_seed(-1)
-        # seed = u32(prg.getrandbits(32))
-        # self.randomness.restore_seed(-1)
-        # sampler = new_gaussian_sampler(new_prng(seed), ring_q, 3.19, 19)
+        seed = u32(prg.getrandbits(32))
+        sampler = new_gaussian_sampler(new_prng(seed), ring_q, 3.19, 19)
 
-        # pt_mask = []
+        n = ring_q.n
+        mask_big_int = zeros_mat(len(ciphervector), n, TP=lattiseq_int)
+        # TODO: Masking is buggy at the moment. Needs to be fixed.
+        # downshift = 3
+        # bound = lattiseq_int(ring_q.modulus_at_level[level_start])
+        # bound >>= lattiseq_int(downshift)
+        # bound_half = bound >> lattiseq_int(1)
         # for k in range(len(ciphervector)):
-        #     # h0 = mask (at level min)
-        #     share_decrypt[k].randomize(ring_q.modulus[level_start])
-        #     ring_q._mm_ntt_lvl(level_start, share_decrypt[k], share_decrypt[k])
-        #     pt_mask.append(Plaintext(share_decrypt[k].copy(), ciphervector[0].scale))
+        #     for j in range(n):
+        #         m = lattiseq_int(prg.getrandbits_intn(int(bound_half.bitlen()) - 2, TP=lattiseq_uint))
+        #         # if m >= bound_half:
+        #         #     m = m.sub_mod(m, bound)
+        #         mask_big_int[k][j] = m
+        
+        pt_mask = []
+        share_decrypt = [params.ring_q.new_poly_lvl(level_start) for _ in range(len(ciphervector))]
+        for k in range(len(ciphervector)):
+            # h0 = mask (at level min)
+            ring_q.set_coefficients_bigint_lvl(level_start, mask_big_int[k], share_decrypt[k])
+            ring_q._mm_ntt_lvl(level_start, share_decrypt[k], share_decrypt[k])
+            share_decrypt[k].is_ntt = True
+            pt_mask.append(Plaintext(share_decrypt[k].copy(), ciphervector[0].scale))
 
-        #     # h0 = sk*c1 + mask
-        #     ring_q._mm_mul_coeffs_montgomery_and_add_lvl(level_start, self.crypto_params.sk_shard.value.q, ciphervector[k].value[1], share_decrypt[k])
+            # h0 = sk*c1 + mask
+            ring_q._mm_mul_coeffs_montgomery_and_add_lvl(level_start, self.crypto_params.sk_shard.value.q, ciphervector[k].value[1], share_decrypt[k])
 
-        #     # h0 = sk*c1 + mask + e0
-        #     tmp = sampler._mm_read_new()
-        #     ring_q._mm_ntt_lvl(level_start, tmp, tmp)
+            # h0 = sk*c1 + mask + e0
+            tmp = sampler._mm_read_new()
+            ring_q._mm_ntt_lvl(level_start, tmp, tmp)
+            tmp.is_ntt = True
             
-        #     ring_q._mm_add_lvl(level_start, share_decrypt[k], tmp, share_decrypt[k])
+            ring_q._mm_add_lvl(level_start, share_decrypt[k], tmp, share_decrypt[k])
+        
+        agg = self._aggregate_refresh_share_vec(share_decrypt, level_start)
 
-        # # TODO: communicate in one batch
-        # agg = self._aggregate_refresh_share_vec(share_decrypt, level_start)
+        pt = []
+        for i in range(len(ciphervector)):
+            ct_out = ciphervector[i].copy()
+            ring_q._mm_add_lvl(level_start, ct_out.value[0], agg[i], ct_out.value[0])
 
-        # pt = []
-        # for i in range(len(ciphervector)):
-        #     ct_out = ciphervector[i].copy()
-        #     ring_q._mm_add_lvl(level_start, ct_out.value[0], agg[i], ct_out.value[0])
+            pt.append(ct_out.plaintext())
 
-        #     pt.append(ct_out.plaintext())
+        for i in range(len(pt)):
+            rv_out = zeros_vec(slots, TP=complex)
+            if self.pid == self.comms.hub_pid:
+                rv_out = self.crypto_params.encoder.decode(pt[i], self.crypto_params.params.log_slots)
 
-        # for i in range(len(pt)):
-        #     rv_out = zeros_vec(slots, TP=complex)
-        #     if self.pid == self.comms.hub_pid:
-        #         rv_out = self.crypto_params.encoder.decode(pt[i], self.crypto_params.params.log_slots)
+            rv_mask = self.crypto_params.encoder.decode(pt_mask[i], self.crypto_params.params.log_slots)
+            rv_out -= rv_mask
 
-        #     rv_mask = self.crypto_params.encoder.decode(pt_mask[i], self.crypto_params.params.log_slots)
-        #     rv_out -= rv_mask
+            rv_out_shared = double_to_fp([e.real for e in rv_out], modulus)
 
-        #     rv_out_shared = double_to_fp([e.real for e in rv_out], modulus)
+            start = i * slots
+            count = min(slots, number_of_elements - start)
 
-        #     start = i * slots
-        #     end = start + slots
-        #     if end > number_of_elements: end -= number_of_elements
-        #     else: end = slots
+            for i in range(count):
+                shared_vector[i + start] = rv_out_shared[i]
 
-        #     shared_vector.extend(rv_out_shared.slice_reference(0, end))
-
-        # return shared_vector
-
+        return shared_vector
+    
+    def _temp_mhe_to_mpc_unsecure[dtype](self, ciphervector: List[Ciphertext], number_of_elements: int, modulus: mpc_uint, source_pid: int) -> List[mpc_uint]:
         # Temp non-secure solution:
         if self.pid == 0:
             return zeros_vec(number_of_elements, TP=type(modulus))
@@ -701,6 +756,7 @@ class MPCMHE[TP]:
                 return decoded_values.to_int_t(modulus)
             else:
                 compile_error("Invalid type in ciphervector to additive share vector switch")
+        
         return zeros_vec(number_of_elements, TP=type(modulus))
 
     def mask_one[T](self, x: T, idx: int, complement: bool = False) -> T:
@@ -1092,8 +1148,21 @@ class MPCMHE[TP]:
         
         return crp
 
-    def _aggregate_cipher_vector(self, ciphervector: List[Ciphertext]) -> List[Ciphertext]:
+    def _aggregate_cipher_vector(self, ciphervector: List[Ciphertext], target_pid: int = -1) -> List[Ciphertext]:
         if self.pid == 0: return []
+
+        if target_pid > 0:
+            if self.pid == target_pid:
+                # receive and add
+                out = ciphervector.copy()
+                for p in range(1, self.comms.number_of_parties):
+                    if p != self.pid:
+                        out = self.add(out, self.comms.receive_as_jar(p, List[Ciphertext]))
+            else:
+                self.comms.send_as_jar(ciphervector, target_pid)
+                out = []
+
+            return out    
 
         if self.pid == self.comms.hub_pid:
             # receive and add
