@@ -25,7 +25,7 @@ from sequre.types.sharetensor import Sharetensor
 from sequre.utils.utils import random_floats, random_ints
 from sequre.utils.testing import time_frame
 from sequre.constants import RUN_TOGGLES, ENC_DIAG, mpc_uint
-from sequre.utils.io import read_ndarray
+from sequre.utils.io import read_ndarray, log
 
 from unit_tests.test_he import lattiseq_test_setup
 
@@ -172,24 +172,58 @@ def king_mpc_wrapper(mpc, modulus):
     return king(mpc, mpc_data, mpc_het_inv)
 
 def pca_wrapper(mpc, modulus):
-    rows_per_party = 1 << 12
+    def _project(mpc, components, data):
+        w = orthonormalize(mpc, components.reveal(mpc) @ data)
+        return (w @ data.T).T
+    
+    rows_per_party = 16
     rows = rows_per_party * (mpc.comms.number_of_parties - 1)
-    cols = 4
+    cols = 1 << 15
 
     top_components_count = 2
     oversampling_count = 2
     power_iterations_count = 10
 
-    raw_data = loadtxt("data/pca/sample.txt", shape=(rows, cols), dtype=float)
+    raw_data = loadtxt("data/lung/filtered_dosage.txt", shape=(rows, cols), dtype=float)
+    # Scale data to avoid overflow
     raw_data -= raw_data.mean(axis=0)
+    raw_data /= 1024
     
     local_data = raw_data[(mpc.pid - 1) * rows_per_party:mpc.pid * rows_per_party] if mpc.pid else raw_data.zeros()
+    mpc_data = Sharetensor.enc(mpc, raw_data, 0, modulus)
     mp_data = MPU(mpc, local_data, "partition")
+    
+    mpc.randomness.reset_seed(-1, hash('global'))
+    with timing("Raw PCA"):
+        raw_y = random_pca_experimental(
+            mpc, raw_data, top_components_count, oversampling_count,
+            power_iterations_count, rows_per_party)
+    
+    log("", raw_y.tolist(), path='results/raw_pca_components.txt', mode='w', separator=' ')
+    raw_projection = _project(mpc, raw_y, raw_data)
+    log("", raw_projection.tolist(), path='results/raw_pca_projection.txt', mode='w', separator=' ')
 
-    y = random_pca_experimental(mpc, mp_data, top_components_count, oversampling_count, power_iterations_count, rows_per_party)
+    mpc.randomness.reset_seed(-1, hash('global'))
+    with timing("Sequre PCA"):
+        mpc_y = random_pca_experimental(
+            mpc, mpc_data, top_components_count, oversampling_count,
+            power_iterations_count, rows_per_party)
+    
+    log("", mpc_y.reveal(mpc).tolist(), path='results/mpc_pca_components.txt', mode='w', separator=' ')
+    mpc_projection = _project(mpc, mpc_y, raw_data)
+    log("", mpc_projection.tolist(), path='results/mpc_pca_projection.txt', mode='w', separator=' ')
 
-    w_raw = orthonormalize(mpc, y.reveal() @ raw_data)
-    return (w_raw @ raw_data.T).T
+    mpc.randomness.reset_seed(-1, hash('global'))
+    with timing("SheQi PCA"):
+        mp_y = random_pca_experimental(
+            mpc, mp_data, top_components_count, oversampling_count,
+            power_iterations_count, rows_per_party)
+    
+    log("", mp_y.reveal().tolist(), path='results/mp_pca_components.txt', mode='w', separator=' ')
+    mp_projection = _project(mpc, mp_y, raw_data)
+    log("", mp_projection.tolist(), path='results/mhe_pca_projection.txt', mode='w', separator=' ')
+
+    return mp_projection
 
 def lin_alg_wrapper(mpc, modulus, sv_mat):
     # return qr_fact_square(mpc, sv_mat)
