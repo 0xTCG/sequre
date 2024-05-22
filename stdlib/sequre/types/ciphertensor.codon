@@ -513,7 +513,7 @@ class Ciphertensor[ctype]:
         if not bool(self):
             return ndarray[Tuple[int, int], T]()
         
-        plain = self.copy().decrypt(mpc, source_pid) if isinstance(ctype, Ciphertext) else self.copy()
+        plain = self.decrypt(mpc, source_pid) if isinstance(ctype, Ciphertext) else self
         return plain.decode(mpc, T=T)
     
     def filter(self, mask: ndarray[Tuple[int], int]) -> Ciphertensor[ctype]:
@@ -680,7 +680,7 @@ class Ciphertensor[ctype]:
         mpc.mhe.isub(self._data, other_cipher._data)
         return self
 
-    def imul(self, mpc, other) -> Ciphertensor[Ciphertext]:
+    def imul(self, mpc, other, no_refresh: bool = False) -> Ciphertensor[Ciphertext]:
         if mpc.pid == 0: return self
 
         if isinstance(other, ByVal):
@@ -690,7 +690,7 @@ class Ciphertensor[ctype]:
         assert not isinstance(ctype, Plaintext), "Ciphertensor: cannot multiply plaintext inplace"
         other_cipher = self._check_other_operand_elem_wise(mpc, other)
 
-        mpc.mhe.imul(self._data, other_cipher._data, self._is_broadcast, other_cipher._is_broadcast)
+        mpc.mhe.imul(self._data, other_cipher._data, self._is_broadcast, other_cipher._is_broadcast, no_refresh)
         return self
     
     def ipow(self, mpc, p: int) -> Ciphertensor[Ciphertext]:
@@ -1278,26 +1278,26 @@ class Ciphertensor[ctype]:
     
     @staticmethod
     def _get_matmul_v1_cost_by_shape(first_shape, other_shape, slots):
-        cost_per_cipher = (first_shape[1] + slots - 1) // slots
-        output_size = first_shape[0] * other_shape[1]
+        ctx_per_row = (first_shape[1] + slots - 1) // slots
+        iter_count = first_shape[0] * other_shape[1]
 
-        return ((cost_per_cipher + 1) * output_size * HE_MUL_COST_ESTIMATE +
-                output_size * cost_per_cipher * (slots - 1).bitlen() * HE_ROT_COST_ESTIMATE)
+        return iter_count * (ctx_per_row * HE_MUL_COST_ESTIMATE + (slots - 1).bitlen() * HE_ROT_COST_ESTIMATE)
 
     @staticmethod
     def _get_matmul_v2_cost_by_shape(first_shape, other_shape, slots):
-        cost_per_cipher = (first_shape[1] + slots - 1) // slots
-        self_size = first_shape[0] * first_shape[1]
+        ctx_per_row = (first_shape[1] + slots - 1) // slots
+        iter_count = first_shape[0] * first_shape[1]
 
-        return (cost_per_cipher * self_size * HE_MUL_COST_ESTIMATE +
-                self_size * (min(other_shape[1], slots) - 1).bitlen() * HE_ROT_COST_ESTIMATE)
+        return (ctx_per_row * iter_count * HE_MUL_COST_ESTIMATE +
+                iter_count * (HE_MUL_COST_ESTIMATE + (min(other_shape[1], slots) - 1).bitlen() * HE_ROT_COST_ESTIMATE))
     
     @staticmethod
     def _get_matmul_v3_cost_by_shape(first_shape, other_shape, slots):
-        cost_per_cipher = (max(max(first_shape), max(other_shape)) + slots - 1) // slots
+        ctx_per_row = (max(max(first_shape), max(other_shape)) + slots - 1) // slots
         iter_count = first_shape[0] * min(other_shape)
+        masking_overhead = 2 if ctx_per_row > 1 else 1
 
-        return (cost_per_cipher * iter_count * (HE_MUL_COST_ESTIMATE + HE_ROT_COST_ESTIMATE) +
+        return (ctx_per_row * iter_count * (HE_MUL_COST_ESTIMATE * masking_overhead + HE_ROT_COST_ESTIMATE) +
                 (max(other_shape) - 1).bitlen() * HE_ROT_COST_ESTIMATE)
     
     @staticmethod
@@ -1309,7 +1309,7 @@ class Ciphertensor[ctype]:
     
     @staticmethod
     def _get_matmul_v1_cost(first, other):
-        return Ciphertensor._get_matmul_v1_cost_by_shape(first.shape, other.shape, first.slots)
+        return Ciphertensor._get_matmul_v1_cost_by_shape(first.shape, other.actual_shape, first.slots)
 
     @staticmethod
     def _get_matmul_v2_cost(first, other):
@@ -1468,9 +1468,7 @@ class Ciphertensor[ctype]:
         assert not other._transposed, "Ciphertensor: internal error"
 
         if self.shape[1] < other.shape[1]:
-            if self.level() - 2 <= mpc.mhe.bootstrap_min_level:
-                mpc.mhe.refresh(self._data, self._is_broadcast, True)
-            
+            mpc.mhe.refresh(self._data, self._is_broadcast, min_level_distance=2)
             patch_copy_self = self.patch_copy(mpc, other.shape[1])
         else: patch_copy_self = self.copy()
 
@@ -1482,11 +1480,9 @@ class Ciphertensor[ctype]:
             # Assume diagonals are trailed by zeros and pad them lazily by expanding shape
             other.shape[1] <<= 1
         
-        if patch_copy_self.level() - 2 <= mpc.mhe.bootstrap_min_level:
-            mpc.mhe.refresh(patch_copy_self._data, self._is_broadcast, True)
+        mpc.mhe.refresh(patch_copy_self._data, self._is_broadcast, min_level_distance=2)
         if isinstance(other, Ciphertensor[Ciphertext]):
-            if other.level() - 2 <= mpc.mhe.bootstrap_min_level:
-                mpc.mhe.refresh(other._data, other._is_broadcast, True)
+            mpc.mhe.refresh(other._data, other._is_broadcast)
         
         new_data = []
         debug_counter = 0
@@ -1500,16 +1496,18 @@ class Ciphertensor[ctype]:
             row._is_broadcast = self_is_broadcast
             for i in range(1, min(other.shape)):
                 rotated_row = row.copy()
+
                 if semi_slot:
                     mpc.mhe.irotate(rotated_row._data, i)
                 else:
                     rotated_row.irotate(mpc, i)
+                
                 other_diag = other.diagonal(i)
                 other_diag._is_broadcast = other_is_broadcast
-                new_row.iadd(mpc, rotated_row.mul(mpc, other_diag))
+                rotated_row.imul(mpc, other_diag, no_refresh=True)
+                new_row.iadd(mpc, rotated_row)
             
             new_data.extend(new_row._data)
-
         new_ciphertensor = Ciphertensor[ctype](
             _data=new_data,
             shape=patch_copy_self.shape,
@@ -1709,11 +1707,9 @@ class Ciphertensor[ctype]:
             # Assume diagonals are trailed by zeros and pad them lazily by expanding shape
             other_cipher.shape[1] <<= 1
         
-        if patch_copy_self.level() - 2 <= mpc.mhe.bootstrap_min_level:
-            mpc.mhe.refresh(patch_copy_self._data, self._is_broadcast, True)
+        mpc.mhe.refresh(patch_copy_self._data, self._is_broadcast, min_level_distance=2)
         if isinstance(other_cipher, Ciphertensor[Ciphertext]):
-            if other_cipher.level() - 2 <= mpc.mhe.bootstrap_min_level:
-                mpc.mhe.refresh(other_cipher._data, other_cipher._is_broadcast, True)
+            mpc.mhe.refresh(other_cipher._data, other_cipher._is_broadcast)
         
         new_data = []
         debug_counter = 0
