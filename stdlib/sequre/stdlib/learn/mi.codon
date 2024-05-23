@@ -10,6 +10,7 @@ from numpy.create import zeros
 from sequre import sequre
 from sequre.utils.io import log
 from sequre.constants import MI_BATCHED_MODE, MI_STOCHASTIC_MODE
+from sequre.types.multiparty_union import MPU
 
 
 class Imputer[M]:
@@ -53,7 +54,58 @@ class Imputer[M]:
         return X, X_complement, y
     
     @staticmethod
+    def split_train_test_partitioned(data, target_col: int, miss_rows: List[int]):
+        if not isinstance(data, MPU):
+            compile_error("split_train_test_partitioned is reserved only for MPU type")
+        assert data.is_mpp(), "Imputer: Invalid MPU sub-type. It should be MPP."
+        
+        mpc = data.mpc
+        ratios = data._mpp._ratios
+        m, n = data.shape_local
+        
+        if mpc.pid == 0:
+            miss_count = len(miss_rows)
+        else:
+            miss_count = 0
+            lower_bound = ratios[:mpc.pid - 1].sum()
+            upper_bound = ratios[:mpc.pid].sum()
+
+            for miss_row in miss_rows:
+                if lower_bound <= miss_row < upper_bound:
+                    miss_count += 1
+
+        _complete_rows = zeros((m - miss_count, n - 1))
+        _complete_labels = zeros((m - miss_count, 1))
+        _incomplete_rows = zeros((miss_count, n - 1))
+
+        if mpc.pid == 0:
+            return (MPU(mpc, _complete_rows, "partition"),
+                    MPU(mpc, _incomplete_rows, "partition"),
+                    MPU(mpc, _complete_labels, "partition"))
+
+        x_idx = 0
+        x_com_idx = 0
+        for local_i in range(m):
+            actual_i = lower_bound + local_i
+            row = data._mpp._local_data[local_i]
+            row_complement = row.erase_element(target_col)
+            if actual_i in miss_rows:
+                _incomplete_rows[x_com_idx] = row_complement
+                x_com_idx += 1
+            else:
+                _complete_rows[x_idx] = row_complement
+                _complete_labels[x_idx, 0] = row[target_col]
+                x_idx += 1
+        
+        return (MPU(mpc, _complete_rows, "partition"),
+                MPU(mpc, _incomplete_rows, "partition"),
+                MPU(mpc, _complete_labels, "partition"))
+
+    @staticmethod
     def split_train_test(data, target_col: int, miss_rows: List[int]):
+        if isinstance(data, MPU):
+            return Imputer.split_train_test_partitioned(data, target_col, miss_rows)
+        
         m, n = data.shape
         miss_count = len(miss_rows)
 
@@ -91,24 +143,11 @@ class Imputer[M]:
         self.model.fit(mpc, X=complete_data, y=complete_labels, step=step, epochs=epochs)
         imputed_y = self.model.predict(mpc, incomplete_data, noise_scale)
 
-        idx = 0
-        imputed_data = data.copy()
-        for i in miss_rows:
-            imputed_data[i, miss_col] = imputed_y[idx, 0]
-            idx += 1
+        return Imputer.update(data, imputed_y, miss_rows, miss_col, False)
 
-        return imputed_data
-    
     def impute(self, mpc, data, incomplete_data, miss_rows, miss_col, noise_scale):
         imputed_y = self.model.predict(mpc, incomplete_data, noise_scale)
-
-        idx = 0
-        imputed_data = data.copy()
-        for i in miss_rows:
-            imputed_data[i, miss_col] = imputed_y[idx, 0]
-            idx += 1
-
-        return imputed_data
+        return Imputer.update(data, imputed_y, miss_rows, miss_col, False)
     
     def impute_inplace(self, mpc, data, mask, miss_col, noise_scale):
         if mask.sum() == 0:  # Nothing to impute --- no missing data
@@ -117,11 +156,34 @@ class Imputer[M]:
         reference_data = data[:, :miss_col].hstack(data[:, miss_col+1:])
         imputed_y = self.model.predict(mpc, reference_data.filter(mask), noise_scale)
 
+        Imputer.update_via_mask(data, imputed_y, mask, miss_col, True)
+
+    @staticmethod
+    def update(data, imputed_y, miss_rows, miss_col, inplace):
         idx = 0
+        imputed_data = data if inplace else data.copy()
+        for i in miss_rows:
+            if isinstance(data, MPU):
+                imputed_data[i, miss_col] = imputed_y.reveal()[idx, 0]
+            else:
+                imputed_data[i, miss_col] = imputed_y[idx, 0]
+            idx += 1
+
+        return imputed_data
+    
+    @staticmethod
+    def update_via_mask(data, imputed_y, mask, miss_col, inplace):
+        idx = 0
+        imputed_data = data if inplace else data.copy()
         for i in range(len(mask)):
             if mask[i]:
-                data[i, miss_col] = imputed_y[idx, 0]
+                if isinstance(data, MPU):
+                    imputed_data[i, miss_col] = imputed_y.reveal()[idx, 0]
+                else:
+                    imputed_data[i, miss_col] = imputed_y[idx, 0]
                 idx += 1
+
+        return imputed_data
     
 
 class MI[IM, FM]:
