@@ -57,6 +57,3 @@ RUN \
     cmake --build build --config Release
 
 WORKDIR /sequre
-
-# Compile
-RUN CODON_DEBUG=lt scripts/run.sh -release build --build-only
