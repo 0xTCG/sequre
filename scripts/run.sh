@@ -43,6 +43,7 @@ then
 else
     if [[ $* == *--build* ]]
     then
+        rm -f ./sequrex
         echo "Compiling $2 in $1 mode ..."
         CC=clang CXX=clang++ $SEQURE_CODON_PATH/build/codon build --disable-opt="core-pythonic-list-addition-opt" -plugin $SEQURE_PATH -plugin $SEQURE_SEQ_PATH $1 -o sequrex scripts/invoke.codon
     fi
