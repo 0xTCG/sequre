@@ -211,7 +211,7 @@ def linkage_disequilibrium_filter(mpc, snp_pos, miss, dosage, geno_mean, geno_st
 
 
 @sequre
-def population_stratification_analysis(mpc, top_components, oversampling_count, power_iterations,
+def psa_with_norm(mpc, top_components, oversampling_count, power_iterations,
         snp_pos, cov, geno_mean, geno_std_inv, ind_keep, gkeep, miss, dosage):
     
     miss, dosage, geno_mean, geno_std_inv = linkage_disequilibrium_filter(
@@ -261,90 +261,39 @@ def gwas_protocol(mpc, modulus):
     ikeep, gwas_snp_keep_mask) = quality_control(
         mpc, NUM_INDS, NUM_SNPS, snp_pos, pheno, cov, g, miss, dosage)
     
-    s = time.time()
-    print(f"CP{mpc.pid}:\tTemp counter: GWAS-MPC PSA bytes sent before PSA {mpc.stats.bytes_sent}")
-    components = population_stratification_analysis(mpc, PCA_COMPONENTS, PCA_OVERSAMPLES, PCA_POWER_ITERATIONS,
+    components = psa_with_norm(mpc, PCA_COMPONENTS, PCA_OVERSAMPLES, PCA_POWER_ITERATIONS,
             snp_pos, cov, g_mean, g_std_bern_inv, ikeep, gwas_snp_keep_mask, miss, dosage)
-    e = time.time()
-    print(f"CP{mpc.pid}:\tTemp counter: GWAS-MPC PSA done in {e - s}s")
-    print(f"CP{mpc.pid}:\tTemp counter: GWAS-MPC PSA bytes sent after PSA {mpc.stats.bytes_sent}")
-    
-    ca = cochran_armitage(mpc, components, pheno, dosage.filter(ikeep).T.filter(gwas_snp_keep_mask).T)
-    e = time.time()
-    print(f"CP{mpc.pid}:\tTemp counter: GWAS-MPC PSA + CA done in {e - s}s")
-    print(f"CP{mpc.pid}:\tTemp counter: GWAS-MPC PSA bytes sent after CA {mpc.stats.bytes_sent}")
-
-    return ca
+    return cochran_armitage(mpc, components, pheno, dosage.filter(ikeep).T.filter(gwas_snp_keep_mask).T)
 
 
 @sequre
-def sf_psa_experimental(mpc, geno, cov, top_components, oversampling_count, power_iterations, cp_1_size):
+def psa_without_norm(mpc, geno, cov, top_components, oversampling_count, power_iterations):
     U = random_pca_without_projection(
         mpc, geno, top_components,
         oversampling_count, power_iterations)
-    
     print(f"CP{mpc.pid}:\tSelected {top_components} eigenvectors.")
-    return orthonormalize(mpc, U.extend(cov.T.to_fp()))
+
+    if cov.shape[1] > 1:
+        U.extend(cov.T.to_fp())
+
+    return U.via_mpc(lambda stensor: orthonormalize(mpc, stensor))
 
 
-def sf_gwas_experimental(mpc, modulus):
-    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
-    assert SKIP_QC, "Not implemented yet: MHE GWAS QC"
+def gwas_without_norm(mpc, dosage, pheno, cov, pca_top_components_count, pca_oversampling_count, pca_power_iterations_count):
+    assert SKIP_QC, "Not implemented yet: GWAS QC without norm"
+
+    with time.timing(f"CP{mpc.pid}:\tGWAS PSA"):
+        bs = mpc.stats.bytes_sent
+        components = psa_without_norm(
+            mpc, dosage, cov, pca_top_components_count,
+            pca_oversampling_count, pca_power_iterations_count)
+        be = mpc.stats.bytes_sent
+        print(f"CP{mpc.pid}:\tGWAS PSA bytes sent: {be - bs}")
     
-    # Experimental run: temp solution for loading data to facilitate easier testing
-    indv_per_party = 64
-    indv_count = indv_per_party * (mpc.comms.number_of_parties - 1)
-    cov_count = 2
-    top_components_count = 2
-    oversampling_count = 2
-    snps_count = 1 << 14
-    power_iterations_count = 1
-
-    path = "data/gwas/lung"
-    raw_pheno = loadtxt(f"{path}/pheno.txt", shape=(indv_count,), dtype=float)
-    raw_cov = loadtxt(f"{path}/cov.txt", shape=(indv_count, cov_count), dtype=float)
-    raw_dosage = loadtxt(f"{path}/filtered_dosage.txt", shape=(indv_count, snps_count), dtype=float)
-    raw_dosage -= raw_dosage.mean(axis=0)
-    raw_dosage /= len(raw_dosage)
-        
-    def _get_partition(mpc, data, rows, cols):
-        dealer_data = zeros(((mpc.comms.number_of_parties - 1) * rows, cols))
-        return data[(mpc.pid - 1) * rows: mpc.pid * rows, :cols] if mpc.pid else dealer_data
-
-    def _get_partition_1_dim(mpc, data, rows):
-        dealer_data = zeros(((mpc.comms.number_of_parties - 1) * rows,))
-        return data[(mpc.pid - 1) * rows: mpc.pid * rows] if mpc.pid else dealer_data
-
-    partition_dosage = _get_partition(mpc, raw_dosage, indv_per_party, snps_count)
-    partition_cov = _get_partition(mpc, raw_cov, indv_per_party, cov_count)
-    partition_pheno = _get_partition_1_dim(mpc, raw_pheno, indv_per_party)
-    
-    dosage = MPU(mpc, partition_dosage, "partition")
-    cov = MPU(mpc, partition_cov, "partition")
-    pheno = MPU(mpc, partition_pheno, "partition").T
-    
-    mpc.randomness.reset_seed(-1, hash('global'))
-    raw_components = sf_psa_experimental(
-        mpc, raw_dosage, raw_cov, top_components_count,
-        oversampling_count, power_iterations_count, indv_per_party)
-    raw_ca = cochran_armitage(mpc, raw_components, raw_pheno, raw_dosage)
-
-    s = time.time()
-    mpc.randomness.reset_seed(-1, hash('global'))
-    components = sf_psa_experimental(
-        mpc, dosage, cov, top_components_count,
-        oversampling_count, power_iterations_count, indv_per_party)
-    e = time.time()
-    print(f"CP{mpc.pid}:\tTemp counter: GWAS PSA done in {e - s}s")
-    print(f"CP{mpc.pid}:\tTemp counter: GWAS-MPC PSA bytes sent after PSA {mpc.stats.bytes_sent}")
-    
-    s = time.time()
-    ca = cochran_armitage(mpc, components, pheno, dosage)
-    e = time.time()
-    print(f"CP{mpc.pid}:\tTemp counter: GWAS PSA and CA done in {e - s}s")
-    print(f"CP{mpc.pid}:\tTemp counter: GWAS-MPC CA bytes sent after CA {mpc.stats.bytes_sent}")
-
-    # if mpc.pid:
-    #     assert_eq_approx(f'CP{mpc.pid}:\tSequre GWAS-MHE ({alg_struct}) test', ca.reveal(mpc), raw_ca.nan_to_num(), error=0.05)
+    with time.timing(f"CP{mpc.pid}:\tGWAS CA"):
+        bs = mpc.stats.bytes_sent
+        ca = cochran_armitage(mpc, components, pheno, dosage)
+        be = mpc.stats.bytes_sent
+        print(f"CP{mpc.pid}:\tGWAS CA bytes sent: {be - bs}")
 
     return ca

@@ -1,4 +1,7 @@
-from numpy.create import zeros_like, array
+import time
+import toml
+
+from numpy.create import zeros, zeros_like, array, loadtxt
 
 from sequre.types.sharetensor import Sharetensor
 from sequre.types.multiparty_union import MPU
@@ -8,7 +11,7 @@ from sequre.utils.utils import random_ints, random_floats
 from .. import \
     cochran_armitage, \
     gwas_protocol, \
-    sf_gwas_experimental
+    gwas_without_norm
 
 
 def test_cochran_armitage(mpc, modulus):
@@ -101,11 +104,64 @@ def test_gwas_mpc(mpc, modulus):
 
 
 def test_gwas_mhe(mpc, modulus):
-    print(f'CP{mpc.pid}:\tTesting Sequre GWAS-MHE on {"ring" if modulus.popcnt() == 1 else "field"} ... \n')
-    sf_gwas_experimental(mpc, modulus)
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    print(f'CP{mpc.pid}:\tTesting Sequre GWAS-MHE on {alg_struct} ... \n')
+    config = toml.read("tests/config/gwas.toml")
+    
+    indv_per_party = config.get("individuals_per_party", T=int)
+    indv_count = indv_per_party * (mpc.comms.number_of_parties - 1)
+    snps_count = config.get("number_of_snps", T=int)
+    cov_count = config.get("number_of_covariates", T=int)
+    pca_top_components_count = config.get("pca_components", T=int)
+    pca_oversampling_count = config.get("pca_oversampling", T=int)
+    pca_power_iterations_count = config.get("pca_power_iterations", T=int)
+
+    path = config.get("data_dir", T=str)
+    raw_pheno = loadtxt(f"{path}/pheno.txt", shape=(indv_count,), dtype=float)
+    raw_cov = loadtxt(f"{path}/cov.txt", shape=(indv_count, cov_count), dtype=float)
+    raw_dosage = loadtxt(f"{path}/dosage.txt", shape=(indv_count, snps_count), dtype=float)
+    raw_dosage -= raw_dosage.mean(axis=0)
+    raw_dosage /= len(raw_dosage)
+
+    def _get_partition(mpc, data, rows, cols):
+        dealer_data = zeros(((mpc.comms.number_of_parties - 1) * rows, cols))
+        return data[(mpc.pid - 1) * rows: mpc.pid * rows, :cols] if mpc.pid else dealer_data
+
+    def _get_partition_1_dim(mpc, data, rows):
+        dealer_data = zeros(((mpc.comms.number_of_parties - 1) * rows,))
+        return data[(mpc.pid - 1) * rows: mpc.pid * rows] if mpc.pid else dealer_data
+
+    partition_dosage = _get_partition(mpc, raw_dosage, indv_per_party, snps_count)
+    partition_cov = _get_partition(mpc, raw_cov, indv_per_party, cov_count)
+    partition_pheno = _get_partition_1_dim(mpc, raw_pheno, indv_per_party)
+    
+    mhe_dosage = MPU(mpc, partition_dosage, "partition")
+    mhe_cov = MPU(mpc, partition_cov, "partition")
+    mhe_pheno = MPU(mpc, partition_pheno, "partition").T
+
+    mpc.randomness.reset_seed(-1, hash('global'))
+    with time.timing(f"CP{mpc.pid}:\tRaw GWAS without normalization"):
+        bs = mpc.stats.bytes_sent
+        raw_ca = gwas_without_norm(
+            mpc, raw_dosage, raw_pheno, raw_cov, pca_top_components_count,
+            pca_oversampling_count, pca_power_iterations_count)
+        be = mpc.stats.bytes_sent
+    print(f"CP{mpc.pid}:\tRaw GWAS without normalization bytes sent: {be - bs}")
+
+    mpc.randomness.reset_seed(-1, hash('global'))
+    with time.timing(f"CP{mpc.pid}:\tMHE GWAS without normalization"):
+        bs = mpc.stats.bytes_sent
+        mhe_ca = gwas_without_norm(
+            mpc, mhe_dosage, mhe_pheno, mhe_cov, pca_top_components_count,
+            pca_oversampling_count, pca_power_iterations_count)
+        be = mpc.stats.bytes_sent
+    print(f"CP{mpc.pid}:\tMHE GWAS without normalization bytes sent: {be - bs}")
+    
+    if mpc.pid:
+        assert_eq_approx(f'CP{mpc.pid}:\tSequre GWAS-MHE ({alg_struct}) test', mhe_ca.reveal(mpc), raw_ca.nan_to_num())
 
 
 def test_gwas(mpc, modulus):
-    test_gwas_mpc(mpc, modulus)
     test_gwas_sections(mpc, modulus)
-    # test_gwas_mhe(mpc, modulus)
+    test_gwas_mpc(mpc, modulus)
+    test_gwas_mhe(mpc, modulus)
