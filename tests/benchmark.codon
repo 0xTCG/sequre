@@ -1,4 +1,5 @@
 import toml
+import secure_operator
 
 from time import timing
 from datetime import datetime
@@ -129,49 +130,112 @@ def mhe_wrapper(mpc, modulus):
     boot_lvl = ciphertext_bootstrapped.level()
 
     print(f"CP{mpc.pid}:\tMHE collective bootstrapping level (Bootstrapped level: {boot_lvl}. Initial level: {initial_level}. Reduced level: {ciphervector[0].level()})")
+
+def stdlib_builtin_wrapper(mpc, modulus):
+    rows_per_party_setups = [16, 64]
+    cols = 8192
     
+    for rows_per_party in rows_per_party_setups:
+        rows = rows_per_party * (mpc.comms.number_of_parties - 1)
+
+        with mpc.randomness.seed_switch(-1):
+            raw_data = array(random_ints((rows, cols), 0, 2), dtype=float)
+        raw_data_partition = zeros_like(raw_data) if mpc.pid == 0 else raw_data[(mpc.pid - 1) * rows_per_party:mpc.pid * rows_per_party]
+
+        with timing(f"CP{mpc.pid}:\tSequre A @ A.T"):
+            bs = mpc.stats.bytes_sent
+            sequre_data = Sharetensor.enc(mpc, raw_data)
+            mpc_matmul = secure_operator.matmul(mpc, sequre_data, sequre_data.T)
+            mpc_matmul.reveal(mpc)
+            be = mpc.stats.bytes_sent
+        print(f"CP{mpc.pid}:\tSequre A @ A.T for shape {sequre_data.shape} bytes sent: {be - bs}")
+
+        with timing(f"CP{mpc.pid}:\tSequre L2"):
+            bs = mpc.stats.bytes_sent
+            sequre_data = Sharetensor.enc(mpc, raw_data)
+            mpc_distance = l2(mpc, sequre_data)
+            mpc_distance.reveal(mpc)
+            be = mpc.stats.bytes_sent
+        print(f"CP{mpc.pid}:\tSequre L2 for shape {sequre_data.shape} bytes sent: {be - bs}")
+
+        with timing(f"CP{mpc.pid}:\tSheQi A @ A.T"):
+            bs = mpc.stats.bytes_sent
+            sheqi_data = MPU(mpc, raw_data_partition, "partition")
+            mhe_matmul = secure_operator.matmul(mpc, sheqi_data, sheqi_data.T)
+            mhe_matmul.reveal(mpc)
+            be = mpc.stats.bytes_sent
+        print(f"CP{mpc.pid}:\tSheQi A @ A.T for shape {sheqi_data.shape} bytes sent: {be - bs}")
+
+        with timing(f"CP{mpc.pid}:\tSheQi L2"):
+            bs = mpc.stats.bytes_sent
+            sheqi_data = MPU(mpc, raw_data_partition, "partition")
+            mhe_distance = l2(mpc, sheqi_data)
+            mhe_distance.reveal(mpc)
+            be = mpc.stats.bytes_sent
+        print(f"CP{mpc.pid}:\tSheQi L2 for shape {sheqi_data.shape} bytes sent: {be - bs}")
+    
+    rows_per_party = 4096
+    rows = rows_per_party * (mpc.comms.number_of_parties - 1)
+    cols_setups = [32, 128]
+
+    for cols in cols_setups:
+        with mpc.randomness.seed_switch(-1):
+            raw_data = array(random_ints((rows, cols), 0, 2), dtype=float)
+        raw_data_partition = zeros_like(raw_data) if mpc.pid == 0 else raw_data[(mpc.pid - 1) * rows_per_party:mpc.pid * rows_per_party]
+
+        with timing(f"CP{mpc.pid}:\tSheQi A.T @ A"):
+            bs = mpc.stats.bytes_sent
+            sheqi_data = MPU(mpc, raw_data_partition, "partition")
+            mhe_matmul = secure_operator.matmul(mpc, sheqi_data.T, sheqi_data)
+            mhe_matmul.reveal(mpc)
+            be = mpc.stats.bytes_sent
+        print(f"CP{mpc.pid}:\tSheQi A.T @ A for shape {sheqi_data.shape} bytes sent: {be - bs}")
+
+    return sheqi_data
+
 def king_wrapper(mpc, modulus):
-    slots = mpc.mhe.crypto_params.params.slots()
+    config = toml.read("applications/config/king.toml")
 
-    rows_per_party = 16
-    snps_count = 145443
-    cols = snps_count // slots * slots
+    rows_per_partition = config.get("individuals_per_party", T=int)
+    rows = rows_per_partition * (mpc.comms.number_of_parties - 1)
+    cols = config.get("number_of_snps", T=int)
+    het_inv_scale = cols // 100
     
-    mpp_data = MPP.collective_load(
-        mpc, f"data/king/1000_genomes_ph_3/partition_small_{mpc.pid}.bin",
-        rows=rows_per_party, cols=cols, binary=True, dtype=int).astype(float)
+    # Generate data
+    with mpc.randomness.seed_switch(-1):
+        raw_data = array(random_ints((rows, cols), 0, 2), dtype=float)
+    raw_data_partition = zeros_like(raw_data) if mpc.pid == 0 else raw_data[(mpc.pid - 1) * rows_per_partition:mpc.pid * rows_per_partition]
+    sequre_data = Sharetensor.enc(mpc, raw_data)
+    sheqi_data = MPP(mpc, raw_data_partition)
     
-    het_inv_scale = 1000
-    het_inv = MPP.like(mpp_data, array([[(1 / row.count(1)) for _ in range(len(mpp_data))] for row in mpp_data], dtype=float))
-    scaled_het_inv = het_inv * 1000
+    # Upscale het_inv by het_inv_scale to reduce the impact of CKKS noise
+    raw_het_inv = array([[(1 / row.count(1)) for _ in range(rows)] for row in raw_data], dtype=float) * het_inv_scale
+    raw_het_inv_partition = zeros_like(raw_het_inv) if mpc.pid == 0 else raw_het_inv[(mpc.pid - 1) * rows_per_partition:mpc.pid * rows_per_partition]
+    sequre_het_inv = Sharetensor.enc(mpc, raw_het_inv)
+    sheqi_het_inv = MPP(mpc, raw_het_inv_partition)
+    
+    bs = mpc.stats.bytes_sent
+    with timing(f"CP{mpc.pid}:\tRaw KING for shape: {raw_data.shape}"):
+        classic_king_coefficients = king(mpc, raw_data, raw_het_inv)
+    be = mpc.stats.bytes_sent
+    print(f"CP{mpc.pid}: Bytes sent raw king: {be - bs}")
+    log("", classic_king_coefficients.nan_to_num().tolist(), path=f'results/raw_king_CP{mpc.pid}_ind_{rows}_snps_{cols}.txt', mode='w', separator=' ')
+    
+    bs = mpc.stats.bytes_sent
+    with timing(f"CP{mpc.pid}:\tSequre KING for shape: {sequre_data.shape}"):
+        sequre_king_coefficients = king(mpc, sequre_data, sequre_het_inv)
+    be = mpc.stats.bytes_sent
+    print(f"CP{mpc.pid}: Bytes sent Sequre king: {be - bs}")
+    log("", sequre_king_coefficients.reveal(mpc).tolist(), path=f'results/mpc_king_CP{mpc.pid}_ind_{rows}_snps_{cols}.txt', mode='w', separator=' ')
+    
+    bs = mpc.stats.bytes_sent
+    with timing(f"CP{mpc.pid}:\tSheQi KING for shape: {sheqi_data.shape}"):
+        sheqi_king_coefficients = king(mpc, sheqi_data, sheqi_het_inv)
+    be = mpc.stats.bytes_sent
+    print(f"CP{mpc.pid}: Bytes sent SheQi king: {be - bs}")
+    log("", sheqi_king_coefficients.reveal(mpc).tolist(), path=f'results/mhe_king_CP{mpc.pid}_ind_{rows}_snps_{cols}.txt', mode='w', separator=' ')
 
-    return king(mpc, mpp_data, scaled_het_inv) / het_inv_scale
-
-def king_mpc_wrapper(mpc, modulus):
-    ins_per_party = 16
-    rows = ins_per_party * (mpc.comms.number_of_parties - 1)
-    snps_count = 145443
-    cols = snps_count // 8192 * 8192
-    
-    if mpc.pid:
-        with open(f"data/king/1000_genomes_ph_3/partition_small_{mpc.pid}.bin") as f:
-            raw_data = read_ndarray(f, (ins_per_party, cols), True, dtype=float)
-            raw_het_inv = array([[(1 / row.count(1)) for _ in range(rows)] for row in raw_data], dtype=float)
-    else:
-        raw_data = zeros((ins_per_party, cols), dtype=float)
-        raw_het_inv = zeros((ins_per_party, rows), dtype=float)
-    
-    mpc_data = Sharetensor(list[list[mpc_uint]](rows), modulus)
-    mpc_data.fp = True
-    for p in range(1, mpc.comms.number_of_parties):
-        mpc_data.extend(Sharetensor.enc(mpc, raw_data, p, modulus))
-    
-    mpc_het_inv = Sharetensor(list[list[mpc_uint]](rows), modulus)
-    mpc_het_inv.fp = True
-    for p in range(1, mpc.comms.number_of_parties):
-        mpc_het_inv.extend(Sharetensor.enc(mpc, raw_het_inv, p, modulus))
-    
-    return king(mpc, mpc_data, mpc_het_inv)
+    return sheqi_king_coefficients
 
 def pca_wrapper(mpc, modulus):
     def _project(mpc, components, data):
@@ -198,7 +262,7 @@ def pca_wrapper(mpc, modulus):
     mp_data = MPU(mpc, partition, "partition")
     
     mpc.randomness.reset_seed(-1, hash('global'))
-    with timing(f"CP{mpc.pid}:\tRaw PCA"):
+    with timing(f"CP{mpc.pid}:\tRaw PCA for shape {raw_data.shape}"):
         bs = mpc.stats.bytes_sent
         raw_y = random_pca_without_projection(
             mpc, raw_data, top_components_count, oversampling_count,
@@ -211,7 +275,7 @@ def pca_wrapper(mpc, modulus):
     log("", raw_projection.tolist(), path=f'results/raw_pca_projection_CP{mpc.pid}_ind_{cols}_snps_{cols}.txt', mode='w', separator=' ')
 
     mpc.randomness.reset_seed(-1, hash('global'))
-    with timing(f"CP{mpc.pid}:\tSequre PCA"):
+    with timing(f"CP{mpc.pid}:\tSequre PCA for shape {mpc_data.shape}"):
         bs = mpc.stats.bytes_sent
         mpc_y = random_pca_without_projection(
             mpc, mpc_data, top_components_count, oversampling_count,
@@ -224,7 +288,7 @@ def pca_wrapper(mpc, modulus):
     log("", mpc_projection.tolist(), path=f'results/mpc_pca_projection_CP{mpc.pid}_ind_{cols}_snps_{cols}.txt', mode='w', separator=' ')
 
     mpc.randomness.reset_seed(-1, hash('global'))
-    with timing(f"CP{mpc.pid}:\tSheQi PCA"):
+    with timing(f"CP{mpc.pid}:\tSheQi PCA for shape {mp_data.shape}"):
         bs = mpc.stats.bytes_sent
         mp_y = random_pca_without_projection(
             mpc, mp_data, top_components_count, oversampling_count,
@@ -319,7 +383,7 @@ def gwas_wo_norm_wrapper(mpc, modulus):
     mhe_pheno = MPU(mpc, partition_pheno, "partition").T
 
     mpc.randomness.reset_seed(-1, hash('global'))
-    with timing(f"CP{mpc.pid}:\tRaw GWAS without normalization"):
+    with timing(f"CP{mpc.pid}:\tRaw GWAS without normalization for shape {raw_dosage.shape}"):
         bs = mpc.stats.bytes_sent
         raw_ca = gwas_without_norm(
             mpc, raw_dosage, raw_pheno, raw_cov, pca_top_components_count,
@@ -330,7 +394,7 @@ def gwas_wo_norm_wrapper(mpc, modulus):
     log("", raw_ca.nan_to_num().tolist(), path=f'results/raw_gwas_assoc_CP{mpc.pid}_ind_{indv_count}_snps_{snps_count}.txt', mode='w', separator=' ')
 
     mpc.randomness.reset_seed(-1, hash('global'))
-    with timing(f"CP{mpc.pid}:\tMPC GWAS without normalization"):
+    with timing(f"CP{mpc.pid}:\tMPC GWAS without normalization for shape {mpc_dosage.shape}"):
         bs = mpc.stats.bytes_sent
         mpc_ca = gwas_without_norm(
             mpc, mpc_dosage, mpc_pheno, mpc_cov, pca_top_components_count,
@@ -341,7 +405,7 @@ def gwas_wo_norm_wrapper(mpc, modulus):
     log("", mpc_ca.reveal(mpc).tolist(), path=f'results/mpc_gwas_assoc_CP{mpc.pid}_ind_{indv_count}_snps_{snps_count}.txt', mode='w', separator=' ')
 
     mpc.randomness.reset_seed(-1, hash('global'))
-    with timing(f"CP{mpc.pid}\tMHE GWAS without normalization"):
+    with timing(f"CP{mpc.pid}\tMHE GWAS without normalization for shape {mhe_dosage.shape}"):
         bs = mpc.stats.bytes_sent
         mhe_ca = gwas_without_norm(
             mpc, mhe_dosage, mhe_pheno, mhe_cov, pca_top_components_count,
@@ -404,10 +468,10 @@ def benchmark[TP](mpc, benchmark_toggles: dict, modulus: TP):
         time_frame(mpc, lattiseq_mult3_wrapper, 'Lattiseq mult3', modulus)
     if benchmark_toggles[RUN_TOGGLES.MHE_FLAG] or run_all:
         time_frame(mpc, mhe_wrapper, 'MHE', modulus)
+    if benchmark_toggles[RUN_TOGGLES.STDLIB_BUILTIN_TEST_FLAG] or run_all:
+        time_frame(mpc, stdlib_builtin_wrapper, 'Stdlib builtins', modulus)
     if benchmark_toggles[RUN_TOGGLES.KING_FLAG] or run_all:
         time_frame(mpc, king_wrapper, 'KING', modulus)
-    if benchmark_toggles[RUN_TOGGLES.KING_MPC_FLAG] or run_all:
-        time_frame(mpc, king_mpc_wrapper, 'KING-MPC', modulus)
     if benchmark_toggles[RUN_TOGGLES.MI_FLAG] or run_all:
         time_frame(mpc, mi_wrapper, 'Multiple imputation', modulus)
     if benchmark_toggles[RUN_TOGGLES.PCA_FLAG] or run_all:
