@@ -109,7 +109,7 @@ else
 fi
 
 # Build Seq
-if [ -d "${SEQURE_SEQ_PATH}/install" ] 
+if [ -d "${SEQURE_CODON_PATH}/install/lib/codon/plugins/seq" ] 
 then
     echo "Found existing Seq-lang installation." 
 else
@@ -139,7 +139,7 @@ else
         return
     fi
 
-    cmake --install build --prefix="${SEQURE_SEQ_PATH}/install"
+    cmake --install build --prefix="${SEQURE_CODON_PATH}/install/lib/codon/plugins/seq"
     if [ $? -eq 0 ]; then
         echo "Seq-lang exported."
     else
@@ -171,5 +171,13 @@ if [ $? -eq 0 ]; then
     echo "Sequre installed."
 else
     echo "Error! Sequre installation failed" >&2
+    return
+fi
+
+cmake --install build --prefix="${SEQURE_CODON_PATH}/install/lib/codon/plugins/sequre"
+if [ $? -eq 0 ]; then
+    echo "Sequre exported."
+else
+    echo "Error! Sequre export failed" >&2
     return
 fi
