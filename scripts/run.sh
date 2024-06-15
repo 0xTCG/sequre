@@ -33,8 +33,33 @@ fi
 echo "Codon path: $SEQURE_CODON_PATH"
 echo "Seq-lang plugin path: $SEQURE_SEQ_PATH"
 echo "Sequre plugin path: $SEQURE_PATH"
-echo "Compiling $2 in $1 mode ..."
-/usr/bin/time -v $SEQURE_CODON_PATH/build/codon run --disable-opt="core-pythonic-list-addition-opt" -plugin $SEQURE_PATH -plugin $SEQURE_SEQ_PATH $1 scripts/invoke.codon run-$2 ${*:3}
+
+if [[ $* == *--jit* ]]
+then
+    echo "Running $2 in $1 mode ..."
+    /usr/bin/time -v $SEQURE_CODON_PATH/build/codon run --disable-opt="core-pythonic-list-addition-opt" -plugin $SEQURE_PATH -plugin $SEQURE_SEQ_PATH $1 scripts/invoke.codon run-$2 ${*:3}
+    echo "Cleaning up sockets ..."
+    find . -name 'sock.*' -exec rm {} \;
+else
+    if [[ $* == *--build* ]]
+    then
+        rm -f ./sequrex
+        echo "Compiling $2 in $1 mode ..."
+        CC=clang CXX=clang++ $SEQURE_CODON_PATH/build/codon build --disable-opt="core-pythonic-list-addition-opt" -plugin $SEQURE_PATH -plugin $SEQURE_SEQ_PATH $1 -o sequrex scripts/invoke.codon
+    fi
+
+    if [ ! -f "./sequrex" ]
+    then
+        echo "Sequre is not built. Make sure to add --build flag in first run." >&2
+        return
+    fi
+
+    if [[ ! $* == *--build-only* ]]
+    then
+        echo "Running $2 in $1 mode ..."
+        /usr/bin/time -v ./sequrex run-$2 ${*:3}
+    fi
+fi
 
 echo "Cleaning up sockets ..."
 find . -name 'sock.*' -exec rm {} \;

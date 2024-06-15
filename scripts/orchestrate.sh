@@ -5,4 +5,8 @@ if [[ -z "${SEQURE_CP_IPS}" ]]; then
     return
 fi
 
-ssh location docker run --rm -t -e "CODON_DEBUG='lt'" -e "SEQURE_CP_IPS=127.0.0.1,127.0.0.1,127.0.0.1" -p 9001:9001 -p 9002:9002 hsmile/sequre scripts/run.sh -debug tests --mpc 0
+SEQURE_CP_IPS_ARR=(${SEQURE_CP_IPS//,/ })
+SEQURE_CP_IPS_ARR_SIZE=${#SEQURE_CP_IPS_ARR[@]}
+SEQURE_CP_IPS_ARR_SIZE=$(($SEQURE_CP_IPS_ARR_SIZE - 1))
+
+parallel -S ${SEQURE_CP_IPS//,/ -S } "podman run -e 'CODON_DEBUG=lt' -e 'SEQURE_CP_IPS=${SEQURE_CP_IPS}' --privileged hsmile/sheqi:latest scripts/run.sh ${*:1} {}" ::: $(seq -s" " 0 $SEQURE_CP_IPS_ARR_SIZE)
