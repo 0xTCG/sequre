@@ -50,7 +50,7 @@ else
 
     if [ ! -f "./sequrex" ]
     then
-        echo "Sequre is not built. Make sure to add --build flag in first run." >&2
+        echo "Sequre is not built. Make sure to add --build flag in first run or use --jit mode." >&2
         return
     fi
 
@@ -60,21 +60,6 @@ else
         /usr/bin/time -v ./sequrex run-$2 ${*:3}
     fi
 fi
-
-# if [[ $* == *--build* ]]
-# then
-#     echo "Compiling $2 in $1 mode ..."
-#     CC=clang CXX=clang++ $SEQURE_CODON_PATH/build/codon build --disable-opt="core-pythonic-list-addition-opt" -plugin $SEQURE_PATH -plugin $SEQURE_SEQ_PATH $1 -o sequrex scripts/invoke.codon
-# fi
-
-# if [ ! -f "./sequrex" ]
-# then
-#     echo "Sequre is not built. Make sure to add --build flag in first run." >&2
-#     return
-# fi
-
-# echo "Running $2 in $1 mode ..."
-# /usr/bin/time -v ./sequrex run-$2 ${*:3}
 
 echo "Cleaning up sockets ..."
 find . -name 'sock.*' -exec rm {} \;

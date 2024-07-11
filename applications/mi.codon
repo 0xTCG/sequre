@@ -10,7 +10,7 @@ from numpy.create import array, zeros, ones, ones_like
 
 from sequre.stdlib.learn.log_reg import LogReg
 from sequre.stdlib.learn.lin_reg import LinReg
-from sequre.stdlib.learn.mi import MI, BatchMI
+from sequre.stdlib.learn.mi import MI, MICE
 from sequre.types.sharetensor import Sharetensor
 from sequre.types.multiparty_union import MPU
 from sequre.utils.io import read_matrix, log
@@ -249,12 +249,16 @@ def load_scenario_mi_data(scenario: str, rows_count: int, cols_count: int):
         miss_rows = read_matrix(f, rows_count, 1, binary=False, TP=int).flatten()
     
     feature_count = cols_count
-    im_step_size = 1 / (1 << 11) if "1" in scenario else 1 / (1 << 7)
-    fm_step_size = 1 / (1 << 12)
     im_initial_w = ones((feature_count, 1))
     fm_initial_w = ndarray.rand((feature_count + 1, 1), "uniform")
-    im_optimizer = "bgd" if "1" in scenario else "bgd"
-    fm_optimizer = "bgd" if "1" in scenario else "bgd"
+    im_optimizer = "bgd"
+    fm_optimizer = "bgd"
+
+    im_step_size = 1 / (1 << 11)
+    fm_step_size = 1 / (1 << 12)
+    if "scenario_siMICE_2" in scenario:
+        im_step_size = 1 / (1 << 7)
+        im_step_size /= (1 << (rows_count // 2000))
     
     return (incomplete_data, complete_data, labels, miss_rows,
         im_initial_w, fm_initial_w, im_step_size, fm_step_size,
@@ -298,7 +302,7 @@ def evaluate_scenario(
         secure_labels = Sharetensor.enc(mpc, labels, 0, modulus)
         secure_im_initial_w = Sharetensor.enc(mpc, im_initial_w, 0, modulus)
         secure_fm_initial_w = Sharetensor.enc(mpc, fm_initial_w, 0, modulus)
-    elif backend == "sheqi":
+    elif backend == "shechi":
         secure_complete_data = MPU.partition(mpc, complete_data)
         secure_data = MPU.partition(mpc, data)
         secure_labels = MPU.partition(mpc, labels)
@@ -333,14 +337,18 @@ def evaluate_scenario(
     imputed_cols = []
     for imputed_dataset in secure_imputed_datasets:
         raw_data = imputed_dataset.reveal(mpc)
-        imputed_cols.append(array([raw_data[miss_row, miss_col] for miss_row in miss_rows]))
+        imputed_col = array([raw_data[miss_row, miss_col] for miss_row in miss_rows])
+        if "_2" in msg:
+            imputed_col = imputed_col.round()
+        imputed_cols.append(imputed_col)
     
     expected_imputation = array([complete_data[miss_row, miss_col] for miss_row in miss_rows])
     imputation_abs_diff = ([(imputed_col - expected_imputation).abs() for imputed_col in imputed_cols]).sum() / len(imputed_cols)
     imputation_diff_mean = imputation_abs_diff.mean()
     imputation_diff_std = imputation_abs_diff.std()
+    imputation_accuracy = ([((imputed_col == expected_imputation).astype(int).sum() / len(expected_imputation)) for imputed_col in imputed_cols]).mean()
 
-    return secure_mi.model.coef_.reveal(mpc), y_hat_y_mean, y_hat_y_sd, imputation_diff_mean, imputation_diff_std
+    return secure_mi.model.coef_.reveal(mpc), y_hat_y_mean, y_hat_y_sd, imputation_diff_mean, imputation_diff_std, imputation_accuracy
 
 
 def benchmark_scenario(mpc, backend: Static[str], msg: Static[str], runs_count: int, scenario, im_epochs: int,
@@ -351,12 +359,13 @@ def benchmark_scenario(mpc, backend: Static[str], msg: Static[str], runs_count: 
     y_hat_y_sds = zeros((runs_count,))
     imp_means = zeros((runs_count,))
     imp_sds = zeros((runs_count,))
+    imp_accs = zeros((runs_count,))
     runtimes = zeros((runs_count,))
     network_bws = zeros((runs_count,))
     
     for i in tqdm(mpc, range(runs_count), "Evaluating scenario"):
         time_s, net_s = time.time(), mpc.stats.bytes_sent
-        coef, y_hat_y_mean, y_hat_y_sd, imp_mean, imp_sd = evaluate_scenario(
+        coef, y_hat_y_mean, y_hat_y_sd, imp_mean, imp_sd, imp_acc = evaluate_scenario(
             mpc, backend, msg, scenario, im_epochs, fm_epochs, noise_scale,
             mi_factor, miss_col, dump_data, verbose, modulus)
         time_e, net_e = time.time(), mpc.stats.bytes_sent
@@ -366,10 +375,11 @@ def benchmark_scenario(mpc, backend: Static[str], msg: Static[str], runs_count: 
         y_hat_y_sds[i] = y_hat_y_sd
         imp_means[i] = imp_mean
         imp_sds[i] = imp_sd
+        imp_accs[i] = imp_acc
         runtimes[i] = time_e - time_s
         network_bws[i] = net_e - net_s
     
-    return coefs, y_hat_y_means, y_hat_y_sds, imp_means, imp_sds, runtimes, network_bws
+    return coefs, y_hat_y_means, y_hat_y_sds, imp_means, imp_sds, imp_accs, runtimes, network_bws
 
 
 def evaluate_real_setup(mpc, backend: Static[str], real_data, mi_factor: int, im_epochs: int, fm_epochs: int, noise_scale: float, dump_data: bool, verbose: bool, modulus):
@@ -384,7 +394,7 @@ def evaluate_real_setup(mpc, backend: Static[str], real_data, mi_factor: int, im
         secure_labels = Sharetensor.enc(mpc, labels, 0, modulus)
         secure_im_initial_w = Sharetensor.enc(mpc, im_initial_w, 0, modulus)
         secure_fm_initial_w = Sharetensor.enc(mpc, fm_initial_w, 0, modulus)
-    elif backend == "sheqi":
+    elif backend == "shechi":
         secure_incomplete_data = MPU.partition(mpc, incomplete_data)
         secure_complete_data = MPU.partition(mpc, complete_data)
         secure_labels = MPU.partition(mpc, labels)
@@ -396,7 +406,7 @@ def evaluate_real_setup(mpc, backend: Static[str], real_data, mi_factor: int, im
     secure_impute_models = [_match_model(mpc, col_type, secure_im_initial_w, im_optimizer) for col_type in col_types]
     secure_fit_model = LinReg(secure_fm_initial_w, fm_optimizer)
     
-    secure_mi, secure_imputed_datasets = BatchMI(mi_factor, secure_impute_models, secure_fit_model).fit(
+    secure_mi, secure_imputed_datasets = MICE(mi_factor, secure_impute_models, secure_fit_model).fit(
         mpc, secure_incomplete_data, secure_complete_data, secure_labels, miss_row_masks,
         im_step_size, fm_step_size, im_epochs, fm_epochs, noise_scale, verbose=verbose)
     
@@ -434,34 +444,43 @@ def benchmark_real_setup(mpc, backend: Static[str], runs_count: int, real_data, 
         runtimes[i] = time_e - time_s
         network_bws[i] = net_e - net_s
     
-    return zeros((runs_count, 15)), y_hat_y_means, y_hat_y_sds, zeros((runs_count,)) - 1, zeros((runs_count,)) - 1, runtimes, network_bws
+    return zeros((runs_count, 15)), y_hat_y_means, y_hat_y_sds, zeros((runs_count,)) - 1, zeros((runs_count,)) - 1, zeros((runs_count,)) - 1, runtimes, network_bws
 
 
-def print_stats(mpc, msg: Static[str], coefs, biases, sds, imp_biases, imp_sds, runtimes, network_bws):
-    print(f"\tCP{mpc.pid}: {msg} | Sequre MI runtime (s) | mean: {runtimes.mean()}, min: {runtimes.min()}, max: {runtimes.max()}")
-    print(f"\tCP{mpc.pid}: {msg} | Sequre MI network bandwidth (bytes) | mean: {network_bws.mean()}, min: {network_bws.min()}, max: {network_bws.max()}")
-    print(f"\tCP{mpc.pid}: {msg} | Sequre MI y_hat - y mean | mean: {biases.mean()}, min: {biases.min()}, max: {biases.max()}")
-    print(f"\tCP{mpc.pid}: {msg} | Sequre MI y_hat - y SD | mean: {sds.mean()}, min: {sds.min()}, max: {sds.max()}")
-    print(f"\tCP{mpc.pid}: {msg} | Sequre MI imputation diff mean | mean: {imp_biases.mean()}, min: {imp_biases.min()}, max: {imp_biases.max()}")
-    print(f"\tCP{mpc.pid}: {msg} | Sequre MI imputation diff SD | mean: {imp_sds.mean()}, min: {imp_sds.min()}, max: {imp_sds.max()}")
+def print_stats(mpc, msg: Static[str], coefs, biases, sds, imp_biases, imp_sds, imp_accs, runtimes, network_bws):
+    csv_out_path = "temp_mi_stats_sequre.csv"
     
-    if msg.lower().startswith("scenario"):
-        coefs_truth = ones_like(coefs[0])
-        coefs_bias = math.sqrt((ndarray.mean(coefs, axis=0) - coefs_truth).flatten().dot(axis=0))
-        coefs_sd = math.sqrt(ndarray.mean((coefs - ndarray.mean(coefs, axis=0)).dot(axis=1)))
-        coefs_rmse = math.sqrt(ndarray.mean((coefs - coefs_truth).dot(axis=1).flatten()))
+    with open(csv_out_path, "a+") as f:
+        if msg.lower().startswith("scenario"):
+            coefs_truth = ones_like(coefs[0])
+            coefs_bias = math.sqrt((ndarray.mean(coefs, axis=0) - coefs_truth).flatten().dot(axis=0))
+            coefs_sd = math.sqrt(ndarray.mean((coefs - ndarray.mean(coefs, axis=0)).dot(axis=1)))
+            coefs_rmse = math.sqrt(ndarray.mean((coefs - coefs_truth).dot(axis=1).flatten()))
 
-        print(f"\tCP{mpc.pid}: {msg} | Sequre MI coefs bias: {coefs_bias}")
-        print(f"\tCP{mpc.pid}: {msg} | Sequre MI coefs SD: {coefs_sd}")
-        print(f"\tCP{mpc.pid}: {msg} | Sequre MI coefs rMSE: {coefs_rmse}")
+            print(f"\tCP{mpc.pid}: {msg} | Sequre MI coefs bias: {coefs_bias}")
+            print(f"\tCP{mpc.pid}: {msg} | Sequre MI coefs SD: {coefs_sd}")
+            print(f"\tCP{mpc.pid}: {msg} | Sequre MI coefs rMSE: {coefs_rmse}")
+
+        if mpc.pid == 1:
+            f.write(f"{coefs_bias},{coefs_sd},{coefs_rmse}," if msg.lower().startswith("scenario") else ",,,")
+
+        print(f"\tCP{mpc.pid}: {msg} | Sequre MI runtime (s) | mean: {runtimes.mean()}, min: {runtimes.min()}, max: {runtimes.max()}")
+        print(f"\tCP{mpc.pid}: {msg} | Sequre MI network bandwidth (bytes) | mean: {network_bws.mean()}, min: {network_bws.min()}, max: {network_bws.max()}")
+        print(f"\tCP{mpc.pid}: {msg} | Sequre MI y_hat - y mean | mean: {biases.mean()}, min: {biases.min()}, max: {biases.max()}")
+        print(f"\tCP{mpc.pid}: {msg} | Sequre MI y_hat - y SD | mean: {sds.mean()}, min: {sds.min()}, max: {sds.max()}")
+        print(f"\tCP{mpc.pid}: {msg} | Sequre MI imputation diff mean | mean: {imp_biases.mean()}, min: {imp_biases.min()}, max: {imp_biases.max()}")
+        print(f"\tCP{mpc.pid}: {msg} | Sequre MI imputation diff SD | mean: {imp_sds.mean()}, min: {imp_sds.min()}, max: {imp_sds.max()}")
+        print(f"\tCP{mpc.pid}: {msg} | Sequre MI imputation accuracy | mean: {imp_accs.mean()}, min: {imp_accs.min()}, max: {imp_accs.max()}")
+
+        if mpc.pid == 1:
+            f.write(f"{biases.mean()},{sds.mean()},{imp_biases.mean()},{imp_sds.mean()},{imp_accs.mean()},{runtimes.mean()},{network_bws.mean()}\n")
 
 
 def benchmark_mi(mpc, backend: Static[str], mi_factor: int, im_epochs: int, fm_epochs: int, noise_scale: float,
                  dump_data: bool, scenarios_runs_count: int, scenarios_rows: int, scenario_cols: int,
                  simice_rows: int, simice_cols: int, scenarios_miss_col: int, real_setup_runs_count: int,
-                 verbose: bool, run_simice_scenarios: bool, run_paper_scenarios: bool,
-                 run_real_setup: bool, modulus):
-    if run_simice_scenarios:
+                 verbose: bool, run_scenarios: bool, run_real_setup: bool, modulus):
+    if run_scenarios:
         # Scenario siMICE 1
         simice1 = load_scenario_mi_data("scenario_siMICE_1", simice_rows, simice_cols)
         # Scenario siMICE 2
@@ -481,7 +500,6 @@ def benchmark_mi(mpc, backend: Static[str], mi_factor: int, im_epochs: int, fm_e
         
         print_stats(mpc, "Scenario siMICE 2", *simice2_stats)
     
-    if run_paper_scenarios:
         # Scenario 1
         sc1 = load_scenario_mi_data("scenario_1", scenarios_rows, scenario_cols)
         # Scenario 2
@@ -494,19 +512,19 @@ def benchmark_mi(mpc, backend: Static[str], mi_factor: int, im_epochs: int, fm_e
         
         print_stats(mpc, "Scenario 1", *sc1_stats)
 
-        # sc2_stats = benchmark_scenario(
-        #     mpc, backend, "scenario_2", scenarios_runs_count, sc2,
-        #     im_epochs, fm_epochs, noise_scale, mi_factor,
-        #     scenarios_miss_col, dump_data, verbose, modulus)
+        sc2_stats = benchmark_scenario(
+            mpc, backend, "scenario_2", scenarios_runs_count, sc2,
+            im_epochs, fm_epochs, noise_scale, mi_factor,
+            scenarios_miss_col, dump_data, verbose, modulus)
         
-        # print_stats(mpc, "Scenario 2", *sc2_stats)
+        print_stats(mpc, "Scenario 2", *sc2_stats)
     
-    # if run_real_setup:
-    #     # Real data
-    #     real = load_real_mi_data()
+    if backend != "shechi" and run_real_setup:  # Real setup not implemented in Shechi
+        # Real data
+        real = load_real_mi_data()
         
-    #     real_stats = benchmark_real_setup(
-    #         mpc, backend, real_setup_runs_count, real, mi_factor,
-    #         im_epochs, fm_epochs, noise_scale, dump_data, verbose, modulus)
+        real_stats = benchmark_real_setup(
+            mpc, backend, real_setup_runs_count, real, mi_factor,
+            im_epochs, fm_epochs, noise_scale, dump_data, verbose, modulus)
 
-    #     print_stats(mpc, "Real data", *real_stats)
+        print_stats(mpc, "Real data", *real_stats)
