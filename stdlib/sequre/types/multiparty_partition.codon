@@ -226,6 +226,16 @@ class MPP[S, dtype]:
     @property
     def shape_local(self) -> S:
         return self.shape
+
+    @property
+    def partition_shape(self):
+        if self.is_local():
+            return list(self._local_data.shape)
+
+        if self.is_full_encrypted():
+            return self._encryption_unified.shape
+
+        raise ValueError("MPP is semi-encrytped. Fetching raw partition shape should be done manually via mpp._encryption_left.shape and mpp._encryption_right.shape")
     
     @property
     def T(self) -> MPP[S, dtype]:
@@ -822,6 +832,9 @@ class MPP[S, dtype]:
         if self.is_empty():
             return self
         
+        if self.shape == target_shape:
+            return self
+        
         if staticlen(S2) > staticlen(S):
             raise NotImplementedError("Broadasting MPP from lower to higher dimension not implemented yet")
         elif staticlen(S2) == staticlen(S):
@@ -1321,9 +1334,7 @@ class MPP[S, dtype]:
         if mpc.pid == 0:
             return (self._local_data, _encryption_left, _encryption_right, _encryption_unified)
 
-        # print("DEBUG _do_elem_wise_op_public -2", mpc.pid, self._local_data.shape, other_data.shape)
         other_data = other_data.T if self._transposed else other_data
-        # print("DEBUG _do_elem_wise_op_public -1", mpc.pid, self._ratios, self._local_data.shape, other_data.shape)
 
         if staticlen(S) == 2:
             if other_data.shape[0] == self._ratios.sum() and self.shape[0] == self._ratios[mpc.pid - 1]:
@@ -1334,11 +1345,8 @@ class MPP[S, dtype]:
                 if not other_data_size == self.shape[0]:
                     raise ValueError("MPP: shapes missmatch in public elem-wise operation")
         
-        # print("DEBUG _do_elem_wise_op_public 0", mpc.pid, self._local_data.shape, other_data.shape)
-        
         col_end = 0
         if self.is_local():
-            # print("DEBUG _do_elem_wise_op_public 1", mpc.pid, self._local_data.shape, other_data.shape)
             _local_data = elem_wise_op(mpc, self._local_data, other_data)
         elif self.has_unified_encryption():
             _encryption_unified = elem_wise_op(mpc, self._encryption_unified, other_data)
@@ -1394,7 +1402,6 @@ class MPP[S, dtype]:
         with _self.partition_aligner() as aligner, (_other.partition_aligner() if isinstance(_other, MPP) else EmptyWith()):
             if not _self.is_empty():
                 other_broadcast = _other.local_broadcast(_self.shape)
-                # print("DEBUG mpp.op", mpc.pid, _other.shape, other_broadcast.shape)
                 
                 if isinstance(other_broadcast, ndarray):
                     _local_data, _encryption_left, _encryption_right, _encryption_unified = _self._do_elem_wise_op_public(other_broadcast, elem_wise_op)
@@ -2191,7 +2198,7 @@ class MPPAligner[S, dtype]:
             _encryption_right = MPPAligner._revert_encryption(self.mpp._mpc, _encryption_right, self.mpp._ratios, S=self.mpp.S)
         if _encryption_unified:
             _encryption_unified = MPPAligner._revert_encryption(self.mpp._mpc, _encryption_unified, self.mpp._ratios, S=self.mpp.S)
-        
+
         return MPP[S, dtype](
             _mpc=self.mpp._mpc,
             _ratios=self.mpp._ratios.copy(),
@@ -2250,7 +2257,7 @@ class MPPAligner[S, dtype]:
         assert ratios.sum() > 0, "MPPAligner: nothing to align -- MPP empty"
         slots = mpc.mhe.crypto_params.params.slots()
         ref_pid = argmax(ratios) + 1
-        cols = mpc.comms.broadcast_from(encryption.shape[-1] if encryption else 0, ref_pid)
+        cols = mpc.comms.broadcast_from(encryption.shape[int(encryption._transposed) - 1] if encryption else 0, ref_pid)
         
         if staticlen(S) == 1:
             return encryption if mpc.pid == ref_pid else Ciphertensor[Ciphertext].placeholder([cols], slots)
@@ -2261,9 +2268,10 @@ class MPPAligner[S, dtype]:
         if ratios[mpc.pid - 1] == max(ratios):
             return encryption
         
-        _encryption_placeholder = Ciphertensor[Ciphertext].placeholder([max(ratios), cols], slots)
+        _encryption_placeholder = Ciphertensor[Ciphertext].placeholder([cols, max(ratios)] if encryption._transposed else [max(ratios), cols], slots)
+        _encryption_placeholder._transposed = encryption._transposed
         
-        assert not (ratios[mpc.pid - 1] > 0 ^ len(encryption._data) > 0), "MPPAligner: invalid encryption"
+        assert not ((ratios[mpc.pid - 1] > 0) ^ (len(encryption._data) > 0)), f"MPPAligner: invalid encryption at CP{mpc.pid}. Ratios: {ratios[mpc.pid - 1]}. Ciphertexts len: {len(encryption._data)}. Ciphertensor shape: {encryption.shape}"
         
         for i, cipher in enumerate(encryption._data):
             _encryption_placeholder._data[i] = cipher
@@ -2292,10 +2300,17 @@ class MPPAligner[S, dtype]:
     def _revert_encryption[S](mpc, encryption: Ciphertensor[Ciphertext], ratios: List[int]):
         assert ratios.sum() > 0, "MPPAligner: nothing to align -- MPP empty"
         ref_pid = argmax(ratios) + 1
-        
         if staticlen(S) == 1:
-            # TODO: Handle transposed case. Temp and unreliable solution below. Fix ASAP.
-            if encryption._transposed: return encryption
+            if encryption._transposed:
+                # Assume that slice of the result that was produced by nil-ideals is all zeros
+                
+                if encryption:
+                    while encryption._data[-1]._nil_ideal:
+                        encryption._data.pop()
+                
+                assert len(encryption._data) == encryption.cipher_shape[-1], "MPPAligner: invalid encryption after popping nil-ideals"
+                encryption.shape[-1] = ratios[mpc.pid - 1]
+                return encryption
             return encryption if mpc.pid == ref_pid else Ciphertensor[Ciphertext]()
         
         if staticlen(S) != 2:
@@ -2306,6 +2321,15 @@ class MPPAligner[S, dtype]:
         if ratios[mpc.pid - 1] == 0:
             return Ciphertensor[Ciphertext]()
 
+        if encryption._transposed:
+            # Assume that slice of the result that was produced by nil-ideals is all zeros
+            
+            _data = [cipher for cipher in encryption._data if not cipher._nil_ideal]
+            encryption.shape[-1] = ratios[mpc.pid - 1]
+            encryption._data = _data
+            encryption.validate()
+            return encryption
+        
         return encryption._get_rows_raw(slice(start=0, stop=ratios[mpc.pid - 1], step=1))
 
 
