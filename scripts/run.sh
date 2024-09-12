@@ -50,7 +50,7 @@ else
 
     if [ ! -f "./sequrex" ]
     then
-        echo "Sequre is not built. Make sure to add --build flag in first run." >&2
+        echo "Sequre is not built. Make sure to add --build flag in first run or use --jit mode." >&2
         return
     fi
 

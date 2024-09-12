@@ -209,7 +209,6 @@ func (pi *KingProtocolInfo) KingProtocol() map[int][][]float64 {
 						//	backToRmat[l] = localThresSSsign[l*allPidsNbrRows[otherPid] : (l+1)*allPidsNbrRows[otherPid]]
 						//}
 
-						//log.LLvl1("DEBUG ", pi.Prot.MpcObj[otherPid].RevealSymMat(backToRmat).ToFloat(0))
 						_ = pi.Prot.MpcObj[otherPid].SSToCMat(cps, backToRmat)
 
 						log.LLvl1(pid, " finished helping for sign test, ready to decrypt")
@@ -246,7 +245,6 @@ func (pi *KingProtocolInfo) KingProtocol() map[int][][]float64 {
 			////for l := 0; l < len(localThresSS); l++ {
 			//	backToRmat[l] = localThresSSsign[l*allPidsNbrRows[comparingPid] : (l+1)*allPidsNbrRows[comparingPid]]
 			//}
-			//log.LLvl1("DEBUG ", pi.Prot.MpcObj[comparingPid].RevealSymMat(backToRmat).ToFloat(0))
 			_ = pi.Prot.MpcObj[comparingPid].SSToCMat(cps, backToRmat)
 			log.LLvl1(pid, " finished helping, ready to decrypt")
 			_, _ = pi.Prot.MpcObj.GetNetworks()[comparingPid].CollectiveDecryptMat(cps, nil, comparingPid)
@@ -364,7 +362,6 @@ func (pi *KingProtocolInfo) KingProtocol() map[int][][]float64 {
 		//for v := 0; v < len(hetxMinushetySS); v++ {
 		//	backToRmat[v] = hetxMinushetySSSSsign[v*allPidsNbrRows[otherPid] : (v+1)*allPidsNbrRows[otherPid]]
 		//}
-		//log.LLvl1("DEBUG ", pi.Prot.MpcObj[pid].RevealSymMat(backToRmat).ToFloat(0))
 
 		// minimum between a and b, using sign test result r on (a-b), which return 0 for neg and 1 for pos
 		// --> sign(a-b)*a + ((sign(a-b)-1)*(-b))
