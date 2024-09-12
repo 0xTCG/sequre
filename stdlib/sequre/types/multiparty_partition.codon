@@ -226,6 +226,16 @@ class MPP[S, dtype]:
     @property
     def shape_local(self) -> S:
         return self.shape
+
+    @property
+    def partition_shape(self):
+        if self.is_local():
+            return list(self._local_data.shape)
+
+        if self.is_full_encrypted():
+            return self._encryption_unified.shape
+
+        raise ValueError("MPP is semi-encrytped. Fetching raw partition shape should be done manually via mpp._encryption_left.shape and mpp._encryption_right.shape")
     
     @property
     def T(self) -> MPP[S, dtype]:
@@ -419,9 +429,10 @@ class MPP[S, dtype]:
     def to_fp(self) -> MPP[S, float]:
         return self.astype(float)
     
-    def filter(self, mask: ndarray[Tuple[int], int]) -> MPP[S, dtype]:
+    def filter(self, mask) -> MPP[S, dtype]:
         assert self.shape[0] == len(mask), f"MPP: partition and filter mask size mismatch: {self.shape[0]} != {len(mask)}"
         assert not self._transposed, "Not implemented yet: filtering transposed MPP"
+        assert self.is_local(), "Not implemented yet: filtering encrypted MPP"
         
         mpc = self._mpc
         _local_data = self._local_data.filter(mask)
@@ -800,7 +811,7 @@ class MPP[S, dtype]:
     
     def patch_copy(self, new_size: int) -> MPP[S, dtype]:
         mpc = self._mpc
-        if staticlen(S) != 1:
+        if staticlen(S) != 1 and staticlen(S) != 2:
             compile_error("Not implemented yet: MPP n-dim patch copy")
         assert not self.is_semi_encrypted(), "Not implemented yet: Semi-encrypted MPP patch copy"
         assert not self.is_empty(), "MPP: cannot patch copy empty partition"
@@ -822,11 +833,18 @@ class MPP[S, dtype]:
         if self.is_empty():
             return self
         
+        if self.shape == target_shape:
+            return self
+        
         if staticlen(S2) > staticlen(S):
             raise NotImplementedError("Broadasting MPP from lower to higher dimension not implemented yet")
         elif staticlen(S2) == staticlen(S):
             if staticlen(S2) == 1 and target_shape[0] > self.shape[0] and self.shape[0] == 1:
                 return self.patch_copy(target_shape[0])
+            if staticlen(S2) == 2:
+                if self.shape[0] == target_shape[0]:
+                    assert self.shape[1] == 1, f"CP{self._mpc.pid}:\tCannot broadcast shape {self.shape} to {target_shape}"
+                    return self.patch_copy(target_shape[1])
             return self
         else:
             compile_error("MPP: Incompatible shapes for broadcast")
@@ -906,6 +924,15 @@ class MPP[S, dtype]:
             _ratios=self._ratios.copy(),
             _local_data=ndarray[S, dtype].rand(self.shape, distribution))
 
+    def hstack(self, other:  MPP[S, dtype]) ->  MPP[S, dtype]:
+        if self.is_local() and other.is_local():
+            return MPP[S, dtype](
+                _mpc=self._mpc,
+                _ratios=self._ratios.copy(),
+                _local_data=self._local_data.hstack(other._local_data))
+
+        raise NotImplementedError("MPP: hstack supported only on local/non-encrypted MPPs for now.")
+    
     def pad_with_value(self, val, size: int, axis: int, *args):
         mpc = self._mpc
         
@@ -1308,7 +1335,7 @@ class MPP[S, dtype]:
     
     def _do_elem_wise_op_public(self, other_data: ndarray[S, dtype], elem_wise_op) -> Tuple[ndarray[S, dtype], Ciphertensor[Ciphertext], Ciphertensor[Ciphertext], Ciphertensor[Ciphertext]]:
         mpc = self._mpc
-        assert self.shape[-1] == other_data.shape[-1], "MPP: shapes missmatch in public elem-wise operation"
+        assert self.shape[-1] == other_data.shape[-1], f"MPP: shapes missmatch in public elem-wise operation: {self.shape} vs {other_data.shape}"
         _local_data = ndarray[S, dtype]()
         _encryption_left = Ciphertensor[Ciphertext]()
         _encryption_right = Ciphertensor[Ciphertext]()
@@ -1320,7 +1347,7 @@ class MPP[S, dtype]:
         other_data = other_data.T if self._transposed else other_data
 
         if staticlen(S) == 2:
-            if other_data.shape[0] == self._ratios.sum():
+            if other_data.shape[0] == self._ratios.sum() and self.shape[0] == self._ratios[mpc.pid - 1]:
                 start, end = self.get_relative_indices()
                 other_data = other_data[start:end]
             else:
@@ -2181,7 +2208,7 @@ class MPPAligner[S, dtype]:
             _encryption_right = MPPAligner._revert_encryption(self.mpp._mpc, _encryption_right, self.mpp._ratios, S=self.mpp.S)
         if _encryption_unified:
             _encryption_unified = MPPAligner._revert_encryption(self.mpp._mpc, _encryption_unified, self.mpp._ratios, S=self.mpp.S)
-        
+
         return MPP[S, dtype](
             _mpc=self.mpp._mpc,
             _ratios=self.mpp._ratios.copy(),
@@ -2240,7 +2267,7 @@ class MPPAligner[S, dtype]:
         assert ratios.sum() > 0, "MPPAligner: nothing to align -- MPP empty"
         slots = mpc.mhe.crypto_params.params.slots()
         ref_pid = argmax(ratios) + 1
-        cols = mpc.comms.broadcast_from(encryption.shape[-1] if encryption else 0, ref_pid)
+        cols = mpc.comms.broadcast_from(encryption.shape[int(encryption._transposed) - 1] if encryption else 0, ref_pid)
         
         if staticlen(S) == 1:
             return encryption if mpc.pid == ref_pid else Ciphertensor[Ciphertext].placeholder([cols], slots)
@@ -2251,9 +2278,10 @@ class MPPAligner[S, dtype]:
         if ratios[mpc.pid - 1] == max(ratios):
             return encryption
         
-        _encryption_placeholder = Ciphertensor[Ciphertext].placeholder([max(ratios), cols], slots)
+        _encryption_placeholder = Ciphertensor[Ciphertext].placeholder([cols, max(ratios)] if encryption._transposed else [max(ratios), cols], slots)
+        _encryption_placeholder._transposed = encryption._transposed
         
-        assert not (ratios[mpc.pid - 1] > 0 ^ len(encryption._data) > 0), "MPPAligner: invalid encryption"
+        assert not ((ratios[mpc.pid - 1] > 0) ^ (len(encryption._data) > 0)), f"MPPAligner: invalid encryption at CP{mpc.pid}. Ratios: {ratios[mpc.pid - 1]}. Ciphertexts len: {len(encryption._data)}. Ciphertensor shape: {encryption.shape}"
         
         for i, cipher in enumerate(encryption._data):
             _encryption_placeholder._data[i] = cipher
@@ -2282,10 +2310,17 @@ class MPPAligner[S, dtype]:
     def _revert_encryption[S](mpc, encryption: Ciphertensor[Ciphertext], ratios: List[int]):
         assert ratios.sum() > 0, "MPPAligner: nothing to align -- MPP empty"
         ref_pid = argmax(ratios) + 1
-        
         if staticlen(S) == 1:
-            # TODO: Handle transposed case. Temp and unreliable solution below. Fix ASAP.
-            if encryption._transposed: return encryption
+            if encryption._transposed:
+                # Assume that slice of the result that was produced by nil-ideals is all zeros
+                
+                if encryption:
+                    while encryption._data[-1]._nil_ideal:
+                        encryption._data.pop()
+                
+                assert len(encryption._data) == encryption.cipher_shape[-1], "MPPAligner: invalid encryption after popping nil-ideals"
+                encryption.shape[-1] = ratios[mpc.pid - 1]
+                return encryption
             return encryption if mpc.pid == ref_pid else Ciphertensor[Ciphertext]()
         
         if staticlen(S) != 2:
@@ -2296,6 +2331,15 @@ class MPPAligner[S, dtype]:
         if ratios[mpc.pid - 1] == 0:
             return Ciphertensor[Ciphertext]()
 
+        if encryption._transposed:
+            # Assume that slice of the result that was produced by nil-ideals is all zeros
+            
+            _data = [cipher for cipher in encryption._data if not cipher._nil_ideal]
+            encryption.shape[-1] = ratios[mpc.pid - 1]
+            encryption._data = _data
+            encryption.validate()
+            return encryption
+        
         return encryption._get_rows_raw(slice(start=0, stop=ratios[mpc.pid - 1], step=1))
 
 
