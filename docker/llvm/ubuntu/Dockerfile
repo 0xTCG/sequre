@@ -5,19 +5,20 @@ LABEL Name=llvm
 RUN \
     apt-get update && \
     apt-get -y install cmake protobuf-compiler git wget && \
-    apt install -y clang
+    apt install -y clang ninja-build
 
 # Build LLVM
 RUN \
     git clone --depth 1 -b codon https://github.com/exaloop/llvm-project && \
-    mkdir -p llvm-project/llvm/build && \
-    (cd llvm-project/llvm/build && cmake .. \
+    cmake -S llvm-project/llvm -B llvm-project/build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DLLVM_INCLUDE_TESTS=OFF \
         -DLLVM_ENABLE_RTTI=ON \
         -DLLVM_ENABLE_ZLIB=OFF \
         -DLLVM_ENABLE_TERMINFO=OFF \
-        -DLLVM_TARGETS_TO_BUILD=host && make && make install)
+        -DLLVM_TARGETS_TO_BUILD=all && \
+    cmake --build llvm-project/build && \
+    cmake --install llvm-project/build --prefix=llvm-project/install
 
 # Add CPM.cmake
 RUN wget -O $(llvm-config --cmakedir)/../CPM.cmake https://github.com/cpm-cmake/CPM.cmake/releases/latest/download/get_cpm.cmake
