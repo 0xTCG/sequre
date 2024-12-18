@@ -1,15 +1,16 @@
-FROM hsmile/llvm:latest
+FROM hsmile/llvm:17
 LABEL Name=sequre Version=0.0.1
 
 # Install dependencies
 RUN apt-get update
 RUN apt install -y \
     ninja-build openssl vim time \
-    cmake libbz2-dev git patch clang
+    cmake libbz2-dev git patch clang \
+    python3 python3-pip
 
 # Env vars
-ENV CODON_PYTHON=/usr/lib64/libpython3.so
-ENV SEQURE_LLVM_PATH=/llvm-project/llvm
+ENV CODON_PYTHON=/usr/lib/x86_64-linux-gnu/libpython3.12.so
+ENV SEQURE_LLVM_PATH=/llvm-project
 ENV SEQURE_CODON_PATH=/codon
 ENV SEQURE_SEQ_PATH=/codon-seq
 ENV SEQURE_NUMPY_PATH=/codon-numpy
@@ -22,7 +23,7 @@ RUN \
     git clone https://github.com/exaloop/codon.git ${SEQURE_CODON_PATH}  && \
     cd $SEQURE_CODON_PATH && \
     cmake -S . -B build -G Ninja \
-        -DLLVM_DIR=$(llvm-config --cmakedir) \
+        -DLLVM_DIR=${SEQURE_LLVM_PATH}/install/lib/cmake/llvm \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_COMPILER=${CC} \
         -DCMAKE_CXX_COMPILER=${CXX} && \
@@ -34,7 +35,7 @@ RUN \
     git clone --depth 1 https://github.com/exaloop/seq.git ${SEQURE_SEQ_PATH} && \
     cd $SEQURE_SEQ_PATH && \
     cmake -S . -B build -G Ninja \
-        -DLLVM_DIR=$(llvm-config --cmakedir) \
+        -DLLVM_DIR=${SEQURE_LLVM_PATH}/install/lib/cmake/llvm \
         -DCODON_PATH=${SEQURE_CODON_PATH}/install \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_COMPILER=${CC} \
@@ -44,7 +45,7 @@ RUN \
 
 # Install Sequre
 RUN \
-    git clone --depth 1 -b sheqi https://github.com/0xTCG/sequre.git ${SEQURE_PATH} && \
+    git clone --depth 1 -b mice https://github.com/0xTCG/sequre.git ${SEQURE_PATH} && \
     cd ${SEQURE_PATH} && \
     rm -rf build && \
     mkdir build && \
@@ -57,3 +58,6 @@ RUN \
     cmake --build build --config Release
 
 WORKDIR /sequre
+
+# Install py deps
+RUN apt install -y python3-numpy python3-sklearn 
