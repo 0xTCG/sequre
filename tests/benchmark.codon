@@ -16,6 +16,7 @@ from ..applications.dti import dti_mpc_protocol, dti_mhe_protocol
 from ..applications.opal import sequre_opal as opal
 from ..applications.ganon import sequre_ganon as ganon, FilterConfig
 from ..applications.genotype_imputation import genotype_imputation
+from ..applications.mnist import mnist, load_train_data, load_test_data
 from ..applications.utils.data_sharing import share_data
 
 import sequre.lattiseq.ckks as ckks
@@ -529,6 +530,64 @@ def ganon_wrapper(mpc, modulus, read_limit):
 
     ganon(mpc, parsed_hierarchy, [filter_config], 'tests/data/opal/test.fragments.fasta', modulus, read_limit)
 
+def mnist_wrapper(mpc, modulus):
+    train_X, train_Y = load_train_data("./data/mnist/", 6)
+    test_X, test_Y = load_test_data("./data/mnist/", 6)
+    
+    # Coercing MHE friendly shapes
+    train_X = train_X[:49152, :255]
+    train_Y = train_Y[:49152]
+    test_X = test_X[:8192, :255]
+    test_Y = test_Y[:8192]
+
+    assert len(train_X) % (mpc.comms.number_of_parties -1) == 0
+    rows_per_partition = len(train_X) // (mpc.comms.number_of_parties - 1)
+
+    np_train_X = array(train_X)
+    np_train_Y = array(train_Y)
+    np_test_X = array(test_X)
+    np_test_Y = array(test_Y)
+
+    classes = train_Y.shape[1]
+    raw_initial_W = array(random_floats((np_train_X.shape[1] + 1, classes), scale=1.0), dtype=float) * 0.01
+    
+    raw_mnist = mnist(mpc, np_train_X, np_train_Y, raw_initial_W, epochs=100)
+    raw_pred = raw_mnist.predict(mpc, np_test_X).argmax(axis=1)
+    print(f"CP{mpc.pid}:\tMNIST raw accuracy: {(raw_pred == np_test_Y).astype(float).mean()}")
+
+    sequre_train_X = Sharetensor.enc(mpc, np_train_X)
+    sequre_train_Y = Sharetensor.enc(mpc, np_train_Y)
+    sequre_test_X = Sharetensor.enc(mpc, np_test_X)
+    sequre_initial_W = Sharetensor.enc(mpc, raw_initial_W)
+
+    sequre_mnist = mnist(mpc, sequre_train_X, sequre_train_Y, sequre_initial_W)
+    sequre_pred = sequre_mnist.predict(mpc, sequre_test_X).reveal(mpc).argmax(axis=1)
+    print(f"CP{mpc.pid}:\tMNIST sequre accuracy: {(sequre_pred == np_test_Y).astype(float).mean()}")
+
+    partition_train_X = zeros_like(np_train_X) if mpc.pid == 0 else np_train_X[(mpc.pid - 1) * rows_per_partition:mpc.pid * rows_per_partition]
+    partition_train_Y = zeros_like(np_train_Y) if mpc.pid == 0 else np_train_Y[(mpc.pid - 1) * rows_per_partition:mpc.pid * rows_per_partition]
+    partition_test_X = zeros_like(np_test_X) if mpc.pid == 0 else np_test_X[(mpc.pid - 1) * rows_per_partition:mpc.pid * rows_per_partition]
+
+    pretrain_mnist = mnist(mpc, partition_train_X, partition_train_Y, raw_initial_W, epochs=100)
+    pretrain_pred = pretrain_mnist.predict(mpc, np_test_X).argmax(axis=1)
+    print(f"CP{mpc.pid}:\tPre-train MNIST accuracy: {(pretrain_pred == np_test_Y).astype(float).mean()}")
+
+    avg_w = mpc.comms.collect(pretrain_mnist.coef_, include_trusted_dealer=True)[1:].mean()
+    raw_mnist = mnist(mpc, np_train_X, np_train_Y, avg_w)
+    raw_pred = raw_mnist.predict(mpc, np_test_X).argmax(axis=1)
+    print(f"CP{mpc.pid}:\tMNIST raw on pre-trained accuracy (check): {(raw_pred == np_test_Y).astype(float).mean()}")
+
+    shechi_train_X = MPU(mpc, partition_train_X, "partition")
+    shechi_train_Y = MPU(mpc, partition_train_Y, "partition")
+    shechi_test_X = MPU(mpc, partition_test_X, "partition")
+    shechi_initial_W = MPU(mpc, pretrain_mnist.coef_ / (mpc.comms.number_of_parties - 1), "additive")
+    
+    with timing(f"CP{mpc.pid}:\t Shechi MNIST trainig"):
+        shechi_mnist = mnist(mpc, shechi_train_X, shechi_train_Y, shechi_initial_W)
+    with timing(f"CP{mpc.pid}:\t Shechi MNIST inference"):
+        shechi_pred = shechi_mnist.predict(mpc, shechi_test_X).reveal(mpc).argmax(axis=1)
+    print(f"CP{mpc.pid}:\tMNIST shechi accuracy: {(shechi_pred == np_test_Y).astype(float).mean()}")
+
 def ablations_wrapper(mpc, modulus):
     rows_per_partition, cols = 16, 8192
     rows = rows_per_partition * (mpc.comms.number_of_parties - 1)
@@ -711,6 +770,8 @@ def benchmark[TP](mpc, benchmark_toggles: dict, modulus: TP):
         time_frame(mpc, ganon_wrapper, 'Ganon', modulus, 100)
     if benchmark_toggles[RUN_TOGGLES.GENOTYPE_IMPUTATION_FLAG] or run_all:
         time_frame(mpc, genotype_imputation_wrapper, 'Genotype imputation', modulus)
+    if benchmark_toggles[RUN_TOGGLES.MNIST_FLAG] or run_all:
+        time_frame(mpc, mnist_wrapper, 'MNIST', modulus)
     
     if benchmark_toggles[RUN_TOGGLES.ABLATIONS_FLAG] or run_all:
         time_frame(mpc, ablations_wrapper, 'Ablation study', modulus)

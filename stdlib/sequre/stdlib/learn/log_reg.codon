@@ -3,7 +3,7 @@
 from numpy.ndarray import ndarray
 
 from sequre.attributes import sequre
-from sequre.stdlib.builtin import chebyshev_sigmoid, chebyshev_log
+from sequre.stdlib.builtin import maximum_axis, chebyshev_sigmoid, chebyshev_log, chebyshev_exp, clip
 from sequre.settings import DEBUG
 from sequre.mpc.env import MPCEnv
 
@@ -14,50 +14,71 @@ from utils import batch
 class LogReg[T]:
     coef_: T
     optimizer: str
+    variant: str
     interval: tuple[float, float]
 
     def __init__(self):
         self.coef_ = T()
         self.optimizer = ""
+        self.variant = ""
         self.interval = (0.0, 0.0)
     
     def __init__(self, mpc: MPCEnv):
         self.coef_ = T(mpc) if isinstance(T, MPU) else T()
         self.optimizer = ""
+        self.variant = ""
         self.interval = (0.0, 0.0)
     
-    def __init__(self, initial_weights: T, optimizer: str = "bgd", interval: tuple[float, float] = (-10.0, 10.0)):
+    def __init__(
+            self, 
+            initial_weights: T,
+            optimizer: str = "bgd",
+            interval: tuple[float, float] = (0.0, 0.0),
+            variant: str = "binary"):
         self.coef_ = initial_weights.copy()
         self.optimizer = optimizer
-        self.interval = interval
+        self.variant = variant
+        self.interval = interval if interval != (0.0, 0.0) else (-10.0, 10.0) if variant == "binary" else (-20.0, 0.0)
 
     def fit(self, mpc, X: T, y: T, step: float, epochs: int, verbose: bool = False) -> LogReg[T]:
-        self.coef_ = LogReg._fit(mpc, X, y, self.coef_, self.interval, step, epochs, self.optimizer, verbose)
+        self.coef_ = LogReg._fit(mpc, X, y, self.coef_, self.interval, step, epochs, self.optimizer, self.variant, verbose)
         return self
     
     def predict(self, mpc, X: T, *args) -> T:
-        return LogReg._predict(mpc, X, self.coef_, self.interval)
+        return LogReg._predict(mpc, X, self.coef_, self.interval, self.variant)
     
     def loss(self, mpc, X: T, y: T) -> T:
-        return LogReg._loss(mpc, X, y, self.coef_, self.interval)
+        return LogReg._loss(mpc, X, y, self.coef_, self.interval, self.variant)
 
     def randomize_weights(self, mpc, distribution: str = "uniform"):
         self.coef_ = self.coef_.rand(distribution, mpc)
     
-    def _fit(mpc, X: T, y: T, initial_w: T, interval: tuple[float, float], step: float, epochs: int, optimizer: str, verbose: bool, debug: Static[int] = DEBUG) -> T:
+    def _fit(mpc, X: T, y: T, initial_w: T, interval: tuple[float, float], step: float, epochs: int, optimizer: str, variant: str, verbose: bool, debug: Static[int] = DEBUG) -> T:
         # Adding bias
         X_tilde = X.pad_with_value(1, 1, 1, mpc)
 
         # Gradient descent
         if optimizer == "bgd":
-            return LogReg._bgd(mpc, X_tilde, y, initial_w, interval, step, epochs, verbose, debug)
+            return LogReg._bgd(mpc, X_tilde, y, initial_w, interval, variant, step, epochs, verbose, debug)
         if optimizer == "mbgd":
-            return LogReg._mbgd(mpc, X_tilde, y, initial_w, interval, step, epochs, 10, verbose, debug)
+            return LogReg._mbgd(mpc, X_tilde, y, initial_w, interval, variant, step, epochs, 10, verbose, debug)
         else:
             raise ValueError(f"LogReg: invalid optimizer passed: {optimizer}")
     
     @sequre
-    def _bgd(mpc, X_tilde: T, y: T, initial_w: T, interval: tuple[float, float], step: float, epochs: int, verbose: bool, debug: Static[int] = DEBUG) -> T:
+    def _act(mpc, X_tilde, w, interval, variant):
+        dot = X_tilde @ w
+        if variant == "binary":
+            return chebyshev_sigmoid(mpc, dot, interval)  # m x 1
+        if variant == "multinomial":
+            shift = (dot - maximum_axis(mpc, dot, axis=1, keepdims=True))
+            shift = clip(mpc, shift, *interval)
+            return chebyshev_exp(mpc, shift, interval)  # m x 1
+            
+        raise ValueError(f"LogReg: invalid variant passed: {variant}")
+
+    @sequre
+    def _bgd(mpc, X_tilde: T, y: T, initial_w: T, interval: tuple[float, float], variant: str, step: float, epochs: int, verbose: bool, debug: Static[int] = DEBUG) -> T:
         if debug:
             print(f"CP{mpc.pid}:\tLog. reg. BGD step size:", step)
         
@@ -67,16 +88,16 @@ class LogReg[T]:
             if verbose:
                 print(f"CP{mpc.pid}:\tLog. reg. BGD epoch {_ + 1}/{epochs}")
             if debug:
-                print(f"CP{mpc.pid}:\t\t weigts avg {ndarray.mean(w.reveal(mpc))} | loss: {LogReg._loss(mpc, X_tilde, y, w, interval).reveal(mpc)}")
+                print(f"CP{mpc.pid}:\t\t weigts avg {ndarray.mean(w.reveal(mpc))} | loss: {LogReg._loss(mpc, X_tilde, y, w, interval, variant).reveal(mpc)}")
             
-            dot = X_tilde @ w
-            sig = chebyshev_sigmoid(mpc, dot, interval)  # m x 1
-            w -= X_tilde.T @ (sig - y) * step  # n x 1
+            act = LogReg._act(mpc, X_tilde, w, interval, variant)
+            dw = X_tilde.T @ (act - y) * step
+            w -= dw  # n x 1
         
         return w
     
     @sequre
-    def _mbgd(mpc, X_tilde: T, y: T, initial_w: T, interval: tuple[float, float], step: float, epochs: int, batches: int, verbose: bool, debug: Static[int] = DEBUG) -> T:
+    def _mbgd(mpc, X_tilde: T, y: T, initial_w: T, interval: tuple[float, float], variant: str, step: float, epochs: int, batches: int, verbose: bool, debug: Static[int] = DEBUG) -> T:
         if debug:
             print(f"CP{mpc.pid}:\tLog. reg. BGD step size:", step)
         
@@ -91,19 +112,26 @@ class LogReg[T]:
                 if verbose:
                     print(f"CP{mpc.pid}:\tLog. reg. MBGD epoch {_ + 1}/{epochs} -- batch {i + 1}/{batches}")
                 if debug:
-                    print(f"CP{mpc.pid}:\t\t weigts avg {ndarray.mean(w.reveal(mpc))} | loss: {LogReg._loss(mpc, X_mini_batches[i], y_mini_batches[i], w, interval).reveal(mpc)}")
+                    print(f"CP{mpc.pid}:\t\t weigts avg {ndarray.mean(w.reveal(mpc))} | loss: {LogReg._loss(mpc, X_mini_batches[i], y_mini_batches[i], w, interval, variant).reveal(mpc)}")
                 
-                dot = X_mini_batches[i] @ w
-                sig = chebyshev_sigmoid(mpc, dot, interval)  # m x 1
-                w -= X_mini_batches[i].T @ (sig - y_mini_batches[i]) * step
+                act = LogReg._act(mpc, X_mini_batches[i], w, interval, variant)
+                w -= X_mini_batches[i].T @ (act - y_mini_batches[i]) * step
         
         return w
     
     @sequre
-    def _predict(mpc, X: T, w: T, interval: tuple[float, float]) -> T:
-        return chebyshev_sigmoid(mpc, (X.pad_with_value(1, 1, 1, mpc) @ w), interval)
+    def _predict(mpc, X: T, w: T, interval: tuple[float, float], variant: str) -> T:
+        X_tilde = X.pad_with_value(1, 1, 1, mpc)
+        return LogReg._act(mpc, X_tilde, w, interval, variant)
+        
     
     @sequre
-    def _loss(mpc, X: T, y: T, w: T, interval: tuple[float, float]):
-        a = chebyshev_sigmoid(mpc, X @ w, interval)
-        return (-y * chebyshev_log(mpc, a, (0.0, 1.0)) - (1 - y) * chebyshev_log(mpc, 1 - a, (0.0, 1.0))).sum(axis=0)
+    def _loss(mpc, X: T, y: T, w: T, interval: tuple[float, float], variant: str):
+        act = LogReg._act(mpc, X, w, interval, variant)
+        
+        if variant == "binary":
+            return (-y * chebyshev_log(mpc, act, (0.0, 1.0)) - (1 - y) * chebyshev_log(mpc, 1 - act, (0.0, 1.0))).sum(axis=0)
+        if variant == "multinomial":
+            return -((y * chebyshev_log(mpc, act, (0.0, 1.0))).sum(axis=0) / len(X))
+
+        raise ValueError(f"LogReg: invalid variant passed: {variant}")

@@ -1,4 +1,6 @@
-import operator
+import operator, secure_operator
+
+from math import inf
 
 from numpy.ndarray import ndarray
 from numpy.create import array, zeros
@@ -10,7 +12,7 @@ from sequre.utils.utils import one_hot_vector
 from sequre.constants import (
     HE_MUL_COST_ESTIMATE, HE_ROT_COST_ESTIMATE,
     HE_ENC_COST_ESTIMATE, MHE_MPC_SWITCH_COST_ESTIMATE,
-    ENC_ROW, ENC_COL, ENC_DIAG)
+    MPC_BIG_INT_MUL_COST, ENC_ROW, ENC_COL, ENC_DIAG)
 
 from sequre.settings import DEBUG
 
@@ -447,6 +449,17 @@ class Ciphertensor[ctype]:
             shape=shape.copy(),
             slots=slots)
     
+    @staticmethod
+    def like[ctype](other: Ciphertensor) -> Ciphertensor[ctype]:
+        return Ciphertensor[ctype](
+            _data=[],
+            shape=[],
+            slots=other.slots,
+            _transposed=other._transposed,
+            _diagonal_contiguous=other._diagonal_contiguous,
+            _skinny=other._skinny,
+            _is_broadcast=other._is_broadcast)
+    
     def zeros(self, mpc) -> Ciphertensor[Ciphertext]:
         return Ciphertensor[Ciphertext].zeros(mpc, self.shape)
     
@@ -840,7 +853,7 @@ class Ciphertensor[ctype]:
             slots=self.slots,
             _transposed=self._transposed)
 
-    def patch_copy(self, mpc, new_size: int, ignore_transposed: bool = True):
+    def patch_copy(self, mpc, new_size: int, allow_transposed: bool = False):
         """
         Examples: [] - Ciphertensor, () - Single ciphertext
             [(1, 2, 3, 4), (5, 6, 0, 0)].patch_copy(7) -> [(1, 2, 3, 4), (5, 6, 1, 0)]
@@ -850,7 +863,7 @@ class Ciphertensor[ctype]:
         """
         assert mpc.pid, "Not implemented yet: patch_copy at CP0"
         assert 0 < self.ndim < 3, "Ciphertensor: patch-copying can be applied only to 1-dim and 2-dim tensors"
-        assert self.shape[-1] < new_size, "Ciphertensor: can only patch_copy to larger array. Use Ciphertensor.resize() for trimming"
+        assert (self.actual_shape[-1] if allow_transposed else self.shape[-1]) < new_size, "Ciphertensor: can only patch_copy to larger array. Use Ciphertensor.resize() for trimming"
 
         if isinstance(ctype, Plaintext):
             # TODO: Read dtype (T) from self (add dtype static to Ciphertensor class)
@@ -861,16 +874,20 @@ class Ciphertensor[ctype]:
         if self._diagonal_contiguous:
             raise NotImplementedError()
         elif self.ndim == 2:
-            if not ignore_transposed:
-                assert not self._transposed, "Not implemented yet: patch_copy transposed ciphertensor"
             patch_copy_data = []
 
-            for i in range(self.shape[0]):
-                patch_copy_data.extend(patch_copy_tensor._get_rows_raw(i).patch_copy(mpc, new_size)._data)
-            
+            if self._transposed and allow_transposed:
+                for i in range(new_size // self.shape[0]):
+                    patch_copy_data.extend(patch_copy_tensor._data.copy())
+                if new_size % self.shape[0]:
+                    patch_copy_data.extend(patch_copy_tensor._get_rows_raw(slice(0, new_size % self.shape[0], 1))._data.copy())
+            else:
+                for i in range(self.shape[0]):
+                    patch_copy_data.extend(patch_copy_tensor._get_rows_raw(i).patch_copy(mpc, new_size)._data)
+
             return Ciphertensor[ctype](
                 _data=patch_copy_data,
-                shape=[self.shape[0], new_size],
+                shape=[new_size, self.shape[1]] if self._transposed and allow_transposed else [self.shape[0], new_size],
                 slots=self.slots,
                 _transposed=self._transposed,
                 _diagonal_contiguous=self._diagonal_contiguous)
@@ -1283,6 +1300,14 @@ class Ciphertensor[ctype]:
             Ciphertensor._get_matmul_v3_cost(first, other))
     
     @staticmethod
+    def _get_matmul_via_mpc_cost_by_shape(first_shape, other_shape, slots):
+        ctx_per_row = (first_shape[1] + slots - 1) // slots
+        mpc_switch_cost = first_shape[0] * ctx_per_row * MHE_MPC_SWITCH_COST_ESTIMATE
+        iter_count = first_shape[0] * first_shape[1] * other_shape[1]
+        
+        return iter_count * MPC_BIG_INT_MUL_COST + mpc_switch_cost
+    
+    @staticmethod
     def _get_matmul_v1_cost_by_shape(first_shape, other_shape, slots):
         ctx_per_row = (first_shape[1] + slots - 1) // slots
         iter_count = first_shape[0] * other_shape[1]
@@ -1312,6 +1337,10 @@ class Ciphertensor[ctype]:
         iter_count = min(first_shape[0], other_shape[1]) * other_shape[0]
 
         return cost_per_cipher * iter_count * (HE_MUL_COST_ESTIMATE + HE_ROT_COST_ESTIMATE)
+    
+    @staticmethod
+    def _get_matmul_via_mpc_cost(first, other):
+        return Ciphertensor._get_matmul_via_mpc_cost_by_shape(first.shape, other.actual_shape, first.slots)
     
     @staticmethod
     def _get_matmul_v1_cost(first, other):
@@ -1356,27 +1385,32 @@ class Ciphertensor[ctype]:
                 case _:
                     raise ValueError("Invalid cost index")
         
-        costs = (Ciphertensor._get_matmul_v1_cost(self, other),
+        costs = (Ciphertensor._get_matmul_via_mpc_cost(self, other),
+                 Ciphertensor._get_matmul_v1_cost(self, other),
                  Ciphertensor._get_matmul_v2_cost(self, other),
                  Ciphertensor._get_matmul_v3_cost(self, other))
         
         m, n = other.shape
         if m % n and n % m:
             # TODO: temporary constraint: matmul dimensions need to divisible by each-other in v3 matmul for now"
-            from math import inf
             costs = (*costs[:-1], inf)
         
+        if not mpc.default_allow_mpc_switch:
+            costs = (inf, *costs[1:])
+        
         if debug:
-            print(f"\nCP{mpc.pid}:\tMatmul costs:\n\tM1: {costs[0]}\n\tM2: {costs[1]}\n\tM3: {costs[2]}\n")
+            print(f"\nCP{mpc.pid}:\tMatmul costs:\n\tVia SMC: {costs[0]}\n\tM1: {costs[1]}\n\tM2: {costs[2]}\n\tM3: {costs[3]}\n")
                 
         match argmin(costs):
             case 0:
+                return self.via_mpc(mpc, lambda stensor: secure_operator.matmul(mpc, stensor, other), S=Tuple[int, int])
+            case 1:
                 other_cipher = Ciphertensor[Plaintext].enc(mpc, other.T)
                 other_cipher._transposed = True
                 return self._matmul_v1(mpc, other_cipher, debug)
-            case 1:
-                return self._matmul_v2(mpc, Ciphertensor[Plaintext].enc(mpc, other, encoding=ENC_ROW), debug)
             case 2:
+                return self._matmul_v2(mpc, Ciphertensor[Plaintext].enc(mpc, other, encoding=ENC_ROW), debug)
+            case 3:
                 return self._matmul_v3(mpc, Ciphertensor[Plaintext].enc(mpc, other, encoding=ENC_DIAG), debug)
             case _:
                 raise ValueError("Invalid cost index")
