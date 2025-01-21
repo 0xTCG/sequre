@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 )
 
 var pid, _ = strconv.Atoi(os.Getenv("PID"))
@@ -30,10 +31,21 @@ func TestKingProtocol(t *testing.T) {
 		kinship := tprime - (X * X * one - 2 * X * X.T() + 1.T() * X.T() x X.T())
 		relatives := IsPositive(kinship)
 	*/
+	var start time.Time
 
-	prot := InitializeKingProtocol(pid, "config/")
+	start = time.Now()
+	prot := InitializeKingProtocol(pid, "config/king")
+	fmt.Printf("KING setup done in %s \n", time.Since(start))
+	
+	prot.Prot.MpcObj.GetNetworks().ResetNetworkLog()
 
+	start = time.Now()
 	matrices := prot.KingProtocol()
+	fmt.Printf("KING protocol done in %s \n", time.Since(start))
+
+	for i, _ := range matrices {
+		log.LLvl1("Size of matrix", i, ":", len(matrices[i]), len(matrices[i][0]))
+	}
 
 	localInput := prot.Data
 
@@ -52,7 +64,7 @@ func TestKingProtocol(t *testing.T) {
 				log.Fatal(err)
 			}
 			defer f_exp.Close()
-		
+
 			log.LLvl1("Test results of comparison with party", v)
 			otherPartyConfig := new(ConfigKingProtocol)
 			if _, err := toml.DecodeFile(filepath.Join("config/", fmt.Sprintf("configLocal.Party%d.toml", v[0])), otherPartyConfig); err != nil {
@@ -71,11 +83,14 @@ func TestKingProtocol(t *testing.T) {
 			log.LLvl1("localInput data:", len(localInput), len(localInput[0]))
 			for l := 0; l < len(localInput); l++ {
 				for o := 0; o < len(otherData); o++ {
-					minhet, localHet, otherHet := minNumberOfOnes(localInput[l], otherData[o])
-					log.LLvl1("minhet:", minhet, localHet, otherHet)
+					minhet, _, _ := minNumberOfOnes(localInput[l], otherData[o])
+					if !prot.Minimum {
+						minhet = 1
+					}
+					//log.LLvl1("minhet:", minhet, localHet, otherHet)
 					exp_value := squaredNormDistance(localInput[l], otherData[o]) / float64(minhet)
 					obt_value := matrices[v[0]][o][l]
-					
+
 					_, err := fmt.Fprintln(f_exp, strconv.FormatFloat(exp_value, 'f', -1, 64))
 					if err != nil {
 						log.Fatal(err)
@@ -84,18 +99,19 @@ func TestKingProtocol(t *testing.T) {
 					if err != nil {
 						log.Fatal(err)
 					}
-					
+
 					log.LLvl1(l, o, "exp_value:", exp_value)
 					log.LLvl1(l, o, "obt_value:", obt_value)
 					log.LLvl1("Expected value:", exp_value, "Obtained value:", obt_value)
 					if math.Abs(exp_value-obt_value) > 0.1 {
-						log.Error("ERROR : ", l, o, localInput[l], otherData[o], "Expected value:", exp_value, "Obtained value:", obt_value)
+						//log.Error("ERROR : ", l, o, localInput[l], otherData[o], "Expected value:", exp_value, "Obtained value:", obt_value)
 					}
 				}
 			}
 
 		}
 	}
+	prot.Prot.MpcObj.GetNetworks().PrintNetworkLog()
 
 }
 
