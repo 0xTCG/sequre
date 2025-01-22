@@ -40,6 +40,3 @@ replace github.com/ldsec/lattigo/v2 => github.com/hcholab/lattigo/v2 v2.1.2-0.20
 // replace github.com/hhcho/sfgwas-private => ../../../../../libs/go/src/hhcho/sfgwas-private
 // docker
 // replace github.com/hhcho/sfgwas-private => /sfgwas-private
-replace github.com/hhcho/sfgwas-private => ../../../../../libs/go/src/hhcho/sfgwas-private
-replace github.com/hhcho/sfgwas-private => ../../../../../libs/go/src/hhcho/sfgwas-private
-replace github.com/hhcho/sfgwas-private => ../../../../../libs/go/src/hhcho/sfgwas-private
