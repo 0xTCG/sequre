@@ -21,10 +21,6 @@ Afterwards, add alias for sequre command:
 alias sequre="find . -name 'sock.*' -exec rm {} \; && CODON_DEBUG=lt $HOME/.codon/bin/codon run --disable-opt="core-pythonic-list-addition-opt" -plugin sequre"
 ```
 
-Finally, 
-
-This will simulate the run in a two-party setup with a trusted dealer.
-
 ## Run
 
 Clone the repository:
@@ -38,6 +34,8 @@ and check the code in the [examples](examples/) for quick insight into Sequre.
 ```bash
 sequre examples/local_run.codon
 ```
+
+This will simulate the run in a two-party setup with a trusted dealer.
 
 ### Online run
 
