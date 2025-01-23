@@ -37,7 +37,7 @@ echo "Sequre plugin path: $SEQURE_PATH"
 if [[ $* == *--jit* ]]
 then
     echo "Running $2 in $1 mode ..."
-    /usr/bin/time -v $SEQURE_CODON_PATH/build/codon run --disable-opt="core-pythonic-list-addition-opt" -plugin $SEQURE_PATH -plugin $SEQURE_SEQ_PATH $1 scripts/invoke.codon run-$2 ${*:3}
+    /usr/bin/time -v $SEQURE_CODON_PATH/build/codon run --disable-opt="core-pythonic-list-addition-opt" -plugin $SEQURE_PATH $1 scripts/invoke.codon run-$2 ${*:3}
     echo "Cleaning up sockets ..."
     find . -name 'sock.*' -exec rm {} \;
 else
@@ -45,7 +45,7 @@ else
     then
         rm -f ./sequrex
         echo "Compiling $2 in $1 mode ..."
-        CC=clang CXX=clang++ $SEQURE_CODON_PATH/build/codon build --disable-opt="core-pythonic-list-addition-opt" -plugin $SEQURE_PATH -plugin $SEQURE_SEQ_PATH $1 -o sequrex scripts/invoke.codon
+        CC=clang CXX=clang++ $SEQURE_CODON_PATH/build/codon build --disable-opt="core-pythonic-list-addition-opt" -plugin $SEQURE_PATH $1 -o sequrex scripts/invoke.codon
     fi
 
     if [ ! -f "./sequrex" ]
