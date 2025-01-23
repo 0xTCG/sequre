@@ -21,18 +21,23 @@ Afterwards, add alias for sequre command:
 alias sequre="find . -name 'sock.*' -exec rm {} \; && CODON_DEBUG=lt $HOME/.codon/bin/codon run --disable-opt="core-pythonic-list-addition-opt" -plugin sequre"
 ```
 
-Finally, clone the repository:
-```bash
-git clone https://github.com/0xTCG/sequre.git && cd sequre
-```
-and run Sequre examples:
-```bash
-sequre examples/local_run.codon
-```
+Finally, 
+
+This will simulate the run in a two-party setup with a trusted dealer.
 
 ## Run
 
-Check the code in the [examples](examples/) for quick insight into Sequre.
+Clone the repository:
+```bash
+git clone https://github.com/0xTCG/sequre.git && cd sequre
+```
+and check the code in the [examples](examples/) for quick insight into Sequre.
+
+### Local run
+
+```bash
+sequre examples/local_run.codon
+```
 
 ### Online run
 
@@ -58,18 +63,6 @@ SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre examples/online_run.cod
 ```
 at the second party (CP2).
 
-### Local run
-
-To simulate the run on a single machine over multiple processes run:
-
-```bash
-sequre examples/local_run.codon --skip-mhe-setup
-```
-
-This will simulate the run in a two-party setup with a trusted dealer.
-
-_**Note:** `--skip-mhe-setup` flag disables the homomorphic encryption setup since `examples/local_run.codon` does not require homomorphic encryption._
-
 ### Release mode
 
 For (much) better performance but without debugging features such as backtrace, add `-release` flag immediatelly after `sequre` command:
@@ -77,6 +70,8 @@ For (much) better performance but without debugging features such as backtrace, 
 ```bash
 sequre -release examples/local_run.codon --skip-mhe-setup
 ```
+
+_**Note:** `--skip-mhe-setup` flag disables the homomorphic encryption setup since `examples/local_run.codon` runs only Sequre (SMC)._
 
 ## Benchmarks (USENIX Security 2025)
 
