@@ -75,10 +75,11 @@ _**Note:** `--skip-mhe-setup` flag disables the homomorphic encryption setup sin
 
 **Note:** We generate all data at random for easier testing. For the original data (from dbGaP under accession phs000716.v1.p1), please consult the authors.
 
-Run all USENIX Security 2025 benchmarks after cloning Sequre repository and checking out the artifact branch:
+Run all USENIX Security 2025 benchmarks either after cloning Sequre repository and checking out the artifact branch:
 ```bash
 git clone -b artifact https://github.com/0xTCG/sequre.git && cd sequre
 ```
+or directly in Zenodo artifact.
 
 ### Local run (single machine)
 ```bash
