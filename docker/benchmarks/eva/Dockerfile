@@ -1,5 +1,5 @@
 FROM hsmile/eva:latest
-LABEL Name=hefactory
+LABEL Name=eva
 
 # Copy files
 COPY applications/others/eva/ EVA/examples/
