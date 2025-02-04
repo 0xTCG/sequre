@@ -117,5 +117,10 @@ docker run --rm --privileged hsmile/hefactory:latest
 
 Run Lattigo basic workflows **(Figure 7; Section 10.2)** via docker:
 ```bash
-docker run -t --rm --privileged hsmile/lattigo:bench
+docker run --rm --privileged hsmile/lattigo:bench
+```
+
+Run SEAL micro-benchmarks **(Table 2; Section 10.2)** via docker:
+```bash
+docker run --rm --privileged hsmile/seal:bench
 ```
