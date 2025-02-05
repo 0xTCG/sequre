@@ -124,3 +124,8 @@ Run SEAL micro-benchmarks **(Table 2; Section 10.2)** via docker:
 ```bash
 docker run --rm --privileged hsmile/seal:bench
 ```
+
+Run MP-SPDZ micro-benchmarks and basic workflows **(Table 2 and Figure 7; Section 10.2)** via docker:
+```bash
+docker run --rm --privileged hsmile/mpspdz:bench
+```
