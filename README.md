@@ -129,3 +129,8 @@ Run MP-SPDZ micro-benchmarks and basic workflows **(Table 2 and Figure 7; Sectio
 ```bash
 docker run --rm --privileged hsmile/mpspdz:bench
 ```
+
+Run Lattigo micro-benchmarks **(Table 2; Section 10.2)** via docker:
+```bash
+docker run --rm --privileged -it hsmile/lattigo:micro
+```
