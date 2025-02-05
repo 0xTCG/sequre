@@ -1,0 +1,254 @@
+from sequre.constants import (
+    BOSTAN_PARTITIONING_HORIZONTAL_ENUM,
+    BOSTAN_PARTITIONING_VERTICAL_ENUM,
+    BOSTAN_PARTITIONING_ADDITIVE_ENUM,
+    BOSTAN_ENCODING_ROW_WISE_ENUM,
+    BOSTAN_ENCODING_COL_WISE_ENUM,
+    BOSTAN_ENCODING_DIAG_WISE_ENUM)
+
+
+class MPUMetadata:
+    shape: list[int]
+    partitioning: int  # 1, 2, 3
+    should_aggregate: bool
+
+    def __repr__(self):
+        return f"MPUMetadata({self.shape}, {self.partitioning}, {self.should_aggregate})"
+
+    def is_horizontal(self):
+        return self.partitioning == BOSTAN_PARTITIONING_HORIZONTAL_ENUM
+    
+    def is_vertical(self):
+        return self.partitioning == BOSTAN_PARTITIONING_VERTICAL_ENUM
+    
+    def is_additive(self):
+        return self.partitioning == BOSTAN_PARTITIONING_ADDITIVE_ENUM
+
+
+class PartitionMetadata:
+    shape: list[int]
+    plain: bool
+    encoding: int  # 0, 1, 2, 3
+
+    def __repr__(self):
+        return f"PartitionMetadata({self.shape}, {self.plain}, {self.encoding})"
+
+
+class Metadata:
+    mpu: MPUMetadata
+    partition: PartitionMetadata
+    is_secure_type: bool
+
+    def __repr__(self):
+        return f"Metadata({self.mpu}, {self.partition}, {self.is_secure_type})"
+
+    def set_mpu_metadata(self, arg):
+        self.is_secure_type = True
+        self.mpu.shape = list(arg.shape)
+        
+        if arg.is_mpp() and arg._mpp._transposed:
+            self.mpu.partitioning = BOSTAN_PARTITIONING_VERTICAL_ENUM
+        elif arg.is_mpp():
+            self.mpu.partitioning = BOSTAN_PARTITIONING_HORIZONTAL_ENUM
+        else:
+            assert arg.is_mpa(), "Internal error"
+            self.mpu.partitioning = BOSTAN_PARTITIONING_ADDITIVE_ENUM
+        
+        self.set_partition_metadata(arg)
+    
+    def set_partition_metadata(self, arg):
+        self.partition.shape = list(arg.shape_local)
+        self.partition.plain = arg.is_plain()
+
+        if self.partition.plain:
+            # Assume row-wise is default encoding
+            self.partition.encoding = BOSTAN_ENCODING_ROW_WISE_ENUM
+
+        else:
+            encryption = arg.encryption
+            if encryption._diagonal_contiguous:
+                self.partition.encoding = BOSTAN_ENCODING_DIAG_WISE_ENUM
+            elif encryption._transposed:
+                self.partition.encoding = BOSTAN_ENCODING_COL_WISE_ENUM
+            else:
+                self.partition.encoding = BOSTAN_ENCODING_ROW_WISE_ENUM
+
+
+def _is_ndarray(op_type_name):
+    return op_type_name.startswith("std.numpy.ndarray.ndarray")
+
+
+def _is_sharetensor(op_type_name):
+    return op_type_name.startswith("std.sequre.types.sharetensor.Sharetensor")
+
+
+def _is_ciphertensor(op_type_name):
+    return op_type_name.startswith("std.sequre.types.ciphertensor.Ciphertensor")
+
+
+def _is_mp(op_type_name):
+    return op_type_name.startswith("std.sequre.types.multiparty_")
+
+
+def _is_ciphertensor_plaintext(op_type_name):
+    return op_type_name == "std.sequre.types.ciphertensor.Ciphertensor[std.sequre.lattiseq.ckks.Plaintext]"
+
+
+def _is_ciphertensor_ciphertext(op_type_name):
+    return op_type_name == "std.sequre.types.ciphertensor.Ciphertensor[std.sequre.lattiseq.ckks.Ciphertext]"
+
+
+def _is_secure_container(op_type_name):
+    return _is_sharetensor(op_type_name) or _is_ciphertensor(op_type_name) or _is_mp(op_type_name)
+
+
+def _update_encoding_relevant_nodes(bet_node, relevant_encoding_nodes):
+    if bet_node.operation != "__matmul__":
+        return
+    
+    left_partition_metadata = bet_node.left_child.metadata.partition
+    right_partition_metadata = bet_node.right_child.metadata.partition
+
+    if not left_partition_metadata.plain and right_partition_metadata.plain:
+        relevant_encoding_nodes[bet_node.right_child.id] = bet_node.right_child
+    elif not right_partition_metadata.plain and left_partition_metadata.plain:
+        relevant_encoding_nodes[bet_node.left_child.id] = bet_node.left_child
+
+
+def _resolve_node_metadata_shapes(bet_node):
+    pmd = bet_node.metadata
+    
+    if bet_node.operation == "__matmul__":
+        assert bet_node.left_child is not None and bet_node.right_child, "Ivalid operands for __matmul__ in BET tree"
+        lmd = bet_node.left_child.metadata
+        rmd = bet_node.right_child.metadata
+
+        assert lmd.mpu.shape[1] == rmd.mpu.shape[0], "Shapes missmatch for MPUs within matrix multiplication in BOSTAN"
+        assert lmd.partition.shape[1] == rmd.partition.shape[0], "Shapes missmatch for partitions within matrix multiplication in BOSTAN"
+        pmd.mpu.shape = [lmd.mpu.shape[0], rmd.mpu.shape[1]]
+        pmd.partition.shape = [lmd.partition.shape[0], rmd.partition.shape[1]]
+        
+        if lmd.mpu.is_horizontal() and lmd.mpu.should_aggregate:
+            assert not rmd.mpu.is_horizontal(), "Internal error"
+            pmd.partition.shape[0] = lmd.mpu.shape[0]
+        elif lmd.mpu.is_additive() and rmd.mpu.is_vertical() and rmd.mpu.should_aggregate:
+            pmd.partition.shape[1] = rmd.mpu.shape[1]
+    
+    elif bet_node.operation == "T":
+        assert bet_node.left_child is not None, "Ivalid operand for T in BET tree"
+        lmd = bet_node.left_child.metadata
+        pmd.mpu.shape = lmd.mpu.shape[::-1]
+        pmd.partition.shape = lmd.partition.shape[::-1]
+    
+    elif bet_node.operation == "__getitem__":
+        # # TODO: Handle argument (int, slice, tuple)
+        # assert bet_node.left_child is not None, "Ivalid operand for __getitem__ in BET tree"
+        # pmd.mpu.shape = lmd.mpu.shape[1:]
+        # pmd.partition.shape = lmd.partition.shape[1:]
+        raise NotImplementedError()
+    
+    elif bet_node.operation == "expand_dims":
+        # # TODO: Handle axis argument (axis=0, axis=1)
+        # assert bet_node.left_child is not None, "Ivalid operand for expand_dims in BET tree"
+        # bet_node.metadata.shape = [1]
+        # bet_node.metadata.shape.extend(bet_node.left_child.metadata.shape)
+        raise NotImplementedError()
+    
+    elif bet_node.left_child is not None:
+        pmd.mpu.shape = lmd.mpu.shape.copy()
+
+
+def _resolve_node_metadata_partitioning(bet_node):
+    if bet_node.operation != "__matmul__":
+        return
+    
+    assert bet_node.left_child is not None and bet_node.right_child, "Ivalid operands for __matmul__ in BET tree"
+
+    pmd = bet_node.metadata
+    lmd = bet_node.left_child.metadata
+    rmd = bet_node.right_child.metadata
+
+    assert lmd.mpu.shape[1] == rmd.mpu.shape[0], "Shapes missmatch for MPUs within matrix multiplication in BOSTAN"
+    assert lmd.partition.shape[1] == rmd.partition.shape[0], "Shapes missmatch for partitions within matrix multiplication in BOSTAN"
+
+    should_agg_l = lmd.mpu.should_aggregate
+    assert should_agg_l ^ rmd.mpu.should_aggregate, "Internal error: Aggregate instruction not set"
+    
+    pmd.partition.plain = False
+    if lmd.mpu.is_horizontal() and rmd.mpu.is_horizontal():
+        pmd.mpu.partitioning = BOSTAN_PARTITIONING_HORIZONTAL_ENUM
+    elif lmd.mpu.is_horizontal() and rmd.mpu.is_vertical():
+        pmd.mpu.partitioning = BOSTAN_PARTITIONING_VERTICAL_ENUM if should_agg_l else BOSTAN_PARTITIONING_HORIZONTAL_ENUM
+    elif lmd.mpu.is_horizontal() and rmd.mpu.is_additive():
+        pmd.mpu.partitioning = BOSTAN_PARTITIONING_ADDITIVE_ENUM if should_agg_l else BOSTAN_PARTITIONING_HORIZONTAL_ENUM
+    elif lmd.mpu.is_vertical() and rmd.mpu.is_horizontal():
+        pmd.partition.plain = lmd.partition.plain and rmd.partition.plain
+        pmd.mpu.partitioning = BOSTAN_PARTITIONING_ADDITIVE_ENUM
+    elif lmd.mpu.is_vertical() and rmd.mpu.is_vertical():
+        pmd.mpu.partitioning = BOSTAN_PARTITIONING_VERTICAL_ENUM
+    elif lmd.mpu.is_vertical() and rmd.mpu.is_additive():
+        pmd.mpu.partitioning = BOSTAN_PARTITIONING_ADDITIVE_ENUM
+    elif lmd.mpu.is_additive() and rmd.mpu.is_horizontal():
+        pmd.mpu.partitioning = BOSTAN_PARTITIONING_ADDITIVE_ENUM
+    elif lmd.mpu.is_additive() and rmd.mpu.is_vertical():
+        pmd.mpu.partitioning = BOSTAN_PARTITIONING_VERTICAL_ENUM if should_agg_l else BOSTAN_PARTITIONING_ADDITIVE_ENUM
+    elif lmd.mpu.is_additive() and rmd.mpu.is_additive():
+        pmd.mpu.partitioning = BOSTAN_PARTITIONING_ADDITIVE_ENUM
+
+
+def _resolve_node_metadata_encoding(bet_node):
+    pmd = bet_node.metadata
+    if pmd.partition.plain:
+        return
+    
+    if bet_node.operation == "__matmul__":
+        assert bet_node.left_child is not None and bet_node.right_child, "Ivalid operands for __matmul__ in BET tree"
+        
+        lmd = bet_node.left_child.metadata
+        rmd = bet_node.right_child.metadata
+        left_enc = lmd.partition.encoding
+        right_enc = rmd.partition.encoding
+
+        if left_enc == BOSTAN_ENCODING_ROW_WISE_ENUM:
+            pmd.partition.encoding = BOSTAN_ENCODING_ROW_WISE_ENUM
+        elif left_enc == BOSTAN_ENCODING_COL_WISE_ENUM:
+            pmd.partition.encoding = BOSTAN_ENCODING_COL_WISE_ENUM + int(right_enc == BOSTAN_ENCODING_ROW_WISE_ENUM)
+        elif left_enc == BOSTAN_ENCODING_DIAG_WISE_ENUM:
+            pmd.partition.encoding = right_enc
+    
+    elif bet_node.operation == "T":
+        assert bet_node.left_child is not None, "Ivalid operand for T in BET tree"
+        lmd = bet_node.left_child.metadata
+        
+        if 0 < lmd.partition.encoding < 3:
+            pmd.partition.encoding = ((lmd.partition.encoding - 1) ^ 1) + 1  # Swap 1 and 2
+        else:
+            pmd.partition.encoding = lmd.partition.encoding
+    
+    elif bet_node.left_child is not None and bet_node.right_child is not None:
+        lmd = bet_node.left_child.metadata
+        rmd = bet_node.right_child.metadata
+        
+        if lmd.partition.encoding:
+            pmd.partition.encoding = lmd.partition.encoding
+        elif rmd.partition.encoding:
+            pmd.partition.encoding = rmd.partition.encoding
+    
+    elif bet_node.left_child is not None:
+        lmd = bet_node.left_child.metadata
+        pmd.partition.encoding = lmd.partition.encoding
+
+
+def _resolve_node_metadata(bet_node):
+    _resolve_node_metadata_shapes(bet_node)
+    _resolve_node_metadata_partitioning(bet_node)
+    _resolve_node_metadata_encoding(bet_node)
+
+
+def _resolve_tree_metadata(node):
+    if node.left_child is not None:
+        _resolve_tree_metadata(node.left_child)
+    if node.right_child is not None:
+        _resolve_tree_metadata(node.right_child)
+    
+    _resolve_node_metadata(node)
