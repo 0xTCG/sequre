@@ -61,12 +61,11 @@ ENV MP_SPDZ_HOME /usr/src/MP-SPDZ
 WORKDIR $MP_SPDZ_HOME
 
 RUN pip install --upgrade pip ipython
-RUN pip install fabric
 
 RUN git clone --depth 1 https://github.com/data61/MP-SPDZ.git ${MP_SPDZ_HOME}
-COPY source/* Programs/Source/
-COPY input/* Player-Data/
-COPY hosts.txt .
+COPY applications/others/mpspdz/source/* Programs/Source/
+COPY applications/others/mpspdz/run.sh .
+COPY applications/others/mpspdz/hosts.txt .
 
 ARG arch=
 ARG cxx=clang++-11
@@ -144,6 +143,4 @@ FROM machine as program
 ARG src="tutorial"
 ARG compile_options="--field=64"
 RUN ./compile.py ${compile_options} ${src}
-RUN mkdir -p Player-Data \
-        && echo 1 2 3 4 > Player-Data/Input-P0-0 \
-        && echo 1 2 3 4 > Player-Data/Input-P1-0
+COPY applications/others/mpspdz/input/* Player-Data/
