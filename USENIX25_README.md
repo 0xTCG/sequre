@@ -2,11 +2,10 @@
 
 **Note:** We generate all data at random for easier testing. For the original data (from dbGaP under accession phs000716.v1.p1), please consult the authors.
 
-Run all USENIX Security 2025 benchmarks either after cloning Sequre repository and checking out the artifact branch:
+After [installing Sequre](README.md) clone Sequre repository and then run all benchmarks as follows:
 ```bash
-git clone -b artifact https://github.com/0xTCG/sequre.git && cd sequre
+git clone https://github.com/0xTCG/sequre.git && cd sequre
 ```
-or directly in Zenodo artifact.
 
 ### Local run (single machine)
 ```bash
@@ -16,7 +15,7 @@ sequre -release scripts/invoke.codon run-benchmarks --local --jit --lattiseq --m
 This will evaluate microbenchmarks **(Table 2; Section 10.2)**, basic and complex workflows **(Figure 7; Section 10.2)**, and MNIST **(Section 10.5)** for both Sequre and Shechi.
 
 ### Online run
-Set each `<ipN>` to the respective IP address and `<pid>` to the respective ID. Please see the [online run example above](online_run).
+Local run should suffice all functionality tests. However, online run is also possible. Set each `<ipN>` to the respective IP address and `<pid>` to the respective ID. Please see the online run in original [README](README.md) for more details.
 
 ```bash
 SEQURE_CP_IPS=<ip1>,<ip2>,...,<ipN> sequre -release scripts/invoke.codon run-benchmarks --jit --stdlib-builtin --king --pca --gwas-without-norm <pid>
