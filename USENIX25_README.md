@@ -41,7 +41,7 @@ Run HEFactory basic workflows **(Figure 7; Section 10.2)** via docker:
 docker run --rm --privileged hsmile/hefactory:latest
 ```
 
-Run Lattigo basic workflows and KING **(Figure 7; Section 10.2)** via docker:
+Run Lattigo basic workflows **(Figure 7; Section 10.2)** via docker:
 ```bash
 docker run --rm --privileged hsmile/lattigo:bench
 ```
