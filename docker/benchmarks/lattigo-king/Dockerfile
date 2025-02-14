@@ -8,8 +8,8 @@ RUN \
 
 COPY applications/others/lattigo_king /lattigo_king
 COPY deps/sfgwas-private /sfgwas-private
-COPY data/king/ /data
+COPY data/king/king_sample.txt /data/king_sample.txt
 
 # Run benchmarks
 WORKDIR /lattigo_king
-CMD ["bash", "batch_run.sh"]
+CMD ["bash", "batch_run_king.sh"]
