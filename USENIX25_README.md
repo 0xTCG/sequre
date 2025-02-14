@@ -43,7 +43,7 @@ docker run --rm --privileged hsmile/hefactory:latest
 
 Run Lattigo basic workflows **(Figure 7; Section 10.2)** via docker:
 ```bash
-docker run --rm --privileged hsmile/lattigo:bench
+docker run -it --rm --privileged hsmile/lattigo:bench
 ```
 
 Run SEAL micro-benchmarks **(Table 2; Section 10.2)** via docker:
@@ -58,15 +58,15 @@ docker run --rm --privileged hsmile/mpspdz:bench
 
 Run Lattigo micro-benchmarks **(Table 2; Section 10.2)** via docker:
 ```bash
-docker run --rm --privileged -it hsmile/lattigo:micro
+docker run -it --rm --privileged hsmile/lattigo:micro
 ```
 
 Run Lattigo Kinship **(Figure 7; Section 10.2)** via docker:
 ```bash
-docker run --rm --privileged hsmile/lattigo:king
+docker run -it --rm --privileged hsmile/lattigo:king
 ```
 
 Run Lattigo GWAS (with PCA) **(Figure 7; Section 10.2)** via docker:
 ```bash
-docker run --rm --privileged -it hsmile/lattigo:gwas
+docker run -it --rm --privileged hsmile/lattigo:gwas
 ```
