@@ -20,14 +20,18 @@ class MPCComms[TP]:
     pid: int
     hub_pid: int
     sockets: dict[int, CSocket]
+    dealer_buffers: dict[int, List[byte]]
     stats: MPCStats
     randomness: MPCRandomness
     number_of_parties: int
     local: bool
+    detach_dealer: bool
 
     delay_buffer_size: int
 
-    def __init__(self: MPCComms[TP], randomness: MPCRandomness, local: bool, expect_data_sharing: bool):
+    def __init__(
+            self: MPCComms[TP], randomness: MPCRandomness,
+            local: bool, expect_data_sharing: bool):
         self.pid = randomness.pid
         self.hub_pid = 1
         self.stats = randomness.stats
@@ -36,6 +40,8 @@ class MPCComms[TP]:
         self.number_of_parties = NUMBER_OF_PARTIES
         self.local = local
         self.delay_buffer_size = 0
+        self.detach_dealer = False
+        self.dealer_buffers = {k: List[byte]() for k in range(1, self.number_of_parties)}
 
         self.__setup_channels(expect_data_sharing)
         self.reset_stats()
@@ -51,7 +57,7 @@ class MPCComms[TP]:
         self.stats.bytes_sent += sizeof(int)
         jar = ptr[byte](sizeof(int))
         pickle(data._pickle_size(), jar, pasteurized=False)
-        snd_jar(self.sockets[to_pid].sock_fd, jar, sizeof(int))
+        self.flush(to_pid, jar, sizeof(int))
     
     def receive_jar_size(self, from_pid: int) -> int:
         self.stats.receive_requests += 1
@@ -72,13 +78,31 @@ class MPCComms[TP]:
         jar = ptr[byte](pickle_size)
         pickle(data, jar, pasteurized=False)
 
-        snd_jar(self.sockets[to_pid].sock_fd, jar, pickle_size)
+        self.flush(to_pid, jar, pickle_size)
 
     def receive_as_jar[T](self, from_pid: int) -> T:
         self.stats.receive_requests += 1
         msg_len = self.receive_jar_size(from_pid)
         received_jar = receive_jar(self.sockets[from_pid].sock_fd, msg_len)
         return unpickle(received_jar, False, T)
+    
+    def flush(self, to_pid: int, jar, pickle_size):
+        if self.detach_dealer:
+            self.dealer_buffers[to_pid].extend(
+                List(Array(jar, pickle_size), pickle_size))
+        else:
+            snd_jar(self.sockets[to_pid].sock_fd, jar, pickle_size)
+    
+    def flush_dealer_buffers(self):
+        assert not self.detach_dealer, "Cannot flush dealer buffers when detach_dealer is True."
+
+        if self.pid != 0:
+            return
+        
+        @par(num_threads=self.number_of_parties - 1)
+        for to_pid in range(1, self.number_of_parties):
+            jar = self.dealer_buffers[to_pid]
+            self.flush(to_pid, jar.arr.ptr, len(jar))
     
     def share_from(self, data, source_pid: int, modulus):
         from_dealer = source_pid == 0
