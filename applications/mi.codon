@@ -275,19 +275,25 @@ def load_real_mi_data(name: str, rows_count: int = 86322, complete_data_size: in
         complete_data = array(read_matrix(f, complete_data_size, feature_count, binary=False, TP=float))
     with open(f"data/mi/real/{name}/labels.txt") as f:
         labels = array(read_matrix(f, rows_count, 1, binary=False, TP=float))
+    with open(f"data/mi/real/{name}/complete_labels.txt") as f:
+        complete_labels = array(read_matrix(f, complete_data_size, 1, binary=False, TP=float))
     with open(f"data/mi/real/{name}/miss_rows.txt") as f:
         miss_rows = read_matrix(f, feature_count, rows_count, binary=False, TP=int)
     with open(f"data/mi/real/{name}/col_types.txt") as f:
         col_types = [line.strip() for line in f.readlines()]
     
-    im_step_size = 1 / (1 << 17)
-    fm_step_size = 1 / (1 << 19)
-    im_initial_w = ones((feature_count, 1)) * (1 / (1 << 10))
-    fm_initial_w = ones((feature_count + 1, 1)) * (1 / (1 << 10))
+    im_factor = 13 if "balanced" in name else 17
+    fm_factor = 11 if "balanced" in name else 19
+    w_factor = 10
+    
+    im_step_size = 1 / (1 << im_factor)
+    fm_step_size = 1 / (1 << fm_factor)
+    im_initial_w = ones((feature_count, 1)) * (1 / (1 << w_factor))
+    fm_initial_w = ones((feature_count + 1, 1)) * (1 / (1 << w_factor))
     im_optimizer = "bgd"
     fm_optimizer = "bgd"
 
-    return (incomplete_data, complete_data, labels, miss_rows, col_types,
+    return (incomplete_data, complete_data, labels, complete_labels,miss_rows, col_types,
         im_initial_w, fm_initial_w, im_step_size, fm_step_size,
         im_optimizer, fm_optimizer)
 
@@ -396,8 +402,13 @@ def benchmark_scenario(mpc, backend: Static[str], msg: Static[str], runs_count: 
     return coefs, y_hat_y_means, y_hat_y_sds, imp_means, imp_sds, imp_accs, imp_aucs, runtimes, network_bws
 
 
-def evaluate_real_setup(mpc, backend: Static[str], real_data, mi_factor: int, im_epochs: int, fm_epochs: int, noise_scale: float, dump_data: bool, verbose: bool, modulus):
-    (incomplete_data, complete_data, labels,
+def evaluate_real_setup(mpc, name: Static[str], backend: Static[str], real_data, mi_factor: int, im_epochs: int, fm_epochs: int, noise_scale: float, dump_data: bool, verbose: bool, modulus):
+    @python
+    def py_roc_auc(y_true: list[float], y_score: list[float]) -> float:
+        from sklearn.metrics import roc_auc_score
+        return roc_auc_score(y_true, y_score)
+    
+    (incomplete_data, complete_data, labels, complete_labels,
      miss_row_masks, col_types,
      im_initial_w, fm_initial_w, im_step_size, fm_step_size,
      im_optimizer, fm_optimizer) = real_data
@@ -418,10 +429,12 @@ def evaluate_real_setup(mpc, backend: Static[str], real_data, mi_factor: int, im
         compile_error("Invalid backend provided")
     
     secure_impute_models = [_match_model(mpc, col_type, secure_im_initial_w, im_optimizer) for col_type in col_types]
-    secure_fit_model = LinReg(secure_fm_initial_w, fm_optimizer)
+    if name != "balanced_mimic" and name != "mimic" and name != "gcasr":
+        compile_error("Only mimic and gcasr datasets are supported in real setup evaluation")
+    secure_fit_model = LinReg(secure_fm_initial_w, fm_optimizer) if name == "gcasr" else LogReg(secure_fm_initial_w, fm_optimizer)
     
     secure_mi, secure_imputed_datasets = MICE(mi_factor, secure_impute_models, secure_fit_model).fit(
-        mpc, secure_incomplete_data, secure_complete_data, secure_labels, miss_row_masks,
+        mpc, secure_incomplete_data, secure_labels, miss_row_masks,
         im_step_size, fm_step_size, im_epochs, fm_epochs, noise_scale, verbose=verbose)
     
     if dump_data:
@@ -430,8 +443,13 @@ def evaluate_real_setup(mpc, backend: Static[str], real_data, mi_factor: int, im
             if mpc.pid == 2:
                 log("", revealed_data, path=f'data/mi/dump/sequre_imputed_dataset_real_{i + 1}.txt', mode='w', separator=' ')
     
-    predicted_data = secure_mi.model.predict(mpc, secure_incomplete_data).reveal(mpc)
-    abs_diff = (predicted_data - labels).abs()
+    predicted_data = secure_mi.model.predict(mpc, secure_complete_data).reveal(mpc)
+
+    if "mimic" in name:
+        print(f"CP{mpc.pid}:\t MIMIC AUC", py_roc_auc(complete_labels.flatten().tolist(), predicted_data.flatten().tolist()))
+        print(f"CP{mpc.pid}:\t MIMIC Accuracy", ((predicted_data > 0.5).astype(int) == complete_labels.astype(int)).astype(int).mean())
+
+    abs_diff = (predicted_data - complete_labels).abs()
     assert abs_diff.shape == predicted_data.shape
     
     y_hat_y_mean = abs_diff.mean()
@@ -440,7 +458,7 @@ def evaluate_real_setup(mpc, backend: Static[str], real_data, mi_factor: int, im
     return y_hat_y_mean, y_hat_y_sd
 
 
-def benchmark_real_setup(mpc, backend: Static[str], runs_count: int, real_data, mi_factor: int,
+def benchmark_real_setup(mpc, name: Static[str], backend: Static[str], runs_count: int, real_data, mi_factor: int,
                          im_epochs: int, fm_epochs: int, noise_scale: float,
                          dump_data: bool, verbose: bool, modulus):
     y_hat_y_means = zeros((runs_count,))
@@ -450,7 +468,7 @@ def benchmark_real_setup(mpc, backend: Static[str], runs_count: int, real_data, 
     
     for i in tqdm(mpc, range(runs_count), "Evaluating real setup"):
         time_s, net_s = time.time(), mpc.stats.bytes_sent
-        y_hat_y_mean, y_hat_y_sd = evaluate_real_setup(mpc, backend, real_data, mi_factor, im_epochs, fm_epochs, noise_scale, dump_data, verbose, modulus)
+        y_hat_y_mean, y_hat_y_sd = evaluate_real_setup(mpc, name, backend, real_data, mi_factor, im_epochs, fm_epochs, noise_scale, dump_data, verbose, modulus)
         time_e, net_e = time.time(), mpc.stats.bytes_sent
         
         y_hat_y_means[i] = y_hat_y_mean
@@ -458,7 +476,7 @@ def benchmark_real_setup(mpc, backend: Static[str], runs_count: int, real_data, 
         runtimes[i] = time_e - time_s
         network_bws[i] = net_e - net_s
     
-    return zeros((runs_count, 15)), y_hat_y_means, y_hat_y_sds, zeros((runs_count,)) - 1, zeros((runs_count,)) - 1, zeros((runs_count,)) - 1, zeros((runs_count,)) - 1, runtimes, network_bws
+    return zeros((runs_count, 17 if "mimic" in name else 15)), y_hat_y_means, y_hat_y_sds, zeros((runs_count,)) - 1, zeros((runs_count,)) - 1, zeros((runs_count,)) - 1, zeros((runs_count,)) - 1, runtimes, network_bws
 
 
 def print_stats(mpc, msg: Static[str], coefs, biases, sds, imp_biases, imp_sds, imp_accs, imp_aucs, runtimes, network_bws):
@@ -528,14 +546,19 @@ def benchmark_mi(mpc, backend: Static[str], mi_factor: int, im_epochs: int, fm_e
     
     if run_real_setup:
         # real_gcasr = load_real_mi_data("gcasr", 86322, 14940, 15)
-        real_mimic = load_real_mi_data("mimic", 100000, 100000 - 49960, 5)
+        # real_mimic = load_real_mi_data("mimic", 94458, 3022, 17)
+        real_mimic_balanced = load_real_mi_data("balanced_mimic", 6890, 305, 17)
         
         # real_gcasr_stats = benchmark_real_setup(
-        #     mpc, backend, real_setup_runs_count, real_gcasr, mi_factor,
+        #     mpc, "gcasr", backend, real_setup_runs_count, real_gcasr, mi_factor,
         #     im_epochs, fm_epochs, noise_scale, dump_data, verbose, modulus)
-        real_mimic_stats = benchmark_real_setup(
-            mpc, backend, real_setup_runs_count, real_mimic, mi_factor,
+        # real_mimic_stats = benchmark_real_setup(
+        #     mpc, "mimic", backend, real_setup_runs_count, real_mimic, mi_factor,
+        #     im_epochs, fm_epochs, noise_scale, dump_data, verbose, modulus)
+        real_mimic_balanced_stats = benchmark_real_setup(
+            mpc, "balanced_mimic", backend, real_setup_runs_count, real_mimic_balanced, mi_factor,
             im_epochs, fm_epochs, noise_scale, dump_data, verbose, modulus)
 
         # print_stats(mpc, "Real data (GCASR)", *real_gcasr_stats)
-        print_stats(mpc, "Real data (MIMIC)", *real_mimic_stats)
+        # print_stats(mpc, "Real data (MIMIC)", *real_mimic_stats)
+        print_stats(mpc, "Real data (MIMIC balanced)", *real_mimic_balanced_stats)
