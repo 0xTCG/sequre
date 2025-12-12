@@ -2,6 +2,7 @@ from sequre import sequre
 
 from sequre.constants import SUPPORTED_ACTIVATIONS
 from activations import activate, dactivate
+from numpy.create import zeros
 
 
 class Input[ctype]:
@@ -110,3 +111,184 @@ class Dense[ctype]:
     def _evaluate(mpc, layer: Dense, last_output: ctype):
         layer.input = last_output @ layer.weights + layer.bias
         layer.output = layer.activate(mpc)
+
+class Conv2D[ctype]:
+    activation: str
+    out_channels: int
+    kernel_size: tuple[int, int]
+    stride: tuple[int, int]
+    padding: str
+    kernel_initializer: str
+    bias_initializer: str
+    
+    in_channels: int
+
+    weights: ctype
+    bias: ctype
+    input: ctype
+    output: ctype
+    last_input: ctype
+
+    dw: ctype
+    db: ctype
+
+    vw: ctype
+    vb: ctype
+
+    def __init__(self, activation: str, out_channels: int, kernel_size=(3, 3), stride=(1, 1), padding: str = "valid", kernel_initializer: str = "uniform", bias_initializer: str = "uniform"):
+        assert activation in SUPPORTED_ACTIVATIONS, f"Conv2D: {activation} activation not supported. Supported: {SUPPORTED_ACTIVATIONS}"
+        assert padding == "valid", f"Conv2D: only 'valid' padding is currently supported, got {padding}"
+        
+        self.activation = activation
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)
+        self.stride = stride if isinstance(stride, tuple) else (stride, stride)
+        self.padding = padding
+        self.kernel_initializer = kernel_initializer
+        self.bias_initializer = bias_initializer
+    
+    @property
+    def size(self) -> int:
+        if hasattr(self, 'output') and not self.output.is_empty():
+            batch, H, W, C = self.output.shape
+            return H * W * C
+        return 0
+    
+    @property
+    def channels(self) -> int:
+        return self.out_channels
+
+    def initialize(self, mpc, prev_size: int, *args, **kwargs):
+        self.in_channels = prev_size
+
+        kH, kW = self.kernel_size
+        w_shape = (kH, kW, self.in_channels, self.out_channels)
+        b_shape = (1, 1, 1, self.out_channels)
+
+        self.weights = ctype.rand(w_shape, self.kernel_initializer, mpc, *args, **kwargs)
+        self.bias = ctype.rand(b_shape, self.bias_initializer, mpc, *args, **kwargs)
+
+        self.dw = self.weights.zeros()
+        self.db = self.bias.zeros()
+
+        self.vw = self.weights.zeros()
+        self.vb = self.bias.zeros()
+
+    def is_evaluated(self):
+        return not self.output.is_empty()
+
+    def evaluate(self, mpc, last_output: ctype):
+        Conv2D[ctype]._evaluate(mpc, self, last_output)
+
+    def activate(self, mpc) -> ctype:
+        return activate(mpc, self.input, self.activation)
+
+    def derive(self, mpc, prev_output: ctype, dhidden: ctype, LAYER_IDX: Static[int]) -> ctype:
+        dact = dactivate(mpc, self.input, self.activation)
+        return Conv2D[ctype]._derive(mpc, self, prev_output, dhidden, dact, LAYER_IDX=LAYER_IDX)
+
+    def update(self, mpc, step: float, momentum: float):
+        Conv2D[ctype]._nesterov_update(mpc, self, step, momentum)
+
+    @sequre
+    def _nesterov_update(mpc, layer: Conv2D, step: float, momentum: float):
+        vw_prev = layer.vw.copy()
+        layer.vw = layer.vw * momentum - layer.dw * step
+        layer.weights += layer.vw * (momentum + 1) - vw_prev * momentum
+
+        vb_prev = layer.vb.copy()
+        layer.vb = layer.vb * momentum - layer.db * step
+        layer.bias += layer.vb * (momentum + 1) - vb_prev * momentum
+
+    @sequre
+    def _im2col(mpc, X: ctype, kH: int, kW: int, stride_h: int, stride_w: int, pad_h: int, pad_w: int) -> ctype:
+        # Main Logic
+        batch, H, W, C = X.shape
+        out_H = (H - kH) // stride_h + 1
+        out_W = (W - kW) // stride_w + 1
+        
+        kernel_slices = []
+        for i in range(kH):
+            for j in range(kW):
+                r_start = i
+                r_end = i + out_H * stride_h
+                c_start = j
+                c_end = j + out_W * stride_w
+                
+                val = X[:, r_start:r_end:stride_h, c_start:c_end:stride_w, :]                
+                val_flat = val.reshape((batch * out_H * out_W, C))
+                kernel_slices.append(val_flat)
+        
+        cols = kernel_slices[0]
+        for k in range(1, len(kernel_slices)):
+             cols = cols.concatenate(kernel_slices[k], axis=1)
+             
+        return cols
+
+    @sequre
+    def _col2im(mpc, cols: ctype, batch: int, H: int, W: int, C: int, kH: int, kW: int, 
+                stride_h: int, stride_w: int, pad_h: int, pad_w: int) -> ctype:
+        out_H = (H - kH) // stride_h + 1
+        out_W = (W - kW) // stride_w + 1
+        
+        dX = (cols * 0)[0:1, 0:1].reshape((batch, H, W, C))
+        
+        col_idx = 0
+        for i in range(kH):
+            for j in range(kW):
+                block = cols[:, col_idx : col_idx + C]
+                col_idx += C                
+                block_reshaped = block.reshape((batch, out_H, out_W, C))                
+                r_start = i
+                r_end = i + out_H * stride_h
+                c_start = j
+                c_end = j + out_W * stride_w
+                dX[:, r_start:r_end:stride_h, c_start:c_end:stride_w, :] += block_reshaped
+                
+        return dX
+
+    @sequre
+    def _evaluate(mpc, layer: Conv2D, last_output: ctype):
+        # Forward pass logic
+        batch, H, W, C_in = last_output.shape
+        kH, kW = layer.kernel_size
+        stride_h, stride_w = layer.stride
+        
+        layer.last_input = last_output
+        
+        out_H = (H - kH) // stride_h + 1
+        out_W = (W - kW) // stride_w + 1        
+        cols = Conv2D[ctype]._im2col(mpc, last_output, kH, kW, stride_h, stride_w, 0, 0)        
+        weights_flat = layer.weights.reshape((kH * kW * C_in, layer.out_channels))        
+        features = cols @ weights_flat        
+        output = features.reshape((batch, out_H, out_W, layer.out_channels))        
+        layer.input = output + layer.bias
+        layer.output = layer.activate(mpc)
+
+    @sequre
+    def _derive(mpc, layer: Conv2D, prev_output: ctype, dhidden: ctype, dact: ctype, LAYER_IDX: Static[int]):
+        # Backward pass logic
+        batch, H, W, C = prev_output.shape
+        kH, kW = layer.kernel_size
+        stride_h, stride_w = layer.stride        
+        dhidden = dhidden * dact
+        pad_h = 0
+        pad_w = 0
+        out_H = (H - kH) // stride_h + 1
+        out_W = (W - kW) // stride_w + 1
+        
+        dhidden_flat = dhidden.reshape((batch * out_H * out_W, layer.out_channels))        
+        cols = Conv2D[ctype]._im2col(mpc, prev_output, kH, kW, stride_h, stride_w, pad_h, pad_w)        
+        dW_flat = cols.T @ dhidden_flat
+        layer.dw = dW_flat.reshape((kH, kW, C, layer.out_channels))        
+        db_sum = dhidden_flat.sum(axis=0).expand_dims(axis=0)  # (1, out_channels)
+        layer.db = db_sum.expand_dims(axis=0).expand_dims(axis=0)  # (1, 1, 1, out_channels)
+        
+        if LAYER_IDX == 1:
+            return layer.output
+        
+        W_col = layer.weights.reshape((kH * kW * C, layer.out_channels))
+        dcols = dhidden_flat @ W_col.T  # (N, kHkWC)        
+        dprev = Conv2D[ctype]._col2im(mpc, dcols, batch, H, W, C, kH, kW, 
+                                      stride_h, stride_w, pad_h, pad_w)
+        return dprev
