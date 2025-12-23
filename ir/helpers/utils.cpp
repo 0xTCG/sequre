@@ -40,27 +40,27 @@ bool isBinaryInstr(CallInstr *instr) {
 }
 
 bool hasSequreAttr( Func *f ) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.sequre");
+  return bool(f) && util::hasAttribute(f, codon::ast::getMangledFunc("std.sequre.attributes", "sequre"));
 }
 
 bool hasPolyOptAttr( Func *f ) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.mpc_poly_opt");
+  return bool(f) && util::hasAttribute(f, codon::ast::getMangledFunc("std.sequre.attributes", "mpc_poly_opt"));
 }
 
 bool hasMatmulReorderOptAttr( Func *f ) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.reorder_matmul");
+  return bool(f) && util::hasAttribute(f, codon::ast::getMangledFunc("std.sequre.attributes", "reorder_matmul"));
 }
 
 bool hasCipherOptAttr( Func *f ) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.mhe_cipher_opt");
+  return bool(f) && util::hasAttribute(f, codon::ast::getMangledFunc("std.sequre.attributes", "mhe_cipher_opt"));
 }
 
 bool hasEncOptAttr( Func *f ) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.mhe_enc_opt");
+  return bool(f) && util::hasAttribute(f, codon::ast::getMangledFunc("std.sequre.attributes", "mhe_enc_opt"));
 }
 
 bool hasDebugAttr( Func *f ) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.debug");
+  return bool(f) && util::hasAttribute(f, codon::ast::getMangledFunc("std.sequre.attributes", "debug"));
 }
 
 bool hasCKKSPlaintext( types::Type *t ) {
@@ -111,7 +111,8 @@ bool isMPC( Value *value ) {
   auto generics = value->getType()->getGenerics();
   assert( generics.size() == 1 && "ERROR: While testing if value is the MPC instance. It should have one and only one generic type." );
   auto *M = value->getModule();
-  auto *mpcType = M->getOrRealizeType("MPCEnv", { generics[0] }, "std.sequre.mpc.env");
+  auto *mpcType = M->getOrRealizeType(
+    codon::ast::getMangledClass("std.sequre.mpc.env", "MPCEnv"), generics);
   assert(mpcType);
   return value->getType()->is(mpcType);
 }
@@ -131,7 +132,7 @@ types::Type *getTupleType( std::vector<Value *> vals, Module *M ) {
 Func *getOrRealizeSequreInternalMethod( Module *M, std::string const &methodName,
                                         std::vector<types::Type *> args,
                                         std::vector<types::Generic> generics ) {
-  auto *sequreInternalType = M->getOrRealizeType("Internal", {}, "std.sequre.types.internal");
+  auto *sequreInternalType = M->getOrRealizeType(codon::ast::getMangledClass("std.sequre.types.internal", "Internal"), {});
   auto *method = M->getOrRealizeMethod(sequreInternalType, methodName, args, generics);
   
   if ( !method ) {

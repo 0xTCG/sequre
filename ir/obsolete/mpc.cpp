@@ -1085,32 +1085,34 @@ void routeFactorizations(CallInstr *v, BodiedFunc *bf, SeriesFlow *series,
   // costVars contains the cost calculation expression for each newVar
   std::vector<Value *> costVars;
 
-  for (auto factorizationTree : factorizationTrees) {
-    newVars.push_back(
-        util::makeVar(generateExpression(M, factorizationTree), series, bf, true));
-    costVars.push_back(
-        util::makeVar(generateCostExpression(M, factorizationTree), series, bf, true));
-  }
+  // TODO: Needs to be adapted to Codon v19. Ignoring for now as this pass is obsolete anyways.
+  // for (auto factorizationTree : factorizationTrees) {
+  //   newVars.push_back(
+  //       util::makeVar(generateExpression(M, factorizationTree), series, bf, true));
+  //   costVars.push_back(
+  //       util::makeVar(generateCostExpression(M, factorizationTree), series, bf, true));
+  // }
 
-  auto it = series->begin();
-  while (it != series->end()) {
-    auto *retIns = cast<ReturnInstr>(*it);
-    if (!retIns) {
-      ++it;
-      continue;
-    }
+  // auto it = series->begin();
+  // while (it != series->end()) {
+  //   auto *retIns = cast<ReturnInstr>(*it);
+  //   if (!retIns) {
+  //     ++it;
+  //     continue;
+  //   }
 
-    // TODO: Add support for n1 + n2 + ... + nm case
-    // TODO: Update type-getter to deduce the return type
-    retIns->setValue(callRouter(M, newVars, costVars));
-    ++it;
-  }
+  //   // TODO: Add support for n1 + n2 + ... + nm case
+  //   // TODO: Update type-getter to deduce the return type
+  //   retIns->setValue(callRouter(M, newVars, costVars));
+  //   ++it;
+  // }
+  assert(false && "Sequre factorization optimization is obsolete.");
 }
 
 /* IR passes */
 
 bool isFactOptFunc(Func *f) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.mhe_mat_opt");
+  return bool(f) && util::hasAttribute(f, codon::ast::getMangledFunc("std.sequre.attributes", "mhe_mat_opt"));
 }
 
 void applyFactorizationOptimizations(CallInstr *v) {
