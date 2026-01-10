@@ -1,0 +1,118 @@
+name: Build Sequre Plugin (Linux x86_64)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-linux:
+    name: Build Sequre plugin (linux-x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache Codon LLVM
+        uses: actions/cache@v4
+        with:
+          path: |
+            codon-llvm/build
+            codon-llvm/install
+          key: codon-llvm-${{ runner.os }}-${{ runner.arch }}-codon-0.17.0-${{ hashFiles('CMakeLists.txt', 'ir/**', 'plugin.toml') }}
+
+      - name: Cache Codon install
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.codon
+          key: codon-${{ runner.os }}-${{ runner.arch }}-0.17.0
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils \
+            clang \
+            cmake \
+            curl \
+            git \
+            ninja-build
+
+      - name: Install Codon v0.17.0 (if needed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -x "$HOME/.codon/bin/codon" ]; then
+            mkdir -p "$HOME/.codon"
+            curl -L https://github.com/exaloop/codon/releases/download/v0.17.0/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | \
+              tar zxvf - -C "$HOME/.codon" --strip-components=1
+          fi
+          echo "$HOME/.codon/bin" >> "$GITHUB_PATH"
+          "$HOME/.codon/bin/codon" --version
+
+      - name: Build Codon LLVM fork (if needed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d "codon-llvm/install/lib/cmake/llvm" ]; then
+            echo "Found existing Codon LLVM install."
+            exit 0
+          fi
+          rm -rf codon-llvm
+          git clone --depth 1 -b codon https://github.com/exaloop/llvm-project codon-llvm
+          cmake -S codon-llvm/llvm -B codon-llvm/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_ENABLE_RTTI=ON \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_TARGETS_TO_BUILD=all \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++
+          cmake --build codon-llvm/build
+          cmake --install codon-llvm/build --prefix codon-llvm/install
+
+      - name: Build Sequre plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          ABI_FLAG=0
+          if nm -D "$HOME/.codon/lib/codon/libcodonc.so" 2>/dev/null | grep -q "NE_MAGIC_NAMEB5cxx11"; then
+            ABI_FLAG=1
+          fi
+          CXX_ABI_FLAGS="-D_GLIBCXX_USE_CXX11_ABI=${ABI_FLAG}"
+
+          rm -rf build
+          cmake -S . -B build -G Ninja \
+            -DLLVM_DIR="$PWD/codon-llvm/install/lib/cmake/llvm" \
+            -DCODON_PATH="$HOME/.codon" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="$CXX_ABI_FLAGS" \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++
+          cmake --build build --config Release
+          cmake --install build --prefix "$HOME/.codon/lib/codon/plugins/sequre"
+
+      - name: Package plugin artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT_DIR="$PWD/artifacts/sequre"
+          mkdir -p "$OUT_DIR/build"
+          cp "$HOME/.codon/lib/codon/plugins/sequre/build/libsequre.so" "$OUT_DIR/build/libsequre.so"
+          cp "$HOME/.codon/lib/codon/plugins/sequre/plugin.toml" "$OUT_DIR/plugin.toml"
+          cp -R "$HOME/.codon/lib/codon/plugins/sequre/stdlib" "$OUT_DIR/stdlib"
+
+      - name: Upload plugin artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sequre-plugin-linux-x86_64
+          path: artifacts/sequre
