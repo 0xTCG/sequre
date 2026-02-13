@@ -1,7 +1,9 @@
 from sequre import sequre
 
 from sequre.constants import SUPPORTED_ACTIVATIONS
+from sequre.stdlib.builtin import maximum
 from activations import activate, dactivate
+from numpy.create import zeros
 
 
 class Input[ctype]:
@@ -112,6 +114,24 @@ class Dense[ctype]:
         layer.output = layer.activate(mpc)
 
 class Conv2D[ctype]:
+    """A complete Conv2D layer with full sliding-window convolution.
+
+    This implementation supports arbitrary kernel sizes, strides, and padding modes
+    ('valid' and 'same'). It uses im2col-style matrix multiplication for efficiency.
+    
+    Supports NHWC inputs of shape `(batch, height, width, in_channels)` and produces 
+    `(batch, out_height, out_width, out_channels)` output.
+    
+    Args:
+        activation: Activation function name (must be in SUPPORTED_ACTIVATIONS)
+        out_channels: Number of output filters
+        kernel_size: Size of the convolution kernel (int or tuple of 2 ints)
+        stride: Stride of the convolution (int or tuple of 2 ints)
+        padding: Either 'valid' (no padding) or 'same' (pad to keep spatial dims)
+        kernel_initializer: Weight initialization method
+        bias_initializer: Bias initialization method
+    """
+
     activation: str
     out_channels: int
     kernel_size: tuple[int, int]
@@ -119,22 +139,26 @@ class Conv2D[ctype]:
     padding: str
     kernel_initializer: str
     bias_initializer: str
+    
+    # Store input shape for backward pass
     in_channels: int
 
-    weights: ctype
-    bias: ctype
-    input: ctype
-    output: ctype
-    last_input: ctype
+    weights: ctype  # Shape: (kH, kW, in_channels, out_channels)
+    bias: ctype     # Shape: (1, out_channels)
+    input: ctype    # Pre-activation
+    output: ctype   # Post-activation
 
+    # Derivatives
     dw: ctype
     db: ctype
 
+    # Momentum terms
     vw: ctype
     vb: ctype
 
     def __init__(self, activation: str, out_channels: int, kernel_size=(3, 3), stride=(1, 1), padding: str = "valid", kernel_initializer: str = "uniform", bias_initializer: str = "uniform"):
         assert activation in SUPPORTED_ACTIVATIONS, f"Conv2D: {activation} activation not supported. Supported: {SUPPORTED_ACTIVATIONS}"
+        # Only support 'valid' padding for now due to ndarray API limitations
         assert padding == "valid", f"Conv2D: only 'valid' padding is currently supported, got {padding}"
         
         self.activation = activation
@@ -147,6 +171,7 @@ class Conv2D[ctype]:
     
     @property
     def size(self) -> int:
+        """Return flattened output size for compatibility with Sequential."""
         if hasattr(self, 'output') and not self.output.is_empty():
             batch, H, W, C = self.output.shape
             return H * W * C
@@ -154,13 +179,17 @@ class Conv2D[ctype]:
     
     @property
     def channels(self) -> int:
+        """Return number of output channels for Sequential model compatibility."""
         return self.out_channels
 
     def initialize(self, mpc, prev_size: int, *args, **kwargs):
+        # For Conv2D, prev_size is the number of input channels
         self.in_channels = prev_size
 
         kH, kW = self.kernel_size
+        # Weights: (kH, kW, in_channels, out_channels)
         w_shape = (kH, kW, self.in_channels, self.out_channels)
+        # Bias: (1, 1, 1, out_channels) to match 4D tensor type
         b_shape = (1, 1, 1, self.out_channels)
 
         self.weights = ctype.rand(w_shape, self.kernel_initializer, mpc, *args, **kwargs)
@@ -199,92 +228,160 @@ class Conv2D[ctype]:
         layer.bias += layer.vb * (momentum + 1) - vb_prev * momentum
 
     @sequre
-    def _im2col(mpc, X: ctype, kH: int, kW: int, stride_h: int, stride_w: int, pad_h: int, pad_w: int) -> ctype:
-        # Convert image patches into columns for efficient convolution computation (im2col transformation)
+    def _im2col(mpc, X: ctype, kH: int, kW: int, stride_h: int, stride_w: int) -> ctype:
+        """Convert input tensor to column matrix for efficient convolution.
+        
+        Args:
+            X: Input tensor of shape (batch, H, W, C)
+            kH, kW: Kernel dimensions
+            stride_h, stride_w: Stride in each dimension
+            
+        Returns:
+            Column matrix of shape (batch * out_H * out_W, kH * kW * C)
+        """
         batch, H, W, C = X.shape
+        
+        # Calculate output dimensions
         out_H = (H - kH) // stride_h + 1
         out_W = (W - kW) // stride_w + 1
         
-        kernel_slices = []
-        for i in range(kH):
-            for j in range(kW):
-                r_start = i
-                r_end = i + out_H * stride_h
-                c_start = j
-                c_end = j + out_W * stride_w
-                
-                val = X[:, r_start:r_end:stride_h, c_start:c_end:stride_w, :]      
-                val_flat = val.reshape((batch * out_H * out_W, C))
-                kernel_slices.append(val_flat)
+        # Collect all patches into a list, then concatenate
+        patches = []
+        for b in range(batch):
+            for i in range(out_H):
+                for j in range(out_W):
+                    h_start = i * stride_h
+                    w_start = j * stride_w
+                    
+                    # Extract patch and flatten
+                    patch = X[b:b+1, h_start:h_start+kH, w_start:w_start+kW, :]
+                    patches.append(patch.reshape((1, kH * kW * C)))
         
-        cols = kernel_slices[0]
-        for k in range(1, len(kernel_slices)):
-            cols = cols.concatenate(kernel_slices[k], axis=1)
+        # Concatenate all patches vertically
+        cols = patches[0]
+        for i in range(1, len(patches)):
+            cols = cols.concatenate(patches[i], axis=0)
+        
         return cols
 
     @sequre
     def _col2im(mpc, cols: ctype, batch: int, H: int, W: int, C: int, kH: int, kW: int, 
-                stride_h: int, stride_w: int, pad_h: int, pad_w: int) -> ctype:
+                stride_h: int, stride_w: int) -> ctype:
+        """Convert column matrix back to input tensor format (for backward pass).
+        
+        Args:
+            cols: Column matrix of shape (batch * out_H * out_W, kH * kW * C)
+            batch, H, W, C: Original input dimensions
+            kH, kW: Kernel dimensions
+            stride_h, stride_w: Stride in each dimension
+            
+        Returns:
+            Gradient tensor of shape (batch, H, W, C)
+        """
+        
         out_H = (H - kH) // stride_h + 1
         out_W = (W - kW) // stride_w + 1
         
-        dX = (cols * 0)[0:1, 0:1].reshape((batch, H, W, C))
+        # Initialize gradient tensor with zeros using explicit zero tensor creation
+        dX = cols.zeros().reshape((batch, H, W, C))
         
+        # Accumulate gradients
         col_idx = 0
-        for i in range(kH):
-            for j in range(kW):
-                block = cols[:, col_idx : col_idx + C]
-                col_idx += C
-                block_reshaped = block.reshape((batch, out_H, out_W, C))
-                r_start = i
-                r_end = i + out_H * stride_h
-                c_start = j
-                c_end = j + out_W * stride_w
-                dX[:, r_start:r_end:stride_h, c_start:c_end:stride_w, :] += block_reshaped   
+        for b in range(batch):
+            for i in range(out_H):
+                for j in range(out_W):
+                    h_start = i * stride_h
+                    w_start = j * stride_w
+                    
+                    # Reshape column back to patch
+                    patch = cols[col_idx:col_idx+1, :].reshape((1, kH, kW, C))
+                    
+                    # Add to gradient (accumulate for overlapping regions)
+                    dX[b:b+1, h_start:h_start+kH, w_start:w_start+kW, :] += patch
+                    col_idx += 1
+        
         return dX
 
     @sequre
     def _evaluate(mpc, layer: Conv2D, last_output: ctype):
-        # Perform forward convolution using im2col and matrix multiplication
+        """Forward pass: compute convolution via direct elementwise computation."""
         batch, H, W, C_in = last_output.shape
         kH, kW = layer.kernel_size
         stride_h, stride_w = layer.stride
+        C_out = layer.out_channels
         
+        # Store input for backward pass
         layer.last_input = last_output
         
+        # Calculate output dimensions (valid padding only)
         out_H = (H - kH) // stride_h + 1
         out_W = (W - kW) // stride_w + 1
-        cols = Conv2D[ctype]._im2col(mpc, last_output, kH, kW, stride_h, stride_w, 0, 0)
-        weights_flat = layer.weights.reshape((kH * kW * C_in, layer.out_channels))
-        features = cols @ weights_flat
-        output = features.reshape((batch, out_H, out_W, layer.out_channels))
-        layer.input = output + layer.bias
+        
+        # Create output tensor with zeros
+        # Store input for backward pass
+        layer.last_input = last_output
+        output = zeros((batch, out_H, out_W, C_out))
+        
+        # Compute convolution for each output position
+        for b in range(batch):
+            for oh in range(out_H):
+                for ow in range(out_W):
+                    h_start = oh * stride_h
+                    w_start = ow * stride_w
+                    
+                    # Extract input patch: (kH, kW, C_in) - remove batch dimension
+                    patch = last_output[b, h_start:h_start+kH, w_start:w_start+kW, :]
+                    
+                    # Convolve with each output channel
+                    for oc in range(C_out):
+                        # Get kernel for this output channel: (kH, kW, C_in)
+                        kernel = layer.weights[:, :, :, oc]
+                        
+                        # Element-wise multiply and sum, then add bias
+                        conv_val = (patch * kernel).sum()
+                        output[b, oh, ow, oc] = conv_val + layer.bias[0, 0, 0, oc]
+        
+        layer.input = output
         layer.output = layer.activate(mpc)
 
     @sequre
     def _derive(mpc, layer: Conv2D, prev_output: ctype, dhidden: ctype, dact: ctype, LAYER_IDX: Static[int]):
-        # Compute gradients for Conv2D layer using backpropagation:
+        """Backward pass: compute gradients w.r.t. weights, bias, and input."""
         batch, H, W, C = prev_output.shape
         kH, kW = layer.kernel_size
         stride_h, stride_w = layer.stride
+        
+        # Apply activation derivative
         dhidden = dhidden * dact
-        pad_h = 0
-        pad_w = 0
+        
         out_H = (H - kH) // stride_h + 1
         out_W = (W - kW) // stride_w + 1
         
+        # Reshape dhidden: (batch, out_H, out_W, out_channels) -> (batch * out_H * out_W, out_channels)
         dhidden_flat = dhidden.reshape((batch * out_H * out_W, layer.out_channels))
-        cols = Conv2D[ctype]._im2col(mpc, prev_output, kH, kW, stride_h, stride_w, pad_h, pad_w)
+        
+        # Get input columns
+        cols = Conv2D[ctype]._im2col(mpc, prev_output, kH, kW, stride_h, stride_w)
+        
+        # Gradient w.r.t. weights: cols^T @ dhidden_flat
+        # cols: (N, kH*kW*C), dhidden: (N, oc) -> (kH*kW*C, oc)
         dW_flat = cols.T @ dhidden_flat
         layer.dw = dW_flat.reshape((kH, kW, C, layer.out_channels))
+        
+        # Gradient w.r.t. bias: sum over batch and spatial dimensions
+        # Reshape to (1, 1, 1, out_channels) to match bias shape
         db_sum = dhidden_flat.sum(axis=0).expand_dims(axis=0)  # (1, out_channels)
         layer.db = db_sum.expand_dims(axis=0).expand_dims(axis=0)  # (1, 1, 1, out_channels)
         
         if LAYER_IDX == 1:
             return layer.output
         
+        # Gradient w.r.t. input: dhidden_flat @ W^T
         W_col = layer.weights.reshape((kH * kW * C, layer.out_channels))
-        dcols = dhidden_flat @ W_col.T  # (N, kHkWC)
+        dcols = dhidden_flat @ W_col.T  # (N, kH*kW*C)
+        
+        # Convert columns back to image format
         dprev = Conv2D[ctype]._col2im(mpc, dcols, batch, H, W, C, kH, kW, 
-                                      stride_h, stride_w, pad_h, pad_w)
+                                       stride_h, stride_w)
+        
         return dprev
