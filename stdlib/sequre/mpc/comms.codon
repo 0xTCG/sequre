@@ -20,14 +20,18 @@ class MPCComms[TP]:
     pid: int
     hub_pid: int
     sockets: dict[int, CSocket]
+    dealer_buffers: dict[int, List[byte]]
     stats: MPCStats
     randomness: MPCRandomness
     number_of_parties: int
     local: bool
+    detach_dealer: bool
 
     delay_buffer_size: int
 
-    def __init__(self: MPCComms[TP], randomness: MPCRandomness, local: bool, expect_data_sharing: bool):
+    def __init__(
+            self: MPCComms[TP], randomness: MPCRandomness,
+            local: bool, expect_data_sharing: bool):
         self.pid = randomness.pid
         self.hub_pid = 1
         self.stats = randomness.stats
@@ -36,6 +40,8 @@ class MPCComms[TP]:
         self.number_of_parties = NUMBER_OF_PARTIES
         self.local = local
         self.delay_buffer_size = 0
+        self.detach_dealer = False
+        self.dealer_buffers = {k: List[byte]() for k in range(1, self.number_of_parties)}
 
         self.__setup_channels(expect_data_sharing)
         self.reset_stats()
@@ -51,7 +57,7 @@ class MPCComms[TP]:
         self.stats.bytes_sent += sizeof(int)
         jar = ptr[byte](sizeof(int))
         pickle(data._pickle_size(), jar, pasteurized=False)
-        snd_jar(self.sockets[to_pid].sock_fd, jar, sizeof(int))
+        self.flush(to_pid, jar, sizeof(int))
     
     def receive_jar_size(self, from_pid: int) -> int:
         self.stats.receive_requests += 1
@@ -72,13 +78,33 @@ class MPCComms[TP]:
         jar = ptr[byte](pickle_size)
         pickle(data, jar, pasteurized=False)
 
-        snd_jar(self.sockets[to_pid].sock_fd, jar, pickle_size)
+        self.flush(to_pid, jar, pickle_size)
 
     def receive_as_jar[T](self, from_pid: int) -> T:
         self.stats.receive_requests += 1
         msg_len = self.receive_jar_size(from_pid)
         received_jar = receive_jar(self.sockets[from_pid].sock_fd, msg_len)
         return unpickle(received_jar, False, T)
+    
+    def flush(self, to_pid: int, jar, pickle_size):
+        if self.detach_dealer:
+            self.dealer_buffers[to_pid].extend(
+                List(Array(jar, pickle_size), pickle_size))
+        else:
+            snd_jar(self.sockets[to_pid].sock_fd, jar, pickle_size)
+    
+    def flush_dealer_buffers(self):
+        assert not self.detach_dealer, "Cannot flush dealer buffers when detach_dealer is True."
+
+        if self.pid != 0:
+            return
+        
+        @par(num_threads=self.number_of_parties - 1)
+        for to_pid in range(1, self.number_of_parties):
+            jar = self.dealer_buffers[to_pid]
+            self.flush(to_pid, jar.arr.ptr, len(jar))
+        
+        self.dealer_buffers = {k: List[byte]() for k in range(1, self.number_of_parties)}
     
     def share_from(self, data, source_pid: int, modulus):
         from_dealer = source_pid == 0
@@ -113,6 +139,7 @@ class MPCComms[TP]:
         if self.pid == 0:
             return value
         
+        self.stats.rounds += 1
         if self.pid == 1:
             for i in range(2, self.number_of_parties):
                 value = value.add_mod(self.receive_as_jar(i, type(value)), modulus)
@@ -211,29 +238,31 @@ class MPCComms[TP]:
         else:
             return [(self.receive_as_jar(p, type(value)) if p != self.pid else value) for p in range(1, self.number_of_parties)]
 
-    def sync_parties(self: MPCComms[TP], lite: bool = True):
+    def sync_parties(self: MPCComms[TP], lite: bool = True, include_trusted_dealer: bool = True):
         with self.randomness.seed_switch(-1):
             control_elem = int.rand(1 << 62, "uniform")
         
+        start_pid = 0 if include_trusted_dealer else 1
+
         if lite:
-            if self.pid == 0:
-                for p in range(1, self.number_of_parties):
+            if self.pid == start_pid:
+                for p in range(start_pid + 1, self.number_of_parties):
                     from_p = self.receive_as_jar(p, T=type(control_elem))
                     assert from_p == control_elem, f"ERROR! CP{self.pid} <-/-> CP{p} out of sync."
-                
-                for p in range(1, self.number_of_parties):
+
+                for p in range(start_pid + 1, self.number_of_parties):
                     self.send_as_jar(control_elem, p)
             else:
-                self.send_as_jar(control_elem, 0)
-                return_elem = self.receive_as_jar(0, T=type(control_elem))
-                assert return_elem == control_elem, f"ERROR! CP{self.pid} <-/-> CP0 out of sync."
-        else:        
+                self.send_as_jar(control_elem, start_pid)
+                return_elem = self.receive_as_jar(start_pid, T=type(control_elem))
+                assert return_elem == control_elem, f"ERROR! CP{self.pid} <-/-> CP{start_pid} out of sync."
+        elif self.pid >= start_pid:        
             for p in range(self.number_of_parties - 1, self.pid, -1):
                 from_p = self.receive_as_jar(p, T=type(control_elem))
                 assert from_p == control_elem, f"ERROR! CP{self.pid} <-/-> CP{p} out of sync."
                 self.send_as_jar(control_elem, p)
             
-            for p in range(self.pid - 1, -1, -1):
+            for p in range(self.pid - 1, start_pid - 1, -1):
                 self.send_as_jar(control_elem, p)
                 from_p = self.receive_as_jar(p, T=type(control_elem))
                 assert from_p == control_elem, f"ERROR! CP{self.pid} <-/-> CP{p} out of sync."
