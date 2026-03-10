@@ -10,6 +10,7 @@ from sequre.utils.stats import precision_stats
 from sequre.utils.testing import assert_eq
 from sequre.utils.utils import random_floats
 from sequre.constants import MPC_FIELD_SIZE, MPC_RING_SIZE
+from sequre.types.utils import fp_to_double, double_to_fp
 
 
 def test_send_receive_poly(mpc):
@@ -295,7 +296,7 @@ def test_cipher_to_additive_share_vec_conversion(mpc, mpc_modulus):
     if mpc.pid > 0:
         ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
 
-        secret_share = mpc.mhe.ciphervector_to_additive_share_vector(ciphervector, len(values), mpc_modulus, source_pid=1, dtype=float)
+        secret_share = mpc.mhe.ciphervector_to_additive_share_vector(ciphervector, len(values), mpc_modulus, source_pid=1)
         ciphervector = mpc.mhe.additive_share_vector_to_ciphervector(secret_share, mpc_modulus, True)
 
         stats = precision_stats(
@@ -306,7 +307,173 @@ def test_cipher_to_additive_share_vec_conversion(mpc, mpc_modulus):
             expected=values)
         
         assert_eq(f"CP{mpc.pid}:\tMHE additive-share and ciphertext switching on {'ring' if mpc_modulus.popcnt() == 1 else 'field'}", stats.min_precision.l2 > 10, True)
+
+
+def test_mhe_mpc_conversion_additive_shares_sum_correctly(mpc, mpc_modulus):
+    """Test that additive shares from all parties sum to the original value."""
+    with mpc.randomness.seed_switch(-1):
+        values = random_floats((mpc.mhe.crypto_params.params.slots(),), scale=5.0)
+
+    if mpc.pid > 0:
+        ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
+        secret_share = mpc.mhe.ciphervector_to_additive_share_vector(ciphervector, len(values), mpc_modulus, source_pid=1)
+        
+        # Reveal shares and verify they sum to the original values
+        revealed_sum = mpc.comms.reveal(secret_share, mpc_modulus)
+        revealed_values = fp_to_double(revealed_sum, mpc_modulus)
+        
+        stats = precision_stats(
+            mpc=mpc,
+            result=revealed_values,
+            expected=values)
+        
+        assert_eq(f"CP{mpc.pid}:\tMHE->MPC additive shares sum correctly", stats.min_precision.l2 > 10, True)
+
+
+def test_mhe_mpc_conversion_double_roundtrip(mpc, mpc_modulus):
+    """Test that double round-trip conversion preserves values."""
+    with mpc.randomness.seed_switch(-1):
+        values = random_floats((mpc.mhe.crypto_params.params.slots(),), scale=3.0)
+
+    if mpc.pid > 0:
+        # First round-trip
+        ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
+        secret_share = mpc.mhe.ciphervector_to_additive_share_vector(ciphervector, len(values), mpc_modulus, source_pid=1)
+        ciphervector = mpc.mhe.additive_share_vector_to_ciphervector(secret_share, mpc_modulus, True)
+        
+        # Second round-trip
+        secret_share2 = mpc.mhe.ciphervector_to_additive_share_vector(ciphervector, len(values), mpc_modulus, source_pid=1)
+        ciphervector2 = mpc.mhe.additive_share_vector_to_ciphervector(secret_share2, mpc_modulus, True)
+
+        stats = precision_stats(
+            mpc=mpc,
+            result=mpc.mhe.decode(
+                enc=mpc.mhe.decrypt(ciphervector2),
+                dtype=float),
+            expected=values)
+        
+        assert_eq(f"CP{mpc.pid}:\tMHE<->MPC double roundtrip", stats.min_precision.l2 > 8, True)
+
+
+def test_mhe_mpc_conversion_negative_values(mpc, mpc_modulus):
+    """Test conversion with negative values."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    with mpc.randomness.seed_switch(-1):
+        # Generate values in range [-5, 5]
+        values = [prg.random() * 10.0 - 5.0 for _ in range(slots)]
+
+    if mpc.pid > 0:
+        ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
+        secret_share = mpc.mhe.ciphervector_to_additive_share_vector(ciphervector, len(values), mpc_modulus, source_pid=1)
+        ciphervector_back = mpc.mhe.additive_share_vector_to_ciphervector(secret_share, mpc_modulus, True)
+
+        stats = precision_stats(
+            mpc=mpc,
+            result=mpc.mhe.decode(
+                enc=mpc.mhe.decrypt(ciphervector_back),
+                dtype=float),
+            expected=values)
+        
+        assert_eq(f"CP{mpc.pid}:\tMHE<->MPC negative values", stats.min_precision.l2 > 10, True)
+
+
+def test_mhe_mpc_conversion_partial_slots(mpc, mpc_modulus):
+    """Test conversion with partially filled slots."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    partial_size = slots // 3  # Use only 1/3 of slots
     
+    with mpc.randomness.seed_switch(-1):
+        values = random_floats((partial_size,), scale=4.0)
+
+    if mpc.pid > 0:
+        ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
+        secret_share = mpc.mhe.ciphervector_to_additive_share_vector(ciphervector, partial_size, mpc_modulus, source_pid=1)
+        ciphervector_back = mpc.mhe.additive_share_vector_to_ciphervector(secret_share, mpc_modulus, True)
+
+        result = mpc.mhe.decode(enc=mpc.mhe.decrypt(ciphervector_back), dtype=float)
+        stats = precision_stats(
+            mpc=mpc,
+            result=result[:partial_size],
+            expected=values)
+        
+        assert_eq(f"CP{mpc.pid}:\tMHE<->MPC partial slots ({partial_size}/{slots})", stats.min_precision.l2 > 10, True)
+
+
+def test_mhe_mpc_conversion_multiple_ciphertexts(mpc, mpc_modulus):
+    """Test conversion with values spanning multiple ciphertexts."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    num_values = slots * 2 + slots // 2  # 2.5 ciphertexts worth
+    
+    with mpc.randomness.seed_switch(-1):
+        values = random_floats((num_values,), scale=2.0)
+
+    if mpc.pid > 0:
+        ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
+        assert_eq(f"CP{mpc.pid}:\tMHE multi-cipher count", len(ciphervector), 3)
+        
+        secret_share = mpc.mhe.ciphervector_to_additive_share_vector(ciphervector, num_values, mpc_modulus, source_pid=1)
+        ciphervector_back = mpc.mhe.additive_share_vector_to_ciphervector(secret_share, mpc_modulus, True)
+
+        result = mpc.mhe.decode(enc=mpc.mhe.decrypt(ciphervector_back), dtype=float)
+        stats = precision_stats(
+            mpc=mpc,
+            result=result[:num_values],
+            expected=values)
+        
+        assert_eq(f"CP{mpc.pid}:\tMHE<->MPC multi-ciphertext ({num_values} values)", stats.min_precision.l2 > 9, True)
+
+
+def test_mhe_mpc_conversion_mpc_operations_on_shares(mpc, mpc_modulus):
+    """Test that MPC operations work correctly on converted shares."""
+    with mpc.randomness.seed_switch(-1):
+        values = random_floats((mpc.mhe.crypto_params.params.slots(),), scale=2.0)
+
+    if mpc.pid > 0:
+        ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
+        secret_share = mpc.mhe.ciphervector_to_additive_share_vector(ciphervector, len(values), mpc_modulus, source_pid=1)
+        
+        # Add a public constant in MPC domain
+        constant = 1.5
+        constant_fp = double_to_fp(constant, mpc_modulus)
+        share_plus_const = secret_share.add_mod(constant_fp if mpc.pid == mpc.comms.hub_pid else type(mpc_modulus)(0), mpc_modulus)
+        
+        # Convert back to ciphertext
+        ciphervector_back = mpc.mhe.additive_share_vector_to_ciphervector(share_plus_const, mpc_modulus, True)
+
+        expected = [v + constant for v in values]
+        stats = precision_stats(
+            mpc=mpc,
+            result=mpc.mhe.decode(
+                enc=mpc.mhe.decrypt(ciphervector_back),
+                dtype=float),
+            expected=expected)
+        
+        assert_eq(f"CP{mpc.pid}:\tMPC ops on MHE-converted shares", stats.min_precision.l2 > 9, True)
+
+
+def test_mhe_mpc_conversion_from_different_sources(mpc, mpc_modulus):
+    """Test conversion when ciphertext originates from different parties."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    
+    with mpc.randomness.seed_switch(-1):
+        values = random_floats((slots,), scale=3.0)
+    
+    if mpc.pid > 0:
+        # Test with source_pid = 1 (ciphertext at party 1)
+        ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext) if mpc.pid == 1 else [ckks.NIL_IDEAL_CIPHERTEXT]
+        secret_share = mpc.mhe.ciphervector_to_additive_share_vector(ciphervector, slots, mpc_modulus, source_pid=1)
+        
+        # Reveal and check
+        revealed_sum = mpc.comms.reveal(secret_share, mpc_modulus)
+        revealed_values = fp_to_double(revealed_sum, mpc_modulus)
+        
+        stats = precision_stats(
+            mpc=mpc,
+            result=revealed_values,
+            expected=values)
+        
+        assert_eq(f"CP{mpc.pid}:\tMHE->MPC from source_pid=1", stats.min_precision.l2 > 10, True)
+
 
 def test_mhe(mpc):
     print(f'CP{mpc.pid}:\tTesting MHE ... \n')
@@ -318,6 +485,15 @@ def test_mhe(mpc):
     test_collective_bootstrapping(mpc)
     test_cipher_to_additive_plaintext_conversion(mpc)
     test_cipher_to_additive_share_vec_conversion(mpc, MPC_FIELD_SIZE)
+    
+    # Extended MHE<->MPC conversion tests
+    test_mhe_mpc_conversion_additive_shares_sum_correctly(mpc, MPC_FIELD_SIZE)
+    test_mhe_mpc_conversion_double_roundtrip(mpc, MPC_FIELD_SIZE)
+    test_mhe_mpc_conversion_negative_values(mpc, MPC_FIELD_SIZE)
+    test_mhe_mpc_conversion_partial_slots(mpc, MPC_FIELD_SIZE)
+    test_mhe_mpc_conversion_multiple_ciphertexts(mpc, MPC_FIELD_SIZE)
+    test_mhe_mpc_conversion_mpc_operations_on_shares(mpc, MPC_FIELD_SIZE)
+    test_mhe_mpc_conversion_from_different_sources(mpc, MPC_FIELD_SIZE)
     
     # with mpc.default_modulus(MPC_RING_SIZE):
     #     test_cipher_to_additive_share_vec_conversion(mpc, MPC_RING_SIZE)
