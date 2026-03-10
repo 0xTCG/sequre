@@ -610,15 +610,17 @@ class MPCMHE[TP]:
 
     def flatten_levels(self, x: list[list[Ciphertext]]) -> tuple[list[list[Ciphertext]], int]:
         min_level = x[0][0].level()
-        not_flat = False
+        max_level = min_level
         
         for row in x:
             for col in row:
-                if col.level() < min_level:
-                    min_level = col.level()
-                    not_flat = True
+                lvl = col.level()
+                if lvl < min_level:
+                    min_level = lvl
+                if lvl > max_level:
+                    max_level = lvl
 
-        if not not_flat:
+        if min_level == max_level:
             return x, min_level
 
         return self.drop_level(x, min_level), min_level
@@ -651,10 +653,10 @@ class MPCMHE[TP]:
         # After fp_to_double: float ≈ fixed_point / 2^MPC_NBIT_F
         # Constraint: (mask / 2^MPC_NBIT_F) * scale < 2^64
         # => mask < 2^(64 + MPC_NBIT_F - log2(scale))
-        # We need -2 margin: -1 for safety, -1 because hub party computes (masked_shared + mask)
-        # which can nearly double the value when both are max.
+        # Subtract log2(n_parties - 1) bits because hub party computes sum of shares
+        # which can be up to (n_parties - 1) * max_mask.
         log_scale = int(self.crypto_params.params.default_scale).bitlen() - 1
-        max_mask_bits = 64 + MPC_NBIT_F - log_scale - 2
+        max_mask_bits = 64 + MPC_NBIT_F - log_scale - int((self.comms.number_of_parties - 1)).bitlen()
         mask = shared_tensor.rand_bits(max_mask_bits)
 
         masked_shared_tensor = self.comms.reveal(shared_tensor.sub_mod(mask, modulus), modulus)
@@ -668,6 +670,10 @@ class MPCMHE[TP]:
             share = share.resize(new_shape)
 
         values = fp_to_double(share, modulus)
+        # DEBUG: Log first few double values being encrypted
+        if DEBUG:
+            flat_vals = values.flatten()
+            print(f"  CP{self.pid} mpc_to_mhe: max_mask_bits={max_mask_bits}, n_values={len(flat_vals)}, first4={[flat_vals[j] for j in range(min(4, len(flat_vals)))]}")
         ciphervector = self.enc_vector(values.flatten(), T=Ciphertext)
         self.stats.secure_mpc_mhe_switch_count += len(ciphervector)
         return self._aggregate_cipher_vector(ciphervector, target_pid=target_pid)
@@ -676,10 +682,9 @@ class MPCMHE[TP]:
         # """
         # If source_pid is:
         #     - PID number (0, 1, 2, ...), then only the ciphers at that PID will be decrypted and broadcast to all parties
-        #     - -2, then each ciphervector will be collectively decrypted at each party one after the other
         #     - -1, then the ciphers are expected to be already shared (the same) between the parties
         # """
-        assert source_pid > -3, f"MPCMHE: Invalid source PID: {source_pid}"
+        assert source_pid > -2, f"MPCMHE: Invalid source PID: {source_pid}"
         self.stats.secure_mhe_mpc_switch_count += len(ciphervector)
         
         return self._mhe_to_mpc(
@@ -698,58 +703,73 @@ class MPCMHE[TP]:
         if source_pid >= 0:
             ciphervector = self.comms.broadcast_from(ciphervector, source_pid)
 
-        # Refresh to max level to ensure all ciphertexts are at the same level
-        # and default scale, which is required for the masking step.
-        # This also ensures that we have enough levels for the subsequent operations
-        # in the conversion process.
+        # DEBUG: Log levels/scales before refresh
+        if DEBUG:
+            for _di in range(min(2, len(ciphervector))):
+                print(f"  CP{self.pid} _mhe_to_mpc PRE-refresh ct[{_di}]: level={ciphervector[_di].level()}, scale={ciphervector[_di].scale}, source_pid={source_pid}")
+
+        # Refresh to ensure ciphertexts are at default scale and have enough
+        # levels for the subsequent masking and aggregation steps.
         self.refresh(ciphervector, is_broadcast=(source_pid > -2), min_level_distance=1)
+
+        # DEBUG: Log levels/scales after refresh
+        if DEBUG:
+            for _di in range(min(2, len(ciphervector))):
+                print(f"  CP{self.pid} _mhe_to_mpc POST-refresh ct[{_di}]: level={ciphervector[_di].level()}, scale={ciphervector[_di].scale}")
 
         # Flatten levels AFTER rescaling (rescaling can change levels)
         ciphermatrix, level_start = self.flatten_levels([ciphervector])
         ciphervector = ciphermatrix[0]
 
+        if DEBUG:
+            print(f"  CP{self.pid} _mhe_to_mpc: n_ct={len(ciphervector)}, level_start={level_start}, n_elements={number_of_elements}")
+
         params = self.crypto_params.params
         ring_q = params.ring_q
-        
-        seed = u32(prg.getrandbits(32))
-        # TODO: Use sigma smudge for masking
-        sampler = new_gaussian_sampler(new_prng(seed), ring_q, 3.19, 19)
 
-        # Generate random float mask values and properly CKKS-encode them.
-        # The mask scale should be small enough to not overflow but large enough for security.
-        mask_scale = 1.0  # Small scale for mask to avoid numerical issues
-        mask_float_values = [random_floats((slots,), scale=mask_scale) for _ in range(len(ciphervector))]
-        
-        share_decrypt = [params.ring_q.new_poly_lvl(level_start) for _ in range(len(ciphervector))]
-        for k in range(len(ciphervector)):
-            # # Create a plaintext at the ciphertext's scale (now at default scale after rescaling)
-            pt_mask_k = new_plaintext(params, level_start, ciphervector[k].scale if len(ciphervector) > k else params.default_scale)
+        seed = u32(prg.getrandbits(32))
+        sampler = self.crypto_params.encryptor.gaussian_sampler
+
+        # Generate random float mask values with full complex encoding.
+        # Using complex(real, imag) fills all N NTT dimensions, preventing the
+        # N/2-dimensional subspace leak that real-only masks would have due to
+        # CKKS conjugation symmetry.
+        mask_scale = 1.0
+        mask_real = [random_floats((slots,), scale=mask_scale) for _ in range(len(ciphervector))]
+        mask_imag = [random_floats((slots,), scale=mask_scale) for _ in range(len(ciphervector))]
+        mask_complex_values = [[complex(mask_real[i][j], mask_imag[i][j]) for j in range(slots)] for i in range(len(ciphervector))]
+
+        n_ct = len(ciphervector)
+        share = [ring_q.new_poly_lvl(level_start) for _ in range(n_ct)]
+
+        for k in range(n_ct):
+            # Encode mask as a plaintext polynomial at the ciphertext's scale
+            pt_mask_k = new_plaintext(params, level_start, ciphervector[k].scale if k < n_ct else params.default_scale)
             self.crypto_params.encoder.encode(
-                [complex(v, 0) for v in mask_float_values[k]],
+                mask_complex_values[k],
                 pt_mask_k,
                 params.log_slots)
 
             # h0 = mask (the encoded mask polynomial, already in NTT form)
-            ring_copy_lvl(level_start, pt_mask_k.value, share_decrypt[k])
-            share_decrypt[k].is_ntt = True
+            ring_copy_lvl(level_start, pt_mask_k.value, share[k])
+            share[k].is_ntt = True
 
-            # h0 = sk*c1 + mask
-            ring_q._mm_mul_coeffs_montgomery_and_add_lvl(level_start, self.crypto_params.sk_shard.value.q, ciphervector[k].value[1], share_decrypt[k])
+            # h0 = sk*c1 + mask (NTT domain)
+            ring_q._mm_mul_coeffs_montgomery_and_add_lvl(level_start, self.crypto_params.sk_shard.value.q, ciphervector[k].value[1], share[k])
 
-            # h0 = sk*c1 + mask + e0
-            tmp = sampler._mm_read_new()
-            ring_q._mm_ntt_lvl(level_start, tmp, tmp)
-            tmp.is_ntt = True
-            
-            ring_q._mm_add_lvl(level_start, share_decrypt[k], tmp, share_decrypt[k])
-        
-        agg = self._aggregate_refresh_share_vec(share_decrypt, level_start)
+            # Add smudging noise for defense-in-depth
+            e = ring_q.new_poly_lvl(level_start)
+            sampler._mm_read_lvl(level_start, e)
+            ring_q._mm_ntt_lvl(level_start, e, e)
+            ring_q._mm_add_lvl(level_start, share[k], e, share[k])
+
+        # Aggregate shares at hub: sum(sk_i * c1) + sum(mask_i) + sum(e_i)
+        agg = self._aggregate_refresh_share_vec(share, level_start)
 
         pt = []
-        for i in range(len(ciphervector)):
+        for i in range(n_ct):
             ct_out = ciphervector[i].copy()
             ring_q._mm_add_lvl(level_start, ct_out.value[0], agg[i], ct_out.value[0])
-
             pt.append(ct_out.plaintext())
 
         for i in range(len(pt)):
@@ -759,7 +779,7 @@ class MPCMHE[TP]:
 
             # Subtract the original float mask values directly (not decode from polynomial)
             for j in range(slots):
-                rv_out[j] -= complex(mask_float_values[i][j], 0)
+                rv_out[j] -= mask_complex_values[i][j]
 
             # Always use fixed-point representation for secure masking.
             # The float masks require fixed-point arithmetic for correct cancellation.
