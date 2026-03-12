@@ -7,7 +7,17 @@ from sequre.mpc.env import MPCEnv
 from sequre.stdlib.learn.neural_net.model import Sequential
 from sequre.stdlib.learn.neural_net.layers import Input, Dense, Conv2D, Flatten
 from sequre.stdlib.learn.neural_net.loss import dloss
+from sequre import sequre
+from sequre.stdlib.builtin import maximum
 
+
+@sequre
+def _sequre_matmul(mpc, a, b):
+    return a @ b
+
+@sequre
+def _sequre_maximum(mpc, a, b):
+    return maximum(mpc, a, b)
 
 def _test_neural_net_cnn[TP](mpc: MPCEnv[TP], modulus: TP):
     """
@@ -57,13 +67,22 @@ def _test_neural_net_cnn[TP](mpc: MPCEnv[TP], modulus: TP):
     # Record initial conv weight sum
     w0_sum = conv.weights.reshape((conv.weights.size,)).sum()
 
-    # Training loop
+    # Training loop — track loss at first and last epoch
+    loss_first = 0.0
+    loss_last = 0.0
     for ep in range(epochs):
         inp.evaluate(mpc, X)
         # Forward Pass
         conv.evaluate(mpc, inp.output)      # Conv2D Forward Pass
         flat.evaluate(mpc, conv.output)
         dense.evaluate(mpc, flat.output)    # Dense Forward Pass
+
+        # Compute MSE loss for this epoch
+        diff = y - dense.output
+        epoch_loss = (diff * diff).sum() / (2.0 * N)
+        if ep == 0:
+            loss_first = epoch_loss
+        loss_last = epoch_loss
 
         # Backward Pass
         g = dloss(mpc, y, dense.output, "mean_squared_error")
@@ -83,8 +102,105 @@ def _test_neural_net_cnn[TP](mpc: MPCEnv[TP], modulus: TP):
 
     # Weights must change after training
     assert w0_sum != w1_sum, f"CP{mpc.pid}: Conv2D weights unchanged after training"
+
+    # Loss must decrease after training
+    assert loss_last < loss_first, f"CP{mpc.pid}: CNN loss did not drop (first={loss_first}, last={loss_last})"
+    print(f'CP{mpc.pid}:\tCNN loss dropped: {loss_first:.4f} -> {loss_last:.4f}')
     print(f'CP{mpc.pid}:\tSequre CNN layers on {alg_struct} tests passed.\n')
 
+def _test_conv2d[TP](mpc: MPCEnv[TP], modulus: TP):
+    """
+    Convolution step on a single 2D matrix
+    """
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    print(f'CP{mpc.pid}:\tTesting Conv2D 2D matmul component on {alg_struct} ... \n')
+
+    # A small 2D "patch" (4 samples x 3 input channels)
+    with mpc.randomness.seed_switch(-1):
+        patch = array([[0.5, 0.3, 0.1],
+                       [0.2, 0.8, 0.4],
+                       [0.9, 0.1, 0.6],
+                       [0.3, 0.7, 0.2]])
+        # Weight matrix (3 input channels x 2 output filters)
+        weights = array([[0.1, -0.2],
+                         [0.3,  0.4],
+                         [-0.1, 0.5]])
+
+    # Plaintext Conv2D
+    raw_result = patch @ weights
+
+    # Encrypted Conv2D
+    mpc_patch = Sharetensor.enc(mpc, patch, 0, modulus)
+    mpc_weights = Sharetensor.enc(mpc, weights, 0, modulus)
+    mpc_result = _sequre_matmul(mpc, mpc_patch, mpc_weights)
+
+    if mpc.pid == 0:
+        assert_eq(f"CP{mpc.pid}:\tConv2D matmul shape on {alg_struct}",
+                  mpc_result.shape, list(raw_result.shape))
+    else:
+        assert_eq_approx(f"CP{mpc.pid}:\tConv2D 2D matmul on {alg_struct}",
+                         mpc_result.reveal(mpc), raw_result, error=0.1)
+    print(f'CP{mpc.pid}:\tConv2D 2D matmul component on {alg_struct} passed.\n')
+
+
+def _test_maxpool2d[TP](mpc: MPCEnv[TP], modulus: TP):
+    """
+    Max-pooling on a 2D matrix.
+    """
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    print(f'CP{mpc.pid}:\tTesting MaxPool2D component on {alg_struct} ... \n')
+
+    # 4x4 input matrix
+    with mpc.randomness.seed_switch(-1):
+        mat = array([[1.0, 3.0, 2.0, 4.0],
+                     [5.0, 2.0, 8.0, 1.0],
+                     [3.0, 7.0, 6.0, 0.0],
+                     [9.0, 4.0, 2.0, 5.0]])
+
+    # Expected 2x2 max-pooling with pool_size=2, stride=2:
+    #   top-left  pool: max(1,3,5,2) = 5
+    #   top-right pool: max(2,4,8,1) = 8
+    #   bottom-left  pool: max(3,7,9,4) = 9
+    #   bottom-right pool: max(6,0,2,5) = 6
+    raw_result = array([[5.0, 8.0],
+                        [9.0, 6.0]])
+
+    # Plaintext maxpool
+    pH, pW = 2, 2
+    out_H, out_W = 2, 2
+    plain_out = zeros((out_H, out_W))
+    for oh in range(out_H):
+        for ow in range(out_W):
+            h_s = oh * pH
+            w_s = ow * pW
+            max_val = mat[h_s, w_s]
+            for i in range(pH):
+                for j in range(pW):
+                    max_val = _sequre_maximum(mpc, max_val, mat[h_s + i, w_s + j])
+            plain_out[oh, ow] = max_val
+    assert_eq_approx(f"CP{mpc.pid}:\tMaxPool2D plaintext on {alg_struct}",
+                     plain_out, raw_result, error=0.01)
+
+    # Encrypted maxpool
+    mpc_mat = Sharetensor.enc(mpc, mat, 0, modulus)
+    mpc_out_rows = list[list[float]]()
+    for oh in range(out_H):
+        row = list[float]()
+        for ow in range(out_W):
+            h_s = oh * pH
+            w_s = ow * pW
+            max_val = mpc_mat[h_s][w_s]
+            for i in range(pH):
+                for j in range(pW):
+                    max_val = _sequre_maximum(mpc, max_val, mpc_mat[h_s + i][w_s + j])
+            row.append(max_val.reveal(mpc))
+        mpc_out_rows.append(row)
+    mpc_out = array(mpc_out_rows)
+
+    if mpc.pid > 0:
+        assert_eq_approx(f"CP{mpc.pid}:\tMaxPool2D sequre on {alg_struct}",
+                         mpc_out, raw_result, error=0.1)
+    print(f'CP{mpc.pid}:\tMaxPool2D component on {alg_struct} passed.\n')
 
 def test_neural_net[TP](mpc: MPCEnv[TP], modulus: TP):
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
@@ -144,6 +260,8 @@ def test_neural_net[TP](mpc: MPCEnv[TP], modulus: TP):
         assert_eq_approx(f"CP{mpc.pid}:\tSequre neural net (MPC) on {alg_struct}", mpc_w.reveal(mpc), raw_w, error=0.3)
     
     _test_neural_net_cnn(mpc, modulus)
+    _test_conv2d(mpc, modulus)
+    _test_maxpool2d(mpc, modulus)
 
     mpu_layers = (
         Input[type(mpu_X)](input_size),
