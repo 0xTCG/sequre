@@ -1,11 +1,12 @@
 import prg
 
 from stats import MPCStats
-from sequre.settings import DEBUG
-from sequre.constants import NUMBER_OF_PARTIES
+from sequre.constants import NUMBER_OF_PARTIES, USE_TLS, USE_SECURE_PRG
+from sequre.network.common import generate_random_bytes
 
 from copy import copy
-from time import time
+
+from C import memcpy(cobj, cobj, int)
 
 
 class MPCRandomness:
@@ -13,33 +14,59 @@ class MPCRandomness:
     pid: int
     stats: MPCStats
     prg_states: dict[int, tuple[array[u32], int]]
+    other_seeds: dict[int, int]
+    global_seed: Optional[int]
     
     def __init__(self: MPCRandomness, stats: MPCStats):
         self.pid = stats.pid
         self.stats = stats
         self.prg_states = dict[int, tuple[array[u32], int]]()
-        self.reset_streams()
+        self.other_seeds = dict[int, int]()
+        self.global_seed = None
+
+        if not USE_TLS:
+            self.reset_streams()  # Deterministically seed all streams in debug mode for reproducibility.
         
     def reset_streams(self):
-        self.reset_seed(-1, hash('global'))
-        
+        if USE_TLS and len(self.other_seeds) != (NUMBER_OF_PARTIES - 1):
+            raise ValueError("Other seeds have not been set yet. Randomness not yet properly initialized.")
+
+        self.reset_global_seed()
         for other_pid in set(range(NUMBER_OF_PARTIES)) - {self.pid}:
-            self.reset_seed(other_pid)
+            other_seed = self.other_seeds[other_pid] if USE_TLS else hash(
+                (min(self.pid, other_pid), max(self.pid, other_pid)))
+            self.reset_seed(other_pid, other_seed)
+
+        # Seed private stream with cryptographically random bytes
+        seed = 0
+        if USE_SECURE_PRG:
+            seed_buf = generate_random_bytes(32)
+            memcpy(__ptr__(seed).as_byte(), seed_buf, 8)
+
+        self.reset_seed(self.pid, seed)
+
+        print(f'CP{self.pid}:\tPRG streams reset with new {"secure" if USE_TLS and USE_SECURE_PRG else "NON-SECURE"} seeds: '
+              f'\n\t\tPrivate seed: {seed}\n\t\tOther seeds: {self.other_seeds}\n\t\t global seed={self.global_seed}')
         
-        # TODO: Implement secure seeding of private streams
-        seed = 0 if DEBUG else int(time())
-        self.reset_seed(self.pid, seed + self.pid)
+    def reset_global_seed(self):
+        if USE_TLS and self.global_seed == None:
+            raise ValueError("Global seed has not been set yet. Randomness not yet properly initialized.")
+        
+        if not USE_TLS:
+            self.global_seed = hash("global")
+        
+        # Reset the global seed stream (pid = -1) to the exchanged global seed.
+        self.reset_seed(-1, self.global_seed)
     
     def get_state(self: MPCRandomness) -> tuple[array[u32], int]:
-        return copy(prg._rnd.gen.state), prg._rnd.gen.next
+        return prg._rnd.gen.get_state()
     
     def set_state(self: MPCRandomness, state: tuple[array[u32], int]):
-        prg._rnd.gen.state = state[0]
-        prg._rnd.gen.next = state[1]
+        prg._rnd.gen.set_state(state)
 
-    def reset_seed(self: MPCRandomness, pid: int, seed: int = -1):
-        # TODO: Implement secure seeding of shared streams
-        seed = hash((min(self.pid, pid), max(self.pid, pid))) if seed == -1 else seed
+    def reset_seed(self: MPCRandomness, pid: int, seed: int):
+        # Shared streams are securely seeded via __secure_seed_exchange in MPCComms.
+        # The default hash-based seed is only a placeholder until the exchange occurs.
         prg.seed(seed)
         self.prg_states[pid] = self.get_state()
         

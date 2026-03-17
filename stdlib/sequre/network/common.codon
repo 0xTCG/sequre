@@ -1,4 +1,6 @@
-from sequre.constants import SHUT_RDWR
+from sequre.constants import (
+    SHUT_RDWR, OPENSSL_PATH, LIBCRYPTO_PATH,
+    CERT_DIR, CA_CERT_FILE, PARTY_CERT_FILE, PARTY_KEY_FILE)
 from sequre.types.utils import core_type_size
 
 from C import listen(int, int) -> int
@@ -10,8 +12,103 @@ from C import send(int, cobj, int, int) -> int
 from C import close(int) -> int
 from C import memcpy(cobj, cobj, int)
 
+# OpenSSL TLS imports (libssl)
+from C import OPENSSL_PATH.OPENSSL_init_ssl(u64, cobj) -> int as OPENSSL_init_ssl
+from C import OPENSSL_PATH.TLS_server_method() -> cobj as TLS_server_method
+from C import OPENSSL_PATH.TLS_client_method() -> cobj as TLS_client_method
+from C import OPENSSL_PATH.SSL_CTX_new(cobj) -> cobj as SSL_CTX_new
+from C import OPENSSL_PATH.SSL_CTX_free(cobj) as SSL_CTX_free
+from C import OPENSSL_PATH.SSL_CTX_use_certificate_file(cobj, cobj, int) -> int as SSL_CTX_use_certificate_file
+from C import OPENSSL_PATH.SSL_CTX_use_PrivateKey_file(cobj, cobj, int) -> int as SSL_CTX_use_PrivateKey_file
+from C import OPENSSL_PATH.SSL_CTX_load_verify_locations(cobj, cobj, cobj) -> int as SSL_CTX_load_verify_locations
+from C import OPENSSL_PATH.SSL_CTX_set_verify(cobj, int, cobj) as SSL_CTX_set_verify
+from C import OPENSSL_PATH.SSL_new(cobj) -> cobj as SSL_new
+from C import OPENSSL_PATH.SSL_free(cobj) as SSL_free
+from C import OPENSSL_PATH.SSL_set_fd(cobj, int) -> int as SSL_set_fd
+from C import OPENSSL_PATH.SSL_accept(cobj) -> int as SSL_accept_handshake
+from C import OPENSSL_PATH.SSL_connect(cobj) -> int as SSL_connect_handshake
+from C import OPENSSL_PATH.SSL_write(cobj, cobj, int) -> int as SSL_write
+from C import OPENSSL_PATH.SSL_read(cobj, cobj, int) -> int as SSL_read
+from C import OPENSSL_PATH.SSL_shutdown(cobj) -> int as SSL_shutdown
+from C import OPENSSL_PATH.SSL_get_error(cobj, int) -> int as SSL_get_error
 
-def close_socket(sock_fd: int):
+# OpenSSL crypto imports (libcrypto)
+from C import LIBCRYPTO_PATH.RAND_bytes(cobj, int) -> int as RAND_bytes
+
+# OpenSSL constants
+SSL_FILETYPE_PEM = 1
+SSL_VERIFY_PEER = 1
+SSL_VERIFY_FAIL_IF_NO_PEER_CERT = 2
+OPENSSL_INIT_SSL_DEFAULT = u64(0x00200002)  # OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS
+
+_ssl_initialized = False
+
+
+def init_openssl():
+    global _ssl_initialized
+    if not _ssl_initialized:
+        OPENSSL_init_ssl(OPENSSL_INIT_SSL_DEFAULT, cobj())
+        _ssl_initialized = True
+
+
+def create_ssl_context(pid: int, is_server: bool) -> cobj:
+    init_openssl()
+
+    method = TLS_server_method() if is_server else TLS_client_method()
+    ctx = SSL_CTX_new(method)
+    if not ctx:
+        raise ValueError('Failed to create SSL context')
+
+    cert_file = PARTY_CERT_FILE.replace("{pid}", str(pid))
+    key_file = PARTY_KEY_FILE.replace("{pid}", str(pid))
+    ca_path = CERT_DIR + "/" + CA_CERT_FILE
+    cert_path = CERT_DIR + "/" + cert_file
+    key_path = CERT_DIR + "/" + key_file
+
+    if SSL_CTX_load_verify_locations(ctx, ca_path.c_str(), cobj()) != 1:
+        SSL_CTX_free(ctx)
+        raise ValueError(f'Failed to load CA certificate from {ca_path}')
+
+    if SSL_CTX_use_certificate_file(ctx, cert_path.c_str(), SSL_FILETYPE_PEM) != 1:
+        SSL_CTX_free(ctx)
+        raise ValueError(f'Failed to load party certificate from {cert_path}')
+
+    if SSL_CTX_use_PrivateKey_file(ctx, key_path.c_str(), SSL_FILETYPE_PEM) != 1:
+        SSL_CTX_free(ctx)
+        raise ValueError(f'Failed to load party key from {key_path}')
+
+    # Require mutual TLS: verify peer certificate
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, cobj())
+
+    return ctx
+
+
+def ssl_wrap_accept(ctx: cobj, sock_fd: int) -> cobj:
+    ssl = SSL_new(ctx)
+    if not ssl:
+        raise ValueError('Failed to create SSL object')
+    SSL_set_fd(ssl, sock_fd)
+    if SSL_accept_handshake(ssl) <= 0:
+        SSL_free(ssl)
+        raise ValueError('SSL accept (TLS handshake) failed')
+    return ssl
+
+
+def ssl_wrap_connect(ctx: cobj, sock_fd: int) -> cobj:
+    ssl = SSL_new(ctx)
+    if not ssl:
+        raise ValueError('Failed to create SSL object')
+    SSL_set_fd(ssl, sock_fd)
+    if SSL_connect_handshake(ssl) <= 0:
+        SSL_free(ssl)
+        raise ValueError('SSL connect (TLS handshake) failed')
+    return ssl
+
+
+def close_socket(sock_fd: int, ssl: cobj = cobj()):
+    if ssl:
+        SSL_shutdown(ssl)
+        SSL_free(ssl)
     if sock_fd != -1:
         shutdown(sock_fd, SHUT_RDWR)
         close(sock_fd)
@@ -34,12 +131,15 @@ def accept_socket(sock_fd):
     return accepted_fd
 
 
-def snd_jar(sock_fd, jar: Jar, msg_len: int) -> int:
+def snd_jar(sock_fd, jar: Jar, msg_len: int, ssl: cobj = cobj()) -> int:
     totalsent = 0
 
     while totalsent < msg_len:
-        sent = send(sock_fd, jar + totalsent, msg_len - totalsent, 0)
-        if sent == 0:
+        if ssl:
+            sent = SSL_write(ssl, jar + totalsent, msg_len - totalsent)
+        else:
+            sent = send(sock_fd, jar + totalsent, msg_len - totalsent, 0)
+        if sent <= 0:
             perror('Send socket connection broken'.c_str())
             raise ValueError(f'Socket connection broken for msg_len of {msg_len}')
         totalsent += sent
@@ -47,18 +147,28 @@ def snd_jar(sock_fd, jar: Jar, msg_len: int) -> int:
     return totalsent    
 
 
-def receive_jar(sock_fd, msg_len: int) -> Jar:
+def receive_jar(sock_fd, msg_len: int, ssl: cobj = cobj()) -> Jar:
     bytes_recd = 0
     buffer = ptr[byte](msg_len)
 
     while bytes_recd < msg_len:
-        received = recv(sock_fd, buffer + bytes_recd, msg_len - bytes_recd, 0)
+        if ssl:
+            received = SSL_read(ssl, buffer + bytes_recd, msg_len - bytes_recd)
+        else:
+            received = recv(sock_fd, buffer + bytes_recd, msg_len - bytes_recd, 0)
         if received <= 0:
             perror('Receive socket connection broken'.c_str())
             raise ValueError(f'Socket connection broken for msg_len of {msg_len - bytes_recd}')
         bytes_recd += received
     
     return buffer
+
+
+def generate_random_bytes(n: int) -> ptr[byte]:
+    buf = ptr[byte](n)
+    if RAND_bytes(buf, n) != 1:
+        raise ValueError('Failed to generate random bytes via RAND_bytes')
+    return buf
 
 
 # Wrappers
@@ -72,4 +182,4 @@ def send_to_socket(socket, data):
         p = ptr[byte](__ptr__(value).as_byte())
         memcpy(buffer + i * fs, p, fs)
 
-    return snd_jar(socket.sock_fd, buffer, msg_len)
+    return snd_jar(socket.sock_fd, buffer, msg_len, socket.ssl)
