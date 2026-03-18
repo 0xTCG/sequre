@@ -1,18 +1,143 @@
-from numpy.create import array, zeros_like
+from sequre.stdlib.learn.neural_net.layers import Input, Dense, Conv2D, MaxPooling2D, Flatten
+from sequre.stdlib.learn.neural_net.loss import dloss
+from sequre import sequre
+from sequre.stdlib.builtin import maximum
 
-from sequre.types.sharetensor import Sharetensor
-from sequre.types.multiparty_union import MPU
-from sequre.utils.testing import assert_eq, assert_eq_approx
-from sequre.utils.utils import random_floats, random_ints
-from sequre.mpc.env import MPCEnv
-from sequre.stdlib.learn.neural_net.model import Sequential
-from sequre.stdlib.learn.neural_net.layers import Input, Dense
-
-
-def test_neural_net[TP](mpc: MPCEnv[TP], modulus: TP):
+# --- CNN component test: MaxPooling2D on encrypted data ---
+def _test_maxpool2d_secure[TP](mpc: MPCEnv[TP], modulus: TP):
+    """
+    Uses plain 4D data (4D Sharetensors not yet supported).
+    """
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
-    print(f'CP{mpc.pid}:\tTesting Sequre neural net on {alg_struct} ... \n')
+    print(f'CP{mpc.pid}:\tTesting MaxPool2D component on {alg_struct} ... \n')
+    ndarray_4d = type(zeros((1, 1, 1, 1)))
 
+    # Input shape: (batch = 1, Height = 4, Width = 4, Channels = 1)
+    with mpc.randomness.seed_switch(-1):
+        X = zeros((1, 4, 4, 1))
+        vals = [1.0, 3.0, 2.0, 4.0,
+                5.0, 2.0, 8.0, 1.0,
+                3.0, 7.0, 6.0, 0.0,
+                9.0, 4.0, 2.0, 5.0]
+        for r in range(4):
+            for c in range(4):
+                X[0, r, c, 0] = vals[r * 4 + c]
+
+    pool = MaxPooling2D[ndarray_4d](pool_size = (2, 2), strides = (2, 2))
+    pool.evaluate(mpc, X)
+
+    assert_eq(f"CP{mpc.pid}:\tMaxPool2D output shape on {alg_struct}",
+              list(pool.output.shape), [1, 2, 2, 1])
+    assert_eq_approx(f"CP{mpc.pid}:\tMaxPool2D [0,0,0,0] on {alg_struct}",
+                     pool.output[0, 0, 0, 0], 5.0, error=0.001)
+    assert_eq_approx(f"CP{mpc.pid}:\tMaxPool2D [0,0,1,0] on {alg_struct}",
+                     pool.output[0, 0, 1, 0], 8.0, error=0.001)
+    assert_eq_approx(f"CP{mpc.pid}:\tMaxPool2D [0,1,0,0] on {alg_struct}",
+                     pool.output[0, 1, 0, 0], 9.0, error=0.001)
+    assert_eq_approx(f"CP{mpc.pid}:\tMaxPool2D [0,1,1,0] on {alg_struct}",
+                     pool.output[0, 1, 1, 0], 6.0, error=0.001)
+
+    print(f'CP{mpc.pid}:\tMaxPool2D component on {alg_struct} passed.\n')
+
+# --- CNN end-to-end test ---
+def _test_neural_net_cnn[TP](mpc: MPCEnv[TP], modulus: TP):
+    """
+    End-to-end CNN training test.
+    """
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    print(f'CP{mpc.pid}:\tTesting Sequre CNN layers on {alg_struct} ... \n')
+
+    N = 4
+    H, W, C_in = 8, 8, 1
+    n_filters = 4
+    dense_out = 2
+    step = 0.01
+    momentum = 0.9
+    epochs = 2
+
+    ndarray_4d = type(zeros((1, 1, 1, 1)))
+    ndarray_2d = type(zeros((1, 1)))
+
+    kH, kW = 3, 3
+    conv_out_H = (H - kH) + 1
+    conv_out_W = (W - kW) + 1
+    pool_size = (2, 2)
+    pool_stride = (2, 2)
+    pool_out_H = (conv_out_H - pool_size[0]) // pool_stride[0] + 1
+    pool_out_W = (conv_out_W - pool_size[1]) // pool_stride[1] + 1
+    flat_size = pool_out_H * pool_out_W * n_filters
+
+    with mpc.randomness.seed_switch(-1):
+        X = zeros((N, H, W, C_in))
+        for i in range(N):
+            for j in range(min(H, W)):
+                X[i, j, j, 0] = float(i + 1)
+    y = ones((N, dense_out))
+    for i in range(N // 2):
+        y[i, 0] = -1.0
+
+    inp = Input[ndarray_4d](H * W * C_in)
+    conv = Conv2D[ndarray_4d]("relu", out_channels=n_filters, kernel_size=(kH, kW), stride=(1, 1))
+    conv.initialize(mpc, C_in)
+    pool = MaxPooling2D[ndarray_4d](pool_size=pool_size, strides=pool_stride)
+    flat = Flatten[ndarray_4d, ndarray_2d]()
+    dense = Dense[ndarray_2d]("linear", size=dense_out)
+    dense.initialize(mpc, flat_size)
+
+    w0_sum = conv.weights.reshape((conv.weights.size,)).sum()
+
+    loss_first = 0.0
+    loss_last = 0.0
+    for ep in range(epochs):
+        inp.evaluate(mpc, X)
+        conv.evaluate(mpc, inp.output)
+        pool.evaluate(mpc, conv.output)
+        flat.evaluate(mpc, pool.output)
+        dense.evaluate(mpc, flat.output)
+
+        diff = y - dense.output
+        epoch_loss = (diff * diff).sum() / (2.0 * N)
+        if ep == 0:
+            loss_first = epoch_loss
+        loss_last = epoch_loss
+
+        g = dloss(mpc, y, dense.output, "mean_squared_error")
+        g = dense.derive(mpc, flat.output, g, LAYER_IDX=5)
+        g = flat.derive(mpc, pool.output, g, LAYER_IDX=4)
+        g = pool.derive(mpc, conv.output, g, LAYER_IDX=3)
+        conv.derive(mpc, inp.output, g, LAYER_IDX=1)
+        conv.update(mpc, step, momentum)
+        dense.update(mpc, step, momentum)
+
+    w1_sum = conv.weights.reshape((conv.weights.size,)).sum()
+
+    assert_eq(f"CP{mpc.pid}:\tCNN Conv2D output shape on {alg_struct}", list(conv.output.shape), [N, conv_out_H, conv_out_W, n_filters])
+    assert_eq(f"CP{mpc.pid}:\tCNN MaxPool2D output shape on {alg_struct}", list(pool.output.shape), [N, pool_out_H, pool_out_W, n_filters])
+    assert_eq(f"CP{mpc.pid}:\tCNN Flatten output shape on {alg_struct}", list(flat.output.shape), [N, flat_size])
+    assert_eq(f"CP{mpc.pid}:\tCNN Dense output shape on {alg_struct}", list(dense.output.shape), [N, dense_out])
+    assert w0_sum != w1_sum, f"CP{mpc.pid}: Conv2D weights unchanged after training"
+    assert loss_last < loss_first, f"CP{mpc.pid}: CNN loss did not drop (first={loss_first}, last={loss_last})"
+    print(f'CP{mpc.pid}:\tCNN loss dropped: {loss_first:.4f} -> {loss_last:.4f}')
+    print(f'CP{mpc.pid}:\tSequre CNN layers on {alg_struct} tests passed.\n')
+
+
+def _test_neural_net_cnn_all[TP](mpc: MPCEnv[TP], modulus: TP):
+    """
+    Run CNN tests: secure 2D maxpool component + end-to-end CNN workflow.
+    """
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    print(f'CP{mpc.pid}:\tTesting Sequre CNN on {alg_struct} ... \n')
+
+    _test_maxpool2d_secure(mpc, modulus)
+    _test_neural_net_cnn(mpc, modulus)
+
+    print(f'CP{mpc.pid}:\tSequre CNN on {alg_struct} tests passed.\n')
+
+
+# --- Vanilla Dense neural net test ---
+def _test_neural_net_vanilla[TP](mpc: MPCEnv[TP], modulus: TP):
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    print(f'CP{mpc.pid}:\tTesting Sequre vanilla neural net on {alg_struct} ... \n')
     input_size = 16
     output_size = 1
     n_neurons = 32
