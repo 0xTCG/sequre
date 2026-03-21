@@ -51,45 +51,51 @@ sequre build examples/local_run.codon -o local_run
 
 Use the `@local` decorator — Sequre forks one process per party on your machine, communicating via UNIX sockets:
 
+`local_run.codon`:
 ```python
-from hastings import mult3
-from sequre import local, Sharetensor as Stensor
+from sequre import sequre, local, Sharetensor as Stensor
+
+@sequre
+def muls(mpc, a, b, c):
+    return a * b + b * c + a * c
 
 @local
-def mult3_local(mpc, a: int, b: int, c: int):
+def mul_local(mpc, a: int, b: int, c: int):
     a_enc = Stensor.enc(mpc, a)
     b_enc = Stensor.enc(mpc, b)
     c_enc = Stensor.enc(mpc, c)
-    print(f"CP{mpc.pid}:\t{mult3(mpc, a_enc, b_enc, c_enc).reveal(mpc)}")
+    print(f"CP{mpc.pid}:\t{muls(mpc, a_enc, b_enc, c_enc).reveal(mpc)}")
 
-mult3_local(7, 13, 19)
+mul_local(7, 13, 19)
 ```
 
-```
-$ sequre examples/local_run.codon
-CP0:    mult3: 500
-CP1:    mult3: 500
+```bash
+sequre local_run.codon
 ```
 
 ### Distributed execution
 
 Use `mpc()` — each party runs as a separate process on a separate machine:
 
+`online_run.codon`:
 ```python
-from hastings import mult3
-from sequre import mpc, Sharetensor as Stensor
+from sequre import mpc, sequre, Sharetensor as Stensor
+
+@sequre
+def muls(mpc, a, b, c):
+    return a * b + b * c + a * c
 
 mpc = mpc()
 
 a = Stensor.enc(mpc, 7)
 b = Stensor.enc(mpc, 13)
 c = Stensor.enc(mpc, 19)
-print(f"CP{mpc.pid}:\t{mult3(mpc, a, b, c).reveal(mpc)}")
+print(f"CP{mpc.pid}:\t{muls(mpc, a, b, c).reveal(mpc)}")
 ```
 
 ```bash
 # On each machine:
-SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre examples/online_run.codon <pid>
+SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre online_run.codon <pid>
 ```
 
 Distributed mode requires mutual TLS certificates. Sequre handles MHE/MPC key management automatically, but **TLS certificates are your responsibility**. For development, generate test certificates with `scripts/generate_certs.sh`. For production, use your own CA — see [TLS configuration](https://0xTCG.github.io/sequre/user-guide/running-distributed/#tls-configuration) in the docs.
