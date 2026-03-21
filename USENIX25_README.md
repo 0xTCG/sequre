@@ -9,7 +9,7 @@ git clone https://github.com/0xTCG/sequre.git && cd sequre
 
 ### Local run (single machine)
 ```bash
-sequre -release scripts/invoke.codon run-benchmarks --local --jit --lattiseq --mpc --mhe --stdlib-builtin --king --pca --gwas-without-norm --mnist
+sequre -release scripts/invoke.codon run-benchmarks --local --jit --lattiseq --mpc --mhe --stdlib-builtin --king --pca --gwas-without-norm --ablation
 ```
 
 This will evaluate microbenchmarks **(Table 2; Section 10.2)**, basic and complex workflows **(Figure 7; Section 10.2)**, and MNIST **(Section 10.5)** for both Sequre and Shechi.
@@ -41,9 +41,9 @@ Run HEFactory basic workflows **(Figure 7; Section 10.2)** via docker:
 docker run --rm --privileged hsmile/hefactory:latest
 ```
 
-Run Lattigo basic workflows and KING **(Figure 7; Section 10.2)** via docker:
+Run Lattigo basic workflows **(Figure 7; Section 10.2)** via docker:
 ```bash
-docker run --rm --privileged hsmile/lattigo:bench
+docker run -it --rm --privileged hsmile/lattigo:bench
 ```
 
 Run SEAL micro-benchmarks **(Table 2; Section 10.2)** via docker:
@@ -58,10 +58,15 @@ docker run --rm --privileged hsmile/mpspdz:bench
 
 Run Lattigo micro-benchmarks **(Table 2; Section 10.2)** via docker:
 ```bash
-docker run --rm --privileged -it hsmile/lattigo:micro
+docker run -it --rm --privileged hsmile/lattigo:micro
 ```
 
-Run Lattigo complex workflows **(Figure 7; Section 10.2)** via docker:
+Run Lattigo Kinship **(Figure 7; Section 10.2)** via docker:
 ```bash
-docker run --rm --privileged -it hsmile/lattigo:gwas
+docker run -it --rm --privileged hsmile/lattigo:king
+```
+
+Run Lattigo GWAS (with PCA) **(Figure 7; Section 10.2)** via docker:
+```bash
+docker run -it --rm --privileged hsmile/lattigo:gwas
 ```
