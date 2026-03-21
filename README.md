@@ -110,13 +110,22 @@ def innerprod(mpc, a, b):
     return a.dot(mpc, b, axis=0)
 ```
 
-### Performance mode
+### Release vs debug mode
 
-For production workloads, compile with `-release` for full optimizations (disables debug backtraces):
+> **Important:** Sequre compiles in **debug mode by default** (with backtraces). Always use `-release` for production and benchmarks — it is significantly faster.
 
 ```bash
-sequre -release examples/local_run.codon --skip-mhe-setup
+# Debug mode (default) — slow, with full backtraces on failure
+sequre run my_protocol.codon
+
+# Release mode — fast, production-ready
+sequre -release run my_protocol.codon
+
+# Building a release binary
+sequre -release build my_protocol.codon -o my_protocol
 ```
+
+The `-release` flag must come immediately after `sequre`, before `run` or `build`.
 
 ## Documentation
 
