@@ -20,8 +20,10 @@ A matrix of shape `[m, n]` is chunked into `ceil(m * n / slots)` ciphertexts, ea
 
 You typically don't construct `Ciphertensor` directly. It is created by:
 
-1. **MHE encryption**: `mpc.mhe.enc_vector[Ciphertext](values)` returns a list of ciphertexts that you wrap in a `Ciphertensor`.
+1. **Factory method**: `Ciphertensor.enc(mpc, values)` encrypts a plaintext tensor into a `Ciphertensor`.
 2. **MPP/MPA internals**: When an `MPU` operation needs encryption, it creates `Ciphertensor` objects automatically.
+
+See the [Ciphertensor API](../api/ciphertensor.md) for the full list of factory methods.
 
 ## Arithmetic
 

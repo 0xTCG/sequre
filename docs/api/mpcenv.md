@@ -130,12 +130,20 @@ Tracks all operations automatically:
 | `partitions_count` | Beaver partitions performed |
 | `truncations_count` | Fixed-point truncations |
 | `secure_bootstrap_count` | HE bootstrapping operations |
+| `secure_mhe_mpc_switch_count` | SMC ↔ MHE protocol switches (via E2S/S2E) |
 
 ## Context managers
 
 ### `AllowMPCSwitch`
 
-Enables automatic switching between MPC and MHE backends mid-computation.
+Enables automatic [SMC ↔ MHE switching](../user-guide/switching.md) for the duration of the block. Inside this context, operations like `Ciphertensor.matmul` may automatically convert to Sharetensor (via the E2S protocol), run the operation using Beaver-triple MPC, and convert back (via S2E) when a cost estimator determines this is cheaper than a pure-HE path.
+
+```python
+with mpc.allow_mpc_switch():
+    result = ct_a @ ct_b  # matmul may use MPC path if cheaper
+```
+
+See the dedicated [SMC ↔ MHE Switching](../user-guide/switching.md) page for details.
 
 ### `ModulusSwitch`
 
