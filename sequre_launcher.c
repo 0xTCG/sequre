@@ -92,11 +92,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (!getenv("CODON_DEBUG")) {
-    setenv("CODON_DEBUG", "lt", 0);
-  }
-
-  const int base = 5; /* codon run --disable-opt=... -plugin sequre */
+  const int base = 5; /* codon <mode> --disable-opt=... -plugin sequre */
   char **args = calloc((size_t)argc + (size_t)base + 1, sizeof(char *));
   if (!args) {
     fprintf(stderr, "Out of memory.\n");
@@ -104,14 +100,21 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  const char *mode = "run";
+  int arg_start = 1;
+  if (argc > 1 && (!strcmp(argv[1], "build") || !strcmp(argv[1], "run"))) {
+    mode = argv[1];
+    arg_start = 2;
+  }
+
   int k = 0;
   args[k++] = codon;
-  args[k++] = "run";
+  args[k++] = mode;
   args[k++] = "--disable-opt=core-pythonic-list-addition-opt";
   args[k++] = "-plugin";
   args[k++] = "sequre";
 
-  for (int i = 1; i < argc; i++) {
+  for (int i = arg_start; i < argc; i++) {
     args[k++] = argv[i];
   }
   args[k] = NULL;

@@ -9,7 +9,7 @@ then
 fi
 
 case "$(uname -s)" in
-  Darwin*)    OPT=/usr/local;;
+  Darwin*)    OPT=/opt;;
   *)          OPT=/opt
 esac
 
@@ -35,5 +35,9 @@ else
   cmake --build build --target sequre
 fi
 cmake --install build --prefix=$HOME/.codon/lib/codon/plugins/sequre
-tar czvf sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz -C $HOME/.codon/lib/codon/plugins sequre seq
+
+# Build sequre launcher binary
+$OPT/llvm-codon/bin/clang -O2 -o $HOME/.codon/bin/sequre $1/sequre_launcher.c
+
+tar czvf sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz -C $HOME/.codon bin/sequre lib/codon/plugins/sequre lib/codon/plugins/seq
 echo "Done"
