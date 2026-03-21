@@ -85,5 +85,7 @@ The `Sequential` model handles the collective HE operations internally.
 ## Next steps
 
 - **[Secure Local Tensors (Ciphertensor)](secure-local-tensors.md)** — The layer beneath MPU.
-- **[MPU / MPP / MPA API](../api/multiparty-types.md)** — Complete reference.
+- **[MPU API](../api/mpu.md)** — Complete MPU reference.
+- **[MPP API](../api/mpp.md)** — Complete MPP reference.
+- **[MPA API](../api/mpa.md)** — Complete MPA reference.
 - **[Core MHE module](../deep-dive-shechi/core-mhe.md)** — How collective operations work.
