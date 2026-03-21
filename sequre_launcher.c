@@ -82,6 +82,42 @@ static char *default_codon_path(void) {
   return p;
 }
 
+static void print_help(const char *codon) {
+  printf("Sequre — Secure computation framework\n");
+  printf("\n");
+  printf("Usage: sequre [build|run] <file.codon> [codon-flags] [-- program-args]\n");
+  printf("\n");
+  printf("Modes:\n");
+  printf("  run    Compile and execute a Sequre program (default)\n");
+  printf("  build  Compile a Sequre program to a binary\n");
+  printf("\n");
+  printf("Runtime flags (passed after the .codon file):\n");
+  printf("  --use-ring         Use ring modulus instead of field modulus\n");
+  printf("  --skip-mhe-setup   Skip the MHE key-generation setup phase\n");
+  printf("  -h, --help         Show this help message\n");
+  printf("\n");
+  printf("Execution modes:\n");
+  printf("  Use @local decorator for local (single-machine) programs\n");
+  printf("  Use mpc() function for distributed (multi-machine) programs\n");
+  printf("\n");
+  printf("Environment variables:\n");
+  printf("  CODON_BIN              Path to the codon executable\n");
+  printf("  SEQURE_CP_IPS          Comma-separated party IP addresses\n");
+  printf("  SEQURE_CERT_DIR        TLS certificate directory (default: certs)\n");
+  printf("  SEQURE_CA_CERT_FILE    CA certificate file (default: ca.pem)\n");
+  printf("  SEQURE_USE_TLS         Set to 0 to disable TLS (insecure)\n");
+  printf("  SEQURE_OPENSSL_PATH    Path to libssl.so\n");
+  printf("  SEQURE_LIBCRYPTO_PATH  Path to libcrypto.so\n");
+  printf("\n");
+  printf("Examples:\n");
+  printf("  sequre run my_protocol.codon                     # @local program\n");
+  printf("  sequre run my_protocol.codon --skip-mhe-setup    # @local, SMC-only\n");
+  printf("  sequre build my_protocol.codon                   # compile to binary\n");
+  printf("  sequre run my_protocol.codon 1                   # distributed, party 1\n");
+  printf("\n");
+  printf("For Codon compiler flags, run: %s run --help\n", codon);
+}
+
 int main(int argc, char **argv) {
   cleanup_socks();
   ensure_default_ssl_env();
@@ -92,11 +128,21 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (!getenv("CODON_DEBUG")) {
-    setenv("CODON_DEBUG", "lt", 0);
+  /* Handle --help / -h before doing anything else */
+  if (argc < 2) {
+    print_help(codon);
+    free(codon);
+    return 0;
+  }
+  for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+      print_help(codon);
+      free(codon);
+      return 0;
+    }
   }
 
-  const int base = 5; /* codon run --disable-opt=... -plugin sequre */
+  const int base = 5; /* codon <mode> --disable-opt=... -plugin sequre */
   char **args = calloc((size_t)argc + (size_t)base + 1, sizeof(char *));
   if (!args) {
     fprintf(stderr, "Out of memory.\n");
@@ -104,14 +150,21 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  const char *mode = "run";
+  int arg_start = 1;
+  if (argc > 1 && (!strcmp(argv[1], "build") || !strcmp(argv[1], "run"))) {
+    mode = argv[1];
+    arg_start = 2;
+  }
+
   int k = 0;
   args[k++] = codon;
-  args[k++] = "run";
+  args[k++] = mode;
   args[k++] = "--disable-opt=core-pythonic-list-addition-opt";
   args[k++] = "-plugin";
   args[k++] = "sequre";
 
-  for (int i = 1; i < argc; i++) {
+  for (int i = arg_start; i < argc; i++) {
     args[k++] = argv[i];
   }
   args[k] = NULL;

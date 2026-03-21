@@ -1,95 +1,166 @@
-# Sequre (with Shechi)
+# Sequre
 
-Sequre and Shechi are an end-to-end, statically compiled and performance engineered, Pythonic framework for building efficient secure multiparty computation (MPC), homomorphic encryption (HE), and multiparty homomorphic encryption (MHE) pipelines in bioinformatics.
+### [Docs](https://0xTCG.github.io/sequre/)  ·  [Papers](#citations)  ·  [Examples](examples/)
 
-## Installation
+## What is Sequre?
 
-**Note:** Sequre/Shechi runs only on Linux at the moment.
+Sequre is a statically compiled, Pythonic framework for building secure computation pipelines — combining secure multiparty computation (MPC), homomorphic encryption (HE), and multiparty homomorphic encryption (MHE) in a single, high-performance system.
 
-Install [Codon](https://github.com/exaloop/codon) first:
+Write Python-like code; the Sequre compiler handles secret sharing, encrypted arithmetic, and inter-party communication automatically. Programs compile to native machine code via [Codon](https://github.com/exaloop/codon) with no runtime interpreter overhead.
+
+## Goals
+
+- 🐍 **Pythonic**: Write secure computation protocols in familiar Python syntax — no cryptographic boilerplate
+- 🚀 **Fast**: Compiled to native code; outperforms interpreter-based MPC frameworks by orders of magnitude
+- 🔀 **Unified**: MPC + HE + MHE in one framework — switch between schemes within a single protocol
+- 🧩 **Batteries included**: Built-in linear algebra, statistics, machine learning (linear/logistic regression, PCA, SVM), and GWAS pipelines
+- 🔒 **Secure by default**: Mutual TLS between parties, automatic key management, secret-shared arithmetic
+
+## Quick start
+
+**Supported platforms:** Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon).
+
+Install [Codon](https://github.com/exaloop/codon), then install Sequre:
+
 ```bash
-mkdir $HOME/.codon && curl -L https://github.com/exaloop/codon/releases/download/v0.17.0/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon --strip-components=1
+mkdir -p $HOME/.codon && \
+  curl -L https://github.com/exaloop/codon/releases/download/v0.17.0/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon --strip-components=1
+
+curl -L https://github.com/0xTCG/sequre/releases/download/v0.0.20-alpha/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon
+
+export PATH=$HOME/.codon/bin:$PATH
 ```
 
-Then install Sequre:
-```bash
-curl -L https://github.com/0xTCG/sequre/releases/download/v0.0.20-alpha/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon/lib/codon/plugins
-```
+Run your first secure protocol:
 
-Afterwards, build the local `sequre` launcher binary (no install needed):
-```bash
-mkdir -p bin
-cc -O2 -s -o bin/sequre sequre_launcher.c
-```
-
-This launcher preserves inline env vars like `SEQURE_CP_IPS=...` for the actual `codon run` process.
-It also auto-detects common OpenSSL library paths when `SEQURE_LIBCRYPTO_PATH` / `SEQURE_OPENSSL_PATH` are not explicitly set.
-
-## Run
-
-Clone the repository:
 ```bash
 git clone https://github.com/0xTCG/sequre.git && cd sequre
+sequre examples/local_run.codon
 ```
-and check the code in the [examples](examples/) for quick insight into Sequre.
 
-### Local run
+Or compile to a binary:
 
 ```bash
-./bin/sequre examples/local_run.codon
+sequre build examples/local_run.codon -o local_run
+./local_run
 ```
 
-This will simulate the run in a two-party setup with a trusted dealer.
+## Examples
 
-### Online run
+### Local execution
 
-At each party run:
-```bash
-SEQURE_CP_IPS=<ip1>,<ip2>,...,<ipN> ./bin/sequre examples/online_run.codon <pid>
-```
-where `<ipN>` denotes the IP address of each party and `<pid>` denotes the ID of the party.
+Use the `@local` decorator — Sequre forks one process per party on your machine, communicating via UNIX sockets:
 
-For example, in a two-party setup with a trusted dealer, run (IP addresses are random):
-```bash
-SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 ./bin/sequre examples/online_run.codon 0
-```
-at a trusted dealer (CP0).
+```python
+from hastings import mult3
+from sequre import local, Sharetensor as Stensor
 
-```bash
-SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 ./bin/sequre examples/online_run.codon 1
-```
-at the first party (CP1).
+@local
+def mult3_local(mpc, a: int, b: int, c: int):
+    a_enc = Stensor.enc(mpc, a)
+    b_enc = Stensor.enc(mpc, b)
+    c_enc = Stensor.enc(mpc, c)
+    print(f"CP{mpc.pid}:\t{mult3(mpc, a_enc, b_enc, c_enc).reveal(mpc)}")
 
-```bash
-SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 ./bin/sequre examples/online_run.codon 2
-```
-at the second party (CP2).
-
-### TLS certificates
-
-While Sequre handles MHE/MPC key-management under the hood, it relies on user-provided certificates for setting up secure channels between the parties.
-
-The following files are expected under `certs/` (or path configured by `SEQURE_CERT_DIR` env var) on each host:
-- `ca.pem` (adjustable via `SEQURE_CA_CERT_FILE` env var)
-- `cp<pid>.pem`  (adjustable via `SEQURE_PARTY_CERT_FILE` env var)
-- `cp<pid>-key.pem` (adjustable via `SEQURE_PARTY_KEY_FILE` env var)
-
-For development/testing, you can generate local certificates with:
-```bash
-./scripts/generate_certs.sh <num_parties> ./certs
+mult3_local(7, 13, 19)
 ```
 
-Production guidance:
-- Manage certificates with your own PKI workflow (for example, enterprise PKI, Vault PKI, or cloud/private CA).
-- Do not use `scripts/generate_certs.sh` as a production CA/enrollment workflow.
-- Rotate party certificates regularly and keep CA private keys outside Sequre application hosts.
+```
+$ sequre examples/local_run.codon
+CP0:    mult3: 500
+CP1:    mult3: 500
+```
 
-### Release mode
+### Distributed execution
 
-For (much) better performance but without debugging features such as backtrace, add `-release` flag immediatelly after `sequre` command:
+Use `mpc()` — each party runs as a separate process on a separate machine:
+
+```python
+from hastings import mult3
+from sequre import mpc, Sharetensor as Stensor
+
+mpc = mpc()
+
+a = Stensor.enc(mpc, 7)
+b = Stensor.enc(mpc, 13)
+c = Stensor.enc(mpc, 19)
+print(f"CP{mpc.pid}:\t{mult3(mpc, a, b, c).reveal(mpc)}")
+```
 
 ```bash
-./bin/sequre -release examples/local_run.codon --skip-mhe-setup
+# On each machine:
+SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre examples/online_run.codon <pid>
 ```
 
-_**Note:** `--skip-mhe-setup` flag disables the homomorphic encryption setup since `examples/local_run.codon` runs only Sequre (SMC)._
+Distributed mode requires mutual TLS certificates. Sequre handles MHE/MPC key management automatically, but **TLS certificates are your responsibility**. For development, generate test certificates with `scripts/generate_certs.sh`. For production, use your own CA — see [TLS configuration](https://0xTCG.github.io/sequre/user-guide/running-distributed/#tls-configuration) in the docs.
+
+### Writing secure functions
+
+The `@sequre` decorator marks functions that operate on secret-shared or encrypted data. The compiler applies MPC/MHE optimizations automatically:
+
+```python
+from sequre import sequre, Sharetensor as Stensor
+
+@sequre
+def mult3(mpc, a, b, c):
+    return a * b + b * c + a * c
+
+@sequre
+def innerprod(mpc, a, b):
+    return a.dot(mpc, b, axis=0)
+```
+
+### Release vs debug mode
+
+> **Important:** Sequre compiles in **debug mode by default** (with backtraces). Always use `-release` for production and benchmarks — it is significantly faster.
+
+```bash
+# Debug mode (default) — slow, with full backtraces on failure
+sequre run my_protocol.codon
+
+# Release mode — fast, production-ready
+sequre -release run my_protocol.codon
+
+# Building a release binary
+sequre -release build my_protocol.codon -o my_protocol
+```
+
+The `-release` flag must come immediately after `sequre`, before `run` or `build`.
+
+## Documentation
+
+Please see [0xTCG.github.io/sequre](https://0xTCG.github.io/sequre/) for in-depth documentation, including the [API reference](https://0xTCG.github.io/sequre/api/), [tutorials](https://0xTCG.github.io/sequre/tutorials/), and [network/TLS setup](https://0xTCG.github.io/sequre/user-guide/running-distributed/).
+
+Alternatively, you can [build from source](https://0xTCG.github.io/sequre/getting-started/build-from-source/).
+
+## Citations
+
+If you use Sequre or Shechi in your research, please cite the relevant paper(s):
+
+- **Shechi** (USENIX Security 2025):  
+  Smajlović H, Froelicher D, Shajii A, Berger B, Cho H, Numanagić I.  
+  [Shechi: a secure distributed computation compiler based on multiparty homomorphic encryption.](https://dl.acm.org/doi/10.5555/3766078.3766473)  
+  *34th USENIX Security Symposium*, 2025.
+
+- **Sequre** (Genome Biology 2023):  
+  Smajlović H, Shajii A, Berger B, Cho H, Numanagić I.  
+  [Sequre: a high-performance framework for secure multiparty computation enables biomedical data sharing.](https://link.springer.com/article/10.1186/s13059-022-02841-5)  
+  *Genome Biology*, 2023.
+
+- **Sequre** (IEEE ISBI 2022):  
+  Smajlović H, Shajii A, Berger B, Cho H, Numanagić I.  
+  [Sequre: a high-performance framework for rapid development of secure bioinformatics pipelines.](https://ieeexplore.ieee.org/document/9835664)  
+  *IEEE International Symposium on Biomedical Imaging*, 2022.
+
+## Acknowledgements
+
+This project was supported by:
+
+- 🇺🇸 National Science Foundation (NSF)
+- 🇺🇸 National Institutes of Health (NIH)
+- 🇨🇦 Natural Sciences and Engineering Research Council (NSERC)
+- 🇨🇦 Canada Research Chairs
+- 🇨🇦 Canada Foundation for Innovation
+- 🇨🇦 B.C. Knowledge Development Fund
+
+Built on [Codon](https://github.com/exaloop/codon) and a reimplementation of [Lattigo](https://github.com/tuneinsight/lattigo).
