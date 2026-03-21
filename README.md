@@ -1,29 +1,38 @@
 # Sequre (with Shechi)
 
-Sequre and Shechi are an end-to-end, statically compiled and performance engineered, Pythonic framework for building efficient secure multiparty computation (MPC), homomorphic encryption (HE), and multiparty homomorphic encryption (MHE) pipelines in bioinformatics.
+Sequre and Shechi are an end-to-end, statically compiled and performance engineered, Pythonic framework for building efficient secure multiparty computation (MPC), homomorphic encryption (HE), and multiparty homomorphic encryption (MHE) pipelines.
 
 ## Installation
 
-**Note:** Sequre/Shechi runs only on Linux at the moment.
+**Supported platforms:** Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon).
 
 Install [Codon](https://github.com/exaloop/codon) first:
 ```bash
-mkdir $HOME/.codon && curl -L https://github.com/exaloop/codon/releases/download/v0.17.0/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon --strip-components=1
+mkdir -p $HOME/.codon && curl -L https://github.com/exaloop/codon/releases/download/v0.17.0/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon --strip-components=1
 ```
 
 Then install Sequre:
 ```bash
-curl -L https://github.com/0xTCG/sequre/releases/download/v0.0.20-alpha/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon/lib/codon/plugins
+curl -L https://github.com/0xTCG/sequre/releases/download/v0.0.20-alpha/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon
 ```
 
-Afterwards, build the local `sequre` launcher binary (no install needed):
+This installs the `sequre` binary to `$HOME/.codon/bin/sequre` alongside the Sequre and Seq plugins.
+Add `$HOME/.codon/bin` to your `PATH` if you haven't already (the Codon tarball does not do this automatically):
 ```bash
-mkdir -p bin
-cc -O2 -s -o bin/sequre sequre_launcher.c
+export PATH=$HOME/.codon/bin:$PATH
 ```
+To make this permanent, add the line above to your `~/.bashrc`, `~/.zshrc`, or equivalent shell profile.
 
-This launcher preserves inline env vars like `SEQURE_CP_IPS=...` for the actual `codon run` process.
+The launcher preserves inline env vars like `SEQURE_CP_IPS=...` for the actual `codon run` process.
 It also auto-detects common OpenSSL library paths when `SEQURE_LIBCRYPTO_PATH` / `SEQURE_OPENSSL_PATH` are not explicitly set.
+
+### Run vs build
+
+Sequre supports the two Codon execution modes:
+- `run` (default): JIT-compile and execute immediately (`sequre run <file> [args]`).
+- `build`: Produce a standalone binary you can execute later (`sequre build -o <out> [build-opts]`).
+
+If mode is omitted, `run` is assumed.
 
 ## Run
 
@@ -36,7 +45,13 @@ and check the code in the [examples](examples/) for quick insight into Sequre.
 ### Local run
 
 ```bash
-./bin/sequre examples/local_run.codon
+sequre examples/local_run.codon
+```
+
+Or build a binary instead:
+```bash
+sequre build examples/local_run.codon -o local_run
+./local_run
 ```
 
 This will simulate the run in a two-party setup with a trusted dealer.
@@ -45,23 +60,23 @@ This will simulate the run in a two-party setup with a trusted dealer.
 
 At each party run:
 ```bash
-SEQURE_CP_IPS=<ip1>,<ip2>,...,<ipN> ./bin/sequre examples/online_run.codon <pid>
+SEQURE_CP_IPS=<ip1>,<ip2>,...,<ipN> sequre examples/online_run.codon <pid>
 ```
 where `<ipN>` denotes the IP address of each party and `<pid>` denotes the ID of the party.
 
 For example, in a two-party setup with a trusted dealer, run (IP addresses are random):
 ```bash
-SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 ./bin/sequre examples/online_run.codon 0
+SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre examples/online_run.codon 0
 ```
 at a trusted dealer (CP0).
 
 ```bash
-SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 ./bin/sequre examples/online_run.codon 1
+SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre examples/online_run.codon 1
 ```
 at the first party (CP1).
 
 ```bash
-SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 ./bin/sequre examples/online_run.codon 2
+SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre examples/online_run.codon 2
 ```
 at the second party (CP2).
 
@@ -89,7 +104,7 @@ Production guidance:
 For (much) better performance but without debugging features such as backtrace, add `-release` flag immediatelly after `sequre` command:
 
 ```bash
-./bin/sequre -release examples/local_run.codon --skip-mhe-setup
+sequre -release examples/local_run.codon --skip-mhe-setup
 ```
 
 _**Note:** `--skip-mhe-setup` flag disables the homomorphic encryption setup since `examples/local_run.codon` runs only Sequre (SMC)._
