@@ -16,7 +16,7 @@
 | **Primary mechanism** | Additive secret sharing over Mersenne-prime fields | Multiparty CKKS homomorphic encryption |
 | **Core type** | `Sharetensor` | `Ciphertensor`, `MPU`, `MPP`, `MPA` |
 | **Non-linear ops** | Beaver triples + network rounds | Local HE evaluation + collective key-switching |
-| **Best for** | Integer/fixed-point MPC, boolean circuits | Floating-point, batched linear algebra, ML |
+| **Best for** | Integer/fixed-point MPC, smaller data scale | Floating-point, batched linear algebra, large scale ML |
 
 ## Architecture layers
 

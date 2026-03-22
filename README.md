@@ -47,6 +47,8 @@ sequre build examples/local_run.codon -o local_run
 ./local_run
 ```
 
+> **Note:** Make sure to delete sockets (`rm sock.*`) if running a **local run** pre-built binary. `sequre` command does this automatically, otherwise, but built binaries do not.
+
 ### Release vs debug mode
 
 > **Important:** Sequre compiles in **debug mode by default** (with backtraces). Always use `-release` for production and benchmarks — it is significantly faster.

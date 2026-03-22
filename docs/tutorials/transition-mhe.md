@@ -109,7 +109,7 @@ Both passes are applied automatically to `@sequre`-annotated functions when the 
 | Per-multiply cost | 1 network round | Local HE op (~34ms, no network) |
 | Batching | No | Yes (thousands of values per ciphertext) |
 | Precision | Exact (integer/fixed-point) | Approximate (CKKS) |
-| Best for | Exact results, smaller scale data | Dense linear algebra, large scale ML training |
+| Best for | Exact results, smaller data scale | Dense linear algebra, large scale ML training |
 
 ## Next steps
 
