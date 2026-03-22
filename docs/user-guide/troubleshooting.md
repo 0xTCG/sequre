@@ -26,9 +26,9 @@ Use debug mode only when you need a backtrace to diagnose a crash. Switch to `-r
 
 ### libgmp (GMP)
 
-GMP is **bundled** with Sequre releases and auto-detected by the launcher. It checks bundled paths, the source tree (`external/GMP/lib/`), and common system locations.
+GMP is **bundled** with Sequre releases and auto-detected by the launcher. It checks bundled paths and common system locations.
 
-If auto-detection fails, install GMP and set the path to it to `SEQURE_GMP_PATH` env variable:
+If auto-detection fails, install GMP and set the path to it to `SEQURE_GMP_PATH` env variable (Sequre repository also provides these libraries in `external/GMP/lib` dir):
 
 ```bash
 # Linux
@@ -42,14 +42,19 @@ export SEQURE_GMP_PATH=/opt/homebrew/lib/libgmp.dylib
 
 ### OpenSSL (libssl / libcrypto)
 
-The Sequre launcher auto-detects common OpenSSL paths on Linux. If it fails:
+The Sequre launcher auto-detects common OpenSSL paths on both Linux and macOS (Homebrew). If auto-detection fails, install OpenSSL and point to it manually:
 
 ```bash
-export SEQURE_OPENSSL_PATH=/path/to/libssl.so.3
-export SEQURE_LIBCRYPTO_PATH=/path/to/libcrypto.so.3
-```
+# Linux
+sudo apt install libssl-dev
+export SEQURE_OPENSSL_PATH=/usr/lib/x86_64-linux-gnu/libssl.so.3
+export SEQURE_LIBCRYPTO_PATH=/usr/lib/x86_64-linux-gnu/libcrypto.so.3
 
-On Debian/Ubuntu: `sudo apt install libssl-dev`. On macOS, OpenSSL is typically provided by Homebrew (`brew install openssl`).
+# macOS
+brew install openssl/
+export SEQURE_OPENSSL_PATH=/opt/homebrew/opt/openssl/lib/libssl.dylib
+export SEQURE_LIBCRYPTO_PATH=/opt/homebrew/opt/openssl/lib/libcrypto.dylib
+```
 
 ### libpython (for `@python` interop)
 

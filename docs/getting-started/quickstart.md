@@ -34,21 +34,19 @@ sequre examples/local_run.codon
 ```
 
 !!! info "Compilation takes a moment"
-    Sequre programs compile to native machine code, so the first run may take a few minutes. To track compilation progress in real time, set `CODON_DEBUG=lt`:
-    ```bash
-    CODON_DEBUG=lt sequre examples/local_run.codon
+    Sequre programs compile to native machine code, so the first run may take a few minutes. The launcher shows compilation progress by default.
     ```
 
 This forks three processes on your machine (a trusted dealer + two compute parties) and runs the `mult3` micro-benchmark from Hastings et al.
 
 Expected output:
 ```
-CP0:    mult3: 500
-CP1:    mult3: 500
-CP2:    mult3: 500
+CP0:    mult3: 471
+CP1:    mult3: 471
+CP2:    mult3: 471
 ```
 
-The result `7*13 + 13*19 + 7*19 = 500` was computed entirely on secret-shared data — no party ever saw the raw inputs of another.
+The result `7*13 + 13*19 + 7*19 = 471` was computed entirely on secret-shared data — no party ever saw the raw inputs of another.
 
 ## What just happened?
 
