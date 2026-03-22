@@ -15,9 +15,7 @@ The switching mechanism is built on two low-level Lattiseq distributed protocols
 
 A single round-trip (E2S → compute in MPC → S2E) is what `via_mpc` performs under the hood. The cost of one switch is estimated as:
 
-$$
-\text{switch\_cost} \approx \text{HE\_ENC\_COST} + \text{HE\_DEC\_COST} \;\;\text{per ciphertext}
-$$
+$$\mathrm{switch\text{-}cost} \approx \mathrm{HE\text{-}ENC\text{-}COST} + \mathrm{HE\text{-}DEC\text{-}COST} \quad \text{per ciphertext}$$
 
 This is defined by the `MHE_MPC_SWITCH_COST_ESTIMATE` constant and used by the cost estimator to decide between pure-MHE and switching paths.
 
