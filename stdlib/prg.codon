@@ -1,9 +1,22 @@
-import sys
+from copy import copy
 from math import inf as INF, sqrt as _sqrt, acos as _acos, cos as _cos
 from math import log as _log, exp as _exp, pi as _pi, e as _e, ceil as _ceil
 from bisect import bisect as _bisect
 from time import time as _time
 from experimental.simd import Vec
+from sequre.constants import LIBCRYPTO_PATH, USE_SECURE_PRG
+from sequre.types.llvm import *
+
+# Libcrypto FFI for AES-256-CTR DRBG (secure PRG backend)
+_LIBCRYPTO = LIBCRYPTO_PATH
+from C import _LIBCRYPTO.EVP_CIPHER_CTX_new() -> cobj as _EVP_CIPHER_CTX_new
+from C import _LIBCRYPTO.EVP_CIPHER_CTX_free(cobj) as _EVP_CIPHER_CTX_free
+from C import _LIBCRYPTO.EVP_aes_256_ctr() -> cobj as _EVP_aes_256_ctr
+from C import _LIBCRYPTO.EVP_EncryptInit_ex(cobj, cobj, cobj, cobj, cobj) -> int as _EVP_EncryptInit_ex
+from C import _LIBCRYPTO.EVP_EncryptUpdate(cobj, cobj, cobj, cobj, int) -> int as _EVP_EncryptUpdate
+from C import _LIBCRYPTO.EVP_EncryptFinal_ex(cobj, cobj, cobj) -> int as _EVP_EncryptFinal_ex
+from C import _LIBCRYPTO.RAND_bytes(cobj, int) -> int as _RAND_bytes
+from C import memset(cobj, int, int) -> cobj as _memset
 
 
 # Global params
@@ -30,6 +43,21 @@ SFMT_POS2: Static[int] = (FREQ - DIFF_POS) * 4
 N_SFMT_POS2: Static[int] = N - SFMT_POS2
 SSE_MASK = (((((u128(0xdfffffef) << u128(32)) | u128(0xddfecb7f)) << u128(32)) | u128(0xbffaffff)) << u128(32)) | u128(0xbffffff6)
 
+# Secure PRG backend constants (AES-256-CTR DRBG)
+# State layout: [0:8]=key, [8:12]=IV/counter, [12:N]=random buffer
+_SECURE_KEY_U32S: Static[int] = 8
+_SECURE_IV_U32S: Static[int] = 4
+_SECURE_HDR: Static[int] = _SECURE_KEY_U32S + _SECURE_IV_U32S
+_SECURE_BUF_BYTES: Static[int] = (N - _SECURE_HDR) * 4
+_SECURE_BLOCKS_PER_REFILL: Static[int] = _SECURE_BUF_BYTES // 16
+
+assert _SECURE_KEY_U32S > 1, "Secure PRG:\n\tInvalid parameters:\n\tKey size must be at least 64 bits (2 u32s) for security."
+seed_t = UInt[_SECURE_KEY_U32S * 32]
+
+@llvm
+def _to_cobj(p: ptr[u32]) -> cobj:
+    %0 = bitcast i32* %p to i8*
+    ret i8* %0
 
 @llvm
 def _at(src: ptr[u32], idx: i64) -> ptr[u32]:
@@ -179,7 +207,7 @@ class RandomGenerator:
         k = N if N > key_length else key_length
 
         while k > 0:
-            self.state[i] = (self.state[i] ^ ((self.state[i-1] ^ (self.state[i-1] >> u32(30))) * u32(1664525))) + init_key[j] + j
+            self.state[i] = (self.state[i] ^ ((self.state[i-1] ^ (self.state[i-1] >> u32(30))) * u32(1664525))) + init_key[j] + u32(j)
             i += 1
             j += 1
 
@@ -192,7 +220,7 @@ class RandomGenerator:
 
         k = N - 1
         while k > 0:
-            self.state[i] = (self.state[i] ^ ((self.state[i-1] ^ (self.state[i-1] >> u32(30))) * u32(1566083941))) - i
+            self.state[i] = (self.state[i] ^ ((self.state[i-1] ^ (self.state[i-1] >> u32(30))) * u32(1566083941))) - u32(i)
             i += 1
             if i >= N:
                 self.state[0] = self.state[N-1]
@@ -389,18 +417,259 @@ class RandomGenerator:
         """
         self.random_seed_time_pid()
 
+    def get_state(self) -> tuple[Array[u32], int]:
+        return copy(self.state), self.next
+
+    def set_state(self, s: tuple[Array[u32], int]):
+        self.state = s[0]
+        self.next = s[1]
+
+
+class SecureRandomGenerator:
+    """AES-256-CTR based CSPRNG. Deterministic given a seed, cryptographically secure."""
+    state: Array[u32]     # [0:8]=key, [8:12]=IV/counter, [12:N]=random buffer
+    next: int
+
+    def __init__(self):
+        self.state = Array[u32](N)
+        self.next = N + 1  # Force refill on first use
+
+    def _refill(self):
+        buf_bytes = _SECURE_BUF_BYTES
+        key_ptr = _to_cobj(_at(self.state.ptr, 0))
+        iv_ptr = _to_cobj(_at(self.state.ptr, _SECURE_KEY_U32S))
+        out_ptr = _to_cobj(_at(self.state.ptr, _SECURE_HDR))
+
+        zeros = ptr[byte](buf_bytes)
+        _memset(zeros, 0, buf_bytes)
+
+        ctx = _EVP_CIPHER_CTX_new()
+        assert ctx != cobj(), "SecureRandomGenerator: Failed to create EVP context"
+
+        rc = _EVP_EncryptInit_ex(ctx, _EVP_aes_256_ctr(), cobj(), key_ptr, iv_ptr)
+        assert rc == 1, "SecureRandomGenerator: EVP_EncryptInit_ex failed"
+
+        outlen = 0
+        rc = _EVP_EncryptUpdate(ctx, out_ptr, __ptr__(outlen).as_byte(), zeros, buf_bytes)
+        assert rc == 1, "SecureRandomGenerator: EVP_EncryptUpdate failed"
+
+        final_outlen = 0
+        dummy = ptr[byte](16)
+        _EVP_EncryptFinal_ex(ctx, dummy, __ptr__(final_outlen).as_byte())
+        _EVP_CIPHER_CTX_free(ctx)
+
+        # Advance 64-bit counter in state[9]:state[8] using 32-bit add with carry.
+        old_lo = self.state[8]
+        self.state[8] = old_lo + u32(_SECURE_BLOCKS_PER_REFILL)
+        if self.state[8] < old_lo:
+            self.state[9] += u32(1)
+
+        self.next = _SECURE_HDR
+
+    def init_genrand(self, s: seed_t):
+        # Set the key portion of the state from the seed
+        for i in staticrange(_SECURE_KEY_U32S):
+            self.state[i] = (s >> (i * 32)).trunc_to(32)
+        # Zero the IV/counter
+        for i in staticrange(_SECURE_KEY_U32S, _SECURE_HDR):
+            self.state[i] = u32(0)
+        self._refill()
+
+    def seed(self):
+        _RAND_bytes(_to_cobj(self.state.ptr), _SECURE_KEY_U32S * 4)
+        for i in range(_SECURE_KEY_U32S, _SECURE_HDR):
+            self.state[i] = u32(0)
+        self._refill()
+
+    def get_state(self) -> tuple[Array[u32], int]:
+        return copy(self.state), self.next
+
+    def set_state(self, s: tuple[Array[u32], int]):
+        self.state = s[0]
+        self.next = s[1]
+
+    def genrand_int32(self) -> u32:
+        if self.next >= N:
+            self._refill()
+        y = self.state[self.next]
+        self.next += 1
+        return y
+
+    def genrand_u32x4(self) -> Vec[u32, 4]:
+        if self.next > N_4:
+            self._refill()
+        y = _get_elem_value_u32x4(self.state.ptr, self.next)
+        self.next += 4
+        return y
+
+    def genrand_u32x8(self) -> Vec[u32, 8]:
+        if self.next > N_8:
+            self._refill()
+        y = _get_elem_value_u32x8(self.state.ptr, self.next)
+        self.next += 8
+        return y
+
+    def genrand_u64x4(self) -> Vec[u64, 4]:
+        if self.next > N_8:
+            self._refill()
+        y = _get_elem_value_u64x4(self.state.ptr, self.next)
+        self.next += 8
+        return y
+
+    def genrand_u64x8(self) -> Vec[u64, 8]:
+        if self.next > N_16:
+            self._refill()
+        y = _get_elem_value_u64x8(self.state.ptr, self.next)
+        self.next += 16
+        return y
+
+    def genrand_int64(self) -> u64:
+        if self.next > N_2:
+            self._refill()
+        y = _get_elem_value_64(self.state.ptr, self.next)
+        self.next += 2
+        return y
+
+    def genrand_int128(self) -> u128:
+        if self.next > N_4:
+            self._refill()
+        y = _get_elem_value_128(self.state.ptr, self.next)
+        self.next += 4
+        return y
+
+    def genrand_int192(self) -> u192:
+        if self.next > N_6:
+            self._refill()
+        y = _get_elem_value_192(self.state.ptr, self.next)
+        self.next += 6
+        return y
+
+    def genrand_int256(self) -> u256:
+        if self.next > N_8:
+            self._refill()
+        y = _get_elem_value_256(self.state.ptr, self.next)
+        self.next += 8
+        return y
+
+    def genrand_int512(self) -> u512:
+        if self.next > N_16:
+            self._refill()
+        y = _get_elem_value_512(self.state.ptr, self.next)
+        self.next += 16
+        return y
+
+    def genrand_res53(self) -> float:
+        a = self.genrand_int32() >> u32(5)
+        b = self.genrand_int32() >> u32(6)
+        return (int(a)*67108864.0 + int(b)) * (1.0 / 9007199254740992.0)
+
+    def _mm_genrand_res53[T](self) -> T:
+        _mm_const_1 = T(67108864.0)
+        _mm_const_2 = T(1.0 / 9007199254740992.0)
+        if isinstance(T, Vec[float, 4]):
+            _mm_a = (self.genrand_u32x4() >> Vec[u32, 4](5)).to_float()
+            _mm_b = (self.genrand_u32x4() >> Vec[u32, 4](6)).to_float()
+            return (_mm_a * _mm_const_1 + _mm_b) * _mm_const_2
+        elif isinstance(T, Vec[float, 8]):
+            _mm_a = (self.genrand_u32x8() >> Vec[u32, 8](5)).to_float()
+            _mm_b = (self.genrand_u32x8() >> Vec[u32, 8](6)).to_float()
+            return (_mm_a * _mm_const_1 + _mm_b) * _mm_const_2
+        else: compile_error("Invalid vector type.")
+
+
+# Temp solution until Union types are fixed.
+class PRGBackend:
+    _sfmt: RandomGenerator
+    _secure: SecureRandomGenerator
+    _use_secure: bool
+
+    def __init__(self, sfmt: RandomGenerator):
+        self._sfmt = sfmt
+        self._secure = SecureRandomGenerator()
+        self._use_secure = False
+
+    def __init__(self, secure: SecureRandomGenerator):
+        self._sfmt = RandomGenerator()
+        self._secure = secure
+        self._use_secure = True
+
+    def init_genrand(self, s):
+        if self._use_secure: self._secure.init_genrand(s)
+        else: self._sfmt.init_genrand(s.trunc_to(32))
+
+    def seed(self):
+        if self._use_secure: self._secure.seed()
+        else: self._sfmt.seed()
+
+    def get_state(self) -> tuple[Array[u32], int]:
+        if self._use_secure: return self._secure.get_state()
+        return self._sfmt.get_state()
+
+    def set_state(self, s: tuple[Array[u32], int]):
+        if self._use_secure: self._secure.set_state(s)
+        else: self._sfmt.set_state(s)
+
+    def genrand_int32(self) -> u32:
+        if self._use_secure: return self._secure.genrand_int32()
+        return self._sfmt.genrand_int32()
+
+    def genrand_u32x4(self) -> Vec[u32, 4]:
+        if self._use_secure: return self._secure.genrand_u32x4()
+        return self._sfmt.genrand_u32x4()
+
+    def genrand_u32x8(self) -> Vec[u32, 8]:
+        if self._use_secure: return self._secure.genrand_u32x8()
+        return self._sfmt.genrand_u32x8()
+
+    def genrand_u64x4(self) -> Vec[u64, 4]:
+        if self._use_secure: return self._secure.genrand_u64x4()
+        return self._sfmt.genrand_u64x4()
+
+    def genrand_u64x8(self) -> Vec[u64, 8]:
+        if self._use_secure: return self._secure.genrand_u64x8()
+        return self._sfmt.genrand_u64x8()
+
+    def genrand_int64(self) -> u64:
+        if self._use_secure: return self._secure.genrand_int64()
+        return self._sfmt.genrand_int64()
+
+    def genrand_int128(self) -> u128:
+        if self._use_secure: return self._secure.genrand_int128()
+        return self._sfmt.genrand_int128()
+
+    def genrand_int192(self) -> u192:
+        if self._use_secure: return self._secure.genrand_int192()
+        return self._sfmt.genrand_int192()
+
+    def genrand_int256(self) -> u256:
+        if self._use_secure: return self._secure.genrand_int256()
+        return self._sfmt.genrand_int256()
+
+    def genrand_int512(self) -> u512:
+        if self._use_secure: return self._secure.genrand_int512()
+        return self._sfmt.genrand_int512()
+
+    def genrand_res53(self) -> float:
+        if self._use_secure: return self._secure.genrand_res53()
+        return self._sfmt.genrand_res53()
+
+    def _mm_genrand_res53[T](self) -> T:
+        if self._use_secure: return self._secure._mm_genrand_res53(T=T)
+        return self._sfmt._mm_genrand_res53(T=T)
+
+
 """
 Random number generator base class used by bound module functions.
 Used to instantiate instances of Random to get generators that don't
 share state.
-Class Random can also be subclassed if you want to use a different basic
-generator of your own devising: in that case, override the following
+Class Random can also be subclassed if a different basic
+generator is needed: in that case, override the following
 methods:  random(), seed(), getstate(), and setstate().
 Optionally, implement a getrandbits() method so that randrange()
 can cover arbitrarily large ranges.
 """
 class Random:
-    gen: RandomGenerator # comment for another error
+    gen: PRGBackend
 
     def __init__(self, g: RandomGenerator):
         """
@@ -410,8 +679,13 @@ class Random:
 
         For now x is set to its default None.
         """
+        self.gen = PRGBackend(sfmt=g)
+
+    def __init__(self, g: SecureRandomGenerator):
+        self.gen = PRGBackend(secure=g)
+
+    def __init__(self, g: PRGBackend):
         self.gen = g
-        # self.gauss_next = None
 
     def seed(self):
         """
@@ -464,6 +738,12 @@ class Random:
         TODO: #187 Generalize
         """
         return self.gen.genrand_u64x8() >> Vec[u64, 8](u64(64 - k))
+
+    def getrandbits_32(self, k: int) -> u32:
+        """
+        TODO: #187 Generalize to UInt[N]
+        """
+        return self.gen.genrand_int32() >> u32(32 - k)
 
     def getrandbits_64(self, k: int) -> u64:
         """
@@ -832,7 +1112,7 @@ class Random:
           """
           Log normal distribution.
 
-          If you take the natural logarithm of this distribution, you'll get a
+          The natural logarithm of this distribution will produce a
           normal distribution with mean mu and standard deviation sigma.
           mu can have any value, and sigma must be greater than zero.
           """
@@ -960,16 +1240,16 @@ class Random:
         return [population[_bisect(cum_weights, int(self.random() * total), 0, hi)]
                 for i in range(k)]
 
-_gen = RandomGenerator()
+_gen = PRGBackend(secure=SecureRandomGenerator()) if USE_SECURE_PRG else PRGBackend(sfmt=RandomGenerator())
+_gen.seed()  # Seed the generator with random bits or current time, depending on the generator type.
 _rnd = Random(_gen)
 
-def seed(a: int):
-    _gen.init_genrand(u32(a))
-
-seed(int(_time()))
+def seed(a):
+    _gen.init_genrand(a)
 
 def getrandbits_intn[TP](k: int):
     # TODO: #187 Generalize to UInt[N]
+    if isinstance(TP, u32): return _rnd.getrandbits_32(k)
     if isinstance(TP, u64): return _rnd.getrandbits_64(k)
     if isinstance(TP, u128): return _rnd.getrandbits_128(k)
     if isinstance(TP, u192): return _rnd.getrandbits_192(k)

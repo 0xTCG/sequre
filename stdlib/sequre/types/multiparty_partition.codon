@@ -430,11 +430,17 @@ class MPP[S, dtype]:
         return self.astype(float)
     
     def filter(self, mask) -> MPP[S, dtype]:
-        assert self.shape[0] == len(mask), f"MPP: partition and filter mask size mismatch: {self.shape[0]} != {len(mask)}"
+        assert self.shape[0] == len(mask) or self.cohort_shape[0] == len(mask), f"MPP: partition and filter mask size mismatch: {self.shape[0]} != {len(mask)}"
         assert not self._transposed, "Not implemented yet: filtering transposed MPP"
         assert self.is_local(), "Not implemented yet: filtering encrypted MPP"
         
         mpc = self._mpc
+        if self.shape[0] != len(mask) and mpc.pid:
+            start = self._ratios[:mpc.pid - 1].sum()
+            stop = start + self._ratios[mpc.pid - 1]
+            mask = mask[start:stop]
+        
+        assert self.shape[0] == len(mask), f"MPP: partition and filter mask size mismatch: {self.shape[0]} != {len(mask)}"
         _local_data = self._local_data.filter(mask)
         _ratios = mpc.comms.collect(_local_data.shape[0], include_trusted_dealer=True)[1:]
 
@@ -653,9 +659,14 @@ class MPP[S, dtype]:
             return self._local_data.T if self._transposed else self._local_data
         
         if self.has_local_data():
-            print(f"CP{mpc.pid}: WARNING! Revealing local data")
+            print(
+                f"CP{mpc.pid}: WARNING! At least part of the MPP partition is in plaintext. "
+                f"Revealing with secure aggregation may cause information leakage.")
 
-        if mpc.council(self.is_local()).any():
+        if mpc.council(self.is_local() or self.is_empty()).all():
+            print(
+                f"CP{mpc.pid}: WARNING! Revealing MPP partition without secure "
+                f"aggregation since all parties have plaintext data")
             arr = mpc.comms.collect(self._local_data.copy()).unfence()
         else:
             reveals = [enc.reveal(mpc, source_pid=-1, T=dtype) for enc in self.collect()]
@@ -809,7 +820,7 @@ class MPP[S, dtype]:
         else: # case not self._transposed and other._transposed
             return MPP._matmul_case_ntt(mpc, self, other)
     
-    def patch_copy(self, new_size: int) -> MPP[S, dtype]:
+    def replicate(self, new_size: int) -> MPP[S, dtype]:
         mpc = self._mpc
         if staticlen(S) != 1 and staticlen(S) != 2:
             compile_error("Not implemented yet: MPP n-dim patch copy")
@@ -821,9 +832,9 @@ class MPP[S, dtype]:
             _ratios=self._ratios)
         
         if self.is_local() or mpc.pid == 0:
-            new_mpp._local_data = self._local_data.patch_copy(new_size)
+            new_mpp._local_data = self._local_data.replicate(new_size)
         elif self.is_full_encrypted():
-            new_mpp._encryption_unified = self._encryption_unified.patch_copy(mpc, new_size, True)
+            new_mpp._encryption_unified = self._encryption_unified.replicate(mpc, new_size, True)
         else:
             raise NotImplementedError("MPP: expected to be either local or fully encrypted for patch copy at the moment")
         
@@ -840,11 +851,11 @@ class MPP[S, dtype]:
             raise NotImplementedError("Broadasting MPP from lower to higher dimension not implemented yet")
         elif staticlen(S2) == staticlen(S):
             if staticlen(S2) == 1 and target_shape[0] > self.shape[0] and self.shape[0] == 1:
-                return self.patch_copy(target_shape[0])
+                return self.replicate(target_shape[0])
             if staticlen(S2) == 2:
                 if self.shape[0] == target_shape[0]:
                     assert self.shape[1] == 1, f"CP{self._mpc.pid}:\tCannot broadcast shape {self.shape} to {target_shape}"
-                    return self.patch_copy(target_shape[1])
+                    return self.replicate(target_shape[1])
             return self
         else:
             compile_error("MPP: Incompatible shapes for broadcast")
@@ -863,10 +874,10 @@ class MPP[S, dtype]:
         mpc = self._mpc
         if mpc.pid == 0:
             self_cp._ratios = target._ratios.copy()
-            self_cp._local_data = self_cp._local_data.patch_copy(target._ratios[mpc.pid - 1])
+            self_cp._local_data = self_cp._local_data.replicate(target._ratios[mpc.pid - 1])
         
         self_cp.broadcast_from(argmax(self._ratios) + 1)
-        self_cp._encryption_unified = self_cp._encryption_unified.patch_copy(mpc, target._ratios[mpc.pid - 1])
+        self_cp._encryption_unified = self_cp._encryption_unified.replicate(mpc, target._ratios[mpc.pid - 1])
         self_cp._ratios = target._ratios.copy()
 
         return self_cp
@@ -1277,7 +1288,7 @@ class MPP[S, dtype]:
         if mpc.council(enc._diagonal_contiguous).any():
             joined_sum = mpc.comms.collect(enc).sum(mpc)
             return joined_sum.to_sharetensor(
-                mpc, modulus=mpc.default_mpc_modulus, source_pid=-1, S=S, dtype=dtype).to_mpp(
+                mpc, modulus=mpc.default_mpc_modulus, source_pid=-1, S=S, dtype=float).to_mpp(
                     mpc, ratios=first._ratios, dtype=dtype)
         
         return mpc.comms.collect_at(enc, mpc.comms.hub_pid).sum(mpc).to_mpp(mpc, first._ratios, source_pid=mpc.comms.hub_pid, S=S, dtype=dtype)

@@ -107,7 +107,6 @@ func (pi *MatMultProtocolInfo) MatMultProtocol() [][]float64 {
         }
         log.LLvl1(pid, "finished exchanging number of rows: ", allPidsNbrRows)
 
-        // for toy examples, we assume #SNPs >> #samples and therefore pack the input matrices row-wise (each row is one or multiple ciphertexts
         if pid > 0 {
                 rowsLocal := len(pi.Data)
                 cols := len(pi.Data[0])
@@ -123,9 +122,7 @@ func (pi *MatMultProtocolInfo) MatMultProtocol() [][]float64 {
                         resultDecrypt, _ := pi.Prot.MpcObj[1].Network.CollectiveDecryptMat(cps, result, -1)
                         decryptedMatrix := make([][]float64, len(resultDecrypt))
                         for d := 0; d < len(resultDecrypt); d++ {
-                                log.LLvl1(d)
                                 decryptedMatrix[d] = libspindle.DecodeFloatVector(cps, resultDecrypt[d])
-                                //log.LLvl1("localResultDecode : ", decryptedMatrix[d][:2*allPidsNbrRows[1]])
                         }
                         return decryptedMatrix
                 } else {
@@ -133,68 +130,27 @@ func (pi *MatMultProtocolInfo) MatMultProtocol() [][]float64 {
 
                                 YTEnc := cryptobasics.EncryptDense(cps, mat.DenseCopyOf(Y.T()))
 
-                                // communication simul for HEFactory
-                                // pi.Prot.MpcObj.GetNetworks().ResetNetworkLog()
-                                // timeStart := time.Now()
-                                // pi.Prot.MpcObj.GetNetworks()[1].SendInt(len(YTEnc), 1)
-                                // pi.Prot.MpcObj.GetNetworks()[1].SendInt(len(YTEnc[0]), 1)
-                                // pi.Prot.MpcObj.GetNetworks()[1].SendCipherMatrix(YTEnc, 1)
-                                // pi.Prot.MpcObj.GetNetworks()[1].SendCipherMatrix(YTEnc, 1)
-                                // pi.Prot.MpcObj.GetNetworks().PrintNetworkLog()
-                                // log.LLvl1("Time taken for communication: ", time.Since(timeStart))
-                                // log.Fatal()
-
                                 pi.Prot.MpcObj.GetNetworks()[1].SendInt(len(YTEnc), 1)
                                 pi.Prot.MpcObj.GetNetworks()[1].SendInt(len(YTEnc[0]), 1)
                                 pi.Prot.MpcObj.GetNetworks()[1].SendCipherMatrix(YTEnc, 1)
-
-                                nrowsY := pi.Prot.MpcObj.GetNetworks()[2].ReceiveInt(1)
-                                ncolsCipherY := pi.Prot.MpcObj.GetNetworks()[2].ReceiveInt(1)
-                                YT := pi.Prot.MpcObj.GetNetworks()[2].ReceiveCipherMatrix(cps, nrowsY, ncolsCipherY, 1)
-
-
-                                result := gwas.CPMatMult4(cps, YT, mat.DenseCopyOf(Y.T()), 6)
-
                                 _, _ = pi.Prot.MpcObj[1].Network.CollectiveDecryptMat(cps, nil, 1)
-
-                                resultDecrypt, _ := pi.Prot.MpcObj[2].Network.CollectiveDecryptMat(cps, result, 2)
-                                decryptedMatrix := make([][]float64, len(resultDecrypt))
-                                for d := 0; d < len(resultDecrypt); d++ {
-                                        decryptedMatrix[d] = libspindle.DecodeFloatVector(cps, resultDecrypt[d])
-                                        //log.LLvl1("localResultDecode : ", decryptedMatrix[d][:2*allPidsNbrRows[otherPid]])
-                                }
-                                return decryptedMatrix
-
                         } else {
+                                nrowsY := pi.Prot.MpcObj.GetNetworks()[pid].ReceiveInt(2)
+                                ncolsCipherY := pi.Prot.MpcObj.GetNetworks()[pid].ReceiveInt(2)
+                                YT := pi.Prot.MpcObj.GetNetworks()[pid].ReceiveCipherMatrix(cps, nrowsY, ncolsCipherY, 2)
 
-                                YTEnc := cryptobasics.EncryptDense(cps, mat.DenseCopyOf(Y.T()))
-
-
-                                nrowsY := pi.Prot.MpcObj.GetNetworks()[1].ReceiveInt(2)
-                                ncolsCipherY := pi.Prot.MpcObj.GetNetworks()[1].ReceiveInt(2)
-                                YT := pi.Prot.MpcObj.GetNetworks()[1].ReceiveCipherMatrix(cps, nrowsY, ncolsCipherY, 2)
-
-                                pi.Prot.MpcObj.GetNetworks()[2].SendInt(len(YTEnc), 2)
-                                pi.Prot.MpcObj.GetNetworks()[2].SendInt(len(YTEnc[0]), 2)
-                                pi.Prot.MpcObj.GetNetworks()[2].SendCipherMatrix(YTEnc, 2)
-
-                                // communication simul for HEFactory
-                                // YT = pi.Prot.MpcObj.GetNetworks()[pid].ReceiveCipherMatrix(cps, nrowsY, ncolsCipherY, 2)
                                 result := gwas.CPMatMult4(cps, YT, mat.DenseCopyOf(Y.T()), 6)
 
                                 resultDecrypt, _ := pi.Prot.MpcObj[1].Network.CollectiveDecryptMat(cps, result, 1)
                                 decryptedMatrix := make([][]float64, len(resultDecrypt))
                                 for d := 0; d < len(resultDecrypt); d++ {
                                         decryptedMatrix[d] = libspindle.DecodeFloatVector(cps, resultDecrypt[d])
-                                        //log.LLvl1("localResultDecode : ", decryptedMatrix[d][:2*allPidsNbrRows[otherPid]])
+                                        log.LLvl1("localResultDecode : ", decryptedMatrix[d][:2*allPidsNbrRows[1]])
                                 }
-
-                                _, _ = pi.Prot.MpcObj[2].Network.CollectiveDecryptMat(cps, nil, 2)
-                                
                                 return decryptedMatrix
+
                         }
                 }
-
         }
         return nil
 }

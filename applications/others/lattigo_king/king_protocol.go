@@ -73,6 +73,7 @@ func InitializeKingProtocol(pid int, configFolder string) (relativeProt *KingPro
 		}
 		// for now we use one example dataset, parties can read a subset of it
 		data = readData[ConfigKing.StartingIndex : ConfigKing.StartingIndex+ConfigKing.NumberOfRows]
+		log.LLvl1(len(data), len(data[0]))
 		for j := 0; j < ConfigKing.NumberOfRows; j++ {
 			data[j] = data[j][:ConfigKing.NumberOfColumns]
 		}
@@ -177,16 +178,16 @@ func (pi *KingProtocolInfo) KingProtocol() map[int][][]float64 {
 							}
 
 							// TODO REMOVE, JUST FOR L2-HEFACTORY COMMUNICATION
-							pi.Prot.MpcObj.GetNetworks().ResetNetworkLog()
-							timeStart := time.Now()
-							dummy := mat.NewDense(8192, 32, nil)
-							dummyEncrypted := cryptobasics.EncryptDense(cps, mat.DenseCopyOf(dummy))
-							pi.Prot.MpcObj.GetNetworks()[otherPid].SendInt(len(dummyEncrypted), otherPid)
-							pi.Prot.MpcObj.GetNetworks()[otherPid].SendInt(len(dummyEncrypted[0]), otherPid)
-							pi.Prot.MpcObj.GetNetworks()[otherPid].SendCipherMatrix(dummyEncrypted, otherPid)
-							log.LLvl1("Time to send all matrix: ", time.Since(timeStart))
-							pi.Prot.MpcObj.GetNetworks().PrintNetworkLog()
-							log.Fatal()
+							//pi.Prot.MpcObj.GetNetworks().ResetNetworkLog()
+							//timeStart := time.Now()
+							//dummy := mat.NewDense(8192, 32, nil)
+							//dummyEncrypted := cryptobasics.EncryptDense(cps, mat.DenseCopyOf(dummy))
+							//pi.Prot.MpcObj.GetNetworks()[otherPid].SendInt(len(dummyEncrypted), otherPid)
+							//pi.Prot.MpcObj.GetNetworks()[otherPid].SendInt(len(dummyEncrypted[0]), otherPid)
+							//pi.Prot.MpcObj.GetNetworks()[otherPid].SendCipherMatrix(dummyEncrypted, otherPid)
+							//log.LLvl1("Time to send all matrix: ", time.Since(timeStart))
+							//pi.Prot.MpcObj.GetNetworks().PrintNetworkLog()
+							//log.Fatal()
 
 							yrows, ycols := Y.Dims()
 							OneYTYTrows, OneYTYTcols := OneYTYT.Dims()
@@ -251,7 +252,7 @@ func (pi *KingProtocolInfo) KingProtocol() map[int][][]float64 {
 		}(i, v)
 	}
 
-	// auxiliary party helps for SMC computations
+	// auxiliary party helps for MPC computations
 	if pid == 0 {
 		for i, v := range pi.ComparisonMap {
 			//wg.Add(1)
@@ -460,6 +461,7 @@ func (pi *KingProtocolInfo) KingProtocol() map[int][][]float64 {
 				for d := 0; d < len(distanceDecrypt); d++ {
 					distanceDecode := libspindle.DecodeFloatVector(cps, distanceDecrypt[d])
 					decryptedMatrix[d] = distanceDecode[:allPidsNbrRows[pid]]
+					//log.LLvl1(decryptedMatrix[d])
 				}
 				comparisonResults[otherPid] = decryptedMatrix
 			}

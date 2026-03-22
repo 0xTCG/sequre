@@ -1,33 +1,40 @@
+from prg import _SECURE_KEY_U32S, seed_t
 from pickler import pickle, unpickle
 from internal.gc import sizeof
 
 from sequre.constants import (
     DATA_SHARING_PORT, COMMUNICATION_PORT, CP_IPS,
     NUMBER_OF_PARTIES, AF_UNIX_PREFIX,
-    NETWORK_DELAY_TIME, NETWORK_DELAY_THRESHOLD)
+    NETWORK_DELAY_TIME, NETWORK_DELAY_THRESHOLD,
+    USE_TLS)
 from sequre.types.utils import fp_to_double
 from sequre.network.socket import CSocket
 from sequre.network.connect import connect
-from sequre.network.common import close_socket, snd_jar, receive_jar
+from sequre.network.common import close_socket, snd_jar, receive_jar, generate_random_bytes
 
 from stats import MPCStats
 from randomness import MPCRandomness
 
 from C import usleep(int) -> int
+from C import memcpy(cobj, cobj, int)
 
 
 class MPCComms[TP]:
     pid: int
     hub_pid: int
     sockets: dict[int, CSocket]
+    dealer_buffers: dict[int, List[byte]]
     stats: MPCStats
     randomness: MPCRandomness
     number_of_parties: int
     local: bool
+    detach_dealer: bool
 
     delay_buffer_size: int
 
-    def __init__(self: MPCComms[TP], randomness: MPCRandomness, local: bool, expect_data_sharing: bool):
+    def __init__(
+            self: MPCComms[TP], randomness: MPCRandomness,
+            local: bool, expect_data_sharing: bool):
         self.pid = randomness.pid
         self.hub_pid = 1
         self.stats = randomness.stats
@@ -36,8 +43,11 @@ class MPCComms[TP]:
         self.number_of_parties = NUMBER_OF_PARTIES
         self.local = local
         self.delay_buffer_size = 0
+        self.detach_dealer = False
+        self.dealer_buffers = {k: List[byte]() for k in range(1, self.number_of_parties)}
 
         self.__setup_channels(expect_data_sharing)
+        self.__secure_seed_exchange()
         self.reset_stats()
 
     def send(self, data, to_pid: int):
@@ -51,11 +61,11 @@ class MPCComms[TP]:
         self.stats.bytes_sent += sizeof(int)
         jar = ptr[byte](sizeof(int))
         pickle(data._pickle_size(), jar, pasteurized=False)
-        snd_jar(self.sockets[to_pid].sock_fd, jar, sizeof(int))
+        self.flush(to_pid, jar, sizeof(int))
     
     def receive_jar_size(self, from_pid: int) -> int:
         self.stats.receive_requests += 1
-        return unpickle(receive_jar(self.sockets[from_pid].sock_fd, sizeof(int)), False, int)
+        return unpickle(receive_jar(self.sockets[from_pid].sock_fd, sizeof(int), self.sockets[from_pid].ssl), False, int)
     
     def send_as_jar(self, data, to_pid: int):
         self.stats.send_requests += 1
@@ -72,13 +82,33 @@ class MPCComms[TP]:
         jar = ptr[byte](pickle_size)
         pickle(data, jar, pasteurized=False)
 
-        snd_jar(self.sockets[to_pid].sock_fd, jar, pickle_size)
+        self.flush(to_pid, jar, pickle_size)
 
     def receive_as_jar[T](self, from_pid: int) -> T:
         self.stats.receive_requests += 1
         msg_len = self.receive_jar_size(from_pid)
-        received_jar = receive_jar(self.sockets[from_pid].sock_fd, msg_len)
+        received_jar = receive_jar(self.sockets[from_pid].sock_fd, msg_len, self.sockets[from_pid].ssl)
         return unpickle(received_jar, False, T)
+    
+    def flush(self, to_pid: int, jar, pickle_size):
+        if self.detach_dealer:
+            self.dealer_buffers[to_pid].extend(
+                List(Array(jar, pickle_size), pickle_size))
+        else:
+            snd_jar(self.sockets[to_pid].sock_fd, jar, pickle_size, self.sockets[to_pid].ssl)
+    
+    def flush_dealer_buffers(self):
+        assert not self.detach_dealer, "Cannot flush dealer buffers when detach_dealer is True."
+
+        if self.pid != 0:
+            return
+        
+        @par(num_threads=self.number_of_parties - 1)
+        for to_pid in range(1, self.number_of_parties):
+            jar = self.dealer_buffers[to_pid]
+            self.flush(to_pid, jar.arr.ptr, len(jar))
+        
+        self.dealer_buffers = {k: List[byte]() for k in range(1, self.number_of_parties)}
     
     def share_from(self, data, source_pid: int, modulus):
         from_dealer = source_pid == 0
@@ -113,6 +143,7 @@ class MPCComms[TP]:
         if self.pid == 0:
             return value
         
+        self.stats.rounds += 1
         if self.pid == 1:
             for i in range(2, self.number_of_parties):
                 value = value.add_mod(self.receive_as_jar(i, type(value)), modulus)
@@ -211,36 +242,38 @@ class MPCComms[TP]:
         else:
             return [(self.receive_as_jar(p, type(value)) if p != self.pid else value) for p in range(1, self.number_of_parties)]
 
-    def sync_parties(self: MPCComms[TP], lite: bool = True):
+    def sync_parties(self: MPCComms[TP], lite: bool = True, include_trusted_dealer: bool = True):
         with self.randomness.seed_switch(-1):
             control_elem = int.rand(1 << 62, "uniform")
         
+        start_pid = 0 if include_trusted_dealer else 1
+
         if lite:
-            if self.pid == 0:
-                for p in range(1, self.number_of_parties):
+            if self.pid == start_pid:
+                for p in range(start_pid + 1, self.number_of_parties):
                     from_p = self.receive_as_jar(p, T=type(control_elem))
                     assert from_p == control_elem, f"ERROR! CP{self.pid} <-/-> CP{p} out of sync."
-                
-                for p in range(1, self.number_of_parties):
+
+                for p in range(start_pid + 1, self.number_of_parties):
                     self.send_as_jar(control_elem, p)
             else:
-                self.send_as_jar(control_elem, 0)
-                return_elem = self.receive_as_jar(0, T=type(control_elem))
-                assert return_elem == control_elem, f"ERROR! CP{self.pid} <-/-> CP0 out of sync."
-        else:        
+                self.send_as_jar(control_elem, start_pid)
+                return_elem = self.receive_as_jar(start_pid, T=type(control_elem))
+                assert return_elem == control_elem, f"ERROR! CP{self.pid} <-/-> CP{start_pid} out of sync."
+        elif self.pid >= start_pid:        
             for p in range(self.number_of_parties - 1, self.pid, -1):
                 from_p = self.receive_as_jar(p, T=type(control_elem))
                 assert from_p == control_elem, f"ERROR! CP{self.pid} <-/-> CP{p} out of sync."
                 self.send_as_jar(control_elem, p)
             
-            for p in range(self.pid - 1, -1, -1):
+            for p in range(self.pid - 1, start_pid - 1, -1):
                 self.send_as_jar(control_elem, p)
                 from_p = self.receive_as_jar(p, T=type(control_elem))
                 assert from_p == control_elem, f"ERROR! CP{self.pid} <-/-> CP{p} out of sync."
     
     def clean_up(self: MPCComms[TP]):
         for socket in self.sockets.values():
-            close_socket(socket.sock_fd)
+            close_socket(socket.sock_fd, socket.ssl)
     
     def print_stats(self: MPCComms[TP], file_stream = None):
         self.stats.print_comms_stats(file_stream)
@@ -270,6 +303,8 @@ class MPCComms[TP]:
             self.send(1, self.pid + 1)
 
     def __setup_channels(self, expect_data_sharing):
+        assert self.local or len(CP_IPS) == NUMBER_OF_PARTIES, f"CP_IPS are invalid: len({CP_IPS}) != NUMBER_OF_PARTIES ({NUMBER_OF_PARTIES})"
+        
         # Sockets are spawned per corresponding party
         for pid in range(self.number_of_parties):
             if pid == self.pid:
@@ -286,6 +321,9 @@ class MPCComms[TP]:
             else:
                 ip_address = '0.0.0.0' if self.pid < pid else CP_IPS[pid]
                 self.sockets[pid] = CSocket(ip_address=ip_address, port=str(port))
+                # Initialize TLS context for INET sockets when enabled.
+                if USE_TLS:
+                    self.sockets[pid].init_ssl_ctx(self.pid, is_server=(self.pid < pid))
 
             if self.pid < pid:
                 self.sockets[pid].open_channel()
@@ -297,4 +335,43 @@ class MPCComms[TP]:
             assert not self.local, "Local data sharing not supported yet"
             # Data sharing host socket is at self.sockets[self.pid]
             self.sockets[self.pid] = CSocket(ip_address='0.0.0.0', port=str(DATA_SHARING_PORT + self.pid))
+            if USE_TLS:
+                self.sockets[self.pid].init_ssl_ctx(self.pid, is_server=True)
             self.sockets[self.pid].open_channel()
+
+    def __secure_seed_exchange(self):
+        # Exchange cryptographically random seeds over the [encrypted] channels.
+        # For each pair (i, j) with i < j, party i generates the seed and sends it to j.
+        # Both parties then init their shared PRG stream with that seed.
+        SEED_BYTES = _SECURE_KEY_U32S * 4  # Number of bytes needed for the secure PRG seed
+        
+        for other_pid in range(self.number_of_parties):
+            if other_pid == self.pid:
+                continue
+
+            if self.pid < other_pid:
+                seed_buf = generate_random_bytes(SEED_BYTES)
+                snd_jar(self.sockets[other_pid].sock_fd, seed_buf, SEED_BYTES, self.sockets[other_pid].ssl)
+            else:
+                seed_buf = receive_jar(self.sockets[other_pid].sock_fd, SEED_BYTES, self.sockets[other_pid].ssl)
+
+            seed = seed_t(0)
+            memcpy(__ptr__(seed).as_byte(), seed_buf, SEED_BYTES)
+            self.randomness.other_seeds[other_pid] = seed
+
+        # Also exchange a global seed from trusted dealer (CP0) for any global randomness needs (e.g., shuffling).
+        global_source = 0
+        if self.pid == global_source:
+            global_seed_buf = generate_random_bytes(SEED_BYTES)
+            for p in range(self.number_of_parties):
+                if p != self.pid:
+                    snd_jar(self.sockets[p].sock_fd, global_seed_buf, SEED_BYTES, self.sockets[p].ssl)
+        else:
+            global_seed_buf = receive_jar(self.sockets[global_source].sock_fd, SEED_BYTES, self.sockets[global_source].ssl)
+
+        global_seed = seed_t(0)
+        memcpy(__ptr__(global_seed).as_byte(), global_seed_buf, SEED_BYTES)
+        self.randomness.global_seed = global_seed
+
+        print(f'CP{self.pid}:\tSecure seed exchange complete.')
+        self.randomness.reset_streams()  # Reset all PRG streams with the newly exchanged seeds.
