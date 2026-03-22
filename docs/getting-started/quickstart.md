@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- **Linux** (x86_64) or **macOS** (Apple Silicon).
+- **Linux** (x86_64). macOS (Darwin) builds are currently disabled.
 
 ## 1. Install Codon
 

@@ -35,14 +35,14 @@ If auto-detection fails, install GMP and set the path to it to `SEQURE_GMP_PATH`
 sudo apt install libgmp-dev
 export SEQURE_GMP_PATH=/usr/lib/x86_64-linux-gnu/libgmp.so
 
-# macOS
-brew install gmp
-export SEQURE_GMP_PATH=/opt/homebrew/lib/libgmp.dylib
+# macOS (Darwin builds are currently disabled)
+# brew install gmp
+# export SEQURE_GMP_PATH=/opt/homebrew/lib/libgmp.dylib
 ```
 
 ### OpenSSL (libssl / libcrypto)
 
-The Sequre launcher auto-detects common OpenSSL paths on both Linux and macOS (Homebrew). If auto-detection fails, install OpenSSL and point to it manually:
+The Sequre launcher auto-detects common OpenSSL paths on Linux. If auto-detection fails, install OpenSSL and point to it manually:
 
 ```bash
 # Linux
@@ -50,10 +50,10 @@ sudo apt install libssl-dev
 export SEQURE_OPENSSL_PATH=/usr/lib/x86_64-linux-gnu/libssl.so.3
 export SEQURE_LIBCRYPTO_PATH=/usr/lib/x86_64-linux-gnu/libcrypto.so.3
 
-# macOS
-brew install openssl/
-export SEQURE_OPENSSL_PATH=/opt/homebrew/opt/openssl/lib/libssl.dylib
-export SEQURE_LIBCRYPTO_PATH=/opt/homebrew/opt/openssl/lib/libcrypto.dylib
+# macOS (Darwin builds are currently disabled)
+# brew install openssl
+# export SEQURE_OPENSSL_PATH=/opt/homebrew/opt/openssl/lib/libssl.dylib
+# export SEQURE_LIBCRYPTO_PATH=/opt/homebrew/opt/openssl/lib/libcrypto.dylib
 ```
 
 ### libpython (for `@python` interop)
@@ -66,8 +66,8 @@ In case of errors like `libpython3.x.so: cannot open shared object file`, set th
 # Linux
 export CODON_PYTHON=/usr/lib/x86_64-linux-gnu/libpython3.12.so
 
-# macOS (Homebrew)
-export CODON_PYTHON=$(python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")/libpython3.12.dylib
+# macOS (Darwin builds are currently disabled)
+# export CODON_PYTHON=$(python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")/libpython3.12.dylib
 ```
 
 !!! note
