@@ -29,7 +29,7 @@ def my_secure_function(mpc, x, y):
 !!! note
     Every function that operates on Sequre types (`Sharetensor`, `Ciphertensor`, `MPU`, etc.) should be annotated with `@sequre`.
 
-### `@mpc_poly_opt`
+<!-- ### `@mpc_poly_opt`
 
 Enables polynomial optimization for MPC operations. The compiler rewrites sequences of multiplications and additions into more efficient polynomial evaluation forms to minimize the number of Beaver-triple rounds.
 
@@ -47,7 +47,7 @@ Enables encoding-mode optimization. The compiler performs a brute-force search o
 
 ### `@debug`
 
-Enables debug instrumentation. The compiler inserts additional logging, assertions, and timing instrumentation into the annotated function.
+Enables debug instrumentation. The compiler inserts additional logging, assertions, and timing instrumentation into the annotated function. -->
 
 ---
 
@@ -99,8 +99,6 @@ These functions set up the MPC environment for distributed (non-local) execution
 | Function | Description |
 |---|---|
 | `mpc()` | Parse command-line args, create an `MPCEnv` for the current party, run MHE setup. Returns the initialized environment. |
-| `client(pid, foo, ...)` | Initialize `MPCEnv` for party `pid`, run `foo(mpc, ...)`, then call `mpc.done()`. |
-| `fork_parties(...)` | Recursively fork processes for all parties (used by `@local`). |
 
 ### Typical distributed entry point
 
@@ -121,7 +119,7 @@ from sequre.runtime import local
 def main(mpc):
     ...  # protocol logic
 
-main()  # forks N parties automatically
+main()  # forks N parties automatically --- no need to pass mpc instance
 ```
 
 ---
@@ -135,4 +133,4 @@ The Sequre compiler plugin processes `@sequre`-annotated functions through these
 | **ExpressivenessTransformations** | Rewrites standard operators on secure types to their secure equivalents |
 | **MPCOptimizations** | Optimizes polynomial evaluations and MPC-specific patterns |
 | **MHEOptimizations** | Optimizes HE expression ordering, encoding modes, and matrix strategies |
-| **Debugger** | Inserts debug instrumentation when `@debug` is active |
+<!-- | **Debugger** | Inserts debug instrumentation when `@debug` is active | -->

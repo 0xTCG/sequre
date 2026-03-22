@@ -1,10 +1,10 @@
 # Distributed Tensors (MPU)
 
-`MPU` (Multiparty Union) is Sequre/Shechi's highest-level abstraction for distributed secure computation. It lets you write code that looks like standard tensor arithmetic while the framework handles encryption, communication, and protocol selection.
+`MPU` (Multiparty Union) is Sequre/Shechi's highest-level abstraction for distributed secure computation. It enables writing code that looks like standard tensor arithmetic while the framework handles encryption, communication, and protocol selection.
 
 ## When to use MPU
 
-Use `MPU` when your data is **distributed across parties** — for example, multiple hospitals each hold patient records and want to jointly train a model without sharing raw data.
+When [large scale] data is **distributed across parties** — for example, multiple hospitals each hold patient records and want to jointly train a model without sharing raw data.
 
 ## Construction
 
@@ -64,23 +64,6 @@ Operations that require the full dataset transparently encrypt local data and ru
 
 - `.via_mpc(fn)` — convert to `Sharetensor`, apply a function via MPC, and convert back
 - `.enc()` — encrypt the plaintext share into a `Ciphertensor`
-
-## Practical example: DTI
-
-From `applications/dti.codon` — each party holds a horizontal slice of training data:
-
-```python
-@sequre
-def dti_mhe_protocol(mpc):
-    X_mpu = MPU(mpc, X_partition, "partition")
-    y_mpu = MPU(mpc, y_partition, "partition")
-
-    model = Sequential(...)
-    model.fit(mpc, X_mpu, y_mpu, epochs=100)
-    return model.predict(mpc, X_mpu)
-```
-
-The `Sequential` model handles the collective HE operations internally.
 
 ## Next steps
 

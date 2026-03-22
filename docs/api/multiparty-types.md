@@ -35,4 +35,4 @@ mask = mpu > 0.5
 
 ## See also
 
-- [SMC ↔ MHE Switching](../user-guide/switching.md) — How `via_mpc` enables switching between protocols mid-computation
+- [MPC ↔ MHE Switching](../user-guide/switching.md) — How `via_mpc` enables switching between protocols mid-computation

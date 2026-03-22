@@ -64,8 +64,8 @@ mpa = MPA(mpc, my_ciphertensor)
 | `a / b` | Division by scalar |
 | `a ** n` | Integer exponentiation |
 | `-a` | Negation |
-| `a > b` | Secure greater-than (uses [SMC switching](../user-guide/switching.md) internally) |
-| `a < b` | Secure less-than (uses [SMC switching](../user-guide/switching.md) internally) |
+| `a > b` | Secure greater-than (uses [MPC switching](../user-guide/switching.md) internally) |
+| `a < b` | Secure less-than (uses [MPC switching](../user-guide/switching.md) internally) |
 | `a[i]`, `a[i] = v` | Indexing and slicing |
 | `bool(a)` | Boolean conversion |
 | `len(a)` | Length of first dimension |
@@ -101,11 +101,11 @@ mpa = MPA(mpc, my_ciphertensor)
 
 | Method | Description |
 |---|---|
-| `.via_mpc(fn, *args)` | Execute function through the [SMC layer](../user-guide/switching.md) (converts to Sharetensor, runs fn, converts back) |
+| `.via_mpc(fn, *args)` | Execute function through the [MPC layer](../user-guide/switching.md) (converts to Sharetensor, runs fn, converts back) |
 | `.sign(*args)` | Secure sign function |
 
 !!! info
-    Comparisons (`>`, `<`) automatically use `via_mpc` under the hood. See the [SMC ↔ MHE Switching](../user-guide/switching.md) page.
+    Comparisons (`>`, `<`) automatically use `via_mpc` under the hood. See the [MPC ↔ MHE Switching](../user-guide/switching.md) page.
 
 ## Conversion and creation
 

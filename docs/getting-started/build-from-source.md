@@ -1,6 +1,6 @@
 # Build from Source
 
-This page describes how to compile Sequre and all its dependencies from source. Most users should use the [pre-built binaries](quickstart.md) instead.
+This page describes how to compile Sequre and all its dependencies from source.
 
 ---
 
@@ -27,32 +27,7 @@ Sequre is a Codon compiler plugin. Building it from source requires building the
 4. Sequre  (Codon plugin — secure computation)
 ```
 
-The automated script `scripts/install.sh` handles all four steps. You can also run each step manually.
-
----
-
-## Automated build
-
-From the Sequre repository root:
-
-```bash
-git clone https://github.com/0xTCG/sequre.git && cd sequre
-source scripts/install.sh
-```
-
-This clones and builds LLVM, Codon, Seq, and Sequre into sibling directories, then installs the Sequre plugin into the local Codon installation. The entire build takes a significant amount of time (primarily due to LLVM).
-
-If you already have some components built, set these environment variables **before** running the script to skip those steps:
-
-| Variable | Default | Description |
-|---|---|---|
-| `SEQURE_LLVM_PATH` | `./codon-llvm` | Path to LLVM build directory (skipped if `install/lib/cmake/llvm` exists inside) |
-| `SEQURE_CODON_PATH` | `./codon` | Path to Codon build directory (skipped if `install/` exists inside) |
-| `SEQURE_SEQ_PATH` | `./codon-seq` | Path to Seq build directory |
-
----
-
-## Manual build
+## Build instructions
 
 ### 1. Build LLVM
 
@@ -90,7 +65,7 @@ cmake --build build --config Release
 cmake --install build --prefix=$(pwd)/install
 ```
 
-Replace `<llvm-path>` with the absolute path to your LLVM build directory from step 1.
+Replace `<llvm-path>` with the absolute path to LLVM build directory from step 1.
 
 ### 3. Build the Seq plugin
 
@@ -158,7 +133,7 @@ Run the test suite to confirm everything works:
 <codon-path>/install/bin/codon run -plugin sequre scripts/invoke.codon run-tests --local --all
 ```
 
-Or if you have the `sequre` launcher installed:
+Or if `sequre` launcher is installed:
 
 ```bash
 sequre scripts/invoke.codon run-tests --local --all

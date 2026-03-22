@@ -45,7 +45,7 @@ Most applications distribute data across parties using `MPU(mpc, data, "partitio
 
 ### Protocol switching
 
-Applications like **GWAS** and **Genotype Imputation** use `via_mpc` to switch between MHE and SMC for operations like eigenvalue decomposition and matrix inverse.
+Applications like **GWAS** and **Genotype Imputation** use `via_mpc` to switch between MHE and MPC for operations like eigenvalue decomposition and matrix inverse.
 
 ### Secure ML pipeline
 

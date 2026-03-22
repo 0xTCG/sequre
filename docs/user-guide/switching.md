@@ -1,8 +1,8 @@
-# SMC ↔ MHE Protocol Switching
+# MPC ↔ MHE Protocol Switching
 
 _Defined across `stdlib/sequre/mpc/env.codon`, `stdlib/sequre/types/internal.codon`, and the multiparty type modules_
 
-One of Sequre/Shechi's key features is the ability to **switch between Secure Multiparty Computation (SMC) and Multiparty Homomorphic Encryption (MHE) mid-computation**. Some operations — comparisons, certain matrix multiplications, inverse, square root — are impractical or impossible in pure HE but straightforward in additive secret sharing. Conversely, many linear-algebra operations are more efficient in HE. Sequre lets you mix both within the same program.
+One of Sequre/Shechi's key features is the ability to **switch between Secure Multiparty Computation (MPC) and Multiparty Homomorphic Encryption (MHE) mid-computation**. Some operations — comparisons, certain matrix multiplications, inverse, square root — are impractical or impossible in pure HE but straightforward in additive secret sharing. Conversely, many linear-algebra operations are more efficient in HE.
 
 ## How it works
 
@@ -10,10 +10,10 @@ The switching mechanism is built on two low-level Lattiseq distributed protocols
 
 | Protocol | Direction | Description |
 |---|---|---|
-| **E2S** (Encryption-to-Shares) | MHE → SMC | Each party collectively decrypts a ciphertext into additive secret shares |
-| **S2E** (Shares-to-Encryption) | SMC → MHE | Each party re-encrypts its additive share; the ciphertexts are summed to produce a fresh collective ciphertext |
+| **E2S** (Encryption-to-Shares) | MHE → MPC | Each party collectively decrypts a ciphertext into additive secret shares |
+| **S2E** (Shares-to-Encryption) | MPC → MHE | Each party re-encrypts its additive share; the ciphertexts are summed to produce a fresh collective ciphertext |
 
-A single round-trip (E2S → compute in SMC → S2E) is what `via_mpc` performs under the hood. The cost of one switch is estimated as:
+A single round-trip (E2S → compute in MPC → S2E) is what `via_mpc` performs under the hood. The cost of one switch is estimated as:
 
 $$
 \text{switch\_cost} \approx \text{HE\_ENC\_COST} + \text{HE\_DEC\_COST} \;\;\text{per ciphertext}
@@ -27,16 +27,16 @@ Every multiparty type exposes `via_mpc` as the primary user-facing switching API
 
 ```python
 # On Ciphertensor
-result_ct = ct.via_mpc(mpc, lambda stensor: some_smc_function(mpc, stensor))
+result_ct = ct.via_mpc(mpc, lambda stensor: some_mpc_function(mpc, stensor))
 
 # On MPP
-result_mpp = mpp.via_mpc(lambda stensor: some_smc_function(mpc, stensor))
+result_mpp = mpp.via_mpc(lambda stensor: some_mpc_function(mpc, stensor))
 
 # On MPA
-result_mpa = mpa.via_mpc(lambda stensor: some_smc_function(mpc, stensor))
+result_mpa = mpa.via_mpc(lambda stensor: some_mpc_function(mpc, stensor))
 
 # On MPU
-result_mpu = mpu.via_mpc(lambda stensor: some_smc_function(mpc, stensor))
+result_mpu = mpu.via_mpc(lambda stensor: some_mpc_function(mpc, stensor))
 ```
 
 The flow inside `via_mpc` is:
@@ -54,12 +54,12 @@ The actual type conversions are implemented in `stdlib/sequre/types/internal.cod
 
 | Method | Direction | Description |
 |---|---|---|
-| `Ciphertensor.to_sharetensor(mpc, ...)` | MHE → SMC | Decrypt via E2S into additive shares |
-| `Sharetensor.to_ciphertensor(mpc)` | SMC → MHE | Re-encrypt via S2E into a collective ciphertext |
-| `MPP.to_sharetensor(mpc)` | MHE → SMC | Convert partitioned encryption to shares |
-| `Sharetensor.to_mpp(mpc, ratios)` | SMC → MHE | Convert shares to partitioned encryption |
-| `MPA.to_sharetensor(mpc)` | MHE → SMC | Convert aggregated encryption to shares |
-| `Sharetensor.to_mpa(mpc)` | SMC → MHE | Convert shares to aggregated encryption |
+| `Ciphertensor.to_sharetensor(mpc, ...)` | MHE → MPC | Decrypt via E2S into additive shares |
+| `Sharetensor.to_ciphertensor(mpc)` | MPC → MHE | Re-encrypt via S2E into a collective ciphertext |
+| `MPP.to_sharetensor(mpc)` | MHE → MPC | Convert partitioned encryption to shares |
+| `Sharetensor.to_mpp(mpc, ratios)` | MPC → MHE | Convert shares to partitioned encryption |
+| `MPA.to_sharetensor(mpc)` | MHE → MPC | Convert aggregated encryption to shares |
+| `Sharetensor.to_mpa(mpc)` | MPC → MHE | Convert shares to aggregated encryption |
 
 ## Automatic switching with `AllowMPCSwitch`
 
@@ -74,18 +74,18 @@ Inside the context, `mpc.default_allow_mpc_switch` is set to `True`. The cost es
 
 | Strategy | Label | Description |
 |---|---|---|
-| Via SMC | `Via SMC` | E2S → Beaver matmul → S2E |
+| Via MPC | `Via MPC` | E2S → Beaver matmul → S2E |
 | M1 | `M1` | Column-packed HE matmul |
 | M2 | `M2` | Row-packed HE matmul |
 | M3 | `M3` | Diagonal-packed HE matmul |
 
-The cheapest strategy wins. When `AllowMPCSwitch` is not active, the "Via SMC" cost is set to infinity and only pure-HE paths are considered.
+The cheapest strategy wins. When `AllowMPCSwitch` is not active, the "Via MPC" cost is set to infinity and only pure-HE paths are considered.
 
 !!! tip
     Enable `DEBUG` mode to see the cost breakdown printed at each matmul:
     ```
     CP1:  Matmul costs:
-          Via SMC: 12.34
+          Via MPC: 12.34
           M1: 45.67
           M2: 23.45
           M3: 89.01
@@ -97,7 +97,7 @@ Several built-in operations use `via_mpc` under the hood without requiring `Allo
 
 ### Comparisons
 
-MPP and MPA comparisons (`>`, `<`) always switch to SMC because HE does not natively support comparison:
+MPP and MPA comparisons (`>`, `<`) always switch to MPC because HE does not natively support comparison:
 
 ```python
 mask = mpp > 0.0   # internally: mpp.via_mpc(lambda s: secure_operator.gt(mpc, s, 0.0))
@@ -125,8 +125,8 @@ Higher-level Sequre stdlib routines that rely on switching:
 
 | Function | Location | Uses switching for |
 |---|---|---|
-| `inv(mpc, x)` | `stdlib/sequre/stdlib/builtin.codon` | Matrix inverse (iterative Newton method in SMC) |
-| `sqrt(mpc, x)` | `stdlib/sequre/stdlib/builtin.codon` | Square root (iterative approximation in SMC) |
+| Division | _(implicit)_ | Dividing two encrypted operands (iterative Newton method in MPC) |
+| `sqrt(mpc, x)` | `stdlib/sequre/stdlib/builtin.codon` | Square root (iterative Newton method in MPC) |
 | `orthonormalize` | `applications/gwas.codon` | Gram-Schmidt orthonormalization |
 | `eigen_decomp` | `stdlib/sequre/stdlib/pca.codon` | Eigenvalue decomposition |
 
@@ -138,7 +138,7 @@ The number of E2S/S2E round-trips is tracked by the statistics module:
 print(mpc.stats.secure_mhe_mpc_switch_count)  # number of switches so far
 ```
 
-Use `mpc.stats` or the `StatsLog` context manager to profile switching overhead in your application.
+Use `mpc.stats` or the `mpc.stats_log()` context manager to profile and log switching overhead.
 
 ## When to use switching
 
@@ -151,4 +151,4 @@ Use `mpc.stats` or the `StatsLog` context manager to profile switching overhead 
 | All operations are linear (add, mul, rotate) | Stay in pure MHE — no switching needed |
 
 !!! warning
-    Each switch incurs E2S + S2E communication rounds. For small tensors the overhead may outweigh the benefit. The cost estimator accounts for this, but when calling `via_mpc` manually, consider whether the operation truly requires SMC.
+    Each switch incurs E2S + S2E communication rounds. For small tensors the overhead may outweigh the benefit. The cost estimator accounts for this, but when calling `via_mpc` manually, consider whether the operation truly requires MPC.

@@ -21,7 +21,7 @@ _Defined in `stdlib/sequre/types/ciphertensor.codon`_
 | `_transposed` | `bool` | Whether the tensor is in transposed layout |
 | `_diagonal_contiguous` | `bool` | Whether data is stored in diagonal order |
 | `_skinny` | `bool` | Whether the matrix is "skinny" (rows >> cols) |
-| `_is_broadcast` | `bool` | Whether this tensor was produced by broadcasting |
+| `_is_broadcast` | `bool` | Whether this tensor was produced by broadcasting from all computing parties |
 
 ## Construction
 
@@ -45,7 +45,7 @@ ct = Ciphertensor.enc_row_wise(mpc, my_array, padding=16)
 | `Ciphertensor.enc(mpc, data, padding=0, encoding="")` | Encrypt and encode plaintext data into a ciphertensor |
 | `Ciphertensor.enc_row_wise(mpc, data, padding=0)` | Encrypt in row-wise encoding |
 | `Ciphertensor.enc_diag_wise(mpc, data, padding=0)` | Encrypt 2-D data in diagonal-contiguous encoding |
-| `Ciphertensor.enc_patch_copy(mpc, value, shape)` | Create ciphertensor with a scalar replicated across shape |
+| `Ciphertensor.enc_replicate(mpc, value, shape)` | Create ciphertensor with a scalar replicated across shape |
 | `Ciphertensor.enc_alpern(mpc, data)` | Encode 3-D arrays in Alpern order |
 | `Ciphertensor.zeros(mpc, shape)` | Zero-initialized ciphertensor with given shape |
 | `Ciphertensor.placeholder(shape, slots)` | Placeholder with uninitialized data |
@@ -124,7 +124,7 @@ These methods take `mpc` as the first argument and return a new ciphertensor:
 | `.reduce_add_tiled(mpc, tile_size)` | Tiled sum reduction for 1-D/2-D tensors |
 
 !!! note
-    `matmul` automatically selects between pure-MHE and [SMC ↔ MHE switching](../user-guide/switching.md) paths based on a cost estimator when `AllowMPCSwitch` is active.
+    `matmul` automatically selects between pure-MHE and [MPC ↔ MHE switching](../user-guide/switching.md) paths based on a cost estimator when `AllowMPCSwitch` is active.
 
 ## Encoding modes
 
@@ -150,7 +150,7 @@ The `@mhe_enc_opt` compiler pass selects the optimal encoding strategy per matri
 | `.append(other)` | Append rows to 2-D tensor |
 | `.pop()` | Remove last row |
 | `.filter(mask)` | Boolean mask filtering |
-| `.patch_copy(mpc, new_size)` | Extend 1-D tensor by recursive patch copying |
+| `.replicate(mpc, new_size)` | Extend 1-D tensor by recursive patch copying |
 | `.local_broadcast(mpc, target_shape)` | Broadcast to target shape locally |
 
 ## Encoding and layout
@@ -178,7 +178,7 @@ The `@mhe_enc_opt` compiler pass selects the optimal encoding strategy per matri
 | `.decrypt(mpc, source_pid=-2)` | Decrypt to plaintext |
 | `.decode(mpc)` | Decode plaintext tensor to `ndarray` |
 | `.reveal(mpc, source_pid=-2)` | Decrypt and decode in one step |
-| `.via_mpc(mpc, fn, *args)` | Execute a function through the [SMC layer](../user-guide/switching.md) (E2S → fn → S2E) |
+| `.via_mpc(mpc, fn, *args)` | Execute a function through the [MPC layer](../user-guide/switching.md) (E2S → fn → S2E) |
 
 ## Indexing and iteration
 

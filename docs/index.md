@@ -4,8 +4,8 @@
 
 **Sequre** is the superset framework. It provides:
 
-- **Additive secret sharing** for fast secure multiparty computation (SMC/MPC).
-- **Shechi**, the MHE sub-system that enables SMC via multiparty homomorphic encryption based on the CKKS scheme.
+- **Additive secret sharing** for fast secure multiparty computation (MPC).
+- **Shechi**, the MHE sub-system that enables MPC via multiparty homomorphic encryption based on the CKKS scheme.
 - A unified compiler plugin that automatically rewrites arithmetic on secure types into the correct cryptographic protocol calls.
 
 ## How Sequre and Shechi relate
@@ -20,11 +20,11 @@
 
 ## Architecture layers
 
-Sequre is deliberately multi-layered so you can operate at whatever depth your use case requires:
+Sequre is multi-layered to enable operating at different abstraction levels:
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  @sequre / @local decorators                        │  ← You write Pythonic code here
+│  @sequre / @local decorators                        │  ← Pythonic code
 │  Sharetensor  ·  MPU (multiparty_union)             │
 ├─────────────────────────────────────────────────────┤
 │  MPCEnv                                             │  ← Orchestrates MPC + MHE
@@ -66,7 +66,7 @@ Sequre ships with production-grade implementations of:
 
 ## Quick links
 
-- **[Quickstart →](getting-started/quickstart.md)** — Install and run your first secure computation in minutes.
-- **[Basic SMC Tutorial →](tutorials/basic-smc.md)** — Understand additive secret sharing with `Sharetensor`.
+- **[Quickstart →](getting-started/quickstart.md)** — Install and run Sequre in minutes.
+- **[Basic MPC Tutorial →](tutorials/basic-mpc.md)** — Understand additive secret sharing with `Sharetensor`.
 - **[Transitioning to MHE →](tutorials/transition-mhe.md)** — Move from secret sharing to homomorphic encryption with Shechi.
 - **[API Reference →](api/index.md)** — Complete reference for all public types and modules.

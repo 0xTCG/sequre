@@ -16,8 +16,8 @@ Sequre's behavior is controlled through compile-time constants and environment v
 | Variable | Default | Description |
 |---|---|---|
 | `SEQURE_GMP_PATH` | _(auto-detected)_ | Path to GMP shared library (`.so` on Linux, `.dylib` on macOS) |
-| `SEQURE_OPENSSL_PATH` | `libssl.so` | Path to OpenSSL `libssl` |
-| `SEQURE_LIBCRYPTO_PATH` | `libcrypto.so` | Path to OpenSSL `libcrypto` |
+| `SEQURE_OPENSSL_PATH` | _(auto-detected)_ | Path to OpenSSL `libssl` |
+| `SEQURE_LIBCRYPTO_PATH` | _(auto-detected)_ | Path to OpenSSL `libcrypto` |
 
 ### TLS certificates
 
@@ -32,7 +32,6 @@ Sequre's behavior is controlled through compile-time constants and environment v
 
 | Variable | Default | Description |
 |---|---|---|
-| `LOCAL` | _(none)_ | If set to any non-empty value, forces local (UNIX socket) mode |
 | `CODON_BIN` | _(none)_ | Override the path to the `codon` binary used by the launcher |
 
 ## Compile-time constants
@@ -57,6 +56,9 @@ _Defined in `stdlib/sequre/settings.codon` and `stdlib/sequre/constants.codon`_
 
 - **`MPC_FIELD_SIZE`**: Mersenne prime field $2^k - c$ where $k$ = `MPC_MODULUS_BITS`
 - **`MPC_RING_SIZE`**: Power-of-two ring $2^k$
+- **`MPC_NBIT_K`**: The total bit-width in fixed-point representation
+- **`MPC_NBIT_F`**: The fractional bit-width in fixed-point representation
+- **`MPC_NBIT_V`**: The statistical security padding for fixed-point representation (needed only in comparison protocols on finite fields)
 
 ### Lattiseq constants
 
@@ -71,7 +73,6 @@ _Defined in `stdlib/sequre/settings.codon` and `stdlib/sequre/constants.codon`_
 | Constant | Value | Description |
 |---|---|---|
 | `COMMUNICATION_PORT` | 9000 | Base port for inter-party communication |
-| `DATA_SHARING_PORT` | 9999 | Port for initial data sharing phase |
 
 ### Security toggles
 
@@ -86,10 +87,10 @@ _Defined in `stdlib/sequre/settings.codon` and `stdlib/sequre/constants.codon`_
 
 ## Run-script flags
 
-Pass these as CLI arguments after your `.codon` file:
+The list of `sequre` CLI arguments:
 
 | Flag | Description |
 |---|---|
-| `--skip-mhe-setup` | Skip MHE key generation (use when running MPC-only) |
+| `--skip-mhe-setup` | Skip MHE key generation (useful when running MPC-only) |
 | `--use-ring` | Use ring arithmetic ($\mathbb{Z}_{2^k}$) instead of field ($\mathbb{F}_p$) |
 | `-release` | Enable release mode (better performance, no backtrace) |

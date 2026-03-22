@@ -77,7 +77,7 @@ All standard arithmetic and comparison operators are supported. They dispatch to
 | `.level()` | Current HE noise-growth level |
 | `.sum(axis)` | Distributed sum reduction |
 | `.dot(axis)` | Distributed dot product |
-| `.via_mpc(fn, *args)` | Execute via [SMC layer](../user-guide/switching.md) |
+| `.via_mpc(fn, *args)` | Execute via [MPC layer](../user-guide/switching.md) |
 | `.sign(*args)` | Secure sign function |
 | `.expand_dims(axis=0)` | Insert dimension |
 | `.extend(other)` | Concatenate with compatible MPU |
@@ -100,4 +100,4 @@ All standard arithmetic and comparison operators are supported. They dispatch to
 
 - [MPP](mpp.md) — The partitioned representation used when `MPU` is constructed with `"partition"`
 - [MPA](mpa.md) — The aggregated representation used when `MPU` is constructed with `"additive"`
-- [SMC ↔ MHE Switching](../user-guide/switching.md) — How `via_mpc` works under the hood
+- [MPC ↔ MHE Switching](../user-guide/switching.md) — How `via_mpc` works under the hood

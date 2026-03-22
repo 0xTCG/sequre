@@ -18,7 +18,7 @@ sequre -release build my_protocol.codon -o my_protocol
 
 The `-release` flag must come **immediately after** `sequre` (before `run` or `build`).
 
-Use debug mode only when you need a backtrace to diagnose a crash. Switch to `-release` for benchmarks, production runs, and any performance-sensitive work.
+Use debug mode only when a backtrace diagnostics are needed. Switch to `-release` for benchmarks, production runs, and any performance-sensitive work.
 
 ---
 
@@ -58,9 +58,9 @@ export SEQURE_LIBCRYPTO_PATH=/opt/homebrew/opt/openssl/lib/libcrypto.dylib
 
 ### libpython (for `@python` interop)
 
-The `@python` decorator lets you call Python code from Sequre (see [Python interoperability](#python-interoperability) below). It requires `libpython` to be available at runtime.
+The `@python` decorator enables calling Python code from Sequre (see [Python interoperability](#python-interoperability) below). It requires `libpython` to be available at runtime.
 
-If you see errors like `libpython3.x.so: cannot open shared object file`, set the `CODON_PYTHON` environment variable:
+In case of errors like `libpython3.x.so: cannot open shared object file`, set the `CODON_PYTHON` environment variable:
 
 ```bash
 # Linux
@@ -71,13 +71,13 @@ export CODON_PYTHON=$(python3 -c "import sysconfig; print(sysconfig.get_config_v
 ```
 
 !!! note
-    `libpython` is **not required** unless your program uses the `@python` decorator. Most Sequre programs do not need it.
+    `libpython` is **not required** unless the program uses the `@python` decorator. Most Sequre programs do not need it.
 
 ---
 
 ## Python interoperability
 
-Sequre inherits Codon's `@python` decorator, which lets you run native Python code (including any pip-installed package) from within a compiled Sequre program. This is useful for data loading, visualization, or calling libraries that don't have a Codon equivalent.
+Sequre inherits Codon's `@python` decorator, which enables running native Python code (including any pip-installed package) from within a compiled Sequre program. This is useful for data loading, visualization, or calling libraries that don't have a Codon equivalent.
 
 ```python
 @python
@@ -94,8 +94,8 @@ def my_protocol(mpc):
 
 **Requirements:**
 
-- Set `CODON_PYTHON` to point to your Python shared library (see [above](#libpython-for-python-interop))
-- The `@python` function body runs in the system Python interpreter — any packages you import must be installed in that Python environment
+- Set `CODON_PYTHON` to point to the Python shared library (see [above](#libpython-for-python-interop))
+- The `@python` function body runs in the system Python interpreter — any used packages must be installed in that Python environment
 - Arguments and return values are automatically marshalled between Codon and Python types. Use standard types (`int`, `float`, `str`, `List`, `Dict`, `Tuple`) for the function signature
 
 For more details, see [Codon's Python interoperability docs](https://docs.exaloop.io/codon/interoperability/python).
@@ -106,7 +106,7 @@ For more details, see [Codon's Python interoperability docs](https://docs.exaloo
 
 ### Missing certificates
 
-If you see connection errors in distributed mode, ensure the certificate files exist:
+In case of connection errors in distributed mode, check if the certificate files exist:
 
 ```
 certs/
@@ -124,7 +124,7 @@ Generate test certificates with:
 ./scripts/generate_certs.sh 3 ./certs
 ```
 
-Override paths via environment variables if your certificates are elsewhere:
+Override paths via environment variables if needed:
 
 ```bash
 export SEQURE_CERT_DIR=/path/to/certs
@@ -164,7 +164,7 @@ export SEQURE_USE_TLS=0
 
 ### UNIX socket errors (local mode)
 
-Stale socket files (`sock.*`) from a previous crashed run can prevent new connections. The Sequre launcher cleans these up automatically on startup, but if you're running via `codon` directly:
+Stale socket files (`sock.*`) from a previous crashed run can prevent new connections. The Sequre launcher cleans these up automatically on startup, but if running via `codon` directly:
 
 ```bash
 rm -f sock.*
@@ -180,7 +180,7 @@ The `--use-ring` flag (ring modulus instead of field modulus) is currently unsta
 
 ## Plugin not found
 
-If you see `cannot find plugin 'sequre'`, ensure:
+In case of `cannot find plugin 'sequre'`, ensure:
 
 1. Sequre is installed in the Codon plugins directory: `$HOME/.codon/lib/codon/plugins/sequre/`
 2. The directory contains `plugin.toml`, `build/`, and `stdlib/`
@@ -189,3 +189,5 @@ If you see `cannot find plugin 'sequre'`, ensure:
 ```bash
 codon run -plugin sequre my_protocol.codon
 ```
+
+In case of `cannot find plugin 'seq'`, add the additional `-plugin seq` flag to the run or build command.
