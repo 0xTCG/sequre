@@ -55,5 +55,13 @@ cmake --install build --prefix=$HOME/.codon/lib/codon/plugins/sequre
 # Build sequre launcher binary
 $CC -O2 -o $HOME/.codon/bin/sequre $1/sequre_launcher.c
 
+# Bundle platform-appropriate GMP library
+SEQURE_PREFIX=$HOME/.codon/lib/codon/plugins/sequre
+mkdir -p $SEQURE_PREFIX/lib
+case "$(uname -s)" in
+  Darwin*) cp $1/external/GMP/lib/libgmp.dylib $SEQURE_PREFIX/lib/libgmp.dylib ;;
+  *)       cp $1/external/GMP/lib/libgmp.so     $SEQURE_PREFIX/lib/libgmp.so    ;;
+esac
+
 tar czvf sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz -C $HOME/.codon bin/sequre lib/codon/plugins/sequre lib/codon/plugins/seq
 echo "Done"

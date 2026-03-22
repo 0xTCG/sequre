@@ -38,6 +38,8 @@ git clone https://github.com/0xTCG/sequre.git && cd sequre
 sequre examples/local_run.codon
 ```
 
+> **Note:** The first compilation may take a few minutes — Sequre programs compile to native code. Set `CODON_DEBUG=lt` to see real-time compilation progress.
+
 Or compile to a binary:
 
 ```bash

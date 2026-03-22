@@ -16,6 +16,42 @@ static const char *detect_existing_path(const char *const *candidates) {
   return NULL;
 }
 
+static void ensure_default_gmp_env(void) {
+  const char *gmp = getenv("SEQURE_GMP_PATH");
+  if (gmp && *gmp) return;
+
+  /* Check bundled location under $HOME/.codon */
+  const char *home = getenv("HOME");
+  if (home && *home) {
+    char bundled[PATH_MAX];
+    snprintf(bundled, sizeof(bundled),
+             "%s/.codon/lib/codon/plugins/sequre/lib/libgmp.dylib", home);
+    if (access(bundled, R_OK) == 0) { setenv("SEQURE_GMP_PATH", bundled, 0); return; }
+    snprintf(bundled, sizeof(bundled),
+             "%s/.codon/lib/codon/plugins/sequre/lib/libgmp.so", home);
+    if (access(bundled, R_OK) == 0) { setenv("SEQURE_GMP_PATH", bundled, 0); return; }
+  }
+
+  static const char *const gmp_candidates[] = {
+      /* relative to CWD (source tree) */
+      "external/GMP/lib/libgmp.dylib",
+      "external/GMP/lib/libgmp.so",
+      /* macOS Homebrew */
+      "/opt/homebrew/lib/libgmp.dylib",
+      "/usr/local/lib/libgmp.dylib",
+      /* Linux system */
+      "/usr/lib/x86_64-linux-gnu/libgmp.so",
+      "/usr/lib/aarch64-linux-gnu/libgmp.so",
+      "/usr/lib64/libgmp.so",
+      "/usr/lib/libgmp.so",
+      NULL,
+  };
+  const char *detected = detect_existing_path(gmp_candidates);
+  if (detected) {
+    setenv("SEQURE_GMP_PATH", detected, 0);
+  }
+}
+
 static void ensure_default_ssl_env(void) {
   const char *crypto = getenv("SEQURE_LIBCRYPTO_PATH");
   if (!crypto || !*crypto) {
@@ -102,6 +138,7 @@ static void print_help(const char *codon) {
   printf("\n");
   printf("Environment variables:\n");
   printf("  CODON_BIN              Path to the codon executable\n");
+  printf("  SEQURE_GMP_PATH        Path to libgmp (auto-detected)\n");
   printf("  SEQURE_CP_IPS          Comma-separated party IP addresses\n");
   printf("  SEQURE_CERT_DIR        TLS certificate directory (default: certs)\n");
   printf("  SEQURE_CA_CERT_FILE    CA certificate file (default: ca.pem)\n");
@@ -120,6 +157,7 @@ static void print_help(const char *codon) {
 
 int main(int argc, char **argv) {
   cleanup_socks();
+  ensure_default_gmp_env();
   ensure_default_ssl_env();
 
   char *codon = default_codon_path();

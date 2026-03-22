@@ -26,13 +26,19 @@ Use debug mode only when you need a backtrace to diagnose a crash. Switch to `-r
 
 ### libgmp (GMP)
 
-GMP is **bundled** with Sequre at `external/GMP/lib/libgmp.so`. If you see errors about GMP not being found, set `SEQURE_GMP_PATH` to the absolute path of your GMP shared library:
+GMP is **bundled** with Sequre releases and auto-detected by the launcher. It checks bundled paths, the source tree (`external/GMP/lib/`), and common system locations.
+
+If auto-detection fails, install GMP and set the path to it to `SEQURE_GMP_PATH` env variable:
 
 ```bash
+# Linux
+sudo apt install libgmp-dev
 export SEQURE_GMP_PATH=/usr/lib/x86_64-linux-gnu/libgmp.so
-```
 
-On Debian/Ubuntu, install GMP with `sudo apt install libgmp-dev`. On macOS: `brew install gmp`.
+# macOS
+brew install gmp
+export SEQURE_GMP_PATH=/opt/homebrew/lib/libgmp.dylib
+```
 
 ### OpenSSL (libssl / libcrypto)
 
