@@ -34,11 +34,11 @@ export PATH=$HOME/.codon/bin:$PATH
 Run your first secure protocol:
 
 ```bash
-git clone https://github.com/0xTCG/sequre.git && cd sequre
+git clone --depth 1 https://github.com/0xTCG/sequre.git && cd sequre
 sequre examples/local_run.codon
 ```
 
-> **Note:** The first compilation may take a few minutes — Sequre programs compile to native code. Set `CODON_DEBUG=lt` to see real-time compilation progress.
+> **Note:** The first compilation may take a minute — Sequre programs compile to native code. The launcher shows compilation progress by default.
 
 Or compile to a binary:
 

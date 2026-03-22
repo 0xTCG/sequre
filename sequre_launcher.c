@@ -33,9 +33,6 @@ static void ensure_default_gmp_env(void) {
   }
 
   static const char *const gmp_candidates[] = {
-      /* relative to CWD (source tree) */
-      "external/GMP/lib/libgmp.dylib",
-      "external/GMP/lib/libgmp.so",
       /* macOS Homebrew */
       "/opt/homebrew/lib/libgmp.dylib",
       "/usr/local/lib/libgmp.dylib",
@@ -56,6 +53,12 @@ static void ensure_default_ssl_env(void) {
   const char *crypto = getenv("SEQURE_LIBCRYPTO_PATH");
   if (!crypto || !*crypto) {
     static const char *const crypto_candidates[] = {
+        /* macOS Homebrew */
+        "/opt/homebrew/opt/openssl/lib/libcrypto.dylib",
+        "/usr/local/opt/openssl/lib/libcrypto.dylib",
+        "/opt/homebrew/lib/libcrypto.dylib",
+        "/usr/local/lib/libcrypto.dylib",
+        /* Linux */
         "/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
         "/usr/lib/aarch64-linux-gnu/libcrypto.so.3",
         "/usr/lib64/libcrypto.so.3",
@@ -73,6 +76,12 @@ static void ensure_default_ssl_env(void) {
   const char *ssl = getenv("SEQURE_OPENSSL_PATH");
   if (!ssl || !*ssl) {
     static const char *const ssl_candidates[] = {
+        /* macOS Homebrew */
+        "/opt/homebrew/opt/openssl/lib/libssl.dylib",
+        "/usr/local/opt/openssl/lib/libssl.dylib",
+        "/opt/homebrew/lib/libssl.dylib",
+        "/usr/local/lib/libssl.dylib",
+        /* Linux */
         "/usr/lib/x86_64-linux-gnu/libssl.so.3",
         "/usr/lib/aarch64-linux-gnu/libssl.so.3",
         "/usr/lib64/libssl.so.3",
@@ -145,6 +154,7 @@ static void print_help(const char *codon) {
   printf("  SEQURE_USE_TLS         Set to 0 to disable TLS (insecure)\n");
   printf("  SEQURE_OPENSSL_PATH    Path to libssl.so\n");
   printf("  SEQURE_LIBCRYPTO_PATH  Path to libcrypto.so\n");
+  printf("  CODON_DEBUG            Compilation verbosity (default: lt). Unset to silence.\n");
   printf("\n");
   printf("Examples:\n");
   printf("  sequre run my_protocol.codon                     # @local program\n");
@@ -159,6 +169,7 @@ int main(int argc, char **argv) {
   cleanup_socks();
   ensure_default_gmp_env();
   ensure_default_ssl_env();
+  setenv("CODON_DEBUG", "lt", 0); /* show compilation progress by default */
 
   char *codon = default_codon_path();
   if (!codon) {
@@ -208,7 +219,9 @@ int main(int argc, char **argv) {
   args[k] = NULL;
 
   execvp(codon, args);
-  perror("execvp failed");
+  fprintf(stderr, "error: could not find codon at '%s'\n", codon);
+  fprintf(stderr, "Set CODON_BIN to the path of your codon executable, e.g.:\n");
+  fprintf(stderr, "  export CODON_BIN=/path/to/codon\n");
   free(args);
   free(codon);
   return 127;
