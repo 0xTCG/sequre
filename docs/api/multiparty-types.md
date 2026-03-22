@@ -31,7 +31,7 @@ mask = mpu > 0.5
 | Mode | Internal type | Best for |
 |---|---|---|
 | `"partition"` | MPP | Data naturally split by rows (e.g., each hospital holds patients) |
-| `"additive"` | MPA | Data that needs to be secret-shared across all parties |
+| `"additive"` | MPA | Data that needs to be additively split across parties |
 
 ## See also
 
