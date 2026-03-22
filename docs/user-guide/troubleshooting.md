@@ -10,13 +10,11 @@
 sequre run my_protocol.codon
 
 # Release mode — fast, production-ready
-sequre -release run my_protocol.codon
+sequre run -release my_protocol.codon
 
 # Building a release binary
-sequre -release build my_protocol.codon -o my_protocol
+sequre build -release my_protocol.codon -o my_protocol
 ```
-
-The `-release` flag must come **immediately after** `sequre` (before `run` or `build`).
 
 Use debug mode only when a backtrace diagnostics are needed. Switch to `-release` for benchmarks, production runs, and any performance-sensitive work.
 
