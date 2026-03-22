@@ -67,7 +67,7 @@ By default, `mpc()` and `@local` call `mpc.mhe.default_setup()` which:
 3. Runs collective relinearization key generation (RKG)
 4. Runs collective rotation key generation
 
-Skip this with `--skip-mhe-setup` if you only need MPC.
+Skip this with `--skip-mhe-setup` if only MPC is needed.
 
 ## Sub-modules
 
@@ -130,20 +130,20 @@ Tracks all operations automatically:
 | `partitions_count` | Beaver partitions performed |
 | `truncations_count` | Fixed-point truncations |
 | `secure_bootstrap_count` | HE bootstrapping operations |
-| `secure_mhe_mpc_switch_count` | SMC ↔ MHE protocol switches (via E2S/S2E) |
+| `secure_mhe_mpc_switch_count` | MPC ↔ MHE protocol switches (via E2S/S2E) |
 
 ## Context managers
 
 ### `AllowMPCSwitch`
 
-Enables automatic [SMC ↔ MHE switching](../user-guide/switching.md) for the duration of the block. Inside this context, operations like `Ciphertensor.matmul` may automatically convert to Sharetensor (via the E2S protocol), run the operation using Beaver-triple MPC, and convert back (via S2E) when a cost estimator determines this is cheaper than a pure-HE path.
+Enables automatic [MPC ↔ MHE switching](../user-guide/switching.md) for the duration of the block. Inside this context, operations like `Ciphertensor.matmul` may automatically convert to Sharetensor (via the E2S protocol), run the operation using Beaver-triple MPC, and convert back (via S2E) when a cost estimator determines this is cheaper than a pure-HE path.
 
 ```python
 with mpc.allow_mpc_switch():
     result = ct_a @ ct_b  # matmul may use MPC path if cheaper
 ```
 
-See the dedicated [SMC ↔ MHE Switching](../user-guide/switching.md) page for details.
+See the dedicated [MPC ↔ MHE Switching](../user-guide/switching.md) page for details.
 
 ### `ModulusSwitch`
 
@@ -151,4 +151,23 @@ Temporarily switch the working modulus (e.g., from field to ring).
 
 ### `StatsLog`
 
-Snapshot and report operation statistics for a code block.
+Log operation statistics (multiplications, communication rounds, bytes sent, etc.) for a code block. Resets counters on entry and prints a summary on exit.
+
+```python
+with mpc.stats_log("Training phase"):
+    model.fit(mpc, X=X, y=y, step=0.1, epochs=10, momentum=0.9)
+```
+
+Write stats to a file instead of (or in addition to) stdout:
+
+```python
+with mpc.stats_log("Inference", file_path="results/inference_stats.txt"):
+    prediction = model.predict(mpc, X)
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `msg` | `str` | `""` | Label printed alongside the stats summary |
+| `file_path` | `str` | `""` | If non-empty, write stats to this file |
+| `mode` | `str` | `"a+"` | File open mode |
+| `file_only` | `bool` | `False` | If `True`, only write to file (suppress stdout) |

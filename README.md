@@ -6,15 +6,15 @@
 
 Sequre is a statically compiled, Pythonic framework for building secure computation pipelines — combining secure multiparty computation (MPC), homomorphic encryption (HE), and multiparty homomorphic encryption (MHE) in a single, high-performance system.
 
-Write Python-like code; the Sequre compiler handles secret sharing, encrypted arithmetic, and inter-party communication automatically. Programs compile to native machine code via [Codon](https://github.com/exaloop/codon) with no runtime interpreter overhead.
+Write Python-like code; the Sequre compiler handles encrypted arithmetic and inter-party communication automatically. Programs compile to native machine code via [Codon](https://github.com/exaloop/codon) with no runtime interpreter overhead.
 
 ## Goals
 
 - 🐍 **Pythonic**: Write secure computation protocols in familiar Python syntax — no cryptographic boilerplate
 - 🚀 **Fast**: Compiled to native code; outperforms interpreter-based MPC frameworks by orders of magnitude
 - 🔀 **Unified**: MPC + HE + MHE in one framework — switch between schemes within a single protocol
-- 🧩 **Batteries included**: Built-in linear algebra, statistics, machine learning (linear/logistic regression, PCA, SVM), and GWAS pipelines
-- 🔒 **Secure by default**: Mutual TLS between parties, automatic key management, secret-shared arithmetic
+- 🧩 **Batteries included**: Built-in linear algebra, statistics, machine learning (linear/logistic regression, PCA, SVM, neural networks), and biomedical pipelines (GWAS, DTI, Metagenomic binning, Kinship estimation)
+- 🔒 **Secure by default**: Mutual TLS between parties, automatic key management, secured PRG streams
 
 ## Quick start
 
@@ -31,7 +31,7 @@ curl -L https://github.com/0xTCG/sequre/releases/latest/download/sequre-$(uname 
 export PATH=$HOME/.codon/bin:$PATH
 ```
 
-Run your first secure protocol:
+Run example:
 
 ```bash
 git clone --depth 1 https://github.com/0xTCG/sequre.git && cd sequre
@@ -47,11 +47,28 @@ sequre build examples/local_run.codon -o local_run
 ./local_run
 ```
 
+### Release vs debug mode
+
+> **Important:** Sequre compiles in **debug mode by default** (with backtraces). Always use `-release` for production and benchmarks — it is significantly faster.
+
+```bash
+# Debug mode (default) — slow, with full backtraces on failure
+sequre run my_protocol.codon
+
+# Release mode — fast, production-ready
+sequre run -release my_protocol.codon
+
+# Building a release binary
+sequre build -release my_protocol.codon -o my_protocol
+```
+
 ## Examples
 
 ### Local execution
 
-Use the `@local` decorator — Sequre forks one process per party on your machine, communicating via UNIX sockets:
+Use the `@local` decorator — Sequre forks one process per party, communicating via UNIX sockets:
+
+> **Note:** While each @sequre and @local function expects mpc as a first argument, no need to pass it to the invocation of the local function (see `mul_local` call in the example below). The compiler will do that automatically.
 
 `local_run.codon`:
 ```python
@@ -77,7 +94,7 @@ sequre local_run.codon
 
 ### Distributed execution
 
-Use `mpc()` — each party runs as a separate process on a separate machine:
+Unlike local calls, distributed execution requires manual instantiation of `mpc` enviromnent. Use `mpc()` call for this (see example below). Each party runs as a separate process on a separate machine:
 
 `online_run.codon`:
 ```python
@@ -100,7 +117,7 @@ print(f"CP{mpc.pid}:\t{muls(mpc, a, b, c).reveal(mpc)}")
 SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre online_run.codon <pid>
 ```
 
-Distributed mode requires mutual TLS certificates. Sequre handles MHE/MPC key management automatically, but **TLS certificates are your responsibility**. For development, generate test certificates with `scripts/generate_certs.sh`. For production, use your own CA — see [TLS configuration](https://0xTCG.github.io/sequre/user-guide/running-distributed/#tls-configuration) in the docs.
+Distributed mode requires mutual TLS certificates. Sequre handles MHE/MPC key management automatically, but **does not handle the TLS certificates creation/maintenance**. For testing, generate test certificates with `scripts/generate_certs.sh`. For production, use secure CA — see [TLS configuration](https://0xTCG.github.io/sequre/user-guide/running-distributed/#tls-configuration).
 
 ### Writing secure functions
 
@@ -118,32 +135,11 @@ def innerprod(mpc, a, b):
     return a.dot(mpc, b, axis=0)
 ```
 
-### Release vs debug mode
-
-> **Important:** Sequre compiles in **debug mode by default** (with backtraces). Always use `-release` for production and benchmarks — it is significantly faster.
-
-```bash
-# Debug mode (default) — slow, with full backtraces on failure
-sequre run my_protocol.codon
-
-# Release mode — fast, production-ready
-sequre -release run my_protocol.codon
-
-# Building a release binary
-sequre -release build my_protocol.codon -o my_protocol
-```
-
-The `-release` flag must come immediately after `sequre`, before `run` or `build`.
-
 ## Documentation
 
 Please see [0xTCG.github.io/sequre](https://0xTCG.github.io/sequre/) for in-depth documentation, including the [API reference](https://0xTCG.github.io/sequre/api/), [tutorials](https://0xTCG.github.io/sequre/tutorials/), and [network/TLS setup](https://0xTCG.github.io/sequre/user-guide/running-distributed/).
 
-Alternatively, you can [build from source](https://0xTCG.github.io/sequre/getting-started/build-from-source/).
-
 ## Citations
-
-If you use Sequre or Shechi in your research, please cite the relevant paper(s):
 
 - **Shechi** (USENIX Security 2025):  
   Smajlović H, Froelicher D, Shajii A, Berger B, Cho H, Numanagić I.  
@@ -154,11 +150,6 @@ If you use Sequre or Shechi in your research, please cite the relevant paper(s):
   Smajlović H, Shajii A, Berger B, Cho H, Numanagić I.  
   [Sequre: a high-performance framework for secure multiparty computation enables biomedical data sharing.](https://link.springer.com/article/10.1186/s13059-022-02841-5)  
   *Genome Biology*, 2023.
-
-- **Sequre** (IEEE ISBI 2022):  
-  Smajlović H, Shajii A, Berger B, Cho H, Numanagić I.  
-  [Sequre: a high-performance framework for rapid development of secure bioinformatics pipelines.](https://ieeexplore.ieee.org/document/9835664)  
-  *IEEE International Symposium on Biomedical Imaging*, 2022.
 
 ## Acknowledgements
 
@@ -171,4 +162,4 @@ This project was supported by:
 - 🇨🇦 Canada Foundation for Innovation
 - 🇨🇦 B.C. Knowledge Development Fund
 
-Built on [Codon](https://github.com/exaloop/codon) and a reimplementation of [Lattigo](https://github.com/tuneinsight/lattigo).
+Built via [Codon](https://github.com/exaloop/codon).

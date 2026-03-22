@@ -6,7 +6,7 @@ This page covers how to run Sequre protocols across multiple machines, including
 
 ## Command-line flags
 
-Run `sequre --help` (or pass `--help` to your compiled binary) to see all available flags.
+Run `sequre --help` to see all available flags.
 
 ### Runtime flags
 
@@ -15,7 +15,7 @@ These flags can be passed to any Sequre program (both `@local` and `mpc()` progr
 | Flag | Description |
 |---|---|
 | `--use-ring` | Use a power-of-two ring modulus instead of a prime field modulus. **Warning:** currently unstable — division and square root may produce incorrect results ~50% of the time due to a modulus-switching bug. |
-| `--skip-mhe-setup` | Skip the multiparty homomorphic encryption key-generation phase. Useful when your protocol only uses secret sharing (SMC) without any HE operations. |
+| `--skip-mhe-setup` | Skip the multiparty homomorphic encryption key-generation phase. Useful when the protocol only uses secret sharing (MPC) without any HE operations. |
 | `-h`, `--help` | Print usage information and exit. |
 
 The `--local` flag is **only** used by the built-in test runner (`scripts/invoke.codon`). For custom programs, use the `@local` decorator for local execution or the `mpc()` function for distributed execution — see [Execution modes](#execution-modes) below.
@@ -24,7 +24,7 @@ The `--local` flag is **only** used by the built-in test runner (`scripts/invoke
 # @local program with all defaults
 sequre run my_protocol.codon
 
-# @local program, skip MHE setup (SMC-only protocol)
+# @local program, skip MHE setup (MPC-only protocol)
 sequre run my_protocol.codon --skip-mhe-setup
 
 # Distributed run as party 1
@@ -136,7 +136,6 @@ _Defined in `stdlib/sequre/settings.codon`_
 
 | Setting | Default | Description |
 |---|---|---|
-| `DATA_SHARING_PORT` | `9999` | Port for initial data sharing |
 | `COMMUNICATION_PORT` | `9000` | Base port for inter-party communication. Subsequent connections use incrementing ports. |
 | `NETWORK_DELAY_TIME` | `0` | Simulated network delay in microseconds per `NETWORK_DELAY_THRESHOLD` bytes |
 | `NETWORK_DELAY_THRESHOLD` | `5000000` | Bytes threshold for delay simulation |
@@ -173,7 +172,7 @@ Sequre uses **mutual TLS** for all INET (TCP/IP) connections. Both parties in a 
 !!! warning "Development/testing only"
     The provided script generates a self-signed CA and party certificates for **local development and testing**. Do not use it as a production CA or enrollment workflow.
 
-    In production, provision certificates via your own PKI pipeline (enterprise PKI, HashiCorp Vault, cloud/private CA, etc.). Rotate party certificates regularly and keep CA private keys outside Sequre application hosts.
+    In production, provision certificates via dedicated PKI pipeline (enterprise PKI, HashiCorp Vault, cloud/private CA, etc.). Rotate party certificates regularly and keep CA private keys outside Sequre application hosts.
 
 Use the provided script to generate a CA and per-party certificates:
 
@@ -193,7 +192,7 @@ This creates:
 Set `SEQURE_USE_TLS=0` to disable TLS for INET channels. **This renders communication insecure** and should only be used for debugging.
 
 !!! warning
-    UNIX sockets (used in local mode) are always unencrypted. They rely on OS-level process isolation for security.
+    UNIX sockets (used in local mode) are always unencrypted.
 
 ---
 
@@ -236,4 +235,4 @@ connect(socket)  # retries automatically
 
 ## Debug mode
 
-Set `DEBUG = True` in `stdlib/sequre/settings.codon` (or recompile with the debug flag) to enable verbose logging of network operations, cost estimates, and protocol steps.
+Set `DEBUG = True` in `stdlib/sequre/settings.codon` to enable verbose logging of network operations, cost estimates, and protocol steps.

@@ -1,4 +1,4 @@
-# Basic SMC with Sequre
+# Basic MPC with Sequre
 
 This tutorial walks through writing secure multiparty computations using Sequre's additive secret sharing layer.
 

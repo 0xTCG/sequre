@@ -1,7 +1,5 @@
 # Quickstart
 
-Get Sequre running and execute your first secure computation.
-
 ## Prerequisites
 
 - **Linux** (x86_64) or **macOS** (Apple Silicon).
@@ -22,12 +20,12 @@ curl -L https://github.com/0xTCG/sequre/releases/latest/download/sequre-$(uname 
 ```
 
 This installs the `sequre` binary to `$HOME/.codon/bin/sequre` alongside the Sequre and Seq plugins.
-Add `$HOME/.codon/bin` to your `PATH` if you haven't already:
+Add binaries to `PATH`:
 ```bash
 export PATH=$HOME/.codon/bin:$PATH
 ```
 
-## 3. Run your first example
+## 3. Run first example
 
 ```bash
 sequre examples/local_run.codon
@@ -37,7 +35,7 @@ sequre examples/local_run.codon
     Sequre programs compile to native machine code, so the first run may take a few minutes. The launcher shows compilation progress by default.
     ```
 
-This forks three processes on your machine (a trusted dealer + two compute parties) and runs the `mult3` micro-benchmark from Hastings et al.
+This forks three processes (a trusted dealer + two compute parties) and runs the `mult3` micro-benchmark from Hastings et al.
 
 Expected output:
 ```
@@ -90,8 +88,23 @@ sequre build examples/local_run.codon -o local_run
 ./local_run
 ```
 
+## Release vs debug mode
+
+> **Important:** Sequre compiles in **debug mode by default** (with backtraces). Always use `-release` for production and benchmarks — it is significantly faster.
+
+```bash
+# Debug mode (default) — slow, with full backtraces on failure
+sequre run examples/local_run.codon
+
+# Release mode — fast, production-ready
+sequre run -release examples/local_run.codon
+
+# Building a release binary
+sequre build -release examples/local_run.codon -o local_run
+```
+
 ## Next steps
 
-- **[Basic SMC Tutorial](../tutorials/basic-smc.md)** — Deeper walkthrough of additive secret sharing and Sharetensor.
+- **[Basic MPC Tutorial](../tutorials/basic-mpc.md)** — Deeper walkthrough of additive secret sharing and Sharetensor.
 - **[Transitioning to MHE](../tutorials/transition-mhe.md)** — When and how to switch to homomorphic encryption with Shechi.
 - **[Configuration](../api/configuration.md)** — Environment variables for network, TLS, and parameter tuning.

@@ -196,3 +196,127 @@ Multiple imputation with Rubin's combining rules. `IM` is the imputation model t
 ### `MICE[IM, FM]`
 
 Multiple Imputation by Chained Equations — extends `MI` for datasets with multiple columns containing missing values. Iteratively imputes each column conditioned on the others.
+
+---
+
+## Neural networks — `Sequential[L]`
+
+_Defined in `stdlib/sequre/stdlib/learn/neural_net/model.codon`_
+
+A Keras-style sequential neural network supporting secure training with batch and mini-batch gradient descent and Nesterov momentum.
+
+### Construction
+
+```python
+from sequre.stdlib.learn.neural_net.model import Sequential
+from sequre.stdlib.learn.neural_net.layers import Input, Dense
+from sequre.types.multiparty_union import MPU
+
+layers = (
+    Input[MPU](16),
+    Dense[MPU]("relu", 32, "normal", "zeros"),
+    Dense[MPU]("linear", 1, "normal", "zeros"))
+
+model = Sequential(layers).compile(mpc, loss="hinge", optimizer="bgd")
+```
+
+### Methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `compile` | `compile(mpc, loss, optimizer, *args, **kwargs)` | Initialize layer weights and set loss/optimizer. Returns `self`. |
+| `fit` | `fit(mpc, X, y, step, epochs, momentum, batch_size=0, verbose=False)` | Train the model. `batch_size` is required when `optimizer="mbgd"`. |
+| `predict` | `predict(mpc, X)` | Forward pass; returns the output of the last layer. |
+| `get_loss` | `get_loss(mpc, X, y)` | Forward pass + loss computation. |
+
+### Optimizers
+
+| Optimizer | Description |
+|---|---|
+| `"bgd"` | Batch gradient descent: full-dataset gradient each epoch |
+| `"mbgd"` | Mini-batch gradient descent: splits data into batches of `batch_size` |
+
+### Layers
+
+_Defined in `stdlib/sequre/stdlib/learn/neural_net/layers.codon`_
+
+#### `Input[ctype]`
+
+The input layer. Holds no trainable parameters — simply passes through data.
+
+```python
+Input[type(X)](size)
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `size` | `int` | Number of input features |
+
+#### `Dense[ctype]`
+
+A fully-connected layer with configurable activation and weight initialization.
+
+```python
+Dense[type(X)](activation, size, kernel_initializer="uniform", bias_initializer="uniform")
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `activation` | `str` | — | Activation function: `"relu"` or `"linear"` |
+| `size` | `int` | — | Number of neurons |
+| `kernel_initializer` | `str` | `"uniform"` | Weight initializer: `"uniform"`, `"normal"`, `"zeros"`, or `"ones"` |
+| `bias_initializer` | `str` | `"uniform"` | Bias initializer (same options) |
+
+Weight updates use **Nesterov accelerated gradient** with the `momentum` parameter passed to `fit`.
+
+### Activations
+
+_Defined in `stdlib/sequre/stdlib/learn/neural_net/activations.codon`_
+
+| Activation | Function | Derivative |
+|---|---|---|
+| `"relu"` | $\text{ReLU}(x) = x \cdot \mathbf{1}[x > 0]$ | $\mathbf{1}[x > 0]$ |
+| `"linear"` | $f(x) = x$ | $1$ |
+
+### Losses
+
+_Defined in `stdlib/sequre/stdlib/learn/neural_net/loss.codon`_
+
+| Loss | Function | Derivative |
+|---|---|---|
+| `"hinge"` | $\frac{1}{n}\sum \max(0,\; 1 - y \hat{y})$ | $\frac{1}{n}(-y \cdot \mathbf{1}[1 - y\hat{y} > 0])$ |
+
+### Examples
+
+#### Credit score classification — [applications/credit_score.codon](https://github.com/0xTCG/sequre/blob/develop/applications/credit_score.codon)
+
+Binary credit-score prediction with a single hidden layer. Trains on secret-shared data, then evaluates accuracy/precision/recall/F1.
+
+```python
+from sequre.stdlib.learn.neural_net.layers import Input, Dense
+from sequre.stdlib.learn.neural_net.model import Sequential
+
+layers = (
+    Input[type(X)](X.shape[1]),
+    Dense[type(X)]("relu", 32, "normal", "zeros"),
+    Dense[type(X)]("linear", 1, "normal", "zeros"))
+
+model = Sequential(layers).compile(mpc, loss="hinge", optimizer="bgd")
+model.fit(mpc, X=X, y=y, epochs=epochs, step=step_size, momentum=momentum, verbose=verbose)
+
+prediction = model.predict(mpc, X)
+```
+
+#### Drug-target interaction — [applications/dti.codon](https://github.com/0xTCG/sequre/blob/develop/applications/dti.codon)
+
+DTI inference with a larger network (128 neurons) over 8192-dimensional feature vectors, using mini-batch gradient descent.
+
+```python
+layers = (
+    Input[type(X)](8192),
+    Dense[type(X)]("relu", 128, "normal", "zeros"),
+    Dense[type(X)]("linear", 1, "normal", "zeros"))
+
+model = Sequential(layers).compile(mpc, loss="hinge", optimizer="bgd")
+model.fit(mpc, X=X, y=y, step=0.2, epochs=50, momentum=0.9, batch_size=16)
+```

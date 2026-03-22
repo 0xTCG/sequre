@@ -1,10 +1,10 @@
 # Schemes and Protocols
 
-This page provides the mathematical details of the cryptographic schemes and protocols used in Sequre.
+This page provides [some of] the mathematical details of the cryptographic schemes and protocols used in Sequre.
 
 ## 1. Additive secret sharing
 
-Sequre's MPC path uses **additive secret sharing** over a finite ring $\mathbb{Z}_p$.
+Sequre's MPC uses **additive secret sharing** over a finite field or ring (if specified by user via `--use-ring` flag).
 
 ### Sharing
 
@@ -27,8 +27,8 @@ Multiplication requires **Beaver triples** $(a, b, c)$ where $c = a \cdot b \pmo
 
 To compute $\langle z \rangle = \langle x \rangle \cdot \langle y \rangle$:
 
-1. Each party computes and reveals $\epsilon_i = x_i - a_i$ and $\delta_i = y_i - b_i$
-2. Reconstruct $\epsilon = x - a$ and $\delta = y - b$
+1. Each party computes $\epsilon_i = x_i - a_i$ and $\delta_i = y_i - b_i$
+2. Reveal $\epsilon = x - a$ and $\delta = y - b$
 3. Each party computes: $z_i = c_i + \epsilon \cdot b_i + \delta \cdot a_i + [i = 1] \cdot \epsilon \cdot \delta$
 
 Cost: **one round of communication** per multiplication.
@@ -39,7 +39,7 @@ Sequre represents real numbers in fixed-point with $f$ fractional bits (`MPC_NBI
 
 $$\text{encode}(x) = \lfloor x \cdot 2^f \rceil \pmod{p}$$
 
-After multiplication, the result has $2f$ fractional bits and must be **truncated** back to $f$ bits.
+After multiplication, the result has $2f$ fractional bits and must be **truncated** back to $f$ bits. Sequre uses secure truncation protocol here.
 
 ## 2. CKKS scheme
 
@@ -80,7 +80,7 @@ $$m + e_{\text{noise}} = c_0 + c_1 \cdot s$$
 
 ### Noise budget
 
-Each ciphertext has $L+1$ moduli. After $L$ rescales, the ciphertext is at level 0 and cannot support further multiplications. The **bootstrap** (refresh) protocol restores levels.
+Each ciphertext has $L+1$ moduli. After $L$ rescales, the ciphertext is at level 0 and cannot support further multiplications. The **bootstrap** (refresh) protocol restores levels. Sequre/Shechi currently supports only collective bootstrapping.
 
 ## 3. Multiparty CKKS protocols
 

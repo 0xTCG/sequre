@@ -18,7 +18,7 @@ A matrix of shape `[m, n]` is chunked into `ceil(m * n / slots)` ciphertexts, ea
 
 ## Construction
 
-You typically don't construct `Ciphertensor` directly. It is created by:
+`Ciphertensor` is typically created by:
 
 1. **Factory method**: `Ciphertensor.enc(mpc, values)` encrypts a plaintext tensor into a `Ciphertensor`.
 2. **MPP/MPA internals**: When an `MPU` operation needs encryption, it creates `Ciphertensor` objects automatically.
@@ -57,7 +57,7 @@ For matrix operations, how values are packed into ciphertext slots matters for b
 | Column-wise | `ENC_COL` | One column per ciphertext |
 | Diagonal | `ENC_DIAG` | Diagonal packing for efficient matrix-vector products |
 
-The `@mhe_enc_opt` compiler pass selects the optimal encoding per matrix multiplication via brute-force search.
+<!-- The `@mhe_enc_opt` compiler pass selects the optimal encoding per matrix multiplication via brute-force search. -->
 
 ## Multiparty synergy
 

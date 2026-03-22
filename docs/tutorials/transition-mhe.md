@@ -4,13 +4,14 @@ This tutorial explains when and how to switch from Sequre's additive secret shar
 
 ## Why MHE?
 
-Additive secret sharing excels at linear operations (addition is free, multiplication costs one communication round). But for workloads heavy in:
+Additive secret sharing excels at linear operations on smaller data scale (addition is free, multiplication costs one communication round). But for workloads heavy in:
 
 - **Consecutive multiplications** — each requires a full network round
 - **Matrix multiplications** — communication scales with matrix dimensions
 - **Floating-point batched arithmetic** — fixed-point truncation adds overhead
+- **Large scale data** — MHE scales better than secret-sharing MPC
 
-MHE can be significantly faster because computations happen **locally on encrypted data** with communication only for:
+MHE can be significantly faster because computations happen **locally on data-parallel encrypted data** with communication only for:
 
 1. Collective key generation (one-time setup)
 2. Key-switching / relinearization (after multiplications)
@@ -43,7 +44,7 @@ result = ct_a * ct_b      # HE multiplication + relinearization
 
 ### `MPU` — multiparty union
 
-`MPU` is the highest-level abstraction. It lets you write code that looks like ordinary tensor arithmetic while the framework handles encryption, distribution, and collective operations:
+`MPU` is the highest-level abstraction. It allows writing code that looks like ordinary tensor arithmetic while the framework handles encryption, distribution, and collective operations:
 
 ```python
 from sequre.types.multiparty_union import MPU
@@ -81,15 +82,15 @@ This runs:
 3. **Collective relinearization key generation (RKG)** — joint key for post-multiplication cleanup
 4. **Collective rotation key generation** — joint Galois keys for slot rotations
 
-Skip this with `--skip-mhe-setup` if you only need MPC.
+Adding `--skip-mhe-setup` flag skips MHE setup. Useful when only MPC is needed.
 
-## Compiler optimizations for MHE
+<!-- ## Compiler optimizations for MHE
 
 Shechi includes compiler-level IR passes that optimize HE code automatically:
 
 ### `@mhe_cipher_opt` — expression reordering
 
-The compiler builds a Binary Expression Tree (BET) of your function's arithmetic, then:
+The compiler builds a Binary Expression Tree (BET) of the function's arithmetic, then:
 
 - Factorizes common subexpressions: `a*b + a*c` → `a*(b + c)` (saves one expensive HE multiply)
 - Reorders operations to minimize ciphertext-ciphertext multiplications
@@ -98,30 +99,7 @@ The compiler builds a Binary Expression Tree (BET) of your function's arithmetic
 
 For matrix multiplications, the compiler selects the optimal CKKS encoding strategy (row-wise, column-wise, or diagonal) via brute-force search over encoding candidates.
 
-Both passes are applied automatically to `@sequre`-annotated functions when the operands are Ciphertensor or MPU types.
-
-## Example: DTI with MHE
-
-The Drug-Target Interaction application shows both backends side by side:
-
-```python
-# MPC version — uses Sharetensor
-@sequre
-def dti_mpc_protocol(mpc, X, y):
-    weights = Stensor.enc(mpc, initial_weights)
-    for epoch in range(epochs):
-        pred = X @ weights          # Beaver matmul
-        grad = X.T @ (pred - y)     # Beaver matmul
-        weights = weights - lr * grad
-    return weights
-
-# MHE version — uses MPU
-@sequre
-def dti_mhe_protocol(mpc, X_mpu, y_mpu):
-    model = Sequential(...)
-    model.fit(mpc, X_mpu, y_mpu, epochs=100)
-    return model.predict(mpc, X_mpu)
-```
+Both passes are applied automatically to `@sequre`-annotated functions when the operands are Ciphertensor or MPU types. -->
 
 ## When to use which
 

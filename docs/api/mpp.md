@@ -75,8 +75,8 @@ mpp = MPP(mpc, local_ciphertensor)
 | `a / b` | Division by scalar |
 | `a ** n` | Integer exponentiation |
 | `-a` | Negation |
-| `a > b` | Secure greater-than (uses [SMC switching](../user-guide/switching.md) internally) |
-| `a < b` | Secure less-than (uses [SMC switching](../user-guide/switching.md) internally) |
+| `a > b` | Secure greater-than (uses [MPC switching](../user-guide/switching.md) internally) |
+| `a < b` | Secure less-than (uses [MPC switching](../user-guide/switching.md) internally) |
 | `a[i]`, `a[i] = v` | Indexing and slicing |
 | `bool(a)` | Non-empty check |
 | `len(a)` | Length of first dimension |
@@ -119,7 +119,7 @@ mpp = MPP(mpc, local_ciphertensor)
 | `.cohort_filter(mask)` | Filter across cohort with adjusted ratios |
 | `.hstack(other)` | Horizontal concatenation |
 | `.local_broadcast(target_shape)` | Broadcast single element to shape |
-| `.patch_copy(new_size)` | Copy with size expansion |
+| `.replicate(new_size)` | Copy with size expansion |
 | `.actual_transpose()` | Materialize actual transpose (vs. lazy `.T`) |
 | `.actual_itranspose()` | In-place actual transpose |
 | `.getitem_local(index)` | Local indexing on plaintext data |
@@ -130,11 +130,11 @@ mpp = MPP(mpc, local_ciphertensor)
 
 | Method | Description |
 |---|---|
-| `.via_mpc(fn, *args)` | Execute function through the [SMC layer](../user-guide/switching.md) (converts to Sharetensor, runs fn, converts back) |
+| `.via_mpc(fn, *args)` | Execute function through the [MPC layer](../user-guide/switching.md) (converts to Sharetensor, runs fn, converts back) |
 | `.sign(*args)` | Secure sign function |
 
 !!! info
-    Comparisons (`>`, `<`) and certain `matmul` cases automatically use `via_mpc` under the hood. See the [SMC ↔ MHE Switching](../user-guide/switching.md) page.
+    Comparisons (`>`, `<`) and certain `matmul` cases automatically use `via_mpc` under the hood. See the [MPC ↔ MHE Switching](../user-guide/switching.md) page.
 
 ## Conversion and creation
 

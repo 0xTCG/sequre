@@ -4,7 +4,7 @@
 #
 # WARNING:
 #   This script is not intended for production certificate lifecycle management.
-#   In production, provision ca.pem / cpN.pem / cpN-key.pem via your own PKI pipeline.
+#   In production, provision ca.pem / cpN.pem / cpN-key.pem via private PKI pipeline.
 #
 # Usage: ./scripts/generate_certs.sh [num_parties] [output_dir]
 #   num_parties: Total number of computing parties including trusted dealer (default: 3)

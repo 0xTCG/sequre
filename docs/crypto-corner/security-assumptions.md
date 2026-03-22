@@ -9,23 +9,16 @@ This page documents the threat model and cryptographic hardness assumptions that
 Sequre assumes all parties follow the protocol correctly but may try to learn additional information from the messages they observe. This is the standard **semi-honest** model.
 
 - **No malicious behavior**: Parties do not send forged messages, deviate from the protocol, or abort strategically.
-- **No collusion beyond threshold**: For $N$ compute parties, security holds as long as no single party can reconstruct the full secret. In the additive secret-sharing setting, all $N$ parties must collude to break privacy.
+- **No collusion beyond threshold**: For $N$ compute parties, security holds as long as no single party can reconstruct the full secret. In Sequre's additive secret-sharing setting, all $N$ parties must collude to break privacy.
 
 ### Trusted dealer (CP0)
 
 Party 0 (CP0) acts as a **trusted dealer** during the offline phase:
 
 - Generates and distributes **Beaver triples** (correlated randomness) for MPC multiplication
-- Generates shared PRNG seeds for common reference polynomials
 - Does **not** participate in online computation (holds zero shares / zero secret-key polynomial)
 
 In production deployments, the trusted dealer can be replaced by an MPC preprocessing protocol or a hardware enclave.
-
-### Network assumptions
-
-- **Authenticated channels**: All communication is assumed to be authenticated (no man-in-the-middle).
-- **Synchronous rounds**: The protocols assume synchronous communication — all parties complete each round before the next begins.
-- **Star topology**: Parties communicate through a hub (typically the trusted dealer or a designated CP).
 
 ## Hardness assumptions
 
@@ -70,7 +63,7 @@ CKKS is an **approximate** HE scheme — decrypted values have bounded error:
 
 $$|\hat{m}_i - m_i| \leq \frac{\|e\|_\infty}{\Delta}$$
 
-where $\Delta$ is the encoding scale. Sequre manages scale and level tracking automatically, but users should be aware that:
+where $\Delta$ is the encoding scale. Sequre/Shechi manages scale and level tracking automatically, but users should be aware that:
 
 - Each multiplication roughly doubles the error
 - Rescaling removes one level but restores the scale
@@ -81,7 +74,7 @@ where $\Delta$ is the encoding scale. Sequre manages scale and level tracking au
 | Workload | Recommended | Levels | Why |
 |---|---|---|---|
 | Light (few multiplications) | `PN12QP109` | 2 | Fastest, smallest keys |
-| Medium | `PN14QP438` | 10 | Good balance (Sequre default) |
+| Medium | `PN14QP438` | 10 | Good balance (Sequre/Shechi default) |
 | Heavy (deep circuits) | `PN15QP880` | 18 | More levels before bootstrap |
 | Very heavy | `PN16QP1761` | 34 | Maximum depth |
 

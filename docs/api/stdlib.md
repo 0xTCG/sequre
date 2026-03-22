@@ -29,7 +29,7 @@ _Defined in `stdlib/sequre/stdlib/builtin.codon`_
 | `inv` | `inv(mpc, x)` | Secure matrix inverse (up to 3×3; uses closed-form determinant formulas) |
 
 !!! note
-    For multiparty types (`MPU`, `MPP`, `MPA`), `inv` automatically switches to SMC via `via_mpc`.
+    For multiparty types (`MPU`, `MPP`, `MPA`), `inv` automatically switches to MPC via `via_mpc`.
 
 ### Chebyshev approximations
 

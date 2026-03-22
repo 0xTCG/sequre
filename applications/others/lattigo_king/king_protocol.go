@@ -252,7 +252,7 @@ func (pi *KingProtocolInfo) KingProtocol() map[int][][]float64 {
 		}(i, v)
 	}
 
-	// auxiliary party helps for SMC computations
+	// auxiliary party helps for MPC computations
 	if pid == 0 {
 		for i, v := range pi.ComparisonMap {
 			//wg.Add(1)

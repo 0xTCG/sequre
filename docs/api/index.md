@@ -30,7 +30,7 @@ This section provides detailed reference documentation for every public type and
 | Module | Description |
 |---|---|
 | [Secure Stdlib](stdlib.md) | Built-in secure functions: sign, abs, inv, sqrt, Chebyshev approximations, linear algebra, bit protocols |
-| [Secure ML](learn.md) | Machine learning: linear/logistic regression, SVM, PCA, multiple imputation |
+| [Secure ML](learn.md) | Machine learning: linear/logistic regression, SVM, PCA, multiple imputation, neural networks |
 
 ## Infrastructure
 
