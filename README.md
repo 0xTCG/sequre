@@ -18,7 +18,7 @@ Write Python-like code; the Sequre compiler handles secret sharing, encrypted ar
 
 ## Quick start
 
-**Supported platforms:** Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon).
+**Supported platforms:** Linux (x86_64) and macOS (Apple Silicon).
 
 Install [Codon](https://github.com/exaloop/codon), then install Sequre:
 
@@ -26,7 +26,7 @@ Install [Codon](https://github.com/exaloop/codon), then install Sequre:
 mkdir -p $HOME/.codon && \
   curl -L https://github.com/exaloop/codon/releases/download/v0.17.0/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon --strip-components=1
 
-curl -L https://github.com/0xTCG/sequre/releases/download/v0.0.20-alpha/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon
+curl -L https://github.com/0xTCG/sequre/releases/latest/download/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon
 
 export PATH=$HOME/.codon/bin:$PATH
 ```

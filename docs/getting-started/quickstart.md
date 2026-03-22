@@ -4,7 +4,7 @@ Get Sequre running and execute your first secure computation.
 
 ## Prerequisites
 
-- **Linux** (x86_64 or aarch64) or **macOS** (x86_64 or Apple Silicon).
+- **Linux** (x86_64) or **macOS** (Apple Silicon).
 
 ## 1. Install Codon
 
@@ -17,7 +17,7 @@ curl -L https://github.com/exaloop/codon/releases/download/v0.17.0/codon-$(uname
 ## 2. Install the Sequre plugin
 
 ```bash
-curl -L https://github.com/0xTCG/sequre/releases/download/v0.0.20-alpha/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz \
+curl -L https://github.com/0xTCG/sequre/releases/latest/download/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz \
   | tar zxvf - -C $HOME/.codon
 ```
 
