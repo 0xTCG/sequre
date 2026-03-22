@@ -18,7 +18,7 @@ Write Python-like code; the Sequre compiler handles encrypted arithmetic and int
 
 ## Quick start
 
-**Supported platforms:** Linux (x86_64) and macOS (Apple Silicon).
+**Supported platforms:** Linux (x86_64). macOS (Darwin) builds are currently disabled.
 
 Install [Codon](https://github.com/exaloop/codon), then install Sequre:
 
