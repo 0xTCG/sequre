@@ -33,6 +33,12 @@ export PATH=$HOME/.codon/bin:$PATH
 sequre examples/local_run.codon
 ```
 
+!!! info "Compilation takes a moment"
+    Sequre programs compile to native machine code, so the first run may take a few minutes. To track compilation progress in real time, set `CODON_DEBUG=lt`:
+    ```bash
+    CODON_DEBUG=lt sequre examples/local_run.codon
+    ```
+
 This forks three processes on your machine (a trusted dealer + two compute parties) and runs the `mult3` micro-benchmark from Hastings et al.
 
 Expected output:
