@@ -33,7 +33,9 @@ _Defined in `stdlib/sequre/stdlib/builtin.codon`_
 
 ### Chebyshev approximations
 
-These functions approximate non-linear operations using Chebyshev polynomial interpolation. They require an `interval` parameter specifying the expected input range.
+Non-linear/transcendental functions (exp, log, sigmoid, …) cannot be computed directly on secret-shared or encrypted data. Sequre approximates them via **Chebyshev polynomial interpolation**: the input is scaled to $[-1, 1]$, a degree-$n$ Chebyshev expansion is evaluated using the [Clenshaw recurrence](https://en.wikipedia.org/wiki/Clenshaw_algorithm), and the result is returned as a secret-shared tensor.
+
+Every Chebyshev function requires an **interval** — the expected range of the plaintext input.
 
 | Function | Signature | Approximates |
 |---|---|---|
@@ -44,7 +46,7 @@ These functions approximate non-linear operations using Chebyshev polynomial int
 | `chebyshev_sqrt` | `chebyshev_sqrt(mpc, x, interval)` | $\sqrt{x}$ |
 | `chebyshev_sqrt_inv` | `chebyshev_sqrt_inv(mpc, x, interval)` | $\frac{1}{\sqrt{x}}$ |
 
-The `interval` is a `tuple[float, float]` specifying the domain. The degree of the Chebyshev polynomial is set by the `CHEBYSHEV_DEGREE` constant.
+The polynomial degree is controlled by the `CHEBYSHEV_DEGREE` constant (default: **20**).
 
 ```python
 from sequre.stdlib.builtin import chebyshev_sigmoid, clip
