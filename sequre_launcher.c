@@ -7,96 +7,6 @@
 #include <string.h>
 #include <unistd.h>
 
-static const char *detect_existing_path(const char *const *candidates) {
-  for (int i = 0; candidates[i] != NULL; i++) {
-    if (access(candidates[i], R_OK) == 0) {
-      return candidates[i];
-    }
-  }
-  return NULL;
-}
-
-static void ensure_default_gmp_env(void) {
-  const char *gmp = getenv("SEQURE_GMP_PATH");
-  if (gmp && *gmp) return;
-
-  /* Check bundled location under $HOME/.codon */
-  const char *home = getenv("HOME");
-  if (home && *home) {
-    char bundled[PATH_MAX];
-    snprintf(bundled, sizeof(bundled),
-             "%s/.codon/lib/codon/plugins/sequre/lib/libgmp.dylib", home);
-    if (access(bundled, R_OK) == 0) { setenv("SEQURE_GMP_PATH", bundled, 0); return; }
-    snprintf(bundled, sizeof(bundled),
-             "%s/.codon/lib/codon/plugins/sequre/lib/libgmp.so", home);
-    if (access(bundled, R_OK) == 0) { setenv("SEQURE_GMP_PATH", bundled, 0); return; }
-  }
-
-  static const char *const gmp_candidates[] = {
-      /* macOS Homebrew */
-      "/opt/homebrew/lib/libgmp.dylib",
-      "/usr/local/lib/libgmp.dylib",
-      /* Linux system */
-      "/usr/lib/x86_64-linux-gnu/libgmp.so",
-      "/usr/lib/aarch64-linux-gnu/libgmp.so",
-      "/usr/lib64/libgmp.so",
-      "/usr/lib/libgmp.so",
-      NULL,
-  };
-  const char *detected = detect_existing_path(gmp_candidates);
-  if (detected) {
-    setenv("SEQURE_GMP_PATH", detected, 0);
-  }
-}
-
-static void ensure_default_ssl_env(void) {
-  const char *crypto = getenv("SEQURE_LIBCRYPTO_PATH");
-  if (!crypto || !*crypto) {
-    static const char *const crypto_candidates[] = {
-        /* macOS Homebrew */
-        "/opt/homebrew/opt/openssl/lib/libcrypto.dylib",
-        "/usr/local/opt/openssl/lib/libcrypto.dylib",
-        "/opt/homebrew/lib/libcrypto.dylib",
-        "/usr/local/lib/libcrypto.dylib",
-        /* Linux */
-        "/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
-        "/usr/lib/aarch64-linux-gnu/libcrypto.so.3",
-        "/usr/lib64/libcrypto.so.3",
-        "/usr/lib/libcrypto.so.3",
-        "/lib/x86_64-linux-gnu/libcrypto.so.3",
-        "/lib/aarch64-linux-gnu/libcrypto.so.3",
-        "/lib64/libcrypto.so.3",
-        "/lib/libcrypto.so.3",
-        NULL,
-    };
-    const char *detected = detect_existing_path(crypto_candidates);
-    setenv("SEQURE_LIBCRYPTO_PATH", detected ? detected : "libcrypto.so", 0);
-  }
-
-  const char *ssl = getenv("SEQURE_OPENSSL_PATH");
-  if (!ssl || !*ssl) {
-    static const char *const ssl_candidates[] = {
-        /* macOS Homebrew */
-        "/opt/homebrew/opt/openssl/lib/libssl.dylib",
-        "/usr/local/opt/openssl/lib/libssl.dylib",
-        "/opt/homebrew/lib/libssl.dylib",
-        "/usr/local/lib/libssl.dylib",
-        /* Linux */
-        "/usr/lib/x86_64-linux-gnu/libssl.so.3",
-        "/usr/lib/aarch64-linux-gnu/libssl.so.3",
-        "/usr/lib64/libssl.so.3",
-        "/usr/lib/libssl.so.3",
-        "/lib/x86_64-linux-gnu/libssl.so.3",
-        "/lib/aarch64-linux-gnu/libssl.so.3",
-        "/lib64/libssl.so.3",
-        "/lib/libssl.so.3",
-        NULL,
-    };
-    const char *detected = detect_existing_path(ssl_candidates);
-    setenv("SEQURE_OPENSSL_PATH", detected ? detected : "libssl.so", 0);
-  }
-}
-
 static void cleanup_socks(void) {
   glob_t g;
   if (glob("sock.*", 0, NULL, &g) == 0) {
@@ -147,13 +57,13 @@ static void print_help(const char *codon) {
   printf("\n");
   printf("Environment variables:\n");
   printf("  CODON_BIN              Path to the codon executable\n");
-  printf("  SEQURE_GMP_PATH        Path to libgmp (auto-detected)\n");
+  printf("  SEQURE_GMP_PATH        Override auto-detected libgmp path\n");
   printf("  SEQURE_CP_IPS          Comma-separated party IP addresses\n");
   printf("  SEQURE_CERT_DIR        TLS certificate directory (default: certs)\n");
   printf("  SEQURE_CA_CERT_FILE    CA certificate file (default: ca.pem)\n");
   printf("  SEQURE_USE_TLS         Set to 0 to disable TLS (insecure)\n");
-  printf("  SEQURE_OPENSSL_PATH    Path to libssl.so\n");
-  printf("  SEQURE_LIBCRYPTO_PATH  Path to libcrypto.so\n");
+  printf("  SEQURE_OPENSSL_PATH    Override auto-detected libssl path\n");
+  printf("  SEQURE_LIBCRYPTO_PATH  Override auto-detected libcrypto path\n");
   printf("  CODON_DEBUG            Compilation verbosity (default: lt). Unset to silence.\n");
   printf("\n");
   printf("Examples:\n");
@@ -167,8 +77,6 @@ static void print_help(const char *codon) {
 
 int main(int argc, char **argv) {
   cleanup_socks();
-  ensure_default_gmp_env();
-  ensure_default_ssl_env();
   setenv("CODON_DEBUG", "lt", 0); /* show compilation progress by default */
 
   char *codon = default_codon_path();
