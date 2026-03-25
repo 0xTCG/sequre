@@ -90,6 +90,8 @@ def mul_local(mpc, a: int, b: int, c: int):
 mul_local(7, 13, 19)
 ```
 
+> **Note:** When working with many local runs, the socket files (`sock.*`)---needed for local communication---may collude in-between the runs and cause connection issues. Make sure to delete the stale files in that case `rm sock.*`.
+
 ```bash
 sequre local_run.codon
 ```
@@ -111,7 +113,9 @@ mpc = mpc()
 a = Stensor.enc(mpc, 7)
 b = Stensor.enc(mpc, 13)
 c = Stensor.enc(mpc, 19)
+
 print(f"CP{mpc.pid}:\t{muls(mpc, a, b, c).reveal(mpc)}")
+mpc.done()  # Wait for all parties to finish and then close the sockets
 ```
 
 ```bash

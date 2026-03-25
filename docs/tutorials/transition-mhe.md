@@ -113,6 +113,8 @@ Both passes are applied automatically to `@sequre`-annotated functions when the 
 
 ## Next steps
 
+- **[One Algorithm, Many Secure Types](one-algorithm-many-secure-types.md)** — Validate and debug the same protocol across plaintext and secure representations.
+- **[Dropping Down the Stack](dropping-down-the-stack.md)** — Learn when to stay high-level and when to descend into MHE/Lattiseq internals.
 - **[Distributed Tensors (MPU)](../user-guide/distributed-tensors.md)** — Deep dive into MPU semantics.
 - **[Ciphertensor API](../api/ciphertensor.md)** — Complete reference.
 - **[Core MHE module](../deep-dive-shechi/core-mhe.md)** — Internals of the collective protocols.

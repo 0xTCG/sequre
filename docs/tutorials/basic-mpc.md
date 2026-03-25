@@ -121,6 +121,7 @@ These are more expensive than arithmetic but fully supported.
 
 ## Next steps
 
+- **[Secure Branching Without if](secure-branching-without-if.md)** — Build private min/max and branch bypass logic safely.
 - **[Transitioning to MHE](transition-mhe.md)** — When to prefer homomorphic encryption over secret sharing.
 - **[Sharetensor API](../api/sharetensor.md)** — Complete reference.
 - **[MPCEnv API](../api/mpcenv.md)** — Sub-modules and methods.
