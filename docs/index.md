@@ -24,7 +24,7 @@ Sequre is multi-layered to enable operating at different abstraction levels:
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  @sequre / @local decorators                        │  ← Pythonic code
+│  @sequre / @local / @online / @main decorators         │  ← Pythonic code
 │  Sharetensor  ·  MPU (multiparty_union)             │
 ├─────────────────────────────────────────────────────┤
 │  MPCEnv                                             │  ← Orchestrates MPC + MHE

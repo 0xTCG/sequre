@@ -66,56 +66,85 @@ sequre build -release my_protocol.codon -o my_protocol
 
 ## Examples
 
-### Local execution
+The [examples/](examples/) directory contains self-contained programs that demonstrate realistic secure-computation workflows. Each generates its own synthetic data, runs locally, and prints results — no external datasets or configuration files needed. For full production pipelines, see [applications/](applications/). For correctness and performance coverage, see [tests/](tests/).
 
-Use the `@local` decorator — Sequre forks one process per party, communicating via UNIX sockets:
+| Example | File | Domain | What it shows |
+|---|---|---|---|
+| Local execution | `examples/local_run.codon` | Intro | `@local` decorator — forks parties on one machine |
+| Online execution | `examples/online_run.codon` | Intro | `@online` decorator — wraps `mpc()` lifecycle |
+| Online (controlled) | `examples/online_run_controlled.codon` | Intro | `mpc()` manual setup for distributed runs |
+| Main (CLI-controlled) | `examples/main_run.codon` | Intro | `@main` decorator — local with `--local` flag, online otherwise |
+| Hastings benchmarks | `examples/hastings.codon` | Benchmarks | `mult3`, `innerprod`, `xtabs` micro-benchmarks with `@main` |
+| Credit scoring | `examples/credit_scoring.codon` | Finance | Secure neural-network classification with `MPU` partitioning |
+| Genetic kinship | `examples/genetic_kinship.codon` | Genomics | Pairwise kinship estimation on MHE-encrypted genotype data |
+| Linear regression | `examples/linear_regression.codon` | Healthcare | Multi-hospital model training with `MPU` and `LinReg` |
+| One algorithm, many types | `examples/one_algorithm_many_types.codon` | End-to-end | Same pairwise `l2` on `ndarray`, `Sharetensor`, and `MPU` |
 
-> **Note:** While each @sequre and @local function expects mpc as a first argument, no need to pass it to the invocation of the local function (see `mul_local` call in the example below). The compiler will do that automatically.
+Run any example locally:
+
+```bash
+sequre examples/local_run.codon
+sequre examples/hastings.codon --local
+sequre examples/credit_scoring.codon --local
+sequre examples/genetic_kinship.codon --local
+sequre examples/linear_regression.codon --local
+sequre examples/one_algorithm_many_types.codon --local
+```
+
+### Execution modes
+
+Sequre provides three runtime decorators for different execution scenarios, plus a manual `mpc()` function for full control:
+
+| Decorator | When to use |
+|---|---|
+| `@local` | All parties forked on **one machine** — ideal for development and testing |
+| `@online` | Each party is a **separate process/machine** — production distributed runs |
+| `@main` | **CLI-controlled**: runs locally when `--local` flag is passed, otherwise runs online |
+
+All three inject an `mpc` context as the first argument — no need to pass it at the call site.
+
+### Local execution (`@local`)
+
+Forks one process per party, communicating via UNIX sockets:
 
 `local_run.codon`:
 ```python
-from sequre import sequre, local, Sharetensor as Stensor
-
-@sequre
-def muls(mpc, a, b, c):
-    return a * b + b * c + a * c
+from sequre import local, Sharetensor as Stensor
 
 @local
-def mul_local(mpc, a: int, b: int, c: int):
-    a_enc = Stensor.enc(mpc, a)
-    b_enc = Stensor.enc(mpc, b)
-    c_enc = Stensor.enc(mpc, c)
-    print(f"CP{mpc.pid}:\t{muls(mpc, a_enc, b_enc, c_enc).reveal(mpc)}")
+def mul3_local(mpc, a: int, b: int, c: int):
+    a_stensor = Stensor.enc(mpc, a)
+    b_stensor = Stensor.enc(mpc, b)
+    c_stensor = Stensor.enc(mpc, c)
+    mul3 = a_stensor * b_stensor + b_stensor * c_stensor + a_stensor * c_stensor
+    print(f"CP{mpc.pid}:\tmul3: {mul3.reveal(mpc)}")
 
-mul_local(7, 13, 19)
+mul3_local(7, 13, 19)
+```
+
+```bash
+sequre examples/local_run.codon
 ```
 
 > **Note:** When working with many local runs, the socket files (`sock.*`)---needed for local communication---may collude in-between the runs and cause connection issues. Make sure to delete the stale files in that case `rm sock.*`.
 
-```bash
-sequre local_run.codon
-```
+### Online execution (`@online`)
 
-### Distributed execution
-
-Unlike local calls, distributed execution requires manual instantiation of `mpc` enviromnent. Use `mpc()` call for this (see example below). Each party runs as a separate process on a separate machine:
+Wraps the `mpc()` lifecycle in a decorator — each party runs as a separate process:
 
 `online_run.codon`:
 ```python
-from sequre import mpc, sequre, Sharetensor as Stensor
+from sequre import online, Sharetensor as Stensor
 
-@sequre
-def muls(mpc, a, b, c):
-    return a * b + b * c + a * c
+@online
+def mul3_online(mpc, a: int, b: int, c: int):
+    a_stensor = Stensor.enc(mpc, a)
+    b_stensor = Stensor.enc(mpc, b)
+    c_stensor = Stensor.enc(mpc, c)
+    mul3 = a_stensor * b_stensor + b_stensor * c_stensor + a_stensor * c_stensor
+    print(f"CP{mpc.pid}:\tmul3: {mul3.reveal(mpc)}")
 
-mpc = mpc()
-
-a = Stensor.enc(mpc, 7)
-b = Stensor.enc(mpc, 13)
-c = Stensor.enc(mpc, 19)
-
-print(f"CP{mpc.pid}:\t{muls(mpc, a, b, c).reveal(mpc)}")
-mpc.done()  # Wait for all parties to finish and then close the sockets
+mul3_online(7, 13, 19)
 ```
 
 ```bash
@@ -123,7 +152,36 @@ mpc.done()  # Wait for all parties to finish and then close the sockets
 SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre online_run.codon <pid>
 ```
 
-Distributed mode requires mutual TLS certificates. Sequre handles MHE/MPC key management automatically, but **does not handle the TLS certificates creation/maintenance**. For testing, generate test certificates with `scripts/generate_certs.sh`. For production, use secure CA — see [TLS configuration](https://0xTCG.github.io/sequre/user-guide/running-distributed/#tls-configuration).
+For full manual control without a decorator, use `mpc()` directly (see `online_run_controlled.codon`).
+
+### Main execution (`@main`)
+
+Lets the user control the execution mode via CLI: runs locally when `--local` is passed, otherwise runs online. Best for programs that should work in both modes:
+
+`main_run.codon`:
+```python
+from sequre import main, Sharetensor as Stensor
+
+@main
+def mul3_main(mpc, a: int, b: int, c: int):
+    a_stensor = Stensor.enc(mpc, a)
+    b_stensor = Stensor.enc(mpc, b)
+    c_stensor = Stensor.enc(mpc, c)
+    mul3 = a_stensor * b_stensor + b_stensor * c_stensor + a_stensor * c_stensor
+    print(f"CP{mpc.pid}:\tmul3: {mul3.reveal(mpc)}")
+
+mul3_main(7, 13, 19)  # Runs locally if --local flag is passed, otherwise runs online
+```
+
+```bash
+# Local:
+sequre examples/main_run.codon --local
+
+# Online (on each machine):
+SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre examples/main_run.codon <pid>
+```
+
+Distributed mode (online and main without `--local`) requires mutual TLS certificates. Sequre handles MHE/MPC key management automatically, but **does not handle the TLS certificates creation/maintenance**. For testing, generate test certificates with `scripts/generate_certs.sh`. For production, use secure CA — see [TLS configuration](https://0xTCG.github.io/sequre/user-guide/running-distributed/#tls-configuration).
 
 ### Writing secure functions
 
