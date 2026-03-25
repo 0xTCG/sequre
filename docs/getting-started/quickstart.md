@@ -75,6 +75,9 @@ Key concepts:
 3. **`mult3(mpc, a, b, c)`** — A function annotated with `@sequre` (in `hastings.codon`). The compiler plugin automatically rewrites `a * b`, `b * c`, etc. into Beaver-triple secure multiplications.
 4. **`.reveal(mpc)`** — Reconstructs the secret by combining shares from all parties.
 
+!!! tip "Execution modes"
+    `@local` is one of three runtime decorators. Use `@online` for distributed runs, or `@main` to let the user control the mode via CLI (`--local` for local, online otherwise). See [Running Distributed](../user-guide/running-distributed.md#execution-modes) for details.
+
 ## Run vs. build
 
 The launcher supports both Codon execution modes:

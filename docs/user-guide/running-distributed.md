@@ -18,7 +18,7 @@ These flags can be passed to any Sequre program (both `@local` and `mpc()` progr
 | `--skip-mhe-setup` | Skip the multiparty homomorphic encryption key-generation phase. Useful when the protocol only uses secret sharing (MPC) without any HE operations. |
 | `-h`, `--help` | Print usage information and exit. |
 
-The `--local` flag is **only** used by the built-in test runner (`scripts/invoke.codon`). For custom programs, use the `@local` decorator for local execution or the `mpc()` function for distributed execution — see [Execution modes](#execution-modes) below.
+The `--local` flag selects local execution in programs that use the `@main` decorator. It is also used by the built-in test runner (`scripts/invoke.codon`). For programs that hard-code their mode, use `@local` for local execution, `@online` for distributed execution, or `mpc()` for manual control — see [Execution modes](#execution-modes) below.
 
 ```bash
 # @local program with all defaults
@@ -88,6 +88,15 @@ sequre run scripts/invoke.codon run-benchmarks --local --king
 
 ## Execution modes
 
+Sequre provides three runtime decorators plus a manual `mpc()` function:
+
+| Mode | Decorator / Function | Description |
+|---|---|---|
+| Local | `@local` | Forks parties on one machine (UNIX sockets) |
+| Online | `@online` | Each party is a separate process/machine (TCP/TLS) |
+| CLI-controlled | `@main` | Local if `--local` is passed, otherwise online |
+| Manual | `mpc()` | Full manual control over the MPC environment |
+
 ### Local mode (`@local`)
 
 All parties run as forked processes on a single machine, communicating via UNIX sockets. Ideal for development and testing.
@@ -103,9 +112,52 @@ def my_protocol(mpc):
 my_protocol()
 ```
 
-### Distributed mode (`mpc()`)
+### Online mode (`@online`)
 
-Each party runs as a separate process on a separate machine, communicating via TCP/IP with mutual TLS.
+Wraps the `mpc()` lifecycle in a decorator. Each party runs as a separate process on a separate machine, communicating via TCP/IP with mutual TLS.
+
+```python
+from sequre.runtime import online
+
+@online
+def my_protocol(mpc):
+    # mpc.pid is parsed from sys.argv
+    ...
+
+my_protocol()
+```
+
+Run each party on its machine:
+
+```bash
+SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre my_protocol.codon <pid>
+```
+
+### CLI-controlled mode (`@main`)
+
+Lets the user control the execution mode via CLI. Runs locally when `--local` is passed, otherwise runs online. Best for programs that should work in both local and distributed modes.
+
+```python
+from sequre.runtime import main
+
+@main
+def my_protocol(mpc):
+    ...
+
+my_protocol()
+```
+
+```bash
+# Local:
+sequre my_protocol.codon --local
+
+# Online (on each machine):
+SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre my_protocol.codon <pid>
+```
+
+### Manual mode (`mpc()`)
+
+For full control over the MPC environment lifecycle — useful when you need custom setup or teardown logic.
 
 ```python
 from sequre.runtime import mpc as init_mpc

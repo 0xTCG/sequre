@@ -24,7 +24,7 @@ Sequre is multi-layered to enable operating at different abstraction levels:
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  @sequre / @local decorators                        │  ← Pythonic code
+│  @sequre / @local / @online / @main decorators         │  ← Pythonic code
 │  Sharetensor  ·  MPU (multiparty_union)             │
 ├─────────────────────────────────────────────────────┤
 │  MPCEnv                                             │  ← Orchestrates MPC + MHE
@@ -68,5 +68,8 @@ Sequre ships with production-grade implementations of:
 
 - **[Quickstart →](getting-started/quickstart.md)** — Install and run Sequre in minutes.
 - **[Basic MPC Tutorial →](tutorials/basic-mpc.md)** — Understand additive secret sharing with `Sharetensor`.
+- **[Secure Branching Without if →](tutorials/secure-branching-without-if.md)** — Learn mask-based selection patterns for private control flow.
+- **[One Algorithm, Many Secure Types →](tutorials/one-algorithm-many-secure-types.md)** — Reuse the same algorithm across ndarray, Sharetensor, and multiparty encrypted types.
 - **[Transitioning to MHE →](tutorials/transition-mhe.md)** — Move from secret sharing to homomorphic encryption with Shechi.
+- **[Dropping Down the Stack →](tutorials/dropping-down-the-stack.md)** — Start high-level, then descend through switching, MHE internals, and Lattiseq.
 - **[API Reference →](api/index.md)** — Complete reference for all public types and modules.

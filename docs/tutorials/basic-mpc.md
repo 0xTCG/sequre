@@ -45,22 +45,85 @@ def private_dot(mpc, x, y):
 
 
 @local
-def main(mpc):
+def run_local(mpc):
     x = Stensor.enc(mpc, [1, 2, 3, 4, 5])
     y = Stensor.enc(mpc, [5, 4, 3, 2, 1])
     result = private_dot(mpc, x, y)
     print(f"CP{mpc.pid}: dot product = {result.reveal(mpc)}")
 
 
-main()
+run_local()
 ```
 
 Run:
 ```bash
-./bin/sequre script.codon
+sequre script.codon
 ```
 
-### Online mode (across machines)
+### Online mode (`@online`)
+
+The `@online` decorator wraps the `mpc()` lifecycle — each party runs as a separate process:
+
+```python
+from sequre import online, sequre, Sharetensor as Stensor
+
+
+@sequre
+def private_dot(mpc, x, y):
+    return x.dot(mpc, y, axis=0)
+
+
+@online
+def run_online(mpc):
+    x = Stensor.enc(mpc, [1, 2, 3, 4, 5])
+    y = Stensor.enc(mpc, [5, 4, 3, 2, 1])
+    result = private_dot(mpc, x, y)
+    print(f"CP{mpc.pid}: dot product = {result.reveal(mpc)}")
+
+
+run_online()
+```
+
+Run at each party:
+```bash
+SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre script.codon <pid>
+```
+
+### CLI-controlled mode (`@main`)
+
+The `@main` decorator lets the user control the execution mode via CLI: runs locally when `--local` is passed, otherwise runs online. Ideal for programs that should work in both modes:
+
+```python
+from sequre import main, sequre, Sharetensor as Stensor
+
+
+@sequre
+def private_dot(mpc, x, y):
+    return x.dot(mpc, y, axis=0)
+
+
+@main
+def run_main(mpc):
+    x = Stensor.enc(mpc, [1, 2, 3, 4, 5])
+    y = Stensor.enc(mpc, [5, 4, 3, 2, 1])
+    result = private_dot(mpc, x, y)
+    print(f"CP{mpc.pid}: dot product = {result.reveal(mpc)}")
+
+
+run_main()
+```
+
+```bash
+# Local:
+sequre script.codon --local
+
+# Online (on each machine):
+SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre script.codon <pid>
+```
+
+### Manual mode (`mpc()`)
+
+For full control over the MPC environment lifecycle:
 
 ```python
 from sequre import mpc, sequre, Sharetensor as Stensor
@@ -76,11 +139,12 @@ x = Stensor.enc(mpc, [1, 2, 3, 4, 5])
 y = Stensor.enc(mpc, [5, 4, 3, 2, 1])
 result = private_dot(mpc, x, y)
 print(f"CP{mpc.pid}: dot product = {result.reveal(mpc)}")
+mpc.done()
 ```
 
 Run at each party:
 ```bash
-SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 ./bin/sequre script.codon <pid>
+SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre script.codon <pid>
 ```
 
 ## Party model
@@ -93,7 +157,7 @@ Sequre uses a **trusted dealer** model with at least 3 parties:
 | CP1..N | Compute parties — hold shares and participate in protocols |
 
 !!! note
-    In local mode (`@local`), all parties are forked on the same machine using UNIX sockets. In online mode, they communicate via TCP with TLS.
+    In local mode (`@local` or `@main --local`), all parties are forked on the same machine using UNIX sockets. In online mode (`@online`, `@main`, or `mpc()`), they communicate via TCP with TLS.
 
 ## Fixed-point arithmetic
 
@@ -121,6 +185,7 @@ These are more expensive than arithmetic but fully supported.
 
 ## Next steps
 
+- **[Secure Branching Without if](secure-branching-without-if.md)** — Build private min/max and branch bypass logic safely.
 - **[Transitioning to MHE](transition-mhe.md)** — When to prefer homomorphic encryption over secret sharing.
 - **[Sharetensor API](../api/sharetensor.md)** — Complete reference.
 - **[MPCEnv API](../api/mpcenv.md)** — Sub-modules and methods.

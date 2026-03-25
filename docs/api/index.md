@@ -23,7 +23,7 @@ This section provides detailed reference documentation for every public type and
 | Module | Description |
 |---|---|
 | [MPCEnv](mpcenv.md) | The runtime environment that orchestrates all protocols |
-| [Decorators & Attributes](decorators.md) | `@sequre`, `@local`, `@flatten`, compiler IR pass attributes |
+| [Decorators & Attributes](decorators.md) | `@sequre`, `@local`, `@online`, `@main`, `@flatten`, compiler IR pass attributes |
 
 ## Libraries
 
