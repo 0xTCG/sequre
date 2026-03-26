@@ -92,7 +92,7 @@ The three pure-HE strategies (M1, M2, M3) differ in how they pack matrix element
 
 ### Going deeper
 
-The M1/M2/M3 implementations call `mpc.mhe.iadd`, `mpc.mhe.imul`, `mpc.mhe.irotate` — working directly with ciphertext-level operations. These are the Layer 2 (MPCEnv/MHE) primitives documented in [Core MHE Module](../deep-dive-shechi/core-mhe.md). Below that, each of those methods calls into Lattiseq's `Evaluator` for the actual CKKS polynomial arithmetic.
+The M1/M2/M3 implementations call `mpc.mhe.iadd`, `mpc.mhe.imul`, `mpc.mhe.irotate` — working directly with ciphertext-level operations. These are the Layer 2 (MPC/MHE) primitives documented in [Core MHE Module](../deep-dive-shechi/core-mhe.md). Below that, each of those methods calls into Lattiseq's `Evaluator` for the actual CKKS polynomial arithmetic.
 
 ## When to drop a layer
 

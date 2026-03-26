@@ -20,15 +20,21 @@ Write Python-like code; the Sequre compiler handles encrypted arithmetic and int
 
 **Supported platforms:** Linux (x86_64). macOS (Darwin) builds are currently disabled.
 
-Install [Codon](https://github.com/exaloop/codon), then install Sequre:
+Install Sequre (includes Codon):
 
 ```bash
-mkdir -p $HOME/.codon && \
-  curl -L https://github.com/exaloop/codon/releases/download/v0.17.0/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon --strip-components=1
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/0xTCG/sequre/develop/scripts/install.sh)"
+```
 
-curl -L https://github.com/0xTCG/sequre/releases/latest/download/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon
+This installs to `~/.sequre` and adds it to your `PATH`. To install manually:
 
-export PATH=$HOME/.codon/bin:$PATH
+```bash
+mkdir -p $HOME/.sequre && \
+  curl -L https://github.com/exaloop/codon/releases/download/v0.17.0/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.sequre --strip-components=1
+
+curl -L https://github.com/0xTCG/sequre/releases/latest/download/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.sequre
+
+export PATH=$HOME/.sequre/bin:$PATH
 ```
 
 Run example:
@@ -66,7 +72,7 @@ sequre build -release my_protocol.codon -o my_protocol
 
 ## Examples
 
-The [examples/](examples/) directory contains self-contained programs that demonstrate realistic secure-computation workflows. Each generates its own synthetic data, runs locally, and prints results — no external datasets or configuration files needed. For full production pipelines, see [applications/](applications/). For correctness and performance coverage, see [tests/](tests/).
+The [examples/](examples/) directory contains self-contained programs that demonstrate secure-computation workflows. Each generates its own synthetic data, runs locally, and prints results — no external datasets or configuration files needed. For full production pipelines, see [applications/](applications/).
 
 | Example | File | Domain | What it shows |
 |---|---|---|---|
@@ -84,11 +90,11 @@ Run any example locally:
 
 ```bash
 sequre examples/local_run.codon
-sequre examples/hastings.codon --local
-sequre examples/credit_scoring.codon --local
-sequre examples/genetic_kinship.codon --local
-sequre examples/linear_regression.codon --local
 sequre examples/one_algorithm_many_types.codon --local
+sequre -release examples/hastings.codon --local
+sequre -release examples/credit_scoring.codon --local
+sequre -release examples/genetic_kinship.codon --local
+sequre -release examples/linear_regression.codon --local
 ```
 
 ### Execution modes
@@ -101,7 +107,7 @@ Sequre provides three runtime decorators for different execution scenarios, plus
 | `@online` | Each party is a **separate process/machine** — production distributed runs |
 | `@main` | **CLI-controlled**: runs locally when `--local` flag is passed, otherwise runs online |
 
-All three inject an `mpc` context as the first argument — no need to pass it at the call site.
+All three inject an `mpc` context as the first argument — no need to pass it at the call site. [MPC instance](https://0xtcg.github.io/sequre/api/mpc-instance/) provides access to MPC/MHE essentials (party state, PRG streams, network sockets, and sub-modules for arithmetic, fixed-point, boolean, polynomial, and MHE operations etc.).
 
 ### Local execution (`@local`)
 

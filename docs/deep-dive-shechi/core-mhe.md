@@ -146,4 +146,4 @@ The smudging noise (`gaussian_sampler`) provides defense-in-depth against leakag
 
 - **[Ciphertensor Internals](ciphertensor-internals.md)** — How `Ciphertensor` wraps these MHE ops.
 - **[Lattiseq Overview](../deep-dive-lattiseq/overview.md)** — The CKKS engine underneath.
-- **[MPCMHE API](../api/mpcenv.md)** — Full method reference.
+- **[MPCMHE API](../api/mpc-instance.md)** — Full method reference.

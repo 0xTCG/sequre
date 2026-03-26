@@ -23,6 +23,22 @@ static char *default_codon_path(void) {
     return strdup(env);
   }
 
+  /* Try to find codon relative to this executable (same bin directory) */
+  char self[PATH_MAX];
+  ssize_t len = readlink("/proc/self/exe", self, sizeof(self) - 1);
+  if (len > 0) {
+    self[len] = '\0';
+    /* Find last '/' and replace "sequre" with "codon" */
+    char *slash = strrchr(self, '/');
+    if (slash && (size_t)(slash - self + 6) < sizeof(self)) {
+      strcpy(slash + 1, "codon");
+      if (access(self, X_OK) == 0) {
+        return strdup(self);
+      }
+    }
+  }
+
+  /* Fallback to $HOME/.sequre/bin/codon */
   const char *home = getenv("HOME");
   if (!home || !*home) {
     return strdup("codon");
@@ -33,7 +49,7 @@ static char *default_codon_path(void) {
     return strdup("codon");
   }
 
-  snprintf(p, PATH_MAX, "%s/.codon/bin/codon", home);
+  snprintf(p, PATH_MAX, "%s/.sequre/bin/codon", home);
   return p;
 }
 
@@ -116,10 +132,10 @@ int main(int argc, char **argv) {
 
   int k = 0;
   args[k++] = codon;
-  args[k++] = mode;
-  args[k++] = "--disable-opt=core-pythonic-list-addition-opt";
-  args[k++] = "-plugin";
-  args[k++] = "sequre";
+  args[k++] = (char *)mode;
+  args[k++] = (char *)"--disable-opt=core-pythonic-list-addition-opt";
+  args[k++] = (char *)"-plugin";
+  args[k++] = (char *)"sequre";
 
   for (int i = arg_start; i < argc; i++) {
     args[k++] = argv[i];

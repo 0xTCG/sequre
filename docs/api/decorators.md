@@ -73,7 +73,7 @@ def fp_div(mpc, a, b):
 
 _Defined in `stdlib/sequre/runtime.codon`_
 
-A runtime decorator that forks the current process into `N` parties (using `fork()`), each running the decorated function as a separate MPC party with its own `MPCEnv`. Used for local testing where all parties run on a single machine.
+A runtime decorator that forks the current process into `N` parties (using `fork()`), each running the decorated function as a separate MPC party with its own MPC instance. Used for local testing where all parties run on a single machine.
 
 ```python
 from sequre.runtime import local
@@ -92,7 +92,7 @@ Command-line flags (e.g., `--use-ring`, `--skip-mhe-setup`) are parsed from `sys
 
 _Defined in `stdlib/sequre/runtime.codon`_
 
-A runtime decorator for distributed (multi-machine) execution. Wraps the `mpc()` lifecycle: parses the party ID from `sys.argv`, creates an `MPCEnv`, calls the decorated function, and cleans up with `mpc.done()`.
+A runtime decorator for distributed (multi-machine) execution. Wraps the `mpc()` lifecycle: parses the party ID from `sys.argv`, creates an MPC instance, calls the decorated function, and cleans up with `mpc.done()`.
 
 ```python
 from sequre.runtime import online
@@ -147,7 +147,7 @@ These functions set up the MPC environment for distributed (non-local) execution
 
 | Function | Description |
 |---|---|
-| `mpc()` | Parse command-line args, create an `MPCEnv` for the current party, run MHE setup. Returns the initialized environment. |
+| `mpc()` | Parse command-line args, create an MPC instance for the current party, run MHE setup. Returns the initialized environment. |
 
 ### Typical distributed entry point
 

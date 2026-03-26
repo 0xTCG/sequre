@@ -180,7 +180,7 @@ The `--use-ring` flag (ring modulus instead of field modulus) is currently unsta
 
 In case of `cannot find plugin 'sequre'`, ensure:
 
-1. Sequre is installed in the Codon plugins directory: `$HOME/.codon/lib/codon/plugins/sequre/`
+1. Sequre is installed in the Codon plugins directory: `$HOME/.sequre/lib/codon/plugins/sequre/`
 2. The directory contains `plugin.toml`, `build/`, and `stdlib/`
 3. If using `codon` directly instead of the `sequre` launcher, pass `-plugin sequre`:
 

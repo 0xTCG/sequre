@@ -24,10 +24,10 @@ Sequre is multi-layered to enable operating at different abstraction levels:
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  @sequre / @local / @online / @main decorators         │  ← Pythonic code
+│  @sequre / @local / @online / @main decorators      │  ← Pythonic code
 │  Sharetensor  ·  MPU (multiparty_union)             │
 ├─────────────────────────────────────────────────────┤
-│  MPCEnv                                             │  ← Orchestrates MPC + MHE
+│  MPC Instance                                       │  ← Orchestrates MPC + MHE
 │  ├─ arithmetic (Beaver triples)                     │
 │  ├─ boolean / fp / polynomial                       │
 │  └─ mhe (collective CKKS)                           │
@@ -42,7 +42,7 @@ Sequre is multi-layered to enable operating at different abstraction levels:
 
 **Layer 1 — High-level.** Write standard-looking Python. Annotate functions with `@sequre`; the compiler plugin rewrites operators (`+`, `*`, `@`, `==`, …) on secure types into protocol calls.
 
-**Layer 2 — MPCEnv.** The runtime environment that holds party state, PRG streams, network sockets, and sub-modules for arithmetic, fixed-point, boolean, polynomial, and MHE operations.
+**Layer 2 — MPC Instance.** The runtime environment that holds party state, PRG streams, network sockets, and sub-modules for arithmetic, fixed-point, boolean, polynomial, and MHE operations.
 
 **Layer 3 — Ciphertensor.** A local tensor of CKKS ciphertexts with operator overloading, automatic scale/level tracking, and transparent collective operations when depth limits are reached.
 

@@ -4,28 +4,25 @@
 
 - **Linux** (x86_64). macOS (Darwin) builds are currently disabled.
 
-## 1. Install Codon
+## 1. Install Sequre
 
 ```bash
-mkdir -p $HOME/.codon
-curl -L https://github.com/exaloop/codon/releases/download/v0.17.0/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz \
-  | tar zxvf - -C $HOME/.codon --strip-components=1
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/0xTCG/sequre/develop/scripts/install.sh)"
 ```
 
-## 2. Install the Sequre plugin
+This installs Codon and Sequre to `~/.sequre` and adds it to your `PATH`.
 
-```bash
-curl -L https://github.com/0xTCG/sequre/releases/latest/download/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz \
-  | tar zxvf - -C $HOME/.codon
-```
+??? note "Manual install"
+    ```bash
+    mkdir -p $HOME/.sequre
+    curl -L https://github.com/exaloop/codon/releases/download/v0.17.0/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz \
+      | tar zxvf - -C $HOME/.sequre --strip-components=1
+    curl -L https://github.com/0xTCG/sequre/releases/latest/download/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz \
+      | tar zxvf - -C $HOME/.sequre
+    export PATH=$HOME/.sequre/bin:$PATH
+    ```
 
-This installs the `sequre` binary to `$HOME/.codon/bin/sequre` alongside the Sequre and Seq plugins.
-Add binaries to `PATH`:
-```bash
-export PATH=$HOME/.codon/bin:$PATH
-```
-
-## 3. Run first example
+## 2. Run first example
 
 ```bash
 sequre examples/local_run.codon

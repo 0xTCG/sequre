@@ -40,7 +40,12 @@ bool isBinaryInstr(CallInstr *instr) {
 }
 
 bool hasSequreAttr( Func *f ) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.sequre");
+  if (!f) return false;
+
+  return util::hasAttribute(f, "std.sequre.attributes.sequre") ||
+         util::hasAttribute(f, "std.sequre.runtime.local") ||
+         util::hasAttribute(f, "std.sequre.runtime.online") ||
+         util::hasAttribute(f, "std.sequre.runtime.main");
 }
 
 bool hasPolyOptAttr( Func *f ) {
