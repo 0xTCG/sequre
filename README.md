@@ -26,18 +26,9 @@ Install Sequre (includes Codon):
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/0xTCG/sequre/develop/scripts/install.sh)"
 ```
 
-This installs to `~/.sequre` and adds it to your `PATH`. To install manually:
+This installs to `~/.sequre` and adds it to your `PATH`. See [quickstart](https://0xtcg.github.io/sequre/getting-started/quickstart/) for manual install and building from source.
 
-```bash
-mkdir -p $HOME/.sequre && \
-  curl -L https://github.com/exaloop/codon/releases/download/v0.17.0/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.sequre --strip-components=1
-
-curl -L https://github.com/0xTCG/sequre/releases/latest/download/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.sequre
-
-export PATH=$HOME/.sequre/bin:$PATH
-```
-
-Run example:
+### Run example
 
 ```bash
 git clone --depth 1 https://github.com/0xTCG/sequre.git && cd sequre
