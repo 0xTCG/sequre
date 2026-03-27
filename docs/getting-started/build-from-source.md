@@ -104,7 +104,7 @@ cmake --install build --prefix="<codon-path>/install/lib/codon/plugins/sequre"
 After this, the `codon` binary at `<codon-path>/install/bin/codon` can load the Sequre plugin:
 
 ```bash
-<codon-path>/install/bin/codon run -plugin sequre examples/local_run.codon
+<codon-path>/install/bin/codon run -plugin sequre examples/addmul.codon
 ```
 
 ---

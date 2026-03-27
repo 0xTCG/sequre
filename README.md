@@ -32,7 +32,7 @@ This installs to `~/.sequre` and adds it to your `PATH`. See [quickstart](https:
 
 ```bash
 git clone --depth 1 https://github.com/0xTCG/sequre.git && cd sequre
-sequre examples/local_run.codon
+sequre examples/addmul.codon
 ```
 
 > **Note:** The first compilation may take a minute — Sequre programs compile to native code. The launcher shows compilation progress by default.
@@ -40,8 +40,8 @@ sequre examples/local_run.codon
 Or compile to a binary:
 
 ```bash
-sequre build examples/local_run.codon -o local_run
-./local_run
+sequre build examples/addmul.codon -o addmul
+./addmul
 ```
 
 > **Note:** Make sure to delete sockets (`rm sock.*`) if running a **local run** pre-built binary. `sequre` command does this automatically, otherwise, but built binaries do not.
@@ -67,11 +67,8 @@ The [examples/](examples/) directory contains self-contained programs that demon
 
 | Example | File | Domain | What it shows |
 |---|---|---|---|
-| Local execution | `examples/local_run.codon` | Intro | `@local` decorator — forks parties on one machine |
-| Online execution | `examples/online_run.codon` | Intro | `@online` decorator — wraps `mpc()` lifecycle |
-| Online (controlled) | `examples/online_run_controlled.codon` | Intro | `mpc()` manual setup for distributed runs |
-| Main (CLI-controlled) | `examples/main_run.codon` | Intro | `@main` decorator — local with `--local` flag, online otherwise |
-| Hastings benchmarks | `examples/hastings.codon` | Benchmarks | `mult3`, `innerprod`, `xtabs` micro-benchmarks with `@main` |
+| Simple expression | `examples/addmul.codon` | Intro | Addition and multiplication example — local with `--local` flag, online otherwise |
+| Hastings benchmarks | `examples/hastings.codon` | Benchmarks | `mult3`, `innerprod`, `xtabs` micro-benchmarks |
 | Credit scoring | `examples/credit_scoring.codon` | Finance | Secure neural-network classification with `MPU` partitioning |
 | Genetic kinship | `examples/genetic_kinship.codon` | Genomics | Pairwise kinship estimation on MHE-encrypted genotype data |
 | Linear regression | `examples/linear_regression.codon` | Healthcare | Multi-hospital model training with `MPU` and `LinReg` |
@@ -83,12 +80,12 @@ The [examples/](examples/) directory contains self-contained programs that demon
 Run any example locally:
 
 ```bash
-sequre examples/local_run.codon
-sequre examples/one_algorithm_many_types.codon --local
+sequre -release examples/addmul.codon --local
 sequre -release examples/hastings.codon --local
 sequre -release examples/credit_scoring.codon --local
 sequre -release examples/genetic_kinship.codon --local
 sequre -release examples/linear_regression.codon --local
+sequre examples/one_algorithm_many_types.codon --local
 sequre -release examples/collective_load.codon --local
 ```
 
@@ -132,7 +129,7 @@ The [MPC instance](https://0xtcg.github.io/sequre/api/mpc-instance/) provides ac
 
 Distributed mode requires mutual TLS certificates. Sequre handles MHE/MPC key management automatically, but **does not handle TLS certificate creation/maintenance**. For testing, generate test certificates with `scripts/generate_certs.sh`. For production, use a secure CA — see [TLS configuration](https://0xTCG.github.io/sequre/user-guide/running-distributed/#tls-configuration).
 
-Sequre also provides lower-level `@local` and `@online` decorators for cases where you want to hard-code the execution mode — see the [documentation](https://0xTCG.github.io/sequre/api/decorators/) and `examples/local_run.codon` / `examples/online_run.codon` for details.
+Sequre also provides lower-level `@local` and `@online` decorators for cases where you want to hard-code the execution mode — see the [documentation](https://0xTCG.github.io/sequre/api/decorators/) for details.
 
 ### Writing secure functions
 
