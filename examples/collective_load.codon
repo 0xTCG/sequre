@@ -1,0 +1,200 @@
+"""
+Loading private data with collective_load — real-world workflow.
+
+The other examples in this directory use synthetic data shared from a
+trusted dealer, which is convenient for testing but does not reflect
+how private data is handled in production.  In a real deployment each
+party holds its own data on disk and loads it into the secure
+computation via ``collective_load``.
+
+This file contains two self-contained examples:
+
+  1. **Credit scoring (MHE / partition)** — Two institutions each hold
+     customer records.  Data is loaded with ``MPU.collective_load``
+     in partition mode and a neural network is trained jointly on the
+     encrypted partitions.
+
+  2. **Linear regression (MPC)** — Two hospitals each hold
+     patient records.  Data is loaded with ``Sharetensor.collective_load``
+     and a linear regression model is trained on additive secret shares.
+
+Run locally:
+
+    sequre examples/collective_load.codon --local
+
+See also: docs/tutorials/loading-private-data.md
+"""
+
+from numpy.ndarray import ndarray
+from numpy.create import array, ones, zeros, zeros_like
+
+from sequre import main
+from sequre.types.multiparty_union import MPU
+from sequre.types.sharetensor import Sharetensor
+from sequre.utils.io import write_ndarray
+from sequre.stdlib.learn.neural_net.layers import Input, Dense
+from sequre.stdlib.learn.neural_net.model import Sequential
+from sequre.stdlib.learn.lin_reg import LinReg
+from sequre.utils.utils import __rand_mat
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Example 1:  Credit scoring  (MPU.collective_load — partition mode)
+# ─────────────────────────────────────────────────────────────────────
+
+def credit_scoring_partition(mpc):
+    """Two institutions jointly train a neural-net classifier on
+    horizontally partitioned customer data, loaded from binary files
+    via MPU.collective_load in partition mode (MHE).
+
+    In production each party already has its data on disk; here we
+    simulate that by writing a random binary file per party first.
+    """
+
+    rows_per_party = 4   # each institution has 4 customers
+    features        = 4   # 4 features per customer
+
+    # ── Step 1: Each party writes its private data to a binary file ──
+    #
+    # In a real deployment this step is unnecessary — each party already
+    # has its data on disk.  We create synthetic files here so the
+    # example is self-contained.
+    #
+    # *Only compute parties (pid > 0) hold real data.*
+    # Party 0 (trusted dealer) participates in the protocol but does
+    # not contribute data.
+
+    x_path = f"examples/data/credit_scoring_cp{mpc.pid}_X.bin"
+    y_path = f"examples/data/credit_scoring_cp{mpc.pid}_y.bin"
+
+    if mpc.pid > 0:
+        local_X = array(__rand_mat([rows_per_party, features], 100, TP=int))
+        local_y = array(__rand_mat([rows_per_party, 1], 1, TP=int))
+        with open(x_path, "wb") as f:
+            write_ndarray(f, local_X, binary=True)
+        with open(y_path, "wb") as f:
+            write_ndarray(f, local_y, binary=True)
+
+    mpc.comms.sync_parties()
+
+    # ── Step 2: Collectively load private data via MPU ───────────────
+    #
+    # "partition" mode: each compute party reads *its own* rows from
+    # file.  The result is an MPU backed by MPP (multiparty partition)
+    # where each party holds a horizontal slice of the global matrix.
+
+    X = MPU.collective_load(
+        mpc, x_path,
+        rows=rows_per_party, cols=features,
+        binary=True, dtype=int,
+        collective_type="partition")
+    y = MPU.collective_load(
+        mpc, y_path,
+        rows=rows_per_party, cols=1,
+        binary=True, dtype=int,
+        collective_type="partition")
+
+    # ── Step 3: Train a small neural network on the encrypted data ───
+
+    layers = (
+        Input[type(X)](features),
+        Dense[type(X)]("relu", 8, "normal", "zeros"),
+        Dense[type(X)]("linear", 1, "normal", "zeros"))
+
+    print(f"CP{mpc.pid}:\t[partition / credit scoring] Compiling model ...")
+    model = Sequential(layers).compile(mpc, loss="hinge", optimizer="bgd")
+
+    print(f"CP{mpc.pid}:\t[partition / credit scoring] Training ...")
+    model.fit(mpc, X=X, y=y, epochs=2, step=0.1, momentum=0.9, verbose=True)
+
+    # ── Step 4: Reveal results ───────────────────────────────────────
+
+    loss = model.get_loss(mpc, X, y).reveal(mpc).sum()
+    print(f"CP{mpc.pid}:\t[partition / credit scoring] Final training loss: {loss}")
+
+    predictions = model.predict(mpc, X).reveal(mpc)
+    print(f"CP{mpc.pid}:\t[partition / credit scoring] Predictions: {predictions.flatten()}")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Example 2:  Linear regression  (Sharetensor.collective_load — MPC)
+# ─────────────────────────────────────────────────────────────────────
+
+def linear_regression_mpc(mpc):
+    """Two hospitals jointly train a linear regression model on
+    patient data loaded from binary files via Sharetensor.collective_load
+    (MPC — additive secret sharing).
+
+    In production each hospital already has its data on disk; here we
+    simulate that by writing a random binary file per hospital first.
+    """
+
+    rows_per_party = 4   # each hospital has 4 patients
+    features        = 4   # 4 clinical features per patient
+    weights_len     = features + 1  # includes bias term
+
+    # ── Step 1: Each party writes its private data to a binary file ──
+
+    x_path = f"examples/data/linreg_cp{mpc.pid}_X.bin"
+    y_path = f"examples/data/linreg_cp{mpc.pid}_y.bin"
+
+    if mpc.pid > 0:
+        local_X = array(__rand_mat([rows_per_party, features], 100, TP=int))
+        # Synthetic linear target: y ≈ X @ w
+        target_w = array(__rand_mat([features, 1], 10, TP=int))
+        local_y = local_X @ target_w
+        with open(x_path, "wb") as f:
+            write_ndarray(f, local_X, binary=True)
+        with open(y_path, "wb") as f:
+            write_ndarray(f, local_y, binary=True)
+
+    mpc.comms.sync_parties()
+
+    # ── Step 2: Collectively load private data via Sharetensor ───────
+    #
+    # Each compute party reads its file and secret-shares its rows with
+    # the other parties.  After the call, every party holds additive
+    # shares of the combined dataset.
+
+    X = Sharetensor.collective_load(
+        mpc, x_path,
+        rows=rows_per_party, cols=features,
+        binary=True, dtype=int)
+    y = Sharetensor.collective_load(
+        mpc, y_path,
+        rows=rows_per_party, cols=1,
+        binary=True, dtype=int)
+
+    # ── Step 3: Train a linear regression model ──────────────────────
+
+    initial_w = Sharetensor.enc(mpc, ones((weights_len, 1)) if mpc.pid == 1 else zeros_like(ones((weights_len, 1))), 0, mpc.default_mpc_modulus)
+    print(f"CP{mpc.pid}:\t[MPC / linear regression] Training ...")
+    model = LinReg(initial_w).fit(mpc, X=X, y=y, step=0.01, epochs=3)
+
+    # ── Step 4: Reveal results ───────────────────────────────────────
+
+    if mpc.pid > 0:
+        print(f"CP{mpc.pid}:\t[MPC / linear regression] Secure coefficients:\n\t{model.coef_.reveal(mpc).flatten()}")
+        secure_pred = model.predict(mpc, X).reveal(mpc).flatten()
+        print(f"CP{mpc.pid}:\t[MPC / linear regression] Secure predictions:\n\t{secure_pred}")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────
+
+@main
+def run(mpc):
+    print(f"CP{mpc.pid}:\t{'=' * 50}")
+    print(f"CP{mpc.pid}:\tExample 1 — Credit scoring (MPU.collective_load, partition)")
+    print(f"CP{mpc.pid}:\t{'=' * 50}\n")
+    credit_scoring_partition(mpc)
+
+    print(f"\nCP{mpc.pid}:\t{'=' * 50}")
+    print(f"CP{mpc.pid}:\tExample 2 — Linear regression (Sharetensor.collective_load, MPC)")
+    print(f"CP{mpc.pid}:\t{'=' * 50}\n")
+    linear_regression_mpc(mpc)
+
+
+if __name__ == "__main__":
+    run()

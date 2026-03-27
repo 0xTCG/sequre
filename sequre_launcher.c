@@ -80,7 +80,7 @@ static void print_help(const char *codon) {
   printf("  SEQURE_USE_TLS         Set to 0 to disable TLS (insecure)\n");
   printf("  SEQURE_OPENSSL_PATH    Override auto-detected libssl path\n");
   printf("  SEQURE_LIBCRYPTO_PATH  Override auto-detected libcrypto path\n");
-  printf("  CODON_DEBUG            Compilation verbosity (default: t). Unset to silence.\n");
+  printf("  CODON_DEBUG            Compilation verbosity (default: t). Set to 0 to silence.\n");
   printf("\n");
   printf("Examples:\n");
   printf("  sequre run my_protocol.codon                     # @local program\n");
@@ -93,7 +93,11 @@ static void print_help(const char *codon) {
 
 int main(int argc, char **argv) {
   cleanup_socks();
-  setenv("CODON_DEBUG", "t", 0); /* show compilation progress by default */
+  if (!getenv("CODON_DEBUG")) {
+    setenv("CODON_DEBUG", "t", 0); /* show compilation progress by default */
+  } else if (strcmp(getenv("CODON_DEBUG"), "0") == 0) {
+    unsetenv("CODON_DEBUG"); /* silence compilation output if CODON_DEBUG=0 */
+  }
 
   char *codon = default_codon_path();
   if (!codon) {
