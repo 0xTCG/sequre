@@ -38,43 +38,35 @@ echo ""
 echo "PATH export command:"
 echo "  $EXPORT_COMMAND"
 
-update_profile () {
-  if ! grep -F -q "$EXPORT_COMMAND" "$1"; then
-    read -p "Update PATH in $1? [y/n] " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-      echo "Updating $1"
-      echo >> "$1"
-      echo "# Sequre path (added by install script)" >> "$1"
-      echo "$EXPORT_COMMAND" >> "$1"
-    else
-      echo "Skipping."
-    fi
-  else
-    echo "PATH already updated in $1; skipping update."
-  fi
-}
 
-if [[ "$SHELL" == *zsh ]]; then
-  if [ -e ~/.zshenv ]; then
-    update_profile ~/.zshenv
-  elif [ -e ~/.zshrc ]; then
-    update_profile ~/.zshrc
-  else
-    echo "Could not find zsh configuration file to update PATH"
+PROFILES=()
+for f in ~/.zshenv ~/.zshrc ~/.zprofile ~/.bash_profile ~/.bash_login ~/.bashrc ~/.profile; do
+  if [ -e "$f" ]; then
+    if ! grep -F -q "$EXPORT_COMMAND" "$f"; then
+      PROFILES+=("$f")
+    else
+      echo "PATH already updated in $f; skipping."
+    fi
   fi
-elif [[ "$SHELL" == *bash ]]; then
-  if [ -e ~/.bash_profile ]; then
-    update_profile ~/.bash_profile
-  elif [ -e ~/.bash_login ]; then
-    update_profile ~/.bash_login
-  elif [ -e ~/.profile ]; then
-    update_profile ~/.profile
-  else
-    echo "Could not find bash configuration file to update PATH"
-  fi
+done
+
+if [ ${#PROFILES[@]} -eq 0 ]; then
+  echo "No shell configuration files found to update PATH."
 else
-  echo "Don't know how to update configuration file for shell $SHELL"
+  echo "The following profile files will be updated:"
+  for f in "${PROFILES[@]}"; do echo "  $f"; done
+  read -p "Update PATH in the above files? [y/n] " -n 1 -r
+  echo
+  if [[ $REPLY =~ ^[Yy]$ ]]; then
+    for f in "${PROFILES[@]}"; do
+      echo "Updating $f"
+      echo >> "$f"
+      echo "# Sequre path (added by install script)" >> "$f"
+      echo "$EXPORT_COMMAND" >> "$f"
+    done
+  else
+    echo "Skipping."
+  fi
 fi
 
 echo ""
