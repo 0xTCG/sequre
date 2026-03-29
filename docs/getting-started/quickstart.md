@@ -35,9 +35,12 @@ This forks three processes (a trusted dealer + two compute parties) and runs a s
 
 Expected output:
 ```
-CP0:    addmul: 471
+CP0:    addmul: 0
+CP0:    innerprod: 0
 CP1:    addmul: 471
 CP2:    addmul: 471
+CP1:    innerprod: 32
+CP2:    innerprod: 32
 ```
 
 The result `7*13 + 13*19 + 7*19 = 471` was computed entirely on secret-shared data — no party ever saw the raw inputs of another.
@@ -47,28 +50,39 @@ The result `7*13 + 13*19 + 7*19 = 471` was computed entirely on secret-shared da
 Here is `examples/addmul.codon`:
 
 ```python
-from sequre import main, Sharetensor as Stensor
+from sequre import main, sequre, Sharetensor as Stensor
 
-
-@main
-def addmul(mpc, a: int, b: int, c: int):
-    a_stensor = Stensor.enc(mpc, a)
-    b_stensor = Stensor.enc(mpc, b)
-    c_stensor = Stensor.enc(mpc, c)
-
-    addmul_result = a_stensor * b_stensor + b_stensor * c_stensor + a_stensor * c_stensor
+@sequre
+def addmul(mpc, a, b, c):
+    addmul_result = a * b + b * c + a * c
     print(f"CP{mpc.pid}:\taddmul: {addmul_result.reveal(mpc)}")
 
+@sequre
+def innerprod(mpc, a, b):
+    innerprod_result = a.dot(mpc, b)
+    print(f"CP{mpc.pid}:\tinnerprod: {innerprod_result.reveal(mpc)}")
+
+@main
+def run(mpc, a, b, c, x, y):
+    a_enc = Stensor.enc(mpc, a)
+    b_enc = Stensor.enc(mpc, b)
+    c_enc = Stensor.enc(mpc, c)
+    x_enc = Stensor.enc(mpc, x)
+    y_enc = Stensor.enc(mpc, y)
+
+    addmul(mpc, a_enc, b_enc, c_enc)
+    innerprod(mpc, x_enc, y_enc)
 
 if __name__ == "__main__":
-    addmul(7, 13, 19)
+    # No need to pass mpc argument when calling sequre method with a main decorator
+    run(7, 13, 19, [1, 2, 3], [4, 5, 6])
 ```
 
 Key concepts:
 
 1. **`@main`** — The entry-point decorator. Pass `--local` to fork all parties on one machine, or omit it to run in distributed (online) mode.
 2. **`Stensor.enc(mpc, value)`** — Secret-shares a plaintext integer into additive shares distributed across parties.
-3. **`a_stensor * b_stensor`** — The `@sequre` compiler plugin automatically rewrites arithmetic on secret-shared data into Beaver-triple secure multiplications.
+3. **`a_enc * b_enc`** — The `@sequre` compiler plugin automatically rewrites arithmetic on secret-shared data into Beaver-triple secure multiplications.
 4. **`.reveal(mpc)`** — Reconstructs the secret by combining shares from all parties.
 
 !!! tip "Execution modes"

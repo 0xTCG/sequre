@@ -65,6 +65,7 @@ static void print_help(const char *codon) {
   printf("Runtime flags (passed after the .codon file):\n");
   printf("  --use-ring         Use ring modulus instead of field modulus\n");
   printf("  --skip-mhe-setup   Skip the MHE key-generation setup phase\n");
+  printf("  --local            Run the program in local mode (when @main decorator is used)\n");
   printf("  -h, --help         Show this help message\n");
   printf("\n");
   printf("Execution modes:\n");
@@ -83,10 +84,11 @@ static void print_help(const char *codon) {
   printf("  CODON_DEBUG            Compilation verbosity (default: t). Set to 0 to silence.\n");
   printf("\n");
   printf("Examples:\n");
-  printf("  sequre run my_protocol.codon --local              # local mode (@main)\n");
+  printf("  sequre run my_protocol.codon --local                   # local mode (@main)\n");
   printf("  sequre run my_protocol.codon --local --skip-mhe-setup  # local, MPC-only\n");
-  printf("  sequre build my_protocol.codon                   # compile to binary\n");
-  printf("  sequre run my_protocol.codon 1                   # distributed, party 1\n");
+  printf("  sequre build my_protocol.codon                         # compile to binary\n");
+  printf("  sequre run my_protocol.codon 1                         # distributed, party 1\n");
+  printf("  sequre run my_protocol.codon 1 --use-ring              # distributed, party 1, use ring modulus\n");
   printf("\n");
   printf("For Codon compiler flags, run: %s run --help\n", codon);
 }

@@ -67,8 +67,7 @@ The [examples/](examples/) directory contains self-contained programs that demon
 
 | Example | File | Domain | What it shows |
 |---|---|---|---|
-| Simple expression | `examples/addmul.codon` | Intro | Addition and multiplication example — local with `--local` flag, online otherwise |
-| Hastings benchmarks | `examples/hastings.codon` | Benchmarks | `mult3`, `innerprod`, `xtabs` micro-benchmarks |
+| Simple expression | `examples/addmul.codon` | Intro | Additions, multiplications, and innerprod examples — local with `--local` flag, online otherwise |
 | Credit scoring | `examples/credit_scoring.codon` | Finance | Secure neural-network classification with `MPU` partitioning |
 | Genetic kinship | `examples/genetic_kinship.codon` | Genomics | Pairwise kinship estimation on MHE-encrypted genotype data |
 | Linear regression | `examples/linear_regression.codon` | Healthcare | Multi-hospital model training with `MPU` and `LinReg` |
@@ -80,12 +79,11 @@ The [examples/](examples/) directory contains self-contained programs that demon
 Run any example locally:
 
 ```bash
-sequre -release examples/addmul.codon --local
-sequre -release examples/hastings.codon --local
+sequre examples/addmul.codon --local --skip-mhe-setup
 sequre -release examples/credit_scoring.codon --local
 sequre -release examples/genetic_kinship.codon --local
 sequre -release examples/linear_regression.codon --local
-sequre examples/one_algorithm_many_types.codon --local
+sequre -release examples/one_algorithm_many_types.codon --local
 sequre -release examples/collective_load.codon --local
 ```
 

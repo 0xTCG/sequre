@@ -10,7 +10,7 @@ Run `sequre --help` to see all available flags.
 
 ### Runtime flags
 
-These flags can be passed to any Sequre program (both `@local` and `@online` programs):
+These flags can be passed to any Sequre program:
 
 | Flag | Description |
 |---|---|
