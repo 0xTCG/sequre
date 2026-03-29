@@ -37,40 +37,39 @@ _Defined in `stdlib/sequre/mpc/env.codon`_
 
 ## Initialization
 
-### Local mode (single machine)
+Use the `@main` decorator (recommended). It selects local or distributed mode based on CLI flags:
 
 ```python
-from sequre import local, Sharetensor as Stensor
+from sequre import main, sequre, Sharetensor as Stensor
 
-@local
-def my_computation(mpc, x: int):
-    s = Stensor.enc(mpc, x)
+@main
+def my_computation(mpc):
+    s = Stensor.enc(mpc, 42)
     # ... secure operations ...
     print(s.reveal(mpc))
 
-my_computation(42)  # mpc is injected automatically
+my_computation()  # mpc is injected automatically
 ```
 
-The `@local` decorator forks `NUMBER_OF_PARTIES` processes (default 3) on the same machine, each with its own MPC instance.
+!!! warning
+    The decorated function must be called **exactly once** per program. Calling it more than once will raise an error.
 
-### Online mode (distributed)
-
-```python
-from sequre import mpc, Sharetensor as Stensor
-
-mpc = mpc()  # Reads party ID from sys.argv
-s = Stensor.enc(mpc, 42)
-print(s.reveal(mpc))
-```
-
-Run at each party:
+Run locally (forks parties on one machine):
 ```bash
-SEQURE_CP_IPS=ip1,ip2,ip3 ./bin/sequre script.codon <pid>
+sequre run script.codon --local
 ```
+
+Run distributed (each party is a separate process):
+```bash
+SEQURE_CP_IPS=ip1,ip2,ip3 sequre run script.codon <party_id>
+```
+
+!!! note
+    Lower-level `@local` and `@online` decorators exist for hard-coding the execution mode, but `@main` is recommended for all new programs.
 
 ## MHE setup
 
-By default, `mpc()` and `@local` call `mpc.mhe.default_setup()` which:
+By default, `@main` calls `mpc.mhe.default_setup()` which:
 
 1. Generates per-party secret key shards
 2. Runs collective public key generation (CKG)

@@ -68,8 +68,8 @@ static void print_help(const char *codon) {
   printf("  -h, --help         Show this help message\n");
   printf("\n");
   printf("Execution modes:\n");
-  printf("  Use @local decorator for local (single-machine) programs\n");
-  printf("  Use mpc() function for distributed (multi-machine) programs\n");
+  printf("  Use @main decorator (recommended) — runs locally with --local,\n");
+  printf("  distributed otherwise.\n");
   printf("\n");
   printf("Environment variables:\n");
   printf("  CODON_BIN              Path to the codon executable\n");
@@ -83,8 +83,8 @@ static void print_help(const char *codon) {
   printf("  CODON_DEBUG            Compilation verbosity (default: t). Set to 0 to silence.\n");
   printf("\n");
   printf("Examples:\n");
-  printf("  sequre run my_protocol.codon                     # @local program\n");
-  printf("  sequre run my_protocol.codon --skip-mhe-setup    # @local, MPC-only\n");
+  printf("  sequre run my_protocol.codon --local              # local mode (@main)\n");
+  printf("  sequre run my_protocol.codon --local --skip-mhe-setup  # local, MPC-only\n");
   printf("  sequre build my_protocol.codon                   # compile to binary\n");
   printf("  sequre run my_protocol.codon 1                   # distributed, party 1\n");
   printf("\n");

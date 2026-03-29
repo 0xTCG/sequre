@@ -10,7 +10,7 @@ Run `sequre --help` to see all available flags.
 
 ### Runtime flags
 
-These flags can be passed to any Sequre program (both `@local` and `mpc()` programs):
+These flags can be passed to any Sequre program (both `@local` and `@online` programs):
 
 | Flag | Description |
 |---|---|
@@ -96,6 +96,8 @@ Sequre provides three runtime decorators plus a manual `mpc()` function:
 | Online | `@online` | Each party is a separate process/machine (TCP/TLS) |
 | CLI-controlled | `@main` | Local if `--local` is passed, otherwise online |
 | Manual | `mpc()` | Full manual control over the MPC environment |
+
+`@main` is the recommended execution mode.
 
 ### Local mode (`@local`)
 
