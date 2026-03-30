@@ -1,11 +1,12 @@
 from sequre.constants import AF_UNIX, AF_INET, SOCK_STREAM
-from sequre.types.builtin import sockaddr_un, sockaddr_in, in_addr
+from sequre.constants import GMP_PATH
 
 from C import socket(int, int, int) -> int
 from C import bind(int, cobj, int) -> int
 from C import connect(int, cobj, int) -> int
 from C import perror(cobj)
 from C import memcpy(cobj, cobj, int)
+from C import memset(cobj, int, int) -> cobj
 from C import htons(u16) -> u16
 from C import inet_addr(cobj) -> u32
 from C import unlink(str) -> int
@@ -18,10 +19,13 @@ from common import (
 class CSocket:
     sock_fd: int
     socket_address: str
-    inet_serveraddr: sockaddr_in
-    unix_serveraddr: sockaddr_un
+    inet_serveraddr: Ptr[byte]
+    inet_serveraddr_len: int
+    unix_serveraddr: Ptr[byte]
+    unix_serveraddr_len: int
     is_inet: bool
     is_unix: bool
+    is_macos: bool
     ssl: cobj      # SSL* handle (NULL for UNIX sockets)
     ssl_ctx: cobj  # SSL_CTX* handle (NULL for UNIX sockets)
 
@@ -29,6 +33,11 @@ class CSocket:
         self.sock_fd = -1
         self.ssl = cobj()
         self.ssl_ctx = cobj()
+        self.inet_serveraddr = Ptr[byte](0)
+        self.inet_serveraddr_len = 0
+        self.unix_serveraddr = Ptr[byte](0)
+        self.unix_serveraddr_len = 0
+        self.is_macos = GMP_PATH.endswith(".dylib")
         
         self.is_inet = ip_address != '' and port != ''
         self.is_unix = unix_file_address != ''
@@ -37,10 +46,10 @@ class CSocket:
         
         if self.is_inet:
             self.socket_address = f'{ip_address}:{port}'
-            self.inet_serveraddr = self._set_inet_serveraddr(ip_address, port)
+            self.inet_serveraddr, self.inet_serveraddr_len = self._set_inet_serveraddr(ip_address, port)
         else:
             self.socket_address = unix_file_address
-            self.unix_serveraddr = self._set_unix_serveraddr(unix_file_address)
+            self.unix_serveraddr, self.unix_serveraddr_len = self._set_unix_serveraddr(unix_file_address)
 
     def init_ssl_ctx(self: CSocket, pid: int, is_server: bool):
         if self.is_inet:
@@ -55,11 +64,9 @@ class CSocket:
 
     def connect(self: CSocket) -> bool:
         if self.is_inet:
-            inet_serveraddr = self.inet_serveraddr
-            connection = connect(self.sock_fd, __ptr__(inet_serveraddr).as_byte(), 64)
+            connection = connect(self.sock_fd, self.inet_serveraddr, self.inet_serveraddr_len)
         else:
-            unix_serveraddr = self.unix_serveraddr
-            connection = connect(self.sock_fd, __ptr__(unix_serveraddr).as_byte(), len(self.socket_address) + 2)
+            connection = connect(self.sock_fd, self.unix_serveraddr, self.unix_serveraddr_len)
 
         if connection != 0:
             perror(f'{self.socket_address}:\tCould not connect'.c_str())
@@ -78,11 +85,9 @@ class CSocket:
 
     def bind(self: CSocket):
         if self.is_inet:
-            inet_serveraddr = self.inet_serveraddr
-            rc = bind(self.sock_fd, __ptr__(inet_serveraddr).as_byte(), 64)
+            rc = bind(self.sock_fd, self.inet_serveraddr, self.inet_serveraddr_len)
         else:
-            unix_serveraddr = self.unix_serveraddr
-            rc = bind(self.sock_fd, __ptr__(unix_serveraddr).as_byte(), len(self.socket_address) + 2)
+            rc = bind(self.sock_fd, self.unix_serveraddr, self.unix_serveraddr_len)
 
         if rc < 0:
             perror(f'Server not binded at {self.socket_address} and fd {self.sock_fd}'.c_str())
@@ -97,12 +102,42 @@ class CSocket:
         self.sock_fd = accept_socket(self.sock_fd)
         self.ssl_handshake_accept()
 
-    def _set_unix_serveraddr(self: CSocket, socket_address: str) -> sockaddr_un:
-        serveraddr = sockaddr_un(AF_UNIX, ptr[byte](len(socket_address)))
-        serveraddr_ptr = ptr[byte](__ptr__(serveraddr).as_byte())
-        memcpy(serveraddr_ptr, ptr[byte](__ptr__(AF_UNIX).as_byte()), 2)
-        memcpy(serveraddr_ptr + 2, socket_address.c_str(), len(socket_address))
-        return serveraddr
+    def _set_unix_serveraddr(self: CSocket, socket_address: str) -> Tuple[Ptr[byte], int]:
+        # Linux:   sockaddr_un = {sa_family_t(2), sun_path[108]}
+        # macOS:   sockaddr_un = {sun_len(1), sun_family(1), sun_path[104]}
+        max_path_len = 104 if self.is_macos else 108
+        path_len = min(len(socket_address), max_path_len)
+        addr_len = path_len + 2
+
+        serveraddr = Ptr[byte](max_path_len + 2)
+        memset(serveraddr, 0, max_path_len + 2)
+
+        if self.is_macos:
+            serveraddr[0] = byte(addr_len)
+            serveraddr[1] = byte(AF_UNIX)
+        else:
+            family = i16(AF_UNIX)
+            memcpy(serveraddr, __ptr__(family).as_byte(), 2)
+
+        memcpy(serveraddr + 2, socket_address.c_str(), path_len)
+        return serveraddr, addr_len
     
-    def _set_inet_serveraddr(self: CSocket, ip_address: str, port: str) -> sockaddr_in:
-        return sockaddr_in(i16(AF_INET), htons(u16(port)), in_addr(inet_addr(ip_address.c_str())))
+    def _set_inet_serveraddr(self: CSocket, ip_address: str, port: str) -> Tuple[Ptr[byte], int]:
+        # Linux: sockaddr_in starts with {sin_family: u16, sin_port: u16, sin_addr: u32}
+        # macOS: sockaddr_in starts with {sin_len: u8, sin_family: u8, sin_port: u16, sin_addr: u32}
+        serveraddr = Ptr[byte](16)
+        memset(serveraddr, 0, 16)
+
+        if self.is_macos:
+            serveraddr[0] = byte(16)
+            serveraddr[1] = byte(AF_INET)
+        else:
+            family = i16(AF_INET)
+            memcpy(serveraddr, __ptr__(family).as_byte(), 2)
+
+        net_port = htons(u16(port))
+        addr = inet_addr(ip_address.c_str())
+        memcpy(serveraddr + 2, __ptr__(net_port).as_byte(), 2)
+        memcpy(serveraddr + 4, __ptr__(addr).as_byte(), 4)
+
+        return serveraddr, 16
