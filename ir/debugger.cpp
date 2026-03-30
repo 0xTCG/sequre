@@ -43,7 +43,7 @@ void Debugger::replaceVars( Value *v, VarValue *mpc ) {
       if ( !rawVar ) {
         auto *M         = v->getModule();
         auto *reveal    = revealCall(var, mpc);
-        rawVar          = M->Nr<Var>(reveal->getType(), false, false, "raw_" + var->getName());
+        rawVar          = M->Nr<Var>(reveal->getType(), false, false, false, "raw_" + var->getName());
         auto *rawAssign = M->Nr<AssignInstr>(rawVar, reveal);
 
         insertBefore(rawAssign);
@@ -81,7 +81,7 @@ void Debugger::attachDebugger( AssignInstr *v ) {
   replaceVars(rawRhs, mpc);
 
   auto *revealLhs = revealCall(lhs, mpc);
-  auto *rawLhs    = M->Nr<Var>(revealLhs->getType(), false, false, "raw_" + lhs->getName());
+  auto *rawLhs    = M->Nr<Var>(revealLhs->getType(), false, false, false, "raw_" + lhs->getName());
   auto *rawAssign = M->Nr<AssignInstr>(rawLhs, rawRhs);
   SecureVarsSingleton::instance().insert(lhs->getId(), rawLhs);
 
