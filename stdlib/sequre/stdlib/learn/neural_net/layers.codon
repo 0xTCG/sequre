@@ -1,8 +1,8 @@
 from sequre import sequre
 
 from sequre.constants import SUPPORTED_ACTIVATIONS
+from sequre.stdlib.builtin import maximum
 from activations import activate, dactivate
-
 
 class Input[ctype]:
     size: int
@@ -110,3 +110,619 @@ class Dense[ctype]:
     def _evaluate(mpc, layer: Dense, last_output: ctype):
         layer.input = last_output @ layer.weights + layer.bias
         layer.output = layer.activate(mpc)
+
+# --- Convolution Layer ---
+class Conv2D[ctype]:
+    activation: str
+    out_channels: int
+    kernel_size: tuple[int, int]
+    stride: tuple[int, int]
+    padding: str
+    kernel_initializer: str
+    bias_initializer: str
+    in_channels: int
+
+    weights: ctype
+    bias: ctype
+    input: ctype
+    output: ctype
+    last_input: ctype
+
+    dw: ctype
+    db: ctype
+
+    vw: ctype
+    vb: ctype
+
+    def __init__(self, activation: str, out_channels: int, kernel_size=(3, 3), stride=(1, 1), padding: str = "valid", kernel_initializer: str = "uniform", bias_initializer: str = "uniform"):
+        assert activation in SUPPORTED_ACTIVATIONS, f"Conv2D: {activation} activation not supported. Supported: {SUPPORTED_ACTIVATIONS}"
+        assert padding == "valid", f"Conv2D: only 'valid' padding is currently supported, got {padding}"
+        
+        self.activation = activation
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)
+        self.stride = stride if isinstance(stride, tuple) else (stride, stride)
+        self.padding = padding
+        self.kernel_initializer = kernel_initializer
+        self.bias_initializer = bias_initializer
+    
+    @property
+    def size(self) -> int:
+        if hasattr(self, 'output') and not self.output.is_empty():
+            batch, H, W, C = self.output.shape
+            return H * W * C
+        return 0
+    
+    @property
+    def channels(self) -> int:
+        return self.out_channels
+
+    def initialize(self, mpc, prev_size: int, *args, **kwargs):
+        self.in_channels = prev_size
+
+        kH, kW = self.kernel_size
+        w_shape = (kH, kW, self.in_channels, self.out_channels)
+        b_shape = (1, 1, 1, self.out_channels)
+
+        self.weights = ctype.rand(w_shape, self.kernel_initializer, mpc, *args, **kwargs)
+        self.bias = ctype.rand(b_shape, self.bias_initializer, mpc, *args, **kwargs)
+
+        self.dw = self.weights.zeros()
+        self.db = self.bias.zeros()
+
+        self.vw = self.weights.zeros()
+        self.vb = self.bias.zeros()
+
+    def is_evaluated(self):
+        return not self.output.is_empty()
+
+    def evaluate(self, mpc, last_output: ctype):
+        Conv2D[ctype]._evaluate(mpc, self, last_output)
+
+    def activate(self, mpc) -> ctype:
+        return activate(mpc, self.input, self.activation)
+
+    def derive(self, mpc, prev_output: ctype, dhidden: ctype, LAYER_IDX: Static[int]) -> ctype:
+        dact = dactivate(mpc, self.input, self.activation)
+        return Conv2D[ctype]._derive(mpc, self, prev_output, dhidden, dact, LAYER_IDX=LAYER_IDX)
+
+    def update(self, mpc, step: float, momentum: float):
+        Conv2D[ctype]._nesterov_update(mpc, self, step, momentum)
+
+    @sequre
+    def _nesterov_update(mpc, layer: Conv2D, step: float, momentum: float):
+        vw_prev = layer.vw.copy()
+        layer.vw = layer.vw * momentum - layer.dw * step
+        layer.weights += layer.vw * (momentum + 1) - vw_prev * momentum
+
+        vb_prev = layer.vb.copy()
+        layer.vb = layer.vb * momentum - layer.db * step
+        layer.bias += layer.vb * (momentum + 1) - vb_prev * momentum
+
+    @sequre
+    def _evaluate(mpc, layer: Conv2D, last_output: ctype):
+        # Forward convolution using decomposed partial matrix multiplications.
+        # Instead of im2col + concatenation, we compute the convolution as:
+        #   output = sum over (i,j) of patch_ij @ W[i,j,:,:]
+        # This avoids the need for concatenation on ndarray.
+        batch, H, W, C_in = last_output.shape
+        kH, kW = layer.kernel_size
+        stride_h, stride_w = layer.stride
+        
+        # Store only a tiny slice (not full input) to save memory;
+        # _derive receives prev_output explicitly and does not read last_input.
+        layer.last_input = last_output[0:1, 0:1, 0:1, 0:1]
+        
+        out_H = (H - kH) // stride_h + 1
+        out_W = (W - kW) // stride_w + 1
+        n_rows = batch * out_H * out_W
+        
+        # Compute convolution as sum of partial matmuls for each kernel position
+        first = True
+        result = last_output[0:1, 0:1, 0:1, 0:1].reshape((1, 1))  # placeholder, overwritten below
+        for i in range(kH):
+            for j in range(kW):
+                r_end = i + out_H * stride_h
+                c_end = j + out_W * stride_w
+                patch = last_output[:, i:r_end:stride_h, j:c_end:stride_w, :]
+                patch_flat = patch.reshape((n_rows, C_in))
+                w_ij = layer.weights[i:i+1, j:j+1, :, :].reshape((C_in, layer.out_channels))
+                partial = patch_flat @ w_ij
+                if first:
+                    result = partial
+                    first = False
+                else:
+                    result = result + partial
+        
+        output = result.reshape((batch, out_H, out_W, layer.out_channels))
+        layer.input = output + layer.bias
+        layer.output = layer.activate(mpc)
+
+    @sequre
+    def _derive(mpc, layer: Conv2D, prev_output: ctype, dhidden: ctype, dact: ctype, LAYER_IDX: Static[int]):
+        # Backward pass using decomposed partial matrix multiplications.
+        batch, H, W, C = prev_output.shape
+        kH, kW = layer.kernel_size
+        stride_h, stride_w = layer.stride
+        dhidden = dhidden * dact
+        out_H = (H - kH) // stride_h + 1
+        out_W = (W - kW) // stride_w + 1
+        n_rows = batch * out_H * out_W
+        
+        dhidden_flat = dhidden.reshape((n_rows, layer.out_channels))
+        
+        # Compute weight gradients for each kernel position
+        layer.dw = layer.weights * 0  # Initialize dW to zeros with same shape
+        for i in range(kH):
+            for j in range(kW):
+                r_end = i + out_H * stride_h
+                c_end = j + out_W * stride_w
+                patch = prev_output[:, i:r_end:stride_h, j:c_end:stride_w, :]
+                patch_flat = patch.reshape((n_rows, C))
+                dw_ij = patch_flat.T @ dhidden_flat  # (C, out_channels)
+                layer.dw[i:i+1, j:j+1, :, :] = dw_ij.reshape((1, 1, C, layer.out_channels))
+        
+        # Compute bias gradient
+        db_sum = dhidden_flat.sum(axis=0)  # (out_channels,)
+        layer.db = db_sum.reshape((1, 1, 1, layer.out_channels))
+        
+        if LAYER_IDX == 1:
+            return layer.output
+        
+        # Compute input gradient
+        dprev = prev_output * 0  # zeros with same shape
+        for i in range(kH):
+            for j in range(kW):
+                w_ij = layer.weights[i:i+1, j:j+1, :, :].reshape((C, layer.out_channels))
+                dcols_ij = dhidden_flat @ w_ij.T  # (n_rows, C)
+                block = dcols_ij.reshape((batch, out_H, out_W, C))
+                r_start = i
+                r_end = i + out_H * stride_h
+                c_start = j
+                c_end = j + out_W * stride_w
+                dprev[:, r_start:r_end:stride_h, c_start:c_end:stride_w, :] += block
+        return dprev
+
+# --- Max Pooling Layer ---
+class MaxPooling2D[ctype]:
+    """2D Max Pooling layer for CNNs.
+    
+    Reduces spatial dimensions by taking the maximum value in each pooling window.
+    Commonly used after Conv2D layers to reduce computation and control overfitting.
+    
+    Args:
+        pool_size: Size of the pooling window (int or tuple of 2 ints)
+        strides: Stride of the pooling operation (int or tuple of 2 ints)
+                 If None, defaults to pool_size
+        padding: Either 'valid' (no padding) or 'same' (pad to keep spatial dims)
+    """
+    
+    pool_size: tuple[int, int]
+    strides: tuple[int, int]
+    padding: str
+    
+    # Store for backward pass
+    input_shape: tuple[int, int, int, int]
+    max_indices: ctype  # Store which positions had max values
+    output: ctype
+    last_input: ctype
+    
+    def __init__(self, pool_size=(2, 2), strides=None, padding: str = "valid"):
+        # Only support 'valid' padding for now
+        assert padding == "valid", f"MaxPooling2D: only 'valid' padding is currently supported, got {padding}"
+        
+        self.pool_size = pool_size if isinstance(pool_size, tuple) else (pool_size, pool_size)
+        
+        # Default strides to pool_size (non-overlapping pooling)
+        if strides is None:
+            self.strides = self.pool_size
+        else:
+            self.strides = strides if isinstance(strides, tuple) else (strides, strides)
+        
+        self.padding = padding
+    
+    @property
+    def size(self) -> int:
+        """Return flattened output size for compatibility."""
+        if hasattr(self, 'output') and not self.output.is_empty():
+            batch, H, W, C = self.output.shape
+            return H * W * C
+        return 0
+    
+    @property
+    def channels(self) -> int:
+        """Return number of output channels for Sequential model compatibility."""
+        if hasattr(self, 'output') and not self.output.is_empty():
+            batch, H, W, C = self.output.shape
+            return C
+        return 0
+    
+    @property
+    def activation(self) -> str:
+        return "None"
+    
+    def initialize(self, mpc, prev_size: int, *args, **kwargs):
+        """MaxPooling has no learnable parameters."""
+        pass
+    
+    def is_evaluated(self):
+        return not self.output.is_empty()
+    
+    def evaluate(self, mpc, last_output: ctype):
+        MaxPooling2D[ctype]._evaluate(mpc, self, last_output)
+    
+    def derive(self, mpc, prev_output: ctype, dhidden: ctype, LAYER_IDX: Static[int]) -> ctype:
+        return MaxPooling2D[ctype]._derive(mpc, self, prev_output, dhidden, LAYER_IDX=LAYER_IDX)
+    
+    def update(self, mpc, step: float, momentum: float):
+        """MaxPooling has no parameters to update."""
+        pass
+    
+    @sequre
+    def _evaluate(mpc, layer: MaxPooling2D, last_output: ctype):
+        """Forward pass: compute max pooling."""
+        batch, H, W, C = last_output.shape
+        pH, pW = layer.pool_size
+        stride_h, stride_w = layer.strides
+        
+        # Store only a tiny slice (not full input) to save memory;
+        # _derive receives prev_output explicitly and does not read last_input.
+        layer.last_input = last_output[0:1, 0:1, 0:1, 0:1]
+        layer.input_shape = (batch, H, W, C)
+        
+        # Calculate output dimensions
+        out_H = (H - pH) // stride_h + 1
+        out_W = (W - pW) // stride_w + 1
+        
+        # Create output tensor
+        # Initialize with first element of first pool to get the right type
+        output = last_output[:, 0:out_H, 0:out_W, :] * 0
+        
+        # Compute max pooling for each position
+        for b in range(batch):
+            for oh in range(out_H):
+                for ow in range(out_W):
+                    h_start = oh * stride_h
+                    w_start = ow * stride_w
+                    
+                    # Extract pooling window for all channels
+                    pool_region = last_output[b:b+1, h_start:h_start+pH, w_start:w_start+pW, :]
+                    
+                    # For each channel, find max in the pool window using secure maximum
+                    for c in range(C):
+                        channel_region = pool_region[0, :, :, c]
+                        
+                        # Compute maximum securely using iterative comparison
+                        max_val = channel_region[0, 0]
+                        for i in range(pH):
+                            for j in range(pW):
+                                max_val = maximum(mpc, max_val, channel_region[i, j])
+                        
+                        output[b, oh, ow, c] = max_val
+        
+        layer.output = output
+    
+    @sequre
+    def _derive(mpc, layer: MaxPooling2D, prev_output: ctype, dhidden: ctype, LAYER_IDX: Static[int]) -> ctype:
+        """Backward pass: route gradients to positions that had max values."""
+        batch, H, W, C = layer.input_shape
+        pH, pW = layer.pool_size
+        stride_h, stride_w = layer.strides
+        
+        out_H = (H - pH) // stride_h + 1
+        out_W = (W - pW) // stride_w + 1
+        
+        # Initialize gradient tensor with zeros
+        dprev = prev_output * 0
+        
+        # Route gradients back to max positions
+        for b in range(batch):
+            for oh in range(out_H):
+                for ow in range(out_W):
+                    h_start = oh * stride_h
+                    w_start = ow * stride_w
+                    
+                    # Get the pooling window and output gradient
+                    pool_region = prev_output[b:b+1, h_start:h_start+pH, w_start:w_start+pW, :]
+                    grad_out = dhidden[b, oh, ow, :]
+                    
+                    # For each channel, find where max occurred and assign gradient
+                    for c in range(C):
+                        channel_region = pool_region[0, :, :, c]
+                        
+                        # Compute maximum securely using iterative comparison
+                        max_val = channel_region[0, 0]
+                        for i in range(pH):
+                            for j in range(pW):
+                                max_val = maximum(mpc, max_val, channel_region[i, j])
+                        
+                        # Create mask for max positions (handles ties by distributing gradient)
+                        for i in range(pH):
+                            for j in range(pW):
+                                # Use secure comparison to check if this position had the max value
+                                is_max = ((max_val - channel_region[i, j]) < 1e-6).astype(float)
+                                dprev[b, h_start + i, w_start + j, c] += grad_out[c] * is_max
+        
+        if LAYER_IDX == 1:
+            return layer.output
+        
+        return dprev
+
+# --- Flatten Layer ---
+class Flatten[in_ctype, out_ctype]:
+    """Flatten layer to convert multi-dimensional input into a 2D tensor for Dense layers.
+    
+    Uses two type parameters to handle the dimensionality change:
+        in_ctype:  Input tensor type (e.g., ndarray[Tuple[int,int,int,int], float] for 4D)
+        out_ctype: Output tensor type (e.g., ndarray[Tuple[int,int], float] for 2D)
+    
+    For same-dimension pass-through, use identical types for both parameters.
+    """
+    
+    last_input: in_ctype
+    output: out_ctype
+    
+    @property
+    def size(self) -> int:
+        """Return flattened output size."""
+        if hasattr(self, 'output') and not self.output.is_empty():
+            return self.output.shape[1]
+        return 0
+    
+    @property
+    def activation(self) -> str:
+        return "None"
+    
+    def initialize(self, mpc, prev_size: int, *args, **kwargs):
+        """Flatten has no learnable parameters."""
+        pass
+    
+    def is_evaluated(self):
+        return not self.output.is_empty()
+    
+    def evaluate(self, mpc, last_output: in_ctype):
+        Flatten[in_ctype, out_ctype]._evaluate(mpc, self, last_output)
+    
+    def derive(self, mpc, prev_output: in_ctype, dhidden: out_ctype, LAYER_IDX: Static[int]) -> in_ctype:
+        return Flatten[in_ctype, out_ctype]._derive(mpc, self, prev_output, dhidden, LAYER_IDX=LAYER_IDX)
+    
+    def update(self, mpc, step: float, momentum: float):
+        """Flatten has no parameters to update."""
+        pass
+    
+    @sequre
+    def _evaluate(mpc, layer: Flatten, last_output: in_ctype):
+        # Store only a tiny slice to save memory; _derive uses prev_output.shape.
+        layer.last_input = last_output[0:1, 0:1, 0:1, 0:1]
+        batch_size = last_output.shape[0]
+        s = last_output.shape
+        total = 1
+        for i in range(staticlen(s)):
+            total *= s[i]
+        features = total // batch_size
+        layer.output = last_output.reshape((batch_size, features))
+    
+    @sequre
+    def _derive(mpc, layer: Flatten, prev_output: in_ctype, dhidden: out_ctype, LAYER_IDX: Static[int]) -> in_ctype:
+        if LAYER_IDX == 1:
+            return prev_output * 0
+        
+        return dhidden.reshape(prev_output.shape)
+
+# --- Dropout Layer ---
+class Dropout[ctype]:
+    """Dropout layer for regularization.
+    
+    Randomly sets a fraction of input units to 0 during training to prevent overfitting.
+    During inference, all units are kept but scaled by (1 - rate).
+    
+    Args:
+        rate: Fraction of input units to drop (between 0 and 1)
+    """
+    
+    rate: float
+    training: bool
+    mask: ctype
+    output: ctype
+    
+    def __init__(self, rate: float = 0.5):
+        assert 0 <= rate < 1, f"Dropout: rate must be in [0, 1), got {rate}"
+        self.rate = rate
+        self.training = True
+    
+    @property
+    def size(self) -> int:
+        """Return output size for compatibility."""
+        if hasattr(self, 'output') and not self.output.is_empty():
+            total = 1
+            s = self.output.shape
+            for i in range(staticlen(s)):
+                total *= s[i]
+            return total // s[0]
+        return 0
+    
+    @property
+    def activation(self) -> str:
+        return "None"
+    
+    def initialize(self, mpc, prev_size: int, *args, **kwargs):
+        """Dropout has no learnable parameters."""
+        pass
+    
+    def is_evaluated(self):
+        return not self.output.is_empty()
+    
+    def evaluate(self, mpc, last_output: ctype):
+        Dropout[ctype]._evaluate(mpc, self, last_output)
+    
+    def derive(self, mpc, prev_output: ctype, dhidden: ctype, LAYER_IDX: Static[int]) -> ctype:
+        return Dropout[ctype]._derive(mpc, self, prev_output, dhidden, LAYER_IDX=LAYER_IDX)
+    
+    def update(self, mpc, step: float, momentum: float):
+        """Dropout has no parameters to update."""
+        pass
+    
+    @sequre
+    def _evaluate(mpc, layer: Dropout, last_output: ctype):
+        """Forward pass: apply dropout mask."""
+        if layer.training and layer.rate > 0:
+            # Generate random mask (Note: In MPC, true randomness needs special handling)
+            # For now, use a deterministic approach
+            # In practice, this should use secure randomness
+            scale = 1.0 / (1.0 - layer.rate)
+            layer.mask = (last_output > layer.rate).astype(type(last_output._internal_type))
+            layer.output = last_output * layer.mask * scale
+        else:
+            # During inference, use all units
+            layer.output = last_output
+    
+    @sequre
+    def _derive(mpc, layer: Dropout, prev_output: ctype, dhidden: ctype, LAYER_IDX: Static[int]) -> ctype:
+        """Backward pass: apply same mask to gradients."""
+        if LAYER_IDX == 1:
+            return layer.output
+        
+        if layer.training and layer.rate > 0:
+            scale = 1.0 / (1.0 - layer.rate)
+            return dhidden * layer.mask * scale
+        else:
+            return dhidden
+
+
+class BatchNormalization[ctype]:
+    """Batch Normalization layer for stabilizing and accelerating training.
+    
+    Normalizes inputs across the batch dimension to have mean 0 and variance 1,
+    then applies learnable scale (gamma) and shift (beta) parameters.
+    
+    Args:
+        momentum: Momentum for running mean/variance updates
+        epsilon: Small constant for numerical stability
+    """
+    
+    momentum: float
+    epsilon: float
+    
+    # Learnable parameters
+    gamma: ctype  # Scale
+    beta: ctype   # Shift
+    
+    # Running statistics (for inference)
+    running_mean: ctype
+    running_var: ctype
+    
+    # Cached values for backward pass
+    input_normalized: ctype
+    std: ctype
+    output: ctype
+    
+    # Gradients
+    dgamma: ctype
+    dbeta: ctype
+    
+    # Momentum terms
+    vgamma: ctype
+    vbeta: ctype
+    
+    training: bool
+    size: int
+    
+    def __init__(self, momentum: float = 0.99, epsilon: float = 1e-3):
+        self.momentum = momentum
+        self.epsilon = epsilon
+        self.training = True
+    
+    @property
+    def activation(self) -> str:
+        return "None"
+    
+    def initialize(self, mpc, prev_size: int, *args, **kwargs):
+        """Initialize scale, shift, and running statistics."""
+        self.size = prev_size
+        shape = (1, prev_size)
+        
+        # Initialize gamma to 1, beta to 0
+        self.gamma = ctype.ones(shape, mpc)
+        self.beta = ctype.zeros(shape, mpc)
+        
+        # Initialize running statistics
+        self.running_mean = ctype.zeros(shape, mpc)
+        self.running_var = ctype.ones(shape, mpc)
+        
+        # Initialize gradients and momentum
+        self.dgamma = ctype.zeros(shape, mpc)
+        self.dbeta = ctype.zeros(shape, mpc)
+        self.vgamma = ctype.zeros(shape, mpc)
+        self.vbeta = ctype.zeros(shape, mpc)
+    
+    def is_evaluated(self):
+        return not self.output.is_empty()
+    
+    def evaluate(self, mpc, last_output: ctype):
+        BatchNormalization[ctype]._evaluate(mpc, self, last_output)
+    
+    def derive(self, mpc, prev_output: ctype, dhidden: ctype, LAYER_IDX: Static[int]) -> ctype:
+        return BatchNormalization[ctype]._derive(mpc, self, prev_output, dhidden, LAYER_IDX=LAYER_IDX)
+    
+    def update(self, mpc, step: float, momentum: float):
+        BatchNormalization[ctype]._nesterov_update(mpc, self, step, momentum)
+    
+    @sequre
+    def _nesterov_update(mpc, layer: BatchNormalization, step: float, momentum: float):
+        # Update gamma
+        vg_prev = layer.vgamma.copy()
+        layer.vgamma = layer.vgamma * momentum - layer.dgamma * step
+        layer.gamma += layer.vgamma * (momentum + 1) - vg_prev * momentum
+        
+        # Update beta
+        vb_prev = layer.vbeta.copy()
+        layer.vbeta = layer.vbeta * momentum - layer.dbeta * step
+        layer.beta += layer.vbeta * (momentum + 1) - vb_prev * momentum
+    
+    @sequre
+    def _evaluate(mpc, layer: BatchNormalization, last_output: ctype):
+        """Forward pass: normalize and scale."""
+        if layer.training:
+            # Compute batch statistics
+            batch_mean = last_output.mean(axis=0).expand_dims(axis=0)
+            batch_var = ((last_output - batch_mean) ** 2).mean(axis=0).expand_dims(axis=0)
+            
+            # Update running statistics
+            layer.running_mean = layer.momentum * layer.running_mean + (1 - layer.momentum) * batch_mean
+            layer.running_var = layer.momentum * layer.running_var + (1 - layer.momentum) * batch_var
+            
+            # Normalize
+            layer.std = (batch_var + layer.epsilon) ** 0.5
+            layer.input_normalized = (last_output - batch_mean) / layer.std
+        else:
+            # Use running statistics for inference
+            layer.input_normalized = (last_output - layer.running_mean) / ((layer.running_var + layer.epsilon) ** 0.5)
+        
+        # Scale and shift
+        layer.output = layer.gamma * layer.input_normalized + layer.beta
+    
+    @sequre
+    def _derive(mpc, layer: BatchNormalization, prev_output: ctype, dhidden: ctype, LAYER_IDX: Static[int]) -> ctype:
+        """Backward pass: compute gradients."""
+        batch_size = float(prev_output.shape[0])
+        
+        # Gradient w.r.t. gamma and beta
+        layer.dgamma = (dhidden * layer.input_normalized).sum(axis=0).expand_dims(axis=0)
+        layer.dbeta = dhidden.sum(axis=0).expand_dims(axis=0)
+        
+        if LAYER_IDX == 1:
+            return layer.output
+        
+        # Gradient w.r.t. input
+        dinput_normalized = dhidden * layer.gamma
+        
+        # Gradient w.r.t. variance
+        dvar = ((dinput_normalized * (prev_output - layer.running_mean)) * (-0.5) * (layer.std ** -3)).sum(axis=0).expand_dims(axis=0)
+        
+        # Gradient w.r.t. mean
+        dmean = (dinput_normalized * (-1.0 / layer.std)).sum(axis=0).expand_dims(axis=0) + dvar * ((-2.0 / batch_size) * (prev_output - layer.running_mean)).sum(axis=0).expand_dims(axis=0)
+        
+        # Gradient w.r.t. input
+        dprev = dinput_normalized / layer.std + dvar * (2.0 / batch_size) * (prev_output - layer.running_mean) + dmean / batch_size
+        
+        return dprev

@@ -1,0 +1,229 @@
+"""
+ChestMNIST CNN - Secure Multi-Party Computation (Mini-Batch)
+=============================================================
+Strided convolutions (no MaxPooling) for faster MPC training.
+
+Architecture
+------------
+    Input (N, 28, 28, 1)
+      -> Conv2D(8, 3x3, stride=2, relu)   -> (N, 13, 13, 8)
+      -> Conv2D(16, 3x3, stride=2, relu)  -> (N, 6, 6, 16)
+      -> Flatten                           -> (N, 576)
+      -> Dense(64, relu)
+      -> Dropout(0.2)
+      -> Dense(14, linear)                -> multi-label logits
+
+Loss: binary_crossentropy   (labels in {0, 1})
+"""
+
+from sequre import sequre, local
+from sequre.stdlib.learn.neural_net.layers import (
+    Input, Conv2D, Flatten, Dense, Dropout,
+)
+from sequre.stdlib.learn.neural_net.loss import loss, dloss
+from sequre.stdlib.builtin import clip
+from numpy.create import loadtxt, zeros
+from numpy.ndarray import ndarray
+
+# -- Type aliases --
+ndarray_4d = ndarray[Tuple[int, int, int, int], float]
+ndarray_2d = ndarray[Tuple[int, int], float]
+
+# BCE interval for Chebyshev approximation of log
+BCE_INTERVAL = (0.001, 1.0)
+
+
+# -- Data helpers --
+def load_chestmnist(images_path: str, labels_path: str, n: int):
+    """Load flat images and binarised labels, return 4-D X and 2-D y."""
+    X = loadtxt(images_path, shape=(n, 784), dtype=float).reshape((n, 28, 28, 1))
+    labs = loadtxt(labels_path, shape=(n, 14), dtype=float)
+    return X, labs
+
+
+# -- Forward pass helper --
+def forward(mpc, X: ndarray_4d,
+            input_layer: Input[ndarray_4d],
+            conv1: Conv2D[ndarray_4d],
+            conv2: Conv2D[ndarray_4d],
+            flatten: Flatten[ndarray_4d, ndarray_2d],
+            dense1: Dense[ndarray_2d],
+            dropout: Dropout[ndarray_2d],
+            dense2: Dense[ndarray_2d]):
+    input_layer.evaluate(mpc, X)
+    conv1.evaluate(mpc, input_layer.output)
+    conv2.evaluate(mpc, conv1.output)
+    flatten.evaluate(mpc, conv2.output)
+    dense1.evaluate(mpc, flatten.output)
+    dropout.evaluate(mpc, dense1.output)
+    dense2.evaluate(mpc, dropout.output)
+
+
+# -- Backward pass helper --
+def backward(mpc, y_batch: ndarray_2d,
+             input_layer: Input[ndarray_4d],
+             conv1: Conv2D[ndarray_4d],
+             conv2: Conv2D[ndarray_4d],
+             flatten: Flatten[ndarray_4d, ndarray_2d],
+             dense1: Dense[ndarray_2d],
+             dropout: Dropout[ndarray_2d],
+             dense2: Dense[ndarray_2d]):
+    clipped_output = clip(mpc, dense2.output, 0.001, 0.999)
+    grad = dloss(mpc, y_batch, clipped_output,
+                 "binary_crossentropy", BCE_INTERVAL)
+    grad = dense2.derive(mpc, dropout.output, grad, LAYER_IDX=6)
+    grad = dropout.derive(mpc, dense1.output, grad, LAYER_IDX=5)
+    grad = dense1.derive(mpc, flatten.output, grad, LAYER_IDX=4)
+    grad_4d = flatten.derive(mpc, conv2.output, grad, LAYER_IDX=3)
+    grad_4d = conv2.derive(mpc, conv1.output, grad_4d, LAYER_IDX=2)
+    conv1.derive(mpc, input_layer.output, grad_4d, LAYER_IDX=1)
+
+
+# -- Main --
+@local
+def chestmnist_cnn(mpc):
+    # -- Configuration --
+    N_TRAIN    = 10000
+    N_TEST     = 3000
+    BATCH_SIZE = 512
+    EPOCHS     = 5
+    LR         = 0.001
+    MOMENTUM   = 0.9
+
+    # -- Load data --
+    print("Loading ChestMNIST data ...")
+    X_train, y_train = load_chestmnist(
+        "data/chestmnist/train_images.txt",
+        "data/chestmnist/train_labels.txt", N_TRAIN)
+    X_test, y_test = load_chestmnist(
+        "data/chestmnist/test_images.txt",
+        "data/chestmnist/test_labels.txt", N_TEST)
+
+    print(f"  Train  X={X_train.shape}  y={y_train.shape}")
+    print(f"  Test   X={X_test.shape}   y={y_test.shape}")
+
+    n_batches = (N_TRAIN + BATCH_SIZE - 1) // BATCH_SIZE
+
+    # -- Build layers (strided conv - no MaxPooling) --
+    input_layer = Input[ndarray_4d](784)
+
+    conv1 = Conv2D[ndarray_4d]("relu", out_channels=8,
+                                kernel_size=(3, 3), stride=(2, 2))
+    conv1.initialize(mpc, 1)
+
+    conv2 = Conv2D[ndarray_4d]("relu", out_channels=16,
+                                kernel_size=(3, 3), stride=(2, 2))
+    conv2.initialize(mpc, 8)
+
+    flatten = Flatten[ndarray_4d, ndarray_2d]()
+
+    # 6*6*16 = 576 features after flatten
+    dense1 = Dense[ndarray_2d]("relu", size=64)
+    dense1.initialize(mpc, 576)
+
+    dropout = Dropout[ndarray_2d](0.2)
+
+    dense2 = Dense[ndarray_2d]("linear", size=14)
+    dense2.initialize(mpc, 64)
+
+    print("\nArchitecture (strided conv - no MaxPooling)")
+    print("  Input  -> (N, 28, 28, 1)")
+    print("  Conv2D(8, 3x3, stride=2, relu)  -> (N, 13, 13, 8)")
+    print("  Conv2D(16, 3x3, stride=2, relu) -> (N, 6, 6, 16)")
+    print("  Flatten                          -> (N, 576)")
+    print("  Dense(64, relu)")
+    print("  Dropout(0.2)")
+    print("  Dense(14, linear)")
+    print("  Loss: binary_crossentropy (mini-batch)")
+
+    print(f"\nTraining: {EPOCHS} epochs, lr={LR}, momentum={MOMENTUM}, "
+          f"batch_size={BATCH_SIZE}, batches/epoch={n_batches}")
+    print("-" * 60)
+
+    # -- Mini-Batch Training --
+    for epoch in range(EPOCHS):
+        epoch_loss = 0.0
+
+        for b in range(n_batches):
+            start = b * BATCH_SIZE
+            end = start + BATCH_SIZE
+            if end > N_TRAIN:
+                end = N_TRAIN
+
+            X_batch = X_train[start:end, :, :, :]
+            y_batch = y_train[start:end, :]
+
+            # Forward
+            forward(mpc, X_batch, input_layer,
+                    conv1, conv2,
+                    flatten, dense1, dropout, dense2)
+
+            # Loss
+            clipped = clip(mpc, dense2.output, 0.001, 0.999)
+            batch_loss = loss(mpc, y_batch, clipped,
+                              "binary_crossentropy", BCE_INTERVAL)
+            epoch_loss += batch_loss.reveal(mpc).sum()
+
+            # Backward
+            backward(mpc, y_batch, input_layer,
+                     conv1, conv2,
+                     flatten, dense1, dropout, dense2)
+
+            # Update weights
+            conv1.update(mpc, LR, MOMENTUM)
+            conv2.update(mpc, LR, MOMENTUM)
+            dense1.update(mpc, LR, MOMENTUM)
+            dense2.update(mpc, LR, MOMENTUM)
+
+        print(f"  Epoch {epoch + 1}/{EPOCHS}  "
+              f"bce_loss = {epoch_loss:.6f}  "
+              f"({n_batches} batches)")
+
+    # -- Evaluation (test set only) --
+    dropout.training = False
+
+    n_test_batches = (N_TEST + BATCH_SIZE - 1) // BATCH_SIZE
+    test_correct = 0
+    test_total = 0
+    test_loss_sum = 0.0
+    for b in range(n_test_batches):
+        start = b * BATCH_SIZE
+        end = start + BATCH_SIZE
+        if end > N_TEST:
+            end = N_TEST
+
+        X_batch = X_test[start:end, :, :, :]
+        y_batch = y_test[start:end, :]
+
+        forward(mpc, X_batch, input_layer,
+                conv1, conv2,
+                flatten, dense1, dropout, dense2)
+
+        probs = clip(mpc, dense2.output, 0.001, 0.999).reveal(mpc)
+        bl = loss(mpc, y_batch,
+                  clip(mpc, dense2.output, 0.001, 0.999),
+                  "binary_crossentropy", BCE_INTERVAL)
+        test_loss_sum += bl.reveal(mpc).sum()
+
+        bs = end - start
+        for i in range(bs):
+            for j in range(14):
+                pred = 1.0 if probs[i, j] > 0.5 else 0.0
+                if pred == y_batch[i, j]:
+                    test_correct += 1
+                test_total += 1
+
+    test_acc = float(test_correct) / float(test_total)
+
+    # -- Report --
+    print("\n" + "=" * 60)
+    print("Results")
+    print("=" * 60)
+    print(f"  Test   accuracy: {test_acc:.4f}   "
+          f"bce-loss: {test_loss_sum:.6f}")
+    print(f"  Config: {N_TRAIN} train, {N_TEST} test, "
+          f"batch_size={BATCH_SIZE}, epochs={EPOCHS}")
+
+
+if __name__ == "__main__":
+    chestmnist_cnn()
