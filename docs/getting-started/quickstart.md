@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- **Linux** (x86_64). macOS (Darwin) builds are currently disabled.
+- **Linux** (x86_64, aarch64) or **macOS** (Apple Silicon / arm64).
 
 ## 1. Install Sequre
 

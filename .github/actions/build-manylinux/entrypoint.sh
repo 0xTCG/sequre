@@ -17,12 +17,12 @@ mkdir $HOME/.sequre
 cd $HOME/.sequre
 curl -L https://github.com/exaloop/codon/releases/download/v0.17.0/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - --strip-components=1
 mkdir -p $OPT
-LLVM_TAR=$(curl -L https://github.com/exaloop/llvm-project/releases/download/codon-15.0.1/llvm-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz -o /tmp/llvm.tar.gz && echo /tmp/llvm.tar.gz)
-LLVM_TOP=$(tar tzf "$LLVM_TAR" | head -1 | cut -d/ -f1)
+LLVM_TAR=$(curl -L https://github.com/exaloop/llvm-project/releases/download/codon-20.1.7/llvm-codon-20.1.7-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.bz2 -o /tmp/llvm.tar.bz2 && echo /tmp/llvm.tar.bz2)
+LLVM_TOP=$(tar -tjf "$LLVM_TAR" | head -1 | cut -d/ -f1)
 if [ "$LLVM_TOP" = "opt" ]; then
-  tar zxvf "$LLVM_TAR" -C /
+  tar -jxvf "$LLVM_TAR" -C /
 else
-  tar zxvf "$LLVM_TAR" -C $OPT
+  tar -jxvf "$LLVM_TAR" -C $OPT
 fi
 rm -f "$LLVM_TAR"
 cd $HOME
@@ -52,6 +52,18 @@ else
 fi
 cmake --install build --prefix=$HOME/.sequre/lib/codon/plugins/sequre
 
+# Sequre's numpy is a fork, not patches — Sequre's ndarray is
+# defined differently and is incompatible with Codon's own (for now; the
+# plan is to eventually migrate Sequre to use Codon's numpy directly).
+# `import numpy` resolves from $CODON_PATH/lib/codon/stdlib
+# (the package root), not from the plugin's stdlib dir, so Codon's numpy/ is
+# wholesale replaced here rather than merged file-by-file, to avoid leaving
+# any of Codon's original numpy files behind referencing a mismatched
+# ndarray type.
+CODON_STDLIB=$HOME/.sequre/lib/codon/stdlib
+rm -rf $CODON_STDLIB/numpy
+cp -r $1/stdlib/numpy $CODON_STDLIB/numpy
+
 # Build sequre launcher binary
 $CC -O2 -o $HOME/.sequre/bin/sequre $1/sequre_launcher.c
 
@@ -63,5 +75,13 @@ case "$(uname -s)" in
   *)       cp $1/external/GMP/lib/libgmp.so     $SEQURE_PREFIX/lib/libgmp.so    ;;
 esac
 
-tar czvf sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz -C $HOME/.sequre bin/sequre lib/codon/plugins/sequre lib/codon/plugins/seq
+# Note: only Sequre's own files are included (not the whole lib/codon/stdlib
+# tree) so the tarball stays scoped to Sequre's own files; install.sh
+# extracts Codon itself separately, and removes Codon's own numpy/ before
+# extracting this tarball so Sequre's fork fully replaces it.
+tar czvf sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz -C $HOME/.sequre \
+  bin/sequre \
+  lib/codon/plugins/sequre \
+  lib/codon/plugins/seq \
+  lib/codon/stdlib/numpy
 echo "Done"

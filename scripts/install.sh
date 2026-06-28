@@ -6,13 +6,18 @@ SEQURE_INSTALL_DIR=~/.sequre
 OS=$(uname -s | awk '{print tolower($0)}')
 ARCH=$(uname -m)
 
-if [ "$OS" != "linux" ]; then
-  echo "error: Pre-built binaries only exist for Linux (x86_64, aarch64)." >&2
-  exit 1
-fi
-
-if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
-  echo "error: Pre-built binaries only exist for x86_64 and aarch64." >&2
+if [ "$OS" = "linux" ]; then
+  if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
+    echo "error: Pre-built binaries for Linux only exist for x86_64 and aarch64." >&2
+    exit 1
+  fi
+elif [ "$OS" = "darwin" ]; then
+  if [ "$ARCH" != "arm64" ]; then
+    echo "error: Pre-built binaries for macOS only exist for Apple Silicon (arm64)." >&2
+    exit 1
+  fi
+else
+  echo "error: Pre-built binaries only exist for Linux (x86_64, aarch64) and macOS (arm64)." >&2
   exit 1
 fi
 
@@ -28,6 +33,11 @@ cd "$SEQURE_INSTALL_DIR"
 # 1. Install Codon runtime
 echo "Downloading Codon $CODON_VERSION ..."
 curl -L "https://github.com/exaloop/codon/releases/download/$CODON_VERSION/$CODON_BUILD_ARCHIVE" | tar zxvf - --strip-components=1
+
+# Sequre's numpy is a fork, not a patch (its ndarray is defined differently
+# and is incompatible with Codon's own), so it fully replaces Codon's numpy/
+# rather than being merged into it.
+rm -rf lib/codon/stdlib/numpy
 
 # 2. Install Sequre (plugin + launcher) on top
 echo "Downloading Sequre ..."

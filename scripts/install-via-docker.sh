@@ -46,20 +46,21 @@ fi
 # Detect architecture
 ARCH=$(uname -m)
 case "$ARCH" in
-  x86_64)  DOCKER_IMAGE="sequre-builder-x86_64" ;;
-  aarch64) DOCKER_IMAGE="sequre-builder-aarch64" ;;
+  x86_64)        DOCKERFILE_ARCH="x86_64" ;;
+  aarch64|arm64) DOCKERFILE_ARCH="aarch64" ;;
   *)
     echo "Error: Unsupported architecture: $ARCH"
     exit 1
     ;;
 esac
+DOCKER_IMAGE="sequre-builder-$DOCKERFILE_ARCH"
 
 # Build Docker image if it doesn't exist or --rebuild requested (caches Codon/LLVM/seq)
 if [ "$REBUILD_IMAGE" = "1" ] || ! docker image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
   echo "Building Docker image $DOCKER_IMAGE (this caches Codon/LLVM/seq for future builds)..."
   docker build \
     -t "$DOCKER_IMAGE" \
-    -f "$SEQURE_SRC/docker/local-build/Dockerfile.$ARCH" \
+    -f "$SEQURE_SRC/docker/local-build/Dockerfile.$DOCKERFILE_ARCH" \
     "$SEQURE_SRC/docker/local-build"
 fi
 

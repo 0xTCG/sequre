@@ -1,12 +1,15 @@
+import internal.static as static
+
 """
 Ported from https://github.com/tuneinsight/lattigo/tree/master/ring
 """
 import prg
+from patch import *  # @extend Vec: adds u64xN.fdiv(u64xN) -> f64xN
 
 from copy import copy
-from experimental.simd import Vec
-from numpy.create import zeros
-from numpy.ndarray import ndarray
+from simd import Vec
+from sequre.stdlib.numpy.create import zeros
+from sequre.stdlib.numpy.ndarray import ndarray
 
 import utils
 
@@ -198,7 +201,7 @@ def _mm_inv_mform(a: u64xN, q: u64xN, q_inv: u64xN) -> u64xN:
 # required for mred.
 def mred_params(q):
 	q_inv = u64(1)
-	for _ in staticrange(63):
+	for _ in static.range(63):
 		q_inv *= q
 		q *= q
 
@@ -321,7 +324,7 @@ def factorization_pollards_rho(m):
     # c is used to change the ring in Pollard's Rho algorithm,
     # Every time the algorithm fails to get a factor, c is increased and a retry starts,
     # because Pollard's Rho algorithm sometimes will miss some small prime factors.
-    for c in staticrange(1, 10):
+    for c in static.range(1, 10):
         x, y, d = u64(2), u64(2), u64(1)
 
         while d != u64(0):
@@ -679,7 +682,7 @@ def _mm_inv_ntt_core_v8u64(
     j = 0
     # Copy the result of the first round of butterflies on p2 with approximate reduction
     for i in range(h, h << 1, 8):
-        for j1 in staticrange(8):
+        for j1 in static.range(8):
             j2 = j + j1 * 2 
             coeffs_out_scattered[j2], coeffs_out_scattered[j2 + 1] = invbutterfly(
                 coeffs_in_scattered[j2], coeffs_in_scattered[j2 + 1], ntt_psi_inv[i + j1], two_q, four_q, q, q_inv)
@@ -807,6 +810,28 @@ class Poly:
     _buf_coeffs: list[list[u64]]
     is_ntt: bool
     is_mform: bool
+
+    def __init__(
+            self,
+            _ndarray: ndarray[Tuple[int, int], u64xN],
+            _mm_coeffs: list[list[u64xN]],
+            _buf_coeffs: list[list[u64]],
+            is_ntt: bool = False,
+            is_mform: bool = False):
+        self._ndarray = _ndarray
+        self._mm_coeffs = _mm_coeffs
+        self._buf_coeffs = _buf_coeffs
+        self.is_ntt = is_ntt
+        self.is_mform = is_mform
+
+    def __init__(self):
+        _ndarray = zeros((0, 0), dtype=u64xN)
+        _mm_coeffs = _ndarray.to_list()
+        self._ndarray = _ndarray
+        self._mm_coeffs = _mm_coeffs
+        self._buf_coeffs = []
+        self.is_ntt = False
+        self.is_mform = False
 
     def __bool__(self):
         return len(self._buf_coeffs) > 0
@@ -1023,6 +1048,9 @@ class Ring:
 
     ntt_type: str
 
+    def __init__(self, n: int = 0):
+        self.n = n
+
     def __bool__(self):
         return bool(self.n)
     
@@ -1045,6 +1073,8 @@ class Ring:
         self.aided_mod_const = list[u64](len(modulus))
         self._mm_modulus = list[u64xN](len(modulus))
         self.mask = list[u64](len(modulus))
+        self._mm_bred_params = list[Tuple[u64xN, u64xN]](len(modulus))
+        self._mm_mred_params = list[u64xN](len(modulus))
 
         for qi in modulus:
             self.modulus.append(qi)
@@ -1136,6 +1166,7 @@ class Ring:
         self.ntt_psi = [[] for _ in range(len(self.modulus))]
         self.ntt_psi_inv = [[] for _ in range(len(self.modulus))]
         self.ntt_n_inv = list[u64](len(self.modulus))
+        self._mm_ntt_n_inv = list[u64xN](len(self.modulus))
 
         log_nth_root = int((nth_root >> u64(1)).bitlen()) - 1
 
@@ -1359,7 +1390,7 @@ class Ring:
     # mul_scalar_bigint_lvl muliplies each coefficient of p1 by a big.Int scalar
     # for the moduli from q_0 up to q_level and writes the result on p2.
     def _mm_mul_scalar_bigint_lvl(self, level, p1, scalar, p2):
-        @par(num_threads=NUM_THREADS)
+        # NOTE: Keep this serial to avoid alias/capture issues with Poly-backed buffers in OpenMP outlining.
         for i in range(level + 1):
             _mm_scalarQi = u64xN(scalar.__fast_mod_aided_64_bits_mod_const(self.modulus[i], self.aided_mod_const[i]))
             _mm_m = _mm_mform(_mm_bred_add(_mm_scalarQi, self._mm_modulus[i], self._mm_bred_params[i][0]), self._mm_modulus[i], self._mm_bred_params[i])
@@ -1639,7 +1670,7 @@ def _mm_mul_sum(
         v: u64xN, y: list[u64xN],
         pj_const: u64xN, q_inv_const: u64xN,
         vtimesqmodp: list[u64], qoverqimodp: list[u64xN]):
-    r = u64xN(u64(0)).zext_double()
+    r = u64xN(u64(0)).cast(u128)
     # Accumulates the sum on uint128 and does a lazy montgomery reduction at the end
     for i in range(len(y)): r = r + y[i].zext_mul(qoverqimodp[i])
 
@@ -1655,7 +1686,7 @@ def _mm_reconstruct_rns(
 
     for i in range(len(p_row)):
         y.append(_mm_mred(p_row[i], qb_mont[i], q[i], q_inv[i]))
-        v = v + (y[i] / q[i])
+        v = v + y[i].fdiv(q[i])
     
     return v.to_u64(), y
 
@@ -1682,6 +1713,16 @@ class BasisExtender:
 
     buff_q: Poly
     buff_p: Poly
+
+    def __init__(self):
+        self.ring_q = Ring()
+        self.ring_p = Ring()
+        self.params_q_to_p = []
+        self.params_p_to_q = []
+        self._mm_mod_down_params_p_to_q = []
+        self.mod_down_params_q_to_p = []
+        self.buff_q = Poly()
+        self.buff_p = Poly()
 
     def __repr__(self) -> str:
         return f"""\tBasisExtender:
@@ -1778,7 +1819,7 @@ class GaussianSampler(Static[BaseSampler]):
         for _ in range(_mm_n):        
             _mm_coeff_uint, _mm_sign = self._mm_norm_u64(_mm_sigma, _mm_bound)
             for i in range(level + 1):
-                yield _mm_coeff_uint.mask(_mm_sign, _mm_modulus[i] - _mm_coeff_uint)
+                yield _mm_coeff_uint.mask_no_trunc(_mm_sign, _mm_modulus[i] - _mm_coeff_uint)
     
     # Read samples a truncated Gaussian polynomial on "pol" at the maximum level in the default ring, standard deviation and bound.
     def _mm_read(self, pol: Poly):
@@ -1823,6 +1864,27 @@ class TernarySampler(Static[BaseSampler]):
     p: float
     hw: int
     sample_name: str
+
+    def __init__(
+            self,
+            prng,
+            base_ring,
+            matrix_proba: Optional[list[list[u8]]] = None,
+            matrix_values: Optional[list[list[u64]]] = None,
+            p: float = 0.0,
+            hw: int = 0,
+            sample_name: str = ""):
+        if matrix_proba is None:
+            matrix_proba = list[list[u8]]()
+        if matrix_values is None:
+            matrix_values = list[list[u64]]()
+        self.prng = prng
+        self.base_ring = base_ring
+        self.matrix_proba = matrix_proba
+        self.matrix_values = matrix_values
+        self.p = p
+        self.hw = hw
+        self.sample_name = sample_name
 
     def __repr__(self) -> str:
         return f"""\tTernarySampler:
@@ -2097,7 +2159,7 @@ def new_gaussian_sampler(prng, base_ring, sigma, bound):
         prng=prng,
         base_ring=base_ring,
         _mm_sigma=f64xN(sigma),
-        _mm_bound=u64xN(bound))
+        _mm_bound=u64xN(u64(bound)))
 
 
 # NewTernarySamplerWithHammingWeight creates a new instance of a fixed-hamming-weight TernarySampler from a PRNG, the ring definition and the desired
@@ -2137,6 +2199,11 @@ class Decomposer:
     ring_q: Ring
     ring_p: Ring
     mod_up_params: list[list[list[ModupParams]]]
+
+    def __init__(self, ring_q: Ring, ring_p: Ring):
+        self.ring_q = ring_q
+        self.ring_p = ring_p
+        self.mod_up_params = []
 
     # decompose_and_split decomposes a polynomial p(x) in basis q, reduces it modulo qi, and returns
     # the result in basis QP separately.
@@ -2190,7 +2257,7 @@ class Decomposer:
                     _mm_p1_q_coeffs[x][j] = _mm_p0_q_coeffs[x][j]
                     y[i] = _mm_mred(_mm_p0_q_coeffs[x][j], params._mm_qoverqiinvqi[i], q[j], mred_params_q[j])
                     # Computation of the correction term v * q%pi
-                    vf = vf + y[i] / q[j]
+                    vf = vf + y[i].fdiv(q[j])
                     i, j = i + 1, j + 1
 
                 # Index of the correction term
@@ -2222,10 +2289,7 @@ class Decomposer:
 
 # NewDecomposer creates a new Decomposer.
 def new_decomposer(ring_q: Ring, ring_p: Ring):
-    decomposer = Decomposer()
-
-    decomposer.ring_q = ring_q
-    decomposer.ring_p = ring_p
+    decomposer = Decomposer(ring_q, ring_p)
 
     q = ring_q.modulus
 

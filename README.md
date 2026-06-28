@@ -18,7 +18,7 @@ Write Python-like code; the Sequre compiler handles encrypted arithmetic and int
 
 ## Quick start
 
-**Supported platforms:** Linux (x86_64). macOS (Darwin) builds are currently disabled.
+**Supported platforms:** Linux (x86_64, aarch64) and macOS (Apple Silicon / arm64).
 
 Install Sequre (includes Codon):
 
