@@ -15,7 +15,7 @@ esac
 
 mkdir $HOME/.sequre
 cd $HOME/.sequre
-curl -L https://github.com/exaloop/codon/releases/download/v0.17.0/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - --strip-components=1
+curl -L https://github.com/exaloop/codon/releases/download/v0.19.6/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - --strip-components=1
 mkdir -p $OPT
 LLVM_TAR=$(curl -L https://github.com/exaloop/llvm-project/releases/download/codon-20.1.7/llvm-codon-20.1.7-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.bz2 -o /tmp/llvm.tar.bz2 && echo /tmp/llvm.tar.bz2)
 LLVM_TOP=$(tar -tjf "$LLVM_TAR" | head -1 | cut -d/ -f1)

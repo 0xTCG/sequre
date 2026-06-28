@@ -15,7 +15,7 @@ This installs Codon and Sequre to `~/.sequre` and adds it to your `PATH`.
 ??? note "Manual install"
     ```bash
     mkdir -p $HOME/.sequre
-    curl -L https://github.com/exaloop/codon/releases/download/v0.17.0/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz \
+    curl -L https://github.com/exaloop/codon/releases/download/v0.19.6/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz \
       | tar zxvf - -C $HOME/.sequre --strip-components=1
     curl -L https://github.com/0xTCG/sequre/releases/latest/download/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz \
       | tar zxvf - -C $HOME/.sequre

@@ -21,7 +21,7 @@ else
   exit 1
 fi
 
-CODON_VERSION=v0.17.0
+CODON_VERSION=v0.19.6
 CODON_BUILD_ARCHIVE=codon-$OS-$ARCH.tar.gz
 SEQURE_BUILD_ARCHIVE=sequre-$OS-$ARCH.tar.gz
 
