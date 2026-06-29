@@ -28,13 +28,40 @@ rm -f "$LLVM_TAR"
 cd $HOME
 curl -L https://github.com/exaloop/seq/releases/download/v0.11.3/seq-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C .sequre/lib/codon/plugins
 
-# Use LLVM-codon clang on Linux; system clang on macOS (darwin LLVM tarball has no clang)
+# Pick the C/C++ compiler:
+#  - macOS: Apple's system clang. It knows the SDK sysroot for both the plugin
+#    build and the standalone launcher. (The LLVM-codon darwin tarball now ships
+#    a clang too, but it has no default sysroot, so system headers like glob.h
+#    are not found when building the launcher directly.)
+#  - Linux: the LLVM-codon clang, to match the bundled LLVM toolchain.
+case "$(uname -s)" in
+  Darwin*)
+    CC=$(command -v clang)
+    CXX=$(command -v clang++)
+    ;;
+  *)
+    if [ -f "$OPT/llvm-codon/bin/clang" ]; then
+      CC=$OPT/llvm-codon/bin/clang
+      CXX=$OPT/llvm-codon/bin/clang++
+    else
+      CC=$(command -v clang)
+      CXX=$(command -v clang++)
+    fi
+    ;;
+esac
+
+# On manylinux_2_28 the default toolchain is a gcc-toolset under /opt/rh, which
+# the LLVM-codon clang does not auto-detect, so it cannot find libstdc++ (or the
+# C++20 headers) when linking the plugin. Point clang at it via a config file,
+# matching how Codon builds its own plugins (see exaloop/codon
+# .github/build-linux/Dockerfile.linux-x86_64). No-op off manylinux: the glob is
+# empty (e.g. on macOS), so no config file is written.
 if [ -f "$OPT/llvm-codon/bin/clang" ]; then
-  CC=$OPT/llvm-codon/bin/clang
-  CXX=$OPT/llvm-codon/bin/clang++
-else
-  CC=$(command -v clang)
-  CXX=$(command -v clang++)
+  GCC_INSTALL_DIR=$(ls -d /opt/rh/gcc-toolset-*/root/usr/lib/gcc/*/* 2>/dev/null | sort -V | tail -1)
+  if [ -n "$GCC_INSTALL_DIR" ]; then
+    echo "--gcc-install-dir=$GCC_INSTALL_DIR" > "$OPT/llvm-codon/bin/clang.cfg"
+    echo "--gcc-install-dir=$GCC_INSTALL_DIR" > "$OPT/llvm-codon/bin/clang++.cfg"
+  fi
 fi
 
 cd $1
