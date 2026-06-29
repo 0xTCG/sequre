@@ -33,17 +33,12 @@ fi
 
 cmake --install build --prefix=$HOME/.sequre/lib/codon/plugins/sequre
 
-# Sequre's numpy is a fork, not a patch — Sequre's ndarray is
-# defined differently and is incompatible with Codon's own (for now; the
-# plan is to eventually migrate Sequre to use Codon's numpy directly).
-# `import numpy` resolves from $CODON_PATH/lib/codon/stdlib
-# (the package root), not from the plugin's stdlib dir, so Codon's numpy/ is
-# wholesale replaced here rather than merged file-by-file, to avoid leaving
-# any of Codon's original numpy files behind referencing a mismatched
-# ndarray type.
-CODON_STDLIB=$HOME/.sequre/lib/codon/stdlib
-rm -rf "$CODON_STDLIB/numpy"
-cp -r "$SRC/stdlib/numpy" "$CODON_STDLIB/numpy"
+# Sequre's numpy is a fork (its ndarray is defined differently and is
+# incompatible with Codon's own; for now — the plan is to eventually migrate
+# Sequre to use Codon's numpy directly). It is shipped inside the plugin (via
+# the `install(DIRECTORY stdlib ...)` rule) and imported exclusively through
+# the `sequre.stdlib.numpy` namespace, so it never collides with Codon's
+# native `numpy`, which is left intact.
 
 # Build sequre launcher binary
 $CC -O2 -o $HOME/.sequre/bin/sequre "$SRC/sequre_launcher.c"

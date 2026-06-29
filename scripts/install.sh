@@ -34,10 +34,10 @@ cd "$SEQURE_INSTALL_DIR"
 echo "Downloading Codon $CODON_VERSION ..."
 curl -L "https://github.com/exaloop/codon/releases/download/$CODON_VERSION/$CODON_BUILD_ARCHIVE" | tar zxvf - --strip-components=1
 
-# Sequre's numpy is a fork, not a patch (its ndarray is defined differently
-# and is incompatible with Codon's own), so it fully replaces Codon's numpy/
-# rather than being merged into it.
-rm -rf lib/codon/stdlib/numpy
+# Sequre's numpy is a fork (its ndarray is defined differently and is
+# incompatible with Codon's own). It ships inside the plugin and is imported
+# exclusively via the `sequre.stdlib.numpy` namespace, so it no longer
+# collides with Codon's native `numpy` — Codon's own numpy/ is left intact.
 
 # 2. Install Sequre (plugin + launcher) on top
 echo "Downloading Sequre ..."

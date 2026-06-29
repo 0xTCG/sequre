@@ -79,17 +79,12 @@ else
 fi
 cmake --install build --prefix=$HOME/.sequre/lib/codon/plugins/sequre
 
-# Sequre's numpy is a fork, not patches — Sequre's ndarray is
-# defined differently and is incompatible with Codon's own (for now; the
-# plan is to eventually migrate Sequre to use Codon's numpy directly).
-# `import numpy` resolves from $CODON_PATH/lib/codon/stdlib
-# (the package root), not from the plugin's stdlib dir, so Codon's numpy/ is
-# wholesale replaced here rather than merged file-by-file, to avoid leaving
-# any of Codon's original numpy files behind referencing a mismatched
-# ndarray type.
-CODON_STDLIB=$HOME/.sequre/lib/codon/stdlib
-rm -rf $CODON_STDLIB/numpy
-cp -r $1/stdlib/numpy $CODON_STDLIB/numpy
+# Sequre's numpy is a fork (its ndarray is defined differently and is
+# incompatible with Codon's own; for now — the plan is to eventually migrate
+# Sequre to use Codon's numpy directly). It is shipped inside the plugin (via
+# the `install(DIRECTORY stdlib ...)` rule) and imported exclusively through
+# the `sequre.stdlib.numpy` namespace, so it never collides with Codon's
+# native `numpy`, which is left intact.
 
 # Build sequre launcher binary
 $CC -O2 -o $HOME/.sequre/bin/sequre $1/sequre_launcher.c
@@ -103,12 +98,12 @@ case "$(uname -s)" in
 esac
 
 # Note: only Sequre's own files are included (not the whole lib/codon/stdlib
-# tree) so the tarball stays scoped to Sequre's own files; install.sh
-# extracts Codon itself separately, and removes Codon's own numpy/ before
-# extracting this tarball so Sequre's fork fully replaces it.
+# tree) so the tarball stays scoped to Sequre's own files; install.sh extracts
+# Codon itself separately. Sequre's numpy fork travels inside the plugin
+# (lib/codon/plugins/sequre/stdlib/numpy), so Codon's native numpy/ is neither
+# bundled nor replaced.
 tar czvf sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz -C $HOME/.sequre \
   bin/sequre \
   lib/codon/plugins/sequre \
-  lib/codon/plugins/seq \
-  lib/codon/stdlib/numpy
+  lib/codon/plugins/seq
 echo "Done"

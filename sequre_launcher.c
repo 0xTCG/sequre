@@ -408,6 +408,37 @@ static void maybe_set_codon_python(void) {
   }
 }
 
+/* Point SEQURE_GMP_PATH at the libgmp bundled inside the plugin
+ * (<plugin>/lib/libgmp.{so,dylib}). The Sequre runtime otherwise only
+ * searches a fixed list of *system* locations (see _find_lib in
+ * stdlib/sequre/constants.codon), so a clean install with no system libgmp
+ * would fail to start even though we ship one. Respects a user-set
+ * SEQURE_GMP_PATH and does nothing if the bundled library is absent. */
+static void maybe_set_gmp_path(const char *plugin_path) {
+  const char *existing = getenv("SEQURE_GMP_PATH");
+  if (existing && *existing) {
+    return; /* respect user override */
+  }
+  if (!plugin_path || !*plugin_path) {
+    return;
+  }
+
+#ifdef __APPLE__
+  const char *libname = "libgmp.dylib";
+#else
+  const char *libname = "libgmp.so";
+#endif
+
+  char gmp[PATH_MAX];
+  int n = snprintf(gmp, sizeof(gmp), "%s/lib/%s", plugin_path, libname);
+  if (n < 0 || (size_t)n >= sizeof(gmp)) {
+    return;
+  }
+  if (path_exists(gmp)) {
+    setenv("SEQURE_GMP_PATH", gmp, 1);
+  }
+}
+
 static void print_help(const char *codon) {
   printf("Sequre — Secure computation framework\n");
   printf("\n");
@@ -504,6 +535,8 @@ int main(int argc, char **argv) {
     free(codon);
     return 1;
   }
+
+  maybe_set_gmp_path(plugin_path);
 
   char *plugin_arg = malloc(PATH_MAX + 16);
   if (!plugin_arg) {
