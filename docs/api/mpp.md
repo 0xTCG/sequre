@@ -10,7 +10,7 @@ _Defined in `stdlib/sequre/types/multiparty_partition.codon`_
 
 | Field | Description |
 |---|---|
-| `_mpc` | Reference to the `MPCEnv` |
+| `_mpc` | Reference to the MPC instance |
 | `_ratios` | List of per-party row counts |
 | `_local_data` | This party's local plaintext rows |
 | `_encryption_unified` | Encrypted version of the local data (`Ciphertensor[Ciphertext]`) |

@@ -10,7 +10,7 @@ _Defined in `stdlib/sequre/types/multiparty_aggregate.codon`_
 
 | Field | Description |
 |---|---|
-| `_mpc` | Reference to the `MPCEnv` |
+| `_mpc` | Reference to the MPC instance |
 | `_plain` | Plaintext share (ndarray) |
 | `_encryption` | Per-party encrypted share (`Ciphertensor`) |
 | `_aggregate` | Aggregated (summed) encrypted ciphertext |

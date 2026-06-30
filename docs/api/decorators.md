@@ -73,7 +73,10 @@ def fp_div(mpc, a, b):
 
 _Defined in `stdlib/sequre/runtime.codon`_
 
-A runtime decorator that forks the current process into `N` parties (using `fork()`), each running the decorated function as a separate MPC party with its own `MPCEnv`. Used for local testing where all parties run on a single machine.
+A runtime decorator that forks the current process into `N` parties (using `fork()`), each running the decorated function as a separate MPC party with its own MPC instance. Used for local testing where all parties run on a single machine.
+
+!!! warning
+    The decorated function must be called **exactly once** per program. Calling it more than once will raise an error. This applies to `@local`, `@online`, and `@main` alike.
 
 ```python
 from sequre.runtime import local
@@ -86,7 +89,62 @@ def my_protocol(mpc):
     print(f"CP{mpc.pid}: done")
 ```
 
-Command-line flags (e.g., `--ring`, `--skip-mhe-setup`) are parsed from `sys.argv` and passed as control toggles.
+Command-line flags (e.g., `--use-ring`, `--skip-mhe-setup`) are parsed from `sys.argv` and passed as control toggles.
+
+### `@online`
+
+_Defined in `stdlib/sequre/runtime.codon`_
+
+A runtime decorator for distributed (multi-machine) execution. Wraps the `mpc()` lifecycle: parses the party ID from `sys.argv`, creates an MPC instance, calls the decorated function, and cleans up with `mpc.done()`.
+
+!!! warning
+    Must be called **exactly once** per program (same as `@local` and `@main`).
+
+```python
+from sequre.runtime import online
+
+@online
+def my_protocol(mpc):
+    X = MPU(mpc, local_data, "partition")
+    result = X @ X.T
+    print(f"CP{mpc.pid}: done")
+
+my_protocol()  # party ID is parsed from sys.argv
+```
+
+Run on each machine:
+```bash
+SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre my_protocol.codon <pid>
+```
+
+### `@main`
+
+_Defined in `stdlib/sequre/runtime.codon`_
+
+A runtime decorator that lets the user control the execution mode via CLI. If `--local` is present in `sys.argv`, it runs the function via `@local` (forking parties on a single machine). Otherwise, it runs via `@online` (distributed execution).
+
+!!! warning
+    Must be called **exactly once** per program (same as `@local` and `@online`).
+
+```python
+from sequre.runtime import main
+
+@main
+def my_protocol(mpc):
+    X = MPU(mpc, local_data, "partition")
+    result = X @ X.T
+    print(f"CP{mpc.pid}: done")
+
+my_protocol()
+```
+
+```bash
+# Local:
+sequre my_protocol.codon --local
+
+# Online (on each machine):
+SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre my_protocol.codon <pid>
+```
 
 ---
 
@@ -98,7 +156,7 @@ These functions set up the MPC environment for distributed (non-local) execution
 
 | Function | Description |
 |---|---|
-| `mpc()` | Parse command-line args, create an `MPCEnv` for the current party, run MHE setup. Returns the initialized environment. |
+| `mpc()` | Parse command-line args, create an MPC instance for the current party, run MHE setup. Returns the initialized environment. |
 
 ### Typical distributed entry point
 
@@ -120,6 +178,18 @@ def main(mpc):
     ...  # protocol logic
 
 main()  # forks N parties automatically --- no need to pass mpc instance
+```
+
+### Typical CLI-controlled entry point
+
+```python
+from sequre.runtime import main
+
+@main
+def my_protocol(mpc):
+    ...  # protocol logic
+
+my_protocol()  # --local → forks locally; otherwise → online
 ```
 
 ---

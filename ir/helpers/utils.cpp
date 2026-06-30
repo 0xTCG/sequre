@@ -1,28 +1,100 @@
+#include <array>
+
 #include "codon/cir/util/irtools.h"
+#include "codon/parser/common.h"
 #include "utils.h"
 
 namespace sequre {
 
 using namespace codon::ir;
 
-const std::string ckksPlaintextTypeName = "std.sequre.lattiseq.ckks.Ciphertext";
-const std::string ckksCiphertextTypeName = "std.sequre.lattiseq.ckks.Plaintext";
-const std::string sharetensorTypeName = "std.sequre.types.sharetensor.Sharetensor";
-const std::string cipherTensorTypeName = "std.sequre.types.ciphertensor.Ciphertensor";
-const std::string MPPTypeName = "std.sequre.types.multiparty_partition.MPP";
-const std::string MPATypeName = "std.sequre.types.multiparty_aggregate.MPA";
-const std::string MPUTypeName = "std.sequre.types.multiparty_union.MPU";
+const std::string ckksPlaintextTypeSuffix = ".lattiseq.ckks.Ciphertext";
+const std::string ckksCiphertextTypeSuffix = ".lattiseq.ckks.Plaintext";
+const std::string sharetensorTypeSuffix = ".types.sharetensor.Sharetensor";
+const std::string cipherTensorTypeSuffix = ".types.ciphertensor.Ciphertensor";
+const std::string MPPTypeSuffix = ".types.multiparty_partition.MPP";
+const std::string MPATypeSuffix = ".types.multiparty_aggregate.MPA";
+const std::string MPUTypeSuffix = ".types.multiparty_union.MPU";
+
+// Codon 0.19.6 names a plugin-provided module after the *first* registered
+// search root that prefixes its file (codon/parser/common.cpp:get_root).
+// The generic "<codon>/lib/codon/plugins" root (registered unconditionally
+// for plugin auto-discovery) is an ancestor of the Sequre plugin's own
+// stdlib root ("<codon>/lib/codon/plugins/sequre/stdlib", registered only
+// once the plugin is loaded) and is checked first, so Sequre's modules are
+// actually named "std.sequre.stdlib.sequre.*", not "std.sequre.*". Each
+// lookup below tries both forms so this is robust to either resolution
+// order without depending on codon-internal search-path precedence.
+static constexpr std::array<const char *, 2> sequreAttributeModules = {
+  "std.sequre.attributes",
+  "std.sequre.stdlib.sequre.attributes",
+};
+
+static constexpr std::array<const char *, 2> sequreRuntimeModules = {
+  "std.sequre.runtime",
+  "std.sequre.stdlib.sequre.runtime",
+};
+
+static constexpr std::array<const char *, 2> sequreMpcEnvModules = {
+  "std.sequre.mpc.env",
+  "std.sequre.stdlib.sequre.mpc.env",
+};
+
+static constexpr std::array<const char *, 2> sequreInternalModules = {
+  "std.sequre.types.internal",
+  "std.sequre.stdlib.sequre.types.internal",
+};
+
+static constexpr std::array<const char *, 2> sequreOptimizationModules = {
+  "std.optimization.ir.__init__",
+  "std.sequre.stdlib.optimization.ir.__init__",
+};
+
+static bool hasTypeSuffix(types::Type *t, const std::string &suffix) {
+  if (!t) return false;
+  // Only match against the type's own base name, not nested generic
+  // arguments (e.g. List[Ciphertensor[Ciphertext]] must not match
+  // Ciphertensor, even though the substring appears nested inside it).
+  std::string name = t->getName();
+  auto bracketPos = name.find('[');
+  std::string base = bracketPos == std::string::npos ? name : name.substr(0, bracketPos);
+  return base.find(suffix) != std::string::npos;
+}
+
+static bool hasAttributeInAnyModule(Func *f, const std::array<const char *, 2> &modules,
+                                    const char *name) {
+  if (!f)
+    return false;
+
+  for (const auto *module : modules) {
+    if (util::hasAttribute(f, codon::ast::getMangledFunc(module, name)))
+      return true;
+  }
+
+  return false;
+}
+
+static types::Type *getOrRealizeAnyType(Module *M, const std::array<const char *, 2> &modules,
+                                        const char *name,
+                                        const std::vector<types::Generic> &generics) {
+  for (const auto *module : modules) {
+    if (auto *type = M->getOrRealizeType(codon::ast::getMangledClass(module, name), generics))
+      return type;
+  }
+
+  return nullptr;
+}
 
 
 std::pair<std::vector<Value *>, std::vector<types::Type *>> getTypedArgs( CallInstr *v, int skip) {
     std::vector<Value *> args;
     std::vector<types::Type *> types;
-    
+
     int idx = 0;
     for ( auto it = v->begin(); it != v->end(); ++it, ++idx ) {
       if ( idx < skip )
         continue;
-      
+
       auto *arg = *it;
       args.push_back(arg);
       types.push_back(arg->getType());
@@ -40,63 +112,66 @@ bool isBinaryInstr(CallInstr *instr) {
 }
 
 bool hasSequreAttr( Func *f ) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.sequre");
+  return hasAttributeInAnyModule(f, sequreAttributeModules, "sequre") ||
+         hasAttributeInAnyModule(f, sequreRuntimeModules, "local") ||
+         hasAttributeInAnyModule(f, sequreRuntimeModules, "online") ||
+         hasAttributeInAnyModule(f, sequreRuntimeModules, "main");
 }
 
 bool hasPolyOptAttr( Func *f ) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.mpc_poly_opt");
+  return hasAttributeInAnyModule(f, sequreAttributeModules, "mpc_poly_opt");
 }
 
 bool hasMatmulReorderOptAttr( Func *f ) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.reorder_matmul");
+  return hasAttributeInAnyModule(f, sequreAttributeModules, "reorder_matmul");
 }
 
 bool hasCipherOptAttr( Func *f ) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.mhe_cipher_opt");
+  return hasAttributeInAnyModule(f, sequreAttributeModules, "mhe_cipher_opt");
 }
 
 bool hasEncOptAttr( Func *f ) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.mhe_enc_opt");
+  return hasAttributeInAnyModule(f, sequreAttributeModules, "mhe_enc_opt");
 }
 
 bool hasDebugAttr( Func *f ) {
-  return bool(f) && util::hasAttribute(f, "std.sequre.attributes.debug");
+  return hasAttributeInAnyModule(f, sequreAttributeModules, "debug");
 }
 
 bool hasCKKSPlaintext( types::Type *t ) {
-  return t->getName().find(ckksPlaintextTypeName) != std::string::npos;
+  return hasTypeSuffix(t, ckksPlaintextTypeSuffix);
 }
 
 bool hasCKKSCiphertext( types::Type *t ) {
-  return t->getName().find(ckksCiphertextTypeName) != std::string::npos;
+  return hasTypeSuffix(t, ckksCiphertextTypeSuffix);
 }
 
 bool isCKKSPlaintext( types::Type *t ) {
-  return t->getName().rfind(ckksPlaintextTypeName, 0) == 0;
+  return hasTypeSuffix(t, ckksPlaintextTypeSuffix);
 }
 
 bool isCKKSCiphertext( types::Type *t ) {
-  return t->getName().rfind(ckksCiphertextTypeName, 0) == 0;
+  return hasTypeSuffix(t, ckksCiphertextTypeSuffix);
 }
 
 bool isSharetensor( types::Type *t ) {
-  return t->getName().rfind(sharetensorTypeName, 0) == 0;
+  return hasTypeSuffix(t, sharetensorTypeSuffix);
 }
 
 bool isCiphertensor( types::Type *t ) {
-  return t->getName().rfind(cipherTensorTypeName, 0) == 0;
+  return hasTypeSuffix(t, cipherTensorTypeSuffix);
 }
 
 bool isMPP( types::Type *t ) {
-  return t->getName().rfind(MPPTypeName, 0) == 0;
+  return hasTypeSuffix(t, MPPTypeSuffix);
 }
 
 bool isMPA( types::Type *t ) {
-  return t->getName().rfind(MPATypeName, 0) == 0;
+  return hasTypeSuffix(t, MPATypeSuffix);
 }
 
 bool isMPU( types::Type *t ) {
-  return t->getName().rfind(MPUTypeName, 0) == 0;
+  return hasTypeSuffix(t, MPUTypeSuffix);
 }
 
 bool isMP( types::Type *t ) {
@@ -111,7 +186,7 @@ bool isMPC( Value *value ) {
   auto generics = value->getType()->getGenerics();
   assert( generics.size() == 1 && "ERROR: While testing if value is the MPC instance. It should have one and only one generic type." );
   auto *M = value->getModule();
-  auto *mpcType = M->getOrRealizeType("MPCEnv", { generics[0] }, "std.sequre.mpc.env");
+  auto *mpcType = getOrRealizeAnyType(M, sequreMpcEnvModules, "MPCEnv", generics);
   assert(mpcType);
   return value->getType()->is(mpcType);
 }
@@ -131,37 +206,42 @@ types::Type *getTupleType( std::vector<Value *> vals, Module *M ) {
 Func *getOrRealizeSequreInternalMethod( Module *M, std::string const &methodName,
                                         std::vector<types::Type *> args,
                                         std::vector<types::Generic> generics ) {
-  auto *sequreInternalType = M->getOrRealizeType("Internal", {}, "std.sequre.types.internal");
+  auto *sequreInternalType = getOrRealizeAnyType(M, sequreInternalModules, "Internal", {});
   auto *method = M->getOrRealizeMethod(sequreInternalType, methodName, args, generics);
-  
+
   if ( !method ) {
     std::cout << "\nSEQURE TYPE REALIZATION ERROR: Could not realize internal method: " << methodName
               << "\n\tfor parameters ";
-    
+
     for ( auto arg : args )
       std::cout << "\n\t\t" << arg->getName();
-              
+
     std::cout << std::endl;
   }
-  
+
   return method;
 }
 
 Func *getOrRealizeSequreOptimizationHelper( Module *M, std::string const &funcName,
                                             std::vector<types::Type *> args,
                                             std::vector<types::Generic> generics ) {
-  auto *func = M->getOrRealizeFunc(funcName, args, generics, "std.optimization.ir.__init__");
-  
+  Func *func = nullptr;
+  for (const auto *module : sequreOptimizationModules) {
+    func = M->getOrRealizeFunc(funcName, args, generics, module);
+    if (func)
+      break;
+  }
+
   if ( !func ) {
     std::cout << "\nSEQURE TYPE REALIZATION ERROR: Could not realize helper func: " << funcName
               << "\n\tfor parameters ";
-    
+
     for ( auto arg : args )
       std::cout << "\n\t\t" << arg->getName();
-              
+
     std::cout << std::endl;
   }
-  
+
   return func;
 }
 
@@ -184,7 +264,7 @@ Value *findCallByName( Value *value, const std::string &name, std::set<Value *> 
   for ( auto *usedValue : value->getUsedValues() )
     if ( auto *foundCall = findCallByName(usedValue, name, visited) )
       return foundCall;
-  
+
   return nullptr;
 }
 
@@ -209,18 +289,18 @@ CallInstr *revealCall( Var *var, VarValue *mpc ) {
 
   std::string namePath;
   if ( isSharetensor(varType) )
-    namePath = sharetensorTypeName;
+    namePath = sharetensorTypeSuffix;
   else if ( isCiphertensor(varType) )
-    namePath = cipherTensorTypeName;
+    namePath = cipherTensorTypeSuffix;
   else if ( isMPP(varType) )
-    namePath = MPPTypeName;
+    namePath = MPPTypeSuffix;
   else if ( isMPA(varType) )
-    namePath = MPATypeName;
+    namePath = MPATypeSuffix;
   else if ( isMPU(varType) )
-    namePath = MPUTypeName;
+    namePath = MPUTypeSuffix;
   else
     throw "ERROR: Reveal call called on top of non-secure container";
-  
+
   auto *M          = var->getModule();
   auto *method     = M->getOrRealizeMethod(varType, "reveal", { varType, mpc->getType() }, {});
   if ( !method )

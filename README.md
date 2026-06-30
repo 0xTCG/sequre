@@ -18,24 +18,21 @@ Write Python-like code; the Sequre compiler handles encrypted arithmetic and int
 
 ## Quick start
 
-**Supported platforms:** Linux (x86_64). macOS (Darwin) builds are currently disabled.
+**Supported platforms:** Linux (x86_64, aarch64) and macOS (Apple Silicon / arm64).
 
-Install [Codon](https://github.com/exaloop/codon), then install Sequre:
+Install Sequre (includes Codon):
 
 ```bash
-mkdir -p $HOME/.codon && \
-  curl -L https://github.com/exaloop/codon/releases/download/v0.17.0/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon --strip-components=1
-
-curl -L https://github.com/0xTCG/sequre/releases/latest/download/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C $HOME/.codon
-
-export PATH=$HOME/.codon/bin:$PATH
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/0xTCG/sequre/develop/scripts/install.sh)"
 ```
 
-Run example:
+This installs to `~/.sequre` and adds it to your `PATH`. See [quickstart](https://0xtcg.github.io/sequre/getting-started/quickstart/) for manual install and building from source.
+
+### Run example
 
 ```bash
 git clone --depth 1 https://github.com/0xTCG/sequre.git && cd sequre
-sequre examples/local_run.codon
+sequre examples/addmul.codon
 ```
 
 > **Note:** The first compilation may take a minute — Sequre programs compile to native code. The launcher shows compilation progress by default.
@@ -43,8 +40,8 @@ sequre examples/local_run.codon
 Or compile to a binary:
 
 ```bash
-sequre build examples/local_run.codon -o local_run
-./local_run
+sequre build examples/addmul.codon -o addmul
+./addmul
 ```
 
 > **Note:** Make sure to delete sockets (`rm sock.*`) if running a **local run** pre-built binary. `sequre` command does this automatically, otherwise, but built binaries do not.
@@ -66,64 +63,71 @@ sequre build -release my_protocol.codon -o my_protocol
 
 ## Examples
 
-### Local execution
+The [examples/](examples/) directory contains self-contained programs that demonstrate secure-computation workflows. Each generates its own synthetic data, runs locally, and prints results — no external datasets or configuration files needed. For full production pipelines, see [applications/](applications/).
 
-Use the `@local` decorator — Sequre forks one process per party, communicating via UNIX sockets:
+| Example | File | Domain | What it shows |
+|---|---|---|---|
+| Simple expression | `examples/addmul.codon` | Intro | Additions, multiplications, and innerprod examples — local with `--local` flag, online otherwise |
+| Credit scoring | `examples/credit_scoring.codon` | Finance | Secure neural-network classification with `MPU` partitioning |
+| Genetic kinship | `examples/genetic_kinship.codon` | Genomics | Pairwise kinship estimation on MHE-encrypted genotype data |
+| Linear regression | `examples/linear_regression.codon` | Healthcare | Multi-hospital model training with `MPU` and `LinReg` |
+| One algorithm, many types | `examples/one_algorithm_many_types.codon` | End-to-end | Same pairwise `l2` on `ndarray`, `Sharetensor`, and `MPU` |
+| Loading private data | `examples/collective_load.codon` | Deployment | Real-world data loading with `MPU.collective_load` (MHE) and `Sharetensor.collective_load` (MPC) |
 
-> **Note:** While each @sequre and @local function expects mpc as a first argument, no need to pass it to the invocation of the local function (see `mul_local` call in the example below). The compiler will do that automatically.
+> **Note:** The examples above use **synthetic data shared from a trusted dealer** for quick experimentation and testing. In real-world deployments, each party holds its own private data on disk and loads it into the secure computation via `collective_load`. See [`examples/collective_load.codon`](examples/collective_load.codon) for a complete working example and the [Loading Private Data](https://0xTCG.github.io/sequre/tutorials/loading-private-data/) tutorial for the full guide.
 
-`local_run.codon`:
+Run any example locally:
+
+```bash
+sequre examples/addmul.codon --local --skip-mhe-setup
+sequre -release examples/credit_scoring.codon --local
+sequre -release examples/genetic_kinship.codon --local
+sequre -release examples/linear_regression.codon --local
+sequre -release examples/one_algorithm_many_types.codon --local
+sequre -release examples/collective_load.codon --local
+```
+
+### Dispatching a Sequre program (`@main`)
+
+The `@main` decorator is the entry point for every Sequre program. It sets up the MPC/MHE runtime environment and injects an `mpc` context as the first argument. The execution mode is controlled via CLI: pass `--local` to fork all parties on one machine, or omit it to run in distributed (online) mode.
+
+> **Important:** The `@main`-decorated function is the **dispatcher** — it must be called **exactly once** at module level. All secure computation happens inside (or is called from) this function.
+
 ```python
-from sequre import sequre, local, Sharetensor as Stensor
+from sequre import sequre, main, Sharetensor as Stensor
 
 @sequre
-def muls(mpc, a, b, c):
+def my_protocol(mpc, a, b, c):
     return a * b + b * c + a * c
 
-@local
-def mul_local(mpc, a: int, b: int, c: int):
+@main
+def main_call(mpc, a, b, c):
     a_enc = Stensor.enc(mpc, a)
     b_enc = Stensor.enc(mpc, b)
     c_enc = Stensor.enc(mpc, c)
-    print(f"CP{mpc.pid}:\t{muls(mpc, a_enc, b_enc, c_enc).reveal(mpc)}")
+    
+    result = my_protocol(mpc, a_enc, b_enc, c_enc)
+    print(f"CP{mpc.pid}:\tresult: {result.reveal(mpc)}")
 
-mul_local(7, 13, 19)
-```
-
-> **Note:** When working with many local runs, the socket files (`sock.*`)---needed for local communication---may collude in-between the runs and cause connection issues. Make sure to delete the stale files in that case `rm sock.*`.
-
-```bash
-sequre local_run.codon
-```
-
-### Distributed execution
-
-Unlike local calls, distributed execution requires manual instantiation of `mpc` enviromnent. Use `mpc()` call for this (see example below). Each party runs as a separate process on a separate machine:
-
-`online_run.codon`:
-```python
-from sequre import mpc, sequre, Sharetensor as Stensor
-
-@sequre
-def muls(mpc, a, b, c):
-    return a * b + b * c + a * c
-
-mpc = mpc()
-
-a = Stensor.enc(mpc, 7)
-b = Stensor.enc(mpc, 13)
-c = Stensor.enc(mpc, 19)
-
-print(f"CP{mpc.pid}:\t{muls(mpc, a, b, c).reveal(mpc)}")
-mpc.done()  # Wait for all parties to finish and then close the sockets
+if __name__ == "__main__":
+    main_call(7, 13, 19)
 ```
 
 ```bash
-# On each machine:
-SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre online_run.codon <pid>
+# Local (all parties on one machine — development & testing):
+sequre my_protocol.codon --local
+
+# Distributed (each party is a separate process/machine — production):
+SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre my_protocol.codon <pid>
 ```
 
-Distributed mode requires mutual TLS certificates. Sequre handles MHE/MPC key management automatically, but **does not handle the TLS certificates creation/maintenance**. For testing, generate test certificates with `scripts/generate_certs.sh`. For production, use secure CA — see [TLS configuration](https://0xTCG.github.io/sequre/user-guide/running-distributed/#tls-configuration).
+The [MPC instance](https://0xtcg.github.io/sequre/api/mpc-instance/) provides access to MPC/MHE essentials (party state, PRG streams, network sockets, and sub-modules for arithmetic, fixed-point, boolean, polynomial, and MHE operations etc.).
+
+> **Note:** When working with many local runs, the socket files (`sock.*`) — needed for local communication — may collide between runs and cause connection issues. Delete stale files with `rm sock.*`.
+
+Distributed mode requires mutual TLS certificates. Sequre handles MHE/MPC key management automatically, but **does not handle TLS certificate creation/maintenance**. For testing, generate test certificates with `scripts/generate_certs.sh`. For production, use a secure CA — see [TLS configuration](https://0xTCG.github.io/sequre/user-guide/running-distributed/#tls-configuration).
+
+Sequre also provides lower-level `@local` and `@online` decorators for hard-coding the execution mode --- see the [documentation](https://0xTCG.github.io/sequre/api/decorators/) --- but `@main` covers both use-cases.
 
 ### Writing secure functions
 

@@ -1,183 +1,93 @@
-CC=clang
-CXX=clang++
-export SEQURE_PATH=$(pwd)
+#!/usr/bin/env bash
+set -e
+set -o pipefail
 
-# Requirements
-if (echo a version 3.20.0; cmake --version) | sort -Vk3 | tail -1 | grep -q cmake
-then
-    echo "CMake version ok."
+SEQURE_INSTALL_DIR=~/.sequre
+OS=$(uname -s | awk '{print tolower($0)}')
+ARCH=$(uname -m)
+
+if [ "$OS" = "linux" ]; then
+  if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
+    echo "error: Pre-built binaries for Linux only exist for x86_64 and aarch64." >&2
+    exit 1
+  fi
+elif [ "$OS" = "darwin" ]; then
+  if [ "$ARCH" != "arm64" ]; then
+    echo "error: Pre-built binaries for macOS only exist for Apple Silicon (arm64)." >&2
+    exit 1
+  fi
 else
-    echo "Error! CMake version invalid. Make sure to use CMake version >3.20.0" >&2
-    return
+  echo "error: Pre-built binaries only exist for Linux (x86_64, aarch64) and macOS (arm64)." >&2
+  exit 1
 fi
 
-if [[ -z "${SEQURE_LLVM_PATH}" ]]; then
-    export SEQURE_LLVM_PATH=$SEQURE_PATH/codon-llvm
-    echo "LLVM path is not set. Using the local path: ${SEQURE_LLVM_PATH}"
+CODON_VERSION=v0.19.6
+CODON_BUILD_ARCHIVE=codon-$OS-$ARCH.tar.gz
+SEQURE_BUILD_ARCHIVE=sequre-$OS-$ARCH.tar.gz
+
+echo "Installing Sequre to $SEQURE_INSTALL_DIR ..."
+
+mkdir -p "$SEQURE_INSTALL_DIR"
+cd "$SEQURE_INSTALL_DIR"
+
+# 1. Install Codon runtime
+echo "Downloading Codon $CODON_VERSION ..."
+curl -L "https://github.com/exaloop/codon/releases/download/$CODON_VERSION/$CODON_BUILD_ARCHIVE" | tar zxvf - --strip-components=1
+
+# Sequre's numpy is a fork (its ndarray is defined differently and is
+# incompatible with Codon's own). It ships inside the plugin and is imported
+# exclusively via the `sequre.stdlib.numpy` namespace, so it no longer
+# collides with Codon's native `numpy` — Codon's own numpy/ is left intact.
+
+# 2. Install Sequre (plugin + launcher) on top
+echo "Downloading Sequre ..."
+curl -L "https://github.com/0xTCG/sequre/releases/latest/download/$SEQURE_BUILD_ARCHIVE" | tar zxvf - --strip-components=0
+
+# 3. Apply the AVX-512 heap-vector alignment workaround for Codon (no-op off
+#    x86_64). A fresh Codon install ships an unpatched stdlib, so re-apply the
+#    Ptr unaligned-load patch here (the shim and patched launcher come from the
+#    Sequre tarball; Sequre's own stdlib, incl. prg.codon, ships in the plugin).
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+if [ -f "$SCRIPT_DIR/apply_avx512_workaround.sh" ]; then
+  bash "$SCRIPT_DIR/apply_avx512_workaround.sh" "$SEQURE_INSTALL_DIR"
 fi
 
-if [[ -z "${SEQURE_CODON_PATH}" ]]; then
-    export SEQURE_CODON_PATH=$SEQURE_PATH/codon
-    echo "Codon path is not set. Using the local path: ${SEQURE_CODON_PATH}"
-fi
+EXPORT_COMMAND="export PATH=$SEQURE_INSTALL_DIR/bin:\$PATH"
+echo ""
+echo "PATH export command:"
+echo "  $EXPORT_COMMAND"
 
-if [[ -z "${SEQURE_SEQ_PATH}" ]]; then
-    export SEQURE_SEQ_PATH=$SEQURE_PATH/codon-seq
-    echo "Seq-lang path is not set. Using the local path: ${SEQURE_SEQ_PATH}"
-fi
 
-# Build LLVM
-if [ -d "${SEQURE_LLVM_PATH}/install/lib/cmake/llvm" ] 
-then
-    echo "Found existing LLVM installation." 
+PROFILES=()
+for f in ~/.zshenv ~/.zshrc ~/.zprofile ~/.bash_profile ~/.bash_login ~/.bashrc ~/.profile; do
+  if [ -e "$f" ]; then
+    if ! grep -F -q "$EXPORT_COMMAND" "$f"; then
+      PROFILES+=("$f")
+    else
+      echo "PATH already updated in $f; skipping."
+    fi
+  fi
+done
+
+if [ ${#PROFILES[@]} -eq 0 ]; then
+  echo "No shell configuration files found to update PATH."
 else
-    echo "LLVM not installed. Proceeding with the installation ..."
-
-    rm -rf $SEQURE_LLVM_PATH
-    git clone --depth 1 -b codon https://github.com/exaloop/llvm-project $SEQURE_LLVM_PATH
-    cd $SEQURE_LLVM_PATH
-    
-    cmake -S llvm -B build -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DLLVM_INCLUDE_TESTS=OFF \
-        -DLLVM_ENABLE_RTTI=ON \
-        -DLLVM_ENABLE_ZLIB=OFF \
-        -DLLVM_ENABLE_TERMINFO=OFF \
-        -DLLVM_TARGETS_TO_BUILD=all
-    if [ $? -eq 0 ]; then
-        echo "LLVM built."
-    else
-        echo "Error! LLVM build failed" >&2
-        return
-    fi
-
-    cmake --build build
-    if [ $? -eq 0 ]; then
-        echo "LLVM installed."
-    else
-        echo "Error! LLVM installation failed" >&2
-        return
-    fi
-
-    cmake --install build --prefix=$SEQURE_LLVM_PATH/install
-    if [ $? -eq 0 ]; then
-        echo "LLVM exported."
-    else
-        echo "Error! LLVM export failed" >&2
-        return
-    fi
+  echo "The following profile files will be updated:"
+  for f in "${PROFILES[@]}"; do echo "  $f"; done
+  read -p "Update PATH in the above files? [y/n] " -n 1 -r
+  echo
+  if [[ $REPLY =~ ^[Yy]$ ]]; then
+    for f in "${PROFILES[@]}"; do
+      echo "Updating $f"
+      echo >> "$f"
+      echo "# Sequre path (added by install script)" >> "$f"
+      echo "$EXPORT_COMMAND" >> "$f"
+    done
+  else
+    echo "Skipping."
+  fi
 fi
 
-# Build Codon
-if [ -d "${SEQURE_CODON_PATH}/install" ] 
-then
-    echo "Found existing Codon installation." 
-else
-    echo "Codon not installed. Proceeding with the installation ..."
-    rm -rf $SEQURE_CODON_PATH
-    git clone https://github.com/exaloop/codon.git $SEQURE_CODON_PATH
-    cd $SEQURE_CODON_PATH
-
-    cmake -S . -B build -G Ninja \
-        -DLLVM_DIR="${SEQURE_LLVM_PATH}/install/lib/cmake/llvm" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_C_COMPILER=$CC \
-        -DCMAKE_CXX_COMPILER=$CXX
-    if [ $? -eq 0 ]; then
-        echo "Codon built."
-    else
-        echo "Error! Codon build failed" >&2
-        return
-    fi
-
-    cmake --build build --config Release
-    if [ $? -eq 0 ]; then
-        echo "Codon installed."
-    else
-        echo "Error! Codon installation failed" >&2
-        return
-    fi
-
-    cmake --install build --prefix="${SEQURE_CODON_PATH}/install"
-    if [ $? -eq 0 ]; then
-        echo "Codon exported."
-    else
-        echo "Error! Codon export failed" >&2
-        return
-    fi
-
-fi
-
-# Build Seq
-if [ -d "${SEQURE_CODON_PATH}/install/lib/codon/plugins/seq" ] 
-then
-    echo "Found existing Seq-lang installation." 
-else
-    echo "Seq-lang not installed. Proceeding with the installation ..."
-    rm -rf $SEQURE_SEQ_PATH
-    git clone https://github.com/exaloop/seq.git $SEQURE_SEQ_PATH
-    cd $SEQURE_SEQ_PATH
-
-    cmake -S . -B build -G Ninja \
-        -DLLVM_DIR="${SEQURE_LLVM_PATH}/install/lib/cmake/llvm" \
-        -DCODON_PATH="${SEQURE_CODON_PATH}/install" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_C_COMPILER=$CC \
-        -DCMAKE_CXX_COMPILER=$CXX
-    if [ $? -eq 0 ]; then
-        echo "Seq-lang built."
-    else
-        echo "Error! Seq-lang build failed" >&2
-        return
-    fi
-
-    cmake --build build --config Release
-    if [ $? -eq 0 ]; then
-        echo "Seq-lang installed."
-    else
-        echo "Error! Seq-lang installation failed" >&2
-        return
-    fi
-
-    cmake --install build --prefix="${SEQURE_CODON_PATH}/install/lib/codon/plugins/seq"
-    if [ $? -eq 0 ]; then
-        echo "Seq-lang exported."
-    else
-        echo "Error! Seq-lang export failed" >&2
-        return
-    fi
-
-fi
-
-# Build Sequre
-cd $SEQURE_PATH
-rm -rf build
-mkdir build
-cmake -S . -B build -G Ninja \
-    -DLLVM_DIR="${SEQURE_LLVM_PATH}/install/lib/cmake/llvm" \
-    -DCODON_PATH="${SEQURE_CODON_PATH}/install" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_COMPILER=$CC \
-    -DCMAKE_CXX_COMPILER=$CXX
-if [ $? -eq 0 ]; then
-    echo "Sequre built."
-else
-    echo "Error! Sequre build failed" >&2
-    return
-fi
-
-cmake --build build --config Release
-if [ $? -eq 0 ]; then
-    echo "Sequre installed."
-else
-    echo "Error! Sequre installation failed" >&2
-    return
-fi
-
-cmake --install build --prefix="${SEQURE_CODON_PATH}/install/lib/codon/plugins/sequre"
-if [ $? -eq 0 ]; then
-    echo "Sequre exported."
-else
-    echo "Error! Sequre export failed" >&2
-    return
-fi
+echo ""
+echo "Sequre successfully installed at: $(pwd)"
+echo "Open a new terminal session or update your PATH to use sequre"

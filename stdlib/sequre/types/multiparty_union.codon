@@ -1,9 +1,12 @@
+import internal.static as static
+
 import operator
 
-from numpy.ndarray import ndarray
-from numpy.create import zeros
+from sequre.stdlib.numpy.ndarray import ndarray
+from sequre.stdlib.numpy.create import zeros
 
 from sequre.attributes import sequre
+from sequre.mpc.env import MPCEnv
 from sequre.lattiseq.ckks import Ciphertext
 from sequre.types.ciphertensor import Ciphertensor
 from sequre.types.multiparty_partition import MPP
@@ -157,7 +160,7 @@ class MPU[S, dtype]:
     
     @property
     def ndim(self) -> int:
-        return staticlen(S)
+        return static.len(S)
 
     @property
     def shape(self):
@@ -248,6 +251,19 @@ class MPU[S, dtype]:
         return MPU[S, dtype](
             _mpp=self._mpp.enc(mpc, data, self._mpp._ratios),
             _mpa=MPA[S, dtype](mpc))
+    
+    @staticmethod
+    def collective_load[dtype](mpc: MPCEnv, data_path: str, rows: int, cols: int, binary: bool, collective_type: Static[str]) -> MPU[Tuple[int, int], dtype]:
+        if collective_type == "partition":
+            return MPU[Tuple[int, int], dtype](
+                _mpp=MPP[Tuple[int, int], dtype].collective_load(mpc, data_path, rows, cols, binary, dtype=dtype),
+                _mpa=MPA[Tuple[int, int], dtype](mpc))
+        elif collective_type == "additive":
+            return MPU[Tuple[int, int], dtype](
+                _mpp=MPP[Tuple[int, int], dtype](mpc),
+                _mpa=MPA[Tuple[int, int], dtype].collective_load(mpc, data_path, rows, cols, binary, dtype=dtype))
+        else:
+            compile_error("MPU: invalid collective type for collective_load. Should be either partition or additive.")
     
     def copy(self) -> MPU[S, dtype]:
         self.check_valid()
@@ -359,7 +375,17 @@ class MPU[S, dtype]:
         return MPU[S, dtype](
             _mpp=self._mpp.sign(*args),
             _mpa=MPA[S, dtype](self._mpp._mpc))
-    
+
+    def cov_max(self, mpc, *args) -> MPU[S, dtype]:
+        self.check_valid()
+
+        if self.is_mpa():
+            raise NotImplementedError("MPU: cov_max not implemented for MPA")
+
+        return MPU[S, dtype](
+            _mpp=self._mpp.cov_max(mpc, *args),
+            _mpa=MPA[S, dtype](self._mpp._mpc))
+
     def sum(self, axis: int) -> MPU[Tuple[int], dtype]:
         self.check_valid()
         
@@ -451,7 +477,7 @@ class MPU[S, dtype]:
         elif collective_type == "additive":
             return MPU[S, dtype](
                 _mpp=MPP[S, dtype](mpc),
-                _mpa=MPA[S, dtype].rand(shape, distribution, mpc))
+                _mpa=MPA[S, dtype].rand(shape, distribution, mpc, plain=True))
         else:
             compile_error("MPU: invalid collective type. Should be either partition or additive.")
     
@@ -653,11 +679,10 @@ class MPU[S, dtype]:
             mpp.unify_encryption()
             _encryption_unified = mpp._encryption_unified.sum(mpc, axis)
         
-        mpa = MPA[Tuple[int], dtype](
-            _mpc=mpp._mpc,
-            _plain=_local_data,
-            _encryption=_encryption_unified,
-            _aggregate=Ciphertensor[Ciphertext]())
+        if _encryption_unified:
+            mpa = MPA[Tuple[int], dtype](mpp._mpc, _encryption_unified)
+        else:
+            mpa = MPA[Tuple[int], dtype](mpp._mpc, _local_data)
         
         return MPU[Tuple[int], dtype](
                 _mpp=MPP[Tuple[int], dtype](mpc),
@@ -688,7 +713,7 @@ class MPU[S, dtype]:
                 _mpp=MPP[S, dtype](self._mpa._mpc),
                 _mpa=MPU[S, dtype]._add_mpa_mpp(other._mpa, self._mpp))
         
-        if staticlen(S) == 2:  # Broadcasting non-2-dimensional MPUs is not implemented yet
+        if static.len(S) == 2:  # Broadcasting non-2-dimensional MPUs is not implemented yet
             # Broadcast cases
             if 1 == other.shape[0] < self.shape[0] and self.shape[1:] == other.shape[1:]:
                 return MPU[S, dtype](
@@ -722,7 +747,7 @@ class MPU[S, dtype]:
                 _mpp=MPP[S, dtype](self._mpa._mpc),
                 _mpa=MPU[S, dtype]._add_mpa_mpp(-other._mpa, self._mpp))
         
-        if staticlen(S) == 2:  # Broadcasting non-2-dimensional MPUs is not implemented yet
+        if static.len(S) == 2:  # Broadcasting non-2-dimensional MPUs is not implemented yet
             # Broadcast cases
             if 1 == other.shape[0] < self.shape[0] and self.shape[1:] == other.shape[1:]:
                 return MPU[S, dtype](
@@ -896,11 +921,11 @@ class MPU[S, dtype]:
         else:
             mpa_float = mpa * mpp.join()
         
-        return MPA[S, dtype](
-            _mpc=mpa._mpc,
-            _plain=mpa_float._plain.astype(dtype),
-            _encryption=mpa_float._encryption,
-            _aggregate=mpa_float._aggregate)
+        return MPA[S, dtype]._from_parts(
+            mpa._mpc,
+            mpa_float._plain.astype(dtype),
+            mpa_float._encryption,
+            mpa_float._aggregate)
     
     def _matmul_mpp_mpa(mpc, mpp: MPP[S, dtype], mpa: MPA[S, dtype]) -> MPU[S, dtype]:
         if mpp._transposed:
@@ -965,9 +990,7 @@ class MPU[S, dtype]:
                     mpp.unify_encryption()
                     _encryption = mpp._encryption_unified.T @ other._encryption_unified
             
-            return MPA[S, dtype](
-                _mpc=mpc,
-                _encryption=_encryption)
+            return MPA[S, dtype](mpc, _encryption)
     
     @sequre
     def _matmul_mpp_nt_mpa(mpc, mpp: MPP[S, dtype], mpa: MPA[S, dtype]) -> MPP[S, dtype]:
@@ -996,9 +1019,7 @@ class MPU[S, dtype]:
     @sequre
     def _matmul_mpp_t_mpp(mpc, first: MPP[S, dtype], other: MPP[S, dtype]) -> MPA[S, dtype]:
         if mpc.pid == 0:
-            return MPA[S, dtype](
-                _mpc=first._mpc,
-                _plain=zeros((first._local_data.shape[1], other._local_data.shape[1]), dtype=dtype))
+            return MPA[S, dtype](first._mpc, zeros((first._local_data.shape[1], other._local_data.shape[1]), dtype=dtype))
 
         assert not (first.is_empty() ^ other.is_empty()), "MPU: all or none of the partitions should be empty"
 
@@ -1023,10 +1044,11 @@ class MPU[S, dtype]:
                 else:
                     enc = first._encryption_unified.T @ other._encryption_unified
 
-        return MPA[S, dtype](
-            _mpc=first._mpc,
-            _plain=plain,
-            _encryption=enc)
+        if enc:
+            return MPA[S, dtype](first._mpc, enc)
+        if not plain.is_empty():
+            return MPA[S, dtype](first._mpc, plain)
+        return MPA[S, dtype](first._mpc)
     
     @staticmethod
     def _broadcast_mpa_to_mpp(mpa: MPA[S, dtype], mpp: MPP[S, dtype]) -> MPP[S, dtype]:
