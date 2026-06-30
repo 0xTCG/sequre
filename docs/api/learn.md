@@ -288,7 +288,7 @@ _Defined in `stdlib/sequre/stdlib/learn/neural_net/loss.codon`_
 
 ### Examples
 
-#### Credit score classification — [applications/credit_score.codon](https://github.com/0xTCG/sequre/blob/develop/applications/credit_score.codon)
+#### Credit score classification — [applications/credit_score.codon](https://github.com/0xTCG/sequre/blob/main/applications/credit_score.codon)
 
 Binary credit-score prediction with a single hidden layer. Trains on secret-shared data, then evaluates accuracy/precision/recall/F1.
 
@@ -307,7 +307,7 @@ model.fit(mpc, X=X, y=y, epochs=epochs, step=step_size, momentum=momentum, verbo
 prediction = model.predict(mpc, X)
 ```
 
-#### Drug-target interaction — [applications/dti.codon](https://github.com/0xTCG/sequre/blob/develop/applications/dti.codon)
+#### Drug-target interaction — [applications/dti.codon](https://github.com/0xTCG/sequre/blob/main/applications/dti.codon)
 
 DTI inference with a larger network (128 neurons) over 8192-dimensional feature vectors, using mini-batch gradient descent.
 

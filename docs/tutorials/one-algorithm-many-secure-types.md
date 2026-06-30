@@ -6,7 +6,7 @@ This page walks through how that works, using linear regression and PCA as concr
 
 ## Linear regression: one class, any type
 
-Open [stdlib/sequre/stdlib/learn/lin_reg.codon](../../stdlib/sequre/stdlib/learn/lin_reg.codon). The class is declared as `LinReg[T]` — it's generic over the tensor type `T`:
+Open [stdlib/sequre/stdlib/learn/lin_reg.codon](https://github.com/0xTCG/sequre/blob/main/stdlib/sequre/stdlib/learn/lin_reg.codon). The class is declared as `LinReg[T]` — it's generic over the tensor type `T`:
 
 ```python
 class LinReg[T]:
@@ -47,15 +47,15 @@ def _closed_form(mpc, X: T, y: T) -> T:
     return inv(mpc, X.T @ X) @ X.T @ y
 ```
 
-`inv` also dispatches by type — for `Sharetensor` or `ndarray` it does direct matrix inversion formula; for encrypted types it calls `x.via_mpc(lambda stensor: inv(mpc, stensor))` to switch to MPC, compute the inverse there, and switch back. This can be seen in [stdlib/sequre/stdlib/builtin.codon](../../stdlib/sequre/stdlib/builtin.codon).
+`inv` also dispatches by type — for `Sharetensor` or `ndarray` it does direct matrix inversion formula; for encrypted types it calls `x.via_mpc(lambda stensor: inv(mpc, stensor))` to switch to MPC, compute the inverse there, and switch back. This can be seen in [stdlib/sequre/stdlib/builtin.codon](https://github.com/0xTCG/sequre/blob/main/stdlib/sequre/stdlib/builtin.codon).
 
 ### Where this is used for real
 
-The Multiple Imputation application ([applications/mi.codon](../../applications/mi.codon)) uses `LinReg[T]` and `LogReg[T]` over parameterized secure types — same algorithm, different backends depending on the deployment scenario.
+The Multiple Imputation application ([applications/mi.codon](https://github.com/0xTCG/sequre/blob/main/applications/mi.codon)) uses `LinReg[T]` and `LogReg[T]` over parameterized secure types — same algorithm, different backends depending on the deployment scenario.
 
 ## PCA: same algorithm on four data types
 
-The PCA test in [tests/e2e_tests/test_pca.codon](../../tests/e2e_tests/test_pca.codon) is the clearest side-by-side comparison of running the same computation across representations. Here's what happens:
+The PCA test in [tests/e2e_tests/test_pca.codon](https://github.com/0xTCG/sequre/blob/main/tests/e2e_tests/test_pca.codon) is the clearest side-by-side comparison of running the same computation across representations. Here's what happens:
 
 **Step 1: Run on plaintext.** The test calls `random_pca_with_norm(mpc, raw_data, ...)` where `raw_data` is just an ndarray. This gives a plaintext reference result.
 

@@ -131,16 +131,28 @@ static char *default_plugin_path(void) {
     return strdup(env);
   }
 
-  const char *home = getenv("HOME");
-  if (home && *home) {
-    char *p = malloc(PATH_MAX);
-    if (!p) {
-      return strdup("sequre");
+  /* Resolve the plugin relative to this executable (<bindir>/../lib/codon/
+   * plugins/sequre), so the launcher works from any install prefix rather than
+   * only ~/.sequre. Mirrors how default_codon_path() finds codon. */
+  char self[PATH_MAX];
+  ssize_t len = readlink("/proc/self/exe", self, sizeof(self) - 1);
+  if (len > 0) {
+    self[len] = '\0';
+    char *slash = strrchr(self, '/');
+    if (slash) {
+      *slash = '\0'; /* self == <bindir> */
+      char *p = malloc(PATH_MAX);
+      if (p) {
+        if (snprintf(p, PATH_MAX, "%s/../lib/codon/plugins/sequre", self) < PATH_MAX) {
+          return p;
+        }
+        free(p);
+      }
     }
-    snprintf(p, PATH_MAX, "%s/.sequre/lib/codon/plugins/sequre", home);
-    return p;
   }
 
+  /* Fallback (e.g. macOS / no /proc): let codon resolve the plugin by name,
+   * relative to the codon binary it loads. */
   return strdup("sequre");
 }
 

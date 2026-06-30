@@ -7,7 +7,7 @@
 ## 1. Install Sequre
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/0xTCG/sequre/develop/scripts/install.sh)"
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/0xTCG/sequre/main/scripts/install.sh)"
 ```
 
 This installs Codon and Sequre to `~/.sequre` and adds it to your `PATH`.

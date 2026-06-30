@@ -79,7 +79,7 @@ See [Configuration](api/configuration.md) for the full configuration reference.
 
 The examples in `examples/` use synthetic data shared from a trusted dealer, which is convenient for testing but does not reflect how production deployments handle private data.  In a real deployment, each party holds its own data on disk and loads it via `collective_load`.
 
-[`examples/collective_load.codon`](https://github.com/0xTCG/sequre/blob/develop/examples/collective_load.codon) demonstrates both protocols in a single file:
+[`examples/collective_load.codon`](https://github.com/0xTCG/sequre/blob/main/examples/collective_load.codon) demonstrates both protocols in a single file:
 
 | Part | Protocol | Type | Application |
 |---|---|---|---|
