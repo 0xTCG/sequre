@@ -128,7 +128,7 @@ The trusted dealer participates in the cryptographic protocol (key generation, s
 
 ## Full working example
 
-See [`examples/collective_load.codon`](https://github.com/0xTCG/sequre/blob/develop/examples/collective_load.codon) for a complete, runnable file that demonstrates both modes:
+See [`examples/collective_load.codon`](https://github.com/0xTCG/sequre/blob/main/examples/collective_load.codon) for a complete, runnable file that demonstrates both modes:
 
 - **Credit scoring (partition mode):** loads customer records via `MPU.collective_load(..., collective_type="partition")`, trains a neural network on the encrypted partitions.
 - **Linear regression (MPC):** loads patient records via `Sharetensor.collective_load`, trains a regression model on additive secret shares.

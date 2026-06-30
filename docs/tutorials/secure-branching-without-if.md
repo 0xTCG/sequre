@@ -17,7 +17,7 @@ To implement `max`, `min`, `clip`, or any other conditional logic on secrets, th
 
 The idea is simple: compute the comparison as a secret-shared 0-or-1 value, then use it as an arithmetic mask to select between two outcomes — without ever branching.
 
-Here is the actual `maximum` from Sequre's stdlib ([stdlib/sequre/stdlib/builtin.codon](../../stdlib/sequre/stdlib/builtin.codon)):
+Here is the actual `maximum` from Sequre's stdlib ([stdlib/sequre/stdlib/builtin.codon](https://github.com/0xTCG/sequre/blob/main/stdlib/sequre/stdlib/builtin.codon)):
 
 ```python
 @sequre
@@ -93,7 +93,7 @@ Notice `(new_maximum > maximum) * i` — this produces `i` if the new element wa
 
 **Comparisons are not cheap.** Under the hood, `x > y` on secret-shared data involves bit decomposition — significantly more expensive than addition or multiplication. If an algorithm does many comparisons, that will dominate the cost. Restructuring to minimize the number of comparison operations is advisable.
 
-**There's also oblivious array access.** When indexing into an array at a secret position (not just pick between two values), Sequre provides `oblivious_get` in [stdlib/sequre/mpc/collections.codon](../../stdlib/sequre/mpc/collections.codon). It uses a demultiplexer built from bit decomposition ([stdlib/sequre/mpc/boolean.codon](../../stdlib/sequre/mpc/boolean.codon)) to read a public array at a secret index without revealing which element was accessed. This scales as $O(2^{\text{bits}})$, so best to keep the key bit length small.
+**There's also oblivious array access.** When indexing into an array at a secret position (not just pick between two values), Sequre provides `oblivious_get` in [stdlib/sequre/mpc/collections.codon](https://github.com/0xTCG/sequre/blob/main/stdlib/sequre/mpc/collections.codon). It uses a demultiplexer built from bit decomposition ([stdlib/sequre/mpc/boolean.codon](https://github.com/0xTCG/sequre/blob/main/stdlib/sequre/mpc/boolean.codon)) to read a public array at a secret index without revealing which element was accessed. This scales as $O(2^{\text{bits}})$, so best to keep the key bit length small.
 
 ## Existing built-ins
 

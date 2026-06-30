@@ -182,10 +182,10 @@ In case of `cannot find plugin 'sequre'`, ensure:
 
 1. Sequre is installed in the Codon plugins directory: `$HOME/.sequre/lib/codon/plugins/sequre/`
 2. The directory contains `plugin.toml`, `build/`, and `stdlib/`
-3. If using `codon` directly instead of the `sequre` launcher, pass `-plugin sequre`:
+3. If using `codon` directly instead of the `sequre` launcher, pass `--plugin=sequre`:
 
 ```bash
-codon run -plugin sequre my_protocol.codon
+codon run --plugin=sequre my_protocol.codon
 ```
 
-In case of `cannot find plugin 'seq'`, add the additional `-plugin seq` flag to the run or build command.
+In case of `cannot find plugin 'seq'`, add the additional `--plugin=seq` flag to the run or build command.

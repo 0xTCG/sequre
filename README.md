@@ -32,7 +32,7 @@ This installs to `~/.sequre` and adds it to your `PATH`. See [quickstart](https:
 
 ```bash
 git clone --depth 1 https://github.com/0xTCG/sequre.git && cd sequre
-sequre examples/addmul.codon
+sequre examples/addmul.codon --local
 ```
 
 > **Note:** The first compilation may take a minute — Sequre programs compile to native code. The launcher shows compilation progress by default.
@@ -41,7 +41,7 @@ Or compile to a binary:
 
 ```bash
 sequre build examples/addmul.codon -o addmul
-./addmul
+./addmul --local
 ```
 
 > **Note:** Make sure to delete sockets (`rm sock.*`) if running a **local run** pre-built binary. `sequre` command does this automatically, otherwise, but built binaries do not.
@@ -52,10 +52,10 @@ sequre build examples/addmul.codon -o addmul
 
 ```bash
 # Debug mode (default) — slow, with full backtraces on failure
-sequre run my_protocol.codon
+sequre run my_protocol.codon --local
 
 # Release mode — fast, production-ready
-sequre run -release my_protocol.codon
+sequre run -release my_protocol.codon --local
 
 # Building a release binary
 sequre build -release my_protocol.codon -o my_protocol
