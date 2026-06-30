@@ -98,6 +98,13 @@ echo "Build complete. Extracting to $INSTALL_PATH..."
 mkdir -p "$INSTALL_PATH"
 tar xzvf "$TARBALL" -C "$INSTALL_PATH"
 
+# Apply the AVX-512 alignment workaround: patch Codon's bundled Ptr (the shim and
+# patched launcher are already in the tarball). No-op off x86_64.
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+if [ -f "$SCRIPT_DIR/apply_avx512_workaround.sh" ]; then
+  SEQURE_WORKAROUND_SKIP_LAUNCHER=1 bash "$SCRIPT_DIR/apply_avx512_workaround.sh" "$INSTALL_PATH"
+fi
+
 echo ""
 echo "Done! Sequre installed to $INSTALL_PATH"
 echo "Run with: $INSTALL_PATH/bin/sequre <file.codon>"

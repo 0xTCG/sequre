@@ -43,6 +43,15 @@ curl -L "https://github.com/exaloop/codon/releases/download/$CODON_VERSION/$CODO
 echo "Downloading Sequre ..."
 curl -L "https://github.com/0xTCG/sequre/releases/latest/download/$SEQURE_BUILD_ARCHIVE" | tar zxvf - --strip-components=0
 
+# 3. Apply the AVX-512 heap-vector alignment workaround for Codon (no-op off
+#    x86_64). A fresh Codon install ships an unpatched stdlib, so re-apply the
+#    Ptr unaligned-load patch here (the shim and patched launcher come from the
+#    Sequre tarball; Sequre's own stdlib, incl. prg.codon, ships in the plugin).
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+if [ -f "$SCRIPT_DIR/apply_avx512_workaround.sh" ]; then
+  bash "$SCRIPT_DIR/apply_avx512_workaround.sh" "$SEQURE_INSTALL_DIR"
+fi
+
 EXPORT_COMMAND="export PATH=$SEQURE_INSTALL_DIR/bin:\$PATH"
 echo ""
 echo "PATH export command:"

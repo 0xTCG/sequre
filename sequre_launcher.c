@@ -67,6 +67,64 @@ static char *default_codon_path(void) {
   return p;
 }
 
+/* Work around a Codon AVX-512 heap-vector alignment bug (aligned vmovaps %zmm to
+ * 16-byte-aligned GC memory) by LD_PRELOAD-ing a small shim that over-aligns GC
+ * allocations. The shim is resolved next to this executable
+ * (<bindir>/../lib/sequre_align64.so). Scoped to the codon child only.
+ * Disable with SEQURE_NO_ALIGN_SHIM=1; override the path with SEQURE_ALIGN_SHIM.
+ * No-op when the shim is absent (e.g. macOS/arm64, which is unaffected). */
+static void maybe_set_align_shim(void) {
+  const char *disable = getenv("SEQURE_NO_ALIGN_SHIM");
+  if (disable && *disable && strcmp(disable, "0") != 0) {
+    return;
+  }
+
+  char shim[PATH_MAX];
+  const char *override = getenv("SEQURE_ALIGN_SHIM");
+  if (override && *override) {
+    if (strlen(override) >= sizeof(shim)) {
+      return;
+    }
+    strcpy(shim, override);
+  } else {
+    char self[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", self, sizeof(self) - 1);
+    if (len <= 0) {
+      return; /* e.g. no /proc (macOS); nothing to do */
+    }
+    self[len] = '\0';
+    char *slash = strrchr(self, '/');
+    if (!slash) {
+      return;
+    }
+    *slash = '\0'; /* now self == <bindir> */
+    if (snprintf(shim, sizeof(shim), "%s/../lib/sequre_align64.so", self) >= (int)sizeof(shim)) {
+      return;
+    }
+  }
+
+  if (access(shim, R_OK) != 0) {
+    return; /* shim not installed; run without it */
+  }
+
+  const char *existing = getenv("LD_PRELOAD");
+  if (existing && *existing) {
+    if (strstr(existing, shim) != NULL) {
+      return; /* already present */
+    }
+    size_t n = strlen(shim) + 1 + strlen(existing) + 1;
+    char *combined = malloc(n);
+    if (!combined) {
+      return;
+    }
+    snprintf(combined, n, "%s:%s", shim, existing);
+    setenv("LD_PRELOAD", combined, 1);
+    free(combined);
+  } else {
+    setenv("LD_PRELOAD", shim, 1);
+  }
+}
+
 static char *default_plugin_path(void) {
   const char *env = getenv("SEQURE_PLUGIN_PATH");
   if (env && *env) {
@@ -498,6 +556,7 @@ int main(int argc, char **argv) {
   }
 
   maybe_set_codon_python();
+  maybe_set_align_shim();
 
   /* Handle --help / -h before doing anything else */
   if (argc < 2) {

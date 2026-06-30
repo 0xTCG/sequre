@@ -40,8 +40,14 @@ cmake --install build --prefix=$HOME/.sequre/lib/codon/plugins/sequre
 # the `sequre.stdlib.numpy` namespace, so it never collides with Codon's
 # native `numpy`, which is left intact.
 
-# Build sequre launcher binary
+# Build sequre launcher binary (auto-preloads the AVX-512 over-align shim)
 $CC -O2 -o $HOME/.sequre/bin/sequre "$SRC/sequre_launcher.c"
+
+# Build the AVX-512 over-align shim into lib/ (bundled via the lib/ tar entry
+# below; install-via-docker.sh patches Codon's Ptr post-extraction). x86_64 only.
+if [ "$(uname -m)" = "x86_64" ]; then
+  $CC -shared -fPIC -O2 -o $HOME/.sequre/lib/sequre_align64.so "$SRC/sequre_align64.c" -ldl
+fi
 
 # Bundle GMP library
 SEQURE_PREFIX=$HOME/.sequre/lib/codon/plugins/sequre

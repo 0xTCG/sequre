@@ -97,6 +97,16 @@ case "$(uname -s)" in
   *)       cp $1/external/GMP/lib/libgmp.so     $SEQURE_PREFIX/lib/libgmp.so    ;;
 esac
 
+# Build the AVX-512 heap-vector over-align shim (x86_64 only). The launcher
+# auto-preloads it (maybe_set_align_shim()); install.sh patches Codon's Ptr
+# separately (Codon's stdlib is not bundled here). macOS/arm64 is unaffected,
+# so no shim is built or bundled there.
+SHIM_TAR_ENTRY=
+if [ "$(uname -m)" = "x86_64" ]; then
+  $CC -shared -fPIC -O2 -o $HOME/.sequre/lib/sequre_align64.so $1/sequre_align64.c -ldl
+  SHIM_TAR_ENTRY=lib/sequre_align64.so
+fi
+
 # Note: only Sequre's own files are included (not the whole lib/codon/stdlib
 # tree) so the tarball stays scoped to Sequre's own files; install.sh extracts
 # Codon itself separately. Sequre's numpy fork travels inside the plugin
@@ -105,5 +115,6 @@ esac
 tar czvf sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz -C $HOME/.sequre \
   bin/sequre \
   lib/codon/plugins/sequre \
-  lib/codon/plugins/seq
+  lib/codon/plugins/seq \
+  $SHIM_TAR_ENTRY
 echo "Done"
