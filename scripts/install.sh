@@ -6,17 +6,22 @@ SEQURE_INSTALL_DIR=~/.sequre
 OS=$(uname -s | awk '{print tolower($0)}')
 ARCH=$(uname -m)
 
-if [ "$OS" != "linux" ]; then
-  echo "error: Pre-built binaries only exist for Linux (x86_64, aarch64)." >&2
+if [ "$OS" = "linux" ]; then
+  if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
+    echo "error: Pre-built binaries for Linux only exist for x86_64 and aarch64." >&2
+    exit 1
+  fi
+elif [ "$OS" = "darwin" ]; then
+  if [ "$ARCH" != "arm64" ]; then
+    echo "error: Pre-built binaries for macOS only exist for Apple Silicon (arm64)." >&2
+    exit 1
+  fi
+else
+  echo "error: Pre-built binaries only exist for Linux (x86_64, aarch64) and macOS (arm64)." >&2
   exit 1
 fi
 
-if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
-  echo "error: Pre-built binaries only exist for x86_64 and aarch64." >&2
-  exit 1
-fi
-
-CODON_VERSION=v0.17.0
+CODON_VERSION=v0.19.6
 CODON_BUILD_ARCHIVE=codon-$OS-$ARCH.tar.gz
 SEQURE_BUILD_ARCHIVE=sequre-$OS-$ARCH.tar.gz
 
@@ -29,9 +34,23 @@ cd "$SEQURE_INSTALL_DIR"
 echo "Downloading Codon $CODON_VERSION ..."
 curl -L "https://github.com/exaloop/codon/releases/download/$CODON_VERSION/$CODON_BUILD_ARCHIVE" | tar zxvf - --strip-components=1
 
+# Sequre's numpy is a fork (its ndarray is defined differently and is
+# incompatible with Codon's own). It ships inside the plugin and is imported
+# exclusively via the `sequre.stdlib.numpy` namespace, so it no longer
+# collides with Codon's native `numpy` — Codon's own numpy/ is left intact.
+
 # 2. Install Sequre (plugin + launcher) on top
 echo "Downloading Sequre ..."
 curl -L "https://github.com/0xTCG/sequre/releases/latest/download/$SEQURE_BUILD_ARCHIVE" | tar zxvf - --strip-components=0
+
+# 3. Apply the AVX-512 heap-vector alignment workaround for Codon (no-op off
+#    x86_64). A fresh Codon install ships an unpatched stdlib, so re-apply the
+#    Ptr unaligned-load patch here (the shim and patched launcher come from the
+#    Sequre tarball; Sequre's own stdlib, incl. prg.codon, ships in the plugin).
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+if [ -f "$SCRIPT_DIR/apply_avx512_workaround.sh" ]; then
+  bash "$SCRIPT_DIR/apply_avx512_workaround.sh" "$SEQURE_INSTALL_DIR"
+fi
 
 EXPORT_COMMAND="export PATH=$SEQURE_INSTALL_DIR/bin:\$PATH"
 echo ""

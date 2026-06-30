@@ -15,26 +15,53 @@ esac
 
 mkdir $HOME/.sequre
 cd $HOME/.sequre
-curl -L https://github.com/exaloop/codon/releases/download/v0.17.0/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - --strip-components=1
+curl -L https://github.com/exaloop/codon/releases/download/v0.19.6/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - --strip-components=1
 mkdir -p $OPT
-LLVM_TAR=$(curl -L https://github.com/exaloop/llvm-project/releases/download/codon-15.0.1/llvm-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz -o /tmp/llvm.tar.gz && echo /tmp/llvm.tar.gz)
-LLVM_TOP=$(tar tzf "$LLVM_TAR" | head -1 | cut -d/ -f1)
+LLVM_TAR=$(curl -L https://github.com/exaloop/llvm-project/releases/download/codon-20.1.7/llvm-codon-20.1.7-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.bz2 -o /tmp/llvm.tar.bz2 && echo /tmp/llvm.tar.bz2)
+LLVM_TOP=$(tar -tjf "$LLVM_TAR" | head -1 | cut -d/ -f1)
 if [ "$LLVM_TOP" = "opt" ]; then
-  tar zxvf "$LLVM_TAR" -C /
+  tar -jxvf "$LLVM_TAR" -C /
 else
-  tar zxvf "$LLVM_TAR" -C $OPT
+  tar -jxvf "$LLVM_TAR" -C $OPT
 fi
 rm -f "$LLVM_TAR"
 cd $HOME
 curl -L https://github.com/exaloop/seq/releases/download/v0.11.3/seq-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz | tar zxvf - -C .sequre/lib/codon/plugins
 
-# Use LLVM-codon clang on Linux; system clang on macOS (darwin LLVM tarball has no clang)
+# Pick the C/C++ compiler:
+#  - macOS: Apple's system clang. It knows the SDK sysroot for both the plugin
+#    build and the standalone launcher. (The LLVM-codon darwin tarball now ships
+#    a clang too, but it has no default sysroot, so system headers like glob.h
+#    are not found when building the launcher directly.)
+#  - Linux: the LLVM-codon clang, to match the bundled LLVM toolchain.
+case "$(uname -s)" in
+  Darwin*)
+    CC=$(command -v clang)
+    CXX=$(command -v clang++)
+    ;;
+  *)
+    if [ -f "$OPT/llvm-codon/bin/clang" ]; then
+      CC=$OPT/llvm-codon/bin/clang
+      CXX=$OPT/llvm-codon/bin/clang++
+    else
+      CC=$(command -v clang)
+      CXX=$(command -v clang++)
+    fi
+    ;;
+esac
+
+# On manylinux_2_28 the default toolchain is a gcc-toolset under /opt/rh, which
+# the LLVM-codon clang does not auto-detect, so it cannot find libstdc++ (or the
+# C++20 headers) when linking the plugin. Point clang at it via a config file,
+# matching how Codon builds its own plugins (see exaloop/codon
+# .github/build-linux/Dockerfile.linux-x86_64). No-op off manylinux: the glob is
+# empty (e.g. on macOS), so no config file is written.
 if [ -f "$OPT/llvm-codon/bin/clang" ]; then
-  CC=$OPT/llvm-codon/bin/clang
-  CXX=$OPT/llvm-codon/bin/clang++
-else
-  CC=$(command -v clang)
-  CXX=$(command -v clang++)
+  GCC_INSTALL_DIR=$(ls -d /opt/rh/gcc-toolset-*/root/usr/lib/gcc/*/* 2>/dev/null | sort -V | tail -1)
+  if [ -n "$GCC_INSTALL_DIR" ]; then
+    echo "--gcc-install-dir=$GCC_INSTALL_DIR" > "$OPT/llvm-codon/bin/clang.cfg"
+    echo "--gcc-install-dir=$GCC_INSTALL_DIR" > "$OPT/llvm-codon/bin/clang++.cfg"
+  fi
 fi
 
 cd $1
@@ -52,6 +79,13 @@ else
 fi
 cmake --install build --prefix=$HOME/.sequre/lib/codon/plugins/sequre
 
+# Sequre's numpy is a fork (its ndarray is defined differently and is
+# incompatible with Codon's own; for now — the plan is to eventually migrate
+# Sequre to use Codon's numpy directly). It is shipped inside the plugin (via
+# the `install(DIRECTORY stdlib ...)` rule) and imported exclusively through
+# the `sequre.stdlib.numpy` namespace, so it never collides with Codon's
+# native `numpy`, which is left intact.
+
 # Build sequre launcher binary
 $CC -O2 -o $HOME/.sequre/bin/sequre $1/sequre_launcher.c
 
@@ -63,5 +97,24 @@ case "$(uname -s)" in
   *)       cp $1/external/GMP/lib/libgmp.so     $SEQURE_PREFIX/lib/libgmp.so    ;;
 esac
 
-tar czvf sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz -C $HOME/.sequre bin/sequre lib/codon/plugins/sequre lib/codon/plugins/seq
+# Build the AVX-512 heap-vector over-align shim (x86_64 only). The launcher
+# auto-preloads it (maybe_set_align_shim()); install.sh patches Codon's Ptr
+# separately (Codon's stdlib is not bundled here). macOS/arm64 is unaffected,
+# so no shim is built or bundled there.
+SHIM_TAR_ENTRY=
+if [ "$(uname -m)" = "x86_64" ]; then
+  $CC -shared -fPIC -O2 -o $HOME/.sequre/lib/sequre_align64.so $1/sequre_align64.c -ldl
+  SHIM_TAR_ENTRY=lib/sequre_align64.so
+fi
+
+# Note: only Sequre's own files are included (not the whole lib/codon/stdlib
+# tree) so the tarball stays scoped to Sequre's own files; install.sh extracts
+# Codon itself separately. Sequre's numpy fork travels inside the plugin
+# (lib/codon/plugins/sequre/stdlib/numpy), so Codon's native numpy/ is neither
+# bundled nor replaced.
+tar czvf sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz -C $HOME/.sequre \
+  bin/sequre \
+  lib/codon/plugins/sequre \
+  lib/codon/plugins/seq \
+  $SHIM_TAR_ENTRY
 echo "Done"
