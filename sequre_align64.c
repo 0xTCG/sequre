@@ -29,6 +29,7 @@
  */
 #define _GNU_SOURCE
 #include <stddef.h>
+#include <string.h>
 #include <dlfcn.h>
 
 /* The bug is specific to x86-64 (wide aligned vector stores; ARM NEON is
@@ -45,15 +46,18 @@
 
 typedef void *(*alloc_fn)(size_t);
 typedef void *(*memalign_fn)(size_t, size_t);
+typedef void *(*realloc_fn)(void *, size_t, size_t);
 
 static alloc_fn real_alloc;
 static alloc_fn real_alloc_atomic;
 static memalign_fn gc_memalign;
+static realloc_fn real_realloc;
 
 static void init(void) {
   if (!real_alloc) real_alloc = (alloc_fn)dlsym(RTLD_NEXT, "seq_alloc");
   if (!real_alloc_atomic) real_alloc_atomic = (alloc_fn)dlsym(RTLD_NEXT, "seq_alloc_atomic");
   if (!gc_memalign) gc_memalign = (memalign_fn)dlsym(RTLD_NEXT, "GC_memalign");
+  if (!real_realloc) real_realloc = (realloc_fn)dlsym(RTLD_NEXT, "seq_realloc");
 }
 
 void *seq_alloc(size_t n) {
@@ -72,6 +76,30 @@ void *seq_alloc_atomic(size_t n) {
   }
   if (!gc_memalign) init();
   return gc_memalign(SEQURE_ALIGN, n);
+}
+
+/* seq_realloc MUST be interposed too. A growable buffer (e.g. a List backing
+ * store) is first allocated here via GC_memalign, then grown through
+ * seq_realloc. The stock seq_realloc calls GC_realloc on that over-aligned
+ * block, which mishandles it and corrupts the heap (observed as a NULL
+ * coroutine resume pointer when building `list(range(N))` for N large enough to
+ * trigger a regrow). Codon passes the old size, so we can over-align the grown
+ * buffer ourselves: allocate a fresh SEQURE_ALIGN-aligned block and copy. Only
+ * the large path is redirected; small reallocations keep the fast stock path
+ * (they can never hold a 64-byte vector and never came from GC_memalign while
+ * large). */
+void *seq_realloc(void *p, size_t newsize, size_t oldsize) {
+  if (newsize < SEQURE_ALIGN) {
+    if (!real_realloc) init();
+    return real_realloc(p, newsize, oldsize);
+  }
+  if (!gc_memalign) init();
+  void *q = gc_memalign(SEQURE_ALIGN, newsize);
+  if (p && oldsize) {
+    size_t copy = oldsize < newsize ? oldsize : newsize;
+    memcpy(q, p, copy);
+  }
+  return q;
 }
 
 #endif /* x86-64 */
