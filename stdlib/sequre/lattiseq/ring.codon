@@ -1735,14 +1735,40 @@ class BasisExtender:
     # Given a polynomial with coefficients in basis {P0,P1....Plevel},
     # it extends its basis from {P0,P1....Plevel} to {Q0,Q1...Qj}
     def _mm_mod_up_p_to_q(self, level_p: int, level_q: int, pol_p: Poly, pol_q: Poly):
-        _mm_reference = pol_q._mm_coeffs.slice_reference(0, level_q + 1).transpose()
-        _mm_mod_up_exact(
-            pol_p._mm_coeffs.slice_reference(0, level_p + 1).transpose(),
-            _mm_reference,
-            self.ring_p, self.ring_q, self.params_p_to_q[level_p])
-        _mm_reference_t = _mm_reference.transpose()
-        for i in range(level_q + 1):
-            pol_q._mm_coeffs[i] = _mm_reference_t[i]
+        # Direct [level][coefficient] indexing version of _mm_mod_up_exact: the
+        # transposed-copy route allocated thousands of small lists per call (plus
+        # a fresh `y` per coefficient in _mm_reconstruct_rns), which dominated
+        # the key-switch mod-down cost.
+        params = self.params_p_to_q[level_p]
+        src_mod = self.ring_p._mm_modulus
+        src_mred = self.ring_p._mm_mred_params
+        dst_mod = self.ring_q._mm_modulus
+        dst_mred = self.ring_q._mm_mred_params
+        qb_mont = params._mm_qoverqiinvqi
+        vtimesqmodp = params.vtimesqmodp
+        qoverqimodp = params._mm_qoverqimodp
+        src = pol_p._mm_coeffs
+        dst = pol_q._mm_coeffs
+        n_src = level_p + 1
+        n_dst = level_q + 1
+        _mm_n = len(src[0])
+
+        # We loop over each coefficient and apply the basis extension. Chunked
+        # @par with one `y` scratch buffer per worker: the loop body itself must
+        # stay allocation-free or the workers serialize on the GC lock.
+        chunk = (_mm_n + NUM_THREADS - 1) // NUM_THREADS
+        @par(num_threads=NUM_THREADS)
+        for c in range(NUM_THREADS):
+            y = [u64xN(u64(0)) for _ in range(n_src)]
+            x_end = min((c + 1) * chunk, _mm_n)
+            for x in range(c * chunk, x_end):
+                vf = f64xN(0.0)
+                for i in range(n_src):
+                    y[i] = _mm_mred(src[i][x], qb_mont[i], src_mod[i], src_mred[i])
+                    vf = vf + y[i].fdiv(src_mod[i])
+                v = vf.to_u64()
+                for j in range(n_dst):
+                    dst[j][x] = _mm_mul_sum(v, y, dst_mod[j], dst_mred[j], vtimesqmodp[j], qoverqimodp[j])
                 
     # ModDownQPtoQNTT reduces the basis of a polynomial.
     # Given a polynomial with coefficients in basis {Q0,Q1....Qi} and {P0,P1...Pj},
@@ -2213,11 +2239,19 @@ class Decomposer:
         else: decomp_lvl = (level_q % nb_pi) - 1
 
         # First we check if the vector can simply by copying and rearranging elements (the case where no reconstruction is needed)
+        # NOTE: copies are done in-place (no fresh list allocation) so the @par
+        # workers never touch the GC allocation lock -- this loop is on the
+        # key-switch hot path and allocations here serialize the whole region.
         if decomp_lvl == -1:
+            src = p0_q._mm_coeffs[lvl_q_start]
             @par(num_threads=NUM_THREADS)
-            for j in range(level_q + 1): p1_q._mm_coeffs[j] = copy(p0_q._mm_coeffs[lvl_q_start])
+            for j in range(level_q + 1):
+                dst_q = p1_q._mm_coeffs[j]
+                for k in range(len(src)): dst_q[k] = src[k]
             @par(num_threads=NUM_THREADS)
-            for j in range(level_p + 1): p1_p._mm_coeffs[j] = copy(p0_q._mm_coeffs[lvl_q_start])
+            for j in range(level_p + 1):
+                dst_p = p1_p._mm_coeffs[j]
+                for k in range(len(src)): dst_p[k] = src[k]
             # Otherwise, we apply a fast exact base conversion for the reconstruction
         else:
             p0_idx_st = decomp_rns * nb_pi
@@ -2233,52 +2267,53 @@ class Decomposer:
             vtimesqmodp = params.vtimesqmodp
             qoverqimodp = params._mm_qoverqimodp
 
-            _mm_p0_q_coeffs = p0_q._mm_coeffs.slice_reference(0, level_q + 1).transpose()
-            _mm_p1_q_coeffs = p1_q._mm_coeffs.slice_reference(0, level_q + 1).transpose()
-            _mm_p1_p_coeffs = p1_p._mm_coeffs.slice_reference(0, level_p + 1).transpose()
-            
-            y = [u64xN(u64(0)) for _ in range(decomp_lvl + 2)]
-            # We loop over each coefficient and apply the basis extension
-            
-            #TODO: Try parallelism
-            for x in range(len(_mm_p0_q_coeffs)):
-                i, j = 0, lvl_q_start
-                vf = f64xN(0.0)
+            # Index [level][coefficient] directly instead of materializing
+            # transposed copies: the transposes allocated thousands of small
+            # lists per call and dominated the key-switch cost.
+            _mm_p0_q_coeffs = p0_q._mm_coeffs
+            _mm_p1_q_coeffs = p1_q._mm_coeffs
+            _mm_p1_p_coeffs = p1_p._mm_coeffs
+            _mm_n = len(_mm_p0_q_coeffs[0])
+            p_offset = len(ring_q.modulus)
 
-                # Coefficients to self decomposed
-                while i < decomp_lvl + 2:
-                    # For the coefficients to self decomposed, we can simply copy them
-                    _mm_p1_q_coeffs[x][j] = _mm_p0_q_coeffs[x][j]
-                    y[i] = _mm_mred(_mm_p0_q_coeffs[x][j], params._mm_qoverqiinvqi[i], q[j], mred_params_q[j])
-                    # Computation of the correction term v * q%pi
-                    vf = vf + y[i].fdiv(q[j])
-                    i, j = i + 1, j + 1
-
-                # Index of the correction term
-                v = vf.to_u64()
- 
-                # Coefficients of index smaller than the ones to self decomposed
-                for j in range(p0_idx_st):
-                    _mm_p1_q_coeffs[x][j] = _mm_mul_sum(v, y, q[j], mred_params_q[j], vtimesqmodp[j], qoverqimodp[j])
-
-                # Coefficients of index greater than the ones to self decomposed
-                for j in range(p0_idx_ed, level_q + 1):
-                    _mm_p1_q_coeffs[x][j] = _mm_mul_sum(v, y, q[j], mred_params_q[j], vtimesqmodp[j], qoverqimodp[j])
-
-                # Coefficients of the special primes Pi
-                j, u = 0, len(ring_q.modulus)
-                while j < level_p + 1:
-                    _mm_p1_p_coeffs[x][j] = _mm_mul_sum(v, y, p[j], mred_params_p[j], vtimesqmodp[u], qoverqimodp[u])
-                    j, u = j + 1, u + 1
-
-            _mm_p0_q_coeffs = _mm_p0_q_coeffs.transpose()
-            _mm_p1_q_coeffs = _mm_p1_q_coeffs.transpose()
-            # Copies the coefficients of polynomials mod the RNS decomposition
+            # We loop over each coefficient and apply the basis extension. Chunked
+            # @par with one `y` scratch buffer per worker: the loop body itself
+            # must stay allocation-free or the workers serialize on the GC lock.
+            chunk = (_mm_n + NUM_THREADS - 1) // NUM_THREADS
             @par(num_threads=NUM_THREADS)
-            for i in range(p0_idx_st, p0_idx_ed): _mm_p1_q_coeffs[i] = copy(_mm_p0_q_coeffs[i])
+            for c in range(NUM_THREADS):
+                y = [u64xN(u64(0)) for _ in range(decomp_lvl + 2)]
+                x_end = min((c + 1) * chunk, _mm_n)
+                for x in range(c * chunk, x_end):
+                    i, j = 0, lvl_q_start
+                    vf = f64xN(0.0)
 
-            p1_q._mm_set_coeffs(_mm_p1_q_coeffs)
-            p1_p._mm_set_coeffs(_mm_p1_p_coeffs.transpose())
+                    # Coefficients to self decomposed
+                    while i < decomp_lvl + 2:
+                        # For the coefficients to self decomposed, we can simply copy them
+                        cf = _mm_p0_q_coeffs[j][x]
+                        _mm_p1_q_coeffs[j][x] = cf
+                        y[i] = _mm_mred(cf, params._mm_qoverqiinvqi[i], q[j], mred_params_q[j])
+                        # Computation of the correction term v * q%pi
+                        vf = vf + y[i].fdiv(q[j])
+                        i, j = i + 1, j + 1
+
+                    # Index of the correction term
+                    v = vf.to_u64()
+
+                    # Coefficients of index smaller than the ones to self decomposed
+                    for j in range(p0_idx_st):
+                        _mm_p1_q_coeffs[j][x] = _mm_mul_sum(v, y, q[j], mred_params_q[j], vtimesqmodp[j], qoverqimodp[j])
+
+                    # Coefficients of index greater than the ones to self decomposed
+                    for j in range(p0_idx_ed, level_q + 1):
+                        _mm_p1_q_coeffs[j][x] = _mm_mul_sum(v, y, q[j], mred_params_q[j], vtimesqmodp[j], qoverqimodp[j])
+
+                    # Coefficients of the special primes Pi
+                    j, u = 0, p_offset
+                    while j < level_p + 1:
+                        _mm_p1_p_coeffs[j][x] = _mm_mul_sum(v, y, p[j], mred_params_p[j], vtimesqmodp[u], qoverqimodp[u])
+                        j, u = j + 1, u + 1
         
 
 # NewDecomposer creates a new Decomposer.
