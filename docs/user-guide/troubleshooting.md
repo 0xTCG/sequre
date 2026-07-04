@@ -33,14 +33,14 @@ If auto-detection fails, install GMP and set the path to it to `SEQURE_GMP_PATH`
 sudo apt install libgmp-dev
 export SEQURE_GMP_PATH=/usr/lib/x86_64-linux-gnu/libgmp.so
 
-# macOS (Darwin builds are currently disabled)
-# brew install gmp
-# export SEQURE_GMP_PATH=/opt/homebrew/lib/libgmp.dylib
+# macOS
+brew install gmp
+export SEQURE_GMP_PATH=/opt/homebrew/lib/libgmp.dylib
 ```
 
 ### OpenSSL (libssl / libcrypto)
 
-The Sequre launcher auto-detects common OpenSSL paths on Linux. If auto-detection fails, install OpenSSL and point to it manually:
+The Sequre launcher auto-detects common OpenSSL paths on Linux and macOS. If auto-detection fails, install OpenSSL and point to it manually:
 
 ```bash
 # Linux
@@ -48,24 +48,24 @@ sudo apt install libssl-dev
 export SEQURE_OPENSSL_PATH=/usr/lib/x86_64-linux-gnu/libssl.so.3
 export SEQURE_LIBCRYPTO_PATH=/usr/lib/x86_64-linux-gnu/libcrypto.so.3
 
-# macOS (Darwin builds are currently disabled)
-# brew install openssl
-# export SEQURE_OPENSSL_PATH=/opt/homebrew/opt/openssl/lib/libssl.dylib
-# export SEQURE_LIBCRYPTO_PATH=/opt/homebrew/opt/openssl/lib/libcrypto.dylib
+# macOS
+brew install openssl
+export SEQURE_OPENSSL_PATH=/opt/homebrew/opt/openssl/lib/libssl.dylib
+export SEQURE_LIBCRYPTO_PATH=/opt/homebrew/opt/openssl/lib/libcrypto.dylib
 ```
 
 ### libpython (for `@python` interop)
 
 The `@python` decorator enables calling Python code from Sequre (see [Python interoperability](#python-interoperability) below). It requires `libpython` to be available at runtime.
 
-In case of errors like `libpython3.x.so: cannot open shared object file`, set the `CODON_PYTHON` environment variable:
+The `sequre` launcher auto-detects `libpython` by querying `python3` on `PATH` (via `sysconfig`), so most setups need no configuration. If auto-detection fails (no `python3` on `PATH`, or an unusual install layout), or in case of errors like `libpython3.x.so: cannot open shared object file`, set the `CODON_PYTHON` environment variable manually:
 
 ```bash
 # Linux
 export CODON_PYTHON=/usr/lib/x86_64-linux-gnu/libpython3.12.so
 
-# macOS (Darwin builds are currently disabled)
-# export CODON_PYTHON=$(python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")/libpython3.12.dylib
+# macOS
+export CODON_PYTHON=$(python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")/libpython3.12.dylib
 ```
 
 !!! note
@@ -92,7 +92,7 @@ def my_protocol(mpc):
 
 **Requirements:**
 
-- Set `CODON_PYTHON` to point to the Python shared library (see [above](#libpython-for-python-interop))
+- `CODON_PYTHON` must point to the Python shared library — the launcher auto-detects this via `python3` on `PATH`; set it manually if detection fails (see [above](#libpython-for-python-interop))
 - The `@python` function body runs in the system Python interpreter — any used packages must be installed in that Python environment
 - Arguments and return values are automatically marshalled between Codon and Python types. Use standard types (`int`, `float`, `str`, `List`, `Dict`, `Tuple`) for the function signature
 
@@ -182,10 +182,10 @@ In case of `cannot find plugin 'sequre'`, ensure:
 
 1. Sequre is installed in the Codon plugins directory: `$HOME/.sequre/lib/codon/plugins/sequre/`
 2. The directory contains `plugin.toml`, `build/`, and `stdlib/`
-3. If using `codon` directly instead of the `sequre` launcher, pass `-plugin sequre`:
+3. If using `codon` directly instead of the `sequre` launcher, pass `--plugin=sequre`:
 
 ```bash
-codon run -plugin sequre my_protocol.codon
+codon run --plugin=sequre my_protocol.codon
 ```
 
-In case of `cannot find plugin 'seq'`, add the additional `-plugin seq` flag to the run or build command.
+In case of `cannot find plugin 'seq'`, add the additional `--plugin=seq` flag to the run or build command.

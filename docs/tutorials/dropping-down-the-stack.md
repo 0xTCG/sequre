@@ -10,7 +10,7 @@ For the overall architecture (Layers 1–4), see the [Home page](../index.md).
 
 ### Starting point: high-level PCA
 
-In [stdlib/sequre/stdlib/learn/pca.codon](../../stdlib/sequre/stdlib/learn/pca.codon), the randomized PCA routines are written as straightforward linear algebra — matrix products, orthonormalization, eigendecomposition. Most of the algorithm stays at the top level: `@` for matrix multiply, `.T` for transpose, slicing for submatrix extraction.
+In [stdlib/sequre/stdlib/learn/pca.codon](https://github.com/0xTCG/sequre/blob/main/stdlib/sequre/stdlib/learn/pca.codon), the randomized PCA routines are written as straightforward linear algebra — matrix products, orthonormalization, eigendecomposition. Most of the algorithm stays at the top level: `@` for matrix multiply, `.T` for transpose, slicing for submatrix extraction.
 
 But two operations can't be done (or are very expensive) in pure HE: orthonormalization and eigendecomposition. So PCA drops into MPC for those, using `via_mpc`:
 
@@ -35,13 +35,13 @@ So `via_mpc` is the boundary between "stay in HE" and "temporarily drop into MPC
 
 ### One layer down: type conversions
 
-The E2S and S2E steps are implemented in [stdlib/sequre/types/internal.codon](../../stdlib/sequre/types/internal.codon):
+The E2S and S2E steps are implemented in [stdlib/sequre/types/internal.codon](https://github.com/0xTCG/sequre/blob/main/stdlib/sequre/types/internal.codon):
 
 - `Ciphertensor.to_sharetensor(mpc, ...)` — decrypts via the E2S protocol.
 - `Sharetensor.to_ciphertensor(mpc, ...)` — re-encrypts via S2E.
 - `to_mpp`, `to_mpa`, `to_mpu` — handle the multiparty wrappers.
 
-These methods delegate to `mpc.mhe.ciphervector_to_additive_share_vector` and `mpc.mhe.additive_share_vector_to_ciphervector` — the core MHE conversion routines in [stdlib/sequre/mpc/mhe.codon](../../stdlib/sequre/mpc/mhe.codon), documented in [Core MHE Module](../deep-dive-shechi/core-mhe.md).
+These methods delegate to `mpc.mhe.ciphervector_to_additive_share_vector` and `mpc.mhe.additive_share_vector_to_ciphervector` — the core MHE conversion routines in [stdlib/sequre/mpc/mhe.codon](https://github.com/0xTCG/sequre/blob/main/stdlib/sequre/mpc/mhe.codon), documented in [Core MHE Module](../deep-dive-shechi/core-mhe.md).
 
 ### The deepest layer: Lattiseq protocols
 
@@ -53,7 +53,7 @@ This layer rarely needs to be touched directly. But when implementing a new coll
 
 ### Starting point: linear regression
 
-In [stdlib/sequre/stdlib/learn/lin_reg.codon](../../stdlib/sequre/stdlib/learn/lin_reg.codon), the gradient descent loop does:
+In [stdlib/sequre/stdlib/learn/lin_reg.codon](https://github.com/0xTCG/sequre/blob/main/stdlib/sequre/stdlib/learn/lin_reg.codon), the gradient descent loop does:
 
 ```python
 cov = X_tilde.T @ X_tilde  # n x n
@@ -64,7 +64,7 @@ When `X_tilde` is a `Sharetensor`, this is a standard Beaver-triple matmul — o
 
 ### One layer down: the cost selector
 
-The key function is `_switch_matmul_by_cost` in [stdlib/sequre/types/ciphertensor.codon](../../stdlib/sequre/types/ciphertensor.codon). When a `Ciphertensor` is multiplied by a plaintext `ndarray`, it estimates the cost of four strategies:
+The key function is `_switch_matmul_by_cost` in [stdlib/sequre/types/ciphertensor.codon](https://github.com/0xTCG/sequre/blob/main/stdlib/sequre/types/ciphertensor.codon). When a `Ciphertensor` is multiplied by a plaintext `ndarray`, it estimates the cost of four strategies:
 
 ```python
 costs = (Ciphertensor._get_matmul_via_mpc_cost(self, other),   # decrypt, MPC matmul, re-encrypt

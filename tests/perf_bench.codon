@@ -1,0 +1,645 @@
+"""
+Sequre layered performance benchmark.
+
+Run:
+    sequre run tests/perf_bench.codon --local
+
+Measures every performance-critical layer bottom-up, on EVERY party separately
+(CP0 is the MPC dealer and does no MHE compute -- never benchmark on it alone):
+
+    L0  CPU primitives        montgomery mul, NTT, gather, PRG, allocation rate
+    L1  local HE ops          enc, add, mul(+rescale/relin), rotation (step/level grid)
+    L2  collective MHE        bootstrap, decrypt, MPC<->MHE switches (+bytes sent)
+    L3  MPC (Sharetensor)     enc, add, beaver mul, comparison, reveal (+bytes sent)
+    L4  Ciphertensor          enc/reveal, pt@ct matmul (64/256), M1/M2/M3, rotation sweep
+    L5  mini end-to-end       L2-distance on Sharetensor (MPC) and MPU (MHE)
+    L6  KING kinship          paper-scale app benchmark (king.toml config), MPC vs MHE
+
+Each op runs `reps` times; the median and min land in a per-party TSV:
+
+    results/perf_v2_CP{pid}.tsv
+    columns: layer  op  params  median_s  min_s  reps  check
+
+`check` is a correctness witness (checksum or max-abs-error vs plaintext) so a
+speedup that breaks the math is caught in the same run. Data is drawn from the
+shared global PRG stream (seed_switch(-1)) so all parties agree on inputs.
+"""
+import time
+
+
+import prg
+import secure_operator
+import sequre.lattiseq.ckks as ckks
+import toml
+
+from numpy.create import rand_normal
+from sequre import main
+from sequre.constants import (
+    LATTISEQ_STANDARD_RING_ENUM, MPC_FIELD_SIZE, NUM_THREADS, ENC_DIAG)
+from sequre.settings import MPC_INT_SIZE
+from sequre.stdlib.numpy.create import array as sq_array, zeros_like as sq_zeros_like
+from sequre.types.multiparty_partition import MPP
+from sequre.utils.utils import random_ints
+
+from ..applications.king import king
+from sequre.lattiseq.ring import new_ring_from_type, _mm_mred
+from sequre.stdlib.lin_alg import l2
+from sequre.types.builtin import u64xN
+from sequre.types.ciphertensor import Ciphertensor, Plaintext, Ciphertext
+from sequre.types.multiparty_union import MPU
+from sequre.types.sharetensor import Sharetensor
+from sequre.utils.utils import random_floats
+
+
+TSV_PATH_PREFIX = "results/perf_v2_CP"
+
+
+def _tsv_path(mpc) -> str:
+    return f"{TSV_PATH_PREFIX}{mpc.pid}.tsv"
+
+
+def _init_tsv(mpc):
+    with open(_tsv_path(mpc), "w") as f:
+        f.write(f"# sequre perf_v2 | pid={mpc.pid} | parties={mpc.comms.number_of_parties} "
+                f"| slots={mpc.mhe.crypto_params.params.slots() if mpc.pid else 0} "
+                f"| NUM_THREADS={NUM_THREADS} | MPC_INT_SIZE={MPC_INT_SIZE}\n")
+        f.write("layer\top\tparams\tmedian_s\tmin_s\treps\tcheck\n")
+
+
+def _report(mpc, layer: str, op: str, params: str, times: list[float], check: float):
+    times.sort()
+    med = times[len(times) // 2]
+    line = f"{layer}\t{op}\t{params}\t{med:.6g}\t{times[0]:.6g}\t{len(times)}\t{check:.6g}"
+    with open(_tsv_path(mpc), "a") as f:
+        f.write(line + "\n")
+    print(f"CP{mpc.pid}:\t{line}")
+
+
+########################## L0: CPU primitives ##########################
+
+def bench_l0(mpc):
+    # Montgomery modular multiplication (8 lanes per op) -- the innermost CKKS primitive.
+    q = u64xN(u64(0x1fffffffffe00001))
+    q_inv = u64xN(u64(0x1fffffffffdfffff))
+    x = u64xN(u64(123456789123456789))
+    y = u64xN(u64(987654321987654321))
+    n_ops = 1000000
+    times = []
+    acc = u64xN(u64(0))
+    for _ in range(3):
+        s = time.time()
+        for _ in range(n_ops):
+            acc += _mm_mred(x, y, q, q_inv)
+        times.append(time.time() - s)
+    _report(mpc, "L0", "mred_x8", f"n={n_ops}", times, float(int(acc[0]) & 0xffff))
+
+    # Forward NTT, n=8192 (the key-switch workhorse; ~19 of these per rotation).
+    moduli = [u64(0x1fffffffffe00001), u64(0x1fffffffffc80001), u64(0x1fffffffffb40001)]
+    ring = new_ring_from_type(8192, moduli, LATTISEQ_STANDARD_RING_ENUM)
+    p1 = ring.new_poly()
+    p2 = ring.new_poly()
+    for j in range(len(p1._mm_coeffs[0])):
+        p1._mm_coeffs[0][j] = u64xN(u64(prg.getrandbits(50)))
+    n_ntt = 20
+    times = []
+    for _ in range(3):
+        s = time.time()
+        for _ in range(n_ntt):
+            ring._mm_ntt_single(0, p1._mm_coeffs[0], p2._mm_coeffs[0])
+        times.append((time.time() - s) / n_ntt)
+    _report(mpc, "L0", "ntt_8192", "fwd,level=0", times, float(int(p2._mm_coeffs[0][0][0]) & 0xffff))
+
+    # List.shuffle gather (basis-extension hot path).
+    table = [u64(i * 3) for i in range(64)]
+    idx = u64xN(u64(5))
+    n_g = 100000
+    times = []
+    accg = u64xN(u64(0))
+    for _ in range(3):
+        s = time.time()
+        for _ in range(n_g):
+            accg += table.shuffle(idx)
+        times.append(time.time() - s)
+    _report(mpc, "L0", "shuffle_gather", f"n={n_g}", times, float(int(accg[0]) & 0xffff))
+
+    # PRG throughput: default backend (secure AES-CTR) vs raw SFMT.
+    n_r = 200000
+    times = []
+    accr = u64(0)
+    for _ in range(3):
+        s = time.time()
+        for _ in range(n_r):
+            accr ^= prg.getrandbits_intn(64, TP=u64)
+        times.append(time.time() - s)
+    _report(mpc, "L0", "prg_secure_u64", f"n={n_r}", times, float(int(accr) & 0xffff))
+
+    sfmt = prg.RandomGenerator()
+    sfmt.init_genrand(u32(42))
+    times = []
+    accs = u64(0)
+    for _ in range(3):
+        s = time.time()
+        for _ in range(n_r):
+            accs ^= sfmt.genrand_int64()
+        times.append(time.time() - s)
+    _report(mpc, "L0", "prg_sfmt_u64", f"n={n_r}", times, float(int(accs) & 0xffff))
+
+    # Small-allocation rate: 64-byte list payloads (GC / align-shim canary).
+    n_a = 100000
+    times = []
+    acca = u64(0)
+    for _ in range(3):
+        s = time.time()
+        for i in range(n_a):
+            lst = [u64(i), u64(i + 1), u64(i + 2), u64(i + 3),
+                   u64(i + 4), u64(i + 5), u64(i + 6), u64(i + 7)]
+            acca ^= lst[i & 7]
+        times.append(time.time() - s)
+    _report(mpc, "L0", "alloc_64B_list", f"n={n_a}", times, float(int(acca) & 0xffff))
+
+
+########################## L1: local HE ops ##########################
+
+def bench_l1(mpc):
+    if mpc.pid == 0:
+        return
+
+    params = mpc.mhe.crypto_params.params
+    evaluator = mpc.mhe.crypto_params.evaluator
+    slots = params.slots()
+
+    mpc.randomness.reset_global_seed()
+    with mpc.randomness.seed_switch(-1):
+        values = random_floats((slots,))
+
+    # encode + encrypt
+    times = []
+    cv = [ckks.Ciphertext()]
+    for _ in range(5):
+        s = time.time()
+        cv = mpc.mhe.enc_vector(values, T=Ciphertext)
+        times.append(time.time() - s)
+    _report(mpc, "L1", "enc_vector", f"slots={slots}", times, float(cv[0].level()))
+
+    pt = mpc.mhe.enc_vector(values, T=Plaintext)[0]
+    ct = cv[0]
+
+    # ct + ct
+    out = ct.copy()
+    times = []
+    for _ in range(5):
+        s = time.time()
+        evaluator.add(ct, ct, out)
+        times.append(time.time() - s)
+    _report(mpc, "L1", "add_ct_ct", f"level={ct.level()}", times, float(out.level()))
+
+    # ct * pt (no rescale)
+    times = []
+    prod = ct.copy()
+    for _ in range(5):
+        s = time.time()
+        prod = evaluator.mul_new(ct, pt)
+        times.append(time.time() - s)
+    _report(mpc, "L1", "mul_ct_pt", f"level={ct.level()}", times, float(prod.level()))
+
+    # rescale after mul
+    times = []
+    for _ in range(5):
+        fresh = evaluator.mul_new(ct, pt)
+        s = time.time()
+        evaluator.rescale(fresh, params.default_scale, fresh)
+        times.append(time.time() - s)
+    _report(mpc, "L1", "rescale", f"from_level={prod.level()}", times, float(prod.level()))
+
+    # ct * ct with relinearization (uses the relin key -- gadget product)
+    times = []
+    for _ in range(5):
+        s = time.time()
+        rl = evaluator.mul_relin_new(ct, ct)
+        times.append(time.time() - s)
+    _report(mpc, "L1", "mul_relin_ct_ct", f"level={ct.level()}", times, 0.0)
+
+    # rotation (single key-switch), high level vs low level
+    times = []
+    for _ in range(5):
+        s = time.time()
+        rot = evaluator.rotate_new(ct, 1)
+        times.append(time.time() - s)
+    _report(mpc, "L1", "rotate_step1", f"level={ct.level()}", times, 0.0)
+
+    low_ct = ct.copy()
+    target_low = mpc.mhe.bootstrap_min_level + 1
+    evaluator.drop_level(low_ct, low_ct.level() - target_low)
+    times = []
+    for _ in range(5):
+        s = time.time()
+        rot = evaluator.rotate_new(low_ct, 1)
+        times.append(time.time() - s)
+    _report(mpc, "L1", "rotate_step1_low", f"level={low_ct.level()}", times, 0.0)
+
+
+########################## L2: collective MHE ##########################
+
+def bench_l2(mpc):
+    # NOTE: gate the body, don't early-return -- and use source_pid=1 with a
+    # small value scale, mirroring tests/unit_tests/test_mhe.codon. The switch
+    # protocols are sensitive to both.
+    modulus = MPC_FIELD_SIZE
+    slots = mpc.mhe.crypto_params.params.slots()
+
+    mpc.randomness.reset_global_seed()
+    with mpc.randomness.seed_switch(-1):
+        values = random_floats((slots,), scale=3.0)
+
+    if mpc.pid > 0:
+        cv = mpc.mhe.enc_vector(values, T=Ciphertext)
+
+        # collective bootstrap (drop near the bootstrap threshold first)
+        boot_ct = cv[0].copy()
+        mpc.mhe.crypto_params.evaluator.drop_level(
+            boot_ct, boot_ct.level() - mpc.mhe.bootstrap_min_level - 1)
+        times = []
+        for _ in range(3):
+            fresh = boot_ct.copy()
+            bs = mpc.stats.bytes_sent
+            s = time.time()
+            mpc.mhe._collective_bootstrap(fresh, -1)
+            times.append(time.time() - s)
+            be = mpc.stats.bytes_sent
+        _report(mpc, "L2", "collective_bootstrap", f"bytes={be - bs}", times, float(fresh.level()))
+
+        # collective decrypt (returns plaintexts; value check happens in L4 reveal)
+        times = []
+        n_dec = 0
+        for _ in range(3):
+            bs = mpc.stats.bytes_sent
+            s = time.time()
+            revealed = mpc.mhe.decrypt([cv[0].copy()], -1)
+            times.append(time.time() - s)
+            be = mpc.stats.bytes_sent
+            n_dec = len(revealed)
+        _report(mpc, "L2", "collective_decrypt", f"bytes={be - bs}", times, float(n_dec))
+
+        # MHE -> MPC switch
+        times = []
+        share = list[type(modulus)]()
+        for _ in range(3):
+            bs = mpc.stats.bytes_sent
+            s = time.time()
+            share = mpc.mhe.ciphervector_to_additive_share_vector(
+                cv, len(values), modulus, source_pid=1)
+            times.append(time.time() - s)
+            be = mpc.stats.bytes_sent
+        _report(mpc, "L2", "mhe_to_mpc", f"bytes={be - bs}", times, float(len(share)))
+
+        # MPC -> MHE switch
+        times = []
+        for _ in range(3):
+            bs = mpc.stats.bytes_sent
+            s = time.time()
+            back = mpc.mhe.additive_share_vector_to_ciphervector(share, modulus, True)
+            times.append(time.time() - s)
+            be = mpc.stats.bytes_sent
+        _report(mpc, "L2", "mpc_to_mhe", f"bytes={be - bs}", times, float(len(back)))
+
+
+########################## L3: MPC (Sharetensor) ##########################
+
+def bench_l3(mpc):
+    modulus = MPC_FIELD_SIZE
+    slots = 8192
+
+    mpc.randomness.reset_global_seed()
+    with mpc.randomness.seed_switch(-1):
+        values = random_floats((slots,))
+
+    # secret-share encryption
+    times = []
+    st = Sharetensor.enc(mpc, values, 1, modulus)
+    for _ in range(5):
+        s = time.time()
+        st = Sharetensor.enc(mpc, values, 1, modulus)
+        times.append(time.time() - s)
+    _report(mpc, "L3", "st_enc", f"n={slots}", times, 0.0)
+
+    # add (local)
+    times = []
+    for _ in range(5):
+        bs = mpc.stats.bytes_sent
+        s = time.time()
+        r = secure_operator.add(mpc, st, st)
+        times.append(time.time() - s)
+        be = mpc.stats.bytes_sent
+    _report(mpc, "L3", "st_add", f"n={slots};bytes={be - bs}", times, 0.0)
+
+    # beaver multiplication (network)
+    times = []
+    for _ in range(5):
+        bs = mpc.stats.bytes_sent
+        s = time.time()
+        r = secure_operator.mul(mpc, st, st)
+        times.append(time.time() - s)
+        be = mpc.stats.bytes_sent
+    _report(mpc, "L3", "st_mul_beaver", f"n={slots};bytes={be - bs}", times, 0.0)
+
+    # comparison (bit decomposition -- heaviest MPC primitive)
+    times = []
+    for _ in range(2):
+        bs = mpc.stats.bytes_sent
+        s = time.time()
+        r = secure_operator.gt(mpc, st, 0)
+        times.append(time.time() - s)
+        be = mpc.stats.bytes_sent
+    _report(mpc, "L3", "st_gt", f"n={slots};bytes={be - bs}", times, 0.0)
+
+    # reveal
+    times = []
+    check = 0.0
+    for _ in range(5):
+        bs = mpc.stats.bytes_sent
+        s = time.time()
+        rv = st.reveal(mpc)
+        times.append(time.time() - s)
+        be = mpc.stats.bytes_sent
+        if mpc.pid:
+            check = abs(rv[0] - values[0])
+    _report(mpc, "L3", "st_reveal", f"n={slots};bytes={be - bs}", times, check)
+
+
+########################## L4: Ciphertensor compound ##########################
+
+def _pt_ct_matmul(mpc, n: int, reps: int):
+    with mpc.randomness.seed_switch(-1):
+        pt_mat = rand_normal((n, n), mu=0.0, sigma=1.0)
+        pt_vec = rand_normal((n, 1), mu=0.0, sigma=1.0)
+
+    ct_vec = Ciphertensor[Ciphertext].enc(mpc, pt_vec)
+    times = []
+    err = 0.0
+    for _ in range(reps):
+        s = time.time()
+        comp = pt_mat.matmul(mpc, ct_vec, debug=False)
+        times.append(time.time() - s)
+        if mpc.pid:
+            result = comp.reveal(mpc, T=float)
+            expected = pt_mat @ pt_vec
+            for i in range(n):
+                e = float(abs(result[i][0] - expected[i][0]))
+                if e > err:
+                    err = e
+    _report(mpc, "L4", "pt_mat@ct_vec", f"{n}x{n}", times, err)
+
+
+def bench_l4(mpc):
+    if mpc.pid == 0:
+        return
+
+    slots = mpc.mhe.crypto_params.params.slots()
+
+    mpc.randomness.reset_global_seed()
+
+    # enc + reveal roundtrip of a 64x64 matrix
+    with mpc.randomness.seed_switch(-1):
+        mat64 = rand_normal((64, 64), mu=0.0, sigma=1.0)
+    times = []
+    err = 0.0
+    for _ in range(3):
+        s = time.time()
+        ct = Ciphertensor[Ciphertext].enc(mpc, mat64)
+        out = ct.reveal(mpc, T=float)
+        times.append(time.time() - s)
+        err = float(abs(out[0][0] - mat64[0][0]))
+    _report(mpc, "L4", "enc_reveal_roundtrip", "64x64", times, err)
+
+    # rotation-step sweep: keyed steps (<=63/pow2) vs butterfly (65..300)
+    with mpc.randomness.seed_switch(-1):
+        vec = random_floats((slots,))
+    cv = mpc.mhe.enc_vector(vec, T=Ciphertext)
+    for step in (1, 8, 63, 65, 128, 300):
+        times = []
+        for _ in range(3):
+            s = time.time()
+            mpc.mhe.rotate(cv, step)
+            times.append(time.time() - s)
+        _report(mpc, "L4", "rotate_by_step", f"step={step}", times, 0.0)
+
+    # the temp.codon case: plaintext matrix @ encrypted column vector
+    _pt_ct_matmul(mpc, 64, 3)
+    _pt_ct_matmul(mpc, 256, 2)
+
+    # ciphertensor x ciphertensor, each method explicitly.
+    # M1/M2 cost O(rows*cols) rotations/masked ops PER ELEMENT -- keep tiny.
+    # M3 costs ~rows*min(shape) rotations -- 16x16 is representative.
+    with mpc.randomness.seed_switch(-1):
+        a8 = rand_normal((8, 8), mu=0.0, sigma=1.0)
+        b8 = rand_normal((8, 8), mu=0.0, sigma=1.0)
+        a16 = rand_normal((16, 16), mu=0.0, sigma=1.0)
+        b16 = rand_normal((16, 16), mu=0.0, sigma=1.0)
+
+    ct_a8 = Ciphertensor[Ciphertext].enc(mpc, a8)
+    ct_b8 = Ciphertensor[Ciphertext].enc(mpc, b8)
+    times = []
+    for _ in range(1):
+        s = time.time()
+        r1 = ct_a8._matmul_v1(mpc, ct_b8.T, debug=False)
+        times.append(time.time() - s)
+    _report(mpc, "L4", "ct@ct_M1", "8x8", times, 0.0)
+
+    times = []
+    for _ in range(1):
+        s = time.time()
+        r2 = ct_a8._matmul_v2(mpc, ct_b8, debug=False)
+        times.append(time.time() - s)
+    _report(mpc, "L4", "ct@ct_M2", "8x8", times, 0.0)
+
+    ct_a16 = Ciphertensor[Ciphertext].enc(mpc, a16)
+    ct_b16_diag = Ciphertensor[Ciphertext].enc(mpc, b16, encoding=ENC_DIAG)
+    times = []
+    for _ in range(1):
+        s = time.time()
+        r3 = ct_a16.matmul(mpc, ct_b16_diag, debug=False)
+        times.append(time.time() - s)
+    _report(mpc, "L4", "ct@ct_M3", "16x16", times, 0.0)
+
+    # reduce_add and replicate on a 1-dim vector
+    with mpc.randomness.seed_switch(-1):
+        v256 = rand_normal((256,), mu=0.0, sigma=1.0)
+    ct_vec = Ciphertensor[Ciphertext].enc(mpc, v256)
+    times = []
+    for _ in range(3):
+        s = time.time()
+        red = ct_vec.reduce_add(mpc)
+        times.append(time.time() - s)
+    _report(mpc, "L4", "reduce_add", "n=256", times, 0.0)
+
+    times = []
+    for _ in range(3):
+        s = time.time()
+        rep = ct_vec.replicate(mpc, 1024)
+        times.append(time.time() - s)
+    _report(mpc, "L4", "replicate", "256->1024", times, 0.0)
+
+
+########################## L5: mini end-to-end ##########################
+
+def bench_l5(mpc):
+    rows_per_party = 8
+    cols = 1024
+    rows = rows_per_party * (mpc.comms.number_of_parties - 1)
+
+    mpc.randomness.reset_global_seed()
+    with mpc.randomness.seed_switch(-1):
+        raw = rand_normal((rows, cols), mu=0.0, sigma=1.0)
+    partition = raw.zeros() if mpc.pid == 0 else \
+        raw[(mpc.pid - 1) * rows_per_party:mpc.pid * rows_per_party]
+
+    # MPC path: L2 distance over secret shares
+    times = []
+    for _ in range(2):
+        bs = mpc.stats.bytes_sent
+        s = time.time()
+        st = Sharetensor.enc(mpc, raw)
+        d_mpc = l2(mpc, st)
+        d_mpc_raw = d_mpc.reveal(mpc)
+        times.append(time.time() - s)
+        be = mpc.stats.bytes_sent
+    _report(mpc, "L5", "l2_sharetensor", f"{rows}x{cols};bytes={be - bs}", times, 0.0)
+
+    # MHE path: L2 distance over an MPU partition
+    times = []
+    for _ in range(2):
+        bs = mpc.stats.bytes_sent
+        s = time.time()
+        mpu = MPU(mpc, partition, "partition")
+        d_mhe = l2(mpc, mpu)
+        d_mhe_raw = d_mhe.reveal(mpc)
+        times.append(time.time() - s)
+        be = mpc.stats.bytes_sent
+    _report(mpc, "L5", "l2_mpu", f"{rows}x{cols};bytes={be - bs}", times, 0.0)
+
+
+def _mark(mpc, tag: str):
+    with open(_tsv_path(mpc), "a") as f:
+        f.write(f"# mark {tag}\n")
+
+
+########################## L6: KING kinship (paper-scale) ##########################
+
+def bench_l6_king(mpc):
+    """Paper reference (Fig. 7, 12-core i7-8700/party, 1Gb/s LAN, 256-bit MPC):
+    kinship ran in ~6.4 min (MPC/Sequre) and ~4.1 min (MHE/Shechi).
+    NOTE: current default MPC_INT_SIZE is 192-bit (vs 256-bit in the paper), so
+    the MPC side is expected to run faster here on that account alone."""
+    config = toml.read("applications/config/king.toml")
+    rows_per_partition = config.get("individuals_per_party", T=int)
+    rows = rows_per_partition * (mpc.comms.number_of_parties - 1)
+    cols = config.get("number_of_snps", T=int)
+    het_inv_scale = cols // 100
+
+    mpc.randomness.reset_global_seed()
+    with mpc.randomness.seed_switch(-1):
+        raw_data = sq_array(random_ints((rows, cols), 0, 2), dtype=float)
+    raw_data_partition = sq_zeros_like(raw_data) if mpc.pid == 0 else \
+        raw_data[(mpc.pid - 1) * rows_per_partition:mpc.pid * rows_per_partition]
+
+    raw_het_inv = sq_array(
+        [[(1 / row.count(1)) for _ in range(rows)] for row in raw_data],
+        dtype=float) * het_inv_scale
+    raw_het_inv_partition = sq_zeros_like(raw_het_inv) if mpc.pid == 0 else \
+        raw_het_inv[(mpc.pid - 1) * rows_per_partition:mpc.pid * rows_per_partition]
+
+    # MPC path (Sharetensor)
+    times = []
+    bs = mpc.stats.bytes_sent
+    s = time.time()
+    sequre_data = Sharetensor.enc(mpc, raw_data)
+    sequre_het_inv = Sharetensor.enc(mpc, raw_het_inv)
+    king_mpc = king(mpc, sequre_data, sequre_het_inv)
+    king_mpc_raw = king_mpc.reveal(mpc)
+    times.append(time.time() - s)
+    be = mpc.stats.bytes_sent
+    _report(mpc, "L6", "king_mpc", f"{rows}x{cols};bytes={be - bs}", times, 0.0)
+
+    mpc.randomness.reset_global_seed()
+    mpc.comms.sync_parties()
+
+    # MHE path (MPP)
+    times = []
+    bs = mpc.stats.bytes_sent
+    s = time.time()
+    shechi_data = MPP(mpc, raw_data_partition)
+    shechi_het_inv = MPP(mpc, raw_het_inv_partition)
+    king_mhe = king(mpc, shechi_data, shechi_het_inv)
+    king_mhe_raw = king_mhe.reveal(mpc)
+    times.append(time.time() - s)
+    be = mpc.stats.bytes_sent
+
+    # correctness witness: MPC and MHE agree (off-diagonal element + max diff)
+    diff = 0.0
+    if mpc.pid:
+        for i in range(rows):
+            for j in range(rows):
+                if i == j: continue
+                d = float(abs(king_mpc_raw[i][j] - king_mhe_raw[i][j]))
+                if d > diff: diff = d
+    _report(mpc, "L6", "king_mhe", f"{rows}x{cols};bytes={be - bs}", times, diff)
+
+
+@main
+def perf_v2(mpc):
+    _init_tsv(mpc)
+    total_s = time.time()
+    # sync_parties barriers keep CP0 (which skips the MHE-only layers) from
+    # racing ahead into layers where it exchanges MPC traffic with parties
+    # still inside the previous layer.
+    bench_l0(mpc)
+    _mark(mpc, "sync1_enter")
+    # sync_parties draws its control element from the shared global PRG
+    # stream; layers that draw from it on compute parties only would desync
+    # the barrier, so re-align the stream first.
+    mpc.randomness.reset_global_seed()
+    mpc.comms.sync_parties()
+    _mark(mpc, "sync1_exit")
+    bench_l1(mpc)
+    _mark(mpc, "sync2_enter")
+    # sync_parties draws its control element from the shared global PRG
+    # stream; layers that draw from it on compute parties only would desync
+    # the barrier, so re-align the stream first.
+    mpc.randomness.reset_global_seed()
+    mpc.comms.sync_parties()
+    _mark(mpc, "sync2_exit")
+    bench_l2(mpc)
+    _mark(mpc, "sync3_enter")
+    # sync_parties draws its control element from the shared global PRG
+    # stream; layers that draw from it on compute parties only would desync
+    # the barrier, so re-align the stream first.
+    mpc.randomness.reset_global_seed()
+    mpc.comms.sync_parties()
+    _mark(mpc, "sync3_exit")
+    bench_l3(mpc)
+    _mark(mpc, "sync4_enter")
+    # sync_parties draws its control element from the shared global PRG
+    # stream; layers that draw from it on compute parties only would desync
+    # the barrier, so re-align the stream first.
+    mpc.randomness.reset_global_seed()
+    mpc.comms.sync_parties()
+    _mark(mpc, "sync4_exit")
+    bench_l4(mpc)
+    _mark(mpc, "sync5_enter")
+    # sync_parties draws its control element from the shared global PRG
+    # stream; layers that draw from it on compute parties only would desync
+    # the barrier, so re-align the stream first.
+    mpc.randomness.reset_global_seed()
+    mpc.comms.sync_parties()
+    _mark(mpc, "sync5_exit")
+    bench_l5(mpc)
+    _mark(mpc, "sync6_enter")
+    mpc.randomness.reset_global_seed()
+    mpc.comms.sync_parties()
+    _mark(mpc, "sync6_exit")
+    bench_l6_king(mpc)
+    _report(mpc, "ALL", "total_wall", "", [time.time() - total_s], 0.0)
+
+
+if __name__ == "__main__":
+    perf_v2()

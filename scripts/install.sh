@@ -6,17 +6,22 @@ SEQURE_INSTALL_DIR=~/.sequre
 OS=$(uname -s | awk '{print tolower($0)}')
 ARCH=$(uname -m)
 
-if [ "$OS" != "linux" ]; then
-  echo "error: Pre-built binaries only exist for Linux (x86_64, aarch64)." >&2
+if [ "$OS" = "linux" ]; then
+  if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
+    echo "error: Pre-built binaries for Linux only exist for x86_64 and aarch64." >&2
+    exit 1
+  fi
+elif [ "$OS" = "darwin" ]; then
+  if [ "$ARCH" != "arm64" ]; then
+    echo "error: Pre-built binaries for macOS only exist for Apple Silicon (arm64)." >&2
+    exit 1
+  fi
+else
+  echo "error: Pre-built binaries only exist for Linux (x86_64, aarch64) and macOS (arm64)." >&2
   exit 1
 fi
 
-if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
-  echo "error: Pre-built binaries only exist for x86_64 and aarch64." >&2
-  exit 1
-fi
-
-CODON_VERSION=v0.17.0
+CODON_VERSION=v0.19.6
 CODON_BUILD_ARCHIVE=codon-$OS-$ARCH.tar.gz
 SEQURE_BUILD_ARCHIVE=sequre-$OS-$ARCH.tar.gz
 
@@ -29,52 +34,63 @@ cd "$SEQURE_INSTALL_DIR"
 echo "Downloading Codon $CODON_VERSION ..."
 curl -L "https://github.com/exaloop/codon/releases/download/$CODON_VERSION/$CODON_BUILD_ARCHIVE" | tar zxvf - --strip-components=1
 
+# Sequre's numpy is a fork (its ndarray is defined differently and is
+# incompatible with Codon's own). It ships inside the plugin and is imported
+# exclusively via the `sequre.stdlib.numpy` namespace, so it no longer
+# collides with Codon's native `numpy` — Codon's own numpy/ is left intact.
+
 # 2. Install Sequre (plugin + launcher) on top
 echo "Downloading Sequre ..."
 curl -L "https://github.com/0xTCG/sequre/releases/latest/download/$SEQURE_BUILD_ARCHIVE" | tar zxvf - --strip-components=0
+
+# 3. AVX-512 heap-vector alignment workaround for Codon (Linux x86_64 only).
+#    A freshly downloaded Codon ships an unpatched stdlib, so patch its Ptr
+#    load/store to be unaligned. Inlined (not delegated to a sibling script) so
+#    it also works when this installer is run via `curl ... | bash`. The
+#    over-align shim and the patched launcher ship in the Sequre tarball, and
+#    Sequre's own stdlib (incl. prg.codon) ships in the plugin.
+if [ "$OS" = "linux" ] && [ "$ARCH" = "x86_64" ]; then
+  PTR="$SEQURE_INSTALL_DIR/lib/codon/stdlib/internal/types/ptr.codon"
+  if [ -f "$PTR" ] && ! grep -q ', align 1' "$PTR"; then
+    sed -i -E '/(^|[[:space:]])(load|store)[[:space:]]/ { /align/! { /%0$/ s/$/, align 1/ } }' "$PTR"
+    echo "Applied AVX-512 Ptr unaligned-load patch."
+  fi
+fi
 
 EXPORT_COMMAND="export PATH=$SEQURE_INSTALL_DIR/bin:\$PATH"
 echo ""
 echo "PATH export command:"
 echo "  $EXPORT_COMMAND"
 
-update_profile () {
-  if ! grep -F -q "$EXPORT_COMMAND" "$1"; then
-    read -p "Update PATH in $1? [y/n] " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-      echo "Updating $1"
-      echo >> "$1"
-      echo "# Sequre path (added by install script)" >> "$1"
-      echo "$EXPORT_COMMAND" >> "$1"
-    else
-      echo "Skipping."
-    fi
-  else
-    echo "PATH already updated in $1; skipping update."
-  fi
-}
 
-if [[ "$SHELL" == *zsh ]]; then
-  if [ -e ~/.zshenv ]; then
-    update_profile ~/.zshenv
-  elif [ -e ~/.zshrc ]; then
-    update_profile ~/.zshrc
-  else
-    echo "Could not find zsh configuration file to update PATH"
+PROFILES=()
+for f in ~/.zshenv ~/.zshrc ~/.zprofile ~/.bash_profile ~/.bash_login ~/.bashrc ~/.profile; do
+  if [ -e "$f" ]; then
+    if ! grep -F -q "$EXPORT_COMMAND" "$f"; then
+      PROFILES+=("$f")
+    else
+      echo "PATH already updated in $f; skipping."
+    fi
   fi
-elif [[ "$SHELL" == *bash ]]; then
-  if [ -e ~/.bash_profile ]; then
-    update_profile ~/.bash_profile
-  elif [ -e ~/.bash_login ]; then
-    update_profile ~/.bash_login
-  elif [ -e ~/.profile ]; then
-    update_profile ~/.profile
-  else
-    echo "Could not find bash configuration file to update PATH"
-  fi
+done
+
+if [ ${#PROFILES[@]} -eq 0 ]; then
+  echo "No shell configuration files found to update PATH."
 else
-  echo "Don't know how to update configuration file for shell $SHELL"
+  echo "The following profile files will be updated:"
+  for f in "${PROFILES[@]}"; do echo "  $f"; done
+  read -p "Update PATH in the above files? [y/n] " -n 1 -r
+  echo
+  if [[ $REPLY =~ ^[Yy]$ ]]; then
+    for f in "${PROFILES[@]}"; do
+      echo "Updating $f"
+      echo >> "$f"
+      echo "# Sequre path (added by install script)" >> "$f"
+      echo "$EXPORT_COMMAND" >> "$f"
+    done
+  else
+    echo "Skipping."
+  fi
 fi
 
 echo ""

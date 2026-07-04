@@ -1087,9 +1087,9 @@ void routeFactorizations(CallInstr *v, BodiedFunc *bf, SeriesFlow *series,
 
   for (auto factorizationTree : factorizationTrees) {
     newVars.push_back(
-        util::makeVar(generateExpression(M, factorizationTree), series, bf, true));
+      M->Nr<VarValue>(util::makeVar(generateExpression(M, factorizationTree), series, bf, true)));
     costVars.push_back(
-        util::makeVar(generateCostExpression(M, factorizationTree), series, bf, true));
+      M->Nr<VarValue>(util::makeVar(generateCostExpression(M, factorizationTree), series, bf, true)));
   }
 
   auto it = series->begin();

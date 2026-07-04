@@ -115,7 +115,7 @@ void applyEncodingOptimization( CallInstr *v ) {
   auto *betInitCall = util::call(betInitHelper, {betEncoding, argsTuple});
   assert(betInitCall);
 
-  auto *treeVarValue = util::makeVar(betInitCall, series, bf, true);
+  auto *treeVarValue = bfm->Nr<VarValue>(util::makeVar(betInitCall, series, bf, true));
   assert(treeVarValue);
 
   auto *betOptHelper = getOrRealizeSequreOptimizationHelper(M, "bet_enc_opt", {treeVarValue->getType()}, {});

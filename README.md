@@ -18,7 +18,7 @@ Write Python-like code; the Sequre compiler handles encrypted arithmetic and int
 
 ## Quick start
 
-**Supported platforms:** Linux (x86_64). macOS (Darwin) builds are currently disabled.
+**Supported platforms:** Linux (x86_64, aarch64) and macOS (Apple Silicon / arm64).
 
 Install Sequre (includes Codon):
 
@@ -32,7 +32,7 @@ This installs to `~/.sequre` and adds it to your `PATH`. See [quickstart](https:
 
 ```bash
 git clone --depth 1 https://github.com/0xTCG/sequre.git && cd sequre
-sequre examples/addmul.codon
+sequre examples/addmul.codon --local
 ```
 
 > **Note:** The first compilation may take a minute — Sequre programs compile to native code. The launcher shows compilation progress by default.
@@ -41,7 +41,7 @@ Or compile to a binary:
 
 ```bash
 sequre build examples/addmul.codon -o addmul
-./addmul
+./addmul --local
 ```
 
 > **Note:** Make sure to delete sockets (`rm sock.*`) if running a **local run** pre-built binary. `sequre` command does this automatically, otherwise, but built binaries do not.
@@ -52,10 +52,10 @@ sequre build examples/addmul.codon -o addmul
 
 ```bash
 # Debug mode (default) — slow, with full backtraces on failure
-sequre run my_protocol.codon
+sequre run my_protocol.codon --local
 
 # Release mode — fast, production-ready
-sequre run -release my_protocol.codon
+sequre run -release my_protocol.codon --local
 
 # Building a release binary
 sequre build -release my_protocol.codon -o my_protocol
@@ -67,8 +67,7 @@ The [examples/](examples/) directory contains self-contained programs that demon
 
 | Example | File | Domain | What it shows |
 |---|---|---|---|
-| Simple expression | `examples/addmul.codon` | Intro | Addition and multiplication example — local with `--local` flag, online otherwise |
-| Hastings benchmarks | `examples/hastings.codon` | Benchmarks | `mult3`, `innerprod`, `xtabs` micro-benchmarks |
+| Simple expression | `examples/addmul.codon` | Intro | Additions, multiplications, and innerprod examples — local with `--local` flag, online otherwise |
 | Credit scoring | `examples/credit_scoring.codon` | Finance | Secure neural-network classification with `MPU` partitioning |
 | Genetic kinship | `examples/genetic_kinship.codon` | Genomics | Pairwise kinship estimation on MHE-encrypted genotype data |
 | Linear regression | `examples/linear_regression.codon` | Healthcare | Multi-hospital model training with `MPU` and `LinReg` |
@@ -80,12 +79,11 @@ The [examples/](examples/) directory contains self-contained programs that demon
 Run any example locally:
 
 ```bash
-sequre -release examples/addmul.codon --local
-sequre -release examples/hastings.codon --local
+sequre examples/addmul.codon --local --skip-mhe-setup
 sequre -release examples/credit_scoring.codon --local
 sequre -release examples/genetic_kinship.codon --local
 sequre -release examples/linear_regression.codon --local
-sequre examples/one_algorithm_many_types.codon --local
+sequre -release examples/one_algorithm_many_types.codon --local
 sequre -release examples/collective_load.codon --local
 ```
 
@@ -129,7 +127,7 @@ The [MPC instance](https://0xtcg.github.io/sequre/api/mpc-instance/) provides ac
 
 Distributed mode requires mutual TLS certificates. Sequre handles MHE/MPC key management automatically, but **does not handle TLS certificate creation/maintenance**. For testing, generate test certificates with `scripts/generate_certs.sh`. For production, use a secure CA — see [TLS configuration](https://0xTCG.github.io/sequre/user-guide/running-distributed/#tls-configuration).
 
-Sequre also provides lower-level `@local` and `@online` decorators for cases where you want to hard-code the execution mode — see the [documentation](https://0xTCG.github.io/sequre/api/decorators/) for details.
+Sequre also provides lower-level `@local` and `@online` decorators for hard-coding the execution mode --- see the [documentation](https://0xTCG.github.io/sequre/api/decorators/) --- but `@main` covers both use-cases.
 
 ### Writing secure functions
 

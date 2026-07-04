@@ -46,20 +46,21 @@ fi
 # Detect architecture
 ARCH=$(uname -m)
 case "$ARCH" in
-  x86_64)  DOCKER_IMAGE="sequre-builder-x86_64" ;;
-  aarch64) DOCKER_IMAGE="sequre-builder-aarch64" ;;
+  x86_64)        DOCKERFILE_ARCH="x86_64" ;;
+  aarch64|arm64) DOCKERFILE_ARCH="aarch64" ;;
   *)
     echo "Error: Unsupported architecture: $ARCH"
     exit 1
     ;;
 esac
+DOCKER_IMAGE="sequre-builder-$DOCKERFILE_ARCH"
 
 # Build Docker image if it doesn't exist or --rebuild requested (caches Codon/LLVM/seq)
 if [ "$REBUILD_IMAGE" = "1" ] || ! docker image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
   echo "Building Docker image $DOCKER_IMAGE (this caches Codon/LLVM/seq for future builds)..."
   docker build \
     -t "$DOCKER_IMAGE" \
-    -f "$SEQURE_SRC/docker/local-build/Dockerfile.$ARCH" \
+    -f "$SEQURE_SRC/docker/local-build/Dockerfile.$DOCKERFILE_ARCH" \
     "$SEQURE_SRC/docker/local-build"
 fi
 
@@ -96,6 +97,13 @@ echo "Build complete. Extracting to $INSTALL_PATH..."
 # Create install directory and extract
 mkdir -p "$INSTALL_PATH"
 tar xzvf "$TARBALL" -C "$INSTALL_PATH"
+
+# Apply the AVX-512 alignment workaround: patch Codon's bundled Ptr (the shim and
+# patched launcher are already in the tarball). No-op off x86_64.
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+if [ -f "$SCRIPT_DIR/apply_avx512_workaround.sh" ]; then
+  SEQURE_WORKAROUND_SKIP_LAUNCHER=1 bash "$SCRIPT_DIR/apply_avx512_workaround.sh" "$INSTALL_PATH"
+fi
 
 echo ""
 echo "Done! Sequre installed to $INSTALL_PATH"
