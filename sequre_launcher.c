@@ -632,6 +632,32 @@ int main(int argc, char **argv) {
   args[k++] = (char *)"--disable-opt=core-pythonic-list-addition-opt";
   args[k++] = plugin_arg;
 
+  /* Codon consumes compiler flags only BEFORE the input file; a -release or
+   * -debug placed after <file.codon> is treated as a PROGRAM argument and
+   * silently ignored (the program then runs unoptimized -- a 4-14x perf trap
+   * on HE kernels). We forward args verbatim, so the user must place such
+   * flags right after `sequre run`/`build` (before the input file). Warn
+   * loudly if a known compiler flag is detected in program-argument position. */
+  static const char *codon_flags[] = {"-release", "--release", "-debug", "--debug", NULL};
+  int file_seen = 0;
+  for (int i = arg_start; i < argc; i++) {
+    if (!strcmp(argv[i], "--")) break;
+    if (!file_seen) {
+      if (argv[i][0] != '-') file_seen = 1; /* first non-flag token = input file */
+      continue;
+    }
+    for (int f = 0; codon_flags[f]; f++) {
+      if (!strcmp(argv[i], codon_flags[f])) {
+        fprintf(stderr,
+                "Warning: '%s' after the input file is treated as a program "
+                "argument and ignored by the compiler. Place it right after "
+                "'sequre %s' (before the input file) to enable it.\n",
+                argv[i], mode);
+        break;
+      }
+    }
+  }
+
   for (int i = arg_start; i < argc; i++) {
     args[k++] = argv[i];
   }
