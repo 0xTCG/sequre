@@ -1,0 +1,228 @@
+import math
+import internal.static as static
+
+from functools import partial
+from sequre.stdlib.numpy.create import array
+
+from sequre.types.sharetensor import Sharetensor
+from sequre.utils.testing import assert_eq_approx, assert_distributed_eq_approx
+
+from sequre.decor import (
+    via_decor_trig, via_decor, get_decor_foos,
+    get_decor_trig_foo, via_fourier,
+    linspace, trig_double_to_fp, period_double_to_fp,
+    sin, cos, tan, cot, exp, sigmoid,
+    sinh, cosh, tanh, square_wave, sawtooth_wave)
+
+
+DECOR_POLY_PERIOD_OF_THRS: Static[int] = 10
+DEGREE_LOWER_LIMIT: Static[int] = 3
+DEGREE_UPPER_LIMIT: Static[int] = 4
+DEGREE_SIEVE: Static[int] = 5
+
+
+def _test_op(
+        mpc, msg, op, raw_input, mpc_input,
+        expected_result, interval, iter_count,
+        error=0.01, periodic=True):
+    period = interval[1] - interval[0]
+
+    revealed_results = []
+    for _ in range(iter_count):
+        mpc_input.get_partitions(mpc, force=True)
+        op_result = op(mpc, mpc_input, interval)
+        
+        if isinstance(op_result, tuple):
+            mpc_result, _ = op_result
+        else:
+            mpc_result = op_result
+
+        revealed_results.append(mpc_result.reveal(mpc).tolist())
+
+    revealed_result = revealed_results.mean()
+    revealed_input = mpc_input.reveal(mpc).tolist()
+
+    assert_distributed_eq_approx(
+        mpc, f'CP{mpc.pid}:\tSequre {msg} at interval {interval} (MPC)',
+        revealed_result, expected_result, error)
+    assert_distributed_eq_approx(
+        mpc, f'CP{mpc.pid}:\tMPC input intact post {msg}',
+        (revealed_input * period) if periodic else revealed_input,
+        raw_input, error, silent_pass=True)
+
+
+def _test_decor_trig_method(
+        mpc, floats, shared_floats,
+        iter_count, method: Static[str]):
+    foo = get_decor_trig_foo(method=method)[0]
+
+    revealed_results = []
+    for _ in range(iter_count):
+        shared_floats.get_partitions(mpc, force=True)
+        shared_result = via_decor_trig(mpc, shared_floats, method=method)
+        revealed_results.append(shared_result.reveal(mpc).tolist())
+
+    revealed_result = revealed_results.mean()
+    ground_truth = foo(floats)
+
+    if mpc.pid != 0:
+        assert_eq_approx(
+            f'Decor {method} for {floats}',
+            revealed_result, ground_truth, error=0.02, silent_pass=True)
+
+
+def _test_decor_method(
+        mpc, floats, shared_floats,
+        interval, iter_count, 
+        *args, method: Static[str]):
+    foo = get_decor_foos(*args, method=method)[0][0]
+
+    revealed_results = []
+    for _ in range(iter_count):
+        shared_floats.get_partitions(mpc, force=True)
+        shared_result = via_decor(
+            mpc, shared_floats, interval, *args, method=method)
+        revealed_results.append(shared_result.reveal(mpc).tolist())
+
+    revealed_result = revealed_results.mean()
+
+    # Both branches must yield the same type: binding a lambda in one and a
+    # plain function in the other crashes the Codon translation stage.
+    if method == "polynomial":
+        ground_truth = ([args[1]].astype(float) @ foo(floats))[0]
+    else:
+        ground_truth = foo(floats)
+
+    if mpc.pid != 0:
+        assert_eq_approx(
+            f'Decor {method} for {floats}',
+            revealed_result, ground_truth, error=0.1, silent_pass=True)
+
+
+def test_decor_trig(mpc, interval, sample_size, iter_count):
+    """
+    Test Decor for computing sin and cos.
+    """
+    modulus = mpc.default_mpc_modulus
+    print(f'\nCP{mpc.pid}:\tTesting Decor trigonometry at interval {interval}...')
+
+    floats = linspace(*interval, sample_size)
+    fp_floats = trig_double_to_fp(floats, modulus)
+    shared_fp = mpc.comms.share_from_trusted_dealer(fp_floats, modulus)
+    shared_floats = Sharetensor(shared_fp, modulus)
+    shared_floats.fp = True
+    period = interval[1] - interval[0]
+
+    _test_decor_trig_method(mpc, floats, shared_floats, iter_count, method="sin")
+    _test_decor_trig_method(mpc, floats, shared_floats, iter_count, method="cos")
+
+    if period < math.pi:
+        if interval[0] < 0:
+            _test_decor_trig_method(
+                mpc, floats, shared_floats, iter_count, method="tan")
+        else:
+            _test_decor_trig_method(
+                mpc, floats, shared_floats, iter_count, method="cot")
+
+
+def test_decor_nonperiodic(mpc, interval, sample_size, iter_count):
+    """
+    Test Decor.
+    """
+    print(f'\nCP{mpc.pid}:\tTesting Decor internal methods at interval {interval}...')
+
+    floats = linspace(*interval, sample_size)
+    shared_floats = Sharetensor.enc(mpc, array(floats))
+    period = interval[1] - interval[0]
+
+    _test_decor_method(
+        mpc, floats, shared_floats, interval, iter_count, method="exp")
+    _test_decor_method(
+        mpc, floats, shared_floats, interval, iter_count, method="sigmoid")
+    _test_decor_method(
+        mpc, floats, shared_floats, interval, iter_count, method="tanh")
+    _test_decor_method(
+        mpc, floats, shared_floats, interval, iter_count, 3, list(range(1, 5)), method="polynomial")
+
+    if period <= DECOR_POLY_PERIOD_OF_THRS:
+        _test_decor_method(
+            mpc, floats, shared_floats, interval, iter_count, method="sinh")
+        _test_decor_method(
+            mpc, floats, shared_floats, interval, iter_count, method="cosh")
+    
+
+def test_decor_fourier(mpc, interval, sample_size, iter_count):
+    period = interval[1] - interval[0]
+    modulus = mpc.default_mpc_modulus
+    print(f'\nCP{mpc.pid}:\tTesting Decor Fourier at interval {interval}...')
+
+    floats = linspace(*interval, sample_size)
+    fp_floats = period_double_to_fp(floats, period, modulus)
+    shared_fp = mpc.comms.share_from_trusted_dealer(fp_floats, modulus)
+    stensor = Sharetensor(shared_fp, modulus)
+    stensor.fp = True
+
+    for deg in static.range(DEGREE_LOWER_LIMIT, DEGREE_UPPER_LIMIT):
+        degree: Static[int] = deg * DEGREE_SIEVE
+
+        name = f"fourier_{degree}"
+        _test_op(mpc, f"{name}_sin",
+            partial(via_fourier, op=sin, degree=degree), floats, stensor,
+            sin(floats), interval, iter_count)
+
+        _test_op(mpc, f"{name}_cos",
+            partial(via_fourier, op=cos, degree=degree), floats, stensor,
+            cos(floats), interval, iter_count)
+
+        _test_op(mpc, f"{name}_sigmoid",
+            partial(via_fourier, op=sigmoid, degree=degree), floats, stensor,
+            sigmoid(floats), interval, iter_count)
+
+        _test_op(mpc, f"{name}_exp",
+            partial(via_fourier, op=exp, degree=degree), floats, stensor,
+            exp(floats), interval, iter_count)
+        
+        _test_op(mpc, f"{name}_square_wave",
+            partial(via_fourier, op=square_wave, degree=degree), floats, stensor,
+            square_wave(floats), interval, iter_count)
+
+        _test_op(mpc, f"{name}_sawtooth_wave",
+            partial(via_fourier, op=sawtooth_wave, degree=degree), floats, stensor,
+            sawtooth_wave(floats), interval, iter_count)
+
+        _test_op(mpc, f"{name}_tanh",
+            partial(via_fourier, op=tanh, degree=degree), floats, stensor,
+            tanh(floats), interval, iter_count)
+        
+        if period <= math.pi:
+            _test_op(mpc, f"{name}_sinh",
+                partial(via_fourier, op=sinh, degree=degree), floats, stensor,
+                sinh(floats), interval, iter_count)
+
+            _test_op(mpc, f"{name}_cosh",
+                partial(via_fourier, op=cosh, degree=degree), floats, stensor,
+                cosh(floats), interval, iter_count)
+            if interval[0] < 0:
+                _test_op(mpc, f"{name}_tan",
+                    partial(via_fourier, op=tan, degree=degree), floats, stensor,
+                    tan(floats), interval, iter_count)
+            else:
+                _test_op(mpc, f"{name}_cot",
+                    partial(via_fourier, op=cot, degree=degree), floats, stensor,
+                    cot(floats), interval, iter_count)
+
+
+def test_decor(mpc):
+    sample_size = 500
+    iter_count = 3
+    intervals = [
+        (-math.pi / 4, math.pi / 4),
+        (math.pi / 4, 3 * math.pi / 4),
+        (-math.pi * 3, math.pi * 3)
+        ]
+    
+    with mpc.detach_dealer():
+        for interval in intervals:
+            test_decor_trig(mpc, interval, sample_size, iter_count)
+            test_decor_nonperiodic(mpc, interval, sample_size, iter_count)
+            test_decor_fourier(mpc, interval, sample_size, iter_count)

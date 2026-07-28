@@ -1,0 +1,90 @@
+""" General function approximation on top of Decor's trigonometric protocols.
+
+Any Fourier term a_k cos(w x) + b_k sin(w x) expands under angle addition into
+plaintext coefficients at the revealed point times dealer shares at the mask.
+So a whole truncated Fourier series costs the same three rounds as a single
+sine: the degree only adds local work, not communication. That is what makes
+Decor constant-round for periodic functions, where polynomial approximations
+need degree-proportional depth.
+"""
+
+import math
+
+from sequre.types.builtin import *
+from sequre.constants import DECOR_FOURIER_EPSILON, FBITS_MASK
+from sequre.types.sharetensor import Sharetensor
+from sequre.types.utils import double_to_fp
+
+from functions import period_fp_to_double, sin, cos, trapz, linspace
+
+
+def fourier_coeffs(op, nodes, period, degree: Static[int]):
+    a0 = trapz(op(nodes), nodes) / period
+    an = [(trapz(op(nodes) * cos(nodes * (2 * math.pi * i / period)), nodes) * (2 / period)) for i in range(1, degree + 1)]
+    bn = [(trapz(op(nodes) * sin(nodes * (2 * math.pi * i / period)), nodes) * (2 / period)) for i in range(1, degree + 1)]
+    cn = [(math.pi * 2 * i / period) for i in range(1, degree + 1)]
+
+    return a0, an, bn, cn
+
+
+def decor_fourier_partition(mpc, x_r, r, coeffs, period, modulus, degree: Static[int]):
+    _, an, bn, cn = coeffs
+    # Terms whose coefficients both vanish contribute nothing; dropping them
+    # saves the dealer randomness and the local trig evaluations.
+    skip_term = [(-DECOR_FOURIER_EPSILON < an[i] < DECOR_FOURIER_EPSILON) and
+                 (-DECOR_FOURIER_EPSILON < bn[i] < DECOR_FOURIER_EPSILON) for i in static.range(degree)]
+
+    all_skipped = True
+    for i in static.range(degree):
+        all_skipped &= skip_term[i]
+
+    if all_skipped:
+        return [x_r.zeros()], [x_r.zeros()], [x_r.zeros()], [x_r.zeros()]
+
+    double_r = period_fp_to_double(r & FBITS_MASK, period, modulus)
+    double_x_r = period_fp_to_double(x_r & FBITS_MASK, period, modulus)
+
+    sin_rs = [double_to_fp(sin(double_r * cn[i]), modulus) for i in range(degree) if not skip_term[i]]
+    cos_rs = [double_to_fp(cos(double_r * cn[i]), modulus) for i in range(degree) if not skip_term[i]]
+
+    sin_rs_share = mpc.comms.share_from_trusted_dealer(sin_rs, modulus)
+    cos_rs_share = mpc.comms.share_from_trusted_dealer(cos_rs, modulus)
+
+    sin_x_rs = [sin(double_x_r * cn[i]) for i in range(degree)]
+    cos_x_rs = [cos(double_x_r * cn[i]) for i in range(degree)]
+    t1s = [double_to_fp(cos_x_rs[i] * an[i] + sin_x_rs[i] * bn[i], modulus) for i in range(degree) if not skip_term[i]]
+    t2s = [double_to_fp(cos_x_rs[i] * bn[i] - sin_x_rs[i] * an[i], modulus) for i in range(degree) if not skip_term[i]]
+
+    return t1s, sin_rs_share, t2s, cos_rs_share
+
+
+def decor_fourier(mpc, t1s, sin_rs_share, t2s, cos_rs_share, coeffs, modulus):
+    ts = cos_rs_share.mul_mod(t1s, modulus).add_mod(sin_rs_share.mul_mod(t2s, modulus), modulus)
+
+    result_share = ts[0]
+    for i in range(1, len(ts)):
+        result_share = result_share.add_mod(ts[i], modulus)
+
+    result_share = mpc.fp.trunc(result_share, modulus)
+    return mpc.arithmetic.add_public(result_share, double_to_fp(coeffs[0], modulus), modulus)
+
+
+def fourier_evaluate(mpc, x, coeffs, period, degree: Static[int]):
+    modulus = x.modulus
+    x_r, r = x.get_partitions(mpc)
+
+    partitions = decor_fourier_partition(mpc, x_r, r, coeffs, period, modulus, degree)
+    result = decor_fourier(mpc, *partitions, coeffs, modulus)
+    stensor = Sharetensor(result, modulus)
+    stensor.fp = True
+
+    return stensor
+
+
+def via_fourier(mpc, x, op, interval, degree: Static[int], node_count: int = 1000):
+    """ Approximates op over interval by a degree-term Fourier series, evaluated via Decor. """
+    period = interval[1] - interval[0]
+    nodes = linspace(*interval, node_count)
+    coeffs = fourier_coeffs(op, nodes, period, degree)
+
+    return fourier_evaluate(mpc, x, coeffs, period, degree)

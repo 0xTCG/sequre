@@ -1,0 +1,421 @@
+""" Decor: delegated computation on randomness for nonlinear functions.
+
+Beaver triples let two parties multiply by having a dealer precompute
+randomness ([a], [b], [ab]) that lines up with the algebraic identity
+xy = (x-a)(y-b) + (x-a)b + (y-b)a + ab. Decor generalizes this: whenever f
+admits a decomposition
+
+    f(u + v) = G(g(u), h(v))
+
+with G cheap in MPC, a dealer can precompute [h(r)] for a random mask r, the
+parties reveal x - r, evaluate g(x - r) locally in the clear, and combine.
+The nonlinear work happens on plaintext, so the result is exact to
+fixed-point precision rather than a polynomial approximation.
+
+Reference: Smajlovic et al., "Decor: Delegated Computation on Randomness for
+Secure Evaluation of Nonlinear Functions", IEEE S&P 2026.
+"""
+
+import math
+import secure_operator
+
+from functools import partial
+
+from sequre.attributes import sequre
+from sequre.constants import (
+    FBITS_MASK, MPC_DECOR_MODULUS_BITS, MPC_DECOR_RING_SIZE,
+    MPC_NBIT_F, MPC_NBIT_K,
+    DECOR_NEWTON_METHOD, DECOR_GOLDSCHMIDT_METHOD, mpc_uint)
+from sequre.types.sharetensor import Sharetensor
+from sequre.types.utils import double_to_fp
+
+from functions import (
+    period_fp_to_double, trig_fp_to_double,
+    exp, sigmoid, tanh, powers, sin, cos, tan, cot, sinh, cosh)
+
+
+def switch_ring(stensor, new_ring_size):
+    """ Reinterprets a share over a narrower power-of-two ring. """
+    st = stensor.copy()
+    st.share = stensor.share % new_ring_size
+    st.x_r = (stensor.x_r % new_ring_size) if stensor.x_r else stensor.x_r
+    st.r = (stensor.r % new_ring_size) if stensor.r else stensor.r
+    st.modulus = new_ring_size
+    st.sqrt = (stensor.sqrt % new_ring_size) if stensor.sqrt else stensor.sqrt
+    st.sqrt_inv = (stensor.sqrt_inv % new_ring_size) if stensor.sqrt_inv else stensor.sqrt_inv
+    return st
+
+
+def decor_gt(mpc, x, y):
+    """
+    Greater-than over a ring, via MSB extraction on a reduced ring.
+
+    Comparison only needs the sign of x - y, and a fixed-point difference
+    occupies far fewer bits than the full share modulus. Narrowing to
+    MPC_DECOR_MODULUS_BITS first cuts the bitwise work proportionally.
+    """
+    if x.modulus.popcnt() == 1:
+        if isinstance(y, Sharetensor):
+            diff = secure_operator.sub(
+                mpc, switch_ring(x, MPC_DECOR_RING_SIZE),
+                switch_ring(y, MPC_DECOR_RING_SIZE))
+        elif isinstance(y, ByVal):
+            if y == 0:
+                diff = switch_ring(x, MPC_DECOR_RING_SIZE)
+            else:
+                diff = secure_operator.sub(mpc, switch_ring(x, MPC_DECOR_RING_SIZE), y)
+        else:
+            compile_error("decor_gt: y must be Sharetensor or ByVal")
+
+        return Sharetensor(
+            mpc.boolean.is_positive_ring(
+                diff.share, x.modulus, diff.modulus,
+                op_mod_bitlen=MPC_DECOR_MODULUS_BITS),
+            x.modulus)
+
+    return secure_operator.gt(mpc, x, y)
+
+
+@sequre
+def _decor_mul_inv_newton(mpc, b, niter):
+    """ Newton iteration x <- x(2 - bx) for 1/b, seeded from the normalized b. """
+    assert niter > 0, "niter must be greater than 0 for Newton's method"
+
+    modulus = b.modulus
+    s = Sharetensor(
+        mpc.boolean.normalizer(
+            b.share, modulus, UInt[MPC_NBIT_K](1) << MPC_NBIT_F, bitlen=MPC_NBIT_F), modulus)
+    b_scaled = b * s
+    b_scaled.get_partitions(mpc)
+
+    # Normalization puts b_scaled in (0.25, 1), so init_val = 1.0 is within
+    # the basin of convergence: x = (2 - b_scaled * init_val) * init_val.
+    x = 2 - b_scaled
+    for _ in range(niter):
+        x = (2 - b_scaled * x) * x
+
+    return x * s
+
+
+@sequre
+def _decor_mul_inv_goldschmidt(mpc, b, niter):
+    modulus = b.modulus
+    if niter == 0:
+        niter = 2 * (MPC_NBIT_K // 3).bitlen() + 1
+
+    s = Sharetensor(
+        mpc.boolean.normalizer(
+            b.share, modulus, UInt[MPC_NBIT_K](1) << MPC_NBIT_F, bitlen=MPC_NBIT_F), modulus)
+    estimate = b * s
+    estimate = estimate * estimate * 5 - estimate * 10 + 5.9430
+    x = 1 - b * estimate
+    y = estimate
+
+    for _ in range(niter - 1):
+        y = y * (x + 1)
+        x = x * x
+
+    return y * (x + 1)
+
+
+@sequre
+def decor_mul_inv(mpc, b, niter, sign_check, method: Static[str]):
+    if not b.fp:
+        b = b.to_fp()
+
+    if sign_check:
+        denominator_sign = (b > 0) * 2 - 1
+        b = b * denominator_sign
+
+    if method == DECOR_NEWTON_METHOD:
+        x = _decor_mul_inv_newton(mpc, b, niter)
+    elif method == DECOR_GOLDSCHMIDT_METHOD:
+        x = _decor_mul_inv_goldschmidt(mpc, b, niter)
+    else:
+        compile_error("decor_mul_inv: unknown method " + method)
+
+    if sign_check:
+        return x * denominator_sign
+
+    return x
+
+
+@sequre
+def decor_div(mpc, x, y, niter=0, sign_check=False, method: Static[str] = DECOR_NEWTON_METHOD):
+    if isinstance(y, float) or isinstance(y, int):
+        sv = x * double_to_fp(1.0 / y, x.modulus)
+        if x.is_fp():
+            sv = sv.trunc(mpc.fp)
+        sv.fp = True
+        return sv
+
+    return decor_mul_inv(
+        mpc, y, niter=niter,
+        sign_check=sign_check, method=method) * x
+
+
+# ----------------------------------------------------------------------
+# Per-function combiners.
+#
+# Each takes the plaintext evaluation(s) at the revealed point x - r and the
+# dealer's shares at r, and applies the angle-addition (or equivalent)
+# identity for that function. These are the "G" of f(u + v) = G(g(u), h(v)).
+# ----------------------------------------------------------------------
+
+def decor_sin(mpc, sin_x_r, sin_r, cos_x_r, cos_r, modulus):
+    return mpc.fp.trunc(
+        sin_x_r.mul_mod(cos_r, modulus).add_mod(
+        cos_x_r.mul_mod(sin_r, modulus), modulus), modulus)
+
+
+def decor_cos(mpc, sin_x_r, sin_r, cos_x_r, cos_r, modulus):
+    return mpc.fp.trunc(
+        cos_x_r.mul_mod(cos_r, modulus).sub_mod(
+        sin_x_r.mul_mod(sin_r, modulus), modulus), modulus)
+
+
+def decor_tan(mpc, sin_x_r, sin_r, cos_x_r, cos_r, modulus):
+    sin_ = decor_sin(mpc, sin_x_r, sin_r, cos_x_r, cos_r, modulus)
+    cos_ = decor_cos(mpc, sin_x_r, sin_r, cos_x_r, cos_r, modulus)
+
+    numerator = Sharetensor(sin_, modulus)
+    denominator = Sharetensor(cos_, modulus)
+    numerator.fp = True
+    denominator.fp = True
+
+    return decor_div(mpc, numerator, denominator, niter=5).share
+
+
+def decor_cot(mpc, sin_x_r, sin_r, cos_x_r, cos_r, modulus):
+    sin_ = decor_sin(mpc, sin_x_r, sin_r, cos_x_r, cos_r, modulus)
+    cos_ = decor_cos(mpc, sin_x_r, sin_r, cos_x_r, cos_r, modulus)
+
+    numerator = Sharetensor(cos_, modulus)
+    denominator = Sharetensor(sin_, modulus)
+    numerator.fp = True
+    denominator.fp = True
+
+    return decor_div(mpc, numerator, denominator, niter=5).share
+
+
+@sequre
+def decor_exp(mpc, foo_x_rs, foo_r_shares):
+    # e^x = e^(x-r) * e^r, and e^(x-r) is public.
+    return foo_r_shares[0] * foo_x_rs[0]
+
+
+@sequre
+def decor_sigmoid(mpc, foo_x_rs, foo_x_r_ps, foo_r_shares, r_frac_share, scaled_x):
+    foo_x_r, foo_x_r_p, foo_r_share = foo_x_rs[0], foo_x_r_ps[0], foo_r_shares[0]
+    cond = decor_gt(mpc, r_frac_share, scaled_x)
+    selected_foo_x_r = cond * (foo_x_r_p - foo_x_r) + foo_x_r
+
+    num = foo_r_share * selected_foo_x_r
+    denom = num + (foo_r_share - 1) * (selected_foo_x_r - 1)
+    return decor_div(mpc, num, denom, niter=5)
+
+
+@sequre
+def decor_tanh(mpc, foo_x_rs, foo_x_r_ps, foo_r_shares, r_frac_share, scaled_x):
+    foo_x_r, foo_x_r_p, foo_r_share = foo_x_rs[0], foo_x_r_ps[0], foo_r_shares[0]
+    cond = decor_gt(mpc, r_frac_share, scaled_x)
+    selected_foo_x_r = cond * (foo_x_r_p - foo_x_r) + foo_x_r
+
+    # Halved so that denom stays below 1, which Decor division requires.
+    num = (foo_r_share + selected_foo_x_r) / 2
+    denom = (foo_r_share * selected_foo_x_r + 1) / 2
+    return decor_div(mpc, num, denom, niter=5)
+
+
+@sequre
+def decor_sinh(mpc, foo_x_rs, foo_r_shares):
+    foo_x_r_sinh, foo_x_r_cosh = foo_x_rs
+    foo_r_share_sinh, foo_r_share_cosh = foo_r_shares
+
+    # sinh(u + v) = sinh(u)cosh(v) + cosh(u)sinh(v); the two factors must be
+    # cross-paired, unlike cosh where they pair like-with-like.
+    return foo_r_share_cosh * foo_x_r_sinh + foo_r_share_sinh * foo_x_r_cosh
+
+
+@sequre
+def decor_cosh(mpc, foo_x_rs, foo_r_shares):
+    foo_x_r_cosh, foo_x_r_sinh = foo_x_rs
+    foo_r_share_cosh, foo_r_share_sinh = foo_r_shares
+
+    return foo_r_share_cosh * foo_x_r_cosh + foo_r_share_sinh * foo_x_r_sinh
+
+
+@sequre
+def decor_polynomial(mpc, x_r_powers, r_share_powers, degree: int, coeffs: List):
+    """ Binomial expansion of P(x) = P((x - r) + r) over the precomputed powers of r. """
+    assert len(coeffs) == degree + 1, f"Number of coefficients must be degree + 1 ({len(coeffs)} != {degree + 1})"
+    x_r_powers_, r_share_powers_ = x_r_powers[0], r_share_powers[0]
+
+    pascal_matrix = mpc.polynomial.get_pascal_matrix(degree)
+    result = r_share_powers_[0].share.zeros()
+
+    # TODO: this loop was parallel (@par over i, accumulating per-thread) in the
+    # original Decor implementation, but that segfaults under the current
+    # runtime -- the per-thread accumulators reallocate inside the parallel
+    # region. Kept serial until that is resolved; the work here is local only,
+    # so it costs no extra communication rounds.
+    modulus = r_share_powers_[0].modulus
+    for i in range(degree + 1):
+        for j in range(i + 1):
+            # The binomial weight is folded into the public factor in the clear;
+            # pascal_matrix holds modulus-typed entries, so drop to float first.
+            weight = float(coeffs[i]) * pascal_matrix[i][j].to_float()
+            result = result.add_mod(
+                r_share_powers_[j].share.mul_mod(
+                    double_to_fp(x_r_powers_[i - j] * weight, modulus),
+                    modulus),
+                modulus)
+
+    stensor = Sharetensor(mpc.fp.trunc(result, modulus), modulus)
+    stensor.fp = True
+
+    return stensor
+
+
+def get_decor_trig_foo(*args, method: Static[str]):
+    if method == "sin":
+        return sin, decor_sin
+    if method == "cos":
+        return cos, decor_cos
+    if method == "tan":
+        return tan, decor_tan
+    if method == "cot":
+        return cot, decor_cot
+
+    compile_error("Decor trig method not supported")
+
+
+def get_decor_foos(*args, method: Static[str]):
+    if method == "exp":
+        return (exp,), decor_exp
+    if method == "sigmoid" or method == "sig":
+        return (sigmoid,), decor_sigmoid
+    if method == "sinh":
+        return (sinh, cosh), decor_sinh
+    if method == "cosh":
+        return (cosh, sinh), decor_cosh
+    if method == "tanh" or method == "tan":
+        return (tanh,), decor_tanh
+    if method == "polynomial":
+        return (partial(powers, degree=args[0]),), decor_polynomial
+
+    compile_error("Decor method not supported")
+
+
+@sequre
+def decor_partition(mpc, x, foos, interval, small_shift = False):
+    """
+    Splits x into a revealed masked value and dealer randomness.
+
+    The input is rescaled into [0, 1) over the interval and shifted inward by
+    half (or a quarter) of a period, so that both x and x - r stay inside the
+    interval where the plaintext evaluation is numerically safe.
+    """
+    modulus = x.modulus
+    a, b = interval
+    period = b - a
+    internal_shift = (period / 4) if small_shift else (period / 2)
+
+    scaled_x = (x - a) / period
+    x_r, r = scaled_x.get_partitions(mpc)
+
+    frac_r = r & FBITS_MASK
+    double_r = period_fp_to_double(frac_r, period, modulus) - internal_shift
+    foo_rs = [double_to_fp(foo(double_r), modulus) for foo in foos]
+
+    r_frac_share = Sharetensor(mpc.comms.share_from_trusted_dealer(frac_r, modulus), modulus)
+    r_frac_share.fp = True
+    foo_r_shares = [Sharetensor(mpc.comms.share_from_trusted_dealer(foo_r, modulus), modulus) for foo_r in foo_rs]
+    for foo_r_share in foo_r_shares:
+        foo_r_share.fp = True
+
+    double_x_r = period_fp_to_double(x_r & FBITS_MASK, period, modulus) + internal_shift
+    foo_x_rs = [foo(double_x_r + a) for foo in foos]
+    # Wraparound branch: if the mask pushed x - r past the interval, the
+    # correct evaluation point is one period lower.
+    foo_x_r_ps = [foo(double_x_r - period + a) for foo in foos]
+
+    return foo_x_rs, foo_x_r_ps, foo_r_shares, r_frac_share, scaled_x
+
+
+def decor_trig_partition(mpc, x_r, r, modulus):
+    double_r = trig_fp_to_double(r & FBITS_MASK, modulus)
+    sin_r = double_to_fp(sin(double_r), modulus)
+    cos_r = double_to_fp(cos(double_r), modulus)
+
+    sin_r_share = mpc.comms.share_from_trusted_dealer(sin_r, modulus)
+    cos_r_share = mpc.comms.share_from_trusted_dealer(cos_r, modulus)
+
+    double_x_r = trig_fp_to_double(x_r & FBITS_MASK, modulus)
+    sin_x_r = double_to_fp(sin(double_x_r), modulus)
+    cos_x_r = double_to_fp(cos(double_x_r), modulus)
+
+    return sin_x_r, sin_r_share, cos_x_r, cos_r_share
+
+
+@sequre
+def decor_eval(
+        mpc, decor_foo, foo_x_rs, foo_x_r_ps,
+        foo_r_shares, r_frac_share, scaled_x,
+        *args, internal_switch: Static[int]):
+    """
+    Applies the combiner, selecting between the in-range and wrapped-around
+    evaluation points. Functions whose combiner already needs the selection
+    internally (sigmoid, tanh) handle it themselves.
+    """
+    if internal_switch:
+        return decor_foo(
+            mpc, foo_x_rs, foo_x_r_ps, foo_r_shares,
+            r_frac_share, scaled_x, *args)
+
+    foo_eval = decor_foo(mpc, foo_x_rs, foo_r_shares, *args)
+    foo_eval_shifted = decor_foo(mpc, foo_x_r_ps, foo_r_shares, *args)
+
+    cond = decor_gt(mpc, r_frac_share, scaled_x)
+    return foo_eval + cond * (foo_eval_shifted - foo_eval)
+
+
+def via_decor_generic(mpc, x, interval, *args, method: Static[str]):
+    foos, decor_foo = get_decor_foos(*args, method=method)
+    decor_partitions = decor_partition(mpc, x, foos, interval, small_shift=(method == "exp"))
+
+    # Sigmoid and tanh fold the wraparound selection into their own combiner,
+    # since it has to happen before their division rather than after.
+    if method == "sigmoid" or method == "sig" or method == "tanh":
+        return decor_eval(
+            mpc, decor_foo, *decor_partitions, *args, internal_switch=1)
+
+    return decor_eval(
+        mpc, decor_foo, *decor_partitions, *args, internal_switch=0)
+
+
+def via_decor_trig(mpc, x, method: Static[str]):
+    """ Expects x to be shared relative to the 2*pi period. """
+    modulus = x.modulus
+    decor_foo = get_decor_trig_foo(method=method)[1]
+
+    beaver_partitions = x.get_partitions(mpc)
+    trig_partitions = decor_trig_partition(
+        mpc, *beaver_partitions, modulus)
+    shared_result = decor_foo(mpc, *trig_partitions, modulus)
+
+    stensor = Sharetensor(shared_result, modulus)
+    stensor.fp = True
+
+    return stensor
+
+
+@sequre
+def via_decor(mpc, x, interval, *args, method: Static[str]):
+    if method == "sin" or method == "cos" or method == "tan" or method == "cot":
+        # Trigonometric functions are periodic, so they need no interval
+        # confinement -- only rescaling by the period.
+        period = 2 * math.pi
+        return via_decor_trig(mpc, x / period, method=method)
+
+    return via_decor_generic(mpc, x, interval, *args, method=method)
