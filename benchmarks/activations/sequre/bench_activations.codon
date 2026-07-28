@@ -1,0 +1,511 @@
+""" Sequre column of the activation benchmark.
+
+Two Sequre paths are measured on the same inputs:
+
+    sequre-decor    Decor's exact protocol per function. The dealer precomputes
+                    f(r) for a random mask r, the parties reveal x - r and
+                    evaluate f on that in the clear, and a cheap algebraic
+                    combiner puts the two halves back together. The nonlinear
+                    work happens on plaintext, so the result is exact to
+                    fixed-point precision -- there is no approximation error to
+                    trade against depth. ReLU uses Decor's reduced-ring
+                    comparison (decor_gt), which extracts the sign over
+                    MPC_NBIT_F + 1 bits instead of the full share modulus.
+
+    sequre-fourier  The approximation-based path inside Sequre: a degree-15
+                    Fourier series evaluated through Decor's constant-round
+                    trigonometric protocol. ReLU here uses Sequre's ordinary
+                    full-width comparison. This is the honest "what you would
+                    have done without the exact protocols" column.
+
+Inputs, intervals, sizes and repetition counts mirror ../spec.py. They are
+echoed into the output header and ../report.py refuses to build a table if the
+two disagree.
+
+Every cell is measured twice, and both rows are emitted:
+
+    end_to_end  the dealer's randomness generation is inline, on the critical
+                path -- comparable to CrypTen's TFP provider
+    online      the dealer is detached (mpc.detach_dealer()), so only the
+                compute parties' work is timed -- comparable to a deployment
+                with a genuine offline phase
+
+Results land in ../results/sequre_w{MPC_INT_SIZE}_CP{pid}.jsonl, one JSON
+object per line, in the same schema the Python runners emit. The share width is
+part of the framework id (`sequre-decor-192`), because it is not a free
+parameter: MPC_INT_SIZE also fixes MPC_NBIT_V, the statistical security
+parameter, at 64 bits for 192 and 28 bits for 128. A narrower build is faster
+at equal accuracy but not at equal security.
+
+Run:
+    sequre run -release benchmarks/activations/sequre/bench_activations.codon --local
+
+    # both widths, side by side in one report
+    benchmarks/activations/sequre/run_widths.sh
+"""
+
+import math
+import time
+import secure_operator
+
+from sequre import main, sequre
+from sequre.constants import (
+    MPC_RING_SIZE, MPC_NBIT_F, MPC_NBIT_K, MPC_NBIT_V, NUMBER_OF_PARTIES)
+from sequre.settings import MPC_INT_SIZE
+from sequre.stdlib.numpy.create import array
+from sequre.types.sharetensor import Sharetensor
+
+from sequre.decor import (
+    via_decor, via_fourier, decor_gt, linspace,
+    exp, sigmoid, tanh, sin, cos, tan, cot, sinh, cosh,
+    period_double_to_fp)
+
+
+# ---------------------------------------------------------------------------
+# Mirrors ../spec.py. Keep in sync -- report.py cross-checks the emitted header.
+# ---------------------------------------------------------------------------
+SIZES = [8, 128, 1024, 8192]
+REPS = 5
+WARMUP_REPS = 1
+SPEC_VERSION = "1"
+
+EXP_INTERVAL = (-3.0, 3.0)
+SIGMOID_INTERVAL = (-6.0, 6.0)
+TANH_INTERVAL = (-4.0, 4.0)
+RELU_INTERVAL = (-5.0, 5.0)
+SIN_INTERVAL = (-math.pi, math.pi)
+COS_INTERVAL = (-math.pi, math.pi)
+# tan/cot have poles; these intervals stay well inside them, matching the
+# guards Decor's own unit tests apply.
+TAN_INTERVAL = (-math.pi / 4, math.pi / 4)
+COT_INTERVAL = (math.pi / 4, 3 * math.pi / 4)
+# Decor requires period <= 10 for the hyperbolics.
+SINH_INTERVAL = (-2.0, 2.0)
+COSH_INTERVAL = (-2.0, 2.0)
+POLY_INTERVAL = (-2.0, 2.0)
+POLY_DEGREE = 3
+POLY_COEFFS = [1.0, 2.0, 3.0, 4.0]
+
+FOURIER_DEGREE: Static[int] = 15
+
+# Relative error is meaningless where the true value is ~0; matches
+# common.REL_ERR_FLOOR on the Python side.
+REL_ERR_FLOOR = 1e-6
+
+# A Fourier series over [a, b] treats the function as periodic, so a
+# non-periodic target has a jump at the interval boundary and the classic
+# Gibbs overshoot next to it -- an O(1) max error that says nothing about the
+# fit in the interior. Every framework therefore reports error twice: over the
+# whole interval, and over the middle 80% of it. Matches common.INTERIOR_TRIM.
+INTERIOR_TRIM = 0.1
+
+RESULTS_DIR = "benchmarks/activations/results"
+
+# Share width is a reported dimension, not a footnote: it trades directly
+# against speed and against MPC_NBIT_V, the statistical security parameter.
+# Both the file name and the framework id carry it so two widths can sit
+# side by side in one report.
+WIDTH_TAG = str(MPC_INT_SIZE)
+DECOR_ID = "sequre-decor-" + WIDTH_TAG
+FOURIER_ID = "sequre-fourier-" + WIDTH_TAG
+
+# Codon's f-strings have no `{{` escape, so JSON braces are spliced in.
+LB = "{"
+RB = "}"
+
+
+def _path(mpc) -> str:
+    return f"{RESULTS_DIR}/sequre_w{WIDTH_TAG}_CP{mpc.pid}.jsonl"
+
+
+def _init_output(mpc):
+    sizes = ", ".join([str(s) for s in SIZES])
+    intervals = (f'"exp": [{EXP_INTERVAL[0]:.17g}, {EXP_INTERVAL[1]:.17g}], '
+                 f'"sigmoid": [{SIGMOID_INTERVAL[0]:.17g}, {SIGMOID_INTERVAL[1]:.17g}], '
+                 f'"tanh": [{TANH_INTERVAL[0]:.17g}, {TANH_INTERVAL[1]:.17g}], '
+                 f'"relu": [{RELU_INTERVAL[0]:.17g}, {RELU_INTERVAL[1]:.17g}], '
+                 f'"sin": [{SIN_INTERVAL[0]:.17g}, {SIN_INTERVAL[1]:.17g}], '
+                 f'"cos": [{COS_INTERVAL[0]:.17g}, {COS_INTERVAL[1]:.17g}], '
+                 f'"tan": [{TAN_INTERVAL[0]:.17g}, {TAN_INTERVAL[1]:.17g}], '
+                 f'"cot": [{COT_INTERVAL[0]:.17g}, {COT_INTERVAL[1]:.17g}], '
+                 f'"sinh": [{SINH_INTERVAL[0]:.17g}, {SINH_INTERVAL[1]:.17g}], '
+                 f'"cosh": [{COSH_INTERVAL[0]:.17g}, {COSH_INTERVAL[1]:.17g}], '
+                 f'"polynomial": [{POLY_INTERVAL[0]:.17g}, {POLY_INTERVAL[1]:.17g}]')
+    with open(_path(mpc), "w") as f:
+        f.write(
+            f'{LB}"_meta": {LB}"spec_version": "{SPEC_VERSION}", '
+            f'"sizes": [{sizes}], "reps": {REPS}, '
+            f'"intervals": {LB}{intervals}{RB}, '
+            f'"framework": "sequre", "parties": {NUMBER_OF_PARTIES}, '
+            f'"mpc_int_size": {MPC_INT_SIZE}, "nbit_k": {MPC_NBIT_K}, '
+            f'"nbit_f": {MPC_NBIT_F}, "nbit_v": {MPC_NBIT_V}, '
+            f'"modulus": "ring_2^{MPC_INT_SIZE - 1}", '
+            f'"fourier_degree": {FOURIER_DEGREE}{RB}{RB}\n')
+
+
+def _stat(values: list[float]) -> tuple[float, float, float]:
+    """ (median, min, mean) """
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2], ordered[0], sum(ordered) / len(ordered)
+
+
+def _errors(got: list[float], expected: list[float]) -> tuple[float, float, float, float]:
+    """ (max abs, mean abs, max relative, max abs over the interior) """
+    count = len(expected)
+    # Inputs are linspace, so trimming indices trims the interval.
+    lo = int(float(count) * INTERIOR_TRIM)
+    hi = count - lo
+
+    max_abs = 0.0
+    total_abs = 0.0
+    max_rel = -1.0
+    max_abs_interior = 0.0
+    for i in range(count):
+        diff = abs(got[i] - expected[i])
+        total_abs += diff
+        if diff > max_abs:
+            max_abs = diff
+        if lo <= i < hi and diff > max_abs_interior:
+            max_abs_interior = diff
+        if abs(expected[i]) > REL_ERR_FLOOR:
+            rel = diff / abs(expected[i])
+            if rel > max_rel:
+                max_rel = rel
+    mean_abs = total_abs / count if count else 0.0
+    return max_abs, mean_abs, max_rel, max_abs_interior
+
+
+def _emit(
+        mpc, framework: str, function: str, n: int, times: list[float],
+        bytes_sent: float, rounds: float,
+        got: list[float], expected: list[float],
+        mode: str, note: str):
+    median, minimum, mean = _stat(times)
+    max_abs, mean_abs, max_rel, max_abs_interior = _errors(got, expected)
+    # -1 is the sentinel for "no entry had |truth| above the floor"; report.py
+    # renders it the same way it renders a Python NaN.
+    rel_json = "null" if max_rel < 0.0 else f"{max_rel:.9g}"
+    throughput = (float(n) / median) if median > 0.0 else 0.0
+
+    line = (
+        f'{LB}"framework": "{framework}", "function": "{function}", "n": {n}, '
+        f'"reps": {len(times)}, "median_s": {median:.9g}, "min_s": {minimum:.9g}, '
+        f'"mean_s": {mean:.9g}, "throughput_eps": {throughput:.9g}, '
+        f'"bytes_sent": {bytes_sent:.9g}, "rounds": {rounds:.9g}, '
+        f'"max_abs_err": {max_abs:.9g}, "mean_abs_err": {mean_abs:.9g}, '
+        f'"max_rel_err": {rel_json}, '
+        f'"max_abs_err_interior": {max_abs_interior:.9g}, "party": {mpc.pid}, '
+        f'"parties": {NUMBER_OF_PARTIES}, "mode": "{mode}", '
+        f'"skipped": false, "note": "{note}"{RB}')
+
+    with open(_path(mpc), "a") as f:
+        f.write(line + "\n")
+
+    print(f"CP{mpc.pid}:\t{framework}\t{function}\tn={n}\t"
+          f"{median:.6f}s\t{bytes_sent:.0f}B\tmax_abs_err={max_abs:.3e}")
+
+
+def _poly_truth(values: list[float]) -> list[float]:
+    """ 1 + 2x + 3x^2 + 4x^3, matching spec.POLY_COEFFS. """
+    out = []
+    for v in values:
+        acc = 0.0
+        p = 1.0
+        for c in POLY_COEFFS:
+            acc += c * p
+            p *= v
+        out.append(acc)
+    return out
+
+
+def _relu_truth(values: list[float]) -> list[float]:
+    return [v if v > 0.0 else 0.0 for v in values]
+
+
+def _shared_input(mpc, values: list[float]):
+    return Sharetensor.enc(mpc, array(values))
+
+
+def _shared_input_periodic(mpc, values: list[float], period: float):
+    """ via_fourier expects the input already scaled by the series' period. """
+    modulus = mpc.default_mpc_modulus
+    stensor = Sharetensor(
+        mpc.comms.share_from_trusted_dealer(
+            period_double_to_fp(values, period, modulus), modulus),
+        modulus)
+    stensor.fp = True
+    return stensor
+
+
+# ---------------------------------------------------------------------------
+# Decor path.
+#
+# Decor consumes one fresh mask per evaluation -- reusing a mask across calls
+# would leak -- so mask generation has to be inside the timed region, exactly as
+# CrypTen's per-call triple generation is. Where each path gets that mask
+# differs, and it decides whether an explicit refresh is needed:
+#
+#   via_decor       rescales the input into a new tensor and partitions *that*,
+#                   leaving the benchmark's input unpartitioned. Every call
+#                   already draws a fresh mask, so forcing a refresh here would
+#                   only add a redundant partition round (~25% at n=8192).
+#   via_fourier     partitions the input tensor itself and caches the result on
+#                   it, so without an explicit refresh every repetition after
+#                   the first would reuse one mask. Refresh is required.
+#   relu            same, via the @sequre IR pass. Refresh is required.
+#
+# The asymmetry is verified, not assumed: after a via_decor call the input
+# reports is_partitioned() == False, after the relu path it reports True.
+# ---------------------------------------------------------------------------
+
+def _bench_decor(mpc, function: str, values: list[float], expected: list[float],
+                 interval, mode: str, method: Static[str]):
+    n = len(values)
+    stensor = _shared_input(mpc, values)
+
+    for _ in range(WARMUP_REPS):
+        result = via_decor(mpc, stensor, interval, method=method)
+
+    times = []
+    bytes_start = mpc.stats.bytes_sent
+    rounds_start = mpc.stats.rounds
+    for _ in range(REPS):
+        start = time.time()
+        result = via_decor(mpc, stensor, interval, method=method)
+        times.append(time.time() - start)
+    bytes_per_call = float(mpc.stats.bytes_sent - bytes_start) / REPS
+    rounds_per_call = float(mpc.stats.rounds - rounds_start) / REPS
+
+    revealed = result.reveal(mpc).tolist()
+    _emit(mpc, DECOR_ID, function, n, times,
+          bytes_per_call, rounds_per_call, revealed, expected,
+          mode, f"via_decor method={method}")
+
+
+def _bench_decor_poly(mpc, values: list[float], expected: list[float],
+                      interval, mode: str):
+    """ Decor's polynomial path takes the degree and coefficients as extra args. """
+    n = len(values)
+    stensor = _shared_input(mpc, values)
+
+    for _ in range(WARMUP_REPS):
+        result = via_decor(mpc, stensor, interval, POLY_DEGREE, POLY_COEFFS,
+                           method="polynomial")
+
+    times = []
+    bytes_start = mpc.stats.bytes_sent
+    rounds_start = mpc.stats.rounds
+    for _ in range(REPS):
+        start = time.time()
+        result = via_decor(mpc, stensor, interval, POLY_DEGREE, POLY_COEFFS,
+                           method="polynomial")
+        times.append(time.time() - start)
+    bytes_per_call = float(mpc.stats.bytes_sent - bytes_start) / REPS
+    rounds_per_call = float(mpc.stats.rounds - rounds_start) / REPS
+
+    revealed = result.reveal(mpc).tolist()
+    _emit(mpc, DECOR_ID, "polynomial", n, times,
+          bytes_per_call, rounds_per_call, revealed, expected,
+          mode, f"via_decor polynomial degree={POLY_DEGREE}")
+
+
+def _bench_fourier(mpc, function: str, values: list[float], expected: list[float],
+                   interval, mode: str, op):
+    n = len(values)
+    period = interval[1] - interval[0]
+    stensor = _shared_input_periodic(mpc, values, period)
+
+    for _ in range(WARMUP_REPS):
+        stensor.get_partitions(mpc, force=True)
+        result = via_fourier(mpc, stensor, op, interval, degree=FOURIER_DEGREE)
+
+    times = []
+    bytes_start = mpc.stats.bytes_sent
+    rounds_start = mpc.stats.rounds
+    for _ in range(REPS):
+        start = time.time()
+        stensor.get_partitions(mpc, force=True)
+        result = via_fourier(mpc, stensor, op, interval, degree=FOURIER_DEGREE)
+        times.append(time.time() - start)
+    bytes_per_call = float(mpc.stats.bytes_sent - bytes_start) / REPS
+    rounds_per_call = float(mpc.stats.rounds - rounds_start) / REPS
+
+    revealed = result.reveal(mpc).tolist()
+    _emit(mpc, FOURIER_ID, function, n, times,
+          bytes_per_call, rounds_per_call, revealed, expected,
+          mode, f"via_fourier degree={FOURIER_DEGREE}")
+
+
+# ---------------------------------------------------------------------------
+# ReLU: comparison-bound rather than approximation-bound, so it contrasts
+# Decor's reduced-ring sign extraction against Sequre's full-width one.
+# ---------------------------------------------------------------------------
+
+@sequre
+def _decor_relu(mpc, x, scale: float):
+    """
+    decor_gt reads the sign off a ring of MPC_NBIT_F + 1 bits, which holds
+    fixed-point values in (-1, 1) only. The public rescale brings the input
+    into that window; it cannot change a sign, and it costs one public
+    multiplication plus its truncation, which is inside the timed region.
+    """
+    return x * decor_gt(mpc, x * scale, 0)
+
+
+@sequre
+def _baseline_relu(mpc, x):
+    return x * (x > 0)
+
+
+def _bench_relu(mpc, values: list[float], expected: list[float],
+                interval, mode: str):
+    n = len(values)
+    # 0.9 rather than 1.0 keeps the rescaled endpoints strictly inside the
+    # reduced ring rather than exactly on its boundary.
+    scale = 0.9 / max(abs(interval[0]), abs(interval[1]))
+
+    for framework in (DECOR_ID, FOURIER_ID):
+        stensor = _shared_input(mpc, values)
+
+        for _ in range(WARMUP_REPS):
+            stensor.get_partitions(mpc, force=True)
+            if framework == DECOR_ID:
+                result = _decor_relu(mpc, stensor, scale)
+            else:
+                result = _baseline_relu(mpc, stensor)
+
+        times = []
+        bytes_start = mpc.stats.bytes_sent
+        rounds_start = mpc.stats.rounds
+        for _ in range(REPS):
+            start = time.time()
+            stensor.get_partitions(mpc, force=True)
+            if framework == DECOR_ID:
+                result = _decor_relu(mpc, stensor, scale)
+            else:
+                result = _baseline_relu(mpc, stensor)
+            times.append(time.time() - start)
+        bytes_per_call = float(mpc.stats.bytes_sent - bytes_start) / REPS
+        rounds_per_call = float(mpc.stats.rounds - rounds_start) / REPS
+
+        revealed = result.reveal(mpc).tolist()
+        note = ("decor_gt reduced-ring sign extraction, public rescale by "
+                f"{scale:.4g}" if framework == DECOR_ID
+                else "Sequre full-width comparison")
+        _emit(mpc, framework, "relu", n, times,
+              bytes_per_call, rounds_per_call, revealed, expected, mode, note)
+
+
+def _prewarm(mpc):
+    """ Absorbs the one-time detach_dealer entry stall outside any timed region. """
+    values = linspace(EXP_INTERVAL[0], EXP_INTERVAL[1], SIZES[-1])
+    stensor = _shared_input(mpc, values)
+    for _ in range(2):
+        via_decor(mpc, stensor, EXP_INTERVAL, method="exp")
+
+
+def _bench_all(mpc, mode: str):
+    for n in SIZES:
+        exp_values = linspace(EXP_INTERVAL[0], EXP_INTERVAL[1], n)
+        _bench_decor(mpc, "exp", exp_values, exp(exp_values),
+                     EXP_INTERVAL, mode, method="exp")
+        _bench_fourier(mpc, "exp", exp_values, exp(exp_values),
+                       EXP_INTERVAL, mode, exp)
+
+        sig_values = linspace(SIGMOID_INTERVAL[0], SIGMOID_INTERVAL[1], n)
+        _bench_decor(mpc, "sigmoid", sig_values, sigmoid(sig_values),
+                     SIGMOID_INTERVAL, mode, method="sigmoid")
+        _bench_fourier(mpc, "sigmoid", sig_values, sigmoid(sig_values),
+                       SIGMOID_INTERVAL, mode, sigmoid)
+
+        tanh_values = linspace(TANH_INTERVAL[0], TANH_INTERVAL[1], n)
+        _bench_decor(mpc, "tanh", tanh_values, tanh(tanh_values),
+                     TANH_INTERVAL, mode, method="tanh")
+        _bench_fourier(mpc, "tanh", tanh_values, tanh(tanh_values),
+                       TANH_INTERVAL, mode, tanh)
+
+        relu_values = linspace(RELU_INTERVAL[0], RELU_INTERVAL[1], n)
+        _bench_relu(mpc, relu_values, _relu_truth(relu_values), RELU_INTERVAL, mode)
+
+        # --- Decor's trigonometric protocols -------------------------------
+        # Periodic, so via_decor rescales by 2*pi and needs no interval
+        # confinement. Fourier is included for sin/cos as a sanity check: a
+        # Fourier series of a sinusoid is that sinusoid, so it should be exact.
+        sin_values = linspace(SIN_INTERVAL[0], SIN_INTERVAL[1], n)
+        _bench_decor(mpc, "sin", sin_values, sin(sin_values),
+                     SIN_INTERVAL, mode, method="sin")
+        _bench_fourier(mpc, "sin", sin_values, sin(sin_values),
+                       SIN_INTERVAL, mode, sin)
+
+        cos_values = linspace(COS_INTERVAL[0], COS_INTERVAL[1], n)
+        _bench_decor(mpc, "cos", cos_values, cos(cos_values),
+                     COS_INTERVAL, mode, method="cos")
+        _bench_fourier(mpc, "cos", cos_values, cos(cos_values),
+                       COS_INTERVAL, mode, cos)
+
+        # tan and cot go through the same trig protocol but finish with a
+        # Decor division, so they cost noticeably more than sin/cos.
+        tan_values = linspace(TAN_INTERVAL[0], TAN_INTERVAL[1], n)
+        _bench_decor(mpc, "tan", tan_values, tan(tan_values),
+                     TAN_INTERVAL, mode, method="tan")
+
+        cot_values = linspace(COT_INTERVAL[0], COT_INTERVAL[1], n)
+        _bench_decor(mpc, "cot", cot_values, cot(cot_values),
+                     COT_INTERVAL, mode, method="cot")
+
+        # --- hyperbolics ---------------------------------------------------
+        sinh_values = linspace(SINH_INTERVAL[0], SINH_INTERVAL[1], n)
+        _bench_decor(mpc, "sinh", sinh_values, sinh(sinh_values),
+                     SINH_INTERVAL, mode, method="sinh")
+        _bench_fourier(mpc, "sinh", sinh_values, sinh(sinh_values),
+                       SINH_INTERVAL, mode, sinh)
+
+        cosh_values = linspace(COSH_INTERVAL[0], COSH_INTERVAL[1], n)
+        _bench_decor(mpc, "cosh", cosh_values, cosh(cosh_values),
+                     COSH_INTERVAL, mode, method="cosh")
+        _bench_fourier(mpc, "cosh", cosh_values, cosh(cosh_values),
+                       COSH_INTERVAL, mode, cosh)
+
+        # --- polynomial ----------------------------------------------------
+        poly_values = linspace(POLY_INTERVAL[0], POLY_INTERVAL[1], n)
+        _bench_decor_poly(mpc, poly_values, _poly_truth(poly_values),
+                          POLY_INTERVAL, mode)
+
+
+@main
+def bench(mpc):
+    _init_output(mpc)
+
+    # Decor's reduced-ring comparison needs a power-of-two modulus, and the
+    # ring is the setting the protocol is designed for.
+    with mpc.default_modulus(MPC_RING_SIZE):
+        # end_to_end: the dealer's randomness generation runs inline, on the
+        # critical path. Conservative for Decor, and the figure comparable to
+        # CrypTen's TFP provider, which also produces its correlated
+        # randomness inside the timed call.
+        _bench_all(mpc, "end_to_end")
+
+        mpc.randomness.reset_global_seed()
+        mpc.comms.sync_parties()
+
+        # online: the dealer buffers its sends and flushes on scope exit, so
+        # offline randomness generation leaves the critical path. This is the
+        # figure for a deployment with a real offline phase, and it is how the
+        # Decor paper's own benchmarks are run -- the whole block is wrapped,
+        # not individual operations.
+        #
+        # Entering the block costs the receiving party a one-time stall while
+        # the dealer runs ahead (measured at ~119 ms against a ~17 ms steady
+        # state). _prewarm absorbs it so it lands outside every timed region;
+        # without it the first cell of the matrix would swallow the whole
+        # thing. Results were checked to be identical inside and outside the
+        # block (1.317e-07 vs 1.325e-07 max abs error on exp).
+        with mpc.detach_dealer():
+            _prewarm(mpc)
+            _bench_all(mpc, "online")
+
+    print(f"CP{mpc.pid}:\twrote {_path(mpc)}")
+
+
+if __name__ == "__main__":
+    bench()

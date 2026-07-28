@@ -1,6 +1,63 @@
-from sequre import sequre, sq
-from sequre.constants import SUPPORTED_ACTIVATIONS, RELU_ACTIVATION, LINEAR_ACTIVATION
+""" Activation functions and their derivatives.
 
+Three evaluation strategies are used here, in strict order of preference:
+
+1. **Decor** (`via_decor`) for every function that admits an addition theorem
+   -- sigmoid, tanh, exp, sin, cos, tan, cot, sinh, cosh. The dealer
+   precomputes f(r) for a random mask r, the parties reveal x - r and evaluate
+   f on it in the clear, and a cheap algebraic combiner recombines the halves.
+   The result is exact to fixed-point precision and the round count is constant
+   in the accuracy: sin and cos cost three rounds, full stop.
+
+2. **Comparison** for the piecewise-linear family -- relu, leaky_relu,
+   hardtanh, relu6 -- and **composition** for gelu, silu and softmax, which are
+   built from the exact primitives above and so add no approximation of their
+   own (beyond gelu's stated tanh form).
+
+3. **Chebyshev** (`via_chebyshev`) only for `erf`, which has no addition
+   theorem and therefore no Decor path. This is a genuine fallback: a degree-d
+   Chebyshev evaluation costs depth proportional to d, where Decor is constant
+   round, and it is an approximation where Decor is exact. Decor's Fourier path
+   is constant-round for arbitrary functions and was considered first, but a
+   truncated Fourier series of a non-periodic target has a jump at the interval
+   boundary and the accompanying Gibbs overshoot -- for erf, whose whole range
+   is [-1, 1], that error is not acceptable. Chebyshev wins on accuracy here.
+
+Derivatives are, wherever possible, algebraic in the *forward* value rather
+than a second protocol invocation: sigmoid' = s(1 - s), tanh' = 1 - t^2,
+tan' = 1 + t^2, exp' = exp. The `*_with_derivative` variants exploit this and
+should be preferred in backpropagation -- they cost one extra multiplication
+instead of a second full evaluation. Only sin, cos, sinh and cosh need a second
+Decor call, because their derivatives are a different function of the input
+rather than of the output; at three rounds each that is still cheap.
+"""
+
+from sequre import sequre, sq
+from sequre.constants import (
+    SUPPORTED_ACTIVATIONS, RELU_ACTIVATION, LINEAR_ACTIVATION,
+    ASIGMOID_ACTIVATION, SIGMOID_ACTIVATION, TANH_ACTIVATION, EXP_ACTIVATION,
+    SIN_ACTIVATION, COS_ACTIVATION, TAN_ACTIVATION, COT_ACTIVATION,
+    SINH_ACTIVATION, COSH_ACTIVATION, LEAKY_RELU_ACTIVATION,
+    HARDTANH_ACTIVATION, RELU6_ACTIVATION, GELU_ACTIVATION, SILU_ACTIVATION,
+    SOFTMAX_ACTIVATION, ERF_ACTIVATION,
+    SIGMOID_INTERVAL, TANH_INTERVAL, EXP_INTERVAL, SINH_INTERVAL,
+    COSH_INTERVAL, GELU_INTERVAL, SILU_INTERVAL, SOFTMAX_INTERVAL,
+    ERF_INTERVAL, DERF_EXP_INTERVAL, ERF_CHEBYSHEV_DEGREE,
+    LEAKY_RELU_SLOPE, TRIG_INTERVAL)
+from sequre.decor import via_decor
+from sequre.decor.functions import erf as erf_plaintext
+from sequre.stdlib.chebyshev import via_chebyshev
+
+
+# GELU's tanh form, as in Hendrycks & Gimpel and PyTorch's
+# `approximate="tanh"`: 0.5x(1 + tanh(GELU_ALPHA * (x + GELU_BETA * x^3))).
+GELU_ALPHA = 0.7978845608028654  # sqrt(2 / pi)
+GELU_BETA = 0.044715
+
+
+# ---------------------------------------------------------------------------
+# Linear
+# ---------------------------------------------------------------------------
 
 @sequre
 def linear(mpc, x):
@@ -16,6 +73,16 @@ def dlinear(mpc, x):
 def linear_with_derivative(mpc, x):
     return x, x.ones(mpc)
 
+
+# ---------------------------------------------------------------------------
+# Piecewise linear -- comparison-based, so exact up to fixed-point rounding.
+#
+# These use Sequre's full-width comparison rather than Decor's reduced-ring
+# decor_gt: decor_gt reads the sign off an MPC_NBIT_F + 1 bit ring and is only
+# correct for |x| < 1, which a layer's pre-activations do not respect. Where
+# inputs are known to be normalised, swapping in decor_gt is a large win --
+# it is roughly 20x faster and sends ~7x less.
+# ---------------------------------------------------------------------------
 
 @sequre
 def relu(mpc, x):
@@ -34,6 +101,68 @@ def relu_with_derivative(mpc, x):
 
 
 @sequre
+def leaky_relu(mpc, x, slope: float = LEAKY_RELU_SLOPE):
+    """ x for x > 0, slope * x otherwise. One comparison. """
+    is_pos = (x > 0).astype(type(x._internal_type))
+    return x * is_pos * (1 - slope) + x * slope
+
+
+@sequre
+def dleaky_relu(mpc, x, slope: float = LEAKY_RELU_SLOPE):
+    return (x > 0).astype(type(x._internal_type)) * (1 - slope) + slope
+
+
+@sequre
+def leaky_relu_with_derivative(mpc, x, slope: float = LEAKY_RELU_SLOPE):
+    is_pos = (x > 0).astype(type(x._internal_type))
+    return x * is_pos * (1 - slope) + x * slope, is_pos * (1 - slope) + slope
+
+
+@sequre
+def hardtanh(mpc, x, lo: float = -1.0, hi: float = 1.0):
+    """ Clamp to [lo, hi]. Two comparisons. """
+    above = (x > hi).astype(type(x._internal_type))
+    below = (x > lo).astype(type(x._internal_type))
+    # Inside the band: below = 1, above = 0, so the input passes through.
+    return x * (below - above) + above * hi + (1 - below) * lo
+
+
+@sequre
+def dhardtanh(mpc, x, lo: float = -1.0, hi: float = 1.0):
+    above = (x > hi).astype(type(x._internal_type))
+    below = (x > lo).astype(type(x._internal_type))
+    return below - above
+
+
+@sequre
+def hardtanh_with_derivative(mpc, x, lo: float = -1.0, hi: float = 1.0):
+    above = (x > hi).astype(type(x._internal_type))
+    below = (x > lo).astype(type(x._internal_type))
+    band = below - above
+    return x * band + above * hi + (1 - below) * lo, band
+
+
+@sequre
+def relu6(mpc, x):
+    return hardtanh(mpc, x, 0.0, 6.0)
+
+
+@sequre
+def drelu6(mpc, x):
+    return dhardtanh(mpc, x, 0.0, 6.0)
+
+
+@sequre
+def relu6_with_derivative(mpc, x):
+    return hardtanh_with_derivative(mpc, x, 0.0, 6.0)
+
+
+# ---------------------------------------------------------------------------
+# Algebraic sigmoid -- x / sqrt(x^2 + 1). Kept because it needs no interval
+# confinement at all, unlike the Decor-backed sigmoid below.
+# ---------------------------------------------------------------------------
+
+@sequre
 def asigmoid(mpc, x):
     return x / sq.sqrt(mpc, x * x + 1)
 
@@ -49,21 +178,336 @@ def asigmoid_with_derivative(mpc, x):
     return x * denom, denom ** 3
 
 
+# ---------------------------------------------------------------------------
+# Decor-backed: exact, constant-round.
+#
+# Every derivative below that can be written in terms of the forward value is
+# written that way, so `*_with_derivative` costs one multiplication on top of
+# the forward pass rather than a second protocol run.
+# ---------------------------------------------------------------------------
+
+def sigmoid(mpc, x, interval = SIGMOID_INTERVAL):
+    return via_decor(mpc, x, interval, method="sigmoid")
+
+
+@sequre
+def dsigmoid(mpc, x, interval = SIGMOID_INTERVAL):
+    s = sigmoid(mpc, x, interval)
+    return s * (1 - s)
+
+
+@sequre
+def sigmoid_with_derivative(mpc, x, interval = SIGMOID_INTERVAL):
+    s = sigmoid(mpc, x, interval)
+    return s, s * (1 - s)
+
+
+def tanh(mpc, x, interval = TANH_INTERVAL):
+    return via_decor(mpc, x, interval, method="tanh")
+
+
+@sequre
+def dtanh(mpc, x, interval = TANH_INTERVAL):
+    t = tanh(mpc, x, interval)
+    return 1 - t * t
+
+
+@sequre
+def tanh_with_derivative(mpc, x, interval = TANH_INTERVAL):
+    t = tanh(mpc, x, interval)
+    return t, 1 - t * t
+
+
+def exp(mpc, x, interval = EXP_INTERVAL):
+    return via_decor(mpc, x, interval, method="exp")
+
+
+def dexp(mpc, x, interval = EXP_INTERVAL):
+    # exp is its own derivative, so this is free.
+    return exp(mpc, x, interval)
+
+
+def exp_with_derivative(mpc, x, interval = EXP_INTERVAL):
+    e = exp(mpc, x, interval)
+    return e, e
+
+
+def sin(mpc, x, interval = TRIG_INTERVAL):
+    """ Periodic, so the interval is ignored -- Decor rescales by 2*pi. """
+    return via_decor(mpc, x, interval, method="sin")
+
+
+def cos(mpc, x, interval = TRIG_INTERVAL):
+    return via_decor(mpc, x, interval, method="cos")
+
+
+def dsin(mpc, x, interval = TRIG_INTERVAL):
+    # A second Decor call, because sin' is a function of the input rather than
+    # of the output. Three rounds, so cheaper than any algebraic recovery.
+    return cos(mpc, x, interval)
+
+
+@sequre
+def dcos(mpc, x, interval = TRIG_INTERVAL):
+    return -sin(mpc, x, interval)
+
+
+def sin_with_derivative(mpc, x, interval = TRIG_INTERVAL):
+    return sin(mpc, x, interval), cos(mpc, x, interval)
+
+
+@sequre
+def cos_with_derivative(mpc, x, interval = TRIG_INTERVAL):
+    return cos(mpc, x, interval), -sin(mpc, x, interval)
+
+
+def tan(mpc, x, interval = TRIG_INTERVAL):
+    return via_decor(mpc, x, interval, method="tan")
+
+
+@sequre
+def dtan(mpc, x, interval = TRIG_INTERVAL):
+    t = tan(mpc, x, interval)
+    return 1 + t * t
+
+
+@sequre
+def tan_with_derivative(mpc, x, interval = TRIG_INTERVAL):
+    t = tan(mpc, x, interval)
+    return t, 1 + t * t
+
+
+def cot(mpc, x, interval = TRIG_INTERVAL):
+    return via_decor(mpc, x, interval, method="cot")
+
+
+@sequre
+def dcot(mpc, x, interval = TRIG_INTERVAL):
+    c = cot(mpc, x, interval)
+    return -(1 + c * c)
+
+
+@sequre
+def cot_with_derivative(mpc, x, interval = TRIG_INTERVAL):
+    c = cot(mpc, x, interval)
+    return c, -(1 + c * c)
+
+
+def sinh(mpc, x, interval = SINH_INTERVAL):
+    return via_decor(mpc, x, interval, method="sinh")
+
+
+def cosh(mpc, x, interval = COSH_INTERVAL):
+    return via_decor(mpc, x, interval, method="cosh")
+
+
+def dsinh(mpc, x, interval = SINH_INTERVAL):
+    return cosh(mpc, x, interval)
+
+
+def dcosh(mpc, x, interval = COSH_INTERVAL):
+    return sinh(mpc, x, interval)
+
+
+def sinh_with_derivative(mpc, x, interval = SINH_INTERVAL):
+    # cosh = sqrt(1 + sinh^2) would avoid the second call, but Sequre's sqrt is
+    # an iterative protocol and costs more than Decor's three rounds.
+    return sinh(mpc, x, interval), cosh(mpc, x, interval)
+
+
+def cosh_with_derivative(mpc, x, interval = COSH_INTERVAL):
+    return cosh(mpc, x, interval), sinh(mpc, x, interval)
+
+
+# ---------------------------------------------------------------------------
+# Composites -- available in CrypTen, previously missing here. Each is built
+# from the exact primitives above.
+# ---------------------------------------------------------------------------
+
+@sequre
+def gelu(mpc, x, interval = GELU_INTERVAL):
+    """ 0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715 x^3))) -- PyTorch's tanh form. """
+    inner = (x + x * x * x * GELU_BETA) * GELU_ALPHA
+    return x * (1 + tanh(mpc, inner, interval)) * 0.5
+
+
+@sequre
+def gelu_with_derivative(mpc, x, interval = GELU_INTERVAL):
+    """
+    d/dx = 0.5(1 + t) + 0.5x(1 - t^2) * u', with u' the derivative of the
+    inner cubic. The tanh is evaluated once and reused for both.
+    """
+    x2 = x * x
+    inner = (x + x * x2 * GELU_BETA) * GELU_ALPHA
+    t = tanh(mpc, inner, interval)
+    dinner = (1 + x2 * (3 * GELU_BETA)) * GELU_ALPHA
+    return x * (1 + t) * 0.5, (1 + t) * 0.5 + x * (1 - t * t) * dinner * 0.5
+
+
+@sequre
+def dgelu(mpc, x, interval = GELU_INTERVAL):
+    return gelu_with_derivative(mpc, x, interval)[1]
+
+
+@sequre
+def silu(mpc, x, interval = SILU_INTERVAL):
+    """ x * sigmoid(x), also known as swish. """
+    return x * sigmoid(mpc, x, interval)
+
+
+@sequre
+def dsilu(mpc, x, interval = SILU_INTERVAL):
+    s = sigmoid(mpc, x, interval)
+    return s * (1 + x * (1 - s))
+
+
+@sequre
+def silu_with_derivative(mpc, x, interval = SILU_INTERVAL):
+    s = sigmoid(mpc, x, interval)
+    return x * s, s * (1 + x * (1 - s))
+
+
+@sequre
+def softmax(mpc, x, interval = SOFTMAX_INTERVAL):
+    """
+    exp(x) / sum(exp(x)), row-wise over a (batch, classes) tensor.
+
+    No max-subtraction stabilisation: that would need a secure max, and Decor's
+    exp is exact over the confined interval anyway, so the usual motivation
+    (overflow in floating point) does not apply.
+
+    There is deliberately no elementwise `dsoftmax`. Softmax's derivative is a
+    Jacobian, not a diagonal, so an elementwise function would be wrong; in
+    practice it is fused with cross-entropy, where the combined gradient is
+    just (softmax - target).
+    """
+    e = exp(mpc, x, interval)
+    return e / e.sum(axis=1, keepdims=True)
+
+
+# ---------------------------------------------------------------------------
+# Chebyshev fallback -- erf only.
+# ---------------------------------------------------------------------------
+
+def erf(mpc, x, interval = ERF_INTERVAL, degree: int = ERF_CHEBYSHEV_DEGREE):
+    """
+    Gauss error function.
+
+    erf admits no addition theorem, so there is no Decor decomposition for it;
+    this is the one activation here that is genuinely approximated. See the
+    module docstring for why Chebyshev is preferred over Decor's constant-round
+    Fourier path for this particular function.
+    """
+    return via_chebyshev(mpc, x, erf_plaintext, interval, degree)
+
+
+@sequre
+def derf(mpc, x, exp_interval = DERF_EXP_INTERVAL):
+    """
+    2/sqrt(pi) * exp(-x^2) -- exact, via Decor's exp, so the derivative is
+    better than the Chebyshev-approximated forward pass.
+
+    `exp_interval` confines -x^2, which is what reaches the exp, rather than x.
+    """
+    return exp(mpc, -(x * x), exp_interval) * 1.1283791670955126
+
+
+@sequre
+def erf_with_derivative(mpc, x, interval = ERF_INTERVAL,
+                        degree: int = ERF_CHEBYSHEV_DEGREE,
+                        exp_interval = DERF_EXP_INTERVAL):
+    return erf(mpc, x, interval, degree), derf(mpc, x, exp_interval)
+
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
 def activate(mpc, x, activation: str):
     assert activation in SUPPORTED_ACTIVATIONS, f"Neural net: activation {activation} is not supported"
-    
+
     if activation == RELU_ACTIVATION:
         return relu(mpc, x)
-    
     if activation == LINEAR_ACTIVATION:
         return linear(mpc, x)
+    if activation == ASIGMOID_ACTIVATION:
+        return asigmoid(mpc, x)
+    if activation == SIGMOID_ACTIVATION:
+        return sigmoid(mpc, x)
+    if activation == TANH_ACTIVATION:
+        return tanh(mpc, x)
+    if activation == EXP_ACTIVATION:
+        return exp(mpc, x)
+    if activation == SIN_ACTIVATION:
+        return sin(mpc, x)
+    if activation == COS_ACTIVATION:
+        return cos(mpc, x)
+    if activation == TAN_ACTIVATION:
+        return tan(mpc, x)
+    if activation == COT_ACTIVATION:
+        return cot(mpc, x)
+    if activation == SINH_ACTIVATION:
+        return sinh(mpc, x)
+    if activation == COSH_ACTIVATION:
+        return cosh(mpc, x)
+    if activation == LEAKY_RELU_ACTIVATION:
+        return leaky_relu(mpc, x)
+    if activation == HARDTANH_ACTIVATION:
+        return hardtanh(mpc, x)
+    if activation == RELU6_ACTIVATION:
+        return relu6(mpc, x)
+    if activation == GELU_ACTIVATION:
+        return gelu(mpc, x)
+    if activation == SILU_ACTIVATION:
+        return silu(mpc, x)
+    if activation == SOFTMAX_ACTIVATION:
+        return softmax(mpc, x)
+    if activation == ERF_ACTIVATION:
+        return erf(mpc, x)
 
 
 def dactivate(mpc, x, activation: str):
     assert activation in SUPPORTED_ACTIVATIONS, f"Neural net: activation {activation} is not supported"
-    
+
     if activation == RELU_ACTIVATION:
         return drelu(mpc, x)
-    
     if activation == LINEAR_ACTIVATION:
         return dlinear(mpc, x)
+    if activation == ASIGMOID_ACTIVATION:
+        return dasigmoid(mpc, x)
+    if activation == SIGMOID_ACTIVATION:
+        return dsigmoid(mpc, x)
+    if activation == TANH_ACTIVATION:
+        return dtanh(mpc, x)
+    if activation == EXP_ACTIVATION:
+        return dexp(mpc, x)
+    if activation == SIN_ACTIVATION:
+        return dsin(mpc, x)
+    if activation == COS_ACTIVATION:
+        return dcos(mpc, x)
+    if activation == TAN_ACTIVATION:
+        return dtan(mpc, x)
+    if activation == COT_ACTIVATION:
+        return dcot(mpc, x)
+    if activation == SINH_ACTIVATION:
+        return dsinh(mpc, x)
+    if activation == COSH_ACTIVATION:
+        return dcosh(mpc, x)
+    if activation == LEAKY_RELU_ACTIVATION:
+        return dleaky_relu(mpc, x)
+    if activation == HARDTANH_ACTIVATION:
+        return dhardtanh(mpc, x)
+    if activation == RELU6_ACTIVATION:
+        return drelu6(mpc, x)
+    if activation == GELU_ACTIVATION:
+        return dgelu(mpc, x)
+    if activation == SILU_ACTIVATION:
+        return dsilu(mpc, x)
+    if activation == ERF_ACTIVATION:
+        return derf(mpc, x)
+    # SOFTMAX_ACTIVATION has no elementwise derivative -- see softmax's
+    # docstring. Callers should fuse it with the loss. This is a runtime
+    # dispatch on a str, so it cannot be a compile_error.
+    raise ValueError(
+        f"dactivate: {activation} has no elementwise derivative; "
+        "fuse softmax with the loss instead")

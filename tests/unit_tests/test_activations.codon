@@ -1,0 +1,116 @@
+""" Correctness tests for the neural-net activations and their derivatives.
+
+Each activation is checked against a plaintext reference, and each derivative
+against a central finite difference of its own forward function -- so a
+derivative that disagrees with the activation it claims to differentiate is
+caught even if both are individually plausible.
+"""
+
+import math
+
+from sequre.constants import MPC_RING_SIZE
+from sequre.stdlib.numpy.create import array
+from sequre.types.sharetensor import Sharetensor
+from sequre.utils.testing import assert_eq_approx
+
+from sequre.stdlib.learn.neural_net.activations import (
+    relu, drelu, leaky_relu, dleaky_relu, hardtanh, dhardtanh, relu6, drelu6,
+    sigmoid, dsigmoid, tanh, dtanh, exp, dexp,
+    sin, dsin, cos, dcos, tan, dtan, cot, dcot,
+    sinh, dsinh, cosh, dcosh, gelu, dgelu, silu, dsilu, erf, derf,
+    sigmoid_with_derivative, tanh_with_derivative, silu_with_derivative)
+
+
+FD_STEP = 1e-4
+
+
+def _lin(a: float, b: float, n: int) -> list[float]:
+    step = (b - a) / (n - 1)
+    return [a + step * i for i in range(n)]
+
+
+def _check(mpc, name: str, values: list[float], got: list[float],
+           expected: list[float], error: float):
+    if mpc.pid == 0:
+        return
+    assert_eq_approx(f"activation {name}", got, expected, error=error, silent_pass=True)
+
+
+def _fd(f, x: float) -> float:
+    """ Central finite difference of a plaintext function. """
+    return (f(x + FD_STEP) - f(x - FD_STEP)) / (2 * FD_STEP)
+
+
+def _run(mpc, name: str, op, dop, values: list[float], plain, error: float):
+    st = Sharetensor.enc(mpc, array(values))
+    _check(mpc, name, values, op(mpc, st).reveal(mpc).tolist(),
+           [plain(v) for v in values], error)
+
+    st_d = Sharetensor.enc(mpc, array(values))
+    _check(mpc, f"d{name}", values, dop(mpc, st_d).reveal(mpc).tolist(),
+           [_fd(plain, v) for v in values], error)
+
+
+def test_activations(mpc):
+    print(f"\nCP{mpc.pid}:\tTesting neural-net activations...")
+
+    with mpc.default_modulus(MPC_RING_SIZE):
+        # Piecewise linear. The finite difference is meaningless at the kink,
+        # so the sample points deliberately avoid 0 and the clamp corners.
+        pl = _lin(-2.7, 2.7, 32)
+        _run(mpc, "relu", relu, drelu, pl,
+             lambda v: v if v > 0.0 else 0.0, 0.01)
+        _run(mpc, "leaky_relu", leaky_relu, dleaky_relu, pl,
+             lambda v: v if v > 0.0 else 0.01 * v, 0.01)
+        _run(mpc, "hardtanh", hardtanh, dhardtanh, pl,
+             lambda v: -1.0 if v < -1.0 else (1.0 if v > 1.0 else v), 0.01)
+        _run(mpc, "relu6", relu6, drelu6, pl,
+             lambda v: 0.0 if v < 0.0 else (6.0 if v > 6.0 else v), 0.01)
+
+        # Decor-backed.
+        _run(mpc, "sigmoid", sigmoid, dsigmoid, _lin(-5.5, 5.5, 32),
+             lambda v: 1.0 / (1.0 + math.exp(-v)), 0.01)
+        _run(mpc, "tanh", tanh, dtanh, _lin(-3.5, 3.5, 32),
+             math.tanh, 0.01)
+        _run(mpc, "exp", exp, dexp, _lin(-2.8, 2.8, 32),
+             math.exp, 0.01)
+        _run(mpc, "sin", sin, dsin, _lin(-3.0, 3.0, 32),
+             math.sin, 0.01)
+        _run(mpc, "cos", cos, dcos, _lin(-3.0, 3.0, 32),
+             math.cos, 0.01)
+        _run(mpc, "tan", tan, dtan, _lin(-0.7, 0.7, 32),
+             math.tan, 0.05)
+        _run(mpc, "cot", cot, dcot, _lin(0.8, 2.3, 32),
+             lambda v: 1.0 / math.tan(v), 0.05)
+        _run(mpc, "sinh", sinh, dsinh, _lin(-1.8, 1.8, 32),
+             math.sinh, 0.01)
+        _run(mpc, "cosh", cosh, dcosh, _lin(-1.8, 1.8, 32),
+             math.cosh, 0.01)
+
+        # Composites.
+        def _gelu_plain(v: float) -> float:
+            inner = 0.7978845608028654 * (v + 0.044715 * v * v * v)
+            return 0.5 * v * (1.0 + math.tanh(inner))
+        _run(mpc, "gelu", gelu, dgelu, _lin(-3.5, 3.5, 32), _gelu_plain, 0.02)
+        _run(mpc, "silu", silu, dsilu, _lin(-5.5, 5.5, 32),
+             lambda v: v / (1.0 + math.exp(-v)), 0.02)
+
+        # Chebyshev fallback. Looser tolerance: this is the one approximated
+        # activation, and the fit degrades towards the interval endpoints.
+        _run(mpc, "erf", erf, derf, _lin(-2.5, 2.5, 32), math.erf, 0.05)
+
+        # The fused variants must agree with the separate ones.
+        vals = _lin(-4.0, 4.0, 32)
+        st = Sharetensor.enc(mpc, array(vals))
+        s_fused, ds_fused = sigmoid_with_derivative(mpc, st)
+        st2 = Sharetensor.enc(mpc, array(vals))
+        _check(mpc, "sigmoid_with_derivative[0]", vals,
+               s_fused.reveal(mpc).tolist(),
+               sigmoid(mpc, st2).reveal(mpc).tolist(), 0.01)
+        st3 = Sharetensor.enc(mpc, array(vals))
+        _check(mpc, "sigmoid_with_derivative[1]", vals,
+               ds_fused.reveal(mpc).tolist(),
+               dsigmoid(mpc, st3).reveal(mpc).tolist(), 0.01)
+
+    if mpc.pid != 0:
+        print(f"CP{mpc.pid}:\tActivations unit test passed.")
