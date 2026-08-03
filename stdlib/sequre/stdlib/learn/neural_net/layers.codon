@@ -1,3 +1,5 @@
+import secure_operator
+
 from sequre import sequre
 
 from sequre.constants import SUPPORTED_ACTIVATIONS
@@ -45,20 +47,54 @@ class Dense[ctype]:
     vw: ctype
     vb: ctype
 
-    def __init__(self, activation: str, size: int, kernel_initializer: str = "uniform", bias_initializer: str = "uniform"):
+    # Kernel shaping. The initializers produce a fixed distribution -- "uniform"
+    # draws from [0, 1) -- so a layer whose init depends on its fan-in, such as
+    # SIREN's uniform(-sqrt(6/n)/omega, +sqrt(6/n)/omega), is expressed by
+    # remapping that draw onto kernel_interval and then scaling it. Both default
+    # to the identity, so an unparameterised layer initializes exactly as before.
+    kernel_interval: tuple[float, float]
+    kernel_scale: float
+
+    # Multiplies the pre-activation, i.e. the layer computes
+    # f(pre_act_scale * (x @ W + b)). This is SIREN's omega_0: it is part of the
+    # architecture rather than of the initialization, and cannot be folded into
+    # the weights without also rescaling the gradient it is there to boost.
+    pre_act_scale: float
+
+    def __init__(self, activation: str, size: int,
+                 kernel_initializer: str = "uniform",
+                 bias_initializer: str = "uniform",
+                 kernel_interval: tuple[float, float] = (0.0, 1.0),
+                 kernel_scale: float = 1.0,
+                 pre_act_scale: float = 1.0):
         assert activation in SUPPORTED_ACTIVATIONS, f"Dense neural net layer: {activation} activation is not supported. Supported activations: {SUPPORTED_ACTIVATIONS}"
         self.activation = activation
         self.size = size
         self.kernel_initializer = kernel_initializer
         self.bias_initializer = bias_initializer
-    
+        self.kernel_interval = kernel_interval
+        self.kernel_scale = kernel_scale
+        self.pre_act_scale = pre_act_scale
+
     def initialize(self, mpc, prev_size: int, *args, **kwargs):
         w_shape = (prev_size, self.size)
         b_shape = (1, self.size)
-        
-        self.weights = ctype.rand(w_shape, self.kernel_initializer, mpc, *args, **kwargs)
+
+        weights = ctype.rand(w_shape, self.kernel_initializer, mpc, *args, **kwargs)
+
+        # Guarded rather than unconditional: on a secret-shared ctype each of
+        # these is a public multiplication plus its truncation, and the default
+        # layer should not pay for a no-op.
+        lo, hi = self.kernel_interval
+        if lo != 0.0 or hi != 1.0:
+            weights = secure_operator.add(
+                mpc, secure_operator.mul(mpc, weights, hi - lo), lo)
+        if self.kernel_scale != 1.0:
+            weights = secure_operator.mul(mpc, weights, self.kernel_scale)
+
+        self.weights = weights
         self.bias = ctype.rand(b_shape, self.bias_initializer, mpc, *args, **kwargs)
-        
+
         self.dw = self.weights.zeros()
         self.db = self.bias.zeros()
         
@@ -69,14 +105,15 @@ class Dense[ctype]:
         return not self.output.is_empty()
     
     def evaluate(self, mpc, last_output: ctype):
-        Dense[ctype]._evaluate(mpc, self, last_output)
-    
+        Dense[ctype]._evaluate(mpc, self, last_output, self.pre_act_scale)
+
     def activate(self, mpc) -> ctype:
         return activate(mpc, self.input, self.activation)
     
     def derive(self, mpc, prev_output: ctype, dhidden: ctype, LAYER_IDX: Static[int]) -> ctype:
         dact = dactivate(mpc, self.input, self.activation)
-        return Dense[ctype]._derive(mpc, self, prev_output, dhidden, dact, LAYER_IDX=LAYER_IDX)
+        return Dense[ctype]._derive(
+            mpc, self, prev_output, dhidden, dact, self.pre_act_scale, LAYER_IDX=LAYER_IDX)
     
     def update(self, mpc, step: float, momentum: float):
         Dense[ctype]._nesterov_update(mpc, self, step, momentum)
@@ -94,9 +131,15 @@ class Dense[ctype]:
         layer.bias += layer.vb * (momentum + 1) - vb_prev * momentum
     
     @sequre
-    def _derive(mpc, layer: Dense, prev_output: ctype, dhidden: ctype, dact: ctype, LAYER_IDX: Static[int]) -> ctype:
+    def _derive(mpc, layer: Dense, prev_output: ctype, dhidden: ctype, dact: ctype,
+                pre_act_scale: float, LAYER_IDX: Static[int]) -> ctype:
         # Apply derivative of activation
         dhidden = dhidden * dact
+        # The layer computes f(s * (xW + b)), so d/dz carries the same public
+        # factor s. Applying it here covers both the weight gradient and the
+        # activation backpropagated to the previous layer.
+        if pre_act_scale != 1.0:
+            dhidden = dhidden * pre_act_scale
         # Compute derivative of weights
         layer.dw = prev_output.T @ dhidden
         # Compute derivative of biases
@@ -107,6 +150,8 @@ class Dense[ctype]:
         return dhidden @ layer.weights.T
     
     @sequre
-    def _evaluate(mpc, layer: Dense, last_output: ctype):
+    def _evaluate(mpc, layer: Dense, last_output: ctype, pre_act_scale: float):
         layer.input = last_output @ layer.weights + layer.bias
+        if pre_act_scale != 1.0:
+            layer.input = layer.input * pre_act_scale
         layer.output = layer.activate(mpc)

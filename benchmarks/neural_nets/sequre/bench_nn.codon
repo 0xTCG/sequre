@@ -1,0 +1,466 @@
+""" Sequre column of the neural-network benchmark.
+
+Two sequential feed-forward networks are trained under MPC:
+
+    siren   2-64-64-1 with sine activations and omega = 30 (Sitzmann et al.
+            2020). Its nonlinearity is Decor's best case: sin is exact in three
+            rounds, and its derivative is cos, which is another three. Every
+            other framework in this suite approximates it.
+
+    mlp     784-128-128-10 with ReLU (SecureML, Mohassel & Zhang 2017). The
+            reference workload of the secure-ML literature, and Decor's worst
+            case: ReLU is a comparison, which no addition theorem helps with.
+
+Both use mean squared error and Sequre's batch gradient descent with Nesterov
+momentum. Architecture, data, initial weights and hyperparameters mirror
+../spec.py, are echoed into the output header, and ../report.py refuses to
+build a table if the two disagree.
+
+Initial weights are injected rather than drawn from Sequre's initializers, so
+this column starts training from the same point as the CrypTen and MPyC
+columns and their final losses are directly comparable. The layer definitions
+inside the LOC markers still declare the initializer a user would write --
+that declaration is the model code being counted, and the injection that
+overrides it afterwards is benchmark scaffolding.
+
+Every cell is measured twice, and both rows are emitted:
+
+    end_to_end  the dealer's randomness generation is inline, on the critical
+                path -- comparable to CrypTen's TFP provider
+    online      the dealer is detached (mpc.detach_dealer()), so only the
+                compute parties' work is timed
+
+The activation benchmark wraps its whole online pass in a single
+detach_dealer() block. That does not survive here. Detaching buffers every byte
+the dealer would have sent until the block exits, and one training run of the
+MLP at n = 512 moves ~0.8 GB of randomness; the whole pass buffers several
+gigabytes and the transport fails outright with "Socket connection broken".
+So the online pass detaches per cell, and skips any cell whose measured
+end_to_end traffic times the repetition count would exceed
+ONLINE_BUFFER_BUDGET. Skipped cells are recorded with that reason rather than
+dropped -- the budget is a property of the implementation worth reporting, not
+a gap in the data.
+
+Results land in ../results/sequre_w{MPC_INT_SIZE}_CP{pid}.jsonl.
+
+Run:
+    sequre run -release benchmarks/neural_nets/sequre/bench_nn.codon --local --use-ring
+
+    # both widths, side by side in one report
+    benchmarks/neural_nets/sequre/run_widths.sh
+"""
+
+import internal.static as static
+import math
+import time
+
+from sequre import main
+from sequre.constants import MPC_RING_SIZE, MPC_NBIT_F, MPC_NBIT_K, MPC_NBIT_V, NUMBER_OF_PARTIES
+from sequre.settings import MPC_INT_SIZE
+from sequre.stdlib.numpy.create import array
+from sequre.types.sharetensor import Sharetensor
+
+from sequre.stdlib.learn.neural_net.layers import Input, Dense
+from sequre.stdlib.learn.neural_net.model import Sequential
+
+
+# ---------------------------------------------------------------------------
+# Mirrors ../spec.py. Keep in sync -- report.py cross-checks the emitted header.
+# ---------------------------------------------------------------------------
+SPEC_VERSION = "1"
+EPOCHS = 2
+REPS = 3
+WARMUP_REPS = 1
+MOMENTUM = 0.9
+WITNESS_POINTS = 256
+
+SIREN_SIZES = [64, 256, 1024, 4096]
+SIREN_IN = 2
+SIREN_OUT = 1
+SIREN_HIDDEN = 64
+SIREN_OMEGA = 30.0
+SIREN_STEP = 0.01
+
+MLP_SIZES = [8, 32, 128, 512]
+MLP_IN = 784
+MLP_OUT = 10
+MLP_HIDDEN = 128
+MLP_STEP = 0.01
+
+DATA_SEED = 20250728
+WEIGHT_SEED = 987654321
+LCG_MULT = 6364136223846793005
+LCG_ADD = 1442695040888963407
+LCG_MASK = 0x7FFFFFFFFFFFFFFF
+LCG_RANGE = 2000001
+
+RESULTS_DIR = "benchmarks/neural_nets/results"
+
+# Largest n at which the online (detached-dealer) pass is attempted, per model.
+#
+# These are fixed constants rather than a check against measured traffic on
+# purpose: every party has to reach the same skip decision or they desynchronise
+# mid-protocol, and the parties do not send equal numbers of bytes -- the dealer
+# sends far more than either compute party, so a byte-threshold test would skip
+# different cells on different parties and deadlock.
+#
+# The values come from the end_to_end traffic measured by this benchmark. A
+# detached dealer buffers everything it would have sent until the block exits,
+# i.e. REPS + WARMUP_REPS runs' worth. Above roughly half a gigabyte buffered
+# the transport fails outright with "Socket connection broken", and per compute
+# party the runs cost: siren 7.9 / 25.7 / 97.1 / 382.7 MB and mlp 63.0 / 98.5 /
+# 240.3 / 807.6 MB, so four runs fit under that only up to the sizes below.
+SIREN_ONLINE_MAX_N = 1024
+MLP_ONLINE_MAX_N = 32
+
+WIDTH_TAG = str(MPC_INT_SIZE)
+FRAMEWORK = "sequre-" + WIDTH_TAG
+
+# Codon's f-strings have no `{{` escape, so JSON braces are spliced in.
+LB = "{"
+RB = "}"
+
+
+# ---------------------------------------------------------------------------
+# Deterministic data and initial weights -- the same generator as ../spec.py.
+# ---------------------------------------------------------------------------
+
+def uniform_pm1(count: int, seed: int) -> list[float]:
+    out = []
+    state = seed
+    for _ in range(count):
+        state = (state * LCG_MULT + LCG_ADD) & LCG_MASK
+        out.append(float(state % LCG_RANGE) / 1000000.0 - 1.0)
+    return out
+
+
+def siren_data(n: int) -> tuple[list[list[float]], list[list[float]]]:
+    res = int(math.sqrt(float(n)) + 0.5)
+    assert res * res == n, "siren size is not a square number of pixels"
+    coords = []
+    target = []
+    for i in range(res):
+        for j in range(res):
+            x = -1.0 + 2.0 * float(i) / float(res - 1)
+            y = -1.0 + 2.0 * float(j) / float(res - 1)
+            coords.append([x, y])
+            target.append([0.5 * math.sin(3.0 * x) * math.cos(4.0 * y)])
+    return coords, target
+
+
+def mlp_data(n: int) -> tuple[list[list[float]], list[list[float]]]:
+    flat = uniform_pm1(n * MLP_IN, DATA_SEED)
+    X = [[flat[i * MLP_IN + j] for j in range(MLP_IN)] for i in range(n)]
+    y = [[1.0 if (i % MLP_OUT) == c else 0.0 for c in range(MLP_OUT)] for i in range(n)]
+    return X, y
+
+
+def initial_weights(in_features: int, widths: list[int], scales: list[float]
+                    ) -> list[tuple[list[list[float]], list[list[float]]]]:
+    """ (weights, bias) per layer, drawn from one stream, weights before bias. """
+    fan_in = in_features
+    state = WEIGHT_SEED
+    out = []
+
+    for layer in range(len(widths)):
+        width = widths[layer]
+        scale = scales[layer]
+        count = fan_in * width + width
+        stream = uniform_pm1(count, state)
+        state = (state + count) & LCG_MASK
+        w = [[stream[r * width + c] * scale for c in range(width)] for r in range(fan_in)]
+        b = [[stream[fan_in * width + c] * scale for c in range(width)]]
+        out.append((w, b))
+        fan_in = width
+
+    return out
+
+
+def siren_weights() -> list[tuple[list[list[float]], list[list[float]]]]:
+    inner = math.sqrt(6.0 / float(SIREN_HIDDEN)) / SIREN_OMEGA
+    return initial_weights(
+        SIREN_IN, [SIREN_HIDDEN, SIREN_HIDDEN, SIREN_OUT],
+        [1.0 / float(SIREN_IN), inner, inner])
+
+
+def mlp_weights() -> list[tuple[list[list[float]], list[list[float]]]]:
+    return initial_weights(
+        MLP_IN, [MLP_HIDDEN, MLP_HIDDEN, MLP_OUT],
+        [1.0 / math.sqrt(float(MLP_IN)),
+         1.0 / math.sqrt(float(MLP_HIDDEN)),
+         1.0 / math.sqrt(float(MLP_HIDDEN))])
+
+
+def witness_indices(n: int) -> list[int]:
+    if n <= WITNESS_POINTS:
+        return list(range(n))
+    stride = float(n) / float(WITNESS_POINTS)
+    return [int(float(i) * stride) for i in range(WITNESS_POINTS)]
+
+
+# ---------------------------------------------------------------------------
+# The models.
+#
+# Everything between the LOC-BEGIN/LOC-END markers is the code a user writes to
+# define and train one network; ../loc.py counts it. Data, weight injection,
+# timing and output are deliberately outside.
+# ---------------------------------------------------------------------------
+
+# LOC-BEGIN siren
+def siren_model(mpc, X):
+    """ SIREN: sine activations, fan-in-scaled uniform init, omega on the pre-activation. """
+    inner_scale = math.sqrt(6.0 / float(SIREN_HIDDEN)) / SIREN_OMEGA
+    layers = (
+        Input[type(X)](SIREN_IN),
+        Dense[type(X)]("sin", SIREN_HIDDEN, "uniform", "uniform",
+                       kernel_interval=(-1.0, 1.0),
+                       kernel_scale=1.0 / float(SIREN_IN),
+                       pre_act_scale=SIREN_OMEGA),
+        Dense[type(X)]("sin", SIREN_HIDDEN, "uniform", "uniform",
+                       kernel_interval=(-1.0, 1.0),
+                       kernel_scale=inner_scale,
+                       pre_act_scale=SIREN_OMEGA),
+        Dense[type(X)]("linear", SIREN_OUT, "uniform", "uniform",
+                       kernel_interval=(-1.0, 1.0),
+                       kernel_scale=inner_scale))
+    return Sequential(layers).compile(mpc, loss="mse", optimizer="bgd")
+
+
+def siren_train(mpc, model, X, y):
+    model.fit(mpc, X=X, y=y, step=SIREN_STEP, epochs=EPOCHS, momentum=MOMENTUM)
+
+
+def siren_predict(mpc, model, X):
+    return model.predict(mpc, X)
+# LOC-END siren
+
+
+# LOC-BEGIN mlp
+def mlp_model(mpc, X):
+    """ SecureML's 784-128-128-10 ReLU network. """
+    layers = (
+        Input[type(X)](MLP_IN),
+        Dense[type(X)]("relu", MLP_HIDDEN, "uniform", "uniform",
+                       kernel_interval=(-1.0, 1.0),
+                       kernel_scale=1.0 / math.sqrt(float(MLP_IN))),
+        Dense[type(X)]("relu", MLP_HIDDEN, "uniform", "uniform",
+                       kernel_interval=(-1.0, 1.0),
+                       kernel_scale=1.0 / math.sqrt(float(MLP_HIDDEN))),
+        Dense[type(X)]("linear", MLP_OUT, "uniform", "uniform",
+                       kernel_interval=(-1.0, 1.0),
+                       kernel_scale=1.0 / math.sqrt(float(MLP_HIDDEN))))
+    return Sequential(layers).compile(mpc, loss="mse", optimizer="bgd")
+
+
+def mlp_train(mpc, model, X, y):
+    model.fit(mpc, X=X, y=y, step=MLP_STEP, epochs=EPOCHS, momentum=MOMENTUM)
+
+
+def mlp_predict(mpc, model, X):
+    return model.predict(mpc, X)
+# LOC-END mlp
+
+
+def inject(mpc, model, weights):
+    """
+    Overwrites the initializers' draw with the shared starting point.
+
+    Shapes are unchanged, so the gradient and momentum buffers allocated by
+    compile() stay valid.
+    """
+    for i in static.range(1, static.len(model.layers)):
+        model.layers[i].weights = Sharetensor.enc(mpc, array(weights[i - 1][0]))
+        model.layers[i].bias = Sharetensor.enc(mpc, array(weights[i - 1][1]))
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Output, in the schema ../common.py defines.
+# ---------------------------------------------------------------------------
+
+def _path(mpc) -> str:
+    return f"{RESULTS_DIR}/sequre_w{WIDTH_TAG}_CP{mpc.pid}.jsonl"
+
+
+def _init_output(mpc):
+    siren_sizes = ", ".join([str(s) for s in SIREN_SIZES])
+    mlp_sizes = ", ".join([str(s) for s in MLP_SIZES])
+    with open(_path(mpc), "w") as f:
+        f.write(
+            f'{LB}"_meta": {LB}"spec_version": "{SPEC_VERSION}", '
+            f'"epochs": {EPOCHS}, "reps": {REPS}, "momentum": {MOMENTUM:.17g}, '
+            f'"optimizer": "bgd-nesterov", "witness_points": {WITNESS_POINTS}, '
+            f'"sizes": {LB}"siren": [{siren_sizes}], "mlp": [{mlp_sizes}]{RB}, '
+            f'"framework": "sequre", "parties": {NUMBER_OF_PARTIES}, '
+            f'"mpc_int_size": {MPC_INT_SIZE}, "nbit_k": {MPC_NBIT_K}, '
+            f'"nbit_f": {MPC_NBIT_F}, "nbit_v": {MPC_NBIT_V}, '
+            f'"modulus": "ring_2^{MPC_INT_SIZE - 1}"{RB}{RB}\n')
+
+
+def _stat(values: list[float]) -> tuple[float, float, float]:
+    """ (median, min, mean) """
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2], ordered[0], sum(ordered) / len(ordered)
+
+
+def _emit_skipped(mpc, model_name: str, n: int, mode: str, note: str):
+    line = (
+        f'{LB}"framework": "{FRAMEWORK}", "model": "{model_name}", "n": {n}, '
+        f'"epochs": {EPOCHS}, "reps": 0, "median_s": NaN, "min_s": NaN, '
+        f'"mean_s": NaN, "epoch_s": NaN, "bytes_sent": null, "rounds": null, '
+        f'"final_loss": null, "witness": null, "ref_final_loss": null, '
+        f'"max_abs_pred_err": null, "mean_abs_pred_err": null, "loc": null, '
+        f'"party": {mpc.pid}, "parties": {NUMBER_OF_PARTIES}, '
+        f'"mode": "{mode}", "skipped": true, "note": "{note}"{RB}')
+
+    with open(_path(mpc), "a") as f:
+        f.write(line + "\n")
+
+    print(f"CP{mpc.pid}:\t{FRAMEWORK}\t{model_name}\tn={n}\tskipped: {note}")
+
+
+def _emit(mpc, model_name: str, n: int, times: list[float],
+          bytes_sent: float, rounds: float, final_loss: float,
+          witness: list[float], mode: str, note: str):
+    median, minimum, mean = _stat(times)
+    witness_json = ", ".join([f"{v:.9g}" for v in witness])
+
+    line = (
+        f'{LB}"framework": "{FRAMEWORK}", "model": "{model_name}", "n": {n}, '
+        f'"epochs": {EPOCHS}, "reps": {len(times)}, "median_s": {median:.9g}, '
+        f'"min_s": {minimum:.9g}, "mean_s": {mean:.9g}, '
+        f'"epoch_s": {median / float(EPOCHS):.9g}, '
+        f'"bytes_sent": {bytes_sent:.9g}, "rounds": {rounds:.9g}, '
+        f'"final_loss": {final_loss:.9g}, "witness": [{witness_json}], '
+        f'"ref_final_loss": null, "max_abs_pred_err": null, '
+        f'"mean_abs_pred_err": null, "loc": null, "party": {mpc.pid}, '
+        f'"parties": {NUMBER_OF_PARTIES}, "mode": "{mode}", '
+        f'"skipped": false, "note": "{note}"{RB}')
+
+    with open(_path(mpc), "a") as f:
+        f.write(line + "\n")
+
+    print(f"CP{mpc.pid}:\t{FRAMEWORK}\t{model_name}\tn={n}\t"
+          f"{median / float(EPOCHS):.4f}s/epoch\t{bytes_sent:.0f}B\tloss={final_loss:.6g}")
+
+
+def _collect_witness(predictions, indices: list[int]) -> list[float]:
+    """ The selected rows of the prediction matrix, flattened row-major. """
+    out = []
+    for i in indices:
+        for v in predictions[i]:
+            out.append(v)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Timing.
+#
+# Each repetition builds and trains a fresh network: training mutates the
+# weights, so reusing one would time the second pair of epochs against the
+# first and would make the accuracy witness depend on the repetition count.
+# Construction and weight injection sit outside the timed region -- they are
+# setup, and the other frameworks do not pay for them inside their loops
+# either.
+# ---------------------------------------------------------------------------
+
+def _measure(mpc, X, y, weights, build, train):
+    """ (times, bytes per run, rounds per run, trained model), warmup included.
+
+    The warmup repetition is inside whatever dealer scope the caller has
+    entered, so in the online pass it absorbs the one-time stall the receiving
+    party takes while the detached dealer runs ahead.
+    """
+    for _ in range(WARMUP_REPS):
+        model = inject(mpc, build(mpc, X), weights)
+        train(mpc, model, X, y)
+
+    times = []
+    bytes_start = mpc.stats.bytes_sent
+    rounds_start = mpc.stats.rounds
+    for _ in range(REPS):
+        model = inject(mpc, build(mpc, X), weights)
+        start = time.time()
+        train(mpc, model, X, y)
+        times.append(time.time() - start)
+
+    return (times,
+            float(mpc.stats.bytes_sent - bytes_start) / REPS,
+            float(mpc.stats.rounds - rounds_start) / REPS,
+            model)
+
+
+def _bench(mpc, model_name: str, X, y, weights, build, train, predict,
+           n: int, mode: str, detached: bool):
+    if detached:
+        # Per cell rather than per pass: see the module docstring. The
+        # dealer's buffer is released when this scope exits.
+        with mpc.detach_dealer():
+            times, bytes_per_run, rounds_per_run, model = _measure(
+                mpc, X, y, weights, build, train)
+    else:
+        times, bytes_per_run, rounds_per_run, model = _measure(
+            mpc, X, y, weights, build, train)
+
+    final_loss = model.get_loss(mpc, X, y).reveal(mpc).sum()
+    predictions = predict(mpc, model, X).reveal(mpc).tolist()
+    witness = _collect_witness(predictions, witness_indices(n))
+
+    _emit(mpc, model_name, n, times, bytes_per_run, rounds_per_run,
+          final_loss, witness, mode,
+          f"{EPOCHS} epochs, bgd + nesterov, mse")
+
+
+def _bench_all(mpc, mode: str, detached: bool):
+    """
+    Runs every cell. In the online pass, cells above the per-model caps are
+    recorded as skipped instead of run -- a detached dealer would buffer more
+    than the transport sustains.
+    """
+    siren_w = siren_weights()
+    for n in SIREN_SIZES:
+        if detached and n > SIREN_ONLINE_MAX_N:
+            _emit_skipped(mpc, "siren", n, mode,
+                          "detached dealer would buffer more than the transport sustains")
+            continue
+        coords, target = siren_data(n)
+        X = Sharetensor.enc(mpc, array(coords))
+        y = Sharetensor.enc(mpc, array(target))
+        _bench(mpc, "siren", X, y, siren_w,
+               siren_model, siren_train, siren_predict, n, mode, detached)
+
+    mlp_w = mlp_weights()
+    for n in MLP_SIZES:
+        if detached and n > MLP_ONLINE_MAX_N:
+            _emit_skipped(mpc, "mlp", n, mode,
+                          "detached dealer would buffer more than the transport sustains")
+            continue
+        features, labels = mlp_data(n)
+        X = Sharetensor.enc(mpc, array(features))
+        y = Sharetensor.enc(mpc, array(labels))
+        _bench(mpc, "mlp", X, y, mlp_w,
+               mlp_model, mlp_train, mlp_predict, n, mode, detached)
+
+
+@main
+def bench(mpc):
+    _init_output(mpc)
+
+    # The ring is what Decor's protocols are designed for: the reduced-ring
+    # comparison behind ReLU needs a power-of-two modulus, and the sine
+    # activation's mask arithmetic is cheaper there.
+    with mpc.default_modulus(MPC_RING_SIZE):
+        _bench_all(mpc, "end_to_end", False)
+
+        mpc.randomness.reset_global_seed()
+        mpc.comms.sync_parties()
+
+        # online: the dealer buffers its sends and flushes on scope exit, so
+        # offline randomness generation leaves the critical path.
+        _bench_all(mpc, "online", True)
+
+    print(f"CP{mpc.pid}:\twrote {_path(mpc)}")
+
+
+if __name__ == "__main__":
+    bench()

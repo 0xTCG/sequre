@@ -1,0 +1,361 @@
+""" Sequre column of the core-operations benchmark.
+
+Only Sequre's own primitives appear here -- `Sharetensor.enc`, `+`, `*`,
+`.dot`, `.reveal` -- with the `@sequre` IR pass supplying the Beaver
+partitioning and truncation for the secret-by-secret operations, exactly as an
+application would get them. There is no Decor path in this suite: Decor's
+subject is nonlinear functions, and this benchmark deliberately has none.
+
+Inputs, intervals, sizes and repetition counts mirror ../spec.py. They are
+echoed into the output header and ../report.py refuses to build a table if the
+two disagree.
+
+Every cell is measured twice, and both rows are emitted:
+
+    end_to_end  the dealer's randomness generation is inline, on the critical
+                path -- comparable to CrypTen's TFP provider
+    online      the dealer is detached (mpc.detach_dealer()), so only the
+                compute parties' work is timed -- comparable to a deployment
+                with a genuine offline phase
+
+Results land in ../results/sequre_w{MPC_INT_SIZE}_CP{pid}.jsonl, one JSON
+object per line, in the same schema the Python runners emit. The share
+width is part of the framework id (`sequre-192`), because it is not a free
+parameter: MPC_INT_SIZE also fixes MPC_NBIT_V, the statistical security
+parameter, at 64 bits for 192 and 28 bits for 128.
+
+Run:
+    sequre run -release benchmarks/core_ops/sequre/bench_core.codon --local --use-ring
+
+    # every width, side by side in one report
+    benchmarks/core_ops/sequre/run_widths.sh 64 128 192
+"""
+
+import time
+
+from sequre import main, sequre
+from sequre.constants import (
+    MPC_RING_SIZE, MPC_NBIT_F, MPC_NBIT_K, MPC_NBIT_V, NUMBER_OF_PARTIES)
+from sequre.settings import MPC_INT_SIZE
+from sequre.stdlib.numpy.create import array
+from sequre.types.sharetensor import Sharetensor
+
+
+# ---------------------------------------------------------------------------
+# Mirrors ../spec.py. Keep in sync -- report.py cross-checks the emitted header.
+# ---------------------------------------------------------------------------
+SIZES = [8, 128, 1024, 8192]
+REPS = 5
+WARMUP_REPS = 1
+SPEC_VERSION = "1"
+
+UNIT_INTERVAL = (-1.0, 1.0)
+POLY_INTERVAL = (-2.0, 2.0)
+POLY_COEFFS = [1.0, 2.0, 3.0, 4.0]
+PUBLIC_SCALAR = 3.0
+
+# Relative error is meaningless where the true value is ~0; matches
+# common.REL_ERR_FLOOR on the Python side.
+REL_ERR_FLOOR = 1e-6
+
+RESULTS_DIR = "benchmarks/core_ops/results"
+
+WIDTH_TAG = str(MPC_INT_SIZE)
+SEQURE_ID = "sequre-" + WIDTH_TAG
+
+# Codon's f-strings have no `{{` escape, so JSON braces are spliced in.
+LB = "{"
+RB = "}"
+
+
+def _path(mpc) -> str:
+    return f"{RESULTS_DIR}/sequre_w{WIDTH_TAG}_CP{mpc.pid}.jsonl"
+
+
+def _init_output(mpc):
+    sizes = ", ".join([str(s) for s in SIZES])
+    u = f'[{UNIT_INTERVAL[0]:.17g}, {UNIT_INTERVAL[1]:.17g}]'
+    intervals = (f'"share": {u}, "add": {u}, "mul_public": {u}, '
+                 f'"mul": {u}, "dot": {u}, '
+                 f'"polynomial": [{POLY_INTERVAL[0]:.17g}, {POLY_INTERVAL[1]:.17g}], '
+                 f'"open": {u}')
+    with open(_path(mpc), "w") as f:
+        f.write(
+            f'{LB}"_meta": {LB}"spec_version": "{SPEC_VERSION}", '
+            f'"sizes": [{sizes}], "reps": {REPS}, '
+            f'"intervals": {LB}{intervals}{RB}, '
+            f'"public_scalar": {PUBLIC_SCALAR:.17g}, '
+            f'"framework": "sequre", "parties": {NUMBER_OF_PARTIES}, '
+            f'"mpc_int_size": {MPC_INT_SIZE}, "nbit_k": {MPC_NBIT_K}, '
+            f'"nbit_f": {MPC_NBIT_F}, "nbit_v": {MPC_NBIT_V}, '
+            f'"modulus": "ring_2^{MPC_INT_SIZE - 1}"{RB}{RB}\n')
+
+
+def _linspace(a: float, b: float, n: int) -> list[float]:
+    """ Mirrors spec.inputs: a + i * (b - a) / (n - 1). """
+    if n == 1:
+        return [(a + b) / 2.0]
+    step = (b - a) / float(n - 1)
+    return [a + step * float(i) for i in range(n)]
+
+
+def _stat(values: list[float]) -> tuple[float, float, float]:
+    """ (median, min, mean) """
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2], ordered[0], sum(ordered) / len(ordered)
+
+
+def _errors(got: list[float], expected: list[float]) -> tuple[float, float, float]:
+    """ (max abs, mean abs, max relative) """
+    count = len(expected)
+    max_abs = 0.0
+    total_abs = 0.0
+    max_rel = -1.0
+    for i in range(count):
+        diff = abs(got[i] - expected[i])
+        total_abs += diff
+        if diff > max_abs:
+            max_abs = diff
+        if abs(expected[i]) > REL_ERR_FLOOR:
+            rel = diff / abs(expected[i])
+            if rel > max_rel:
+                max_rel = rel
+    mean_abs = total_abs / count if count else 0.0
+    return max_abs, mean_abs, max_rel
+
+
+def _emit(
+        mpc, op: str, n: int, times: list[float],
+        bytes_sent: float, rounds: float,
+        got: list[float], expected: list[float],
+        mode: str, note: str):
+    median, minimum, mean = _stat(times)
+    max_abs, mean_abs, max_rel = _errors(got, expected)
+    # -1 is the sentinel for "no entry had |truth| above the floor"; report.py
+    # renders it the same way it renders a Python NaN.
+    rel_json = "null" if max_rel < 0.0 else f"{max_rel:.9g}"
+
+    # The local ops on small vectors finish inside one tick of time.time(), so
+    # the median comes back as exactly zero. Reporting that as 0 ms and
+    # infinite throughput would be worse than reporting nothing, so the timing
+    # fields go out as null and the report renders them as "--". The
+    # correctness fields are unaffected and still emitted.
+    below_resolution = median <= 0.0
+    median_json = "null" if below_resolution else f"{median:.9g}"
+    min_json = "null" if below_resolution else f"{minimum:.9g}"
+    mean_json = "null" if below_resolution else f"{mean:.9g}"
+    throughput_json = "null" if below_resolution else f"{float(n) / median:.9g}"
+    if below_resolution:
+        note = note + "; below time.time() resolution"
+
+    line = (
+        f'{LB}"framework": "{SEQURE_ID}", "op": "{op}", "n": {n}, '
+        f'"reps": {len(times)}, "median_s": {median_json}, "min_s": {min_json}, '
+        f'"mean_s": {mean_json}, "throughput_eps": {throughput_json}, '
+        f'"bytes_sent": {bytes_sent:.9g}, "rounds": {rounds:.9g}, '
+        f'"max_abs_err": {max_abs:.9g}, "mean_abs_err": {mean_abs:.9g}, '
+        f'"max_rel_err": {rel_json}, "party": {mpc.pid}, '
+        f'"parties": {NUMBER_OF_PARTIES}, "mode": "{mode}", '
+        f'"skipped": false, "note": "{note}"{RB}')
+
+    with open(_path(mpc), "a") as f:
+        f.write(line + "\n")
+
+    print(f"CP{mpc.pid}:\t{op}\tn={n}\t{mode}\t"
+          f"{median:.6f}s\t{bytes_sent:.0f}B\tmax_abs_err={max_abs:.3e}")
+
+
+# ---------------------------------------------------------------------------
+# The operations.
+#
+# The secret-by-secret ones go through the @sequre IR pass, which is what
+# inserts the Beaver partitioning and the fixed-point truncation. Calling the
+# operator outside the pass raises NotImplementedError by design, so this is
+# not a benchmark-specific detour -- it is how Sequre code is written.
+# ---------------------------------------------------------------------------
+
+@sequre
+def _add(mpc, x, y):
+    return x + y
+
+
+@sequre
+def _mul_public(mpc, x, c: float):
+    return x * c
+
+
+@sequre
+def _mul(mpc, x, y):
+    return x * y
+
+
+@sequre
+def _dot(mpc, x, y):
+    """ Inner product. `Sharetensor.dot` annotates its operand as a bare
+    `Sharetensor`, which unifies against the scalar instantiation outside the
+    IR pass; inside it the call is routed through `InternalMPC.dot`, which is
+    how the example in examples/addmul.codon calls it too. """
+    return x.dot(mpc, y)
+
+
+@sequre
+def _polynomial(mpc, x):
+    """ Horner over POLY_COEFFS: ((4x + 3)x + 2)x + 1. """
+    return ((x * POLY_COEFFS[3] + POLY_COEFFS[2]) * x + POLY_COEFFS[1]) * x + POLY_COEFFS[0]
+
+
+def _truth_add(a: list[float], b: list[float]) -> list[float]:
+    return [a[i] + b[i] for i in range(len(a))]
+
+
+def _truth_mul(a: list[float], b: list[float]) -> list[float]:
+    return [a[i] * b[i] for i in range(len(a))]
+
+
+def _truth_mul_public(a: list[float]) -> list[float]:
+    return [v * PUBLIC_SCALAR for v in a]
+
+
+def _truth_dot(a: list[float], b: list[float]) -> list[float]:
+    acc = 0.0
+    for i in range(len(a)):
+        acc += a[i] * b[i]
+    return [acc]
+
+
+def _truth_poly(a: list[float]) -> list[float]:
+    out = []
+    for v in a:
+        acc = 0.0
+        p = 1.0
+        for c in POLY_COEFFS:
+            acc += c * p
+            p *= v
+        out.append(acc)
+    return out
+
+
+def _as_list(revealed) -> list[float]:
+    """ `dot` reveals to a scalar; every other op reveals to an ndarray. """
+    if isinstance(revealed, float):
+        return [revealed]
+    return revealed.tolist()
+
+
+def _bench(mpc, op: str, n: int, mode: str, call,
+           expected: list[float], note: str):
+    """ Times one cell.
+
+    Every secret-by-secret operation consumes fresh Beaver randomness, and
+    Sequre caches the partitioning on the input tensor, so without an explicit
+    refresh each repetition after the first would reuse one mask -- which is
+    both a leak and a free speedup. The `get_partitions(force=True)` calls in
+    each `call` are therefore inside the timed region, and match CrypTen's
+    per-call triple generation.
+    """
+    for _ in range(WARMUP_REPS):
+        result = call()
+
+    times = []
+    bytes_start = mpc.stats.bytes_sent
+    rounds_start = mpc.stats.rounds
+    for _ in range(REPS):
+        start = time.time()
+        result = call()
+        times.append(time.time() - start)
+    bytes_per_call = float(mpc.stats.bytes_sent - bytes_start) / REPS
+    rounds_per_call = float(mpc.stats.rounds - rounds_start) / REPS
+
+    _emit(mpc, op, n, times, bytes_per_call, rounds_per_call,
+          _as_list(result.reveal(mpc)), expected, mode, note)
+
+
+# `dot` collapses a vector to a scalar, so its Sharetensor is a different
+# concrete type from every other op's. Codon needs one return type per closure,
+# which is why each op gets its own rather than sharing a dispatch on `op`.
+def _bench_all(mpc, mode: str):
+    for n in SIZES:
+        a = _linspace(UNIT_INTERVAL[0], UNIT_INTERVAL[1], n)
+        b = list(reversed(a))
+        p = _linspace(POLY_INTERVAL[0], POLY_INTERVAL[1], n)
+
+        sa = Sharetensor.enc(mpc, array(a))
+        sb = Sharetensor.enc(mpc, array(b))
+        sp = Sharetensor.enc(mpc, array(p))
+
+        def share_call():
+            return Sharetensor.enc(mpc, array(a))
+        _bench(mpc, "share", n, mode, share_call, a, "Sharetensor.enc")
+
+        def open_call():
+            sa.reveal(mpc)
+            return sa
+        _bench(mpc, "open", n, mode, open_call, a, "Sharetensor.reveal")
+
+        def add_call():
+            return _add(mpc, sa, sb)
+        _bench(mpc, "add", n, mode, add_call, _truth_add(a, b), "Sharetensor +")
+
+        def mul_public_call():
+            sa.get_partitions(mpc, force=True)
+            return _mul_public(mpc, sa, PUBLIC_SCALAR)
+        _bench(mpc, "mul_public", n, mode, mul_public_call, _truth_mul_public(a),
+               f"Sharetensor * {PUBLIC_SCALAR:.4g}")
+
+        def mul_call():
+            sa.get_partitions(mpc, force=True)
+            sb.get_partitions(mpc, force=True)
+            return _mul(mpc, sa, sb)
+        _bench(mpc, "mul", n, mode, mul_call, _truth_mul(a, b), "Sharetensor *")
+
+        def dot_call():
+            sa.get_partitions(mpc, force=True)
+            sb.get_partitions(mpc, force=True)
+            return _dot(mpc, sa, sb)
+        _bench(mpc, "dot", n, mode, dot_call, _truth_dot(a, b), "Sharetensor.dot")
+
+        def poly_call():
+            sp.get_partitions(mpc, force=True)
+            return _polynomial(mpc, sp)
+        _bench(mpc, "polynomial", n, mode, poly_call, _truth_poly(p),
+               "Horner, 3 secret multiplications")
+
+
+def _prewarm(mpc):
+    """ Absorbs the one-time detach_dealer entry stall outside any timed region. """
+    values = _linspace(UNIT_INTERVAL[0], UNIT_INTERVAL[1], SIZES[-1])
+    stensor = Sharetensor.enc(mpc, array(values))
+    for _ in range(2):
+        stensor.get_partitions(mpc, force=True)
+        _mul(mpc, stensor, stensor)
+
+
+@main
+def bench(mpc):
+    _init_output(mpc)
+
+    # The ring is the setting Sequre is deployed in and the one the other
+    # runners' power-of-two fixed point corresponds to.
+    with mpc.default_modulus(MPC_RING_SIZE):
+        # end_to_end: the dealer's randomness generation runs inline, on the
+        # critical path. The figure comparable to CrypTen's TFP provider, which
+        # also produces its correlated randomness inside the timed call.
+        _bench_all(mpc, "end_to_end")
+
+        mpc.randomness.reset_global_seed()
+        mpc.comms.sync_parties()
+
+        # online: the dealer buffers its sends and flushes on scope exit, so
+        # offline randomness generation leaves the critical path. This is the
+        # figure for a deployment with a real offline phase. Entering the block
+        # costs the receiving party a one-time stall while the dealer runs
+        # ahead; _prewarm absorbs it so it lands outside every timed region.
+        with mpc.detach_dealer():
+            _prewarm(mpc)
+            _bench_all(mpc, "online")
+
+    print(f"CP{mpc.pid}:\twrote {_path(mpc)}")
+
+
+if __name__ == "__main__":
+    bench()

@@ -18,6 +18,16 @@ report generator, and a README stating what is and is not comparable.
 | Benchmark | What it compares |
 |---|---|
 | [`activations/`](activations/) | `exp`, `sigmoid`, `tanh`, `relu` in Sequre+Decor, CrypTen and MPyC — latency, throughput, communication and accuracy |
+| [`neural_nets/`](neural_nets/) | Secure training of SIREN and SecureML's MLP in Sequre, CrypTen and MPyC — time per epoch, communication, fidelity against a float64 reference, and lines of model code |
+| [`core_ops/`](core_ops/) | Sharing, add, public multiply, secret multiply, inner product, a fixed polynomial and reconstruction in Sequre, CrypTen and MPyC — latency, throughput, communication and accuracy |
+
+The three differ in how far up the stack they reach, and that is deliberate.
+`activations/` and `neural_nets/` measure functions, so their numbers mix
+protocol cost with the quality of each framework's approximation library — a
+framework can lose them by having a slow multiply or a wasteful sigmoid, and
+the table cannot say which. `core_ops/` measures the layer underneath, the
+intersection every arithmetic MPC framework implements itself, which is what
+separates the two.
 
 ## Adding one
 
@@ -40,3 +50,8 @@ Follow the shape of `activations/`:
 Record a correctness witness (error against a plaintext reference) in the same
 row as every timing. A speedup that breaks the math should be visible without
 having to look anywhere else.
+
+Where a framework cannot express the workload at all, record that as a skipped
+row with the reason, not as a missing cell — `neural_nets/` has MPyC skipping
+SIREN because MPyC has no secure sine, and that absence is one of the
+benchmark's results.

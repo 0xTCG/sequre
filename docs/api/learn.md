@@ -257,15 +257,33 @@ Input[type(X)](size)
 A fully-connected layer with configurable activation and weight initialization.
 
 ```python
-Dense[type(X)](activation, size, kernel_initializer="uniform", bias_initializer="uniform")
+Dense[type(X)](activation, size, kernel_initializer="uniform", bias_initializer="uniform",
+               kernel_interval=(0.0, 1.0), kernel_scale=1.0, pre_act_scale=1.0)
 ```
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `activation` | `str` | — | Activation function: `"relu"` or `"linear"` |
+| `activation` | `str` | — | Activation function; see the table below |
 | `size` | `int` | — | Number of neurons |
 | `kernel_initializer` | `str` | `"uniform"` | Weight initializer: `"uniform"`, `"normal"`, `"zeros"`, or `"ones"` |
 | `bias_initializer` | `str` | `"uniform"` | Bias initializer (same options) |
+| `kernel_interval` | `(float, float)` | `(0.0, 1.0)` | Remaps the initializer's draw onto this interval |
+| `kernel_scale` | `float` | `1.0` | Scales the weights after the remap |
+| `pre_act_scale` | `float` | `1.0` | The layer computes `f(s · (xW + b))`; also multiplies the gradient |
+
+`kernel_interval` and `kernel_scale` express a fan-in-dependent initialization,
+which the fixed initializer distributions cannot. `pre_act_scale` is
+architectural rather than an initialization detail — it is SIREN's `omega_0`,
+and folding it into the weights would rescale the very gradient it exists to
+boost. Both default to the identity and cost nothing when unused.
+
+```python
+# A SIREN sine layer: uniform(-sqrt(6/n)/omega, +sqrt(6/n)/omega), sin(omega · z)
+Dense[type(X)]("sin", 64, "uniform", "uniform",
+               kernel_interval=(-1.0, 1.0),
+               kernel_scale=math.sqrt(6.0 / 64) / 30.0,
+               pre_act_scale=30.0)
+```
 
 Weight updates use **Nesterov accelerated gradient** with the `momentum` parameter passed to `fit`.
 
@@ -273,10 +291,23 @@ Weight updates use **Nesterov accelerated gradient** with the `momentum` paramet
 
 _Defined in `stdlib/sequre/stdlib/learn/neural_net/activations.codon`_
 
+Every activation Decor implements is available to a layer. The exact ones —
+`sin`, `cos`, `tanh`, `sigmoid`, `exp` and the rest of the addition-theorem
+family — cost a constant number of rounds and carry no approximation error.
+
 | Activation | Function | Derivative |
 |---|---|---|
-| `"relu"` | $\text{ReLU}(x) = x \cdot \mathbf{1}[x > 0]$ | $\mathbf{1}[x > 0]$ |
-| `"linear"` | $f(x) = x$ | $1$ |
+| `"relu"` | $x \cdot \mathbf{1}[x > 0]$ | $\mathbf{1}[x > 0]$ |
+| `"linear"` | $x$ | $1$ |
+| `"sin"` | $\sin x$ | $\cos x$ |
+| `"cos"` | $\cos x$ | $-\sin x$ |
+| `"tanh"` | $\tanh x$ | $1 - \tanh^2 x$ |
+| `"sigmoid"` | $1/(1 + e^{-x})$ | $\sigma(x)(1 - \sigma(x))$ |
+| `"exp"` | $e^x$ | $e^x$ |
+
+`leaky_relu`, `hardtanh`, `relu6`, `gelu`, `silu`, `asigmoid`, `tan`, `cot`,
+`sinh`, `cosh` and `erf` are also dispatched; `softmax` has no elementwise
+derivative and cannot be used as a hidden-layer activation.
 
 ### Losses
 
@@ -285,6 +316,7 @@ _Defined in `stdlib/sequre/stdlib/learn/neural_net/loss.codon`_
 | Loss | Function | Derivative |
 |---|---|---|
 | `"hinge"` | $\frac{1}{n}\sum \max(0,\; 1 - y \hat{y})$ | $\frac{1}{n}(-y \cdot \mathbf{1}[1 - y\hat{y} > 0])$ |
+| `"mse"` | $\frac{1}{n}\sum \frac{1}{2}(y - \hat{y})^2$ | $\frac{1}{n}(\hat{y} - y)$ |
 
 ### Examples
 
