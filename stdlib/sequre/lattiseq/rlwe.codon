@@ -8,11 +8,9 @@ import prg
 
 import ring, ringqp, utils
 
-from copy import copy
-
 from pickler import pickle, unpickle
 
-from sequre.types.builtin import u64xN
+from sequre.types.builtin import *
 from sequre.utils.utils import zeros_vec
 from sequre.constants import (
     lattiseq_uint,
@@ -25,6 +23,24 @@ from sequre.constants import (
     LATTISEQ_MAX_MODULI_SIZE,
     LATTISEQ_GALOIS_GEN,
     LATTISEQ_CONJUGATE_INVARIANT_RING_ENUM)
+
+
+# product_bitlen returns the size in bits of the product of the moduli, whatever its size.
+# The product is kept as base-2^64 digits, least significant first, so it never wraps.
+def product_bitlen(moduli: list[u64]) -> int:
+    digits = [u64(1)]
+
+    for m in moduli:
+        carry = u64(0)
+        for i in range(len(digits)):
+            hi, lo = digits[i].mul_overflow_u64(m)
+            lo_sum = lo + carry
+            if lo_sum < lo: hi += u64(1)
+            digits[i] = lo_sum
+            carry = hi
+        if carry != u64(0): digits.append(carry)
+
+    return 64 * (len(digits) - 1) + int(digits[-1].bitlen())
 
 
 class Parameters:
@@ -180,7 +196,7 @@ class Parameters:
         c = 0
 
         for qi in self.q().slice_reference(0, levelq + 1): c = max(c, int(qi.bitlen()))
-        for pi in self.q().slice_reference(0, levelp + 1): c = max(c, int(pi.bitlen()))
+        for pi in self.p().slice_reference(0, levelp + 1): c = max(c, int(pi.bitlen()))
 
         return c
     
@@ -194,11 +210,9 @@ class Parameters:
     
     # LogQP returns the size of the extended modulus QP in bits
     def log_qp(self) -> int:
-        tmp = lattiseq_uint(1)
-        for qi in self.qi: tmp *= qi.ext_to_lattiseq_uint()
-        for pi in self.pi: tmp *= pi.ext_to_lattiseq_uint()
-
-        return int(tmp.bitlen())
+        moduli = self.q()
+        moduli.extend(self.p())
+        return product_bitlen(moduli)
 
     # qi_overflow_margin returns floor(2^64 / max(Qi)), i.e. the number of times elements of Z_max{Qi} can
     # be added together before overflowing 2^64.
@@ -1546,6 +1560,7 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers]):
         el = gadget_ct.value
 
         # Key switching with CRT decomposition for the Qi
+        # The loops over the moduli are sequential: they all go through the one buffer _mm_cw_ntt
         reduce = 0
         for i in range(decomp_rns):
             for j in range(decomp_pw2):
@@ -1553,23 +1568,19 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers]):
                 ring._mm_mask_vec(cx_inv_ntt._mm_coeffs[i], _mm_cw, _mm_w, _mm_mask)
 
                 if i == 0 and j == 0:
-                    @par(num_threads=NUM_THREADS)
                     for u in range(level_q + 1):
                         ring_q._mm_ntt_single_lazy(u, _mm_cw, _mm_cw_ntt)
                         ring._mm_mul_coeffs_montgomery_constant_vec(el[i][j].value[0].q._mm_coeffs[u], _mm_cw_ntt, p0_qp.q._mm_coeffs[u], ring_q._mm_modulus[u], ring_q._mm_mred_params[u])
                         ring._mm_mul_coeffs_montgomery_constant_vec(el[i][j].value[1].q._mm_coeffs[u], _mm_cw_ntt, p1_qp.q._mm_coeffs[u], ring_q._mm_modulus[u], ring_q._mm_mred_params[u])
-                    @par(num_threads=NUM_THREADS)
                     for u in range(level_p + 1):
                         ring_p._mm_ntt_single_lazy(u, _mm_cw, _mm_cw_ntt)
                         ring._mm_mul_coeffs_montgomery_constant_vec(el[i][j].value[0].p._mm_coeffs[u], _mm_cw_ntt, p0_qp.p._mm_coeffs[u], ring_p._mm_modulus[u], ring_p._mm_mred_params[u])
                         ring._mm_mul_coeffs_montgomery_constant_vec(el[i][j].value[1].p._mm_coeffs[u], _mm_cw_ntt, p1_qp.p._mm_coeffs[u], ring_p._mm_modulus[u], ring_p._mm_mred_params[u])
                 else:
-                    @par(num_threads=NUM_THREADS)
                     for u in range(level_q + 1):
                         ring_q._mm_ntt_single_lazy(u, _mm_cw, _mm_cw_ntt)
                         ring._mm_mul_coeffs_montgomery_constant_and_add_no_mod_vec(el[i][j].value[0].q._mm_coeffs[u], _mm_cw_ntt, p0_qp.q._mm_coeffs[u], ring_q._mm_modulus[u], ring_q._mm_mred_params[u])
                         ring._mm_mul_coeffs_montgomery_constant_and_add_no_mod_vec(el[i][j].value[1].q._mm_coeffs[u], _mm_cw_ntt, p1_qp.q._mm_coeffs[u], ring_q._mm_modulus[u], ring_q._mm_mred_params[u])
-                    @par(num_threads=NUM_THREADS)
                     for u in range(level_p + 1):
                         ring_p._mm_ntt_single_lazy(u, _mm_cw, _mm_cw_ntt)
                         ring._mm_mul_coeffs_montgomery_constant_and_add_no_mod_vec(el[i][j].value[0].p._mm_coeffs[u], _mm_cw_ntt, p0_qp.p._mm_coeffs[u], ring_p._mm_modulus[u], ring_p._mm_mred_params[u])
@@ -1682,7 +1693,10 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers]):
             raise ValueError("cannot apply Automorphism: input and output Ciphertext must be of degree 1")
 
         if gal_el == 1:
-            if ct_out != ct_in: ct_out = ct_in.copy()
+            # ct_in and ct_out may be wrappers around the same list of polynomials (in-place call).
+            # The copies are stored in the list ct_out shares with its owner, so that they reach it.
+            if ct_out.value is not ct_in.value:
+                for i in range(len(ct_in.value)): ct_out.value[i] = ct_in.value[i].copy()
             return
 
         rtk, generated = self.rtks.get_rotation_key(gal_el)

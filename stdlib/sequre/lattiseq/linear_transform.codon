@@ -1,0 +1,549 @@
+"""
+Ported from https://github.com/tuneinsight/lattigo/blob/v4.0.0/ckks/linear_transform.go
+
+Linear transformations of the slots of a ciphertext: a plaintext matrix, stored by its non-zero
+diagonals, is multiplied with the encrypted vector, either naively (one hoisted rotation per diagonal)
+or with the baby-step giant-step algorithm (double hoisting).
+
+Not ported: Average, InnerSum(Log) and Replicate(Log). The bootstrapping does not use them.
+Trace and RotateHoisted are in evaluator.codon.
+
+Importing this module adds the evaluation methods to ckks.Evaluator.
+"""
+import ring, ringqp, rlwe, ckks, keyswitch, evaluator
+
+from ckks import Evaluator, Ciphertext, Parameters, EncoderComplex128, new_ciphertext
+
+from sequre.types.builtin import *
+
+
+# LinearTransform is a type for linear transformations on ciphertexts.
+# It stores a plaintext matrix diagonalized in diagonal form and
+# can be evaluated on a ciphertext by using the evaluator.linear_transform method.
+class LinearTransform:
+    log_slots: int                # Log of the number of slots of the plaintext (needed to compute the appropriate rotation keys)
+    n1: int                       # n1 is the number of inner loops of the baby-step giant-step algorithm used in the evaluation (if n1 == 0, BSGS is not used).
+    level: int                    # level is the level at which the matrix is encoded (can be circuit dependent)
+    scale: float                  # scale is the scale at which the matrix is encoded (can be circuit dependent)
+    vec: dict[int, ringqp.Poly]   # vec is the matrix, in diagonal form, where each entry of vec is an indexed non-zero diagonal.
+
+    # rotations returns the list of rotations needed for the evaluation
+    # of the linear transform.
+    def rotations(self) -> list[int]:
+        slots = 1 << self.log_slots
+
+        rot_index = set[int]()
+
+        n1 = self.n1
+
+        if n1 == 0:
+            for j in self.vec:
+                rot_index.add(j)
+        else:
+            for j in self.vec:
+                rot_index.add(((j // n1) * n1) & (slots - 1))
+                rot_index.add(j & (n1 - 1))
+
+        return [j for j in rot_index]
+
+    # encode encodes on a pre-allocated LinearTransform the linear transforms' matrix in diagonal form `value`.
+    # value can be either dict[int, list[complex]] or dict[int, list[float]].
+    # User must ensure that 1 <= len(list[complex]\list[float]) <= 2^log_slots < 2^logn.
+    # It can then be evaluated on a ciphertext using evaluator.linear_transform.
+    # Evaluation will use the naive approach (single hoisting and no baby-step giant-step) if the LinearTransform
+    # was allocated without a BSGS ratio, which is faster if there is only a few non-zero diagonals but uses more keys.
+    def encode(self, encoder: EncoderComplex128, value: dict[int, list[T]], scale: float, T: type):
+        slots = 1 << self.log_slots
+        n1 = self.n1
+
+        if n1 == 0:
+            for i in value:
+                idx = i
+                if idx < 0:
+                    idx += slots
+
+                if idx not in self.vec:
+                    raise ValueError("cannot Encode: error encoding on LinearTransform: input does not match the same non-zero diagonals")
+
+                encoder.embed(value[i], self.log_slots, scale, True, self.vec[idx])
+        else:
+            index, _, _ = bsgs_index(list(value.keys()), slots, n1)
+
+            values = [T() for _ in range(slots)]
+
+            for j in index:
+                rot = -j & (slots - 1)
+
+                for i in index[j]:
+                    # manages inputs that have rotation between 0 and slots-1 or between -slots/2 and slots/2-1
+                    v = value[j + i] if (j + i) in value else value[j + i - slots]
+
+                    if (j + i) not in self.vec:
+                        raise ValueError("cannot Encode: error encoding on LinearTransform BSGS: input does not match the same non-zero diagonals")
+
+                    copy_rot_interface(values, v, rot)
+
+                    encoder.embed(values, self.log_slots, scale, True, self.vec[j + i])
+
+        self.scale = scale
+
+
+# new_linear_transform allocates a new LinearTransform with zero plaintexts at the specified level.
+# If bsgs_ratio == 0, the LinearTransform is set to not use the BSGS approach.
+# Method will raise ValueError if bsgs_ratio < 0.
+def new_linear_transform(params: Parameters, non_zero_diags: list[int], level: int, log_slots: int, bsgs_ratio: float) -> LinearTransform:
+    vec = dict[int, ringqp.Poly]()
+    slots = 1 << log_slots
+    level_q = level
+    level_p = params.p_count() - 1
+    n1 = 0
+    if bsgs_ratio == 0:
+        for i in non_zero_diags:
+            idx = i
+            if idx < 0:
+                idx += slots
+            vec[idx] = params.ring_qp().new_poly_lvl(level_q, level_p)
+    elif bsgs_ratio > 0:
+        n1 = find_best_bsgs_split(non_zero_diags, slots, bsgs_ratio)
+        index, _, _ = bsgs_index(non_zero_diags, slots, n1)
+        for j in index:
+            for i in index[j]:
+                vec[j + i] = params.ring_qp().new_poly_lvl(level_q, level_p)
+    else:
+        raise ValueError("BSGS ratio cannot be negative")
+
+    return LinearTransform(log_slots=log_slots, n1=n1, level=level, scale=0.0, vec=vec)
+
+
+# gen_linear_transform allocates and encode a new LinearTransform struct from the linear transforms' matrix in diagonal form `value`.
+# value can be either dict[int, list[complex]] or dict[int, list[float]].
+# User must ensure that 1 <= len(list[complex]\list[float]) <= 2^log_slots < 2^logn.
+# It can then be evaluated on a ciphertext using evaluator.linear_transform.
+# Evaluation will use the naive approach (single hoisting and no baby-step giant-step).
+# Faster if there is only a few non-zero diagonals but uses more keys.
+def gen_linear_transform(encoder: EncoderComplex128, value: dict[int, list[T]], level: int, scale: float, log_slots: int, T: type) -> LinearTransform:
+    params = encoder.params
+    vec = dict[int, ringqp.Poly]()
+    slots = 1 << log_slots
+    level_q = level
+    level_p = params.p_count() - 1
+    for i in value:
+        idx = i
+        if idx < 0:
+            idx += slots
+        vec[idx] = params.ring_qp().new_poly_lvl(level_q, level_p)
+        encoder.embed(value[i], log_slots, scale, True, vec[idx])
+
+    return LinearTransform(log_slots=log_slots, n1=0, level=level, scale=scale, vec=vec)
+
+
+# gen_linear_transform_bsgs allocates and encodes a new LinearTransform struct from the linear transforms' matrix in diagonal form `value` for evaluation with a baby-step giant-step approach.
+# value can be either dict[int, list[complex]] or dict[int, list[float]].
+# User must ensure that 1 <= len(list[complex]\list[float]) <= 2^log_slots < 2^logn.
+# LinearTransform types can be be evaluated on a ciphertext using evaluator.linear_transform.
+# Evaluation will use the optimized approach (double hoisting and baby-step giant-step).
+# Faster if there is more than a few non-zero diagonals.
+# bsgs_ratio is the maximum ratio between the inner and outer loop of the baby-step giant-step algorithm used in evaluator.linear_transform.
+# Optimal bsgs_ratio value is between 4 and 16 depending on the sparsity of the matrix.
+def gen_linear_transform_bsgs(
+        encoder: EncoderComplex128, value: dict[int, list[T]], level: int, scale: float,
+        bsgs_ratio: float, log_slots: int, T: type) -> LinearTransform:
+    params = encoder.params
+
+    slots = 1 << log_slots
+
+    # n1*n2 = n
+    n1 = find_best_bsgs_split(list(value.keys()), slots, bsgs_ratio)
+
+    index, _, _ = bsgs_index(list(value.keys()), slots, n1)
+
+    vec = dict[int, ringqp.Poly]()
+
+    level_q = level
+    level_p = params.p_count() - 1
+
+    values = [T() for _ in range(slots)]
+
+    for j in index:
+        rot = -j & (slots - 1)
+
+        for i in index[j]:
+            # manages inputs that have rotation between 0 and slots-1 or between -slots/2 and slots/2-1
+            v = value[j + i] if (j + i) in value else value[j + i - slots]
+            vec[j + i] = params.ring_qp().new_poly_lvl(level_q, level_p)
+
+            copy_rot_interface(values, v, rot)
+
+            encoder.embed(values, log_slots, scale, True, vec[j + i])
+
+    return LinearTransform(log_slots=log_slots, n1=n1, level=level, scale=scale, vec=vec)
+
+
+# copy_rot_interface copies b, rotated by rot positions to the left, on a.
+# As in Lattigo, what b does not cover is left as it is in a.
+def copy_rot_interface(a: list[T], b: list[T], rot: int, T: type):
+    n = len(a)
+
+    if len(b) >= rot:
+        # copy(a[:n-rot], b[rot:])
+        for i in range(min(n - rot, len(b) - rot)): a[i] = b[rot + i]
+        # copy(a[n-rot:], b[:rot])
+        for i in range(rot): a[n - rot + i] = b[i]
+    else:
+        # copy(a[n-rot:], b)
+        for i in range(len(b)): a[n - rot + i] = b[i]
+
+
+# bsgs_index returns the index map and needed rotation for the BSGS matrix-vector multiplication algorithm.
+# non_zero_diags lists the indexes of the non-zero diagonals of the matrix.
+def bsgs_index(non_zero_diags: list[int], slots: int, n1: int) -> Tuple[dict[int, list[int]], list[int], list[int]]:
+    index = dict[int, list[int]]()
+    rot_n1_map = set[int]()
+    rot_n2_map = set[int]()
+
+    for diag in non_zero_diags:
+        rot = diag & (slots - 1)
+        idx_n1 = ((rot // n1) * n1) & (slots - 1)
+        idx_n2 = rot & (n1 - 1)
+        if idx_n1 not in index:
+            index[idx_n1] = [idx_n2]
+        else:
+            index[idx_n1].append(idx_n2)
+        rot_n1_map.add(idx_n1)
+        rot_n2_map.add(idx_n2)
+
+    rot_n1 = [i for i in rot_n1_map]
+    rot_n2 = [i for i in rot_n2_map]
+
+    return index, rot_n1, rot_n2
+
+
+# find_best_bsgs_split finds the best n1*n2 = n for the baby-step giant-step algorithm for matrix multiplication.
+def find_best_bsgs_split(non_zero_diags: list[int], max_n: int, max_ratio: float) -> int:
+    n1 = 1
+    while n1 < max_n:
+        _, rot_n1, rot_n2 = bsgs_index(non_zero_diags, max_n, n1)
+
+        nb_n1, nb_n2 = len(rot_n1) - 1, len(rot_n2) - 1
+
+        # Lattigo divides the two as floats: x/0 is +Inf, which is larger than any ratio, and 0/0
+        # is NaN, which compares false with everything.
+        if nb_n1 == 0:
+            if nb_n2 > 0:
+                return n1 // 2
+        else:
+            ratio = float(nb_n2) / float(nb_n1)
+
+            if ratio == max_ratio:
+                return n1
+
+            if ratio > max_ratio:
+                return n1 // 2
+
+        n1 <<= 1
+
+    return 1
+
+
+@extend
+class Evaluator:
+    # linear_transform_new evaluates a linear transform on the ciphertext and returns the result on a new ciphertext.
+    # The linear_transform can either be an (ordered) list of LinearTransform or a single LinearTransform.
+    # In either case a list of ciphertext is returned (the second case returning a list
+    # containing a single ciphertext).
+    def linear_transform_new(self, ct_in: Ciphertext, linear_transform) -> list[Ciphertext]:
+        if isinstance(linear_transform, list[LinearTransform]):
+            min_level = ct_in.level()
+            for lt in linear_transform:
+                min_level = min(min_level, lt.level)
+
+            ct_out = [new_ciphertext(self.ckks_params, 1, min_level, ct_in.scale) for _ in range(len(linear_transform))]
+            self.linear_transform(ct_in, linear_transform, ct_out)
+            return ct_out
+        elif isinstance(linear_transform, LinearTransform):
+            min_level = min(linear_transform.level, ct_in.level())
+            ct_out = [new_ciphertext(self.ckks_params, 1, min_level, ct_in.scale)]
+            self.linear_transform(ct_in, linear_transform, ct_out)
+            return ct_out
+        else:
+            compile_error("linear_transform must be a LinearTransform or a list of LinearTransform")
+
+    # linear_transform evaluates a linear transform on the pre-allocated ciphertexts.
+    # The linear_transform can either be an (ordered) list of LinearTransform or a single LinearTransform.
+    # In either case a list of ciphertext is expected (the second case expecting a list
+    # containing a single ciphertext).
+    #
+    # The level of evaluation is the lowest of the levels of the input, of the matrices and of the
+    # outputs. Lattigo decomposes the input at min(highest matrix level, input level) and then evaluates
+    # each matrix at min(its level, input level, output level). A decomposition is only valid at the
+    # level it was computed at, so whenever those two differ (an output or one matrix of a list below the
+    # others) Lattigo silently returns a wrong result; the cases in which they agree are unchanged here.
+    def linear_transform(self, ct_in: Ciphertext, linear_transform, ct_out: list[Ciphertext]):
+        if isinstance(linear_transform, list[LinearTransform]):
+            min_level = ct_in.level()
+            for i, lt in enumerate(linear_transform):
+                min_level = min(min_level, min(lt.level, ct_out[i].level()))
+
+            self._mm_decompose_ntt(min_level, self.params.p_count() - 1, self.params.p_count(), ct_in.value[1], self.buff_decomp_qp)
+
+            for i, lt in enumerate(linear_transform):
+                ct_out[i].resize(ct_out[i].degree(), min_level)
+
+                if lt.n1 == 0:
+                    self.multiply_by_diag_matrix(ct_in, lt, self.buff_decomp_qp, ct_out[i])
+                else:
+                    self.multiply_by_diag_matrix_bsgs(ct_in, lt, self.buff_decomp_qp, ct_out[i])
+        elif isinstance(linear_transform, LinearTransform):
+            min_level = min(min(linear_transform.level, ct_in.level()), ct_out[0].level())
+            self._mm_decompose_ntt(min_level, self.params.p_count() - 1, self.params.p_count(), ct_in.value[1], self.buff_decomp_qp)
+            if linear_transform.n1 == 0:
+                self.multiply_by_diag_matrix(ct_in, linear_transform, self.buff_decomp_qp, ct_out[0])
+            else:
+                self.multiply_by_diag_matrix_bsgs(ct_in, linear_transform, self.buff_decomp_qp, ct_out[0])
+        else:
+            compile_error("linear_transform must be a LinearTransform or a list of LinearTransform")
+
+    # multiply_by_diag_matrix multiplies the ciphertext "ct_in" by the plaintext matrix "matrix" and returns the result on the ciphertext
+    # "ct_out". The memory buffer for the decomposed ciphertext buff_decomp_qp must be provided: a list of poly of ring_qp
+    # of size params.decomp_rns(params.q_count()-1, params.p_count()-1), holding the decomposition of ct_in.value[1] at the
+    # level of evaluation, min(ct_out.level(), ct_in.level(), matrix.level).
+    # The naive approach is used (single hoisting and no baby-step giant-step), which is faster than multiply_by_diag_matrix_bsgs
+    # for matrix of only a few non-zero diagonals but uses more keys.
+    def multiply_by_diag_matrix(self, ct_in: Ciphertext, matrix: LinearTransform, buff_decomp_qp: list[ringqp.Poly], ct_out: Ciphertext):
+        ring_q = self.params.ring_q
+        ring_p = self.params.ring_p
+        ring_qp = self.params.ring_qp()
+
+        level_q = min(ct_out.level(), min(ct_in.level(), matrix.level))
+        level_p = len(ring_p.modulus) - 1
+
+        ct_out.resize(ct_out.degree(), level_q)
+
+        qi_over_f = self.params.qi_overflow_margin(level_q)
+        pi_over_f = self.params.pi_overflow_margin(level_p)
+
+        c0_out_qp = ringqp.Poly(q=ct_out.value[0], p=self.buff_qp[5].q)
+        c1_out_qp = ringqp.Poly(q=ct_out.value[1], p=self.buff_qp[5].p)
+
+        ct0_times_p = self.buff_qp[0].q  # ct0 * P mod Q
+        tmp0_qp = self.buff_qp[1]
+        tmp1_qp = self.buff_qp[2]
+        ks_res0_qp = self.buff_qp[3]
+        ks_res1_qp = self.buff_qp[4]
+
+        in_scale = ct_in.scale
+
+        ring._mm_copy_values_lvl(level_q, ct_in.value[0], self.buff_ct.value[0])
+        ring._mm_copy_values_lvl(level_q, ct_in.value[1], self.buff_ct.value[1])
+        ct_in_tmp0, ct_in_tmp1 = self.buff_ct.value[0], self.buff_ct.value[1]
+
+        ring_q._mm_mul_scalar_bigint_lvl(level_q, ct_in_tmp0, ring_p.modulus_at_level[level_p], ct0_times_p)  # P*c0
+
+        state = False
+        cnt = 0
+        for diag in matrix.vec:
+            k = diag & int((ring_q.nth_root >> u64(2)) - u64(1))
+
+            if k == 0:
+                state = True
+            else:
+                gal_el = self.params.galois_element_for_column_rotation_by(k)
+
+                rtk, generated = self.rtks.get_rotation_key(gal_el)
+                if not generated:
+                    raise ValueError(f"cannot MultiplyByDiagMatrix: switching key not available (rotation by {k})")
+
+                index = self.permute_ntt_index[gal_el]
+
+                self._mm_keyswitch_hoisted_no_mod_down(level_q, buff_decomp_qp, rtk, ks_res0_qp.q, ks_res1_qp.q, ks_res0_qp.p, ks_res1_qp.p)
+                ring_q._mm_add_lvl(level_q, ks_res0_qp.q, ct0_times_p, ks_res0_qp.q)
+                keyswitch.qp_permute_ntt_with_index_lvl(ring_qp, level_q, level_p, ks_res0_qp, index, tmp0_qp)
+                keyswitch.qp_permute_ntt_with_index_lvl(ring_qp, level_q, level_p, ks_res1_qp, index, tmp1_qp)
+
+                if cnt == 0:
+                    # keyswitch(c1_Q) = (d0_QP, d1_QP)
+                    ring_qp._mm_mul_coeffs_montgomery_lvl(level_q, level_p, matrix.vec[k], tmp0_qp, c0_out_qp)
+                    ring_qp._mm_mul_coeffs_montgomery_lvl(level_q, level_p, matrix.vec[k], tmp1_qp, c1_out_qp)
+                else:
+                    # keyswitch(c1_Q) = (d0_QP, d1_QP)
+                    ring_qp._mm_mul_coeffs_montgomery_and_add_lvl(level_q, level_p, matrix.vec[k], tmp0_qp, c0_out_qp)
+                    ring_qp._mm_mul_coeffs_montgomery_and_add_lvl(level_q, level_p, matrix.vec[k], tmp1_qp, c1_out_qp)
+
+                if cnt % qi_over_f == qi_over_f - 1:
+                    ring_q._mm_reduce_lvl(level_q, c0_out_qp.q, c0_out_qp.q)
+                    ring_q._mm_reduce_lvl(level_q, c1_out_qp.q, c1_out_qp.q)
+
+                if cnt % pi_over_f == pi_over_f - 1:
+                    ring_p._mm_reduce_lvl(level_p, c0_out_qp.p, c0_out_qp.p)
+                    ring_p._mm_reduce_lvl(level_p, c1_out_qp.p, c1_out_qp.p)
+
+                cnt += 1
+
+        if cnt == 0:
+            # Only the main diagonal: nothing was accumulated. Lattigo divides whatever the buffers
+            # hold by P here, which leaves a small error on the result.
+            for i in range(level_q + 1):
+                c0, c1 = c0_out_qp.q._mm_coeffs[i], c1_out_qp.q._mm_coeffs[i]
+                for j in range(len(c0)):
+                    c0[j] = u64xN(u64(0))
+                    c1[j] = u64xN(u64(0))
+        else:
+            if cnt % qi_over_f == 0:
+                ring_q._mm_reduce_lvl(level_q, c0_out_qp.q, c0_out_qp.q)
+                ring_q._mm_reduce_lvl(level_q, c1_out_qp.q, c1_out_qp.q)
+
+            if cnt % pi_over_f == 0:
+                ring_p._mm_reduce_lvl(level_p, c0_out_qp.p, c0_out_qp.p)
+                ring_p._mm_reduce_lvl(level_p, c1_out_qp.p, c1_out_qp.p)
+
+            self.basis_extender._mm_mod_down_qp_to_q_ntt(level_q, level_p, c0_out_qp.q, c0_out_qp.p, c0_out_qp.q)  # sum(phi(c0 * P + d0_QP))/P
+            self.basis_extender._mm_mod_down_qp_to_q_ntt(level_q, level_p, c1_out_qp.q, c1_out_qp.p, c1_out_qp.q)  # sum(phi(d1_QP))/P
+
+        if state:  # Rotation by zero
+            ring_q._mm_mul_coeffs_montgomery_and_add_lvl(level_q, matrix.vec[0].q, ct_in_tmp0, c0_out_qp.q)  # ct_out += c0_Q * plaintext
+            ring_q._mm_mul_coeffs_montgomery_and_add_lvl(level_q, matrix.vec[0].q, ct_in_tmp1, c1_out_qp.q)  # ct_out += c1_Q * plaintext
+
+        ct_out.scale = matrix.scale * in_scale
+
+    # multiply_by_diag_matrix_bsgs multiplies the ciphertext "ct_in" by the plaintext matrix "matrix" and returns the result on the ciphertext
+    # "ct_out". The decomposition of ct_in.value[1] at the level of evaluation, min(ct_out.level(), ct_in.level(), matrix.level),
+    # is expected in the evaluator's buff_decomp_qp (as in Lattigo, pool_decomp_qp is not read).
+    # The BSGS approach is used (double hoisting with baby-step giant-step), which is faster than multiply_by_diag_matrix
+    # for matrix with more than a few non-zero diagonals and uses much less keys.
+    def multiply_by_diag_matrix_bsgs(self, ct_in: Ciphertext, matrix: LinearTransform, pool_decomp_qp: list[ringqp.Poly], ct_out: Ciphertext):
+        ring_q = self.params.ring_q
+        ring_p = self.params.ring_p
+        ring_qp = self.params.ring_qp()
+
+        level_q = min(ct_out.level(), min(ct_in.level(), matrix.level))
+        level_p = len(ring_p.modulus) - 1
+
+        ct_out.resize(ct_out.degree(), level_q)
+
+        qi_over_f = self.params.qi_overflow_margin(level_q) >> 1
+        pi_over_f = self.params.pi_overflow_margin(level_p) >> 1
+
+        # Computes the n2 rotations indexes of the non-zero rows of the diagonalized DFT matrix for the baby-step giang-step algorithm
+        index, _, rot_n2 = bsgs_index(list(matrix.vec.keys()), 1 << matrix.log_slots, matrix.n1)
+
+        in_scale = ct_in.scale
+
+        ring._mm_copy_values_lvl(level_q, ct_in.value[0], self.buff_ct.value[0])
+        ring._mm_copy_values_lvl(level_q, ct_in.value[1], self.buff_ct.value[1])
+        ct_in_tmp0, ct_in_tmp1 = self.buff_ct.value[0], self.buff_ct.value[1]
+
+        # Pre-rotates ciphertext for the baby-step giant-step algorithm, does not divide by P yet
+        ct_in_rot_qp = self.rotate_hoisted_no_mod_down_new(level_q, rot_n2, ct_in_tmp0, self.buff_decomp_qp)
+
+        # Accumulator inner loop
+        tmp0_qp = self.buff_qp[1]
+        tmp1_qp = self.buff_qp[2]
+
+        # Accumulator outer loop
+        c0_qp = self.buff_qp[3]
+        c1_qp = self.buff_qp[4]
+
+        # Result in QP
+        c0_out_qp = ringqp.Poly(q=ct_out.value[0], p=self.buff_qp[5].q)
+        c1_out_qp = ringqp.Poly(q=ct_out.value[1], p=self.buff_qp[5].p)
+
+        ring_q._mm_mul_scalar_bigint_lvl(level_q, ct_in_tmp0, ring_p.modulus_at_level[level_p], ct_in_tmp0)  # P*c0
+        ring_q._mm_mul_scalar_bigint_lvl(level_q, ct_in_tmp1, ring_p.modulus_at_level[level_p], ct_in_tmp1)  # P*c1
+
+        # OUTER LOOP
+        cnt0 = 0
+        for j in index:
+            # INNER LOOP
+            cnt1 = 0
+            for i in index[j]:
+                if i == 0:
+                    if cnt1 == 0:
+                        ring_q._mm_mul_coeffs_montgomery_constant_lvl(level_q, matrix.vec[j].q, ct_in_tmp0, tmp0_qp.q)
+                        ring_q._mm_mul_coeffs_montgomery_constant_lvl(level_q, matrix.vec[j].q, ct_in_tmp1, tmp1_qp.q)
+                        tmp0_qp.p.zero_out()
+                        tmp1_qp.p.zero_out()
+                    else:
+                        ring_q._mm_mul_coeffs_montgomery_constant_and_add_no_mod_lvl(level_q, matrix.vec[j].q, ct_in_tmp0, tmp0_qp.q)
+                        ring_q._mm_mul_coeffs_montgomery_constant_and_add_no_mod_lvl(level_q, matrix.vec[j].q, ct_in_tmp1, tmp1_qp.q)
+                else:
+                    if cnt1 == 0:
+                        ring_qp._mm_mul_coeffs_montgomery_constant_lvl(level_q, level_p, matrix.vec[j + i], ct_in_rot_qp[i][0], tmp0_qp)
+                        ring_qp._mm_mul_coeffs_montgomery_constant_lvl(level_q, level_p, matrix.vec[j + i], ct_in_rot_qp[i][1], tmp1_qp)
+                    else:
+                        ring_qp._mm_mul_coeffs_montgomery_constant_and_add_no_mod_lvl(level_q, level_p, matrix.vec[j + i], ct_in_rot_qp[i][0], tmp0_qp)
+                        ring_qp._mm_mul_coeffs_montgomery_constant_and_add_no_mod_lvl(level_q, level_p, matrix.vec[j + i], ct_in_rot_qp[i][1], tmp1_qp)
+
+                if cnt1 % qi_over_f == qi_over_f - 1:
+                    ring_q._mm_reduce_lvl(level_q, tmp0_qp.q, tmp0_qp.q)
+                    ring_q._mm_reduce_lvl(level_q, tmp1_qp.q, tmp1_qp.q)
+
+                if cnt1 % pi_over_f == pi_over_f - 1:
+                    ring_p._mm_reduce_lvl(level_p, tmp0_qp.p, tmp0_qp.p)
+                    ring_p._mm_reduce_lvl(level_p, tmp1_qp.p, tmp1_qp.p)
+
+                cnt1 += 1
+
+            if cnt1 % qi_over_f != 0:
+                ring_q._mm_reduce_lvl(level_q, tmp0_qp.q, tmp0_qp.q)
+                ring_q._mm_reduce_lvl(level_q, tmp1_qp.q, tmp1_qp.q)
+
+            if cnt1 % pi_over_f != 0:
+                ring_p._mm_reduce_lvl(level_p, tmp0_qp.p, tmp0_qp.p)
+                ring_p._mm_reduce_lvl(level_p, tmp1_qp.p, tmp1_qp.p)
+
+            # If j != 0, then rotates ((tmp0_qp.q, tmp0_qp.p), (tmp1_qp.q, tmp1_qp.p)) by n1*j and adds the result on ((c0_qp.q, c0_qp.p), (c1_qp.q, c1_qp.p))
+            if j != 0:
+                # Hoisting of the ModDown of sum(sum(phi(d1) * plaintext))
+                self.basis_extender._mm_mod_down_qp_to_q_ntt(level_q, level_p, tmp1_qp.q, tmp1_qp.p, tmp1_qp.q)  # c1 * plaintext + sum(phi(d1) * plaintext) + phi(c1) * plaintext mod Q
+
+                gal_el = self.params.galois_element_for_column_rotation_by(j)
+
+                rtk, generated = self.rtks.get_rotation_key(gal_el)
+                if not generated:
+                    raise ValueError(f"cannot MultiplyByDiagMatrixBSGS: switching key not available (rotation by {j})")
+
+                rot_index = self.permute_ntt_index[gal_el]
+
+                tmp1_qp.q.is_ntt = True
+                self._mm_gadget_product_no_mod_down(level_q, tmp1_qp.q, rtk.gadget_ciphertext(), c0_qp, c1_qp)  # Switchkey(P*phi(tmpRes_1)) = (d0, d1) in base QP
+                ring_qp._mm_add_lvl(level_q, level_p, c0_qp, tmp0_qp, c0_qp)
+
+                # Outer loop rotations
+                if cnt0 == 0:
+                    keyswitch.qp_permute_ntt_with_index_lvl(ring_qp, level_q, level_p, c0_qp, rot_index, c0_out_qp)
+                    keyswitch.qp_permute_ntt_with_index_lvl(ring_qp, level_q, level_p, c1_qp, rot_index, c1_out_qp)
+                else:
+                    keyswitch.qp_permute_ntt_with_index_and_add_no_mod_lvl(level_q, level_p, c0_qp, rot_index, c0_out_qp)
+                    keyswitch.qp_permute_ntt_with_index_and_add_no_mod_lvl(level_q, level_p, c1_qp, rot_index, c1_out_qp)
+
+                # Else directly adds on ((c0_qp.q, c0_qp.p), (c1_qp.q, c1_qp.p))
+            else:
+                if cnt0 == 0:
+                    keyswitch._mm_qp_copy_values_lvl(level_q, level_p, tmp0_qp, c0_out_qp)
+                    keyswitch._mm_qp_copy_values_lvl(level_q, level_p, tmp1_qp, c1_out_qp)
+                else:
+                    keyswitch._mm_qp_add_no_mod_lvl(level_q, level_p, c0_out_qp, tmp0_qp, c0_out_qp)
+                    keyswitch._mm_qp_add_no_mod_lvl(level_q, level_p, c1_out_qp, tmp1_qp, c1_out_qp)
+
+            if cnt0 % qi_over_f == qi_over_f - 1:
+                ring_q._mm_reduce_lvl(level_q, ct_out.value[0], ct_out.value[0])
+                ring_q._mm_reduce_lvl(level_q, ct_out.value[1], ct_out.value[1])
+
+            if cnt0 % pi_over_f == pi_over_f - 1:
+                ring_p._mm_reduce_lvl(level_p, c0_out_qp.p, c0_out_qp.p)
+                ring_p._mm_reduce_lvl(level_p, c1_out_qp.p, c1_out_qp.p)
+
+            cnt0 += 1
+
+        if cnt0 % qi_over_f != 0:
+            ring_q._mm_reduce_lvl(level_q, ct_out.value[0], ct_out.value[0])
+            ring_q._mm_reduce_lvl(level_q, ct_out.value[1], ct_out.value[1])
+
+        if cnt0 % pi_over_f != 0:
+            ring_p._mm_reduce_lvl(level_p, c0_out_qp.p, c0_out_qp.p)
+            ring_p._mm_reduce_lvl(level_p, c1_out_qp.p, c1_out_qp.p)
+
+        self.basis_extender._mm_mod_down_qp_to_q_ntt(level_q, level_p, ct_out.value[0], c0_out_qp.p, ct_out.value[0])  # sum(phi(c0 * P + d0_QP))/P
+        self.basis_extender._mm_mod_down_qp_to_q_ntt(level_q, level_p, ct_out.value[1], c1_out_qp.p, ct_out.value[1])  # sum(phi(d1_QP))/P
+
+        ct_out.scale = matrix.scale * in_scale

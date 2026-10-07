@@ -1,0 +1,1749 @@
+"""
+Unit tests for the single-key CKKS bootstrapping of Lattiseq and everything it is built on:
+the evaluator additions, hoisted key switching, linear transforms, polynomial evaluation,
+CoeffsToSlots / SlotsToCoeffs / EvalMod and the bootstrapper itself.
+
+Every check decrypts the result and compares it with the same computation done in the clear,
+against an explicit tolerance. A failed check raises, so the process exits non-zero.
+
+Standalone:
+    sequre build -release tests/unit_tests/test_bootstrapping.codon -o <binary> && <binary>
+Through the harness:
+    sequre run scripts/invoke.codon run-tests --local --bootstrapping
+"""
+import math, prg, time
+
+import sequre.lattiseq.ckks as ckks
+import sequre.lattiseq.rlwe as rlwe
+import sequre.lattiseq.ring as ring
+import sequre.lattiseq.keyswitch as keyswitch
+import sequre.lattiseq.evaluator as lattiseq_evaluator
+import sequre.lattiseq.linear_transform as lattiseq_lt
+import sequre.lattiseq.polynomial_evaluation as lattiseq_poly
+import sequre.lattiseq.advanced as advanced
+import sequre.lattiseq.bootstrapping as bootstrapping
+import sequre.lattiseq.bootstrapping_default_params as btp_default
+
+from sequre.lattiseq.params import CKKSParametersLiteral
+from sequre.constants import LATTISEQ_STANDARD_RING_ENUM
+
+
+# ---------------------------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------------------------
+
+class TestContext:
+    params: ckks.Parameters
+    encoder: ckks.EncoderComplex128
+    kgen: ckks.KeyGenerator
+    sk: rlwe.SecretKey
+    encryptor: ckks.SkEncryptor
+    decryptor: ckks.Decryptor
+    rlk: rlwe.RelinearizationKey
+
+
+def new_test_context(literal: CKKSParametersLiteral) -> TestContext:
+    params = ckks.new_parameters_from_literal(literal)
+    kgen = ckks.new_key_generator(params)
+    sk = kgen.gen_secret_key()
+
+    return TestContext(
+        params=params,
+        encoder=ckks.new_encoder_complex(params),
+        kgen=kgen,
+        sk=sk,
+        encryptor=ckks.new_encryptor(params, sk),
+        decryptor=ckks.new_decryptor(params, sk),
+        rlk=kgen.gen_relinearization_key(sk, 1))
+
+
+# An evaluator holding the relinearization key and the keys of the given rotations.
+def new_test_evaluator(tc: TestContext, rotations: list[int], conjugate: bool) -> ckks.Evaluator:
+    rtks = tc.kgen.gen_rotation_keys_for_rotations(rotations, conjugate, tc.sk)
+    return ckks.new_evaluator(tc.params, rlwe.EvaluationKey(rlk=tc.rlk, rtks=rtks))
+
+
+# Uniform complex values with real and imaginary parts in [-bound, bound].
+def random_values(n: int, bound: float) -> list[complex]:
+    return [complex(bound * (2 * prg.random() - 1), bound * (2 * prg.random() - 1)) for _ in range(n)]
+
+
+# Uniform real values in [-bound, bound].
+def random_real_values(n: int, bound: float) -> list[complex]:
+    return [complex(bound * (2 * prg.random() - 1), 0.0) for _ in range(n)]
+
+
+def encrypt_values(tc: TestContext, values: list[complex], level: int, scale: float) -> ckks.Ciphertext:
+    plaintext = ckks.new_plaintext(tc.params, level, scale)
+    tc.encoder.encode(values, plaintext, tc.params.log_slots)
+    return tc.encryptor.encrypt_new(plaintext)
+
+
+def decrypt_values(tc: TestContext, ciphertext: ckks.Ciphertext) -> list[complex]:
+    return tc.encoder.decode(tc.decryptor.decrypt_new(ciphertext), tc.params.log_slots)
+
+
+def max_error(have: list[complex], want: list[complex]) -> float:
+    err = 0.0
+    for i in range(len(want)):
+        err = max(err, abs(have[i] - want[i]))
+    return err
+
+
+# Precision in bits of the real and imaginary parts, averaged over the slots as Lattigo's
+# GetPrecisionStats does: log2(1 / mean(|error|)).
+def mean_precision(have: list[complex], want: list[complex]) -> Tuple[float, float]:
+    err_real, err_imag = 0.0, 0.0
+    for i in range(len(want)):
+        err_real += abs(have[i].real - want[i].real)
+        err_imag += abs(have[i].imag - want[i].imag)
+    n = float(len(want))
+    return math.log2(n / max(err_real, 1e-300)), math.log2(n / max(err_imag, 1e-300))
+
+
+# Fails unless every slot of have is within tolerance of want.
+def check_values(name: str, have: list[complex], want: list[complex], tolerance: float):
+    assert len(have) >= len(want), f"{name} failed: {len(have)} values decoded, {len(want)} expected"
+    err = max_error(have, want)
+    worst = 0
+    for i in range(len(want)):
+        if abs(have[i] - want[i]) == err: worst = i
+    have_worst, want_worst = have[worst], want[worst]
+    have_first, want_first = have[0], want[0]
+    assert err <= tolerance, (
+        f"{name} failed: max error {err} > tolerance {tolerance}"
+        f" (slot {worst}: have {have_worst}, want {want_worst}; slot 0: have {have_first}, want {want_first})")
+    print(f"{name} passed (max error {err:.3e}, tolerance {tolerance:.1e})")
+
+
+def check_true(name: str, condition: bool, details: str):
+    assert condition, f"{name} failed: {details}"
+    print(f"{name} passed ({details})")
+
+
+# Fails unless calling function raises.
+def check_raises(name: str, function):
+    raised = False
+    message = ""
+    try:
+        function()
+    except ValueError as e:
+        raised = True
+        message = e.message
+    except NotImplementedError as e:
+        raised = True
+        message = e.message
+    assert raised, f"{name} failed: no error was raised"
+    print(f"{name} passed (raised: {message})")
+
+
+# ---------------------------------------------------------------------------------------------
+# Parameters of the tests below the bootstrapping: small, insecure, fast
+# ---------------------------------------------------------------------------------------------
+
+# Two special primes: the gadget product decomposes Q in groups of two moduli.
+def test_literal_two_p() -> CKKSParametersLiteral:
+    return CKKSParametersLiteral(
+        logn=12,
+        logq=[55, 45, 45, 45, 45, 45, 45, 45],
+        logp=[55, 55],
+        log_slots=11,
+        default_scale=float(1 << 45))
+
+
+# Three special primes and seven moduli: the last group of the decomposition is incomplete.
+def test_literal_three_p() -> CKKSParametersLiteral:
+    return CKKSParametersLiteral(
+        logn=12,
+        logq=[55, 45, 45, 45, 45, 45, 45],
+        logp=[56, 56, 56],
+        log_slots=11,
+        default_scale=float(1 << 45))
+
+
+# One special prime: every modulus is its own group.
+def test_literal_one_p() -> CKKSParametersLiteral:
+    return CKKSParametersLiteral(
+        logn=12,
+        logq=[55, 45, 45, 45, 45],
+        logp=[60],
+        log_slots=11,
+        default_scale=float(1 << 45))
+
+
+# Sparse packing: 2^9 slots in a ring of degree 2^12.
+def test_literal_sparse() -> CKKSParametersLiteral:
+    return CKKSParametersLiteral(
+        logn=12,
+        logq=[55, 45, 45, 45, 45, 45, 45, 45],
+        logp=[55, 55],
+        log_slots=9,
+        default_scale=float(1 << 45))
+
+
+# ---------------------------------------------------------------------------------------------
+# Evaluator additions
+# ---------------------------------------------------------------------------------------------
+
+def test_switch_keys(tc: TestContext, tag: str):
+    params = tc.params
+    evaluator = new_test_evaluator(tc, [1], False)
+    values = random_values(params.slots(), 1.0)
+
+    # To another key of the same parameters, and back
+    sk_other = tc.kgen.gen_secret_key()
+    swk_to_other = keyswitch.gen_switching_key(tc.kgen, tc.sk, sk_other)
+    swk_from_other = keyswitch.gen_switching_key(tc.kgen, sk_other, tc.sk)
+    decryptor_other = ckks.new_decryptor(params, sk_other)
+
+    ciphertext = encrypt_values(tc, values, params.max_level(), params.default_scale)
+    switched = evaluator.switch_keys_new(ciphertext, swk_to_other)
+    check_values(
+        f"SwitchKeysNew [{tag}]",
+        tc.encoder.decode(decryptor_other.decrypt_new(switched), params.log_slots), values, 1e-7)
+    check_true(
+        f"SwitchKeysNew keeps level and scale [{tag}]",
+        switched.level() == ciphertext.level() and switched.scale == ciphertext.scale,
+        f"level {switched.level()}, scale 2^{math.log2(switched.scale)}")
+
+    back = ckks.new_ciphertext(params, 1, switched.level(), switched.scale)
+    evaluator.switch_keys(switched, swk_from_other, back)
+    check_values(f"SwitchKeys back to the first key [{tag}]", decrypt_values(tc, back), values, 1e-7)
+
+    # In place, at a lower level
+    low = encrypt_values(tc, values, 2, params.default_scale)
+    evaluator.switch_keys(low, swk_to_other, low)
+    check_values(
+        f"SwitchKeys in place at level 2 [{tag}]",
+        tc.encoder.decode(decryptor_other.decrypt_new(low), params.log_slots), values, 1e-7)
+
+
+def test_sparse_secret_switching_keys(tc: TestContext, tag: str):
+    # The two keys of the sparse-secret encapsulation: a dense key of the full parameters and a sparse
+    # key that only exists modulo Q0 and P0.
+    params = tc.params
+    evaluator = new_test_evaluator(tc, [1], False)
+
+    params_sparse = rlwe.new_parameters(
+        params.logn, params.q()[:1], params.p()[:1], 0, params.h, params.sigma, params.ring_type)
+    kgen_sparse = rlwe.new_key_generator(params_sparse)
+    hamming_weight = 32
+    sk_sparse = keyswitch.gen_secret_key_with_hamming_weight(kgen_sparse, hamming_weight)
+
+    # The sparse key has exactly hamming_weight non-zero coefficients, each of them +-1.
+    ring_sparse = params_sparse.ring_q
+    coeffs = ring_sparse.new_poly()
+    ring_sparse._mm_inv_ntt_lvl(0, sk_sparse.value.q, coeffs)
+    ring_sparse._mm_inv_mform_lvl(0, coeffs, coeffs)
+    q0 = ring_sparse.modulus[0]
+    non_zero, not_ternary = 0, 0
+    for c in coeffs._buf_coeffs[0]:
+        if c != u64(0): non_zero += 1
+        if c != u64(0) and c != u64(1) and c != q0 - u64(1): not_ternary += 1
+    check_true(
+        f"GenSecretKeyWithHammingWeight [{tag}]",
+        non_zero == hamming_weight and not_ternary == 0,
+        f"{non_zero} non-zero coefficients for a weight of {hamming_weight}, {not_ternary} of them neither 1 nor -1")
+    check_true(
+        f"Sparse key levels [{tag}]",
+        sk_sparse.level_q() == 0 and sk_sparse.level_p() == 0,
+        f"level_q {sk_sparse.level_q()}, level_p {sk_sparse.level_p()}")
+
+    swk_dense_to_sparse = keyswitch.gen_switching_key(tc.kgen, tc.sk, sk_sparse)
+    swk_sparse_to_dense = keyswitch.gen_switching_key(tc.kgen, sk_sparse, tc.sk)
+    check_true(
+        f"Dense to sparse key lives modulo Q0 and P0 [{tag}]",
+        swk_dense_to_sparse.level_q() == 0 and swk_dense_to_sparse.level_p() == 0,
+        f"level_q {swk_dense_to_sparse.level_q()}, level_p {swk_dense_to_sparse.level_p()}")
+    check_true(
+        f"Sparse to dense key lives modulo QP [{tag}]",
+        swk_sparse_to_dense.level_q() == params.max_level() and swk_sparse_to_dense.level_p() == params.p_count() - 1,
+        f"level_q {swk_sparse_to_dense.level_q()}, level_p {swk_sparse_to_dense.level_p()}")
+
+    # The dense to sparse key has a single special prime, about the size of Q0 (55 bits here), so
+    # this key switch leaves a noise of about 2^17 on the slots: 2^-23 at a scale of 2^40.
+    scale = float(1 << 40)
+    values = random_values(params.slots(), 1.0)
+    ciphertext = encrypt_values(tc, values, 0, scale)
+
+    sparse = evaluator.switch_keys_new(ciphertext, swk_dense_to_sparse)
+    decryptor_sparse = rlwe.new_decryptor(params_sparse, sk_sparse)
+    plaintext = ckks.new_plaintext(params, 0, scale)
+    decryptor_sparse._mm_decrypt(sparse.get_rlwe_ciphertext(), plaintext.get_rlwe_plaintext())
+    check_values(
+        f"SwitchKeys dense to sparse at level 0 [{tag}]",
+        tc.encoder.decode(plaintext, params.log_slots), values, 1e-5)
+
+    dense = evaluator.switch_keys_new(sparse, swk_sparse_to_dense)
+    check_values(f"SwitchKeys sparse to dense at level 0 [{tag}]", decrypt_values(tc, dense), values, 1e-5)
+
+
+def test_conjugate(tc: TestContext, tag: str):
+    params = tc.params
+    evaluator = new_test_evaluator(tc, [1], True)
+    values = random_values(params.slots(), 1.0)
+    want = [v.conjugate() for v in values]
+
+    ciphertext = encrypt_values(tc, values, params.max_level(), params.default_scale)
+    check_values(f"ConjugateNew [{tag}]", decrypt_values(tc, evaluator.conjugate_new(ciphertext)), want, 1e-7)
+
+    evaluator.conjugate(ciphertext, ciphertext)
+    check_values(f"Conjugate in place [{tag}]", decrypt_values(tc, ciphertext), want, 1e-7)
+
+
+def test_div_by_i(tc: TestContext, tag: str):
+    params = tc.params
+    evaluator = new_test_evaluator(tc, [1], False)
+    values = random_values(params.slots(), 1.0)
+    want = [v * complex(0, -1) for v in values]
+
+    ciphertext = encrypt_values(tc, values, params.max_level(), params.default_scale)
+    check_values(f"DivByiNew [{tag}]", decrypt_values(tc, evaluator.div_by_i_new(ciphertext)), want, 1e-7)
+
+    evaluator.div_by_i(ciphertext, ciphertext)
+    check_values(f"DivByi in place [{tag}]", decrypt_values(tc, ciphertext), want, 1e-7)
+
+    evaluator.mul_by_i(ciphertext, ciphertext)
+    check_values(f"MultByi undoes DivByi [{tag}]", decrypt_values(tc, ciphertext), values, 1e-7)
+
+
+def test_scale_up_and_set_scale(tc: TestContext, tag: str):
+    params = tc.params
+    evaluator = new_test_evaluator(tc, [1], False)
+    values = random_values(params.slots(), 1.0)
+
+    # ScaleUp: the values stay, the scale is multiplied
+    scale = float(1 << 30)
+    ciphertext = encrypt_values(tc, values, params.max_level(), scale)
+    scaled = evaluator.scale_up_new(ciphertext, 4096.0)
+    check_true(
+        f"ScaleUpNew scale and level [{tag}]",
+        scaled.scale == scale * 4096.0 and scaled.level() == ciphertext.level(),
+        f"scale 2^{math.log2(scaled.scale)}, level {scaled.level()}")
+    check_values(f"ScaleUpNew [{tag}]", decrypt_values(tc, scaled), values, 1e-6)
+
+    evaluator.scale_up(ciphertext, 3.0, ciphertext)
+    check_true(
+        f"ScaleUp in place scale [{tag}]", ciphertext.scale == scale * 3.0,
+        f"scale {ciphertext.scale}, expected {scale * 3.0}")
+    check_values(f"ScaleUp in place [{tag}]", decrypt_values(tc, ciphertext), values, 1e-6)
+
+    # SetScale: the values stay, the scale becomes the target exactly, one level is spent.
+    # The last target raises the scale by a non-integer ratio above 2, which Lattigo v4.0.0 gets wrong.
+    for target in [float(1 << 45), float(1 << 45) * 1.2345678, float(1 << 38), float(1 << 45) * 1000.5]:
+        ciphertext = encrypt_values(tc, values, params.max_level(), float(1 << 45) * 0.987654321)
+        evaluator.set_scale(ciphertext, target)
+        check_true(
+            f"SetScale to 2^{math.log2(target):.4f} scale and level [{tag}]",
+            ciphertext.scale == target and ciphertext.level() == params.max_level() - 1,
+            f"scale {ciphertext.scale}, level {ciphertext.level()}")
+        check_values(f"SetScale to 2^{math.log2(target):.4f} [{tag}]", decrypt_values(tc, ciphertext), values, 1e-6)
+
+    # An integer multiple of the current scale costs no level
+    ciphertext = encrypt_values(tc, values, params.max_level(), float(1 << 30))
+    evaluator.set_scale(ciphertext, float(1 << 30) * 4096.0)
+    check_true(
+        f"SetScale to an integer multiple of the scale keeps the level [{tag}]",
+        ciphertext.scale == float(1 << 42) and ciphertext.level() == params.max_level(),
+        f"scale 2^{math.log2(ciphertext.scale)}, level {ciphertext.level()}")
+    check_values(f"SetScale to an integer multiple of the scale [{tag}]", decrypt_values(tc, ciphertext), values, 1e-6)
+
+
+def test_relinearize(tc: TestContext, tag: str):
+    params = tc.params
+    evaluator = new_test_evaluator(tc, [1], False)
+    values_0 = random_values(params.slots(), 1.0)
+    values_1 = random_values(params.slots(), 1.0)
+    want = [a * b for a, b in zip(values_0, values_1)]
+
+    ciphertext_0 = encrypt_values(tc, values_0, params.max_level(), params.default_scale)
+    ciphertext_1 = encrypt_values(tc, values_1, params.max_level(), params.default_scale)
+
+    product = evaluator.mul_new(ciphertext_0, ciphertext_1)
+    check_true(f"Mul without relinearization has degree 2 [{tag}]", product.degree() == 2, f"degree {product.degree()}")
+
+    relinearized = evaluator.relinearize_new(product)
+    check_true(f"RelinearizeNew degree [{tag}]", relinearized.degree() == 1, f"degree {relinearized.degree()}")
+    check_values(f"RelinearizeNew [{tag}]", decrypt_values(tc, relinearized), want, 1e-6)
+
+    evaluator.relinearize(product, product)
+    check_true(f"Relinearize in place degree [{tag}]", product.degree() == 1, f"degree {product.degree()}")
+    check_values(f"Relinearize in place [{tag}]", decrypt_values(tc, product), want, 1e-6)
+
+
+def test_mul_by_gaussian_integer_and_add(tc: TestContext, tag: str):
+    params = tc.params
+    evaluator = new_test_evaluator(tc, [1], False)
+    values_0 = random_values(params.slots(), 1.0)
+    values_1 = random_values(params.slots(), 1.0)
+
+    # round(3.2 * 5) + i * round(-0.3 * 7) = 16 - 2i
+    factor = complex(16, -2)
+    want = [a + b * factor for a, b in zip(values_0, values_1)]
+
+    ciphertext_0 = encrypt_values(tc, values_0, params.max_level(), params.default_scale)
+    ciphertext_1 = encrypt_values(tc, values_1, params.max_level(), params.default_scale)
+    evaluator.mul_by_gaussian_integer_and_add(ciphertext_1, (3.2, 5.0), (-0.3, 7.0), ciphertext_0)
+    check_values(f"MultByGaussianIntegerAndAdd [{tag}]", decrypt_values(tc, ciphertext_0), want, 1e-6)
+
+    # The rounding of a product of two floats, far above 64 bits, against exact integer arithmetic:
+    # (2^60 + 2^8) * 2^50 = 2^110 + 2^58, and 0.75 * 2 = 1.5 rounds away from zero.
+    q = params.ring_q.modulus[0]
+    two_pow_58 = ring.mod_exp_u64(u64(2), u64(58), q)
+    two_pow_110 = ring.mod_exp_u64(u64(2), u64(110), q)
+    want_big = ring.cred(two_pow_58 + two_pow_110, q)
+    have_big, negative_big = lattiseq_evaluator.round_product_mod(float(1 << 60) + 256.0, -float(1 << 50), q)
+    have_half, negative_half = lattiseq_evaluator.round_product_mod(0.75, 2.0, q)
+    have_tiny, _ = lattiseq_evaluator.round_product_mod(0.49, 1.0, q)
+    check_true(
+        f"round_product_mod [{tag}]",
+        have_big == want_big and negative_big and have_half == u64(2) and not negative_half and have_tiny == u64(0),
+        f"-(2^110 + 2^58) mod q: {have_big} (negative {negative_big}), want {want_big}; round(1.5) = {have_half}; round(0.49) = {have_tiny}")
+
+
+def test_rotate_hoisted(tc: TestContext, tag: str):
+    params = tc.params
+    slots = params.slots()
+    rotations = [0, 1, 5, 64, slots - 3]
+    evaluator = new_test_evaluator(tc, rotations[1:], False)
+    values = random_values(slots, 1.0)
+
+    ciphertext = encrypt_values(tc, values, params.max_level(), params.default_scale)
+    rotated = evaluator.rotate_hoisted_new(ciphertext, rotations)
+    for k in rotations:
+        want = [values[(i + k) % slots] for i in range(slots)]
+        check_values(f"RotateHoistedNew by {k} [{tag}]", decrypt_values(tc, rotated[k]), want, 1e-7)
+
+    # At a lower level
+    low = encrypt_values(tc, values, 3, params.default_scale)
+    rotated_low = evaluator.rotate_hoisted_new(low, [5, 64])
+    for k in [5, 64]:
+        want = [values[(i + k) % slots] for i in range(slots)]
+        check_values(f"RotateHoistedNew by {k} at level 3 [{tag}]", decrypt_values(tc, rotated_low[k]), want, 1e-7)
+        check_true(
+            f"RotateHoistedNew by {k} at level 3 keeps level and scale [{tag}]",
+            rotated_low[k].level() == 3 and rotated_low[k].scale == low.scale,
+            f"level {rotated_low[k].level()}, scale 2^{math.log2(rotated_low[k].scale)}")
+
+    # A rotation without its key is an error
+    def missing_key():
+        evaluator.rotate_hoisted_new(low, [7])
+    check_raises(f"RotateHoistedNew without the rotation key [{tag}]", missing_key)
+
+
+def test_trace(tc: TestContext, tag: str):
+    # A full-degree plaintext m(X): the trace towards n slots keeps the coefficients of X^(i*N/(2n)) and
+    # cancels all the others, which is what the bootstrapping needs before CoeffsToSlots.
+    params = tc.params
+    log_n = params.logn
+    log_slots = 7
+    rotations = [1 << i for i in range(log_slots, log_n - 1)]
+    evaluator = new_test_evaluator(tc, rotations, False)
+
+    level = params.max_level()
+    n = params.n()
+    gap = n // (2 << log_slots)
+
+    # Integer coefficients of about 40 bits, written in the coefficient domain
+    plaintext = ckks.new_plaintext(params, level, params.default_scale)
+    coeffs_want = [0.0 for _ in range(n)]
+    for i in range(n):
+        value = int(float(1 << 40) * (2 * prg.random() - 1))
+        for j in range(level + 1):
+            qj = params.ring_q.modulus[j]
+            plaintext.value._buf_coeffs[j][i] = u64(value) if value >= 0 else qj - u64(-value)
+        if i % gap == 0: coeffs_want[i] = float(value)
+    params.ring_q._mm_ntt_lvl(level, plaintext.value, plaintext.value)
+
+    ciphertext = tc.encryptor.encrypt_new(plaintext)
+    traced = evaluator.trace_new(ciphertext, log_slots)
+
+    decrypted = tc.decryptor.decrypt_new(traced)
+    params.ring_q._mm_inv_ntt_lvl(level, decrypted.value, decrypted.value)
+    q0 = params.ring_q.modulus[0]
+    err = 0.0
+    for i in range(n):
+        c = decrypted.value._buf_coeffs[0][i]
+        have = float(int(c)) if c < (q0 >> u64(1)) else -float(int(q0 - c))
+        err = max(err, abs(have - coeffs_want[i]))
+    # What is left is the noise of the log2(N/2n) key switches, on coefficients of 40 bits.
+    tolerance = float(1 << 16)
+    check_true(
+        f"Trace to 2^{log_slots} slots keeps the coefficients of X^(i*{gap}) and cancels the others [{tag}]",
+        err < tolerance, f"max coefficient error {err:.1f} < {tolerance:.1f}, on coefficients up to 2^40")
+
+    # A ciphertext that is already sparse is unchanged
+    sparse_values = random_values(1 << log_slots, 1.0)
+    sparse_plaintext = ckks.new_plaintext(params, level, params.default_scale)
+    tc.encoder.encode(sparse_values, sparse_plaintext, log_slots)
+    sparse_ciphertext = tc.encryptor.encrypt_new(sparse_plaintext)
+    evaluator.trace(sparse_ciphertext, log_slots, sparse_ciphertext)
+    check_values(
+        f"Trace leaves a ciphertext of 2^{log_slots} slots unchanged [{tag}]",
+        tc.encoder.decode(tc.decryptor.decrypt_new(sparse_ciphertext), log_slots), sparse_values, 1e-6)
+
+
+# With a single special prime only the hoisted operations are tested: they are new code. The non-hoisted
+# gadget product of rlwe.codon that SwitchKeys, Relinearize, Conjugate and Rotate go through is wrong
+# above level 0 for such parameters (PN12QP109 and PN13QP218 included), with or without this port.
+def test_evaluator_additions_single_special_prime(literal: CKKSParametersLiteral, tag: str):
+    print(f"\nEvaluator additions [{tag}]")
+    tc = new_test_context(literal)
+    test_div_by_i(tc, tag)
+    test_scale_up_and_set_scale(tc, tag)
+    test_mul_by_gaussian_integer_and_add(tc, tag)
+    test_rotate_hoisted(tc, tag)
+
+
+def test_evaluator_additions(literal: CKKSParametersLiteral, tag: str):
+    print(f"\nEvaluator additions [{tag}]")
+    tc = new_test_context(literal)
+    test_switch_keys(tc, tag)
+    test_sparse_secret_switching_keys(tc, tag)
+    test_conjugate(tc, tag)
+    test_div_by_i(tc, tag)
+    test_scale_up_and_set_scale(tc, tag)
+    test_relinearize(tc, tag)
+    test_mul_by_gaussian_integer_and_add(tc, tag)
+    test_rotate_hoisted(tc, tag)
+    test_trace(tc, tag)
+
+
+# ---------------------------------------------------------------------------------------------
+# Linear transforms
+# ---------------------------------------------------------------------------------------------
+
+# The product of the matrix given by its diagonals with the vector: out[i] = sum_k diag_k[i] * values[i + k].
+def apply_diagonals(diagonals: dict[int, list[complex]], values: list[complex]) -> list[complex]:
+    slots = len(values)
+    out = [complex(0, 0) for _ in range(slots)]
+    for k in diagonals:
+        diagonal = diagonals[k]
+        for i in range(slots):
+            out[i] += diagonal[i] * values[(i + k + slots) % slots]
+    return out
+
+
+def random_diagonals(indexes: list[int], slots: int) -> dict[int, list[complex]]:
+    diagonals = dict[int, list[complex]]()
+    for k in indexes:
+        diagonals[k] = random_values(slots, 1.0)
+    return diagonals
+
+
+def test_linear_transform(tc: TestContext, tag: str):
+    params = tc.params
+    slots = params.slots()
+    level = params.max_level()
+    scale = float(params.ring_q.modulus[level])
+
+    # Naive evaluation, one hoisted rotation per diagonal
+    values = random_values(slots, 1.0)
+    diagonals = random_diagonals([-1, 0, 3], slots)
+    want = apply_diagonals(diagonals, values)
+
+    naive = lattiseq_lt.gen_linear_transform(tc.encoder, diagonals, level, scale, params.log_slots)
+    check_true(f"GenLinearTransform does not use BSGS [{tag}]", naive.n1 == 0, f"n1 = {naive.n1}")
+    evaluator = new_test_evaluator(tc, naive.rotations(), False)
+
+    ciphertext = encrypt_values(tc, values, level, params.default_scale)
+    result = evaluator.linear_transform_new(ciphertext, naive)[0]
+    check_true(
+        f"LinearTransform/Naive scale [{tag}]", result.scale == ciphertext.scale * scale,
+        f"scale 2^{math.log2(result.scale)}")
+    evaluator.rescale(result, params.default_scale, result)
+    check_values(f"LinearTransform/Naive [{tag}]", decrypt_values(tc, result), want, 1e-6)
+
+    # Only the main diagonal: no rotation at all
+    diagonal_only = random_diagonals([0], slots)
+    lt_diagonal = lattiseq_lt.gen_linear_transform(tc.encoder, diagonal_only, level, scale, params.log_slots)
+    result = evaluator.linear_transform_new(ciphertext, lt_diagonal)[0]
+    evaluator.rescale(result, params.default_scale, result)
+    check_values(
+        f"LinearTransform/Naive main diagonal only [{tag}]", decrypt_values(tc, result),
+        apply_diagonals(diagonal_only, values), 1e-6)
+
+    # Baby-step giant-step, in place, with Lattigo's test diagonals
+    indexes = [-15, -4, -1, 0, 1, 2, 3, 4, 15]
+    diagonals = random_diagonals(indexes, slots)
+    want = apply_diagonals(diagonals, values)
+
+    bsgs = lattiseq_lt.gen_linear_transform_bsgs(tc.encoder, diagonals, level, scale, 1.0, params.log_slots)
+    check_true(f"GenLinearTransformBSGS uses BSGS [{tag}]", bsgs.n1 > 0, f"n1 = {bsgs.n1}")
+    evaluator = new_test_evaluator(tc, bsgs.rotations(), False)
+    check_true(
+        f"LinearTransform/BSGS needs fewer keys than diagonals [{tag}]",
+        len(bsgs.rotations()) < len(indexes), f"{len(bsgs.rotations())} rotations for {len(indexes)} diagonals")
+
+    ciphertext = encrypt_values(tc, values, level, params.default_scale)
+    evaluator.linear_transform(ciphertext, bsgs, [ciphertext])
+    evaluator.rescale(ciphertext, params.default_scale, ciphertext)
+    check_values(f"LinearTransform/BSGS in place [{tag}]", decrypt_values(tc, ciphertext), want, 1e-6)
+
+    # BSGS on a ciphertext below the level of the matrix, into a new ciphertext
+    low = encrypt_values(tc, values, level - 2, params.default_scale)
+    result = evaluator.linear_transform_new(low, bsgs)[0]
+    check_true(f"LinearTransform/BSGS output level [{tag}]", result.level() == level - 2, f"level {result.level()}")
+    evaluator.rescale(result, params.default_scale / 4, result)
+    check_values(f"LinearTransform/BSGS at a lower level [{tag}]", decrypt_values(tc, result), want, 1e-5)
+
+    # A list of transforms shares one decomposition of the input
+    results = evaluator.linear_transform_new(encrypt_values(tc, values, level, params.default_scale), [bsgs, lt_diagonal])
+    for i in range(2): evaluator.rescale(results[i], params.default_scale, results[i])
+    check_values(f"LinearTransform list, first [{tag}]", decrypt_values(tc, results[0]), want, 1e-6)
+    check_values(
+        f"LinearTransform list, second [{tag}]", decrypt_values(tc, results[1]),
+        apply_diagonals(diagonal_only, values), 1e-6)
+
+    # Encode on a pre-allocated transform, with and without BSGS
+    for ratio in [0.0, 2.0]:
+        allocated = lattiseq_lt.new_linear_transform(params, indexes, level, params.log_slots, ratio)
+        allocated.encode(tc.encoder, diagonals, scale)
+        evaluator = new_test_evaluator(tc, allocated.rotations(), False)
+        result = evaluator.linear_transform_new(encrypt_values(tc, values, level, params.default_scale), allocated)[0]
+        evaluator.rescale(result, params.default_scale, result)
+        check_values(f"NewLinearTransform + Encode with BSGS ratio {ratio} [{tag}]", decrypt_values(tc, result), want, 1e-6)
+
+    # A missing rotation key is an error, not a wrong result
+    evaluator_without_keys = new_test_evaluator(tc, [1], False)
+    def missing_key():
+        evaluator_without_keys.linear_transform_new(encrypt_values(tc, values, level, params.default_scale), bsgs)
+    check_raises(f"LinearTransform/BSGS without its rotation keys [{tag}]", missing_key)
+
+
+def test_bsgs_index(tag: str):
+    # 9 diagonals of a 64-slot matrix. With n1 = 4 they are reached with the giant steps {0, 4, 12, 48, 60}
+    # and the baby steps {0, 1, 2, 3}: -15 = 48 + 1, -4 = 60 + 0, -1 = 60 + 3, 15 = 12 + 3.
+    diagonals = [-15, -4, -1, 0, 1, 2, 3, 4, 15]
+    index, rot_n1, rot_n2 = lattiseq_lt.bsgs_index(diagonals, 64, 4)
+    giant = sorted(rot_n1)
+    baby = sorted(rot_n2)
+    check_true(
+        f"BsgsIndex [{tag}]",
+        giant == [0, 4, 12, 48, 60] and baby == [0, 1, 2, 3] and sorted(index[60]) == [0, 3]
+        and sorted(index[0]) == [0, 1, 2, 3] and index[48] == [1] and index[12] == [3] and index[4] == [0],
+        f"giant steps {giant}, baby steps {baby}, index {index}")
+    # Ratio of baby to giant steps: 0/8 for n1 = 1, 1/6 for 2, 3/4 for 4, 5/3 for 8. The best split
+    # for a ratio of at most 1 is n1 = 4.
+    n1 = lattiseq_lt.find_best_bsgs_split(diagonals, 64, 1.0)
+    check_true(f"FindBestBSGSSplit [{tag}]", n1 == 4, f"n1 = {n1}")
+
+
+def test_linear_transforms(literal: CKKSParametersLiteral, tag: str):
+    print(f"\nLinear transforms [{tag}]")
+    tc = new_test_context(literal)
+    test_bsgs_index(tag)
+    test_linear_transform(tc, tag)
+
+
+# ---------------------------------------------------------------------------------------------
+# Polynomial evaluation
+# ---------------------------------------------------------------------------------------------
+
+def eval_monomial(coeffs: list[complex], x: complex) -> complex:
+    y = complex(0, 0)
+    for i in range(len(coeffs) - 1, -1, -1):
+        y = y * x + coeffs[i]
+    return y
+
+
+# Clenshaw-free evaluation of sum_i c_i T_i(u), with u the image of x in [-1, 1].
+def eval_chebyshev(coeffs: list[complex], a: float, b: float, x: complex) -> complex:
+    u = (complex(2, 0) * x - complex(a + b, 0)) / complex(b - a, 0)
+    t_prev = complex(1, 0)
+    t = u
+    y = coeffs[0]
+    for i in range(1, len(coeffs)):
+        y += coeffs[i] * t
+        t_next = complex(2, 0) * u * t - t_prev
+        t_prev = t
+        t = t_next
+    return y
+
+
+def test_evaluate_poly(tc: TestContext, tag: str):
+    params = tc.params
+    evaluator = new_test_evaluator(tc, [1], False)
+    slots = params.slots()
+
+    # Power basis: the Taylor expansion of exp of degree 7, as in Lattigo's test, on complex inputs
+    values = random_values(slots, 1.0)
+    coeffs = [complex(1.0 / float(math.factorial(i)), 0) for i in range(8)]
+    ciphertext = encrypt_values(tc, values, params.max_level(), params.default_scale)
+    result = evaluator.evaluate_poly(ciphertext, lattiseq_poly.new_poly(coeffs), ciphertext.scale)
+    check_values(
+        f"EvaluatePoly/Monomial exp degree 7 [{tag}]", decrypt_values(tc, result),
+        [eval_monomial(coeffs, v) for v in values], 1e-6)
+    check_true(
+        f"EvaluatePoly/Monomial level and scale [{tag}]",
+        result.level() == params.max_level() - 3 and result.scale == ciphertext.scale,
+        f"level {result.level()} from {params.max_level()}, scale 2^{math.log2(result.scale)}")
+
+    # Power basis with complex coefficients and no structure
+    coeffs = random_values(6, 1.0)
+    result = evaluator.evaluate_poly(ciphertext, lattiseq_poly.new_poly(coeffs), ciphertext.scale)
+    check_values(
+        f"EvaluatePoly/Monomial complex coefficients degree 5 [{tag}]", decrypt_values(tc, result),
+        [eval_monomial(coeffs, v) for v in values], 1e-6)
+
+    # An odd and an even polynomial take the dedicated paths
+    odd = [complex(0, 0), complex(1, 0), complex(0, 0), complex(-1.0 / 6, 0), complex(0, 0), complex(1.0 / 120, 0), complex(0, 0), complex(-1.0 / 5040, 0)]
+    result = evaluator.evaluate_poly(ciphertext, lattiseq_poly.new_poly(odd), ciphertext.scale)
+    check_values(
+        f"EvaluatePoly/Monomial odd polynomial [{tag}]", decrypt_values(tc, result),
+        [eval_monomial(odd, v) for v in values], 1e-6)
+    even = [complex(1, 0), complex(0, 0), complex(-0.5, 0), complex(0, 0), complex(1.0 / 24, 0), complex(0, 0), complex(-1.0 / 720, 0)]
+    result = evaluator.evaluate_poly(ciphertext, lattiseq_poly.new_poly(even), ciphertext.scale)
+    check_values(
+        f"EvaluatePoly/Monomial even polynomial [{tag}]", decrypt_values(tc, result),
+        [eval_monomial(even, v) for v in values], 1e-6)
+
+    # Polynomials of degree 1 and 2
+    for degree in [1, 2]:
+        coeffs = random_values(degree + 1, 1.0)
+        result = evaluator.evaluate_poly(ciphertext, lattiseq_poly.new_poly(coeffs), ciphertext.scale)
+        check_values(
+            f"EvaluatePoly/Monomial degree {degree} [{tag}]", decrypt_values(tc, result),
+            [eval_monomial(coeffs, v) for v in values], 1e-6)
+
+    # Chebyshev basis: the interpolant of sin on [-1.5, 1.5] of degree 15, as in Lattigo's test
+    def sine(x: complex) -> complex:
+        return complex(math.sin(x.real), 0.0)
+    real_values = random_real_values(slots, 1.0)
+    poly = lattiseq_poly.approximate(sine, -1.5, 1.5, 15)
+    ciphertext = encrypt_values(tc, real_values, params.max_level(), params.default_scale)
+    evaluator.mul_const(ciphertext, 2.0 / (poly.b - poly.a), ciphertext)
+    evaluator.add_const(ciphertext, (-poly.a - poly.b) / (poly.b - poly.a), ciphertext)
+    evaluator.rescale(ciphertext, params.default_scale, ciphertext)
+    result = evaluator.evaluate_poly(ciphertext, poly, ciphertext.scale)
+    decrypted = decrypt_values(tc, result)
+    check_values(
+        f"EvaluatePoly/Chebyshev agrees with the polynomial in the clear [{tag}]", decrypted,
+        [eval_chebyshev(poly.coeffs, poly.a, poly.b, v) for v in real_values], 1e-6)
+    check_values(
+        f"EvaluatePoly/Chebyshev sin degree 15 [{tag}]", decrypted,
+        [complex(math.sin(v.real), 0) for v in real_values], 1e-6)
+
+    # Chebyshev basis on a shifted interval [1, 3] with an odd degree
+    def inverse(x: complex) -> complex:
+        return complex(1.0 / x.real, 0.0)
+    shifted_values = [complex(2.0 + 0.9 * v.real, 0) for v in real_values]
+    poly = lattiseq_poly.approximate(inverse, 1.0, 3.0, 31)
+    ciphertext = encrypt_values(tc, shifted_values, params.max_level(), params.default_scale)
+    evaluator.mul_const(ciphertext, 2.0 / (poly.b - poly.a), ciphertext)
+    evaluator.add_const(ciphertext, (-poly.a - poly.b) / (poly.b - poly.a), ciphertext)
+    evaluator.rescale(ciphertext, params.default_scale, ciphertext)
+    result = evaluator.evaluate_poly(ciphertext, poly, ciphertext.scale)
+    check_values(
+        f"EvaluatePoly/Chebyshev 1/x on [1, 3] degree 31 [{tag}]", decrypt_values(tc, result),
+        [eval_chebyshev(poly.coeffs, poly.a, poly.b, v) for v in shifted_values], 1e-5)
+
+    # Not enough levels is an error
+    low = encrypt_values(tc, values, 2, params.default_scale)
+    def not_enough_levels():
+        evaluator.evaluate_poly(low, lattiseq_poly.new_poly([complex(1.0 / float(i + 1), 0) for i in range(16)]), low.scale)
+    check_raises(f"EvaluatePoly without enough levels [{tag}]", not_enough_levels)
+
+
+def test_chebyshev_interpolation(tag: str):
+    def cosine(x: complex) -> complex:
+        return complex(math.cos(x.real), 0.0)
+    poly = lattiseq_poly.approximate(cosine, -2.0, 3.0, 20)
+    err = 0.0
+    for i in range(101):
+        x = -2.0 + 5.0 * float(i) / 100.0
+        err = max(err, abs(eval_chebyshev(poly.coeffs, poly.a, poly.b, complex(x, 0)) - complex(math.cos(x), 0)))
+    check_true(
+        f"Approximate cos on [-2, 3] with degree 20 [{tag}]",
+        err < 1e-12 and poly.degree() == 20 and poly.basis_type == lattiseq_poly.CHEBYSHEV,
+        f"max error {err} on 101 points, degree {poly.degree()}")
+
+    check_true(
+        f"Polynomial depth [{tag}]",
+        poly.depth() == 5 and lattiseq_poly.new_poly([complex(1, 0) for _ in range(8)]).depth() == 3,
+        f"degree 20 -> {poly.depth()} levels, degree 7 -> 3 levels")
+
+
+def test_polynomial_evaluation(literal: CKKSParametersLiteral, tag: str):
+    print(f"\nPolynomial evaluation [{tag}]")
+    tc = new_test_context(literal)
+    test_chebyshev_interpolation(tag)
+    test_evaluate_poly(tc, tag)
+
+
+# ---------------------------------------------------------------------------------------------
+# CoeffsToSlots, SlotsToCoeffs and EvalMod
+# ---------------------------------------------------------------------------------------------
+
+# Encodes real values as the coefficients of the plaintext polynomial (Lattigo's EncodeCoeffs).
+def encode_coeffs(tc: TestContext, values: list[float], level: int, scale: float) -> ckks.Plaintext:
+    params = tc.params
+    plaintext = ckks.new_plaintext(params, level, scale)
+    for i in range(len(values)):
+        v = int(round(values[i] * scale))
+        for j in range(level + 1):
+            qj = params.ring_q.modulus[j]
+            if v >= 0:
+                plaintext.value._buf_coeffs[j][i] = u64(v).__naive_mod(qj)
+            else:
+                plaintext.value._buf_coeffs[j][i] = (qj - u64(-v).__naive_mod(qj)).__naive_mod(qj)
+    params.ring_q._mm_ntt_lvl(level, plaintext.value, plaintext.value)
+    return plaintext
+
+
+# Reads the coefficients of the plaintext polynomial as real values (Lattigo's DecodeCoeffs).
+# Valid as long as the scaled coefficients are smaller than Q0 / 2.
+def decode_coeffs(tc: TestContext, plaintext: ckks.Plaintext) -> list[float]:
+    params = tc.params
+    level = plaintext.level()
+    buff = params.ring_q.new_poly_lvl(level)
+    params.ring_q._mm_inv_ntt_lvl(level, plaintext.value, buff)
+    q0 = params.ring_q.modulus[0]
+    values = list[float](params.n())
+    for c in buff._buf_coeffs[0]:
+        values.append((float(int(c)) if c < (q0 >> u64(1)) else -float(int(q0 - c))) / plaintext.scale)
+    return values
+
+
+# The parameters of Lattigo's homomorphic encoding test: logN=13, Q of 60 + 3 x 45 bits, P of 2 x 61 bits.
+def test_literal_encoding(log_slots: int) -> CKKSParametersLiteral:
+    literal = CKKSParametersLiteral(
+        logn=13,
+        q=[u64(0x10000000006e0001), u64(0x2000000a0001), u64(0x2000000e0001), u64(0x1fffffc20001)],
+        p=[u64(0x1fffffffffe00001), u64(0x1fffffffffc80001)],
+        log_slots=log_slots,
+        default_scale=float(1 << 45))
+    literal.h = 192
+    return literal
+
+
+def encoding_matrix_literal(params: ckks.Parameters, lt_type: int, scaling: float, depth: int) -> advanced.EncodingMatrixLiteral:
+    max_level = params.max_level()
+    scaling_factor = [[float(params.ring_q.modulus[max_level - depth + 1 + i])] for i in range(depth)]
+    return advanced.EncodingMatrixLiteral(
+        linear_transform_type=lt_type,
+        repack_imag_2_real=True,
+        level_start=max_level,
+        bsgs_ratio=16.0,
+        bit_reversed=False,
+        scaling_factor=scaling_factor,
+        logn=params.logn,
+        log_slots=params.log_slots,
+        scaling=scaling)
+
+
+def bit_reverse(values: list[complex]) -> list[complex]:
+    out = [v for v in values]
+    ckks.slice_bit_reverse_in_place_complex128(out, len(out))
+    return out
+
+
+def test_coeffs_to_slots(tc: TestContext, tag: str, depth: int):
+    # This test tests the homomorphic encoding
+    # It first generates a vector of complex values of size params.slots()
+    #
+    # vReal + i*vImag
+    #
+    # Then encode coefficient-wise and encrypts the vectors :
+    #
+    # Enc(bitReverse(vReal)||bitReverse(vImg))
+    #
+    # And applies the homomorphic Encoding (will merge both vectors if there was two)
+    #
+    # Enc(iFFT(vReal+ i*vImag))
+    #
+    # And returns the result in one ciphextext if the ciphertext can store it else in two ciphertexts
+    #
+    # Enc(Ecd(vReal) || Ecd(vImag)) or Enc(Ecd(vReal)) and Enc(Ecd(vImag))
+    #
+    # Then checks that Dcd(Dec(Enc(Ecd(vReal)))) = vReal and Dcd(Dec(Enc(Ecd(vImag)))) = vImag
+    params = tc.params
+    slots = params.slots()
+    sparse = params.log_slots < params.logn - 1
+
+    literal = encoding_matrix_literal(params, advanced.COEFFS_TO_SLOTS, 1.0 / float(2 * slots), depth)
+    matrices = advanced.new_homomorphic_encoding_matrix_from_literal(literal, tc.encoder)
+    rotations = literal.rotations()
+    evaluator = new_test_evaluator(tc, rotations, True)
+
+    # Every rotation the matrices ask for is in the list the literal announces
+    missing = 0
+    for matrix in matrices.matrices:
+        for k in matrix.rotations():
+            if k != 0 and k not in rotations: missing += 1
+    check_true(
+        f"CoeffsToSlots rotations [{tag}]", missing == 0 and len(matrices.matrices) == depth,
+        f"{len(matrices.matrices)} matrices, {len(rotations)} rotation keys, {missing} rotations not announced")
+
+    values = random_values(slots, 1.0)
+    values_real = [complex(v.real, 0) for v in values]
+    values_imag = [complex(v.imag, 0) for v in values]
+
+    # Applies bit-reverse on the original complex vector, maps to a float vector, adds gaps if sparse packing
+    reversed_values = bit_reverse(values)
+    values_float = [0.0 for _ in range(params.n())]
+    gap = params.n() // (2 * slots)
+    for i in range(slots):
+        values_float[i * gap] = reversed_values[i].real
+        values_float[(params.n() >> 1) + i * gap] = reversed_values[i].imag
+
+    # Encodes coefficient-wise and encrypts the test vector
+    ciphertext = tc.encryptor.encrypt_new(encode_coeffs(tc, values_float, params.max_level(), params.default_scale))
+
+    # Applies the homomorphic DFT
+    ct_0, ct_1 = evaluator.coeffs_to_slots_new(ciphertext, matrices)
+
+    check_true(
+        f"CoeffsToSlots level and scale [{tag}]",
+        ct_0.level() == params.max_level() - depth and ct_0.scale == params.default_scale and bool(ct_1) == (not sparse),
+        f"level {ct_0.level()} from {params.max_level()}, scale 2^{math.log2(ct_0.scale)}, second ciphertext: {bool(ct_1)}")
+
+    # Checks against the original coefficients
+    if sparse:
+        real_imag = tc.encoder.decode(tc.decryptor.decrypt_new(ct_0), params.log_slots + 1)
+        check_values(f"CoeffsToSlots real part [{tag}]", real_imag[:slots], values_real, 1e-7)
+        check_values(f"CoeffsToSlots imaginary part [{tag}]", real_imag[slots:2 * slots], values_imag, 1e-7)
+    else:
+        check_values(f"CoeffsToSlots real part [{tag}]", decrypt_values(tc, ct_0), values_real, 1e-7)
+        check_values(f"CoeffsToSlots imaginary part [{tag}]", decrypt_values(tc, ct_1), values_imag, 1e-7)
+
+
+def test_slots_to_coeffs(tc: TestContext, tag: str, depth: int):
+    # This test tests the homomorphic decoding
+    # It first generates a complex vector of size 2*slots
+    # if 2*slots == N, then two vectors are generated, one for the real part, one for the imaginary part :
+    #
+    # vReal and vReal (both floating point vectors because the encoding always result in a real vector)
+    #
+    # Then encode and encrypts the vectors :
+    #
+    # Enc(Ecd(vReal)) and Enc(Ecd(vImag))
+    #
+    # And applies the homomorphic decoding (will merge both vectors if there was two)
+    #
+    # Enc(FFT(Ecd(vReal) + i*Ecd(vImag)))
+    #
+    # The result should be the decoding of the initial vectors bit-reversed
+    #
+    # Enc(FFT(Ecd(vReal) + i*Ecd(vImag))) = Enc(BitReverse(Dcd(Ecd(vReal + i*vImag))))
+    #
+    # The first N/2 slots of the plaintext will be the real part while the last N/2 the imaginary part
+    # In case of 2*slots < N, then there is a gap of N/(2*slots) between each values
+    params = tc.params
+    slots = params.slots()
+    sparse = params.log_slots < params.logn - 1
+
+    literal = encoding_matrix_literal(params, advanced.SLOTS_TO_COEFFS, 1.0, depth)
+    matrices = advanced.new_homomorphic_encoding_matrix_from_literal(literal, tc.encoder)
+    rotations = literal.rotations()
+    evaluator = new_test_evaluator(tc, rotations, True)
+
+    missing = 0
+    for matrix in matrices.matrices:
+        for k in matrix.rotations():
+            if k != 0 and k not in rotations: missing += 1
+    check_true(
+        f"SlotsToCoeffs rotations [{tag}]", missing == 0 and len(matrices.matrices) == depth,
+        f"{len(matrices.matrices)} matrices, {len(rotations)} rotation keys, {missing} rotations not announced")
+
+    values_real = random_real_values(slots, 1.0)
+    values_imag = random_real_values(slots, 1.0)
+    want = [complex(values_real[i].real, values_imag[i].real) for i in range(slots)]
+
+    # Encodes and encrypts the test vectors. If sparse, there there is the space to store both vectors in one
+    plaintext = ckks.new_plaintext(params, params.max_level(), params.default_scale)
+    ct_1 = ckks.Ciphertext()
+    if sparse:
+        tc.encoder.encode(want, plaintext, params.log_slots + 1)
+        ct_0 = tc.encryptor.encrypt_new(plaintext)
+    else:
+        tc.encoder.encode(values_real, plaintext, params.log_slots)
+        ct_0 = tc.encryptor.encrypt_new(plaintext)
+        tc.encoder.encode(values_imag, plaintext, params.log_slots)
+        ct_1 = tc.encryptor.encrypt_new(plaintext)
+
+    # Applies the homomorphic DFT
+    result = evaluator.slots_to_coeffs_new(ct_0, ct_1, matrices)
+
+    check_true(
+        f"SlotsToCoeffs level and scale [{tag}]",
+        result.level() == params.max_level() - depth and result.scale == params.default_scale,
+        f"level {result.level()} from {params.max_level()}, scale 2^{math.log2(result.scale)}")
+
+    # Decrypt and decode in the coefficient domain, extracts the coefficients and construct the complex vector
+    coeffs_float = decode_coeffs(tc, tc.decryptor.decrypt_new(result))
+    gap = params.n() // (2 * slots)
+    values_test = [complex(coeffs_float[i * gap], coeffs_float[i * gap + (params.n() >> 1)]) for i in range(slots)]
+
+    # Result is bit-reversed, so applies the bit-reverse permutation on the reference vector
+    check_values(f"SlotsToCoeffs [{tag}]", values_test, bit_reverse(want), 1e-7)
+
+    # A ciphertext below the level of the matrices is an error
+    def below_level_start():
+        evaluator.slots_to_coeffs_new(evaluator.drop_level_new(ct_0, 1), ct_1, matrices)
+    check_raises(f"SlotsToCoeffs below the starting level [{tag}]", below_level_start)
+
+
+def test_homomorphic_encoding(log_slots: int, tag: str):
+    print(f"\nHomomorphic encoding [{tag}]")
+    tc = new_test_context(test_literal_encoding(log_slots))
+    test_coeffs_to_slots(tc, tag, 3)
+    test_slots_to_coeffs(tc, tag, 3)
+    test_coeffs_to_slots(tc, tag + ", 2 matrices", 2)
+    test_slots_to_coeffs(tc, tag + ", 2 matrices", 2)
+
+
+# The moduli of Lattigo's homomorphic modular reduction test, in a smaller ring:
+# Q0 of 55 bits, 12 moduli of 60 bits for EvalMod, one of 53 bits for the normalization.
+def test_literal_eval_mod() -> CKKSParametersLiteral:
+    literal = CKKSParametersLiteral(
+        logn=12,
+        q=[u64(0x80000000080001), u64(0xffffffffffc0001), u64(0x10000000006e0001), u64(0xfffffffff840001),
+           u64(0x1000000000860001), u64(0xfffffffff6a0001), u64(0x1000000000980001), u64(0xfffffffff5a0001),
+           u64(0x1000000000b00001), u64(0x1000000000ce0001), u64(0xfffffffff2a0001), u64(0xfffffffff240001),
+           u64(0x1000000000f00001), u64(0x200000000e0001)],
+        p=[u64(0x1fffffffffe00001), u64(0x1fffffffffc80001), u64(0x1fffffffffb40001), u64(0x1fffffffff500001), u64(0x1fffffffff420001)],
+        log_slots=11,
+        default_scale=float(1 << 45))
+    literal.h = 192
+    return literal
+
+
+def test_eval_mod_case(
+        tc: TestContext, evaluator: ckks.Evaluator, evm: advanced.EvalModLiteral, name: str, tag: str,
+        approximation_error: float, min_precision: float):
+    params = tc.params
+    slots = params.slots()
+    eval_mod_poly = advanced.new_eval_mod_poly_from_literal(evm)
+
+    # Values I * Q + m: a multiple of the (scaled) modulus with |I| < K, plus a message |m| <= 1
+    k = float(evm.k - 1)
+    q = evm.q_diff() * evm.message_ratio
+    values = [complex(float(round((2 * prg.random() - 1) * k)) * q + (2 * prg.random() - 1), 0) for _ in range(slots)]
+    values[0] = complex(k * q + 0.5, 0)
+    ciphertext = encrypt_values(tc, values, params.max_level(), params.default_scale)
+
+    scale = math.pow(2.0, float(round(math.log2(float(evm.q) / evm.message_ratio))))
+
+    # Scale the message to Delta = Q/MessageRatio
+    evaluator.scale_up(ciphertext, float(round(scale / ciphertext.scale)), ciphertext)
+
+    # Scale the message up to Sine/MessageRatio
+    evaluator.scale_up(ciphertext, float(round((evm.scaling_factor / evm.message_ratio) / ciphertext.scale)), ciphertext)
+
+    # Normalization
+    evaluator.mul_const(ciphertext, 1.0 / (float(evm.k) * evm.q_diff()), ciphertext)
+    evaluator.rescale(ciphertext, params.default_scale, ciphertext)
+    scale_before = ciphertext.scale
+
+    # EvalMod
+    result = evaluator.eval_mod_new(ciphertext, eval_mod_poly)
+
+    check_true(
+        f"EvalMod/{name} level and scale [{tag}]",
+        result.level() == evm.level_start - evm.depth() and result.scale == scale_before,
+        f"level {result.level()} = {evm.level_start} - {evm.depth()}, scale 2^{math.log2(result.scale)}")
+
+    # 1. Against the same circuit evaluated in the clear, on the values the ciphertext held when it
+    #    entered EvalMod: this is what the homomorphic evaluation has to reproduce, up to its noise.
+    entering = [v / complex(float(evm.k) * evm.q_diff(), 0) for v in values]
+    clear = [eval_mod_clear(evm, eval_mod_poly, v, scale_before) for v in entering]
+    decrypted = decrypt_values(tc, result)
+    check_values(f"EvalMod/{name} against the circuit in the clear [{tag}]", decrypted, clear, 1e-6)
+
+    # 2. Against the modular reduction itself: what is left of each value once the multiple of Q is
+    #    removed. The circuit only approximates it; approximation_error bounds how far it may be for a
+    #    message |m| <= 1 = Q / MessageRatio, the largest the parameters are meant for.
+    reduced = [v - complex(q * float(round(v.real / q)), 0) for v in values]
+    precision_real, _ = mean_precision(decrypted, reduced)
+    check_values(f"EvalMod/{name} against the modular reduction [{tag}]", decrypted, reduced, approximation_error)
+    check_true(
+        f"EvalMod/{name} precision [{tag}]", precision_real >= min_precision,
+        f"{precision_real:.2f} bits of mean precision, at least {min_precision} required")
+
+
+# The EvalMod circuit in the clear: the same polynomials, the same double angle formula, on a float.
+# x is the value the ciphertext holds when it enters EvalMod, at the scale scale_before.
+def eval_mod_clear(evm: advanced.EvalModLiteral, eval_mod_poly: advanced.EvalModPoly, x: complex, scale_before: float) -> complex:
+    # The scale is relabelled to the scaling factor: the value shrinks by scale_before / scaling_factor
+    ratio = evm.scaling_factor / scale_before
+    u = x / complex(ratio, 0)
+
+    sine_poly = eval_mod_poly.sine_poly
+    if evm.sine_type == advanced.COS1 or evm.sine_type == advanced.COS2:
+        u += complex(-0.5 / (eval_mod_poly.sc_fac() * (sine_poly.b - sine_poly.a)), 0)
+
+    # The input is the Chebyshev variable itself: the change of basis is folded into the normalization by 1 / K
+    t_prev = complex(1, 0)
+    t = u
+    y = sine_poly.coeffs[0]
+    for i in range(1, len(sine_poly.coeffs)):
+        y += sine_poly.coeffs[i] * t
+        t_next = complex(2, 0) * u * t - t_prev
+        t_prev = t
+        t = t_next
+
+    sqrt_2pi = eval_mod_poly.sqrt_2pi
+    for _ in range(evm.double_angle):
+        sqrt_2pi *= sqrt_2pi
+        y = complex(2, 0) * y * y - complex(sqrt_2pi, 0)
+
+    if eval_mod_poly.arcsine_poly is not None:
+        y = eval_monomial(unwrap(eval_mod_poly.arcsine_poly).coeffs, y)
+
+    return y * complex(ratio, 0)
+
+
+def test_eval_mod(tag: str):
+    print(f"\nHomomorphic modular reduction [{tag}]")
+    tc = new_test_context(test_literal_eval_mod())
+    evaluator = new_test_evaluator(tc, [1], False)
+
+    # Lattigo's two test cases, with its requirement of 15 bits of mean precision
+    test_eval_mod_case(tc, evaluator, advanced.EvalModLiteral(
+        q=u64(0x80000000080001), level_start=12, scaling_factor=float(1 << 60), sine_type=advanced.SIN,
+        message_ratio=256.0, k=14, sine_deg=127, double_angle=0, arcsine_deg=7), "SineChebyshevWithArcSine", tag, 1e-6, 15.0)
+
+    test_eval_mod_case(tc, evaluator, advanced.EvalModLiteral(
+        q=u64(0x80000000080001), level_start=12, scaling_factor=float(1 << 60), sine_type=advanced.COS1,
+        message_ratio=256.0, k=10, sine_deg=31, double_angle=2, arcsine_deg=7), "CosOptimizedChebyshevWithArcSine", tag, 1e-6, 15.0)
+
+    # The configuration of the default bootstrapping parameters: no arcsine, three double angles, and the
+    # smallest degree K = 16 allows. Without the arcsine the circuit returns (Q / 2 pi) sin(2 pi m / Q), off
+    # the reduction m by m (2 pi m / Q)^2 / 6 = 1.0e-4 for the largest message; the interpolation adds 1e-5.
+    sine_error = (6.283185307179586 / 256.0) ** 2 / 6.0
+    test_eval_mod_case(tc, evaluator, advanced.EvalModLiteral(
+        q=u64(0x80000000080001), level_start=12, scaling_factor=float(1 << 60), sine_type=advanced.COS1,
+        message_ratio=256.0, k=16, sine_deg=30, double_angle=3, arcsine_deg=0), "CosOptimizedChebyshev", tag, 1.2 * sine_error, 14.0)
+
+    test_eval_mod_case(tc, evaluator, advanced.EvalModLiteral(
+        q=u64(0x80000000080001), level_start=12, scaling_factor=float(1 << 60), sine_type=advanced.COS2,
+        message_ratio=256.0, k=12, sine_deg=63, double_angle=2, arcsine_deg=0), "CosChebyshev", tag, 1.2 * sine_error, 14.0)
+
+    # Errors: a ciphertext below the starting level, and the double angle formula with a sine
+    low = encrypt_values(tc, random_real_values(tc.params.slots(), 1.0), 5, tc.params.default_scale)
+    poly = advanced.new_eval_mod_poly_from_literal(advanced.EvalModLiteral(
+        q=u64(0x80000000080001), level_start=12, scaling_factor=float(1 << 60), sine_type=advanced.COS1,
+        message_ratio=256.0, k=16, sine_deg=30, double_angle=3, arcsine_deg=0))
+    def below_level_start():
+        evaluator.eval_mod_new(low, poly)
+    check_raises(f"EvalMod below the starting level [{tag}]", below_level_start)
+    def sine_with_double_angle():
+        advanced.new_eval_mod_poly_from_literal(advanced.EvalModLiteral(
+            q=u64(0x80000000080001), level_start=12, scaling_factor=float(1 << 60), sine_type=advanced.SIN,
+            message_ratio=256.0, k=14, sine_deg=127, double_angle=2, arcsine_deg=0))
+    check_raises(f"EvalMod sine with double angle [{tag}]", sine_with_double_angle)
+
+
+def test_eval_mod_literal(tag: str):
+    evm = advanced.EvalModLiteral(
+        q=u64(0x10000000006e0001), level_start=20, scaling_factor=float(1 << 60), sine_type=advanced.COS1,
+        message_ratio=256.0, k=16, sine_deg=30, double_angle=3, arcsine_deg=0)
+    # 0x10000000006e0001 / 2^60
+    check_true(
+        f"EvalModLiteral depth and QDiff [{tag}]",
+        evm.depth() == 8 and abs(evm.q_diff() - 1.0000000000062528) < 1e-15,
+        f"depth {evm.depth()} (5 for degree 31, 3 double angles), QDiff {evm.q_diff()}")
+    evm.arcsine_deg = 7
+    evm.sine_type = advanced.SIN
+    evm.sine_deg = 127
+    evm.double_angle = 0
+    check_true(f"EvalModLiteral depth with arcsine [{tag}]", evm.depth() == 10, f"depth {evm.depth()} (7 for degree 127, 3 for degree 7)")
+
+
+# ---------------------------------------------------------------------------------------------
+# Bootstrapping
+# ---------------------------------------------------------------------------------------------
+
+# Lattigo's bootstrapping test requires 12 bits of mean precision on the real and on the imaginary part.
+BOOTSTRAP_MIN_PRECISION: float = 12.0
+
+
+class BootstrapContext:
+    tc: TestContext
+    btp_params: bootstrapping.Parameters
+    evk: bootstrapping.EvaluationKeys
+    btp: bootstrapping.Bootstrapper
+
+
+# Keys and bootstrapper for a parameter set. With original = True the main secret takes the Hamming weight
+# of the ephemeral secret and no ephemeral secret is used (the bootstrapping without encapsulation), as in
+# Lattigo's test.
+def new_bootstrap_context(literal: btp_default.DefaultParametersLiteral, original: bool) -> BootstrapContext:
+    scheme_params = literal.scheme_params
+    btp_params = literal.bootstrapping_params
+
+    if original:
+        scheme_params.h = btp_params.ephemeral_secret_weight
+        btp_params.ephemeral_secret_weight = 0
+
+    tc = new_test_context(scheme_params)
+    evk = bootstrapping.gen_evaluation_keys(btp_params, tc.params, tc.sk)
+    btp = bootstrapping.new_bootstrapper(tc.params, btp_params, evk)
+
+    return BootstrapContext(tc=tc, btp_params=btp_params, evk=evk, btp=btp)
+
+
+# Lattigo's test vector: uniform complex values in [-1, 1], with the first four set to a fixed value.
+def bootstrap_test_values(slots: int) -> list[complex]:
+    values = random_values(slots, 1.0)
+    for i in range(min(4, slots)):
+        values[i] = complex(0.9238795325112867, 0.3826834323650898)
+    return values
+
+
+# Checks a bootstrapped ciphertext against the values it must hold: level, precision as Lattigo
+# measures it, and the largest error on a slot.
+# The precision required is the 12 bits of Lattigo's test or, when given, the precision Lattigo v4.0.0
+# itself reaches on the same parameters and the same kind of input (reference_precision) minus one bit.
+def check_bootstrapped(
+        bc: BootstrapContext, name: str, ciphertext: ckks.Ciphertext, want: list[complex], tolerance: float,
+        reference_precision: float = 0.0):
+    have = decrypt_values(bc.tc, ciphertext)
+    precision_real, precision_imag = mean_precision(have, want)
+    required = max(BOOTSTRAP_MIN_PRECISION, reference_precision - 1.0)
+    check_true(
+        f"{name}: output level", ciphertext.level() == bc.btp.output_level(),
+        f"level {ciphertext.level()}, expected {bc.btp.output_level()} of {bc.tc.params.max_level()}")
+    check_true(
+        f"{name}: precision", precision_real >= required and precision_imag >= required,
+        f"mean precision {precision_real:.2f} bits (real) and {precision_imag:.2f} bits (imaginary), at least {required:.2f} required")
+    check_values(f"{name}: values", have, want, tolerance)
+
+
+def test_bootstrap_full_circuit(
+        bc: BootstrapContext, tag: str, default_scale_expected: bool, tolerance: float, reference_precision: float):
+    params = bc.tc.params
+    values = bootstrap_test_values(params.slots())
+
+    # As in Lattigo: a ciphertext at level 0 and at the default scale
+    ciphertext = encrypt_values(bc.tc, values, 0, params.default_scale)
+    start = time.time()
+    bootstrapped = bc.btp.bootstrap(ciphertext)
+    elapsed = time.time() - start
+
+    check_bootstrapped(bc, f"Bootstrap [{tag}]", bootstrapped, values, tolerance, reference_precision)
+    check_true(
+        f"Bootstrap [{tag}]: output scale",
+        abs(bootstrapped.scale / bc.btp.output_scale() - 1.0) < 1e-12 and (bootstrapped.scale == params.default_scale or not default_scale_expected),
+        f"scale 2^{math.log2(bootstrapped.scale)}, expected 2^{math.log2(bc.btp.output_scale())}, default scale 2^{math.log2(params.default_scale)}")
+    check_true(
+        f"Bootstrap [{tag}]: the input is left as it was",
+        ciphertext.level() == 0 and ciphertext.scale == params.default_scale and max_error(decrypt_values(bc.tc, ciphertext), values) < tolerance,
+        f"level {ciphertext.level()}, scale 2^{math.log2(ciphertext.scale)}")
+    print(f"Bootstrap [{tag}] took {elapsed:.2f}s")
+
+
+def test_bootstrap_input_levels_and_scales(bc: BootstrapContext, tag: str):
+    params = bc.tc.params
+    values = bootstrap_test_values(params.slots())
+
+    # Above level 0 one level is spent to bring the ciphertext to the scale the circuit wants: the scale
+    # of the input is free, and the output is at the default scale exactly.
+    for level in [1, 2, params.max_level()]:
+        for scale in [params.default_scale, params.default_scale * 0.87654321, params.default_scale * 3.3]:
+            ciphertext = encrypt_values(bc.tc, values, level, scale)
+            bootstrapped = bc.btp.bootstrap(ciphertext)
+            name = f"Bootstrap from level {level} and scale 2^{math.log2(scale):.3f} [{tag}]"
+            check_bootstrapped(bc, name, bootstrapped, values, 1e-6)
+            check_true(
+                f"{name}: output scale", bootstrapped.scale == params.default_scale,
+                f"scale 2^{math.log2(bootstrapped.scale)}, default scale 2^{math.log2(params.default_scale)}")
+
+    # At level 0 the plaintext can only be multiplied by an integer. With a scale that is not a power of two
+    # the scale inside the circuit is then slightly off the nominal one. The output scale records it (Lattigo
+    # returns the default scale and values that are off by that ratio).
+    scale = params.default_scale * 1.00007
+    ciphertext = encrypt_values(bc.tc, values, 0, scale)
+    bootstrapped = bc.btp.bootstrap(ciphertext)
+    name = f"Bootstrap from level 0 and scale 2^{math.log2(scale):.6f} [{tag}]"
+    check_bootstrapped(bc, name, bootstrapped, values, 1e-6)
+    ratio = bootstrapped.scale / params.default_scale
+    integer_factor = float(round(bc.btp.q0_over_message_ratio / scale))
+    expected_ratio = scale * integer_factor / bc.btp.q0_over_message_ratio
+    check_true(
+        f"{name}: output scale", abs(ratio - expected_ratio) < 1e-12 and abs(ratio - 1.0) > 1e-6,
+        f"output scale / default scale = {ratio}, expected scale * {integer_factor} / (Q0 / message ratio) = {expected_ratio}")
+
+    # A scale above Q0 / message ratio at level 0 is an error
+    too_large = encrypt_values(bc.tc, values, 0, bc.btp.q0_over_message_ratio * 2)
+    def scale_too_large():
+        bc.btp.bootstrap(too_large)
+    check_raises(f"Bootstrap of a level 0 ciphertext with a scale above Q0 / message ratio [{tag}]", scale_too_large)
+
+
+def test_bootstrap_cycles(bc: BootstrapContext, tag: str, stop_level: int):
+    # Spends every level the bootstrapping gives back, bootstraps, and starts again, four times over.
+    # Each level is spent on a multiplication by values of modulus 1, so that the vector stays in the range
+    # of the bootstrapping; the first one of each cycle is a ciphertext-ciphertext multiplication.
+    params = bc.tc.params
+    evaluator = bc.btp.evaluator
+    slots = params.slots()
+    cycles = 4
+
+    def unit_values(n: int) -> list[complex]:
+        out = list[complex](n)
+        for _ in range(n):
+            angle = 6.283185307179586 * prg.random()
+            out.append(complex(math.cos(angle), math.sin(angle)))
+        return out
+
+    want = bootstrap_test_values(slots)
+    ciphertext = encrypt_values(bc.tc, want, stop_level, params.default_scale)
+    errors = list[float]()
+
+    for cycle in range(cycles):
+        refreshed = bc.btp.bootstrap(ciphertext)
+        check_bootstrapped(bc, f"Bootstrap cycle {cycle + 1} of {cycles}, from level {stop_level} [{tag}]", refreshed, want, 1e-5)
+        errors.append(max_error(decrypt_values(bc.tc, refreshed), want))
+
+        # Ciphertext-ciphertext multiplication
+        factor = unit_values(slots)
+        encrypted_factor = encrypt_values(bc.tc, factor, refreshed.level(), params.default_scale)
+        evaluator.mul_relin(refreshed, encrypted_factor, True, refreshed)
+        evaluator.rescale(refreshed, params.default_scale, refreshed)
+        want = [want[i] * factor[i] for i in range(slots)]
+
+        # Ciphertext-plaintext multiplications down to stop_level
+        while refreshed.level() > stop_level:
+            level = refreshed.level()
+            factor = unit_values(slots)
+            plaintext = ckks.new_plaintext(params, level, float(params.ring_q.modulus[level]))
+            bc.tc.encoder.encode(factor, plaintext, params.log_slots)
+            evaluator.mul_relin(refreshed, plaintext, True, refreshed)
+            evaluator.rescale(refreshed, params.default_scale, refreshed)
+            want = [want[i] * factor[i] for i in range(slots)]
+
+        check_true(
+            f"Cycle {cycle + 1} of {cycles}: levels spent [{tag}]", refreshed.level() == stop_level,
+            f"level {refreshed.level()}, scale 2^{math.log2(refreshed.scale):.6f}")
+        check_values(f"Cycle {cycle + 1} of {cycles}: values before the next bootstrap [{tag}]", decrypt_values(bc.tc, refreshed), want, 1e-5)
+        ciphertext = refreshed.copy()
+
+    final = bc.btp.bootstrap(ciphertext)
+    check_bootstrapped(bc, f"Bootstrap after {cycles} cycles, from level {stop_level} [{tag}]", final, want, 1e-5)
+    errors.append(max_error(decrypt_values(bc.tc, final), want))
+
+    # No drift: the error after the last bootstrap is of the order of the error after the first one
+    check_true(
+        f"No drift over {cycles} cycles from level {stop_level} [{tag}]", errors[cycles] < 1e-5 and errors[cycles] < 20 * errors[0] + 1e-7,
+        f"max error after each bootstrap: {errors}")
+
+
+def test_multiplication_after_bootstrap(bc: BootstrapContext, tag: str):
+    params = bc.tc.params
+    evaluator = bc.btp.evaluator
+    slots = params.slots()
+    values_0 = bootstrap_test_values(slots)
+    values_1 = random_values(slots, 1.0)
+
+    bootstrapped_0 = bc.btp.bootstrap(encrypt_values(bc.tc, values_0, 0, params.default_scale))
+    bootstrapped_1 = bc.btp.bootstrap(encrypt_values(bc.tc, values_1, 0, params.default_scale))
+
+    # Two bootstrapped ciphertexts
+    product = evaluator.mul_relin_new(bootstrapped_0, bootstrapped_1)
+    evaluator.rescale(product, params.default_scale, product)
+    check_values(
+        f"Multiplication of two bootstrapped ciphertexts [{tag}]", decrypt_values(bc.tc, product),
+        [values_0[i] * values_1[i] for i in range(slots)], 1e-6)
+    check_true(
+        f"Multiplication of two bootstrapped ciphertexts: level [{tag}]", product.level() == bc.btp.output_level() - 1,
+        f"level {product.level()}")
+
+    # A bootstrapped ciphertext, squared twice, then with a fresh ciphertext and with a rotation
+    square = evaluator.mul_relin_new(bootstrapped_0, bootstrapped_0)
+    evaluator.rescale(square, params.default_scale, square)
+    fourth = evaluator.mul_relin_new(square, square)
+    evaluator.rescale(fourth, params.default_scale, fourth)
+    fresh = encrypt_values(bc.tc, values_1, fourth.level(), params.default_scale)
+    mixed = evaluator.mul_relin_new(fourth, fresh)
+    evaluator.rescale(mixed, params.default_scale, mixed)
+    check_values(
+        f"Bootstrapped ciphertext to the fourth power times a fresh ciphertext [{tag}]", decrypt_values(bc.tc, mixed),
+        [values_0[i] ** 4 * values_1[i] for i in range(slots)], 1e-6)
+
+
+# What the party that holds the secret key sends to the party that bootstraps: no secret key in it.
+class PublicMaterial:
+    scheme_params: CKKSParametersLiteral
+    btp_params: bootstrapping.Parameters
+    pk: rlwe.PublicKey
+    evk: bootstrapping.EvaluationKeys
+
+
+def bootstrap_without_secret_key(public: PublicMaterial, ciphertext: ckks.Ciphertext) -> Tuple[ckks.Ciphertext, ckks.Ciphertext]:
+    # Everything here is built from the public material alone: parameters, encryptor, bootstrapper.
+    params = ckks.new_parameters_from_literal(public.scheme_params)
+    encoder = ckks.new_encoder_complex(params)
+    encryptor = ckks.new_encryptor(params, public.pk)
+    btp = bootstrapping.new_bootstrapper(params, public.btp_params, public.evk)
+
+    # A constant the bootstrapping party adds on its own, to show it computes on what it bootstrapped
+    plaintext = ckks.new_plaintext(params, btp.output_level(), params.default_scale)
+    encoder.encode([complex(0.25, -0.125) for _ in range(params.slots())], plaintext, params.log_slots)
+    offset = encryptor.encrypt_new(plaintext)
+
+    bootstrapped = btp.bootstrap(ciphertext)
+    shifted = btp.evaluator.add_new(bootstrapped, offset)
+    return bootstrapped, shifted
+
+
+def test_bootstrap_with_evaluation_keys_only(literal: btp_default.DefaultParametersLiteral, tag: str):
+    # The key holder: generates the keys, encrypts with the public key, and decrypts at the end.
+    params = ckks.new_parameters_from_literal(literal.scheme_params)
+    encoder = ckks.new_encoder_complex(params)
+    kgen = ckks.new_key_generator(params)
+    sk = kgen.gen_secret_key(store_key=True)  # gen_public_key encrypts under the key the generator stores
+    pk = kgen.gen_public_key()
+    decryptor = ckks.new_decryptor(params, sk)
+    encryptor = ckks.new_encryptor(params, pk)
+    evk = bootstrapping.gen_evaluation_keys(literal.bootstrapping_params, params, sk)
+
+    values = bootstrap_test_values(params.slots())
+    plaintext = ckks.new_plaintext(params, 0, params.default_scale)
+    encoder.encode(values, plaintext, params.log_slots)
+    ciphertext = encryptor.encrypt_new(plaintext)
+
+    # The bootstrapping party
+    public = PublicMaterial(scheme_params=literal.scheme_params, btp_params=literal.bootstrapping_params, pk=pk, evk=evk)
+    bootstrapped, shifted = bootstrap_without_secret_key(public, ciphertext)
+
+    # Back at the key holder
+    have = encoder.decode(decryptor.decrypt_new(bootstrapped), params.log_slots)
+    precision_real, precision_imag = mean_precision(have, values)
+    check_true(
+        f"Bootstrap with evaluation keys only: precision [{tag}]",
+        precision_real >= BOOTSTRAP_MIN_PRECISION and precision_imag >= BOOTSTRAP_MIN_PRECISION,
+        f"mean precision {precision_real:.2f} bits (real) and {precision_imag:.2f} bits (imaginary), at least {BOOTSTRAP_MIN_PRECISION} required")
+    check_values(f"Bootstrap with evaluation keys only: values [{tag}]", have, values, 1e-6)
+    check_values(
+        f"Bootstrap with evaluation keys only: computation on the result [{tag}]",
+        encoder.decode(decryptor.decrypt_new(shifted), params.log_slots),
+        [v + complex(0.25, -0.125) for v in values], 1e-6)
+
+
+def test_bootstrap_value_range(bc: BootstrapContext, tag: str):
+    # The circuit reduces the COEFFICIENTS of the plaintext polynomial, and is designed for coefficients up
+    # to 1 (times the scale). A coefficient is at most the mean of the absolute values of the slots.
+    params = bc.tc.params
+    slots = params.slots()
+    message_ratio = bc.btp_params.eval_mod_parameters.message_ratio
+    sine_error = (6.283185307179586 / message_ratio) ** 2 / 6.0  # relative, at the edge of the range
+
+    # One slot at 2048, all the others at zero: the coefficients are 2048 / slots * cos(.), 0.5 at most here,
+    # so the plaintext is in range although one of its slots is far above 1. Being in range is not being
+    # exact: a coefficient c comes back as c (1 - sine_error c^2), and for coefficients 0.5 cos(.) three
+    # quarters of that cubic term fall back on the slot, which loses 3/16 of sine_error: 0.04 out of 2048.
+    one_hot = [complex(0, 0) for _ in range(slots)]
+    one_hot[7] = complex(2048.0, 0)
+    coefficient = 2048.0 / float(slots)
+    bootstrapped = bc.btp.bootstrap(encrypt_values(bc.tc, one_hot, 0, params.default_scale))
+    check_values(
+        f"Bootstrap of one slot at 2048 among {slots}, coefficients up to {coefficient} [{tag}]",
+        decrypt_values(bc.tc, bootstrapped), one_hot, 1.3 * 2048.0 * 0.75 * sine_error * coefficient ** 2 + 1e-6)
+
+    # The same vector with a range of 2^6: the coefficients are 1/128 of the range and the cubic term is gone
+    bootstrapped = bc.btp.bootstrap_with_range(encrypt_values(bc.tc, one_hot, 0, params.default_scale), 6)
+    check_values(
+        f"bootstrap_with_range(6) of one slot at 2048 among {slots} [{tag}]",
+        decrypt_values(bc.tc, bootstrapped), one_hot, 1e-6 * 64.0)
+
+    # The same value in every slot: the plaintext is a constant polynomial and its one coefficient is the
+    # value itself. 1.0 is the edge of the range, where the sine the default parameters reduce with is off
+    # by its cubic term: sine_error = 1.0e-4 for a message ratio of 256. This is the accuracy of the
+    # parameters on such a vector, not noise, and it is the reason for this check.
+    ones = [complex(1.0, 0) for _ in range(slots)]
+    bootstrapped = bc.btp.bootstrap(encrypt_values(bc.tc, ones, 0, params.default_scale))
+    error_ones = max_error(decrypt_values(bc.tc, bootstrapped), ones)
+    check_values(f"Bootstrap of 1.0 in every slot, the edge of the range [{tag}]", decrypt_values(bc.tc, bootstrapped), ones, 1.3 * sine_error)
+    check_true(
+        f"Bootstrap of 1.0 in every slot: the error is the cubic term of the sine [{tag}]", error_ones > 0.7 * sine_error,
+        f"max error {error_ones:.3e}, m (2 pi m / message ratio)^2 / 6 = {sine_error:.3e}")
+
+    # Half the range: the error is 8 times smaller
+    halves = [complex(0.5, 0) for _ in range(slots)]
+    bootstrapped = bc.btp.bootstrap(encrypt_values(bc.tc, halves, 0, params.default_scale))
+    check_values(f"Bootstrap of 0.5 in every slot [{tag}]", decrypt_values(bc.tc, bootstrapped), halves, 1.3 * sine_error / 8)
+
+    # Larger values: bootstrap_with_range trades log_range bits of precision for log_range bits of range
+    check_true(
+        f"max_log_range at the default scale [{tag}]",
+        bc.btp.max_log_range(params.default_scale) == int(math.log2(bc.btp.q0_over_message_ratio / params.default_scale)),
+        f"{bc.btp.max_log_range(params.default_scale)} bits: Q0 / message ratio = 2^{math.log2(bc.btp.q0_over_message_ratio)}, scale 2^{math.log2(params.default_scale)}")
+
+    log_range = 11
+    range_factor = float(1 << log_range)
+    large = random_values(slots, range_factor)
+    bootstrapped = bc.btp.bootstrap_with_range(encrypt_values(bc.tc, large, 0, params.default_scale), log_range)
+    check_true(
+        f"bootstrap_with_range(11): level and scale [{tag}]",
+        bootstrapped.level() == bc.btp.output_level() and bootstrapped.scale == params.default_scale,
+        f"level {bootstrapped.level()}, scale 2^{math.log2(bootstrapped.scale)}")
+    # 1e-6 on [-1, 1] becomes 1e-6 * 2^11 on [-2^11, 2^11]
+    check_values(f"bootstrap_with_range(11) of values up to 2048 [{tag}]", decrypt_values(bc.tc, bootstrapped), large, 1e-6 * range_factor)
+
+    # 2048 in every slot, the edge of that range: the cubic term again, now on 2048
+    all_large = [complex(2048.0, 0) for _ in range(slots)]
+    bootstrapped = bc.btp.bootstrap_with_range(encrypt_values(bc.tc, all_large, 0, params.default_scale), log_range)
+    check_values(
+        f"bootstrap_with_range(11) of 2048 in every slot [{tag}]", decrypt_values(bc.tc, bootstrapped), all_large,
+        1.3 * sine_error * range_factor)
+
+    # 100 in every slot with a range of 2^11: (100 / 2048)^2 of the edge error, relative
+    hundreds = [complex(100.0, 0) for _ in range(slots)]
+    bootstrapped = bc.btp.bootstrap_with_range(encrypt_values(bc.tc, hundreds, 0, params.default_scale), log_range)
+    check_values(
+        f"bootstrap_with_range(11) of 100 in every slot [{tag}]", decrypt_values(bc.tc, bootstrapped), hundreds,
+        1.3 * sine_error * 100.0 * (100.0 / range_factor) ** 2 + 1e-6 * range_factor)
+
+    # From a higher level, where the scale is matched with a level instead of an integer factor
+    bootstrapped = bc.btp.bootstrap_with_range(encrypt_values(bc.tc, large, 3, params.default_scale), log_range)
+    check_values(f"bootstrap_with_range(11) from level 3 [{tag}]", decrypt_values(bc.tc, bootstrapped), large, 1e-6 * range_factor)
+
+    # A range the scale leaves no room for at level 0
+    def range_too_large():
+        bc.btp.bootstrap_with_range(encrypt_values(bc.tc, ones, 0, params.default_scale), bc.btp.max_log_range(params.default_scale) + 1)
+    check_raises(f"bootstrap_with_range above max_log_range at level 0 [{tag}]", range_too_large)
+
+
+def test_bootstrap_errors(bc: BootstrapContext, literal: btp_default.DefaultParametersLiteral, tag: str):
+    params = bc.tc.params
+    evk = bc.evk
+
+    # Parameters that do not fit together
+    def sine_with_double_angle():
+        p = literal.bootstrapping_params.copy()
+        p.eval_mod_parameters.sine_type = advanced.SIN
+        bootstrapping.new_bootstrapper(params, p, evk)
+    check_raises(f"NewBootstrapper: sine with the double angle formula [{tag}]", sine_with_double_angle)
+
+    def degree_too_small():
+        p = literal.bootstrapping_params.copy()
+        p.eval_mod_parameters.sine_deg = 2 * (p.eval_mod_parameters.k - 1) - 1
+        bootstrapping.new_bootstrapper(params, p, evk)
+    check_raises(f"NewBootstrapper: Cos1 with a degree below 2(K-1) [{tag}]", degree_too_small)
+
+    def cts_levels_inconsistent():
+        p = literal.bootstrapping_params.copy()
+        p.eval_mod_parameters.level_start -= 1
+        bootstrapping.new_bootstrapper(params, p, evk)
+    check_raises(f"NewBootstrapper: CoeffsToSlots does not end where EvalMod starts [{tag}]", cts_levels_inconsistent)
+
+    def stc_levels_inconsistent():
+        p = literal.bootstrapping_params.copy()
+        p.slots_to_coeffs_parameters.level_start += 1
+        bootstrapping.new_bootstrapper(params, p, evk)
+    check_raises(f"NewBootstrapper: EvalMod does not end where SlotsToCoeffs starts [{tag}]", stc_levels_inconsistent)
+
+    # Keys that are missing
+    def no_relinearization_key():
+        bootstrapping.new_bootstrapper(params, literal.bootstrapping_params, bootstrapping.EvaluationKeys(
+            rlk=rlwe.RelinearizationKey(keys=list[rlwe.SwitchingKey]()), rtks=evk.rtks, swk_dts=evk.swk_dts, swk_std=evk.swk_std))
+    check_raises(f"NewBootstrapper: no relinearization key [{tag}]", no_relinearization_key)
+
+    def no_rotation_keys():
+        bootstrapping.new_bootstrapper(params, literal.bootstrapping_params, bootstrapping.EvaluationKeys(
+            rlk=evk.rlk, rtks=rlwe.RotationKeySet(keys=dict[u64, rlwe.SwitchingKey]()), swk_dts=evk.swk_dts, swk_std=evk.swk_std))
+    check_raises(f"NewBootstrapper: no rotation keys [{tag}]", no_rotation_keys)
+
+    def no_dense_to_sparse_key():
+        bootstrapping.new_bootstrapper(params, literal.bootstrapping_params, bootstrapping.EvaluationKeys(
+            rlk=evk.rlk, rtks=evk.rtks, swk_dts=rlwe.SwitchingKey(), swk_std=evk.swk_std))
+    check_raises(f"NewBootstrapper: no dense to sparse key [{tag}]", no_dense_to_sparse_key)
+
+    def no_sparse_to_dense_key():
+        bootstrapping.new_bootstrapper(params, literal.bootstrapping_params, bootstrapping.EvaluationKeys(
+            rlk=evk.rlk, rtks=evk.rtks, swk_dts=evk.swk_dts, swk_std=rlwe.SwitchingKey()))
+    check_raises(f"NewBootstrapper: no sparse to dense key [{tag}]", no_sparse_to_dense_key)
+
+    def one_rotation_key_missing():
+        keys = dict[u64, rlwe.SwitchingKey]()
+        skipped = False
+        conjugation = params.galois_element_for_row_rotation()
+        for gal_el in evk.rtks.keys:
+            if not skipped and gal_el != conjugation:
+                skipped = True
+                continue
+            keys[gal_el] = evk.rtks.keys[gal_el]
+        bootstrapping.new_bootstrapper(params, literal.bootstrapping_params, bootstrapping.EvaluationKeys(
+            rlk=evk.rlk, rtks=rlwe.RotationKeySet(keys=keys), swk_dts=evk.swk_dts, swk_std=evk.swk_std))
+    check_raises(f"NewBootstrapper: one rotation key missing [{tag}]", one_rotation_key_missing)
+
+    def conjugation_key_missing():
+        keys = dict[u64, rlwe.SwitchingKey]()
+        conjugation = params.galois_element_for_row_rotation()
+        for gal_el in evk.rtks.keys:
+            if gal_el != conjugation:
+                keys[gal_el] = evk.rtks.keys[gal_el]
+        bootstrapping.new_bootstrapper(params, literal.bootstrapping_params, bootstrapping.EvaluationKeys(
+            rlk=evk.rlk, rtks=rlwe.RotationKeySet(keys=keys), swk_dts=evk.swk_dts, swk_std=evk.swk_std))
+    check_raises(f"NewBootstrapper: conjugation key missing [{tag}]", conjugation_key_missing)
+
+    # The literal the tests share is as it was: the bootstrapper works on a copy
+    check_true(
+        f"NewBootstrapper leaves the parameter literal untouched [{tag}]",
+        literal.bootstrapping_params.coeffs_to_slots_parameters.scaling == 0.0
+        and literal.bootstrapping_params.slots_to_coeffs_parameters.scaling == 0.0
+        and bc.btp.btp_params.coeffs_to_slots_parameters.scaling != 0.0,
+        f"literal CoeffsToSlots scaling {literal.bootstrapping_params.coeffs_to_slots_parameters.scaling}, bootstrapper's {bc.btp.btp_params.coeffs_to_slots_parameters.scaling}")
+
+
+def test_bootstrapping_parameters(tag: str):
+    # N16QP1546H192H32: 4 levels of CoeffsToSlots, 8 of EvalMod, 3 of SlotsToCoeffs, from level 24 down to 9
+    literal = btp_default.N16QP1546H192H32.copy()
+    p = literal.bootstrapping_params
+    check_true(
+        f"Default parameters N16QP1546H192H32 [{tag}]",
+        p.depth() == 15 and p.coeffs_to_slots_parameters.depth(True) == 4 and p.eval_mod_parameters.depth() == 8
+        and p.slots_to_coeffs_parameters.depth(True) == 3 and len(literal.scheme_params.q) == 25 and len(literal.scheme_params.p) == 5
+        and p.coeffs_to_slots_parameters.levels() == [24, 23, 22, 21] and p.slots_to_coeffs_parameters.levels() == [12, 11, 10],
+        f"depth {p.depth()}, CoeffsToSlots levels {p.coeffs_to_slots_parameters.levels()}, SlotsToCoeffs levels {p.slots_to_coeffs_parameters.levels()}")
+
+    # N15QP768H192H32 uses two matrices on one level for SlotsToCoeffs
+    p = btp_default.N15QP768H192H32.bootstrapping_params
+    check_true(
+        f"Default parameters N15QP768H192H32 [{tag}]",
+        p.slots_to_coeffs_parameters.depth(True) == 1 and p.slots_to_coeffs_parameters.depth(False) == 2
+        and p.slots_to_coeffs_parameters.levels() == [3, 3] and p.depth() == 11,
+        f"depth {p.depth()}, SlotsToCoeffs levels {p.slots_to_coeffs_parameters.levels()}")
+
+    # The copies are independent of the shared literals
+    shrunk = btp_default.N16QP1546H192H32.insecure_copy(13, 12)
+    shrunk.bootstrapping_params.ephemeral_secret_weight = 0
+    shrunk.scheme_params.q[0] = u64(1)
+    check_true(
+        f"Default parameter literals are copied, not shared [{tag}]",
+        btp_default.N16QP1546H192H32.scheme_params.logn == 16 and btp_default.N16QP1546H192H32.scheme_params.log_slots == 15
+        and btp_default.N16QP1546H192H32.bootstrapping_params.ephemeral_secret_weight == 32
+        and btp_default.N16QP1546H192H32.scheme_params.q[0] == u64(0x10000000006e0001),
+        f"logN {btp_default.N16QP1546H192H32.scheme_params.logn}, copy logN {shrunk.scheme_params.logn}")
+
+
+# Lattigo's TestBootstrap: the first sparse default set, shrunk to logN = 13 (insecure, for speed), with and
+# without the ephemeral sparse secret, with full and with sparse packing.
+# The reference precisions are the mean precisions Lattigo v4.0.0 prints for this very test (go test
+# ./ckks/bootstrapping -run TestBootstrap -args -print-precision): 25.98, 25.96, 24.94 and 25.02 bits.
+def test_bootstrap_lattigo_combinations():
+    for original, log_slots, reference_precision in [(False, 12, 25.98), (True, 12, 25.96), (False, 11, 24.94), (True, 11, 25.02)]:
+        kind = "Original" if original else "Encapsulation"
+        tag = f"{kind}, logN=13, logSlots={log_slots}, N16QP1546H192H32 moduli"
+        print(f"\nBootstrapping/FullCircuit [{tag}]")
+        start = time.time()
+        literal = btp_default.N16QP1546H192H32.insecure_copy(13, log_slots)
+        bc = new_bootstrap_context(literal, original)
+        check_true(
+            f"Bootstrapper setup [{tag}]",
+            (len(bc.evk.swk_dts.value) == 0) == original and (len(bc.evk.swk_std.value) == 0) == original
+            and bc.btp.output_level() == 9 and bc.tc.params.h == (32 if original else 192),
+            f"{len(bc.evk.rtks.keys)} rotation keys, secret of weight {bc.tc.params.h}, ephemeral secret: {not original}, set up in {time.time() - start:.1f}s")
+
+        test_bootstrap_full_circuit(bc, tag, True, 1e-6, reference_precision)
+
+        if not original and log_slots == 12:
+            # The rest of the suite, on the first combination
+            test_bootstrap_input_levels_and_scales(bc, tag)
+            test_bootstrap_cycles(bc, tag, 0)
+            test_bootstrap_cycles(bc, tag, 1)
+            test_multiplication_after_bootstrap(bc, tag)
+            test_bootstrap_value_range(bc, tag)
+            test_bootstrap_errors(bc, btp_default.N16QP1546H192H32.insecure_copy(13, log_slots), tag)
+
+        if not original and log_slots == 11:
+            test_bootstrap_input_levels_and_scales(bc, tag)
+            test_bootstrap_cycles(bc, tag, 0)
+
+
+# Every other default parameter set, shrunk to logN = 13: the moduli, levels and polynomials of each set
+# go through the whole circuit once.
+# The reference precisions are what Lattigo v4.0.0 reaches on the same shrunk sets and the same kind of
+# input (mean and minimum over the slots, in bits): the sets differ a lot, from 16 to 34 bits.
+def test_bootstrap_default_parameter_sets():
+    names = ["N16QP1547H192H32", "N16QP1553H192H32", "N15QP768H192H32",
+             "N16QP1767H32768H32", "N16QP1788H32768H32", "N16QP1793H32768H32", "N15QP880H16384H32"]
+    literals = [btp_default.N16QP1547H192H32, btp_default.N16QP1553H192H32, btp_default.N15QP768H192H32,
+                btp_default.N16QP1767H32768H32, btp_default.N16QP1788H32768H32, btp_default.N16QP1793H32768H32,
+                btp_default.N15QP880H16384H32]
+    lattigo_mean_precision = [33.97, 20.62, 16.44, 25.95, 33.20, 20.56, 18.38]
+    lattigo_min_precision = [31.68, 18.28, 10.13, 23.86, 30.73, 18.31, 15.53]
+    for i in range(len(names)):
+        name, shared = names[i], literals[i]
+        # The largest error on a slot: Lattigo's worst slot, with 2.5 bits of margin for the modulus of a
+        # complex error and for the spread of the maximum from one run to the next
+        tolerance = math.pow(2.0, -(lattigo_min_precision[i] - 2.5))
+        tag = f"{name} moduli, logN=13, logSlots=12"
+        print(f"\nBootstrapping/DefaultParameters [{tag}]")
+        start = time.time()
+        bc = new_bootstrap_context(shared.insecure_copy(13, 12), False)
+        print(f"Set up in {time.time() - start:.1f}s: {len(bc.evk.rtks.keys)} rotation keys, output level {bc.btp.output_level()} of {bc.tc.params.max_level()}")
+
+        # In two sets the moduli are twice as large as the scale and SlotsToCoeffs uses half of its last
+        # modulus: their output is one level higher, at the default scale squared, like a product that has
+        # not been rescaled yet.
+        half_modulus = name == "N16QP1553H192H32" or name == "N16QP1793H32768H32"
+        stc = bc.btp_params.slots_to_coeffs_parameters
+        default_scale = bc.tc.params.default_scale
+        check_true(
+            f"Output level and scale [{tag}]",
+            bc.btp.output_level() == stc.level_start - stc.depth(True) + (1 if half_modulus else 0)
+            and bc.btp.output_scale() == (default_scale * default_scale if half_modulus else default_scale),
+            f"level {bc.btp.output_level()} (SlotsToCoeffs from {stc.level_start} over {stc.depth(True)} moduli), scale 2^{math.log2(bc.btp.output_scale()):.4f}")
+
+        test_bootstrap_full_circuit(bc, tag, not half_modulus, tolerance, lattigo_mean_precision[i])
+
+        if half_modulus:
+            # One more multiplication uses the other half of the modulus and lands on the default scale
+            params = bc.tc.params
+            values = bootstrap_test_values(params.slots())
+            factor = random_values(params.slots(), 1.0)
+            bootstrapped = bc.btp.bootstrap(encrypt_values(bc.tc, values, 0, default_scale))
+            level = bootstrapped.level()
+            plaintext = ckks.new_plaintext(params, level, float(params.ring_q.modulus[level]) / default_scale)
+            bc.tc.encoder.encode(factor, plaintext, params.log_slots)
+            bc.btp.evaluator.mul_relin(bootstrapped, plaintext, True, bootstrapped)
+            bc.btp.evaluator.rescale(bootstrapped, default_scale, bootstrapped)
+            check_true(
+                f"Multiplication and rescale after the bootstrap [{tag}]",
+                bootstrapped.level() == stc.level_start - stc.depth(True) and abs(bootstrapped.scale / default_scale - 1.0) < 1e-9,
+                f"level {bootstrapped.level()}, scale 2^{math.log2(bootstrapped.scale):.6f}")
+            check_values(
+                f"Multiplication and rescale after the bootstrap: values [{tag}]", decrypt_values(bc.tc, bootstrapped),
+                [values[j] * factor[j] for j in range(params.slots())], 2 * tolerance)
+
+
+# ---------------------------------------------------------------------------------------------
+# Entry points
+# ---------------------------------------------------------------------------------------------
+
+def test_bootstrapping():
+    print('Testing the CKKS bootstrapping and its building blocks ... \n')
+    start = time.time()
+
+    test_evaluator_additions(test_literal_two_p(), "logN=12, 8 Q moduli, 2 P moduli")
+    test_evaluator_additions(test_literal_three_p(), "logN=12, 7 Q moduli, 3 P moduli")
+    test_evaluator_additions_single_special_prime(test_literal_one_p(), "logN=12, 5 Q moduli, 1 P modulus")
+
+    test_linear_transforms(test_literal_two_p(), "logN=12, 8 Q moduli, 2 P moduli")
+    test_linear_transforms(test_literal_three_p(), "logN=12, 7 Q moduli, 3 P moduli")
+    test_linear_transforms(test_literal_one_p(), "logN=12, 5 Q moduli, 1 P modulus")
+    test_linear_transforms(test_literal_sparse(), "logN=12, sparse 2^9 slots")
+
+    test_polynomial_evaluation(test_literal_two_p(), "logN=12, 8 Q moduli, 2 P moduli")
+
+    test_homomorphic_encoding(12, "logN=13, full packing 2^12 slots")
+    test_homomorphic_encoding(11, "logN=13, sparse packing 2^11 slots")
+    test_homomorphic_encoding(8, "logN=13, sparse packing 2^8 slots")
+
+    test_eval_mod_literal("default parameters")
+    test_eval_mod("logN=12, 14 Q moduli, 5 P moduli")
+
+    test_bootstrapping_parameters("default parameters")
+    test_bootstrap_lattigo_combinations()
+    test_bootstrap_with_evaluation_keys_only(
+        btp_default.N16QP1546H192H32.insecure_copy(13, 12), "logN=13, logSlots=12, N16QP1546H192H32 moduli")
+    test_bootstrap_default_parameter_sets()
+
+    print(f'\nBootstrapping tests passed in {time.time() - start:.1f}s.\n')
+
+
+if __name__ == "__main__":
+    test_bootstrapping()

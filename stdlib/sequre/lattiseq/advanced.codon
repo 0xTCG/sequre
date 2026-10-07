@@ -1,0 +1,903 @@
+"""
+Ported from https://github.com/tuneinsight/lattigo/tree/v4.0.0/ckks/advanced
+
+Package advanced implements advanced operations for the CKKS scheme:
+
+  evaluator.go              CoeffsToSlots, SlotsToCoeffs, EvalMod
+  homomorphic_encoding.go   the factorized DFT matrices of the homomorphic encoding and decoding
+  homomorphic_mod.go        the polynomials of the homomorphic modular reduction
+
+cosine_approx.go is in cosine_approx.codon. The binary marshalling of the two literals is not ported.
+
+Lattigo wraps the ckks evaluator in an advanced.Evaluator. Here importing this module adds the
+operations to ckks.Evaluator itself.
+
+Where Lattigo returns or accepts a nil ciphertext for the imaginary part (sparse packing), this module
+uses an empty ckks.Ciphertext(), which is false in a boolean context.
+"""
+import math
+
+import ring, ringqp, rlwe, ckks, keyswitch, evaluator, linear_transform, polynomial_evaluation, cosine_approx
+
+from ckks import Evaluator, Ciphertext, Parameters, EncoderComplex128, new_ciphertext, slice_bit_reverse_in_place_complex128
+from linear_transform import LinearTransform, find_best_bsgs_split, gen_linear_transform_bsgs
+from polynomial_evaluation import Polynomial, new_poly, approximate, CHEBYSHEV
+
+from sequre.types.builtin import *
+
+
+# ---------------------------------------------------------------------------------------------
+# homomorphic_encoding.go
+# ---------------------------------------------------------------------------------------------
+
+# LinearTransformType is a type used to distinguish different linear transformations.
+# COEFFS_TO_SLOTS and SLOTS_TO_COEFFS are two linear transformations.
+COEFFS_TO_SLOTS: int = 0  # Homomorphic Encoding
+SLOTS_TO_COEFFS: int = 1  # Homomorphic Decoding
+
+
+# EncodingMatrixLiteral is a struct storing the parameters to generate the factorized DFT matrix.
+class EncodingMatrixLiteral:
+    linear_transform_type: int
+    repack_imag_2_real: bool            # If true, the imaginary part is repacked into the right n slots of the real part
+    logn: int                           # Log2(RingDegree)
+    log_slots: int                      # Log2(slots)
+    scaling: float                      # Constant by which the matrix is multiplied
+    level_start: int                    # Encoding level
+    bit_reversed: bool                  # If true, then applies the transformation bit-reversed and expects bit-reversed inputs
+    bsgs_ratio: float                   # n1/n2 ratio for the bsgs algo for matrix x vector eval
+    scaling_factor: list[list[float]]
+
+    def __init__(
+            self, linear_transform_type: int, repack_imag_2_real: bool, level_start: int, bsgs_ratio: float,
+            bit_reversed: bool, scaling_factor: list[list[float]], logn: int = 0, log_slots: int = 0, scaling: float = 0.0):
+        self.linear_transform_type = linear_transform_type
+        self.repack_imag_2_real = repack_imag_2_real
+        self.logn = logn
+        self.log_slots = log_slots
+        self.scaling = scaling
+        self.level_start = level_start
+        self.bit_reversed = bit_reversed
+        self.bsgs_ratio = bsgs_ratio
+        self.scaling_factor = scaling_factor
+
+    # copy returns a copy of the literal that shares nothing with the receiver.
+    def copy(self) -> EncodingMatrixLiteral:
+        return EncodingMatrixLiteral(
+            linear_transform_type=self.linear_transform_type,
+            repack_imag_2_real=self.repack_imag_2_real,
+            level_start=self.level_start,
+            bsgs_ratio=self.bsgs_ratio,
+            bit_reversed=self.bit_reversed,
+            scaling_factor=[[e for e in row] for row in self.scaling_factor],
+            logn=self.logn,
+            log_slots=self.log_slots,
+            scaling=self.scaling)
+
+    # depth returns the number of levels allocated.
+    # If actual == true then returns the number of moduli consumed, else
+    # returns the factorization depth.
+    def depth(self, actual: bool) -> int:
+        if actual:
+            return len(self.scaling_factor)
+
+        depth = 0
+        for row in self.scaling_factor:
+            depth += len(row)
+        return depth
+
+    # levels returns the index of the Qi used int CoeffsToSlots.
+    def levels(self) -> list[int]:
+        levels = list[int]()
+        true_depth = self.depth(True)
+        for i in range(len(self.scaling_factor)):
+            for _ in self.scaling_factor[true_depth - 1 - i]:
+                levels.append(self.level_start - i)
+
+        return levels
+
+    # rotations returns the list of rotations performed during the CoeffsToSlot operation.
+    def rotations(self) -> list[int]:
+        rotations = list[int]()
+
+        log_slots = self.log_slots
+        logn = self.logn
+        slots = 1 << log_slots
+        dslots = slots
+        if log_slots < logn - 1 and self.repack_imag_2_real:
+            dslots <<= 1
+            if self.linear_transform_type == COEFFS_TO_SLOTS:
+                rotations.append(slots)
+
+        index_cts = self.compute_bootstrapping_dft_index_map()
+
+        # Coeffs to Slots rotations
+        for i, p_vec in enumerate(index_cts):
+            n1 = find_best_bsgs_split(p_vec, dslots, self.bsgs_ratio)
+            add_matrix_rot_to_list(
+                p_vec, rotations, n1, slots,
+                self.linear_transform_type == SLOTS_TO_COEFFS and log_slots < logn - 1 and i == 0 and self.repack_imag_2_real)
+
+        return rotations
+
+    # compute_bootstrapping_dft_index_map returns, for each matrix of the factorization, the indexes of its non-zero diagonals.
+    def compute_bootstrapping_dft_index_map(self) -> list[list[int]]:
+        logn = self.logn
+        log_slots = self.log_slots
+        lt_type = self.linear_transform_type
+        repacki2r = self.repack_imag_2_real
+        bitreversed = self.bit_reversed
+        max_depth = self.depth(False)
+
+        level = log_slots
+
+        rotation_map = list[list[int]](max_depth)
+
+        # We compute the chain of merge in order or reverse order depending if its DFT or InvDFT because
+        # the way the levels are collapsed has an impact on the total number of rotations and keys to be
+        # stored. Ex. instead of using 255 + 64 plaintext vectors, we can use 127 + 128 plaintext vectors
+        # by reversing the order of the merging.
+        merge = _merge_chain(log_slots, max_depth, lt_type)
+
+        level = log_slots
+        for i in range(max_depth):
+            if log_slots < logn - 1 and lt_type == SLOTS_TO_COEFFS and i == 0 and repacki2r:
+                # Special initial matrix for the repacking before SlotsToCoeffs
+                vectors = gen_wfft_repack_index_map(log_slots, level)
+
+                # Merges this special initial matrix with the first layer of SlotsToCoeffs DFT
+                vectors = next_level_fft_index_map(vectors, log_slots, 2 << log_slots, level, lt_type, bitreversed)
+
+                # Continues the merging with the next layers if the total depth requires it.
+                next_level = level - 1
+                for _ in range(merge[i] - 1):
+                    vectors = next_level_fft_index_map(vectors, log_slots, 2 << log_slots, next_level, lt_type, bitreversed)
+                    next_level -= 1
+
+                rotation_map.append(vectors)
+            else:
+                # First layer of the i-th level of the DFT
+                vectors = gen_wfft_index_map(log_slots, level, lt_type, bitreversed)
+
+                # Merges the layer with the next levels of the DFT if the total depth requires it.
+                next_level = level - 1
+                for _ in range(merge[i] - 1):
+                    vectors = next_level_fft_index_map(vectors, log_slots, 1 << log_slots, next_level, lt_type, bitreversed)
+                    next_level -= 1
+
+                rotation_map.append(vectors)
+
+            level -= merge[i]
+
+        return rotation_map
+
+    # compute_dft_matrices returns the matrices of the factorization, each as the map of its non-zero diagonals.
+    def compute_dft_matrices(self) -> list[dict[int, list[complex]]]:
+        log_slots = self.log_slots
+        slots = 1 << log_slots
+        max_depth = self.depth(False)
+        lt_type = self.linear_transform_type
+        bitreversed = self.bit_reversed
+
+        logd_slots = log_slots
+        if logd_slots < self.logn - 1 and self.repack_imag_2_real:
+            logd_slots += 1
+
+        roots = compute_roots(slots << 1)
+        pow5 = [1 for _ in range((slots << 1) + 1)]
+        for i in range(1, (slots << 1) + 1):
+            pow5[i] = pow5[i - 1] * 5
+            pow5[i] &= (slots << 2) - 1
+
+        fft_level = log_slots
+
+        if lt_type == COEFFS_TO_SLOTS:
+            a, b, c = fft_inv_plain_vec(log_slots, 1 << logd_slots, roots, pow5)
+        else:
+            a, b, c = fft_plain_vec(log_slots, 1 << logd_slots, roots, pow5)
+
+        plain_vector = list[dict[int, list[complex]]](max_depth)
+
+        # We compute the chain of merge in order or reverse order depending if its DFT or InvDFT because
+        # the way the levels are collapsed has an inpact on the total number of rotations and keys to be
+        # stored. Ex. instead of using 255 + 64 plaintext vectors, we can use 127 + 128 plaintext vectors
+        # by reversing the order of the merging.
+        merge = _merge_chain(log_slots, max_depth, lt_type)
+
+        fft_level = log_slots
+        for i in range(max_depth):
+            if log_slots != logd_slots and lt_type == SLOTS_TO_COEFFS and i == 0 and self.repack_imag_2_real:
+                # Special initial matrix for the repacking before SlotsToCoeffs
+                vectors = gen_repack_matrix(log_slots, bitreversed)
+
+                # Merges this special initial matrix with the first layer of SlotsToCoeffs DFT
+                vectors = multiply_fft_matrix_with_next_fft_level(
+                    vectors, log_slots, 2 << log_slots, fft_level,
+                    a[log_slots - fft_level], b[log_slots - fft_level], c[log_slots - fft_level], lt_type, bitreversed)
+
+                # Continues the merging with the next layers if the total depth requires it.
+                next_fft_level = fft_level - 1
+                for _ in range(merge[i] - 1):
+                    vectors = multiply_fft_matrix_with_next_fft_level(
+                        vectors, log_slots, 2 << log_slots, next_fft_level,
+                        a[log_slots - next_fft_level], b[log_slots - next_fft_level], c[log_slots - next_fft_level], lt_type, bitreversed)
+                    next_fft_level -= 1
+
+                plain_vector.append(vectors)
+            else:
+                # First layer of the i-th level of the DFT
+                vectors = gen_fft_diag_matrix(
+                    log_slots, fft_level,
+                    a[log_slots - fft_level], b[log_slots - fft_level], c[log_slots - fft_level], lt_type, bitreversed)
+
+                # Merges the layer with the next levels of the DFT if the total depth requires it.
+                next_fft_level = fft_level - 1
+                for _ in range(merge[i] - 1):
+                    vectors = multiply_fft_matrix_with_next_fft_level(
+                        vectors, log_slots, 1 << log_slots, next_fft_level,
+                        a[log_slots - next_fft_level], b[log_slots - next_fft_level], c[log_slots - next_fft_level], lt_type, bitreversed)
+                    next_fft_level -= 1
+
+                plain_vector.append(vectors)
+
+            fft_level -= merge[i]
+
+        # Repacking after the CoeffsToSlots (we multiply the last DFT matrix with the vector [1, 1, ..., 1, 1, 0, 0, ..., 0, 0]).
+        if log_slots != logd_slots and lt_type == COEFFS_TO_SLOTS and self.repack_imag_2_real:
+            last = plain_vector[max_depth - 1]
+            for j in last:
+                diagonal = last[j]
+                for x in range(1 << log_slots):
+                    diagonal[x + (1 << log_slots)] = complex(0, 0)
+
+        # Rescaling of the DFT matrix of the SlotsToCoeffs/CoeffsToSlots
+        scaling = complex(math.pow(self.scaling, 1.0 / float(self.depth(False))), 0)
+        for matrix in plain_vector:
+            for x in matrix:
+                diagonal = matrix[x]
+                for i in range(len(diagonal)):
+                    diagonal[i] *= scaling
+
+        return plain_vector
+
+
+# The number of DFT layers merged into each matrix of the factorization.
+def _merge_chain(log_slots: int, max_depth: int, lt_type: int) -> list[int]:
+    level = log_slots
+    merge = [0 for _ in range(max_depth)]
+    for i in range(max_depth):
+        depth = int(math.ceil(float(level) / float(max_depth - i)))
+
+        if lt_type == COEFFS_TO_SLOTS:
+            merge[i] = depth
+        else:
+            merge[len(merge) - i - 1] = depth
+
+        level -= depth
+
+    return merge
+
+
+# EncodingMatrix is a struct storing the factorized DFT matrix
+class EncodingMatrix(Static[EncodingMatrixLiteral]):
+    matrices: list[LinearTransform]
+
+    def __init__(self, literal: EncodingMatrixLiteral, matrices: list[LinearTransform]):
+        self.linear_transform_type = literal.linear_transform_type
+        self.repack_imag_2_real = literal.repack_imag_2_real
+        self.logn = literal.logn
+        self.log_slots = literal.log_slots
+        self.scaling = literal.scaling
+        self.level_start = literal.level_start
+        self.bit_reversed = literal.bit_reversed
+        self.bsgs_ratio = literal.bsgs_ratio
+        self.scaling_factor = literal.scaling_factor
+        self.matrices = matrices
+
+
+# new_homomorphic_encoding_matrix_from_literal generates the factorized encoding matrix.
+# m_params : the parameters of the matrix, among which the constant by which all the matrices will be multiplied.
+# encoder : ckks.EncoderComplex128.
+def new_homomorphic_encoding_matrix_from_literal(m_params: EncodingMatrixLiteral, encoder: EncoderComplex128) -> EncodingMatrix:
+    log_slots = m_params.log_slots
+    logd_slots = log_slots
+    if logd_slots < m_params.logn - 1 and m_params.repack_imag_2_real:
+        logd_slots += 1
+
+    cts_levels = m_params.levels()
+
+    # CoeffsToSlots vectors
+    matrices = list[LinearTransform](len(cts_levels))
+    p_vec_dft = m_params.compute_dft_matrices()
+    cnt = 0
+    true_depth = m_params.depth(True)
+    for i in range(len(m_params.scaling_factor)):
+        for j in range(len(m_params.scaling_factor[true_depth - i - 1])):
+            matrices.append(gen_linear_transform_bsgs(
+                encoder, p_vec_dft[cnt], cts_levels[cnt], m_params.scaling_factor[true_depth - i - 1][j],
+                m_params.bsgs_ratio, logd_slots))
+            cnt += 1
+
+    return EncodingMatrix(m_params, matrices)
+
+
+def compute_roots(n: int) -> list[complex]:
+    m = n << 1
+
+    roots = list[complex](m)
+    roots.append(complex(1, 0))
+
+    for i in range(1, m):
+        angle = 6.283185307179586 * float(i) / float(m)
+        roots.append(complex(math.cos(angle), math.sin(angle)))
+
+    return roots
+
+
+def fft_plain_vec(logn: int, dslots: int, roots: list[complex], pow5: list[int]) -> Tuple[list[list[complex]], list[list[complex]], list[list[complex]]]:
+    n = 1 << logn
+
+    a = list[list[complex]](logn)
+    b = list[list[complex]](logn)
+    c = list[list[complex]](logn)
+
+    size = 2 if 2 * n == dslots else 1
+
+    m = 2
+    while m <= n:
+        a_m = [complex(0, 0) for _ in range(dslots)]
+        b_m = [complex(0, 0) for _ in range(dslots)]
+        c_m = [complex(0, 0) for _ in range(dslots)]
+
+        tt = m >> 1
+
+        for i in range(0, n, m):
+            gap = n // m
+            mask = (m << 2) - 1
+
+            for j in range(m >> 1):
+                k = (pow5[j] & mask) * gap
+
+                idx1 = i + j
+                idx2 = i + j + tt
+
+                for u in range(size):
+                    a_m[idx1 + u * n] = complex(1, 0)
+                    a_m[idx2 + u * n] = -roots[k]
+                    b_m[idx1 + u * n] = roots[k]
+                    c_m[idx2 + u * n] = complex(1, 0)
+
+        a.append(a_m)
+        b.append(b_m)
+        c.append(c_m)
+
+        m <<= 1
+
+    return a, b, c
+
+
+def fft_inv_plain_vec(logn: int, dslots: int, roots: list[complex], pow5: list[int]) -> Tuple[list[list[complex]], list[list[complex]], list[list[complex]]]:
+    n = 1 << logn
+
+    a = list[list[complex]](logn)
+    b = list[list[complex]](logn)
+    c = list[list[complex]](logn)
+
+    size = 2 if 2 * n == dslots else 1
+
+    m = n
+    while m >= 2:
+        a_m = [complex(0, 0) for _ in range(dslots)]
+        b_m = [complex(0, 0) for _ in range(dslots)]
+        c_m = [complex(0, 0) for _ in range(dslots)]
+
+        tt = m >> 1
+
+        for i in range(0, n, m):
+            gap = n // m
+            mask = (m << 2) - 1
+
+            for j in range(m >> 1):
+                k = ((m << 2) - (pow5[j] & mask)) * gap
+
+                idx1 = i + j
+                idx2 = i + j + tt
+
+                for u in range(size):
+                    a_m[idx1 + u * n] = complex(1, 0)
+                    a_m[idx2 + u * n] = -roots[k]
+                    b_m[idx1 + u * n] = complex(1, 0)
+                    c_m[idx2 + u * n] = roots[k]
+
+        a.append(a_m)
+        b.append(b_m)
+        c.append(c_m)
+
+        m >>= 1
+
+    return a, b, c
+
+
+# add_matrix_rot_to_list adds to rotations the rotations needed to evaluate the matrix of non-zero diagonals p_vec.
+def add_matrix_rot_to_list(p_vec: list[int], rotations: list[int], n1: int, slots: int, repack: bool):
+    if len(p_vec) < 3:
+        for j in p_vec:
+            if j not in rotations:
+                rotations.append(j)
+    else:
+        for j in p_vec:
+            index = (j // n1) * n1
+
+            if repack:
+                # Sparse repacking, occurring during the first DFT matrix of the CoeffsToSlots.
+                index &= (2 * slots - 1)
+            else:
+                # Other cases
+                index &= (slots - 1)
+
+            if index != 0 and index not in rotations:
+                rotations.append(index)
+
+            index = j & (n1 - 1)
+
+            if index != 0 and index not in rotations:
+                rotations.append(index)
+
+
+# Adds the index to the list of indexes if it is not in it yet (the list stands in for Go's map[int]bool).
+def _add_index(vectors: list[int], index: int):
+    if index not in vectors:
+        vectors.append(index)
+
+
+def gen_wfft_index_map(log_l: int, level: int, lt_type: int, bitreversed: bool) -> list[int]:
+    rot = 0
+
+    if (lt_type == COEFFS_TO_SLOTS and not bitreversed) or (lt_type == SLOTS_TO_COEFFS and bitreversed):
+        rot = 1 << (level - 1)
+    else:
+        rot = 1 << (log_l - level)
+
+    vectors = list[int]()
+    _add_index(vectors, 0)
+    _add_index(vectors, rot)
+    _add_index(vectors, (1 << log_l) - rot)
+    return vectors
+
+
+def gen_wfft_repack_index_map(log_l: int, level: int) -> list[int]:
+    vectors = list[int]()
+    _add_index(vectors, 0)
+    _add_index(vectors, 1 << log_l)
+    return vectors
+
+
+def next_level_fft_index_map(vec: list[int], log_l: int, n: int, next_level: int, lt_type: int, bitreversed: bool) -> list[int]:
+    rot = 0
+
+    new_vec = list[int]()
+
+    if (lt_type == COEFFS_TO_SLOTS and not bitreversed) or (lt_type == SLOTS_TO_COEFFS and bitreversed):
+        rot = (1 << (next_level - 1)) & (n - 1)
+    else:
+        rot = (1 << (log_l - next_level)) & (n - 1)
+
+    for i in vec:
+        _add_index(new_vec, i)
+        _add_index(new_vec, (i + rot) & (n - 1))
+        _add_index(new_vec, (i - rot) & (n - 1))
+
+    return new_vec
+
+
+def gen_fft_diag_matrix(
+        log_l: int, fft_level: int, a: list[complex], b: list[complex], c: list[complex],
+        lt_type: int, bitreversed: bool) -> dict[int, list[complex]]:
+    rot = 0
+
+    if (lt_type == COEFFS_TO_SLOTS and not bitreversed) or (lt_type == SLOTS_TO_COEFFS and bitreversed):
+        rot = 1 << (fft_level - 1)
+    else:
+        rot = 1 << (log_l - fft_level)
+
+    vectors = dict[int, list[complex]]()
+
+    if bitreversed:
+        _bit_reverse_halves(a, log_l)
+        _bit_reverse_halves(b, log_l)
+        _bit_reverse_halves(c, log_l)
+
+    add_to_diag_matrix(vectors, 0, a)
+    add_to_diag_matrix(vectors, rot, b)
+    add_to_diag_matrix(vectors, (1 << log_l) - rot, c)
+
+    return vectors
+
+
+def gen_repack_matrix(log_l: int, bitreversed: bool) -> dict[int, list[complex]]:
+    vectors = dict[int, list[complex]]()
+
+    a = [complex(0, 0) for _ in range(2 << log_l)]
+    b = [complex(0, 0) for _ in range(2 << log_l)]
+
+    for i in range(1 << log_l):
+        a[i] = complex(1, 0)
+        a[i + (1 << log_l)] = complex(0, 1)
+
+        b[i] = complex(0, 1)
+        b[i + (1 << log_l)] = complex(1, 0)
+
+    add_to_diag_matrix(vectors, 0, a)
+    add_to_diag_matrix(vectors, 1 << log_l, b)
+
+    return vectors
+
+
+def multiply_fft_matrix_with_next_fft_level(
+        vec: dict[int, list[complex]], log_l: int, n: int, next_level: int,
+        a: list[complex], b: list[complex], c: list[complex], lt_type: int, bitreversed: bool) -> dict[int, list[complex]]:
+    rot = 0
+
+    new_vec = dict[int, list[complex]]()
+
+    if (lt_type == COEFFS_TO_SLOTS and not bitreversed) or (lt_type == SLOTS_TO_COEFFS and bitreversed):
+        rot = (1 << (next_level - 1)) & (n - 1)
+    else:
+        rot = (1 << (log_l - next_level)) & (n - 1)
+
+    if bitreversed:
+        _bit_reverse_halves(a, log_l)
+        _bit_reverse_halves(b, log_l)
+        _bit_reverse_halves(c, log_l)
+
+    for i in vec:
+        add_to_diag_matrix(new_vec, i, _mul(vec[i], a))
+        add_to_diag_matrix(new_vec, (i + rot) & (n - 1), _mul(_rotate(vec[i], rot), b))
+        add_to_diag_matrix(new_vec, (i - rot) & (n - 1), _mul(_rotate(vec[i], -rot), c))
+
+    return new_vec
+
+
+# Applies the bit-reverse permutation, in place, on the first 2^log_l values of x and, if x is twice as long, on the last 2^log_l.
+def _bit_reverse_halves(x: list[complex], log_l: int):
+    half = 1 << log_l
+    slice_bit_reverse_in_place_complex128(x, half)
+    if len(x) > half:
+        slice_bit_reverse_in_place_complex128(x.slice_reference(half, len(x)), half)
+
+
+# add_to_diag_matrix adds the vector to the diagonal of the given index of the matrix.
+# The matrix never shares a vector with its caller (in Lattigo it may).
+def add_to_diag_matrix(diag_mat: dict[int, list[complex]], index: int, vec: list[complex]):
+    if index not in diag_mat:
+        diag_mat[index] = [e for e in vec]
+    else:
+        diag_mat[index] = _add(diag_mat[index], vec)
+
+
+# Rotates x by n positions to the left.
+def _rotate(x: list[complex], n: int) -> list[complex]:
+    mask = len(x) - 1
+    return [x[(i + n) & mask] for i in range(len(x))]
+
+
+def _mul(a: list[complex], b: list[complex]) -> list[complex]:
+    return [a[i] * b[i] for i in range(len(a))]
+
+
+def _add(a: list[complex], b: list[complex]) -> list[complex]:
+    return [a[i] + b[i] for i in range(len(a))]
+
+
+# ---------------------------------------------------------------------------------------------
+# homomorphic_mod.go
+# ---------------------------------------------------------------------------------------------
+
+# SineType is the type of function used during the bootstrapping
+# for the homomorphic modular reduction
+# SIN and COS are the two proposed functions for SineType
+SIN: int = 0   # Standard Chebyshev approximation of (1/2pi) * sin(2pix)
+COS1: int = 1  # Special approximation (Han and Ki) of pow((1/2pi), 1/2^r) * cos(2pi(x-0.25)/2^r); this method requires a minimum degree of 2*(K-1).
+COS2: int = 2  # Standard Chebyshev approximation of pow((1/2pi), 1/2^r) * cos(2pi(x-0.25)/2^r)
+
+
+def sin2pi2pi(x: complex) -> complex:
+    # Lattigo uses the complex sine. It is only ever evaluated on real nodes.
+    return complex(math.sin(6.283185307179586 * x.real), 0.0)
+
+
+def cos2pi(x: complex) -> complex:
+    return complex(math.cos(6.283185307179586 * x.real), 0.0)
+
+
+# EvalModLiteral a struct for the parameters of the EvalMod step
+# of the bootstrapping
+class EvalModLiteral:
+    q: u64                  # Q to reduce by during EvalMod
+    level_start: int        # Starting level of EvalMod
+    scaling_factor: float   # Scaling factor used during EvalMod
+    sine_type: int          # Chose between [Sin(2*pi*x)] or [cos(2*pi*x/r) with double angle formula]
+    message_ratio: float    # Ratio between Q0 and m, i.e. Q[0]/|m|
+    k: int                  # K parameter (interpolation in the range -K to K)
+    sine_deg: int           # Degree of the interpolation
+    double_angle: int       # Number of rescale and double angle formula (only applies for cos)
+    arcsine_deg: int        # Degree of the Taylor arcsine composed with f(2*pi*x) (if zero then not used)
+
+    def copy(self) -> EvalModLiteral:
+        return EvalModLiteral(
+            q=self.q, level_start=self.level_start, scaling_factor=self.scaling_factor, sine_type=self.sine_type,
+            message_ratio=self.message_ratio, k=self.k, sine_deg=self.sine_deg, double_angle=self.double_angle,
+            arcsine_deg=self.arcsine_deg)
+
+    # q_diff return Q/ClosestedPow2
+    # This is the error introduced by the approximate division by Q
+    def q_diff(self) -> float:
+        return float(self.q) / math.pow(2.0, float(round(math.log2(float(self.q)))))
+
+    # depth returns the depth of the SineEval, the double angle formula and the arcsine included.
+    def depth(self) -> int:
+        depth = 0
+
+        if self.sine_type == COS1:  # this method requires a minimum degree of 2*K-1.
+            depth += int(math.ceil(math.log2(float(max(self.sine_deg, 2 * self.k - 1) + 1))))
+        else:
+            depth += int(math.ceil(math.log2(float(self.sine_deg + 1))))
+
+        depth += self.double_angle
+        depth += int(math.ceil(math.log2(float(self.arcsine_deg + 1))))
+        return depth
+
+
+# EvalModPoly is a struct storing the EvalModLiteral with
+# the polynomials.
+class EvalModPoly:
+    _level_start: int
+    _scaling_factor: float
+    sine_type: int
+    _message_ratio: float
+    double_angle: int
+    _q_diff: float
+    _sc_fac: float
+    sqrt_2pi: float
+    sine_poly: Polynomial
+    arcsine_poly: Optional[Polynomial]
+
+    # level_start returns the starting level of the EvalMod.
+    def level_start(self) -> int:
+        return self._level_start
+
+    # scaling_factor returns scaling factor used during the EvalMod.
+    def scaling_factor(self) -> float:
+        return self._scaling_factor
+
+    # sc_fac returns 1/2^r where r is the number of double angle evaluation.
+    def sc_fac(self) -> float:
+        return self._sc_fac
+
+    # message_ratio returns the pre-set ratio Q[0]/|m|.
+    def message_ratio(self) -> float:
+        return self._message_ratio
+
+    # a returns the left bound of the sine approximation (scaled by 1/2^r).
+    def a(self) -> float:
+        return self.sine_poly.a
+
+    # b returns the right bound of the sine approximation (scaled by 1/2^r).
+    def b(self) -> float:
+        return self.sine_poly.b
+
+    # k return the sine approximation range.
+    def k(self) -> float:
+        return self.sine_poly.b * self._sc_fac
+
+    # q_diff return Q/ClosestedPow2
+    # This is the error introduced by the approximate division by Q.
+    def q_diff(self) -> float:
+        return self._q_diff
+
+
+# new_eval_mod_poly_from_literal generates an EvalModPoly from the EvalModLiteral.
+def new_eval_mod_poly_from_literal(evm: EvalModLiteral) -> EvalModPoly:
+    arcsine_poly: Optional[Polynomial] = None
+    sqrt_2pi = 0.0
+
+    sc_fac = math.pow(2.0, float(evm.double_angle))
+
+    q_diff = evm.q_diff()
+
+    if evm.arcsine_deg > 0:
+        sqrt_2pi = 1.0
+
+        coeffs = [complex(0, 0) for _ in range(evm.arcsine_deg + 1)]
+
+        coeffs[1] = complex(0.15915494309189535 * q_diff, 0)
+
+        for i in range(3, evm.arcsine_deg + 1, 2):
+            coeffs[i] = coeffs[i - 2] * complex(float(i * i - 4 * i + 4) / float(i * i - i), 0)
+
+        arcsine_poly = new_poly(coeffs)
+    else:
+        sqrt_2pi = math.pow(0.15915494309189535 * q_diff, 1.0 / sc_fac)
+
+    if evm.sine_type == SIN:
+        if evm.double_angle != 0:
+            raise ValueError("cannot user double angle with SineType == Sin")
+
+        sine_poly = approximate(sin2pi2pi, -float(evm.k), float(evm.k), evm.sine_deg)
+    elif evm.sine_type == COS1:
+        coeffs = cosine_approx.approximate_cos(evm.k, evm.sine_deg, evm.message_ratio, evm.double_angle)
+        sine_poly = Polynomial(
+            basis_type=CHEBYSHEV,
+            max_deg=len(coeffs) - 1,
+            coeffs=coeffs,
+            lead=True,
+            a=float(-evm.k) / sc_fac,
+            b=float(evm.k) / sc_fac)
+    elif evm.sine_type == COS2:
+        sine_poly = approximate(cos2pi, -float(evm.k) / sc_fac, float(evm.k) / sc_fac, evm.sine_deg)
+    else:
+        raise ValueError("invalid SineType")
+
+    for i in range(len(sine_poly.coeffs)):
+        sine_poly.coeffs[i] *= complex(sqrt_2pi, 0)
+
+    return EvalModPoly(
+        _level_start=evm.level_start,
+        _scaling_factor=evm.scaling_factor,
+        sine_type=evm.sine_type,
+        _message_ratio=evm.message_ratio,
+        double_angle=evm.double_angle,
+        _q_diff=q_diff,
+        _sc_fac=sc_fac,
+        sqrt_2pi=sqrt_2pi,
+        sine_poly=sine_poly,
+        arcsine_poly=arcsine_poly)
+
+
+# ---------------------------------------------------------------------------------------------
+# evaluator.go
+# ---------------------------------------------------------------------------------------------
+
+@extend
+class Evaluator:
+    # coeffs_to_slots_new applies the homomorphic encoding and returns the result on new ciphertexts.
+    # Homomorphically encodes a complex vector vReal + i*vImag.
+    # If the packing is sparse (n < N/2), then returns ct_real = Ecd(vReal || vImag) and ct_imag = Ciphertext() (empty).
+    # If the packing is dense (n == N/2), then returns ct_real = Ecd(vReal) and ct_imag = Ecd(vImag).
+    def coeffs_to_slots_new(self, ct_in: Ciphertext, cts_matrices: EncodingMatrix) -> Tuple[Ciphertext, Ciphertext]:
+        ct_real = new_ciphertext(self.ckks_params, 1, cts_matrices.level_start, 0)
+
+        ct_imag = Ciphertext()
+        if self.ckks_params.log_slots == self.params.logn - 1:
+            ct_imag = new_ciphertext(self.ckks_params, 1, cts_matrices.level_start, 0)
+
+        self.coeffs_to_slots(ct_in, cts_matrices, ct_real, ct_imag)
+        return ct_real, ct_imag
+
+    # coeffs_to_slots applies the homomorphic encoding and returns the results on the provided ciphertexts.
+    # Homomorphically encodes a complex vector vReal + i*vImag of size n on a real vector of size 2n.
+    # If the packing is sparse (n < N/2), then returns ct_real = Ecd(vReal || vImag) and ct_imag is expected empty.
+    # If the packing is dense (n == N/2), then returns ct_real = Ecd(vReal) and ct_imag = Ecd(vImag).
+    def coeffs_to_slots(self, ct_in: Ciphertext, cts_matrices: EncodingMatrix, ct_real: Ciphertext, ct_imag: Ciphertext):
+        if cts_matrices.repack_imag_2_real:
+            z_v = ct_in.copy()
+
+            self.dft(ct_in, cts_matrices.matrices, z_v)
+
+            self.conjugate(z_v, ct_real)
+
+            # Lattigo borrows the evaluator's ciphertext buffer when there is no ct_imag. See keyswitch.codon
+            # for why a buffer is not handed to operations that resize their output.
+            tmp = ct_imag if ct_imag else new_ciphertext(self.ckks_params, 1, ct_real.level(), 0)
+
+            # Imag part
+            self.sub(z_v, ct_real, tmp)
+            self.div_by_i(tmp, tmp)
+
+            # Real part
+            self.add(ct_real, z_v, ct_real)
+
+            # If repacking, then ct0 and ct1 right n/2 slots are zero.
+            if self.ckks_params.log_slots < self.params.logn - 1:
+                self.rotate(tmp, self.ckks_params.slots(), tmp)
+                self.add(ct_real, tmp, ct_real)
+        else:
+            self.dft(ct_in, cts_matrices.matrices, ct_real)
+
+    # slots_to_coeffs_new applies the homomorphic decoding and returns the result on a new ciphertext.
+    # Homomorphically decodes a real vector of size 2n on a complex vector vReal + i*vImag of size n.
+    # If the packing is sparse (n < N/2) then ct_real = Ecd(vReal || vImag) and ct_imag is empty.
+    # If the packing is dense (n == N/2), then ct_real = Ecd(vReal) and ct_imag = Ecd(vImag).
+    def slots_to_coeffs_new(self, ct_real: Ciphertext, ct_imag: Ciphertext, stc_matrices: EncodingMatrix) -> Ciphertext:
+        if ct_real.level() < stc_matrices.level_start or (bool(ct_imag) and ct_imag.level() < stc_matrices.level_start):
+            raise ValueError("ctReal.Level() or ctImag.Level() < EncodingMatrix.LevelStart")
+
+        ct_out = new_ciphertext(self.ckks_params, 1, stc_matrices.level_start, ct_real.scale)
+        self.slots_to_coeffs(ct_real, ct_imag, stc_matrices, ct_out)
+        return ct_out
+
+    # slots_to_coeffs applies the homomorphic decoding and returns the result on the provided ciphertext.
+    # Homomorphically decodes a real vector of size 2n on a complex vector vReal + i*vImag of size n.
+    # If the packing is sparse (n < N/2) then ct_real = Ecd(vReal || vImag) and ct_imag is empty.
+    # If the packing is dense (n == N/2), then ct_real = Ecd(vReal) and ct_imag = Ecd(vImag).
+    def slots_to_coeffs(self, ct_real: Ciphertext, ct_imag: Ciphertext, stc_matrices: EncodingMatrix, ct_out: Ciphertext):
+        # If full packing, the repacking can be done directly using ct0 and ct1.
+        if ct_imag:
+            self.mul_by_i(ct_imag, ct_out)
+            self.add(ct_out, ct_real, ct_out)
+            self.dft(ct_out, stc_matrices.matrices, ct_out)
+        else:
+            self.dft(ct_real, stc_matrices.matrices, ct_out)
+
+    def dft(self, ct_in: Ciphertext, plain_vectors: list[LinearTransform], ct_out: Ciphertext):
+        # Sequentially multiplies w with the provided dft matrices.
+        scale = ct_in.scale
+        for i, plain_vector in enumerate(plain_vectors):
+            if i == 0:
+                self.linear_transform(ct_in, plain_vector, [ct_out])
+            else:
+                self.linear_transform(ct_out, plain_vector, [ct_out])
+            self.rescale(ct_out, scale, ct_out)
+
+    # eval_mod_new applies a homomorphic mod Q on a vector scaled by Delta, scaled down to mod 1 :
+    #
+    #  1. Delta * (Q/Delta * I(X) + m(X)) (Delta = scaling factor, I(X) integer poly, m(X) message)
+    #  2. Delta * (I(X) + Delta/Q * m(X)) (divide by Q/Delta)
+    #  3. Delta * (Delta/Q * m(X)) (x mod 1)
+    #  4. Delta * (m(X)) (multiply back by Q/Delta)
+    #
+    # Since Q is not a power of two, but Delta is, then does an approximate division by the closest
+    # power of two to Q instead. Hence, it assumes that the input plaintext is already scaled by
+    # the correcting factor Q/2^{round(log(Q))}.
+    #
+    # !! Assumes that the input is normalized by 1/K for K the range of the approximation.
+    #
+    # Scaling back error correction by 2^{round(log(Q))}/Q afterward is included in the polynomial
+    #
+    # As in Lattigo, the input ciphertext is modified (level, scale and value).
+    def eval_mod_new(self, ct: Ciphertext, eval_mod_poly: EvalModPoly) -> Ciphertext:
+        if ct.level() < eval_mod_poly.level_start():
+            raise ValueError("ct.Level() < evalModPoly.LevelStart")
+
+        if ct.level() > eval_mod_poly.level_start():
+            self.drop_level(ct, ct.level() - eval_mod_poly.level_start())
+
+        # Stores default scales
+        prev_scale_ct = ct.scale
+
+        # Normalize the modular reduction to mod by 1 (division by Q)
+        ct.set_scale(eval_mod_poly.scaling_factor())
+
+        # Compute the scales that the ciphertext should have before the double angle
+        # formula such that after it it has the scale it had before the polynomial
+        # evaluation
+        target_scale = ct.scale
+        for i in range(eval_mod_poly.double_angle):
+            qi = self.params.ring_q.modulus[eval_mod_poly.level_start() - eval_mod_poly.sine_poly.depth() - eval_mod_poly.double_angle + i + 1]
+            target_scale = math.sqrt(target_scale * float(qi))
+
+        # Division by 1/2^r and change of variable for the Chebyshev evaluation
+        if eval_mod_poly.sine_type == COS1 or eval_mod_poly.sine_type == COS2:
+            self.add_const(ct, -0.5 / (eval_mod_poly.sc_fac() * (eval_mod_poly.sine_poly.b - eval_mod_poly.sine_poly.a)), ct)
+
+        # Chebyshev evaluation
+        # (a new name for each result: reassigning a ciphertext onto its own input miscompiles under Codon 0.19.6)
+        ct_sine = self.evaluate_poly(ct, eval_mod_poly.sine_poly, target_scale)
+
+        # Double angle
+        sqrt_2pi = eval_mod_poly.sqrt_2pi
+        for _ in range(eval_mod_poly.double_angle):
+            sqrt_2pi *= sqrt_2pi
+            self.mul_relin(ct_sine, ct_sine, True, ct_sine)
+            self.add(ct_sine, ct_sine, ct_sine)
+            self.add_const(ct_sine, -sqrt_2pi, ct_sine)
+            self.rescale(ct_sine, target_scale, ct_sine)
+
+        # ArcSine
+        ct_out = ct_sine
+        if eval_mod_poly.arcsine_poly is not None:
+            ct_out = self.evaluate_poly(ct_sine, unwrap(eval_mod_poly.arcsine_poly), ct_sine.scale)
+
+        # Multiplies back by q
+        ct_out.set_scale(prev_scale_ct)
+        return ct_out

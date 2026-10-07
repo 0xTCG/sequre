@@ -1,0 +1,421 @@
+"""
+Ported from https://github.com/tuneinsight/lattigo/tree/v4.0.0/rlwe and /ring: the parts that
+rlwe.codon, ring.codon and ringqp.codon do not have and that the linear transforms and the
+bootstrapping need.
+
+  rlwe/evaluator_keyswitch.go     SwitchKeys, Relinearize, DecomposeNTT, KeyswitchHoisted(NoModDown)
+  rlwe/evaluator_automorphism.go  AutomorphismHoisted(NoModDown), Trace
+  rlwe/keygenerator.go            GenSecretKeyWithHammingWeight, GenSwitchingKey
+  rlwe/ringqp, ring               the few vector operations the above need
+
+Lattigo defines the evaluator operations on rlwe.Evaluator. Here they extend ckks.Evaluator:
+ckks.Evaluator inherits from rlwe.Evaluator statically, and a method added to the parent after the
+child was defined does not reach the child. They accept any ciphertext with the value/level/degree/
+resize interface, i.e. both rlwe.Ciphertext and ckks.Ciphertext, and leave the scale alone.
+
+One convention differs from Lattigo throughout. Lattigo wraps evaluator buffers in a ciphertext "at
+level l" by re-slicing them. A Lattiseq Poly cannot be re-sliced, and resize() reallocates it, so
+an evaluator buffer is never handed to anything that resizes its output.
+"""
+import ring, ringqp, rlwe, ckks
+
+from ckks import Evaluator
+
+from sequre.types.builtin import *
+from sequre.constants import NUM_THREADS
+
+
+# ---------------------------------------------------------------------------------------------
+# ring and ringqp operations
+# ---------------------------------------------------------------------------------------------
+
+# add_no_mod_lvl adds p1 to p2 coefficient-wise without modular reduction
+# for the moduli from q_0 up to q_level and writes the result on p3.
+def _mm_add_no_mod_lvl(level: int, p1: ring.Poly, p2: ring.Poly, p3: ring.Poly):
+    for i in range(level + 1):
+        a, b, c = p1._mm_coeffs[i], p2._mm_coeffs[i], p3._mm_coeffs[i]
+        for j in range(len(c)): c[j] = a[j] + b[j]
+
+
+# permute_ntt_with_index_and_add_no_mod_lvl applies the Galois transform on a polynomial in the NTT domain, up to a given level,
+# and adds the result to the output polynomial without modular reduction.
+# It maps the coefficients x^i to x^(gen*i) using the PermuteNTTIndex table.
+# It must be noted that the result cannot be in-place.
+def permute_ntt_with_index_and_add_no_mod_lvl(level: int, pol_in: ring.Poly, index: list[u64], pol_out: ring.Poly):
+    n = len(index)
+    for i in range(level + 1):
+        x, y = pol_in._buf_coeffs[i], pol_out._buf_coeffs[i]
+        for j in range(n): y[j] += x[int(index[j])]
+
+
+# mul_scalar_montgomery_and_add_vec returns p2 = p2 + p1*scalar_mont mod qi.
+def _mm_mul_scalar_montgomery_and_add_vec(p1: list[u64xN], p2: list[u64xN], scalar_mont: u64xN, qi: u64xN, mred_params: u64xN):
+    for j in range(len(p1)):
+        p2[j] = ring._mm_cred(p2[j] + ring._mm_mred(p1[j], scalar_mont, qi, mred_params), qi)
+
+
+# qp_add_no_mod_lvl adds p1 to p2 coefficient-wise without modular reduction and writes the result on p3.
+# The operation is performed at level_q for the ringQ and level_p for the ringP.
+def _mm_qp_add_no_mod_lvl(level_q: int, level_p: int, p1: ringqp.Poly, p2: ringqp.Poly, p3: ringqp.Poly):
+    _mm_add_no_mod_lvl(level_q, p1.q, p2.q, p3.q)
+    _mm_add_no_mod_lvl(level_p, p1.p, p2.p, p3.p)
+
+
+# qp_copy_values_lvl copies the values of p1 on p2.
+# The operation is performed at level_q for the ringQ and level_p for the ringP.
+def _mm_qp_copy_values_lvl(level_q: int, level_p: int, p1: ringqp.Poly, p2: ringqp.Poly):
+    ring._mm_copy_values_lvl(level_q, p1.q, p2.q)
+    ring._mm_copy_values_lvl(level_p, p1.p, p2.p)
+
+
+# qp_permute_ntt_with_index_lvl applies the automorphism X^{5^j} on p1 and writes the result on p2.
+# Index of automorphism must be provided.
+# Method is not in place.
+def qp_permute_ntt_with_index_lvl(ring_qp: ringqp.Ring, level_q: int, level_p: int, p1: ringqp.Poly, index: list[u64], p2: ringqp.Poly):
+    ring_qp.ring_q.permute_ntt_with_index_lvl(level_q, p1.q, index, p2.q)
+    ring_qp.ring_p.permute_ntt_with_index_lvl(level_p, p1.p, index, p2.p)
+
+
+# qp_permute_ntt_with_index_and_add_no_mod_lvl applies the automorphism X^{5^j} on p1 and adds the result on p2.
+# Index of automorphism must be provided.
+# Method is not in place.
+def qp_permute_ntt_with_index_and_add_no_mod_lvl(level_q: int, level_p: int, p1: ringqp.Poly, index: list[u64], p2: ringqp.Poly):
+    permute_ntt_with_index_and_add_no_mod_lvl(level_q, p1.q, index, p2.q)
+    permute_ntt_with_index_and_add_no_mod_lvl(level_p, p1.p, index, p2.p)
+
+
+# ---------------------------------------------------------------------------------------------
+# rlwe/evaluator_keyswitch.go and rlwe/evaluator_automorphism.go
+# ---------------------------------------------------------------------------------------------
+
+@extend
+class Evaluator:
+    # switch_keys re-encrypts ct_in under a different key and returns the result in ct_out.
+    # It requires a SwitchingKey, which is computed from the key under which the Ciphertext is currently encrypted
+    # and the key under which the Ciphertext will be re-encrypted.
+    # The method will raise ValueError if either ct_in or ct_out degree isn't 1.
+    def _mm_switch_keys(self, ct_in, switching_key: rlwe.SwitchingKey, ct_out):
+        if ct_in.degree() != 1 or ct_out.degree() != 1:
+            raise ValueError("cannot SwitchKeys: input and output Ciphertext must be of degree 1")
+
+        level = min(ct_in.level(), ct_out.level())
+        ring_q = self.params.ring_q
+
+        self._mm_gadget_product(level, ct_in.value[1], switching_key.gadget_ciphertext(), self.buff_qp[1].q, self.buff_qp[2].q)
+
+        ring_q._mm_add_lvl(level, ct_in.value[0], self.buff_qp[1].q, ct_out.value[0])
+        ring._mm_copy_values_lvl(level, self.buff_qp[2].q, ct_out.value[1])
+
+    # relinearize applies the relinearization procedure on ct_in and returns the result in ct_out.
+    # The method will raise ValueError if the corresponding relinearization key to the ciphertext degree
+    # is missing.
+    def _mm_relinearize(self, ct_in, ct_out):
+        if not self.rlk or ct_in.degree() - 1 > len(self.rlk.keys):
+            raise ValueError("cannot Relinearize: relinearization key missing (or ciphertext degree is too large)")
+
+        level = min(ct_in.level(), ct_out.level())
+        ring_q = self.params.ring_q
+
+        self._mm_gadget_product(level, ct_in.value[2], self.rlk.keys[0].gadget_ciphertext(), self.buff_qp[1].q, self.buff_qp[2].q)
+        ring_q._mm_add_lvl(level, ct_in.value[0], self.buff_qp[1].q, ct_out.value[0])
+        ring_q._mm_add_lvl(level, ct_in.value[1], self.buff_qp[2].q, ct_out.value[1])
+
+        for deg in range(ct_in.degree() - 1, 1, -1):
+            self._mm_gadget_product(level, ct_in.value[deg], self.rlk.keys[deg - 2].gadget_ciphertext(), self.buff_qp[1].q, self.buff_qp[2].q)
+            ring_q._mm_add_lvl(level, ct_out.value[0], self.buff_qp[1].q, ct_out.value[0])
+            ring_q._mm_add_lvl(level, ct_out.value[1], self.buff_qp[2].q, ct_out.value[1])
+
+        ct_out.resize(1, level)
+
+    # decompose_ntt applies the full RNS basis decomposition on c2.
+    # Expects the is_ntt flag of c2 to correctly reflect the domain of c2.
+    # buff_decomp_qp is a vector of polynomials (mod QP) that stores the
+    # special RNS decomposition of c2 (in the NTT domain)
+    def _mm_decompose_ntt(self, level_q: int, level_p: int, nb_pi: int, c2: ring.Poly, buff_decomp_qp: list[ringqp.Poly]):
+        ring_q = self.params.ring_q
+
+        poly_ntt = c2
+        poly_inv_ntt = self.buff_inv_ntt
+
+        if c2.is_ntt:
+            ring_q._mm_inv_ntt_lvl(level_q, poly_ntt, poly_inv_ntt)
+        else:
+            poly_ntt = self.buff_inv_ntt
+            poly_inv_ntt = c2
+            ring_q._mm_ntt_lvl(level_q, poly_inv_ntt, poly_ntt)
+
+        decomp_rns = self.params.decomp_rns(level_q, level_p)
+        for i in range(decomp_rns):
+            self._mm_decompose_single_ntt(level_q, level_p, nb_pi, i, poly_ntt, poly_inv_ntt, buff_decomp_qp[i].q, buff_decomp_qp[i].p)
+
+    # keyswitch_hoisted applies the key-switch to the decomposed polynomial c2 mod QP (buff_decomp_qp)
+    # and divides the result by P, reducing the basis from QP to Q.
+    #
+    # c0_q = dot(buff_decomp_qp * evakey[0]) mod Q
+    # c1_q = dot(buff_decomp_qp * evakey[1]) mod Q
+    def _mm_keyswitch_hoisted(
+            self, level_q: int, buff_decomp_qp: list[ringqp.Poly], evakey: rlwe.SwitchingKey,
+            c0_q: ring.Poly, c1_q: ring.Poly, c0_p: ring.Poly, c1_p: ring.Poly):
+        self._mm_keyswitch_hoisted_no_mod_down(level_q, buff_decomp_qp, evakey, c0_q, c1_q, c0_p, c1_p)
+
+        level_p = evakey.value[0][0].value[0].p.level()
+
+        # Computes c0_q = c0_q/c0_p and c1_q = c1_q/c1_p
+        self.basis_extender._mm_mod_down_qp_to_q_ntt(level_q, level_p, c0_q, c0_p, c0_q)
+        self.basis_extender._mm_mod_down_qp_to_q_ntt(level_q, level_p, c1_q, c1_p, c1_q)
+
+    # keyswitch_hoisted_no_mod_down applies the key-switch to the decomposed polynomial c2 mod QP (buff_decomp_qp)
+    #
+    # c0_qp = dot(buff_decomp_qp * evakey[0]) mod QP
+    # c1_qp = dot(buff_decomp_qp * evakey[1]) mod QP
+    def _mm_keyswitch_hoisted_no_mod_down(
+            self, level_q: int, buff_decomp_qp: list[ringqp.Poly], evakey: rlwe.SwitchingKey,
+            c0_q: ring.Poly, c1_q: ring.Poly, c0_p: ring.Poly, c1_p: ring.Poly):
+        ring_q = self.params.ring_q
+        ring_p = self.params.ring_p
+        ring_qp = self.params.ring_qp()
+
+        c0_qp = ringqp.Poly(q=c0_q, p=c0_p)
+        c1_qp = ringqp.Poly(q=c1_q, p=c1_p)
+
+        level_p = evakey.value[0][0].value[0].p.level()
+        decomp_rns = (level_q + 1 + level_p) // (level_p + 1)
+
+        qi_over_f = self.params.qi_overflow_margin(level_q) >> 1
+        pi_over_f = self.params.pi_overflow_margin(level_p) >> 1
+
+        # Key switching with CRT decomposition for the Qi
+        reduce = 0
+        for i in range(decomp_rns):
+            if i == 0:
+                ring_qp._mm_mul_coeffs_montgomery_constant_lvl(level_q, level_p, evakey.value[i][0].value[0], buff_decomp_qp[i], c0_qp)
+                ring_qp._mm_mul_coeffs_montgomery_constant_lvl(level_q, level_p, evakey.value[i][0].value[1], buff_decomp_qp[i], c1_qp)
+            else:
+                ring_qp._mm_mul_coeffs_montgomery_constant_and_add_no_mod_lvl(level_q, level_p, evakey.value[i][0].value[0], buff_decomp_qp[i], c0_qp)
+                ring_qp._mm_mul_coeffs_montgomery_constant_and_add_no_mod_lvl(level_q, level_p, evakey.value[i][0].value[1], buff_decomp_qp[i], c1_qp)
+
+            if reduce % qi_over_f == qi_over_f - 1:
+                ring_q._mm_reduce_lvl(level_q, c0_qp.q, c0_qp.q)
+                ring_q._mm_reduce_lvl(level_q, c1_qp.q, c1_qp.q)
+
+            if reduce % pi_over_f == pi_over_f - 1:
+                ring_p._mm_reduce_lvl(level_p, c0_qp.p, c0_qp.p)
+                ring_p._mm_reduce_lvl(level_p, c1_qp.p, c1_qp.p)
+
+            reduce += 1
+
+        if reduce % qi_over_f != 0:
+            ring_q._mm_reduce_lvl(level_q, c0_qp.q, c0_qp.q)
+            ring_q._mm_reduce_lvl(level_q, c1_qp.q, c1_qp.q)
+
+        if reduce % pi_over_f != 0:
+            ring_p._mm_reduce_lvl(level_p, c0_qp.p, c0_qp.p)
+            ring_p._mm_reduce_lvl(level_p, c1_qp.p, c1_qp.p)
+
+    # automorphism_hoisted is similar to automorphism, except that it takes as input ct_in and c1_decomp_qp, where c1_decomp_qp is the RNS
+    # decomposition of its element of degree 1. This decomposition can be obtained with decompose_ntt.
+    # The method requires that the corresponding RotationKey has been added to the Evaluator.
+    # The method will raise ValueError if either ct_in or ct_out degree is not equal to 1.
+    def _mm_automorphism_hoisted(self, level: int, ct_in, c1_decomp_qp: list[ringqp.Poly], gal_el: u64, ct_out):
+        if ct_in.degree() != 1 or ct_out.degree() != 1:
+            raise ValueError("cannot apply AutomorphismHoisted: input and output Ciphertext must be of degree 1")
+
+        if gal_el == u64(1):
+            if ct_in.value[0] is not ct_out.value[0]:
+                ct_out.resize(1, level)
+                ring._mm_copy_lvl(level, ct_in.value[0], ct_out.value[0])
+                ring._mm_copy_lvl(level, ct_in.value[1], ct_out.value[1])
+            return
+
+        rtk, generated = self.rtks.get_rotation_key(gal_el)
+        if not generated:
+            raise ValueError(f"gal_el key 5^{self.params.inverse_galois_element(gal_el)} missing")
+
+        ring_q = self.params.ring_q
+
+        self._mm_keyswitch_hoisted(level, c1_decomp_qp, rtk, self.buff_qp[0].q, self.buff_qp[1].q, self.buff_qp[0].p, self.buff_qp[1].p)
+        ring_q._mm_add_lvl(level, self.buff_qp[0].q, ct_in.value[0], self.buff_qp[0].q)
+
+        if ct_in.value[0].is_ntt:
+            ring_q.permute_ntt_with_index_lvl(level, self.buff_qp[0].q, self.permute_ntt_index[gal_el], ct_out.value[0])
+            ring_q.permute_ntt_with_index_lvl(level, self.buff_qp[1].q, self.permute_ntt_index[gal_el], ct_out.value[1])
+        else:
+            ring_q.permute_lvl(level, self.buff_qp[0].q, gal_el, ct_out.value[0])
+            ring_q.permute_lvl(level, self.buff_qp[1].q, gal_el, ct_out.value[1])
+
+        ct_out.resize(ct_out.degree(), level)
+
+    # automorphism_hoisted_no_mod_down is similar to automorphism_hoisted, except that it returns a ciphertext modulo QP and scaled by P.
+    # The method requires that the corresponding RotationKey has been added to the Evaluator.
+    def _mm_automorphism_hoisted_no_mod_down(
+            self, level_q: int, c0: ring.Poly, c1_decomp_qp: list[ringqp.Poly], gal_el: u64,
+            ct0_out_q: ring.Poly, ct1_out_q: ring.Poly, ct0_out_p: ring.Poly, ct1_out_p: ring.Poly):
+        rtk, generated = self.rtks.get_rotation_key(gal_el)
+        if not generated:
+            raise ValueError(f"cannot AutomorphismHoistedNoModDown: gal_el key 5^{self.params.inverse_galois_element(gal_el)} missing")
+
+        level_p = rtk.level_p()
+
+        self._mm_keyswitch_hoisted_no_mod_down(level_q, c1_decomp_qp, rtk, self.buff_qp[0].q, self.buff_qp[1].q, self.buff_qp[0].p, self.buff_qp[1].p)
+
+        ring_q = self.params.ring_q
+
+        if c0.is_ntt:
+            index = self.permute_ntt_index[gal_el]
+
+            ring_q.permute_ntt_with_index_lvl(level_q, self.buff_qp[1].q, index, ct1_out_q)
+            ring_q.permute_ntt_with_index_lvl(level_p, self.buff_qp[1].p, index, ct1_out_p)
+
+            if level_p > -1:
+                ring_q._mm_mul_scalar_bigint_lvl(level_q, c0, self.params.ring_p.modulus_at_level[level_p], self.buff_qp[1].q)
+
+            ring_q._mm_add_lvl(level_q, self.buff_qp[0].q, self.buff_qp[1].q, self.buff_qp[0].q)
+
+            ring_q.permute_ntt_with_index_lvl(level_q, self.buff_qp[0].q, index, ct0_out_q)
+            ring_q.permute_ntt_with_index_lvl(level_p, self.buff_qp[0].p, index, ct0_out_p)
+        else:
+            ring_q.permute_lvl(level_q, self.buff_qp[1].q, gal_el, ct1_out_q)
+            ring_q.permute_lvl(level_p, self.buff_qp[1].p, gal_el, ct1_out_p)
+
+            if level_p > -1:
+                ring_q._mm_mul_scalar_bigint_lvl(level_q, c0, self.params.ring_p.modulus_at_level[level_p], self.buff_qp[1].q)
+
+            ring_q._mm_add_lvl(level_q, self.buff_qp[0].q, self.buff_qp[1].q, self.buff_qp[0].q)
+
+            ring_q.permute_lvl(level_q, self.buff_qp[0].q, gal_el, ct0_out_q)
+            ring_q.permute_lvl(level_p, self.buff_qp[0].p, gal_el, ct0_out_p)
+
+    # trace maps X -> sum((-1)^i * X^{i*n+1}) for n <= i < N
+    # Monomial X^k vanishes if k is not divisible by (N/n), otherwise it is multiplied by (N/n).
+    # Ciphertext is pre-multiplied by (N/n)^-1 to remove the (N/n) factor.
+    # Examples of full Trace for [0 + 1X + 2X^2 + 3X^3 + 4X^4 + 5X^5 + 6X^6 + 7X^7]
+    #
+    # 1)	   [1 + 2X + 3X^2 + 4X^3 + 5X^4 + 6X^5 + 7X^6 + 8X^7]
+    #       + [1 - 6X - 3X^2 + 8X^3 + 5X^4 + 2X^5 - 7X^6 - 4X^7]  {X-> X^(i * 5^1)}
+    #   	 = [2 - 4X + 0X^2 +12X^3 +10X^4 + 8X^5 - 0X^6 + 4X^7]
+    #
+    # 2)      [2 - 4X + 0X^2 +12X^3 +10X^4 + 8X^5 - 0X^6 + 4X^7]
+    #       + [2 + 4X + 0X^2 -12X^3 +10X^4 - 8X^5 + 0X^6 - 4X^7]  {X-> X^(i * 5^2)}
+    #       = [4 + 0X + 0X^2 - 0X^3 +20X^4 + 0X^5 + 0X^6 - 0X^7]
+    #
+    # 3)      [4 + 0X + 0X^2 - 0X^3 +20X^4 + 0X^5 + 0X^6 - 0X^7]
+    #       + [4 + 0X + 0X^2 - 0X^3 -20X^4 + 0X^5 + 0X^6 - 0X^7]  {X-> X^(i * -1)}
+    #       = [8 + 0X + 0X^2 - 0X^3 + 0X^4 + 0X^5 + 0X^6 - 0X^7]
+    def _mm_trace(self, ct_in, log_n: int, ct_out):
+        if ct_in.degree() != 1 or ct_out.degree() != 1:
+            raise ValueError("ct_in.degree() != 1 or ct_out.degree() != 1")
+
+        level_q = min(ct_in.level(), ct_out.level())
+
+        ct_out.resize(ct_out.degree(), level_q)
+
+        gap = 1 << (self.params.logn - log_n - 1)
+
+        if log_n == 0:
+            gap <<= 1
+
+        if gap > 1:
+            ring_q = self.params.ring_q
+
+            # pre-multiplication by (N/n)^-1
+            for i in range(level_q + 1):
+                qi = ring_q.modulus[i]
+                inv_n = ring.mod_exp_u64(u64(gap), qi - u64(2), qi)
+                inv_n = ring.mform(inv_n, qi, ring_q.bred_params[i])
+                _mm_inv_n = u64xN(inv_n)
+
+                ring._mm_mul_scalar_montgomery_vec(ct_in.value[0]._mm_coeffs[i], ct_out.value[0]._mm_coeffs[i], _mm_inv_n, ring_q._mm_modulus[i], ring_q._mm_mred_params[i])
+                ring._mm_mul_scalar_montgomery_vec(ct_in.value[1]._mm_coeffs[i], ct_out.value[1]._mm_coeffs[i], _mm_inv_n, ring_q._mm_modulus[i], ring_q._mm_mred_params[i])
+
+            # Lattigo re-slices evaluator buffers here. The automorphism resizes its output, so
+            # the buffer is a ciphertext of its own (see the module docstring).
+            buff = rlwe.new_ciphertext(self.params, 1, level_q)
+            buff.value[0].is_ntt = True
+            buff.value[1].is_ntt = True
+            ct_out_rlwe = rlwe.Ciphertext(value=ct_out.value)
+
+            for i in range(log_n, self.params.logn - 1):
+                self._mm_automorphism(ct_out_rlwe, self.params.galois_element_for_column_rotation_by(1 << i), 1 << i, buff)
+                ring_q._mm_add_lvl(level_q, ct_out.value[0], buff.value[0], ct_out.value[0])
+                ring_q._mm_add_lvl(level_q, ct_out.value[1], buff.value[1], ct_out.value[1])
+
+            if log_n == 0:
+                self._mm_automorphism(ct_out_rlwe, ring_q.nth_root - u64(1), 0, buff)
+                ring_q._mm_add_lvl(level_q, ct_out.value[0], buff.value[0], ct_out.value[0])
+                ring_q._mm_add_lvl(level_q, ct_out.value[1], buff.value[1], ct_out.value[1])
+        else:
+            if ct_in.value[0] is not ct_out.value[0]:
+                ring._mm_copy_lvl(level_q, ct_in.value[0], ct_out.value[0])
+                ring._mm_copy_lvl(level_q, ct_in.value[1], ct_out.value[1])
+
+
+# ---------------------------------------------------------------------------------------------
+# rlwe/keygenerator.go
+#
+# Written as functions over any key generator: both rlwe.KeyGenerator and ckks.KeyGenerator are in
+# use, and extending the first does not reach the second (see the module docstring).
+# ---------------------------------------------------------------------------------------------
+
+# gen_secret_key_with_hamming_weight generates a new SecretKey with exactly hw non-zero coefficients.
+def gen_secret_key_with_hamming_weight(keygen, hw: int) -> rlwe.SecretKey:
+    return keygen._mm_gen_secret_key_from_sampler(
+        ring.new_ternary_sampler_with_hamming_weight(keygen.prng, keygen.params.ring_q, hw, False))
+
+
+# gen_switching_key generates a new key-switching key, that will re-encrypt a Ciphertext encrypted under the input key into the output key.
+# If the ring degree of sk_output is larger than sk_input, then generates [-a*sk_output + w*P*sk_input + e, a] in X^{N_output} with X^{N_output} = X^{N_input * (N_output/N_input)}.
+# If the ring degree of sk_output is smaller than sk_input, then generates [-a*sk_input + w*P*sk_output + e, a] in X^{N_input} with X^{N_input} = X^{N_output * (N_input/N_output)}.
+# If sk_input is at a lower level than sk_output (the two keys of a sparse-secret encapsulation), sk_input is
+# extended to the level of sk_output first.
+# The output switching key is always given in max(N_output, N_input) and in the moduli of the output switching key.
+# When key-switching a ciphertext from Y^{N/n} to X^{N}, the ciphertext must first be mapped to X^{N}
+# using SwitchCiphertextRingDegreeNTT(ct_small_dim, None, ct_large_dim).
+# When key-switching a ciphertext from X^{N} to Y^{N/n}, the output of the key-switch is in still X^{N} and
+# must be mapped Y^{N/n} using SwitchCiphertextRingDegreeNTT(ct_large_dim, ring_q_large_dim, ct_small_dim).
+#
+# Only keys of the same ring degree are supported here: Lattiseq has no ring-degree switching.
+def gen_switching_key(keygen, sk_input: rlwe.SecretKey, sk_output: rlwe.SecretKey) -> rlwe.SwitchingKey:
+    if sk_input.value.q.n() != sk_output.value.q.n():
+        raise NotImplementedError("cannot GenSwitchingKey: switching between ring degrees is not supported")
+
+    params = keygen.params
+
+    # N -> N (swk switch to the same dimension)
+    level_p = min(sk_output.level_p(), params.p_count() - 1)
+
+    swk = rlwe.new_switching_key(params, sk_output.value.q.level(), level_p)
+
+    # ring.MapSmallDimensionToLargerDimensionNTT(skInput.Value.Q, keygen.buffQ[0]): a copy when the dimensions are equal
+    sk_in_q = keygen.buff_q[0]
+    ring._mm_copy_values_lvl(sk_input.value.q.level(), sk_input.value.q, sk_in_q)
+
+    if sk_input.value.q.level() < sk_output.value.q.level():
+        ring_q = params.ring_q
+
+        ring_q._mm_inv_ntt_lvl(0, sk_in_q, keygen.buff_qp.q)
+        ring_q._mm_inv_mform_lvl(0, keygen.buff_qp.q, keygen.buff_qp.q)
+
+        q = ring_q.modulus[0]
+        q_half = q >> u64(1)
+
+        pol_q = keygen.buff_qp.q._buf_coeffs[0]
+        pol_p = sk_in_q
+
+        for j in range(ring_q.n):
+            coeff = pol_q[j]
+
+            sign = u64(1)
+            if coeff > q_half:
+                coeff = q - coeff
+                sign = u64(0)
+
+            for i in range(sk_input.level_q() + 1, sk_output.level_q() + 1):
+                pol_p._buf_coeffs[i][j] = (coeff * sign) | (ring_q.modulus[i] - coeff) * (sign ^ u64(1))
+
+        for i in range(sk_input.level_q() + 1, sk_output.level_q() + 1):
+            ring_q._mm_ntt_single(i, pol_p._mm_coeffs[i], pol_p._mm_coeffs[i])
+            ring.mform_vec(pol_p._buf_coeffs[i], pol_p._buf_coeffs[i], ring_q.modulus[i], ring_q.bred_params[i])
+
+    keygen._mm_gen_switching_key(sk_in_q, sk_output.value, swk)
+
+    return swk

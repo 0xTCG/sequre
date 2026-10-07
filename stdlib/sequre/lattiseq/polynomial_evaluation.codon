@@ -1,0 +1,455 @@
+"""
+Ported from https://github.com/tuneinsight/lattigo/blob/v4.0.0/ckks/polynomial_evaluation.go
+and https://github.com/tuneinsight/lattigo/blob/v4.0.0/ckks/chebyshev_interpolation.go
+
+Evaluation of a polynomial, in the power or in the Chebyshev basis, on a ciphertext in
+ceil(log2(degree + 1)) levels, and Chebyshev interpolation of a function.
+
+Not ported: EvaluatePolyVector (several polynomials on disjoint sets of slots) and the binary
+marshalling of PolynomialBasis. The bootstrapping does not use them.
+
+Importing this module adds evaluate_poly to ckks.Evaluator.
+"""
+import math
+
+import ring, ringqp, rlwe, ckks, keyswitch, evaluator
+
+from ckks import Evaluator, Ciphertext, new_ciphertext
+
+from sequre.types.builtin import *
+from sequre.constants import LATTISEQ_STANDARD_RING_ENUM
+
+
+# BasisType is a type for the polynomials basis
+# MONOMIAL : x^(a+b) = x^a * x^b
+MONOMIAL: int = 0
+# CHEBYSHEV : T_(a+b) = 2 * T_a * T_b - T_(|a-b|)
+CHEBYSHEV: int = 1
+
+# IS_NEGLIGIBLE_THRESHOLD : threshold under which a coefficient
+# of a polynomial is ignored.
+IS_NEGLIGIBLE_THRESHOLD: float = 1e-14
+
+
+# Polynomial is a struct storing the coefficients of a polynomial
+# that then can be evaluated on the ciphertext
+class Polynomial:
+    basis_type: int
+    max_deg: int
+    coeffs: list[complex]
+    lead: bool
+    a: float
+    b: float
+
+    # depth returns the number of levels needed to evaluate the polynomial.
+    def depth(self) -> int:
+        return int(math.ceil(math.log2(float(len(self.coeffs)))))
+
+    # degree returns the degree of the polynomial
+    def degree(self) -> int:
+        return len(self.coeffs) - 1
+
+
+# new_poly creates a new Poly from the input coefficients
+def new_poly(coeffs: list[complex]) -> Polynomial:
+    c = [e for e in coeffs]
+    return Polynomial(basis_type=MONOMIAL, max_deg=len(c) - 1, coeffs=c, lead=True, a=0.0, b=0.0)
+
+
+# check_enough_levels checks that enough levels are available to evaluate the polynomial.
+# Also checks if c is a Gaussian integer or not. If not, then one more level is needed
+# to evaluate the polynomial.
+def check_enough_levels(levels: int, depth: int, c: complex):
+    if c.real != float(int(c.real)) or c.imag != float(int(c.imag)):
+        depth += 1
+
+    if levels < depth:
+        raise ValueError(f"{levels} levels < {depth} log(d) -> cannot evaluate")
+
+
+def optimal_split(log_degree: int) -> int:
+    log_split = log_degree >> 1
+    a = (1 << log_split) + (1 << (log_degree - log_split)) + log_degree - log_split - 3
+    b = (1 << (log_split + 1)) + (1 << (log_degree - log_split - 1)) + log_degree - log_split - 4
+    if a > b:
+        log_split += 1
+
+    return log_split
+
+
+def is_not_negligible(c: complex) -> bool:
+    return abs(c.real) > IS_NEGLIGIBLE_THRESHOLD or abs(c.imag) > IS_NEGLIGIBLE_THRESHOLD
+
+
+# is_odd_or_even_polynomial returns whether the polynomial is odd, and whether it is even.
+# If it is either, the coefficients that are expected to be zero are set to zero.
+def is_odd_or_even_polynomial(coeffs: list[complex]) -> Tuple[bool, bool]:
+    even = True
+    odd = True
+    for i, c in enumerate(coeffs):
+        isnotnegligible = is_not_negligible(c)
+        odd = odd and not (i & 1 == 0 and isnotnegligible)
+        even = even and not (i & 1 == 1 and isnotnegligible)
+        if not odd and not even:
+            break
+
+    # If even or odd, then sets the expected zero coefficients to zero
+    if even or odd:
+        start = 0
+        if even:
+            start = 1
+        for i in range(start, len(coeffs), 2):
+            coeffs[i] = complex(0, 0)
+
+    return odd, even
+
+
+# split_coeffs splits a polynomial p such that p = q*C^degree + r.
+def split_coeffs(coeffs: Polynomial, split: int) -> Tuple[Polynomial, Polynomial]:
+    coeffsr = Polynomial(
+        basis_type=coeffs.basis_type, max_deg=0,
+        coeffs=[complex(0, 0) for _ in range(split)], lead=False, a=0.0, b=0.0)
+    if coeffs.max_deg == coeffs.degree():
+        coeffsr.max_deg = split - 1
+    else:
+        coeffsr.max_deg = coeffs.max_deg - (coeffs.degree() - split + 1)
+
+    for i in range(split):
+        coeffsr.coeffs[i] = coeffs.coeffs[i]
+
+    coeffsq = Polynomial(
+        basis_type=coeffs.basis_type, max_deg=coeffs.max_deg,
+        coeffs=[complex(0, 0) for _ in range(coeffs.degree() - split + 1)], lead=False, a=0.0, b=0.0)
+
+    coeffsq.coeffs[0] = coeffs.coeffs[split]
+
+    if coeffs.basis_type == MONOMIAL:
+        for i in range(split + 1, coeffs.degree() + 1):
+            coeffsq.coeffs[i - split] = coeffs.coeffs[i]
+    elif coeffs.basis_type == CHEBYSHEV:
+        j = 1
+        for i in range(split + 1, coeffs.degree() + 1):
+            coeffsq.coeffs[i - split] = complex(2, 0) * coeffs.coeffs[i]
+            coeffsr.coeffs[split - j] -= coeffs.coeffs[i]
+            j += 1
+
+    if coeffs.lead:
+        coeffsq.lead = True
+
+    return coeffsq, coeffsr
+
+
+# PolynomialBasis is a struct storing powers of a ciphertext.
+class PolynomialBasis:
+    basis_type: int
+    value: dict[int, Ciphertext]
+
+    # gen_power recursively computes X^{n}.
+    # If lazy = true, the final X^{n} will not be relinearized.
+    # Previous non-relinearized X^{n} that are required to compute the target X^{n} are automatically relinearized.
+    # Scale sets the threshold for rescaling (ciphertext won't be rescaled if the rescaling operation would make the scale go under this threshold).
+    def gen_power(self, n: int, lazy: bool, scale: float, eval: Evaluator) -> None:
+        if n not in self.value:
+            self._gen_power(n, lazy, scale, eval)
+            _rescale_in_place(eval, self.value[n], scale)
+
+    def _gen_power(self, n: int, lazy: bool, scale: float, eval: Evaluator) -> None:
+        if n not in self.value:
+            is_pow2 = n & (n - 1) == 0
+
+            # Computes the index required to compute the asked ring evaluation
+            a, b, c = 0, 0, 0
+            if is_pow2:
+                a, b = n // 2, n // 2  # Necessary for optimal depth
+            else:
+                # [Lee et al. 2020] : High-Precision and Low-Complexity Approximate Homomorphic Encryption by Error Variance Minimization
+                # Maximize the number of odd terms of Chebyshev basis
+                k = int(math.ceil(math.log2(float(n)))) - 1
+                a = (1 << k) - 1
+                b = n + 1 - (1 << k)
+
+                if self.basis_type == CHEBYSHEV:
+                    c = abs(a - b)  # Cn = 2*Ca*Cb - Cc, n = a+b and c = abs(a-b)
+
+            # Recurses on the given indexes
+            self._gen_power(a, lazy and not is_pow2, scale, eval)
+            self._gen_power(b, lazy and not is_pow2, scale, eval)
+
+            # Computes C[n] = C[a]*C[b]
+            if lazy:
+                if self.value[a].degree() == 2:
+                    eval.relinearize(self.value[a], self.value[a])
+
+                if self.value[b].degree() == 2:
+                    eval.relinearize(self.value[b], self.value[b])
+
+                _rescale_in_place(eval, self.value[a], scale)
+                _rescale_in_place(eval, self.value[b], scale)
+
+                self.value[n] = eval.mul_new(self.value[a], self.value[b])
+            else:
+                # Lattigo multiplies right away and panics if an operand is still of degree 2, which
+                # happens when an even polynomial left X^{2^k} unrelinearized. Relinearizing first
+                # changes nothing in the cases Lattigo handles.
+                if self.value[a].degree() == 2:
+                    eval.relinearize(self.value[a], self.value[a])
+
+                if self.value[b].degree() == 2:
+                    eval.relinearize(self.value[b], self.value[b])
+
+                self.value[n] = eval.mul_relin_new(self.value[a], self.value[b])
+                _rescale_in_place(eval, self.value[n], scale)
+
+            if self.basis_type == CHEBYSHEV:
+                # Computes C[n] = 2*C[a]*C[b]
+                power = self.value[n]
+                eval.add(power, power, power)
+
+                # Computes C[n] = 2*C[a]*C[b] - C[c]
+                if c == 0:
+                    eval.add_const(power, -1.0, power)
+                else:
+                    # Since C[0] is not stored (but rather seen as the constant 1), only recurses on c if c!= 0
+                    self.gen_power(c, lazy, scale, eval)
+                    eval.sub(power, self.value[c], power)
+
+
+# new_polynomial_basis creates a new PolynomialBasis. It takes as input a ciphertext
+# and a basistype. The struct treats the input ciphertext as a monomial X and
+# can be used to generates power of this monomial X^{n} in the given BasisType.
+def new_polynomial_basis(ct: Ciphertext, basis_type: int) -> PolynomialBasis:
+    value = dict[int, Ciphertext]()
+    value[1] = ct.copy()
+    return PolynomialBasis(basis_type=basis_type, value=value)
+
+
+# Rescales ct in place, down to the threshold min_scale (see Evaluator.rescale).
+# Lattigo returns an error when the ciphertext is at level 0; Evaluator.rescale raises it.
+def _rescale_in_place(eval: Evaluator, ct: Ciphertext, min_scale: float):
+    eval.rescale(ct, min_scale, ct)
+
+
+class PolynomialEvaluator:
+    evaluator: Evaluator
+    basis: PolynomialBasis
+    log_degree: int
+    log_split: int
+    is_odd: bool
+    is_even: bool
+
+    def recurse(self, target_level: int, target_scale: float, pol: Polynomial) -> Ciphertext:
+        params = self.evaluator.ckks_params
+        log_split = self.log_split
+
+        # Recursively computes the evaluation of the Chebyshev polynomial using a baby-set giant-step algorithm.
+        if pol.degree() < (1 << log_split):
+            if pol.lead and self.log_split > 1 and pol.max_deg % (1 << (log_split + 1)) > (1 << (log_split - 1)):
+                log_degree = int(pol.degree().bitlen())
+                log_split_bis = log_degree >> 1
+
+                poly_eval_bis = PolynomialEvaluator(
+                    evaluator=self.evaluator,
+                    basis=self.basis,
+                    log_degree=log_degree,
+                    log_split=log_split_bis,
+                    is_odd=self.is_odd,
+                    is_even=self.is_even)
+
+                return poly_eval_bis.recurse(target_level, target_scale, pol)
+
+            if pol.lead:
+                target_scale *= float(params.ring_q.modulus[target_level])
+
+            return self.evaluate_poly_from_polynomial_basis(target_scale, target_level, pol)
+
+        next_power = 1 << self.log_split
+        while next_power < (pol.degree() >> 1) + 1:
+            next_power <<= 1
+
+        coeffsq, coeffsr = split_coeffs(pol, next_power)
+
+        x_pow = self.basis.value[next_power]
+
+        level = target_level
+
+        current_qi = 0.0
+        if pol.lead:
+            current_qi = float(params.ring_q.modulus[level])
+        else:
+            current_qi = float(params.ring_q.modulus[level + 1])
+
+        res = self.recurse(target_level + 1, target_scale * current_qi / x_pow.scale, coeffsq)
+
+        if res.degree() == 2:
+            self.evaluator.relinearize(res, res)
+
+        _rescale_in_place(self.evaluator, res, params.default_scale)
+
+        self.evaluator.mul(res, x_pow, res)
+
+        tmp = self.recurse(res.level(), res.scale, coeffsr)
+
+        self.evaluator.add(res, tmp, res)
+
+        return res
+
+    def evaluate_poly_from_polynomial_basis(self, target_scale: float, level: int, pol: Polynomial) -> Ciphertext:
+        X = self.basis.value
+        params = self.evaluator.ckks_params
+
+        minimum_degree_non_zero_coefficient = len(pol.coeffs) - 1
+
+        if self.is_even:
+            minimum_degree_non_zero_coefficient -= 1
+
+        # Get the minimum non-zero degree coefficient
+        maximum_ciphertext_degree = 0
+        for i in range(pol.degree(), 0, -1):
+            if i in X:
+                maximum_ciphertext_degree = max(maximum_ciphertext_degree, X[i].degree())
+
+        c = pol.coeffs[0]
+
+        # Lattigo tests for == 0. A single coefficient of an even polynomial gives -1 there, and Lattigo
+        # goes on to return a ciphertext of degree 0, which the multiplication that follows rejects.
+        if minimum_degree_non_zero_coefficient <= 0:
+            res = new_ciphertext(params, 1, level, target_scale)
+
+            if is_not_negligible(c):
+                self.evaluator.add_const(res, c, res)
+
+            return res
+
+        res = new_ciphertext(params, maximum_ciphertext_degree, level, target_scale)
+
+        if is_not_negligible(c):
+            self.evaluator.add_const(res, c, res)
+
+        for key in range(pol.degree(), 0, -1):
+            c = pol.coeffs[key]
+
+            if key != 0 and is_not_negligible(c):
+                # Target scale * rescale-scale / power basis scale
+                const_scale = target_scale / X[key].scale
+
+                self.evaluator.mul_by_gaussian_integer_and_add(X[key], (c.real, const_scale), (c.imag, const_scale), res)
+
+        return res
+
+
+@extend
+class Evaluator:
+    # evaluate_poly evaluates a polynomial in standard basis on the input Ciphertext in ceil(log2(deg+1)) levels.
+    # Raises ValueError if the input ciphertext does not have enough level to carry out the full polynomial evaluation.
+    # Raises ValueError if something is wrong with the scale.
+    # If the polynomial is given in Chebyshev basis, then a change of basis ct' = (2/(b-a)) * (ct + (-a-b)/(b-a))
+    # is necessary before the polynomial evaluation to ensure correctness.
+    # Coefficients of the polynomial with an absolute value smaller than "IS_NEGLIGIBLE_THRESHOLD" will automatically be set to zero
+    # if the polynomial is "even" or "odd" (to ensure that the even or odd property remains valid
+    # after the "split_coeffs" polynomial decomposition).
+    # input must be either Ciphertext or PolynomialBasis.
+    # pol: a Polynomial
+    # target_scale: the desired output scale. This value shouldn't differ too much from the original ciphertext scale. It can
+    # for example be used to correct small deviations in the ciphertext scale and reset it to the default scale.
+    def evaluate_poly(self, input, pol: Polynomial, target_scale: float) -> Ciphertext:
+        if isinstance(input, Ciphertext):
+            monomial_basis = new_polynomial_basis(input, pol.basis_type)
+        elif isinstance(input, PolynomialBasis):
+            if 1 not in input.value:
+                raise ValueError("cannot evaluatePolyVector: given PolynomialBasis.Value[1] is empty")
+            monomial_basis = input
+        else:
+            compile_error("cannot evaluate_poly: invalid input, must be either Ciphertext or PolynomialBasis")
+
+        check_enough_levels(monomial_basis.value[1].level(), pol.depth(), complex(1, 0))
+
+        log_degree = int(pol.degree().bitlen())
+        log_split = optimal_split(log_degree)
+
+        odd, even = is_odd_or_even_polynomial(pol.coeffs)
+
+        is_ring_standard = self.params.ring_type == LATTISEQ_STANDARD_RING_ENUM
+
+        for i in range((1 << log_split) - 1, 1, -1):
+            if not (even or odd) or (i & 1 == 0 and even) or (i & 1 == 1 and odd):
+                monomial_basis.gen_power(i, is_ring_standard, target_scale, self)
+
+        for i in range(log_split, log_degree):
+            monomial_basis.gen_power(1 << i, False, target_scale, self)
+
+        poly_eval = PolynomialEvaluator(
+            evaluator=self,
+            basis=monomial_basis,
+            log_degree=log_degree,
+            log_split=log_split,
+            is_odd=odd,
+            is_even=even)
+
+        op_out = poly_eval.recurse(monomial_basis.value[1].level() - log_degree + 1, target_scale, pol)
+
+        # Lattigo relinearizes unconditionally, which reads past the ciphertext when the result is
+        # of degree 1 already (a polynomial of degree below 2).
+        if op_out.degree() == 2:
+            self.relinearize(op_out, op_out)
+
+        _rescale_in_place(self, op_out, target_scale)
+
+        op_out.scale = target_scale  # solves float precision issues
+
+        return op_out
+
+
+# ---------------------------------------------------------------------------------------------
+# ckks/chebyshev_interpolation.go
+# ---------------------------------------------------------------------------------------------
+
+# approximate computes a Chebyshev approximation of the input function, for the range [-a, b] of degree degree.
+# function must map a complex to a complex (Lattigo also accepts float -> float; wrap such a function).
+# To be used in conjunction with the function evaluate_poly.
+def approximate(function, a: float, b: float, degree: int) -> Polynomial:
+    nodes = chebyshev_nodes(degree + 1, a, b)
+
+    fi = list[complex](len(nodes))
+
+    for i in range(len(nodes)):
+        fi.append(function(complex(nodes[i], 0.0)))
+
+    pol = new_poly(cheby_coeffs(nodes, fi, a, b))
+    pol.a = a
+    pol.b = b
+    pol.max_deg = degree
+    pol.lead = True
+    pol.basis_type = CHEBYSHEV
+
+    return pol
+
+
+def chebyshev_nodes(n: int, a: float, b: float) -> list[float]:
+    u = list[float](n)
+    x, y = 0.5 * (a + b), 0.5 * (b - a)
+    for k in range(1, n + 1):
+        u.append(x + y * math.cos((float(k) - 0.5) * (3.141592653589793 / float(n))))
+    return u
+
+
+def cheby_coeffs(nodes: list[float], fi: list[complex], a: float, b: float) -> list[complex]:
+    n = len(nodes)
+
+    coeffs = [complex(0, 0) for _ in range(n)]
+
+    for i in range(n):
+        u = complex((2 * nodes[i] - a - b) / (b - a), 0)
+        t_prev = complex(1, 0)
+        t = u
+
+        for j in range(n):
+            coeffs[j] += fi[i] * t_prev
+            t_next = complex(2, 0) * u * t - t_prev
+            t_prev = t
+            t = t_next
+
+    coeffs[0] /= complex(float(n), 0)
+    for i in range(1, n):
+        coeffs[i] *= complex(2.0 / float(n), 0)
+
+    return coeffs

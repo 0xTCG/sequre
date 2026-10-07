@@ -1,0 +1,296 @@
+"""
+Ported from https://github.com/tuneinsight/lattigo/blob/v4.0.0/ckks/evaluator.go and
+ckks/linear_transform.go (Trace, RotateHoisted): the evaluator operations ckks.codon does not have.
+
+  SwitchKeys, Relinearize, Conjugate, DivByi, ScaleUp, SetScale, MultByGaussianInteger(AndAdd),
+  Trace, RotateHoisted, RotateHoistedNoModDownNew
+
+Importing this module adds them to ckks.Evaluator.
+"""
+import math
+
+import ring, ringqp, rlwe, ckks, keyswitch
+
+from ckks import Evaluator, Ciphertext, new_ciphertext
+
+from sequre.types.builtin import *
+from sequre.constants import LATTISEQ_CONJUGATE_INVARIANT_RING_ENUM
+
+
+# round_product_mod returns round(|a * b|) mod q together with the sign of a * b (True if negative).
+# The product is rounded half away from zero.
+#
+# It stands in for the following sequence of ckks/polynomial_evaluation.go, which computes the integer
+# a coefficient is multiplied by before it is reduced modulo each q_i:
+#
+#   cFlo.SetFloat64(a); scale.SetFloat64(b)          big.Float with 128 bits of precision
+#   cFlo.Mul(cFlo, scale)                            exact: two 53-bit mantissas
+#   cFlo.Add(cFlo, +-0.5); cFlo.Int(cBig)            rounding half away from zero
+#
+# The product of two floats is m * 2^e with m below 2^106, so it is computed exactly on 128-bit integers.
+def round_product_mod(a: float, b: float, q: u64) -> Tuple[u64, bool]:
+    if a == 0.0 or b == 0.0:
+        return u64(0), False
+
+    is_negative = (a < 0) != (b < 0)
+
+    mant_a, exp_a = math.frexp(abs(a))
+    mant_b, exp_b = math.frexp(abs(b))
+
+    m = u64(int(mant_a * 9007199254740992.0)).ext_double() * u64(int(mant_b * 9007199254740992.0)).ext_double()
+    e = exp_a + exp_b - 106
+    q128 = q.ext_double()
+
+    if e >= 0:
+        # An integer already: (m mod q) * (2^e mod q) mod q
+        m_mod_q = m.__naive_mod(q128).trunc_half()
+        return ring.bred(m_mod_q, ring.mod_exp_u64(u64(2), u64(e), q), q, ring.bred_params(q)), is_negative
+
+    shift = -e
+    if shift > 107:
+        # |a * b| < 2^106 * 2^-108 < 1/2
+        return u64(0), is_negative
+
+    # floor(m / 2^shift + 1/2)
+    rounded = (m + (UInt[128](1) << UInt[128](shift - 1))) >> UInt[128](shift)
+    return rounded.__naive_mod(q128).trunc_half(), is_negative
+
+
+@extend
+class Evaluator:
+    # switch_keys_new re-encrypts ct_0 under a different key and returns the result in a newly created element.
+    # It requires a SwitchingKey, which is computed from the key under which the Ciphertext is currently encrypted,
+    # and the key under which the Ciphertext will be re-encrypted.
+    def switch_keys_new(self, ct_0: Ciphertext, switching_key: rlwe.SwitchingKey) -> Ciphertext:
+        ct_out = new_ciphertext(self.ckks_params, ct_0.degree(), ct_0.level(), ct_0.scale)
+        self.switch_keys(ct_0, switching_key, ct_out)
+        return ct_out
+
+    # switch_keys re-encrypts ct_in under a different key and returns the result in ct_out.
+    # It requires a SwitchingKey, which is computed from the key under which the Ciphertext is currently encrypted,
+    # and the key under which the Ciphertext will be re-encrypted.
+    def switch_keys(self, ct_in: Ciphertext, switching_key: rlwe.SwitchingKey, ct_out: Ciphertext):
+        self._mm_switch_keys(ct_in, switching_key, ct_out)
+        ct_out.scale = ct_in.scale
+
+    # relinearize_new applies the relinearization procedure on ct_0 and returns the result in a newly
+    # created Ciphertext. The input Ciphertext must be of degree two.
+    def relinearize_new(self, ct_0: Ciphertext) -> Ciphertext:
+        ct_out = new_ciphertext(self.ckks_params, 1, ct_0.level(), ct_0.scale)
+        self.relinearize(ct_0, ct_out)
+        return ct_out
+
+    # relinearize applies the relinearization procedure on ct_0 and returns the result in ct_out. The input Ciphertext must be of degree two.
+    def relinearize(self, ct_0: Ciphertext, ct_out: Ciphertext):
+        self._mm_relinearize(ct_0, ct_out)
+        ct_out.scale = ct_0.scale
+
+    # conjugate_new conjugates ct_0 (which is equivalent to a row rotation) and returns the result in a newly
+    # created element. If the provided element is a Ciphertext, a key-switching operation is necessary and a rotation key
+    # for the row rotation needs to be provided.
+    def conjugate_new(self, ct_0: Ciphertext) -> Ciphertext:
+        if self.params.ring_type == LATTISEQ_CONJUGATE_INVARIANT_RING_ENUM:
+            raise ValueError("cannot ConjugateNew: method is not supported when params.RingType() == ring.ConjugateInvariant")
+
+        ct_out = new_ciphertext(self.ckks_params, ct_0.degree(), ct_0.level(), ct_0.scale)
+        self.conjugate(ct_0, ct_out)
+        return ct_out
+
+    # conjugate conjugates ct_0 (which is equivalent to a row rotation) and returns the result in ct_out.
+    # If the provided element is a Ciphertext, a key-switching operation is necessary and a rotation key for the row rotation needs to be provided.
+    def conjugate(self, ct_0: Ciphertext, ct_out: Ciphertext):
+        if self.params.ring_type == LATTISEQ_CONJUGATE_INVARIANT_RING_ENUM:
+            raise ValueError("cannot Conjugate: method is not supported when params.RingType() == ring.ConjugateInvariant")
+
+        self._mm_automorphism(ct_0.get_rlwe_ciphertext(), self.params.galois_element_for_row_rotation(), 0, ct_out.get_rlwe_ciphertext())
+        ct_out.scale = ct_0.scale
+
+    # div_by_i_new multiplies ct_0 by the imaginary number 1/i = -i, and returns the result in a newly created element.
+    # It does not change the scale.
+    def div_by_i_new(self, ct_0: Ciphertext) -> Ciphertext:
+        if self.params.ring_type == LATTISEQ_CONJUGATE_INVARIANT_RING_ENUM:
+            raise ValueError("cannot DivByiNew: method not supported when params.RingType() == ring.ConjugateInvariant")
+
+        ct_out = new_ciphertext(self.ckks_params, 1, ct_0.level(), ct_0.scale)
+        self.div_by_i(ct_0, ct_out)
+        return ct_out
+
+    # div_by_i multiplies ct_0 by the imaginary number 1/i = -i, and returns the result in ct_out.
+    # It does not change the scale.
+    def div_by_i(self, ct_0: Ciphertext, ct_out: Ciphertext):
+        if self.params.ring_type == LATTISEQ_CONJUGATE_INVARIANT_RING_ENUM:
+            raise ValueError("cannot DivByi: method not supported when params.RingType() == ring.ConjugateInvariant")
+
+        level = min(ct_0.level(), ct_out.level())
+        ring_q = self.params.ring_q
+        half = ring_q._mm_n >> 1
+
+        ct_out.scale = ct_0.scale
+
+        # Equivalent to a product by the monomial x^(3*n/2) outside of the NTT domain
+        for i in range(level + 1):
+            psi = ring_q.ntt_psi[i][1]  # Psi^2
+            _mm_qi = ring_q._mm_modulus[i]
+            _mm_mred_params = ring_q._mm_mred_params[i]
+
+            _mm_imag = u64xN(ring_q.modulus[i] - psi)  # -Psi^2
+
+            for u in range(len(ct_out.value)):
+                p0_tmp = ct_0.value[u]._mm_coeffs[i]
+                p1_tmp = ct_out.value[u]._mm_coeffs[i]
+                ring._mm_mul_scalar_montgomery_vec(
+                    p0_tmp.slice_reference(0, half),
+                    p1_tmp, _mm_imag, _mm_qi, _mm_mred_params)
+
+            _mm_imag = u64xN(psi)  # Psi^2
+
+            for u in range(len(ct_out.value)):
+                p0_tmp = ct_0.value[u]._mm_coeffs[i]
+                p1_tmp = ct_out.value[u]._mm_coeffs[i]
+                ring._mm_mul_scalar_montgomery_vec(
+                    p0_tmp.slice_reference(half, ring_q._mm_n),
+                    p1_tmp.slice_reference(half, ring_q._mm_n),
+                    _mm_imag, _mm_qi, _mm_mred_params)
+
+    # scale_up_new multiplies ct_0 by scale and sets its scale to its previous scale
+    # times scale. It returns the result in a newly created element.
+    def scale_up_new(self, ct_0: Ciphertext, scale: float) -> Ciphertext:
+        ct_out = new_ciphertext(self.ckks_params, ct_0.degree(), ct_0.level(), ct_0.scale)
+        self.scale_up(ct_0, scale, ct_out)
+        return ct_out
+
+    # scale_up multiplies ct_0 by scale and sets its scale to its previous scale
+    # times scale. It returns the result in ct_out. The scale is truncated to an integer first.
+    def scale_up(self, ct_0: Ciphertext, scale: float, ct_out: Ciphertext):
+        in_scale = ct_0.scale
+        self._mm_mul_by_const(ct_0, u64(scale), ct_out)
+        ct_out.scale = in_scale * scale
+
+    # set_scale sets the scale of the ciphertext to the input scale (consumes a level, unless the new scale
+    # is an integer multiple of the current one).
+    #
+    # Lattigo multiplies by scale / ct.scale and then calls Rescale(ct, scale, ct). When that ratio is not an
+    # integer the multiplication is by round(ratio * q_level), which has to be divided out again; but Rescale
+    # only divides if ct.scale >= scale / 2, so Lattigo returns a ciphertext that is off by a factor q_level
+    # whenever the scale is raised by a non-integer ratio above 2 (which Bootstrap does to any ciphertext at
+    # level 1 or more whose scale is not exactly the default scale). Here the division always happens.
+    def set_scale(self, ct: Ciphertext, scale: float):
+        level = ct.level()
+        scale_before = ct.scale
+        self._mm_mul_by_const(ct, scale / ct.scale, ct)
+        if ct.scale != scale_before:
+            # The constant was not an integer: one rescale, exactly
+            self.rescale(ct, ct.scale / float(self.params.ring_q.modulus[level]), ct)
+        ct.scale = scale
+
+    # mul_by_gaussian_integer_and_add multiplies ct_0 by the gaussian integer round(c_real) + i*round(c_imag)
+    # and adds the result on ct_out.
+    #
+    # Lattigo takes the two integers as big.Int. Here each of them is given as the pair of floats whose
+    # product it is the rounding of (a coefficient and the scale it is brought to), which is all the
+    # polynomial evaluation ever passes: see round_product_mod.
+    def mul_by_gaussian_integer_and_add(
+            self, ct_0: Ciphertext, c_real: Tuple[float, float], c_imag: Tuple[float, float], ct_out: Ciphertext):
+        ring_q = self.params.ring_q
+        level = min(ct_0.level(), ct_out.level())
+        half = ring_q._mm_n >> 1
+        is_conjugate_invariant = self.params.ring_type == LATTISEQ_CONJUGATE_INVARIANT_RING_ENUM
+
+        for i in range(level + 1):
+            qi = ring_q.modulus[i]
+            _mm_qi = ring_q._mm_modulus[i]
+            bred_params = ring_q.bred_params[i]
+            mred_params = ring_q.mred_params[i]
+            _mm_mred_params = ring_q._mm_mred_params[i]
+
+            # interfaceMod(c, qi) of a big.Int: the non-negative residue
+            scaled_const_real, real_is_negative = round_product_mod(c_real[0], c_real[1], qi)
+            if real_is_negative and scaled_const_real != u64(0):
+                scaled_const_real = qi - scaled_const_real
+
+            scaled_const_imag = u64(0)
+            if not is_conjugate_invariant:
+                imag_abs, imag_is_negative = round_product_mod(c_imag[0], c_imag[1], qi)
+                scaled_const_imag = imag_abs
+                if imag_is_negative and scaled_const_imag != u64(0):
+                    scaled_const_imag = qi - scaled_const_imag
+
+            scaled_const = scaled_const_real
+
+            if scaled_const_imag != u64(0):
+                scaled_const_imag = ring.mred(scaled_const_imag, ring_q.ntt_psi[i][1], qi, mred_params)
+                scaled_const = ring.cred(scaled_const + scaled_const_imag, qi)
+
+            _mm_scaled_const = u64xN(ring.mform(scaled_const, qi, bred_params))
+
+            for u in range(len(ct_0.value)):
+                p0_tmp = ct_0.value[u]._mm_coeffs[i]
+                p1_tmp = ct_out.value[u]._mm_coeffs[i]
+                keyswitch._mm_mul_scalar_montgomery_and_add_vec(
+                    p0_tmp.slice_reference(0, half),
+                    p1_tmp, _mm_scaled_const, _mm_qi, _mm_mred_params)
+
+            scaled_const = ring.cred(scaled_const_real + (qi - scaled_const_imag), qi)
+            _mm_scaled_const = u64xN(ring.mform(scaled_const, qi, bred_params))
+
+            for u in range(len(ct_0.value)):
+                p0_tmp = ct_0.value[u]._mm_coeffs[i]
+                p1_tmp = ct_out.value[u]._mm_coeffs[i]
+                keyswitch._mm_mul_scalar_montgomery_and_add_vec(
+                    p0_tmp.slice_reference(half, ring_q._mm_n),
+                    p1_tmp.slice_reference(half, ring_q._mm_n),
+                    _mm_scaled_const, _mm_qi, _mm_mred_params)
+
+    # trace maps X -> sum((-1)^i * X^{i*n+1}) for 0 <= i < N
+    # For log(n) = log_slots.
+    # Monomial X^k vanishes if k is not divisible by (N/n), otherwise it is multiplied by (N/n).
+    # Ciphertext is pre-multiplied by (N/n)^-1 to remove the (N/n) factor.
+    # See Evaluator._mm_trace for an example.
+    def trace(self, ct_in: Ciphertext, log_slots: int, ct_out: Ciphertext):
+        self._mm_trace(ct_in, log_slots, ct_out)
+        ct_out.scale = ct_in.scale
+
+    # trace_new maps X -> sum((-1)^i * X^{i*n+1}) for 0 <= i < N and returns the result on a new ciphertext.
+    # For log(n) = log_slots.
+    def trace_new(self, ct_in: Ciphertext, log_slots: int) -> Ciphertext:
+        ct_out = new_ciphertext(self.ckks_params, 1, ct_in.level(), ct_in.scale)
+        self.trace(ct_in, log_slots, ct_out)
+        return ct_out
+
+    # rotate_hoisted_new takes an input Ciphertext and a list of rotations and returns a map of Ciphertext, where each element of the map is the input Ciphertext
+    # rotation by one element of the list. It is much faster than sequential calls to Rotate.
+    def rotate_hoisted_new(self, ct_in: Ciphertext, rotations: list[int]) -> dict[int, Ciphertext]:
+        ct_out = dict[int, Ciphertext]()
+        for i in rotations:
+            ct_out[i] = new_ciphertext(self.ckks_params, 1, ct_in.level(), ct_in.scale)
+        self.rotate_hoisted(ct_in, rotations, ct_out)
+        return ct_out
+
+    # rotate_hoisted takes an input Ciphertext and a list of rotations and populates a map of pre-allocated Ciphertexts,
+    # where each element of the map is the input Ciphertext rotation by one element of the list.
+    # It is much faster than sequential calls to Rotate.
+    def rotate_hoisted(self, ct_in: Ciphertext, rotations: list[int], ct_out: dict[int, Ciphertext]):
+        level_q = ct_in.level()
+        self._mm_decompose_ntt(level_q, self.params.p_count() - 1, self.params.p_count(), ct_in.value[1], self.buff_decomp_qp)
+        for i in rotations:
+            self._mm_automorphism_hoisted(level_q, ct_in, self.buff_decomp_qp, self.params.galois_element_for_column_rotation_by(i), ct_out[i])
+            ct_out[i].scale = ct_in.scale
+
+    # rotate_hoisted_no_mod_down_new takes the polynomial c0 of a ciphertext and the decomposition c2_decomp_qp of its
+    # polynomial c1 and returns, for each non-zero rotation of the list, the rotated ciphertext modulo QP and scaled by P.
+    def rotate_hoisted_no_mod_down_new(
+            self, level: int, rotations: list[int], c0: ring.Poly, c2_decomp_qp: list[ringqp.Poly]) -> dict[int, list[ringqp.Poly]]:
+        ring_q = self.params.ring_q
+        ring_p = self.params.ring_p
+        c_out = dict[int, list[ringqp.Poly]]()
+        for i in rotations:
+            if i != 0:
+                c_out_i = [
+                    ringqp.Poly(q=ring_q.new_poly_lvl(level), p=ring_p.new_poly()),
+                    ringqp.Poly(q=ring_q.new_poly_lvl(level), p=ring_p.new_poly())]
+                self._mm_automorphism_hoisted_no_mod_down(
+                    level, c0, c2_decomp_qp, self.params.galois_element_for_column_rotation_by(i),
+                    c_out_i[0].q, c_out_i[1].q, c_out_i[0].p, c_out_i[1].p)
+                c_out[i] = c_out_i
+
+        return c_out

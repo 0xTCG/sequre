@@ -1,0 +1,585 @@
+"""
+Ported from https://github.com/tuneinsight/lattigo/tree/v4.0.0/ckks/bootstrapping
+
+Package bootstrapping implement the bootstrapping for the CKKS scheme: a ciphertext that has run
+out of levels is re-encrypted, homomorphically and with public evaluation keys only, into a
+ciphertext of the same value at a higher level.
+
+  bootstrapper.go            Bootstrapper, EvaluationKeys, GenEvaluationKeys
+  bootstrapping.go           Bootstrap, modUpFromQ0
+  bootstrapping_params.go    Parameters, RotationsForBootstrapping
+
+The default parameter sets of default_params.go are in bootstrapping_default_params.codon.
+Not ported: ShallowCopy and the binary marshalling of Parameters.
+
+Lattigo embeds the advanced evaluator in the Bootstrapper. Here the Bootstrapper holds a
+ckks.Evaluator, which the modules it imports extend with everything the circuit needs.
+
+What a caller has to know about the circuit (see Bootstrapper.bootstrap for the details):
+  - The output is at level Bootstrapper.output_level(), well below the top level, and at the default scale
+    for most parameter sets (Bootstrapper.output_scale()).
+  - The value range is bounded, whatever the parameters: bootstrap is designed for plaintexts whose
+    coefficients, divided by the scale, lie in [-1, 1]. See "Value range" below.
+  - A missing "nil" switching key of Lattigo is an empty rlwe.SwitchingKey() here.
+
+Value range
+  The circuit reduces the coefficients of the plaintext polynomial modulo Q0, with a polynomial that
+  approximates the reduction of a coefficient m only for |m| <= Q0 / message ratio. Before that, bootstrap
+  multiplies the plaintext by an integer so that its scale becomes exactly Q0 / message ratio, to use all
+  that room. So the bound is on value = coefficient / scale, and it is 1 for every parameter set:
+
+    |value| <= 1     the range the parameters are made for. How accurate the edge of it is depends on them:
+                     - message ratio 256, no arcsine (six of the default sets): the result is off by
+                       value * (2 pi value / 256)^2 / 6, i.e. 1.0e-4 at |value| = 1 and 1.3e-5 at 0.5;
+                     - message ratio 4, arcsine of degree 7 (N16QP1547H192H32, N16QP1788H32768H32): far more
+                       accurate on small coefficients (2e-10 on random slots, against 3e-8), but the arcsine
+                       series runs out towards the edge: 1.4e-3 at |value| = 0.5 and 0.18 at 1. Keep the
+                       coefficients below about 1/8 with these.
+    |value| a few    with a message ratio of 256 the error keeps growing with the cube of the value:
+                     1e-2 relative around 10.
+    beyond           garbage, silently. Nothing in the ciphertext tells.
+
+  The coefficients are not the slots. A coefficient is at most the mean of the absolute values of the
+  slots, and reaches it when every slot holds the same real value (the plaintext is then a constant
+  polynomial). For slots without such a structure the coefficients are smaller by about the square root
+  of the number of slots, which is why random slots in [-1, 1] come out with 26 bits where a vector of
+  ones only gets 13.
+
+  For larger values, bootstrap_with_range(ct, log_range) covers |value| <= 2^log_range, at the price
+  of log_range bits of precision.
+"""
+import math
+
+import ring, ringqp, rlwe, ckks, keyswitch, evaluator, linear_transform, polynomial_evaluation, advanced
+
+from ckks import Ciphertext, new_ciphertext
+from advanced import EncodingMatrixLiteral, EncodingMatrix, EvalModLiteral, EvalModPoly
+
+from sequre.types.builtin import *
+from sequre.constants import LATTISEQ_STANDARD_RING_ENUM
+
+
+# ---------------------------------------------------------------------------------------------
+# bootstrapping_params.go
+# ---------------------------------------------------------------------------------------------
+
+# Parameters is a struct for the default bootstrapping parameters
+class Parameters:
+    slots_to_coeffs_parameters: EncodingMatrixLiteral
+    eval_mod_parameters: EvalModLiteral
+    coeffs_to_slots_parameters: EncodingMatrixLiteral
+    ephemeral_secret_weight: int  # Hamming weight of the ephemeral secret. If 0, no ephemeral secret is used during the bootstrapping.
+
+    # copy returns a copy of the parameters that shares nothing with the receiver.
+    # Go passes these structs by value; here they are references, and both the bootstrapper and
+    # rotations_for_bootstrapping write into them.
+    def copy(self) -> Parameters:
+        return Parameters(
+            slots_to_coeffs_parameters=self.slots_to_coeffs_parameters.copy(),
+            eval_mod_parameters=self.eval_mod_parameters.copy(),
+            coeffs_to_slots_parameters=self.coeffs_to_slots_parameters.copy(),
+            ephemeral_secret_weight=self.ephemeral_secret_weight)
+
+    # depth returns the number of levels the bootstrapping circuit consumes.
+    def depth(self) -> int:
+        return (self.coeffs_to_slots_parameters.depth(True)
+                + self.eval_mod_parameters.depth()
+                + self.slots_to_coeffs_parameters.depth(True))
+
+    # rotations_for_bootstrapping returns the list of rotations performed during the Bootstrapping operation.
+    # Unlike Lattigo, the receiver is left untouched and the list has no duplicates.
+    def rotations_for_bootstrapping(self, params: ckks.Parameters) -> list[int]:
+        logn = params.logn
+        log_slots = params.log_slots
+
+        # List of the rotation key values to needed for the bootstrapp
+        rotations = list[int]()
+
+        # SubSum rotation needed X -> Y^slots rotations
+        for i in range(log_slots, logn - 1):
+            if (1 << i) not in rotations:
+                rotations.append(1 << i)
+
+        cts = self.coeffs_to_slots_parameters.copy()
+        stc = self.slots_to_coeffs_parameters.copy()
+
+        cts.logn = logn
+        stc.logn = logn
+
+        cts.log_slots = log_slots
+        stc.log_slots = log_slots
+
+        for k in cts.rotations():
+            if k not in rotations: rotations.append(k)
+        for k in stc.rotations():
+            if k not in rotations: rotations.append(k)
+
+        return rotations
+
+    # gen_encapsulation_switching_keys generates the low level encapsulation switching keys for the bootstrapping:
+    # from the dense key to the sparse ephemeral key, and back.
+    # Both are empty if the parameters use no ephemeral secret.
+    def gen_encapsulation_switching_keys(self, params: ckks.Parameters, sk_dense: rlwe.SecretKey) -> Tuple[rlwe.SwitchingKey, rlwe.SwitchingKey]:
+        if self.ephemeral_secret_weight == 0:
+            return rlwe.SwitchingKey(), rlwe.SwitchingKey()
+
+        params_sparse = rlwe.new_parameters(
+            params.logn, params.q()[:1], params.p()[:1], 0, params.h, params.sigma, params.ring_type)
+
+        kgen_sparse = rlwe.new_key_generator(params_sparse)
+        kgen_dense = rlwe.new_key_generator(params.get_rlwe_params())
+        sk_sparse = keyswitch.gen_secret_key_with_hamming_weight(kgen_sparse, self.ephemeral_secret_weight)
+
+        return keyswitch.gen_switching_key(kgen_dense, sk_dense, sk_sparse), keyswitch.gen_switching_key(kgen_dense, sk_sparse, sk_dense)
+
+
+# ---------------------------------------------------------------------------------------------
+# bootstrapper.go
+# ---------------------------------------------------------------------------------------------
+
+# EvaluationKeys is a type for a CKKS bootstrapping key, which
+# regroups the necessary public relinearization and rotation keys.
+class EvaluationKeys:
+    rlk: rlwe.RelinearizationKey
+    rtks: rlwe.RotationKeySet
+    swk_dts: rlwe.SwitchingKey  # dense to sparse. Empty if there is no ephemeral secret
+    swk_std: rlwe.SwitchingKey  # sparse to dense. Empty if there is no ephemeral secret
+
+
+# gen_evaluation_keys generates the bootstrapping EvaluationKeys, which contain:
+#	rlk: rlwe.RelinearizationKey
+#	rtks: rlwe.RotationKeySet (the rotations of the bootstrapping, the conjugation and extra_rotations)
+#	swk_dts: rlwe.SwitchingKey
+#	swk_std: rlwe.SwitchingKey
+# extra_rotations is not in Lattigo: an application that rotates with the same evaluator as the one it
+# bootstraps with needs its own rotations in the same key set.
+def gen_evaluation_keys(btp_params: Parameters, ckks_params: ckks.Parameters, sk: rlwe.SecretKey, extra_rotations: list[int] = list[int]()) -> EvaluationKeys:
+    kgen = ckks.new_key_generator(ckks_params)
+    rotations = btp_params.rotations_for_bootstrapping(ckks_params)
+    for k in extra_rotations:
+        if k not in rotations: rotations.append(k)
+    rlk = kgen.gen_relinearization_key(sk, 1)
+    rotkeys = kgen.gen_rotation_keys_for_rotations(rotations, True, sk)
+    swk_dts, swk_std = btp_params.gen_encapsulation_switching_keys(ckks_params, sk)
+
+    return EvaluationKeys(rlk=rlk, rtks=rotkeys, swk_dts=swk_dts, swk_std=swk_std)
+
+
+# evaluation_keys_size returns the size in bytes of the coefficients of the evaluation keys that
+# gen_evaluation_keys generates for these parameters, without generating them: the relinearization key,
+# one key per rotation, the conjugation key and the two encapsulation keys.
+# (Not in Lattigo. At logN = 16 these keys do not fit a laptop, which is worth knowing beforehand.)
+def evaluation_keys_size(btp_params: Parameters, ckks_params: ckks.Parameters, extra_rotations: list[int] = list[int]()) -> int:
+    rotations = btp_params.rotations_for_bootstrapping(ckks_params)
+    for k in extra_rotations:
+        if k not in rotations: rotations.append(k)
+
+    q_count, p_count = ckks_params.q_count(), ckks_params.p_count()
+    poly_qp = (q_count + p_count) * ckks_params.n() * 8
+    switching_key = ckks_params.decomp_rns(q_count - 1, p_count - 1) * 2 * poly_qp
+
+    size = (len(rotations) + 2) * switching_key
+    if btp_params.ephemeral_secret_weight != 0:
+        size += 2 * 2 * ckks_params.n() * 8  # dense to sparse: one element modulo Q0 and P0
+        size += switching_key                # sparse to dense
+    return size
+
+
+# Bootstrapper is a struct to store a memory buffer with the plaintext matrices,
+# the polynomial approximation, and the keys for the bootstrapping.
+# It holds evaluation keys only: no secret key is needed to create or to use it.
+class Bootstrapper:
+    evaluator: ckks.Evaluator
+    params: ckks.Parameters
+    btp_params: Parameters
+
+    dslots: int  # Number of plaintext slots after the re-encoding
+    logdslots: int
+
+    eval_mod_poly: EvalModPoly
+    stc_matrices: EncodingMatrix
+    cts_matrices: EncodingMatrix
+
+    q0_over_message_ratio: float
+
+    swk_dts: rlwe.SwitchingKey
+    swk_std: rlwe.SwitchingKey
+
+    # output_level returns the level of the ciphertexts bootstrap returns.
+    def output_level(self) -> int:
+        level, _ = self._output_level_and_scale()
+        return level
+
+    # output_scale returns the scale of the ciphertexts bootstrap returns, for an input whose scale meets
+    # the requirement of bootstrap. It is the default scale for most parameter sets. In N16QP1553H192H32 and
+    # N16QP1793H32768H32 the moduli are twice as large as the default scale and SlotsToCoeffs uses half of
+    # its last one: their output is at the default scale squared, one level higher, like the product of two
+    # ciphertexts that has not been rescaled yet.
+    def output_scale(self) -> float:
+        _, scale = self._output_level_and_scale()
+        return scale
+
+    # Follows the scale and the level through SlotsToCoeffs: each matrix multiplies the scale by its own,
+    # and is followed by a rescale that divides moduli out for as long as the scale stays at or above half
+    # the scale the ciphertext came in with (advanced.Evaluator.dft).
+    def _output_level_and_scale(self) -> Tuple[int, float]:
+        moduli = self.params.ring_q.modulus
+        default_scale = self.params.default_scale
+        level = self.stc_matrices.level_start
+        scale = default_scale
+        for matrix in self.stc_matrices.matrices:
+            level = min(level, matrix.level)
+            scale *= matrix.scale
+            while level > 0 and scale / float(moduli[level]) >= default_scale / 2:
+                scale /= float(moduli[level])
+                level -= 1
+        return level, scale
+
+    # max_log_range returns the largest log_range that bootstrap_with_range accepts for a ciphertext at
+    # level 0 with the given scale: log2((Q0 / message ratio) / scale), rounded down. Zero means that
+    # only values in [-1, 1] fit; a negative result means that such a ciphertext cannot be bootstrapped.
+    # A ciphertext at level 1 or more has no such limit: one level is used to match its scale.
+    def max_log_range(self, scale: float) -> int:
+        return int(math.floor(math.log2(self.q0_over_message_ratio / scale) + 1e-9))
+
+    # check_keys checks if all the necessary keys are present in the instantiated Bootstrapper
+    def check_keys(self, btp_keys: EvaluationKeys):
+        check_keys(self.params, self.btp_params, btp_keys)
+
+
+# check_keys checks if all the keys the bootstrapping circuit of btp_params needs are present in btp_keys.
+def check_keys(params: ckks.Parameters, btp_params: Parameters, btp_keys: EvaluationKeys):
+    if not btp_keys.rlk:
+        raise ValueError("invalid bootstrapping key: relinearization key is nil")
+
+    if not btp_keys.rtks:
+        raise ValueError("invalid bootstrapping key: rotation key is nil")
+
+    if len(btp_keys.swk_dts.value) == 0 and btp_params.ephemeral_secret_weight != 0:
+        raise ValueError("invalid bootstrapping key: switching key dense to sparse is nil")
+
+    if len(btp_keys.swk_std.value) == 0 and btp_params.ephemeral_secret_weight != 0:
+        raise ValueError("invalid bootstrapping key: switching key sparse to dense is nil")
+
+    # The rotations of CoeffsToSlots, of SlotsToCoeffs and of the trace
+    rot_missing = list[int]()
+    for i in btp_params.rotations_for_bootstrapping(params):
+        gal_el = params.galois_element_for_column_rotation_by(i)
+        if gal_el not in btp_keys.rtks.keys:
+            rot_missing.append(i)
+
+    if len(rot_missing) != 0:
+        raise ValueError(f"invalid bootstrapping key: rotation key(s) missing: {rot_missing}")
+
+    # Lattigo does not check the conjugation key and fails in CoeffsToSlots without it.
+    if params.galois_element_for_row_rotation() not in btp_keys.rtks.keys:
+        raise ValueError("invalid bootstrapping key: conjugation key missing")
+
+
+# new_bootstrapper creates a new Bootstrapper.
+def new_bootstrapper(params: ckks.Parameters, btp_params: Parameters, btp_keys: EvaluationKeys) -> Bootstrapper:
+    if btp_params.eval_mod_parameters.sine_type == advanced.SIN and btp_params.eval_mod_parameters.double_angle != 0:
+        raise ValueError("cannot use double angle formul for SineType = Sin -> must use SineType = Cos")
+
+    if btp_params.eval_mod_parameters.sine_type == advanced.COS1 and btp_params.eval_mod_parameters.sine_deg < 2 * (btp_params.eval_mod_parameters.k - 1):
+        raise ValueError("SineType 'advanced.Cos1' uses a minimum degree of 2*(K-1) but EvalMod degree is smaller")
+
+    if btp_params.coeffs_to_slots_parameters.level_start - btp_params.coeffs_to_slots_parameters.depth(True) != btp_params.eval_mod_parameters.level_start:
+        raise ValueError("starting level and depth of CoeffsToSlotsParameters inconsistent starting level of SineEvalParameters")
+
+    if btp_params.eval_mod_parameters.level_start - btp_params.eval_mod_parameters.depth() != btp_params.slots_to_coeffs_parameters.level_start:
+        raise ValueError("starting level and depth of SineEvalParameters inconsistent starting level of CoeffsToSlotsParameters")
+
+    # Not checked by Lattigo, which fails later: the circuit starts at the top of the moduli chain and
+    # reduces modulo Q0.
+    if btp_params.coeffs_to_slots_parameters.level_start != params.max_level():
+        raise ValueError("starting level of CoeffsToSlotsParameters must be the maximum level of the scheme parameters")
+
+    if btp_params.eval_mod_parameters.q != params.ring_q.modulus[0]:
+        raise ValueError("Q of the EvalMod parameters must be the first modulus of the scheme parameters")
+
+    # Lattigo builds the plaintext matrices first and checks the keys afterwards.
+    check_keys(params, btp_params, btp_keys)
+
+    return _new_bootstrapper_base(params, btp_params.copy(), btp_keys)
+
+
+def _new_bootstrapper_base(params: ckks.Parameters, btp_params: Parameters, btp_keys: EvaluationKeys) -> Bootstrapper:
+    dslots = params.slots()
+    logdslots = params.log_slots
+    if params.log_slots < params.max_log_slots():
+        dslots <<= 1
+        logdslots += 1
+
+    eval_mod_poly = advanced.new_eval_mod_poly_from_literal(btp_params.eval_mod_parameters)
+
+    sc_fac = eval_mod_poly.sc_fac()
+    k = eval_mod_poly.k() / sc_fac
+    n = float(2 * params.slots())
+
+    q0 = float(params.ring_q.modulus[0])
+
+    # Correcting factor for approximate division by Q
+    # The second correcting factor for approximate multiplication by Q is included in the coefficients of the EvalMod polynomials
+    q_diff = eval_mod_poly.q_diff()
+
+    # Q0/|m|
+    q0_over_message_ratio = math.pow(2.0, float(round(math.log2(q0 / eval_mod_poly.message_ratio()))))
+
+    # If the scale used during the EvalMod step is smaller than Q0, then we cannot increase the scale during
+    # the EvalMod step to get a free division by MessageRatio, and we need to do this division (totally or partly)
+    # during the CoeffstoSlots step
+    q_div = btp_params.eval_mod_parameters.scaling_factor / math.pow(2.0, float(round(math.log2(q0))))
+
+    # Sets q_div to 1 if there is enough room for the division to happen using scale manipulation.
+    if q_div > 1:
+        q_div = 1.0
+
+    encoder = ckks.new_encoder_complex(params)
+
+    # CoeffsToSlots vectors
+    # Change of variable for the evaluation of the Chebyshev polynomial + cancelling factor for the DFT and SubSum + eventual scaling factor for the double angle formula
+    cts_parameters = btp_params.coeffs_to_slots_parameters
+    cts_parameters.logn = params.logn
+    cts_parameters.log_slots = params.log_slots
+
+    if cts_parameters.scaling == 0:
+        cts_parameters.scaling = q_div / (k * n * sc_fac * q_diff)
+    else:
+        cts_parameters.scaling *= q_div / (k * n * sc_fac * q_diff)
+
+    cts_matrices = advanced.new_homomorphic_encoding_matrix_from_literal(cts_parameters, encoder)
+
+    # SlotsToCoeffs vectors
+    # Rescaling factor to set the final ciphertext to the desired scale
+    stc_parameters = btp_params.slots_to_coeffs_parameters
+    stc_parameters.logn = params.logn
+    stc_parameters.log_slots = params.log_slots
+
+    if stc_parameters.scaling == 0:
+        stc_parameters.scaling = params.default_scale / (eval_mod_poly.scaling_factor() / eval_mod_poly.message_ratio())
+    else:
+        stc_parameters.scaling *= params.default_scale / (eval_mod_poly.scaling_factor() / eval_mod_poly.message_ratio())
+
+    stc_matrices = advanced.new_homomorphic_encoding_matrix_from_literal(stc_parameters, encoder)
+
+    return Bootstrapper(
+        evaluator=ckks.new_evaluator(params, rlwe.EvaluationKey(rlk=btp_keys.rlk, rtks=btp_keys.rtks)),
+        params=params,
+        btp_params=btp_params,
+        dslots=dslots,
+        logdslots=logdslots,
+        eval_mod_poly=eval_mod_poly,
+        stc_matrices=stc_matrices,
+        cts_matrices=cts_matrices,
+        q0_over_message_ratio=q0_over_message_ratio,
+        swk_dts=btp_keys.swk_dts,
+        swk_std=btp_keys.swk_std)
+
+
+# ---------------------------------------------------------------------------------------------
+# bootstrapping.go
+# ---------------------------------------------------------------------------------------------
+
+@extend
+class Bootstrapper:
+    # bootstrap re-encrypts a ciphertext at lvl Q0 to a ciphertext at MaxLevel-k where k is the depth of the bootstrapping circuit.
+    # If the input ciphertext level is zero, the input scale must be an exact power of two smaller or equal to round(Q0/2^{10}).
+    # If the input ciphertext is at level one or more, the input scale does not need to be an exact power of two as one level
+    # can be used to do a scale matching.
+    #
+    # The input is not modified. The output is at level output_level() and scale output_scale() and holds the same values.
+    #
+    # One deviation from Lattigo, on the scale of the output. Lattigo sets it to the default scale whatever
+    # the scale the ciphertext had when it entered the circuit. With an input at level zero whose scale is
+    # not such a power of two, that scale is not exactly Q0 / message ratio, and Lattigo's output is off by
+    # the same ratio on every slot (up to 2^-13 for the default parameters). Here the scale of the output
+    # records that ratio instead, so the values are right; whenever Lattigo's requirement on the input scale
+    # is met the ratio is exactly one and the output scale is the default scale, as in Lattigo.
+    def bootstrap(self, ct_in: Ciphertext) -> Ciphertext:
+        evaluator = self.evaluator
+        eval_mod_poly = self.eval_mod_poly
+        q0 = float(self.params.ring_q.modulus[0])
+
+        ct_low = ct_in.copy()
+
+        # Drops the level to 1
+        if ct_low.level() > 1:
+            evaluator.drop_level(ct_low, ct_low.level() - 1)
+
+        # Brings the ciphertext scale to Q0/MessageRatio
+        if ct_low.level() == 1:
+            # If one level is available, then uses it to match the scale
+            evaluator.set_scale(ct_low, self.q0_over_message_ratio)
+
+            # Then drops to level 0
+            if ct_low.level() != 0:
+                evaluator.drop_level(ct_low, ct_low.level())
+        else:
+            # Does an integer constant mult by round((Q0/Delta_m)/ctscle)
+            if self.q0_over_message_ratio < ct_low.scale:
+                raise ValueError("Cannot bootstrap: ciphetext scale > q/||m||)")
+
+            evaluator.scale_up(ct_low, float(round(self.q0_over_message_ratio / ct_low.scale)), ct_low)
+
+        # Scales the message to Q0/|m|, which is the maximum possible before ModRaise to avoid plaintext overflow.
+        if float(round((q0 / eval_mod_poly.message_ratio()) / ct_low.scale)) > 1:
+            evaluator.scale_up(ct_low, float(round((q0 / eval_mod_poly.message_ratio()) / ct_low.scale)), ct_low)
+
+        # Step 1 : Extend the basis from q to Q
+        ct_raised = self.mod_up_from_q0(ct_low)
+
+        # Scale the message from Q0/|m| to QL/|m|, where QL is the largest modulus used during the bootstrapping.
+        if (eval_mod_poly.scaling_factor() / eval_mod_poly.message_ratio()) / ct_raised.scale > 1:
+            evaluator.scale_up(ct_raised, float(round((eval_mod_poly.scaling_factor() / eval_mod_poly.message_ratio()) / ct_raised.scale)), ct_raised)
+
+        # The scale the message has through CoeffsToSlots and EvalMod. Nominally scaling factor / message ratio.
+        scale_ratio = ct_raised.scale / (eval_mod_poly.scaling_factor() / eval_mod_poly.message_ratio())
+
+        # SubSum X -> (N/dslots) * Y^dslots
+        evaluator.trace(ct_raised, self.params.log_slots, ct_raised)
+
+        # Step 2 : CoeffsToSlots (Homomorphic encoding)
+        ct_real, ct_imag = evaluator.coeffs_to_slots_new(ct_raised, self.cts_matrices)
+
+        # Step 3 : EvalMod (Homomorphic modular reduction)
+        # ct_real = Ecd(real)
+        # ct_imag = Ecd(imag)
+        # If n < N/2 then ct_real = Ecd(real|imag)
+        ct_real_mod = evaluator.eval_mod_new(ct_real, eval_mod_poly)
+        ct_real_mod.set_scale(self.params.default_scale * scale_ratio)
+
+        ct_imag_mod = Ciphertext()
+        if ct_imag:
+            ct_imag_mod = evaluator.eval_mod_new(ct_imag, eval_mod_poly)
+            ct_imag_mod.set_scale(self.params.default_scale * scale_ratio)
+
+        # Step 4 : SlotsToCoeffs (Homomorphic decoding)
+        return evaluator.slots_to_coeffs_new(ct_real_mod, ct_imag_mod, self.stc_matrices)
+
+    # bootstrap_with_range bootstraps a ciphertext whose plaintext coefficients, divided by its scale, lie in
+    # [-2^log_range, 2^log_range] instead of the [-1, 1] that bootstrap is designed for (see "Value range"
+    # at the top of this file). Not in Lattigo.
+    #
+    # A ciphertext of the values v at the scale s is also a ciphertext of the values v / 2^log_range at the
+    # scale s * 2^log_range: it is bootstrapped as the latter, and the result is multiplied by the integer
+    # 2^log_range. That multiplies the error of the bootstrapping by 2^log_range as well: log_range bits of
+    # precision are traded for log_range bits of range.
+    #
+    # With an input at level 0, s * 2^log_range must not exceed Q0 / message ratio: see max_log_range.
+    def bootstrap_with_range(self, ct_in: Ciphertext, log_range: int) -> Ciphertext:
+        if log_range < 0:
+            raise ValueError("Cannot bootstrap: log_range must not be negative")
+
+        if log_range == 0:
+            return self.bootstrap(ct_in)
+
+        range_factor = math.pow(2.0, float(log_range))
+
+        # The same polynomials, read at a larger scale. bootstrap copies its input before changing it.
+        ct_scaled_down = Ciphertext(ct_in.value, ct_in.scale * range_factor, False)
+        ct_out = self.bootstrap(ct_scaled_down)
+
+        # An integer constant: the scale stays, the values are multiplied.
+        self.evaluator._mm_mul_by_const(ct_out, 1 << log_range, ct_out)
+        return ct_out
+
+    # mod_up_from_q0 extends a ciphertext at level 0 to the top level: a ciphertext modulo Q0 of the message m
+    # becomes a ciphertext modulo Q of m + Q0 * I, for a small integer polynomial I.
+    # With an ephemeral secret, the ciphertext is switched to the sparse key first, which keeps I small,
+    # and switched back to the dense key once it is extended.
+    # The input is modified (it is switched to the sparse key in place).
+    def mod_up_from_q0(self, ct: Ciphertext) -> Ciphertext:
+        evaluator = self.evaluator
+        params = self.params
+        has_swk_dts = len(self.swk_dts.value) != 0
+        has_swk_std = len(self.swk_std.value) != 0
+
+        if has_swk_dts:
+            evaluator.switch_keys(ct, self.swk_dts, ct)
+
+        ring_q = params.ring_q
+        ring_p = params.ring_p
+
+        for i in range(len(ct.value)):
+            ring_q._mm_inv_ntt_lvl(ct.level(), ct.value[i], ct.value[i])
+
+        # Extend the ciphertext with zero polynomials.
+        level_q = params.q_count() - 1
+        level_p = params.p_count() - 1
+
+        ct_out = new_ciphertext(params, ct.degree(), level_q, ct.scale)
+        n = params.n()
+        for i in range(len(ct.value)):
+            src, dst = ct.value[i]._buf_coeffs[0], ct_out.value[i]._buf_coeffs[0]
+            for j in range(n): dst[j] = src[j]
+
+        moduli_q = ring_q.modulus
+        moduli_p = ring_p.modulus
+        q = moduli_q[0]
+        q_half = q >> u64(1)
+        bred_params_q = ring_q.bred_params
+        bred_params_p = ring_p.bred_params
+
+        c0 = ct_out.value[0]._buf_coeffs
+        c1 = ct_out.value[1]._buf_coeffs
+
+        # ModUp q->Q for ct[0] centered around q
+        for j in range(n):
+            coeff = c0[0][j]
+            negative = coeff >= q_half
+            if negative:
+                coeff = q - coeff
+
+            for i in range(1, level_q + 1):
+                tmp = ring.bred_add(coeff, moduli_q[i], bred_params_q[i][0])
+                c0[i][j] = (moduli_q[i] - tmp) if negative else tmp
+
+        if has_swk_std:
+            buff_decomp_qp = evaluator.buff_decomp_qp
+            decomp_q = buff_decomp_qp[0].q._buf_coeffs
+            decomp_p = buff_decomp_qp[0].p._buf_coeffs
+
+            # ModUp q->QP for ct[1] centered around q
+            for j in range(n):
+                coeff = c1[0][j]
+                negative = coeff > q_half
+                if negative:
+                    coeff = q - coeff
+
+                for i in range(level_q + 1):
+                    tmp = ring.bred_add(coeff, moduli_q[i], bred_params_q[i][0])
+                    decomp_q[i][j] = (moduli_q[i] - tmp) if negative else tmp
+
+                for i in range(level_p + 1):
+                    tmp = ring.bred_add(coeff, moduli_p[i], bred_params_p[i][0])
+                    decomp_p[i][j] = (moduli_p[i] - tmp) if negative else tmp
+
+            for i in range(len(buff_decomp_qp) - 1, -1, -1):
+                ring_q._mm_ntt_lvl(level_q, buff_decomp_qp[0].q, buff_decomp_qp[i].q)
+
+            for i in range(len(buff_decomp_qp) - 1, -1, -1):
+                ring_p._mm_ntt_lvl(level_p, buff_decomp_qp[0].p, buff_decomp_qp[i].p)
+
+            ring_q._mm_ntt_lvl(level_q, ct_out.value[0], ct_out.value[0])
+
+            # Every element of the "decomposition" is the whole polynomial: it is smaller than Q0, and the
+            # elements of the key sum up to an encryption of P times the sparse key.
+            buff_qp = evaluator.buff_qp
+            evaluator._mm_keyswitch_hoisted(level_q, buff_decomp_qp, self.swk_std, buff_qp[1].q, ct_out.value[1], buff_qp[1].p, buff_qp[2].p)
+            ring_q._mm_add_lvl(level_q, ct_out.value[0], buff_qp[1].q, ct_out.value[0])
+        else:
+            for j in range(n):
+                coeff = c1[0][j]
+                negative = coeff >= q_half
+                if negative:
+                    coeff = q - coeff
+
+                for i in range(1, level_q + 1):
+                    tmp = ring.bred_add(coeff, moduli_q[i], bred_params_q[i][0])
+                    c1[i][j] = (moduli_q[i] - tmp) if negative else tmp
+
+            ring_q._mm_ntt_lvl(level_q, ct_out.value[0], ct_out.value[0])
+            ring_q._mm_ntt_lvl(level_q, ct_out.value[1], ct_out.value[1])
+
+        return ct_out

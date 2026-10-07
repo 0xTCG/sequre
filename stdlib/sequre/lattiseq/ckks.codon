@@ -8,7 +8,7 @@ import math
 from pickler import pickle, unpickle
 from sequre.stdlib.numpy.create import zeros
 
-from sequre.types.builtin import u64xN, f64xN
+from sequre.types.builtin import *
 from sequre.utils.stats import PrecisionStats, evaluate_precision
 from sequre.utils.utils import zeros_vec
 from sequre.constants import (
@@ -107,10 +107,15 @@ class Parameters(Static[rlwe.Parameters]):
     
     # Returns the size of the modulus q in bits at a specific level
     def logq_lvl(self, level: int) -> int:
-        return int(self.q_lvl(level).bitlen())
-    
+        return rlwe.product_bitlen(self.q()[:level + 1])
+
     # Returns the product of the moduli at the given level as a big.Int
     def q_lvl(self, level: int) -> lattiseq_uint:
+        if self.logq_lvl(level) > LATTISEQ_INT_SIZE:
+            raise ValueError(
+                f"cannot q_lvl: the product of the moduli up to level {level} has {self.logq_lvl(level)} bits"
+                f" and does not fit the bigint in use ({LATTISEQ_INT_SIZE} bits)")
+
         tmp = lattiseq_uint(1)
         for qi in self.q().slice_reference(0, level + 1): tmp *= qi.ext_to_lattiseq_uint()
         return tmp
@@ -530,20 +535,24 @@ def new_decryptor(params: Parameters, sk: rlwe.SecretKey) -> Decryptor:
 	return Decryptor(rlwe.new_decryptor(params.get_rlwe_params(), sk), params)
 
 
+# gen_bigint_chain returns the product of the moduli q_0..q_level for each level at which the CRT
+# reconstruction of ring.poly_to_bigint_lvl is exact in the bigint in use: it sums level + 1 products
+# of a coefficient (< q_i) and a CRT factor (< q_0*...*q_level) before reducing them.
+# A chain that does not fit as a whole (any bootstrappable chain) used to be rejected here by an
+# assert. It now yields a chain shorter than q, and plaintext_to_complex reads only those levels.
 def gen_bigint_chain(q: list[u64]) -> list[lattiseq_uint]:
-    num_bits_total = 1
-    for m in q: num_bits_total += int(m.bitlen())
-    assert num_bits_total <= LATTISEQ_INT_SIZE, (
-        f"Moduli product too large for the bigint in use. Increase the bigint size."
-        f" Current bigint size: {LATTISEQ_INT_SIZE}. Required size: {num_bits_total}")
-
     bigint_chain = list[lattiseq_uint](len(q))
     bigint_chain.append(q[0].ext_to_lattiseq_uint())
-	
+
+    num_bits_total = int(q[0].bitlen())
+    max_bits_qi = num_bits_total
     for i in range(1, len(q)):
+        num_bits_total += int(q[i].bitlen())
+        max_bits_qi = max(max_bits_qi, int(q[i].bitlen()))
+        if num_bits_total + max_bits_qi + int((i + 1).bitlen()) > LATTISEQ_INT_SIZE: break
         bigint_chain.append(q[i].ext_to_lattiseq_uint())
         bigint_chain[i] *= bigint_chain[i-1]
-	
+
     return bigint_chain
 
 
@@ -861,6 +870,21 @@ def special_fft_ul8_vec(values: list[complex], n: int, m: int, rot_group: list[i
                 values[i + 14], values[i + 15] = values[i + 14] + values[i + 15], values[i + 14] - values[i + 15]
 
 
+# float_to_u64_mod returns floor(x) mod q for a non-negative float x of any magnitude.
+# A float is m * 2^e with m an integer below 2^53, so the reduction is exact. It stands in for the
+# big.Float -> big.Int -> Mod chain Lattigo uses on values that do not fit a machine word.
+def float_to_u64_mod(x: float, q: u64) -> u64:
+    mantissa, exponent = math.frexp(x)  # x = mantissa * 2^exponent with 0.5 <= mantissa < 1
+    m = u64(int(mantissa * 9007199254740992.0))  # mantissa * 2^53 is an integer below 2^53
+    e = exponent - 53
+
+    if e <= 0:
+        if e <= -64: return u64(0)
+        return (m >> u64(-e)).__naive_mod(q)
+
+    return ring.bred(m.__naive_mod(q), ring.mod_exp_u64(u64(2), u64(e), q), q, ring.bred_params(q))
+
+
 def single_float_to_fixed_point_crt(level: int, i: int, value: float, scale: float, ring_q: ring.Ring, coeffs: list[list[u64]]):
     is_negative = False
 
@@ -871,15 +895,15 @@ def single_float_to_fixed_point_crt(level: int, i: int, value: float, scale: flo
     value *= scale
     moduli = ring_q.modulus.slice_reference(0, level + 1)
 
-    if value > 1.8446744073709552e+19:
-        # x_flo = big_float(value)
-        # x_flo += big_float(0.5)
-        # x_int = lattiseq_uint(x_flo)
-        # for j, qi in enumerate(moduli.slice_reference(0, level + 1)):
-        #     tmp = x_int % qi
-        #     if is_negative: coeffs[j][i] = qi - tmp
-        #     else: coeffs[j][i] = tmp
-        raise NotImplementedError()
+    if value >= 9.223372036854775808e+18:
+        # Values that do not fit the signed 64-bit conversion below (this branch used to raise
+        # NotImplementedError). Lattigo goes through big.Float and big.Int; a float this large is an
+        # integer already, so it is reduced modulo each qi exactly, without any big number.
+        for j in range(level + 1):
+            qi = moduli[j]
+            tmp = float_to_u64_mod(value, qi)
+            if is_negative: coeffs[j][i] = qi - tmp
+            else: coeffs[j][i] = tmp
     else:
         bred_params = ring_q.bred_params
 
@@ -903,32 +927,30 @@ def _mm_ntt_and_montgomery_lvl(level: int, log_slots: int, ring_q: ring.Ring, mo
         ring_q._mm_ntt_lvl(level, pol, pol)
         if montgomery: ring_q._mm_mform_lvl(level, pol, pol)
     else:
-        # n = 0
-        
-        # if ring_q.type() == LATTISEQ_STANDARD_RING_ENUM:
-        #     n = 2 << log_slots
-        # elif ring_q.type() == LATTISEQ_CONJUGATE_INVARIANT_RING_ENUM:
-        #     n = 1 << log_slots
-        #     # NTT = ring_NTTConjugateInvariant
-        #     raise NotImplementedError()
-        # else: raise ValueError("Invalid ring type")
+        # Sparse plaintext (this branch used to raise NotImplementedError). pol holds, in its first n
+        # coefficients, a polynomial of Z[Y]/(Y^n + 1) where Y = X^(N/n). Lattigo runs an NTT of
+        # dimension n and repeats each of its values N/n times. Here the coefficients are instead moved
+        # to their place in Z[X]/(X^N + 1) and a full NTT is run: same result, with the vectorised NTT.
+        n = 0
 
-        # gap = ring_q.n // n
-        # for i in range(level + 1):
-        #     _mm_coeffs = pol._mm_coeffs[i]
+        if ring_q.type() == LATTISEQ_STANDARD_RING_ENUM:
+            n = 2 << log_slots
+        elif ring_q.type() == LATTISEQ_CONJUGATE_INVARIANT_RING_ENUM:
+            raise NotImplementedError("Sparse plaintexts are not supported in the conjugate invariant ring.")
+        else: raise ValueError("Invalid ring type")
 
-        #     # NTT in dimension n
-        #     ring._mm_ntt(_mm_coeffs, _mm_coeffs, n, ring_q.ntt_psi[i], ring_q._mm_modulus[i], ring_q._mm_mred_params[i], ring_q._mm_bred_params[i][0])
-        #     if montgomery: ring._mm_mform_vec(_mm_coeffs, _mm_coeffs, ring_q._mm_modulus[i], ring_q._mm_bred_params[i])
+        gap = ring_q.n // n
+        for i in range(level + 1):
+            coeffs = pol._buf_coeffs[i]
+            # Top-down, so that a coefficient is read before its slot is overwritten.
+            for j in range(n - 1, -1, -1):
+                c = coeffs[j]
+                for w in range(gap): coeffs[j * gap + w] = u64(0)
+                coeffs[j * gap] = c
 
-        #     coeffs = pol._buf_coeffs[i]
-        #     # Maps NTT in dimension n to NTT in dimension n
-        #     for j in range(n - 1, -1, -1):
-        #         c = coeffs[j]
-        #         for w in range(gap): coeffs[j * gap + w] = c
-        #     pol._buf_coeffs[i] = coeffs
-        raise NotImplementedError("Please tell code owners to implement this corner case.")
-            
+        ring_q._mm_ntt_lvl(level, pol, pol)
+        if montgomery: ring_q._mm_mform_lvl(level, pol, pol)
+
 
 def complex_to_fixed_point_crt(values: list[complex], scale: float, ring_q: ring.Ring, is_ring_standard: bool, pol: ring.Poly):
     level = pol.level()
@@ -1158,6 +1180,10 @@ class EncoderComplex128(Static[Encoder]):
     
     def plaintext_to_complex(self, level: int, scale: float, log_slots: int, coeffs: list[list[u64]], values: list[complex]):
         isreal = self.params.ring_type == LATTISEQ_CONJUGATE_INVARIANT_RING_ENUM
+        # A plaintext is fully determined by its residues modulo q_0..q_k as long as it is smaller than
+        # q_0*...*q_k / 2, so the levels above the ones the bigint in use can reconstruct (see
+        # gen_bigint_chain) are not read. For a moduli chain that fits the bigint this changes nothing.
+        level = min(level, len(self.bigint_chain) - 1)
         if level == 0:
             poly_to_complex_no_crt(coeffs[0], values, scale, log_slots, isreal, self.params.ring_q)
         else:
@@ -1274,8 +1300,14 @@ def scale_up_exact(value: float, n: float, q: u64) -> u64:
     x_flo += 0.5  # x_flo.add(x_flo, big.NewFloat(0.5))
 
     # x_int = new(big.Int)
-    x_int = u64(x_flo)  # x_flo.Int(x_int)
-    x_int = x_int.__naive_mod(q)
+    x_int = u64(0)
+    if x_flo >= 9.223372036854775808e+18:
+        # Does not fit the machine conversion below: exact reduction instead (see float_to_u64_mod).
+        # The polynomial evaluation adds constants at scales around 2^120.
+        x_int = float_to_u64_mod(x_flo, q)
+    else:
+        x_int = u64(x_flo)  # x_flo.Int(x_int)
+        x_int = x_int.__naive_mod(q)
 
     res = x_int
     if is_negative: res = q - res
@@ -1829,7 +1861,7 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers], Static[rlwe.Eva
             else: ct_out.resize(1, level)
             
             tmp0, tmp1 = ct_in, op_1
-            if __ptr__(op_1) == __ptr__(ct_out):
+            if op_1.value is ct_out.value:
                 tmp0, tmp1 = op_1, ct_in
 
             ring_q._mm_mform_lvl(level, tmp0.value[0], c00)
@@ -1931,8 +1963,9 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers], Static[rlwe.Eva
             for i in range(len(ct_out.value)):
                 ring_q._mm_div_round_by_last_modulus_many_ntt_lvl(level, nb_rescales, ct_in.value[i], self.buff_q[0], ct_out.value[i])
             ct_out.resize(ct_out.degree(), level - nb_rescales)
-        elif ct_in != ct_out:
-            ct_out = ct_in.copy()
+        elif ct_in.value is not ct_out.value:
+            # Nothing to rescale: ct_out receives a copy of ct_in
+            for i in range(len(ct_out.value)): ct_out.value[i] = ct_in.value[i].copy()
     
     # drop_level reduces the level of ct0 by levels and returns the result in ct0.
     # No rescaling is applied during this procedure.
