@@ -1,0 +1,472 @@
+"""
+Full-size benchmark of the Lattiseq CKKS bootstrapping on one default parameter set.
+
+What it does, in one process (so that the peak memory is the set's own):
+  1. builds the scheme parameters, a secret key and a public key;
+  2. generates the bootstrapping evaluation keys the way CKKSEnv(bootstrap_params=...) does: the rotations of
+     the circuit plus the power-of-two rotations CKKSEnv performs itself (--no-extra-rotations: circuit only);
+  3. builds the bootstrapper (the CoeffsToSlots / SlotsToCoeffs plaintext matrices);
+  4. "lattigo" mode: N bootstraps of a fresh public-key encryption of Lattigo's test vector (uniform complex
+     values in [-1, 1], first four fixed), at level 0 and the default scale, through Bootstrapper.bootstrap:
+     the measurement Lattigo's own test makes and the laptop numbers were taken with;
+  5. "sally" mode (--sally): real-valued vectors of the kind Sally holds, at level 1 (where CKKSEnv triggers
+     the bootstrap), through bootstrap_with_range with the range CKKSEnv picks by default and with others;
+  6. "sweep" mode (--sweep): the error against log_range (0 to 8 and the set's maximum) on random values, on a
+     constant vector, and on vectors shaped like the iterates of CKKSEnv.sign_approx (small values at the smallest
+     comparison margins of Sally's coverage filter, with a zero or a constant -1 in the other slots), counting the
+     small values whose sign the bootstrap flips. The error is measured against the decrypted input, so that it is
+     the circuit's own.
+
+Every ciphertext is a public-key encryption at the top level, dropped to the level it is bootstrapped at, as
+CKKSEnv does. The error of that encryption is measured on its own before the bootstrap, so that it is not
+mistaken for the error of the circuit.
+
+Usage (from the repository root):
+    sequre build -release scripts/bench_bootstrapping.codon -o bench
+    LD_PRELOAD=~/.sequre/lib/sequre_align64.so bench <SET> [n_bootstraps=5] [--sally] [--sweep] [--no-extra-rotations] [--insecure-logn13]
+
+Output: human-readable lines, plus one machine-readable line per measurement starting with "@@ ", a JSON object.
+"""
+import math, prg, sys, time
+
+import sequre.lattiseq.ckks as ckks
+import sequre.lattiseq.rlwe as rlwe
+import sequre.lattiseq.ring as ring
+import sequre.lattiseq.ringqp as ringqp
+import sequre.lattiseq.advanced as advanced
+import sequre.lattiseq.bootstrapping as bootstrapping
+import sequre.lattiseq.bootstrapping_default_params as btp_default
+
+
+GIB = 1024.0 * 1024.0 * 1024.0
+
+
+# ---------------------------------------------------------------------------------------------
+# Parameter sets
+# ---------------------------------------------------------------------------------------------
+
+def select_set(name: str) -> btp_default.DefaultParametersLiteral:
+    if name == "N16QP1546H192H32": return btp_default.N16QP1546H192H32
+    if name == "N16QP1547H192H32": return btp_default.N16QP1547H192H32
+    if name == "N16QP1553H192H32": return btp_default.N16QP1553H192H32
+    if name == "N16QP1767H32768H32": return btp_default.N16QP1767H32768H32
+    if name == "N16QP1788H32768H32": return btp_default.N16QP1788H32768H32
+    if name == "N16QP1793H32768H32": return btp_default.N16QP1793H32768H32
+    if name == "N15QP768H192H32": return btp_default.N15QP768H192H32
+    if name == "N15QP880H16384H32": return btp_default.N15QP880H16384H32
+    raise ValueError(f"unknown parameter set {name}")
+
+
+# ---------------------------------------------------------------------------------------------
+# Memory and sizes
+# ---------------------------------------------------------------------------------------------
+
+# (VmRSS, VmHWM) of this process, in GiB. VmHWM is the peak resident set size so far.
+def memory_gib() -> Tuple[float, float]:
+    rss, hwm = 0.0, 0.0
+    with open('/proc/self/status') as f:
+        for line in f:
+            if line.startswith('VmRSS:'):
+                rss = float(line.split()[1]) / (1024.0 * 1024.0)
+            elif line.startswith('VmHWM:'):
+                hwm = float(line.split()[1]) / (1024.0 * 1024.0)
+    return rss, hwm
+
+
+def poly_bytes(p: ring.Poly) -> int:
+    return p._ndarray.nbytes if p else 0
+
+
+def qp_bytes(p: ringqp.Poly) -> int:
+    return poly_bytes(p.q) + poly_bytes(p.p)
+
+
+def switching_key_bytes(swk: rlwe.SwitchingKey) -> int:
+    total = 0
+    for row in swk.value:
+        for ct in row:
+            for p in ct.value:
+                total += qp_bytes(p)
+    return total
+
+
+def encoding_matrix_bytes(m: advanced.EncodingMatrix) -> int:
+    total = 0
+    for lt in m.matrices:
+        for p in lt.vec.values():
+            total += qp_bytes(p)
+    return total
+
+
+# ---------------------------------------------------------------------------------------------
+# Values and errors
+# ---------------------------------------------------------------------------------------------
+
+def uniform(bound: float) -> float:
+    return bound * (2 * prg.random() - 1)
+
+
+# Lattigo's test vector: uniform complex values in [-1, 1], with the first four set to a fixed value.
+def lattigo_values(slots: int) -> list[complex]:
+    values = [complex(uniform(1.0), uniform(1.0)) for _ in range(slots)]
+    for i in range(min(4, slots)):
+        values[i] = complex(0.9238795325112867, 0.3826834323650898)
+    return values
+
+
+class ErrorStats:
+    precision_real: float   # log2(1 / mean |error|) of the real parts, as Lattigo's GetPrecisionStats
+    precision_imag: float
+    max_error: float        # largest |have - want| over the slots (complex modulus)
+    max_error_slot: int
+    max_rel_error: float    # largest |have - want| / max(|want|, 1e-300) over the slots where |want| >= 1e-3
+    max_want: float
+
+
+def error_stats(have: list[complex], want: list[complex]) -> ErrorStats:
+    err_real, err_imag, max_err, max_rel, max_want = 0.0, 0.0, 0.0, 0.0, 0.0
+    max_slot = 0
+    for i in range(len(want)):
+        d = have[i] - want[i]
+        err_real += abs(d.real)
+        err_imag += abs(d.imag)
+        e = abs(d)
+        if e > max_err:
+            max_err = e
+            max_slot = i
+        w = abs(want[i])
+        if w > max_want: max_want = w
+        if w >= 1e-3:
+            r = e / w
+            if r > max_rel: max_rel = r
+    n = float(len(want))
+    return ErrorStats(
+        precision_real=math.log2(n / max(err_real, 1e-300)),
+        precision_imag=math.log2(n / max(err_imag, 1e-300)),
+        max_error=max_err, max_error_slot=max_slot, max_rel_error=max_rel, max_want=max_want)
+
+
+def jbool(b: bool) -> str:
+    return "true" if b else "false"
+
+
+def json_float(x: float) -> str:
+    if math.isnan(x) or math.isinf(x):
+        return '"' + str(x) + '"'
+    return f"{x:.6e}"
+
+
+# ---------------------------------------------------------------------------------------------
+# The key holder and the bootstrapping party
+# ---------------------------------------------------------------------------------------------
+
+class Bench:
+    name: str
+    params: ckks.Parameters
+    encoder: ckks.EncoderComplex128
+    encryptor: ckks.PkEncryptor
+    decryptor: ckks.Decryptor
+    btp: bootstrapping.Bootstrapper
+
+    # A public-key encryption of values at the top level, dropped to level (as CKKSEnv.encrypt then drop_level).
+    def encrypt_at(self, values: list[complex], level: int) -> ckks.Ciphertext:
+        plaintext = ckks.new_plaintext(self.params, self.params.max_level(), self.params.default_scale)
+        self.encoder.encode(values, plaintext, self.params.log_slots)
+        ct = self.encryptor.encrypt_new(plaintext)
+        if level < ct.level():
+            self.btp.evaluator.drop_level(ct, ct.level() - level)
+        return ct
+
+    def decrypt(self, ct: ckks.Ciphertext) -> list[complex]:
+        return self.encoder.decode(self.decryptor.decrypt_new(ct), self.params.log_slots)
+
+    # Brings an output at the default scale squared (the two "half modulus" sets) to the default scale with one
+    # multiplication by 1 and a rescale, as test_bootstrap_default_parameter_sets does; a no-op otherwise.
+    # Returns the ciphertext and whether it did anything.
+    def normalized(self, ct: ckks.Ciphertext) -> Tuple[ckks.Ciphertext, bool]:
+        default_scale = self.params.default_scale
+        if abs(ct.scale / default_scale - 1.0) < 1e-9:
+            return ct, False
+        level = ct.level()
+        ones = ckks.new_plaintext(self.params, level, float(self.params.ring_q.modulus[level]) * default_scale / ct.scale)
+        self.encoder.encode([complex(1.0, 0.0) for _ in range(self.params.slots())], ones, self.params.log_slots)
+        product = self.btp.evaluator.mul_relin_new(ct, ones)
+        rescaled = ckks.new_ciphertext(self.params, product.degree(), product.level(), product.scale)
+        self.btp.evaluator.rescale(product, default_scale, rescaled)
+        return rescaled, True
+
+
+def run_lattigo_mode(b: Bench, n_bootstraps: int):
+    params = b.params
+    print(f"\n--- lattigo mode: {n_bootstraps} bootstraps of Lattigo's test vector, level 0, default scale, bootstrap() ---")
+    for k in range(n_bootstraps):
+        values = lattigo_values(params.slots())
+        ct = b.encrypt_at(values, 0)
+        enc = error_stats(b.decrypt(ct), values)
+
+        start = time.time()
+        out = b.btp.bootstrap(ct)
+        elapsed = time.time() - start
+
+        st = error_stats(b.decrypt(out), values)
+        rss, hwm = memory_gib()
+        print(f"[{k}] bootstrap {elapsed:.3f}s  level {out.level()}  scale 2^{math.log2(out.scale):.4f}  "
+              f"precision {st.precision_real:.2f}/{st.precision_imag:.2f} bits  max error {st.max_error:.3e} (slot {st.max_error_slot})  "
+              f"| fresh encryption: precision {enc.precision_real:.2f}/{enc.precision_imag:.2f}, max error {enc.max_error:.3e} (slot {enc.max_error_slot})  "
+              f"| rss {rss:.2f} GiB, peak {hwm:.2f} GiB")
+        print('@@ {' + f'"set": "{b.name}", "mode": "lattigo", "i": {k}, "seconds": {elapsed:.4f}, "level": {out.level()}, '
+              f'"log2_scale": {math.log2(out.scale):.6f}, "precision_real": {st.precision_real:.4f}, "precision_imag": {st.precision_imag:.4f}, '
+              f'"max_error": {json_float(st.max_error)}, "max_error_slot": {st.max_error_slot}, '
+              f'"enc_precision_real": {enc.precision_real:.4f}, "enc_max_error": {json_float(enc.max_error)}, "enc_max_error_slot": {enc.max_error_slot}, '
+              f'"rss_gib": {rss:.3f}, "peak_gib": {hwm:.3f}' + '}')
+
+    # The result is usable: square the last bootstrapped vector (ct x ct, relinearize, rescale)
+    values = lattigo_values(params.slots())
+    out = b.btp.bootstrap(b.encrypt_at(values, 0))
+    base, _ = b.normalized(out)
+    start = time.time()
+    product = b.btp.evaluator.mul_relin_new(base, base)
+    squared = ckks.new_ciphertext(params, product.degree(), product.level(), product.scale)
+    b.btp.evaluator.rescale(product, params.default_scale, squared)
+    elapsed = time.time() - start
+    st = error_stats(b.decrypt(squared), [v * v for v in values])
+    print(f"square after bootstrap: level {squared.level()}, scale 2^{math.log2(squared.scale):.4f}, precision {st.precision_real:.2f}/{st.precision_imag:.2f}, max error {st.max_error:.3e}, {elapsed:.3f}s")
+    print('@@ {' + f'"set": "{b.name}", "mode": "square_after", "level": {squared.level()}, "log2_scale": {math.log2(squared.scale):.6f}, '
+          f'"precision_real": {st.precision_real:.4f}, "precision_imag": {st.precision_imag:.4f}, "max_error": {json_float(st.max_error)}' + '}')
+
+
+# Sally-like real vectors. Returns (label, values).
+def sally_patterns(slots: int) -> list[Tuple[str, list[complex]]]:
+    out = list[Tuple[str, list[complex]]]()
+    out.append(("random[-1,1]", [complex(uniform(1.0), 0.0) for _ in range(slots)]))
+    out.append(("const 0.5", [complex(0.5, 0.0) for _ in range(slots)]))
+    out.append(("const 1.0", [complex(1.0, 0.0) for _ in range(slots)]))
+    out.append(("const 2048", [complex(2048.0, 0.0) for _ in range(slots)]))
+    out.append(("mask 0/1 random, all slots", [complex(1.0 if prg.random() < 0.5 else 0.0, 0.0) for _ in range(slots)]))
+    prefix = [complex(0.0, 0.0) for _ in range(slots)]
+    for i in range(64):
+        prefix[i] = complex(1.0 if prg.random() < 0.5 else 0.0, 0.0)
+    out.append(("mask 0/1 random, first 64 slots", prefix))
+    onehot = [complex(0.0, 0.0) for _ in range(slots)]
+    onehot[0] = complex(1.0, 0.0)
+    out.append(("one-hot slot 0", onehot))
+    out.append(("random[-4096,4096]", [complex(uniform(4096.0), 0.0) for _ in range(slots)]))
+    out.append(("random[0,4096]", [complex(4096.0 * prg.random(), 0.0) for _ in range(slots)]))
+    return out
+
+
+def run_sally_mode(b: Bench, env_log_range: int):
+    params = b.params
+    slots = params.slots()
+    print(f"\n--- sally mode: real vectors at level 1 (CKKSEnv's trigger), bootstrap_with_range; CKKSEnv default log_range = {env_log_range} ---")
+    patterns = sally_patterns(slots)
+    for label, values in patterns:
+        # The bound bootstrap needs: mean of the absolute values of the slots (the largest coefficient can reach it)
+        mean_abs = 0.0
+        for v in values: mean_abs += abs(v)
+        mean_abs /= float(slots)
+        needed = 0
+        while float(1 << needed) < mean_abs * 1.0000001: needed += 1
+
+        ranges = list[int]()
+        ranges.append(env_log_range)
+        if mean_abs <= 1.0000001 and 0 not in ranges: ranges.append(0)
+        if needed not in ranges: ranges.append(needed)
+        if "4096" in label and 12 not in ranges: ranges.append(12)
+
+        for log_range in ranges:
+            ct = b.encrypt_at(values, 1)
+            enc = error_stats(b.decrypt(ct), values)
+            start = time.time()
+            out = b.btp.bootstrap_with_range(ct, log_range)
+            elapsed = time.time() - start
+            st = error_stats(b.decrypt(out), values)
+            norm, did = b.normalized(out)
+            stn = error_stats(b.decrypt(norm), values) if did else st
+            note = " (CKKSEnv default)" if log_range == env_log_range else (" (smallest power of two >= mean |value|)" if log_range == needed else "")
+            print(f"{label:<34} mean|v| {mean_abs:9.4f}  log_range {log_range:2d}{note}: {elapsed:.3f}s  level {out.level()} scale 2^{math.log2(out.scale):.2f}  "
+                  f"precision {st.precision_real:.2f} bits  max error {st.max_error:.3e} (slot {st.max_error_slot})  max rel {st.max_rel_error:.3e}"
+                  + (f"  | normalized to level {norm.level()}: precision {stn.precision_real:.2f}, max error {stn.max_error:.3e}" if did else "")
+                  + f"  | fresh encryption max error {enc.max_error:.3e}")
+            print('@@ {' + f'"set": "{b.name}", "mode": "sally", "pattern": "{label}", "mean_abs": {mean_abs:.6f}, "log_range": {log_range}, '
+                  f'"env_default": {jbool(log_range == env_log_range)}, "seconds": {elapsed:.4f}, "level": {out.level()}, '
+                  f'"log2_scale": {math.log2(out.scale):.6f}, "precision_real": {st.precision_real:.4f}, "max_error": {json_float(st.max_error)}, '
+                  f'"max_error_slot": {st.max_error_slot}, "max_rel_error": {json_float(st.max_rel_error)}, "max_want": {st.max_want:.6f}, '
+                  f'"normalized": {jbool(did)}, "norm_level": {norm.level()}, "norm_precision_real": {stn.precision_real:.4f}, '
+                  f'"norm_max_error": {json_float(stn.max_error)}, "enc_max_error": {json_float(enc.max_error)}' + '}')
+
+
+# Sign-iterate-shaped vectors: what most of Sally's bootstraps hold (sign_approx refreshes its iterate before every
+# iteration). n_active slots carry small values, the rest a constant tail (0, or -1: a saturated comparison against a
+# public threshold, which env.sub/add puts in every slot). Half of the active slots sit at +-3.1e-6 to +-1.2e-5 (the
+# smallest normalized comparison margins in server/major.codon's coverage filter), half are uniform in [-1e-3, 1e-3].
+def sign_pattern(slots: int, tail: float, n_active: int) -> list[complex]:
+    values = [complex(tail, 0.0) for _ in range(slots)]
+    for i in range(n_active):
+        if i % 2 == 0:
+            magnitude = 3.1e-6 * float(1 + (i // 2) % 4)
+            values[i] = complex(magnitude if (i // 2) % 2 == 0 else -magnitude, 0.0)
+        else:
+            values[i] = complex(uniform(1e-3), 0.0)
+    return values
+
+
+def run_sweep_mode(b: Bench, env_log_range: int):
+    params = b.params
+    slots = params.slots()
+    n_active = 256
+    print(f"\n--- sweep mode: error against log_range, real vectors at level 1, bootstrap_with_range (CKKSEnv default {env_log_range}) ---")
+    print("    circuit error = |bootstrap output - decrypted input| (excludes the encryption error); truth error = |output - values|")
+    patterns = list[Tuple[str, list[complex], int]]()
+    patterns.append(("random[-1,1]", [complex(uniform(1.0), 0.0) for _ in range(slots)], slots))
+    patterns.append(("const 1.0", [complex(1.0, 0.0) for _ in range(slots)], slots))
+    patterns.append(("sign iterate, zero tail", sign_pattern(slots, 0.0, n_active), n_active))
+    patterns.append(("sign iterate, -1 tail", sign_pattern(slots, -1.0, n_active), n_active))
+    ranges = [0, 1, 2, 3, 4, 5, 6, 8]
+    if env_log_range not in ranges: ranges.append(env_log_range)
+    for label, values, active in patterns:
+        for log_range in ranges:
+            ct = b.encrypt_at(values, 1)
+            dec_in = b.decrypt(ct)
+            start = time.time()
+            out = b.btp.bootstrap_with_range(ct, log_range)
+            elapsed = time.time() - start
+            norm, did = b.normalized(out)
+            have = b.decrypt(norm)
+            circ = error_stats(have, dec_in)
+            truth = error_stats(have, values)
+            # On the active slots: largest circuit error, and sign flips among the margin-sized values
+            max_active, flips, small = 0.0, 0, 0
+            for i in range(active):
+                e = abs(have[i].real - dec_in[i].real)
+                if e > max_active: max_active = e
+                if abs(values[i].real) <= 1.3e-5 and values[i].real != 0.0:
+                    small += 1
+                    if (have[i].real > 0.0) != (values[i].real > 0.0): flips += 1
+            print(f"{label:<26} log_range {log_range:2d}: circuit precision {circ.precision_real:6.2f} bits, circuit max error {circ.max_error:.3e}, "
+                  f"active-slot max {max_active:.3e}, sign flips {flips}/{small} | truth precision {truth.precision_real:6.2f}, truth max {truth.max_error:.3e} (slot {truth.max_error_slot}) | {elapsed:.2f}s")
+            print('@@ {' + f'"set": "{b.name}", "mode": "sweep", "pattern": "{label}", "log_range": {log_range}, "env_default": {jbool(log_range == env_log_range)}, '
+                  f'"seconds": {elapsed:.4f}, "level": {norm.level()}, "circuit_precision": {circ.precision_real:.4f}, "circuit_max_error": {json_float(circ.max_error)}, '
+                  f'"active_max_error": {json_float(max_active)}, "sign_flips": {flips}, "small_slots": {small}, '
+                  f'"truth_precision": {truth.precision_real:.4f}, "truth_max_error": {json_float(truth.max_error)}, "truth_max_error_slot": {truth.max_error_slot}' + '}')
+
+
+# ---------------------------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------------------------
+
+def main():
+    args = sys.argv[1:]
+    if len(args) < 1:
+        print("usage: bench <SET> [n_bootstraps=5] [--sally] [--sweep] [--no-extra-rotations] [--insecure-logn13]")
+        sys.exit(2)
+    name = args[0]
+    n_bootstraps = 5
+    sally = False
+    extra = True
+    insecure = False
+    sweep = False
+    for a in args[1:]:
+        if a == "--sweep":
+            sweep = True
+            continue
+        if a == "--sally": sally = True
+        elif a == "--no-extra-rotations": extra = False
+        elif a == "--insecure-logn13": insecure = True
+        else: n_bootstraps = int(a)
+
+    shared = select_set(name)
+    # --insecure-logn13: the same moduli and circuit in a ring of degree 2^13 (NO security), as the unit tests,
+    # to check this runner against known precisions in seconds
+    literal = shared.insecure_copy(13, 12) if insecure else shared.copy()
+
+    size_label = "INSECURE logN=13" if insecure else "full size"
+    print(f"=== {name}: {size_label}, public-key encryption, {n_bootstraps} bootstraps, sally mode {sally}, CKKSEnv rotations {extra} ===")
+    t_total = time.time()
+
+    start = time.time()
+    params = ckks.new_parameters_from_literal(literal.scheme_params)
+    t_params = time.time() - start
+    rss, hwm = memory_gib()
+    print(f"parameters: logN {params.logn}, log_slots {params.log_slots}, {params.q_count()} Q moduli, {params.p_count()} P moduli, "
+          f"logQP {params.log_qp()}, h {params.h}, ephemeral h {literal.bootstrapping_params.ephemeral_secret_weight}, "
+          f"default scale 2^{math.log2(params.default_scale):.2f}, max level {params.max_level()} -- built in {t_params:.2f}s  (rss {rss:.2f} GiB)")
+
+    start = time.time()
+    kgen = ckks.new_key_generator(params)
+    sk = kgen.gen_secret_key(store_key=True)  # gen_public_key encrypts under the key the generator stores
+    pk = kgen.gen_public_key()
+    t_skpk = time.time() - start
+    print(f"secret + public key: {t_skpk:.2f}s")
+
+    # The rotations CKKSEnv adds to the circuit's own (patch/lattiseq/env.codon)
+    rotation_shifts = list[int]()
+    if extra:
+        for i in range(params.log_slots): rotation_shifts.append(1 << i)
+        for i in range(params.log_slots): rotation_shifts.append(params.slots() - (1 << i))
+
+    btp_params = literal.bootstrapping_params.copy()
+    computed_circuit = bootstrapping.evaluation_keys_size(btp_params, params)
+    computed_env = bootstrapping.evaluation_keys_size(btp_params, params, rotation_shifts)
+    n_circuit_rotations = len(btp_params.rotations_for_bootstrapping(params))
+
+    start = time.time()
+    evk = bootstrapping.gen_evaluation_keys(btp_params, params, sk, rotation_shifts)
+    t_evk = time.time() - start
+    rss_keys, hwm_keys = memory_gib()
+
+    rlk_b = 0
+    for k in evk.rlk.keys: rlk_b += switching_key_bytes(k)
+    rtk_b = 0
+    for k in evk.rtks.keys.values(): rtk_b += switching_key_bytes(k)
+    swk_b = switching_key_bytes(evk.swk_dts) + switching_key_bytes(evk.swk_std)
+    evk_b = rlk_b + rtk_b + swk_b
+    print(f"evaluation keys: {t_evk:.2f}s, {len(evk.rtks.keys)} rotation keys ({n_circuit_rotations} for the circuit + conjugation"
+          + (f" + CKKSEnv's {len(rotation_shifts)} power-of-two shifts, deduplicated" if extra else "") + ")")
+    print(f"  measured {evk_b / GIB:.3f} GiB (relinearization {rlk_b / GIB:.3f}, rotations {rtk_b / GIB:.3f}, encapsulation {swk_b / GIB:.3f}); "
+          f"evaluation_keys_size: circuit only {computed_circuit / GIB:.3f} GiB, with CKKSEnv rotations {computed_env / GIB:.3f} GiB")
+    print(f"  rss {rss_keys:.2f} GiB, peak {hwm_keys:.2f} GiB")
+
+    start = time.time()
+    btp = bootstrapping.new_bootstrapper(params, btp_params, evk)
+    t_btp = time.time() - start
+    rss_btp, hwm_btp = memory_gib()
+    cts_b = encoding_matrix_bytes(btp.cts_matrices)
+    stc_b = encoding_matrix_bytes(btp.stc_matrices)
+    out_level = btp.output_level()
+    out_scale = btp.output_scale()
+    env_log_range = btp.max_log_range(params.default_scale)
+    print(f"bootstrapper (encoding matrices): {t_btp:.2f}s, CoeffsToSlots {cts_b / GIB:.3f} GiB in {len(btp.cts_matrices.matrices)} matrices, "
+          f"SlotsToCoeffs {stc_b / GIB:.3f} GiB in {len(btp.stc_matrices.matrices)} matrices")
+    print(f"  output level {out_level} of {params.max_level()}, output scale 2^{math.log2(out_scale):.4f} (default 2^{math.log2(params.default_scale):.4f}), "
+          f"depth {btp_params.depth()}, max_log_range {env_log_range}")
+    print(f"  keys + matrices {(evk_b + cts_b + stc_b) / GIB:.3f} GiB; rss {rss_btp:.2f} GiB, peak {hwm_btp:.2f} GiB")
+    print('@@ {' + f'"set": "{name}", "mode": "setup", "logn": {params.logn}, "log_slots": {params.log_slots}, "q_count": {params.q_count()}, '
+          f'"p_count": {params.p_count()}, "log_qp": {params.log_qp()}, "max_level": {params.max_level()}, "log2_default_scale": {math.log2(params.default_scale):.6f}, '
+          f'"t_params": {t_params:.3f}, "t_sk_pk": {t_skpk:.3f}, "t_evk": {t_evk:.3f}, "t_matrices": {t_btp:.3f}, '
+          f'"n_rotation_keys": {len(evk.rtks.keys)}, "n_circuit_rotations": {n_circuit_rotations}, "extra_rotations": {jbool(extra)}, '
+          f'"evk_bytes": {evk_b}, "rlk_bytes": {rlk_b}, "rtk_bytes": {rtk_b}, "swk_bytes": {swk_b}, '
+          f'"evk_computed_circuit": {computed_circuit}, "evk_computed_env": {computed_env}, "cts_bytes": {cts_b}, "stc_bytes": {stc_b}, '
+          f'"output_level": {out_level}, "log2_output_scale": {math.log2(out_scale):.6f}, "depth": {btp_params.depth()}, "max_log_range": {env_log_range}, '
+          f'"rss_after_keys_gib": {rss_keys:.3f}, "peak_after_keys_gib": {hwm_keys:.3f}, "rss_after_matrices_gib": {rss_btp:.3f}, "peak_after_matrices_gib": {hwm_btp:.3f}' + '}')
+
+    b = Bench(
+        name=name, params=params, encoder=ckks.new_encoder_complex(params),
+        encryptor=ckks.new_encryptor(params, pk), decryptor=ckks.new_decryptor(params, sk), btp=btp)
+
+    if n_bootstraps > 0:
+        run_lattigo_mode(b, n_bootstraps)
+
+    if sally:
+        run_sally_mode(b, env_log_range if env_log_range > 0 else 0)
+
+    if sweep:
+        run_sweep_mode(b, env_log_range if env_log_range > 0 else 0)
+
+    rss, hwm = memory_gib()
+    total = time.time() - t_total
+    print(f"\ndone in {total:.1f}s; rss {rss:.2f} GiB, peak {hwm:.2f} GiB")
+    print('@@ {' + f'"set": "{name}", "mode": "done", "seconds": {total:.2f}, "rss_gib": {rss:.3f}, "peak_gib": {hwm:.3f}' + '}')
+
+
+main()

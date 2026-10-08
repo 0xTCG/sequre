@@ -10,7 +10,8 @@ ciphertext of the same value at a higher level.
   bootstrapping_params.go    Parameters, RotationsForBootstrapping
 
 The default parameter sets of default_params.go are in bootstrapping_default_params.codon.
-Not ported: ShallowCopy and the binary marshalling of Parameters.
+Not ported: the binary marshalling of Parameters, which pickle instead, like the
+evaluation keys, so that the party holding the secret key can send everything a bootstrapper needs.
 
 Lattigo embeds the advanced evaluator in the Bootstrapper. Here the Bootstrapper holds a
 ckks.Evaluator, which the modules it imports extend with everything the circuit needs.
@@ -50,6 +51,8 @@ Value range
 """
 import math
 
+from pickler import pickle, unpickle
+
 import ring, ringqp, rlwe, ckks, keyswitch, evaluator, linear_transform, polynomial_evaluation, advanced
 
 from ckks import Ciphertext, new_ciphertext
@@ -79,6 +82,31 @@ class Parameters:
             eval_mod_parameters=self.eval_mod_parameters.copy(),
             coeffs_to_slots_parameters=self.coeffs_to_slots_parameters.copy(),
             ephemeral_secret_weight=self.ephemeral_secret_weight)
+
+    def __pickle__(self, jar: Jar, pasteurized: bool):
+        pickle(self.slots_to_coeffs_parameters, jar, pasteurized)
+        if not pasteurized: jar += self.slots_to_coeffs_parameters._pickle_size()
+        pickle(self.eval_mod_parameters, jar, pasteurized)
+        if not pasteurized: jar += self.eval_mod_parameters._pickle_size()
+        pickle(self.coeffs_to_slots_parameters, jar, pasteurized)
+        if not pasteurized: jar += self.coeffs_to_slots_parameters._pickle_size()
+        pickle(self.ephemeral_secret_weight, jar, pasteurized)
+
+    def __unpickle__(jar: Jar, pasteurized: bool) -> Parameters:
+        slots_to_coeffs_parameters = unpickle(jar, pasteurized, EncodingMatrixLiteral)
+        if not pasteurized: jar += slots_to_coeffs_parameters._pickle_size()
+        eval_mod_parameters = unpickle(jar, pasteurized, EvalModLiteral)
+        if not pasteurized: jar += eval_mod_parameters._pickle_size()
+        coeffs_to_slots_parameters = unpickle(jar, pasteurized, EncodingMatrixLiteral)
+        if not pasteurized: jar += coeffs_to_slots_parameters._pickle_size()
+        ephemeral_secret_weight = unpickle(jar, pasteurized, int)
+        return Parameters(
+            slots_to_coeffs_parameters=slots_to_coeffs_parameters, eval_mod_parameters=eval_mod_parameters,
+            coeffs_to_slots_parameters=coeffs_to_slots_parameters, ephemeral_secret_weight=ephemeral_secret_weight)
+
+    def _pickle_size(self) -> int:
+        return (self.slots_to_coeffs_parameters._pickle_size() + self.eval_mod_parameters._pickle_size() +
+                self.coeffs_to_slots_parameters._pickle_size() + self.ephemeral_secret_weight._pickle_size())
 
     # depth returns the number of levels the bootstrapping circuit consumes.
     def depth(self) -> int:
@@ -145,6 +173,29 @@ class EvaluationKeys:
     swk_dts: rlwe.SwitchingKey  # dense to sparse. Empty if there is no ephemeral secret
     swk_std: rlwe.SwitchingKey  # sparse to dense. Empty if there is no ephemeral secret
 
+    def __pickle__(self, jar: Jar, pasteurized: bool):
+        pickle(self.rlk, jar, pasteurized)
+        if not pasteurized: jar += self.rlk._pickle_size()
+        pickle(self.rtks, jar, pasteurized)
+        if not pasteurized: jar += self.rtks._pickle_size()
+        pickle(self.swk_dts, jar, pasteurized)
+        if not pasteurized: jar += self.swk_dts._pickle_size()
+        pickle(self.swk_std, jar, pasteurized)
+
+    def __unpickle__(jar: Jar, pasteurized: bool) -> EvaluationKeys:
+        rlk = unpickle(jar, pasteurized, rlwe.RelinearizationKey)
+        if not pasteurized: jar += rlk._pickle_size()
+        rtks = unpickle(jar, pasteurized, rlwe.RotationKeySet)
+        if not pasteurized: jar += rtks._pickle_size()
+        swk_dts = unpickle(jar, pasteurized, rlwe.SwitchingKey)
+        if not pasteurized: jar += swk_dts._pickle_size()
+        swk_std = unpickle(jar, pasteurized, rlwe.SwitchingKey)
+        return EvaluationKeys(rlk=rlk, rtks=rtks, swk_dts=swk_dts, swk_std=swk_std)
+
+    def _pickle_size(self) -> int:
+        return (self.rlk._pickle_size() + self.rtks._pickle_size() +
+                self.swk_dts._pickle_size() + self.swk_std._pickle_size())
+
 
 # gen_evaluation_keys generates the bootstrapping EvaluationKeys, which contain:
 #	rlk: rlwe.RelinearizationKey
@@ -191,6 +242,9 @@ def evaluation_keys_size(btp_params: Parameters, ckks_params: ckks.Parameters, e
 class Bootstrapper:
     evaluator: ckks.Evaluator
     params: ckks.Parameters
+    # The parameters the bootstrapper was built with, completed by its constructor: the scaling of the two
+    # encoding matrices has the circuit's factors multiplied in. Not for building another bootstrapper, which
+    # would multiply them in again; keep the parameters it was created from for that.
     btp_params: Parameters
 
     dslots: int  # Number of plaintext slots after the re-encoding
@@ -245,6 +299,24 @@ class Bootstrapper:
     # check_keys checks if all the necessary keys are present in the instantiated Bootstrapper
     def check_keys(self, btp_keys: EvaluationKeys):
         check_keys(self.params, self.btp_params, btp_keys)
+
+    # shallow_copy returns a bootstrapper that shares the evaluation keys, the plaintext matrices and the
+    # EvalMod polynomial with this one, and has an evaluator of its own (Evaluator.shallow_copy), so that the
+    # two can bootstrap concurrently. Only the evaluator's buffers are written during a bootstrap. A copy
+    # costs a few ciphertexts' worth of buffers, against the gigabytes of keys and matrices it shares.
+    def shallow_copy(self) -> Bootstrapper:
+        return Bootstrapper(
+            evaluator=self.evaluator.shallow_copy(),
+            params=self.params,
+            btp_params=self.btp_params,
+            dslots=self.dslots,
+            logdslots=self.logdslots,
+            eval_mod_poly=self.eval_mod_poly,
+            stc_matrices=self.stc_matrices,
+            cts_matrices=self.cts_matrices,
+            q0_over_message_ratio=self.q0_over_message_ratio,
+            swk_dts=self.swk_dts,
+            swk_std=self.swk_std)
 
 
 # check_keys checks if all the keys the bootstrapping circuit of btp_params needs are present in btp_keys.

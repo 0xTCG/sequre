@@ -13,6 +13,9 @@ Through the harness:
 """
 import math, prg, time
 
+from pickler import pickle, unpickle
+import openmp
+
 import sequre.lattiseq.ckks as ckks
 import sequre.lattiseq.rlwe as rlwe
 import sequre.lattiseq.ring as ring
@@ -25,6 +28,7 @@ import sequre.lattiseq.bootstrapping as bootstrapping
 import sequre.lattiseq.bootstrapping_default_params as btp_default
 
 from sequre.lattiseq.params import CKKSParametersLiteral
+from sequre.lattiseq.threads import lattiseq_threads, set_lattiseq_threads
 from sequre.constants import LATTISEQ_STANDARD_RING_ENUM
 
 
@@ -1711,6 +1715,151 @@ def test_bootstrap_default_parameter_sets():
 
 
 # ---------------------------------------------------------------------------------------------
+# Pickling: what the key holder sends to the party that bootstraps
+# ---------------------------------------------------------------------------------------------
+
+PICKLE_GUARD_BYTES = 64
+
+# Pickles x into a jar of x._pickle_size() bytes followed by a guard band, which must come out untouched (a
+# _pickle_size() smaller than what __pickle__ writes would overflow the buffers the network code allocates),
+# and unpickles it as T.
+def pickle_round_trip(name: str, x, T: type) -> T:
+    size = x._pickle_size()
+    jar = ptr[byte](size + PICKLE_GUARD_BYTES)
+    for i in range(PICKLE_GUARD_BYTES):
+        jar[size + i] = byte(0xA5)
+    pickle(x, jar, False)
+    untouched = True
+    for i in range(PICKLE_GUARD_BYTES):
+        if jar[size + i] != byte(0xA5): untouched = False
+    check_true(f"Pickling stays within _pickle_size() [{name}]", untouched, f"{size} bytes")
+    return unpickle(jar, False, T)
+
+
+def encoding_matrix_literals_equal(a: advanced.EncodingMatrixLiteral, b: advanced.EncodingMatrixLiteral) -> bool:
+    return (a.linear_transform_type == b.linear_transform_type and a.repack_imag_2_real == b.repack_imag_2_real
+            and a.logn == b.logn and a.log_slots == b.log_slots and a.scaling == b.scaling
+            and a.level_start == b.level_start and a.bit_reversed == b.bit_reversed and a.bsgs_ratio == b.bsgs_ratio
+            and a.scaling_factor == b.scaling_factor)
+
+
+def eval_mod_literals_equal(a: advanced.EvalModLiteral, b: advanced.EvalModLiteral) -> bool:
+    return (a.q == b.q and a.level_start == b.level_start and a.scaling_factor == b.scaling_factor
+            and a.sine_type == b.sine_type and a.message_ratio == b.message_ratio and a.k == b.k
+            and a.sine_deg == b.sine_deg and a.double_angle == b.double_angle and a.arcsine_deg == b.arcsine_deg)
+
+
+def test_pickling():
+    # The bootstrapping parameters of every default set come back field for field
+    names = ["N16QP1546H192H32", "N16QP1547H192H32", "N16QP1553H192H32", "N15QP768H192H32",
+             "N16QP1767H32768H32", "N16QP1788H32768H32", "N16QP1793H32768H32", "N15QP880H16384H32"]
+    literals = [btp_default.N16QP1546H192H32, btp_default.N16QP1547H192H32, btp_default.N16QP1553H192H32,
+                btp_default.N15QP768H192H32, btp_default.N16QP1767H32768H32, btp_default.N16QP1788H32768H32,
+                btp_default.N16QP1793H32768H32, btp_default.N15QP880H16384H32]
+    for i in range(len(names)):
+        p = literals[i].bootstrapping_params
+        q = pickle_round_trip(f"bootstrapping.Parameters of {names[i]}", p, bootstrapping.Parameters)
+        check_true(
+            f"Pickled bootstrapping.Parameters [{names[i]}]",
+            encoding_matrix_literals_equal(p.slots_to_coeffs_parameters, q.slots_to_coeffs_parameters)
+            and eval_mod_literals_equal(p.eval_mod_parameters, q.eval_mod_parameters)
+            and encoding_matrix_literals_equal(p.coeffs_to_slots_parameters, q.coeffs_to_slots_parameters)
+            and p.ephemeral_secret_weight == q.ephemeral_secret_weight and p.depth() == q.depth()
+            and q._pickle_size() == p._pickle_size(),
+            f"depth {q.depth()}, ephemeral secret weight {q.ephemeral_secret_weight}, {q._pickle_size()} bytes")
+
+    # The whole hand-over, on N16QP1546H192H32 shrunk to logN = 13: scheme parameters, public key, bootstrapping
+    # parameters and evaluation keys go through pickling, and the receiving side builds its bootstrapper,
+    # encryptor and encoder from what it unpickled and nothing else.
+    tag = "N16QP1546H192H32 moduli, logN=13, logSlots=12"
+    literal = btp_default.N16QP1546H192H32.insecure_copy(13, 12)
+    params = ckks.new_parameters_from_literal(literal.scheme_params)
+    kgen = ckks.new_key_generator(params)
+    sk = kgen.gen_secret_key(store_key=True)
+    pk = kgen.gen_public_key()
+    evk = bootstrapping.gen_evaluation_keys(literal.bootstrapping_params, params, sk)
+    decryptor = ckks.new_decryptor(params, sk)
+
+    params_r = pickle_round_trip(f"ckks.Parameters [{tag}]", params, ckks.Parameters)
+    pk_r = pickle_round_trip(f"rlwe.PublicKey [{tag}]", pk, rlwe.PublicKey)
+    btp_params_r = pickle_round_trip(f"bootstrapping.Parameters [{tag}]", literal.bootstrapping_params, bootstrapping.Parameters)
+    evk_r = pickle_round_trip(f"bootstrapping.EvaluationKeys [{tag}]", evk, bootstrapping.EvaluationKeys)
+    check_true(
+        f"Pickled bootstrapping.EvaluationKeys: sizes [{tag}]",
+        evk_r._pickle_size() == evk._pickle_size() and len(evk_r.rtks.keys) == len(evk.rtks.keys)
+        and len(evk_r.swk_dts.value) == len(evk.swk_dts.value) and len(evk_r.swk_std.value) == len(evk.swk_std.value),
+        f"{evk_r._pickle_size()} bytes, {len(evk_r.rtks.keys)} rotation keys")
+
+    btp = bootstrapping.new_bootstrapper(params_r, btp_params_r, evk_r)
+    encoder_r = ckks.new_encoder_complex(params_r)
+    encryptor_r = ckks.new_encryptor(params_r, pk_r)
+    values = bootstrap_test_values(params_r.slots())
+    plaintext = ckks.new_plaintext(params_r, 0, params_r.default_scale)
+    encoder_r.encode(values, plaintext, params_r.log_slots)
+    bootstrapped = btp.bootstrap(encryptor_r.encrypt_new(plaintext))
+
+    # Back at the key holder
+    have = encoder_r.decode(decryptor.decrypt_new(bootstrapped), params.log_slots)
+    precision_real, precision_imag = mean_precision(have, values)
+    check_true(
+        f"Bootstrap from unpickled material: precision [{tag}]",
+        bootstrapped.level() == btp.output_level()
+        and precision_real >= BOOTSTRAP_MIN_PRECISION and precision_imag >= BOOTSTRAP_MIN_PRECISION,
+        f"level {bootstrapped.level()}, mean precision {precision_real:.2f} bits (real) and {precision_imag:.2f} bits (imaginary)")
+    check_values(f"Bootstrap from unpickled material: values [{tag}]", have, values, 1e-6)
+
+
+# ---------------------------------------------------------------------------------------------
+# Concurrency: shallow copies of a bootstrapper under @par, and the runtime thread count
+# ---------------------------------------------------------------------------------------------
+
+def test_concurrent_bootstraps():
+    tag = "N16QP1546H192H32 moduli, logN=13, logSlots=12"
+    literal = btp_default.N16QP1546H192H32.insecure_copy(13, 12)
+    bc = new_bootstrap_context(literal, False)
+    params = bc.tc.params
+    slots = params.slots()
+    default_threads = lattiseq_threads()
+
+    for workers, threads in [(4, 1), (4, 2), (2, 4)]:
+        set_lattiseq_threads(threads)
+        openmp.set_max_active_levels(2)
+        copies = [bc.btp.shallow_copy() for _ in range(workers)]
+        per_worker = 2
+        n = workers * per_worker
+        values = [bootstrap_test_values(slots) for _ in range(n)]
+        cts = [encrypt_values(bc.tc, values[i], 0, params.default_scale) for i in range(n)]
+        outs = [ckks.Ciphertext() for _ in range(n)]
+
+        @par(num_threads=workers)
+        for w in range(workers):
+            btp = copies[w]
+            for j in range(per_worker):
+                outs[w * per_worker + j] = btp.bootstrap(cts[w * per_worker + j])
+
+        worst_precision = 1e9
+        for i in range(n):
+            have = decrypt_values(bc.tc, outs[i])
+            precision_real, precision_imag = mean_precision(have, values[i])
+            worst_precision = min(worst_precision, min(precision_real, precision_imag))
+            check_values(f"Concurrent bootstrap {i} of {n} ({workers} workers x {threads} threads) [{tag}]", have, values[i], 1e-6)
+        check_true(
+            f"Concurrent bootstraps: precision ({workers} workers x {threads} threads) [{tag}]",
+            worst_precision >= BOOTSTRAP_MIN_PRECISION and all_at_level(outs, bc.btp.output_level()),
+            f"lowest mean precision {worst_precision:.2f} bits")
+
+    set_lattiseq_threads(default_threads)
+    openmp.set_max_active_levels(1)
+    check_true("Lattiseq thread count restored", lattiseq_threads() == default_threads, f"{lattiseq_threads()} threads")
+
+
+def all_at_level(cts: list[ckks.Ciphertext], level: int) -> bool:
+    for ct in cts:
+        if ct.level() != level: return False
+    return True
+
+
+# ---------------------------------------------------------------------------------------------
 # Entry points
 # ---------------------------------------------------------------------------------------------
 
@@ -1741,6 +1890,8 @@ def test_bootstrapping():
     test_bootstrap_with_evaluation_keys_only(
         btp_default.N16QP1546H192H32.insecure_copy(13, 12), "logN=13, logSlots=12, N16QP1546H192H32 moduli")
     test_bootstrap_default_parameter_sets()
+    test_pickling()
+    test_concurrent_bootstraps()
 
     print(f'\nBootstrapping tests passed in {time.time() - start:.1f}s.\n')
 
