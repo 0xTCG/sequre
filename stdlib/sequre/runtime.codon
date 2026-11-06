@@ -3,8 +3,22 @@ import sys
 from sequre.mpc.env import MPCEnv
 from sequre.constants import RUN_TOGGLES, MPC_FIELD_SIZE, MPC_RING_SIZE, NUMBER_OF_PARTIES
 
-from C import fork() -> int
-from C import waitpid(int, cobj, int) -> int
+from C import fork() -> i32
+from C import waitpid(i32, Ptr[i32], i32) -> i32
+from C import kill(i32, i32) -> i32
+from C import _exit(i32)
+from C import usleep(int) -> int
+
+
+# waitpid/kill constants (same values on Linux and macOS)
+_WNOHANG = i32(1)
+_SIGABRT: int = 6
+_SIGKILL = i32(9)
+
+# After a party fails, how long the process that forked the parties waits for the others to exit on their own (they
+# fail as soon as they read from a closed connection) before killing the ones still blocked on each other.
+_FAILURE_GRACE_US: int = 5_000_000
+_REAP_POLL_US: int = 20_000
 
 
 def _print_sequre_help():
@@ -50,35 +64,143 @@ def _check_help(flags):
         sys.exit(0)
 
 
+def _flush_output():
+    # fflush(NULL) flushes every output stream. Needed before fork(), or each child prints again whatever the parent
+    # had buffered, and before a party exits or fails: an uncaught exception aborts the process, which discards
+    # buffered output.
+    _C.fflush(cobj())
+
+
+def _shut_down_failed_party(mpc):
+    # Runs while an exception propagates out of a party. Names the party (Codon's error report, printed once the
+    # exception reaches the top, does not) and closes its connections, so that the parties waiting on it fail at their
+    # next receive instead of waiting forever. The end-of-run barrier (MPCEnv.done) must not run here: the other
+    # parties may be mid-protocol and would read its message as protocol data. The connections may already be closed
+    # (when MPCEnv.done failed after closing them); closing them again does nothing.
+    #
+    # Callers run this from a `finally` block, not from `except ...: raise`: in Codon, re-raising an exception
+    # restarts its backtrace at the re-raise, which would hide where it was raised.
+    _flush_output()  # so that the party's earlier output comes before this line
+    print(f"CP{mpc.pid}:\tFAILED (see its error report)", file=sys.stderr)
+    _flush_output()
+    mpc.comms.clean_up()
+
+
 def client(pid, foo, control_toggles, local, modulus, *args):
     # Initialize MPC environment
     mpc = MPCEnv(pid, local, modulus)
-    if not control_toggles[RUN_TOGGLES.MHE_SETUP_SKIP_FLAG]:
-        mpc.mhe.default_setup()
+    finished = False
+    try:
+        if not control_toggles[RUN_TOGGLES.MHE_SETUP_SKIP_FLAG]:
+            mpc.mhe.default_setup()
 
-    foo(mpc, *args)
+        foo(mpc, *args)
 
-    # This is here just to keep P0 online until the end for data transfer
-    # In practice, P0 would send data in advance before each phase and go offline
-    mpc.done()
+        # This is here just to keep P0 online until the end for data transfer
+        # In practice, P0 would send data in advance before each phase and go offline
+        mpc.done()
+        finished = True
+    finally:
+        if not finished:
+            _shut_down_failed_party(mpc)
+
+
+def _run_forked_party(party: int, foo, control_toggles, modulus, *args):
+    # Runs in a forked child and does not return. On success the child exits with status 0 instead of returning into
+    # the caller, whose frames belong to the parent's control flow. On failure (client() has already named the party
+    # and closed its connections) the exception propagates: Codon prints its usual error report, with a backtrace in
+    # debug builds, and aborts the child, which the parent sees as a failure.
+    try:
+        client(party, foo, control_toggles, True, modulus, *args)
+    finally:
+        _flush_output()
+    _exit(i32(0))
+
+
+def _reap_parties(children: List[Tuple[int, i32]], grace_us: int) -> List[Tuple[int, int, bool]]:
+    # Waits for the forked parties and returns (party, raw wait status or -1 if waitpid failed, killed) for each.
+    # grace_us < 0: blocks until every party has exited. grace_us >= 0 (after a failure): the parties still running
+    # after grace_us microseconds are killed, since they may be blocked on each other forever.
+    statuses = [-2 for _ in range(len(children))]  # -2: still running
+    killed = [False for _ in range(len(children))]
+    waited = 0
+    while True:
+        running = 0
+        for i in range(len(children)):
+            if statuses[i] != -2:
+                continue
+            status = i32(0)
+            rc = waitpid(children[i][1], __ptr__(status), _WNOHANG if grace_us >= 0 else i32(0))
+            if rc == children[i][1]:
+                statuses[i] = int(status)
+            elif rc == i32(0):
+                running += 1
+            else:
+                statuses[i] = -1
+        if running == 0:
+            break
+        if waited >= grace_us:
+            for i in range(len(children)):
+                if statuses[i] == -2:
+                    kill(children[i][1], _SIGKILL)
+                    killed[i] = True
+            grace_us = -1  # now block until the killed parties are reaped
+        else:
+            usleep(_REAP_POLL_US)
+            waited += _REAP_POLL_US
+    return [(children[i][0], statuses[i], killed[i]) for i in range(len(children))]
+
+
+def _report_failed_parties(results: List[Tuple[int, int, bool]]) -> int:
+    failed = 0
+    for party, status, killed in results:
+        if status == 0:
+            continue
+        failed += 1
+        signal = status & 0x7f
+        if killed:
+            what = "was killed: still running after another party failed"
+        elif status == -1:
+            what = "could not be waited for"
+        elif signal == 0:
+            what = f"exited with status {(status >> 8) & 0xff}"
+        elif signal == _SIGABRT:
+            what = "aborted (uncaught exception, see its error report above)"
+        else:
+            what = f"was terminated by signal {signal}"
+        print(f"CP{party}:\t{what}", file=sys.stderr)
+    return failed
 
 
 def fork_parties(fork_level, last_pid, foo, control_toggles, modulus, *args):
-    null = 0
-    child_pid = fork()
-    if child_pid == 0:
-        try:
-            client(fork_level, foo, control_toggles, True, modulus, *args)
-        finally:
-            sys.exit(0)
-    else:
-        try:
-            if fork_level + 1 == last_pid:
-                client(fork_level + 1, foo, control_toggles, True, modulus, *args)
-            else:
-                fork_parties(fork_level + 1, last_pid, foo, control_toggles, modulus, *args)
-        finally:
-            waitpid(child_pid, __ptr__(null).as_byte(), 0)
+    # Runs parties fork_level..last_pid on this machine: last_pid in this process, the others in forked children.
+    # Returns only if every party succeeded. A party that raises names itself and closes its connections, so the
+    # parties waiting on it fail too. The children are then reaped (and killed if still blocked after a grace
+    # period), every failed party is reported on stderr, and the run fails: this process's own exception propagates,
+    # or it exits with status 1 when only children failed.
+    children = List[Tuple[int, i32]]()
+    for party in range(fork_level, last_pid):
+        _flush_output()
+        os_pid = fork()
+        if os_pid == i32(0):
+            _run_forked_party(party, foo, control_toggles, modulus, *args)
+        if os_pid < i32(0):
+            _report_failed_parties(_reap_parties(children, 0))
+            raise OSError(f"fork() failed while starting CP{party}")
+        children.append((party, os_pid))
+
+    finished = False
+    try:
+        client(last_pid, foo, control_toggles, True, modulus, *args)
+        finished = True
+    finally:
+        if not finished:
+            _report_failed_parties(_reap_parties(children, _FAILURE_GRACE_US))
+            _flush_output()
+
+    if _report_failed_parties(_reap_parties(children, -1)):
+        _flush_output()
+        sys.exit(1)
 
 
 def mpc():
@@ -117,10 +239,14 @@ def local(foo):
 def online(foo):
     def wrapper_online(*args, **kwargs):
         mpc_instance = mpc()
+        finished = False
         try:
             foo(mpc_instance, *args, **kwargs)
-        finally:
             mpc_instance.done()
+            finished = True
+        finally:
+            if not finished:
+                _shut_down_failed_party(mpc_instance)
     
     if CONTROLS.main_called:
         raise RuntimeError(

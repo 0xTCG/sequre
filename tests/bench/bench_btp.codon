@@ -1,0 +1,144 @@
+"""
+Single-key CKKS bootstrapping cases (Lattiseq; no MPC), on a small INSECURE parameter set:
+btp_default.N16QP1546H192H32.insecure_copy(13, 12) -- the moduli and bootstrapping circuit of N16QP1546H192H32 in a
+ring of degree 2^13, as tests/unit_tests/test_bootstrapping.codon uses. For timing only; never for data.
+
+    sequre build -release tests/bench/bench_btp.codon -o bench_btp
+    LD_PRELOAD=$HOME/.sequre/lib/sequre_align64.so ./bench_btp [--cases=...] [--out=DIR] [--reps-scale=F]
+    ./bench_btp --list
+
+The setup cases (keys, bootstrapper) always run and are reported once (one repetition each). Results go to
+DIR/CP1.tsv (same format as the MPC binaries; see tests/bench/harness.codon).
+"""
+import math
+import openmp
+import prg
+
+import sequre.lattiseq.ckks as ckks
+import sequre.lattiseq.bootstrapping as bootstrapping
+import sequre.lattiseq.bootstrapping_default_params as btp_default
+
+from sequre.lattiseq.threads import lattiseq_threads, set_lattiseq_threads
+
+from harness import Bench, Timer, handle_list_flag
+
+
+CASES = [
+    ("btp.setup.keys", "", "params + secret key + bootstrapping evaluation keys (gen_evaluation_keys); always run"),
+    ("btp.setup.bootstrapper", "", "new_bootstrapper (CoeffsToSlots / SlotsToCoeffs matrices, EvalMod); always run"),
+    ("btp.bootstrap.level0", "", "Bootstrapper.bootstrap of a level-0 ciphertext at the default scale, 4096 complex slots"),
+    ("btp.bootstrap_with_range.level1", "", "bootstrap_with_range(log_range=4) of a level-1 ciphertext, real values in [-12, 12]"),
+    ("btp.shallow_copy", "", "Bootstrapper.shallow_copy (own evaluator buffers, shared keys and matrices)"),
+    ("btp.concurrent.2x2", "", "2 shallow copies under @par(2) with set_lattiseq_threads(2), one bootstrap each (wall per pair)"),
+]
+
+handle_list_flag("btp", CASES)
+
+
+def uniform(bound: float) -> float:
+    return bound * (2.0 * prg.random() - 1.0)
+
+
+def max_err(have: list[complex], want: list[complex]) -> float:
+    err = 0.0
+    for i in range(len(want)):
+        d = abs(have[i] - want[i])
+        if d > err: err = d
+    return err
+
+
+def bench_btp_main():
+    b = Bench("btp", 1, CASES)
+    b.start_solo(f" | params=N16QP1546H192H32.insecure_copy(13,12)")
+    literal = btp_default.N16QP1546H192H32.insecure_copy(13, 12)
+    btp_params = literal.bootstrapping_params
+
+    b.always_solo("btp.setup.keys")
+    t = Timer(1, warmup=0)
+    t.begin_local()
+    params = ckks.new_parameters_from_literal(literal.scheme_params)
+    kgen = ckks.new_key_generator(params)
+    sk = kgen.gen_secret_key()
+    evk = bootstrapping.gen_evaluation_keys(btp_params, params, sk)
+    t.end_local()
+    b.report(f"logN={params.logn};slots={params.slots()};rotation_keys={len(evk.rtks.keys)}", t, float(params.max_level()))
+
+    b.always_solo("btp.setup.bootstrapper")
+    t = Timer(1, warmup=0)
+    t.begin_local()
+    btp = bootstrapping.new_bootstrapper(params, btp_params, evk)
+    t.end_local()
+    b.report(f"output_level={btp.output_level()}", t, float(btp.max_log_range(params.default_scale)))
+
+    encoder = ckks.new_encoder_complex(params)
+    encryptor = ckks.new_encryptor(params, sk)
+    decryptor = ckks.new_decryptor(params, sk)
+    slots = params.slots()
+
+    def encrypt_at(values: list[complex], level: int) -> ckks.Ciphertext:
+        pt = ckks.new_plaintext(params, params.max_level(), params.default_scale)
+        encoder.encode(values, pt, params.log_slots)
+        ct = encryptor.encrypt_new(pt)
+        if level < ct.level():
+            btp.evaluator.drop_level(ct, ct.level() - level)
+        return ct
+
+    def decrypt(ct: ckks.Ciphertext) -> list[complex]:
+        return encoder.decode(decryptor.decrypt_new(ct), params.log_slots)
+
+    if b.want_solo("btp.bootstrap.level0"):
+        values = [complex(uniform(1.0), uniform(1.0)) for _ in range(slots)]
+        ct = encrypt_at(values, 0)
+        out = ct
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin_local()
+            out = btp.bootstrap(ct)
+            t.end_local()
+        b.report(f"slots={slots};to_level={out.level()}", t, max_err(decrypt(out), values))
+
+    if b.want_solo("btp.bootstrap_with_range.level1"):
+        values = [complex(uniform(12.0), 0.0) for _ in range(slots)]
+        ct = encrypt_at(values, 1)
+        out = ct
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin_local()
+            out = btp.bootstrap_with_range(ct, 4)
+            t.end_local()
+        b.report(f"slots={slots};log_range=4;to_level={out.level()}", t, max_err(decrypt(out), values))
+
+    if b.want_solo("btp.shallow_copy"):
+        c = btp
+        t = Timer(b.reps(9), batch=5)
+        while t.next():
+            t.begin_local()
+            for _ in range(t.batch):
+                c = btp.shallow_copy()
+            t.end_local()
+        b.report("", t, float(c.output_level()))
+
+    if b.want_solo("btp.concurrent.2x2"):
+        default_threads = lattiseq_threads()
+        set_lattiseq_threads(2)
+        openmp.set_max_active_levels(2)
+        copies = [btp.shallow_copy() for _ in range(2)]
+        values = [[complex(uniform(1.0), uniform(1.0)) for _ in range(slots)] for _ in range(2)]
+        cts = [encrypt_at(values[w], 0) for w in range(2)]
+        outs = [cts[0], cts[1]]
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin_local()
+            @par(num_threads=2)
+            for w in range(2):
+                outs[w] = copies[w].bootstrap(cts[w])
+            t.end_local()
+        set_lattiseq_threads(default_threads)
+        openmp.set_max_active_levels(1)
+        err = max(max_err(decrypt(outs[0]), values[0]), max_err(decrypt(outs[1]), values[1]))
+        b.report(f"workers=2;threads_per_worker=2;slots={slots}", t, err)
+
+    b.finish_solo()
+
+
+bench_btp_main()

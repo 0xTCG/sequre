@@ -1,0 +1,494 @@
+"""
+Shared harness for the performance-regression benchmarks in tests/bench/ (bench_mpc, bench_mhe, bench_btp).
+
+Driven by scripts/bench.sh; see that script for the workflow. A benchmark binary takes:
+
+    --list                 print its case registry (binary, name, flags, description) and exit
+    --cases=P1,P2,...      run only the cases whose name starts with one of the prefixes
+                           (a trailing '$' asks for an exact name: --cases=mpc.beaver.mul_vec_1e4$)
+    --skip=P1,P2,...       drop the cases matching these prefixes (same syntax)
+    --out=DIR              write the per-party result files DIR/CP<pid>.tsv (default: the current directory)
+    --reps-scale=F         multiply every case's repetition count by F (at least one repetition)
+    --pin=C0:C1:C2         pin party k's process to CPU list Ck (e.g. 0-5:6-11:12-17; a solo binary uses C1), so
+                           that runs do not differ by where the scheduler placed the parties (core boost, caches)
+    --gc-each-rep          run a full garbage collection before every repetition, outside the timed region
+                           (slower; removes most collector pauses from the samples -- for precise targeted runs)
+    --keep-fork-gc         leave the collector as fork() leaves it in the forked parties (see below)
+    --gc-none              never force a collection. By default the harness collects, untimed, at the start of every
+                           case (so that a case does not pay for the previous case's garbage) and before every
+                           repetition that follows one longer than LONG_REP_S (where a pause would otherwise land
+                           in some repetitions and not others)
+    --local                local mode (the parties are forked processes talking over UNIX sockets)
+
+Every case is timed on every party that takes part in it and lands as one row of that party's TSV
+(columns in TSV_COLUMNS). A case first runs `warmup` untimed repetitions (their times are kept in warm_s),
+then `reps` timed ones. Multi-party cases put a barrier (comms.sync_parties) before each repetition so that
+all parties start it together; the time a party records is from the barrier to the end of its own part.
+"Solo" cases (local computation) run on CP1 only while the other parties wait at the next barrier.
+
+The gc_per_rep column counts the garbage collections that ran inside the timed repetitions (mean per repetition);
+a change in it between two runs means the allocation volume of the operation changed.
+
+Local mode fork()s CP0 and CP1 from the original process, and the collector's parallel marker threads do not survive
+fork(): their collections run single-threaded (~0.5 s for an MHE party's ~4 GB heap, against ~0.05 s in CP2), which
+makes them both slower and noisier than separate processes (distributed mode). The harness restarts the marker
+threads in every party (GC_start_mark_threads, a no-op where they run) unless --keep-fork-gc is given.
+
+The last row of a complete file is the `__done__` row; a file without it belongs to a party that crashed,
+hung or was killed. The `check` column is a correctness witness (an error against plaintext, a checksum, ...)
+so that a speedup that breaks the arithmetic shows up in the same run.
+
+Data that all parties must agree on is drawn from the shared global stream under seed_switch(-1), by every
+party (CP0 included) in the same order, so that the global stream stays aligned for sync_parties (which draws
+its token from that stream). reset_global_seed() is deliberately never used: it currently re-keys the generator
+without saving its state, which would turn each party's private stream into the public one. Data used by one
+party only comes from its private stream. Solo cases must never touch a stream shared with another party.
+"""
+import sys
+import time
+
+import prg
+
+from sequre.constants import NUM_THREADS, NUMBER_OF_PARTIES
+from sequre.settings import MPC_INT_SIZE
+from sequre.lattiseq.threads import lattiseq_threads
+
+
+from C import sched_setaffinity(i32, int, cobj) -> i32 as _sched_setaffinity
+from C import GC_start_mark_threads() as _gc_start_mark_threads
+from C import GC_gcollect() as _gc_collect
+from C import GC_get_gc_no() -> u64 as _gc_count
+from C import GC_get_heap_size() -> u64 as _gc_heap_size
+
+
+HARNESS_VERSION: int = 2
+TSV_COLUMNS = "case\tparams\tpid\treps\tmedian_s\tmin_s\tmean_s\tmax_s\tq1_s\tq3_s\tmad_rel\twarm_s\tbytes_per_rep\tcheck\twall_s\tsamples\tgc_per_rep"
+GC_EACH_REP: bool = "--gc-each-rep" in sys.argv
+GC_FORCED: bool = "--gc-none" not in sys.argv
+GC_EACH_CASE: bool = GC_FORCED
+LONG_REP_S: float = 0.25
+
+
+def parse_cpu_list(spec: str) -> List[int]:
+    # "6-11" / "0,2,4" / "0-2,6-8"
+    out = List[int]()
+    for part in spec.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        if "-" in p:
+            lo, hi = p.split("-")
+            for c in range(int(lo), int(hi) + 1):
+                out.append(c)
+        else:
+            out.append(int(p))
+    return out
+
+
+def pin_process(pid: int) -> str:
+    # Pins the calling process (all its future threads) to the CPU list --pin gives for this party. Returns the list
+    # used, "" without --pin, or "failed".
+    spec = arg_value("--pin=")
+    if not spec or spec == "none":
+        return ""
+    parts = spec.split(":")
+    chosen = parts[pid] if pid < len(parts) else parts[len(parts) - 1]
+    cpus = parse_cpu_list(chosen)
+    mask = Ptr[u64](16)  # cpu_set_t: 1024 bits
+    for i in range(16):
+        mask[i] = u64(0)
+    for c in cpus:
+        mask[c // 64] = mask[c // 64] | (u64(1) << u64(c % 64))
+    rc = _sched_setaffinity(i32(0), 128, mask.as_byte())
+    return chosen if rc == i32(0) else "failed"
+
+
+def gc_count() -> int:
+    return int(_gc_count())
+
+
+def collect_garbage() -> float:
+    # Full collection; returns its duration in seconds.
+    t0 = time.perf_counter()
+    _gc_collect()
+    return time.perf_counter() - t0
+
+
+def arg_value(prefix: str) -> str:
+    for a in sys.argv[1:]:
+        if a.startswith(prefix):
+            return a[len(prefix):]
+    return ""
+
+
+def split_csv(s: str) -> List[str]:
+    out = List[str]()
+    for p in s.split(","):
+        q = p.strip()
+        if q:
+            out.append(q)
+    return out
+
+
+def pattern_matches(name: str, pattern: str) -> bool:
+    if pattern.endswith("$"):
+        return name == pattern[:-1]
+    return name.startswith(pattern)
+
+
+def handle_list_flag(binary: str, cases: List[Tuple[str, str, str]]):
+    # Prints the registry and exits when --list is given. Call at module level, before @main.
+    if "--list" in sys.argv:
+        for name, flags, desc in cases:
+            print(f"{binary}\t{name}\t{flags}\t{desc}")
+        sys.exit(0)
+
+
+def quantile(sorted_xs: List[float], q: float) -> float:
+    n = len(sorted_xs)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return sorted_xs[0]
+    pos = q * float(n - 1)
+    lo = int(pos)
+    hi = lo + 1 if lo + 1 < n else n - 1
+    frac = pos - float(lo)
+    return sorted_xs[lo] * (1.0 - frac) + sorted_xs[hi] * frac
+
+
+def peak_rss_mb() -> float:
+    with open('/proc/self/status') as f:
+        for line in f:
+            if line.startswith('VmHWM:'):
+                return float(line.split()[1]) / 1024.0
+    return 0.0
+
+
+def fmt(x: float) -> str:
+    return f"{x:.6g}"
+
+
+class Timer:
+    # One repetition = `batch` back-to-back executions of the operation between begin() and end(); the recorded
+    # time (and bytes) are per execution. Batching amortizes the garbage collector: a sub-millisecond operation
+    # that allocates a few MB is otherwise bimodal (collection or not inside the repetition).
+    reps: int
+    warmup: int
+    batch: int
+    i: int
+    t0: float
+    bytes0: int
+    bytes_total: int
+    gc0: int
+    gc_total: int
+    last_dt: float
+    sync: bool
+    times: List[float]
+    warm: List[float]
+
+    def __init__(self, reps: int, warmup: int = 1, sync: bool = True, batch: int = 1):
+        self.reps = reps
+        self.warmup = warmup
+        self.batch = batch if batch >= 1 else 1
+        self.i = 0
+        self.t0 = 0.0
+        self.bytes0 = 0
+        self.bytes_total = 0
+        self.gc0 = 0
+        self.gc_total = 0
+        self.last_dt = 0.0
+        self.sync = sync
+        self.times = List[float]()
+        self.warm = List[float]()
+
+    def next(self) -> bool:
+        return self.i < self.warmup + self.reps
+
+    def _maybe_collect(self):
+        if GC_EACH_REP or (GC_FORCED and self.i > 0 and self.last_dt * float(self.batch) >= LONG_REP_S):
+            _gc_collect()
+
+    def begin(self, mpc):
+        # (Untimed collection,) barrier for multi-party cases, then start the clock.
+        self._maybe_collect()
+        if self.sync:
+            mpc.comms.sync_parties()
+        self.bytes0 = mpc.stats.bytes_sent
+        self.gc0 = gc_count()
+        self.t0 = time.perf_counter()
+
+    def end(self, mpc):
+        dt = (time.perf_counter() - self.t0) / float(self.batch)
+        self.last_dt = dt
+        gcs = gc_count() - self.gc0
+        sent = (mpc.stats.bytes_sent - self.bytes0) // self.batch
+        if self.i < self.warmup:
+            self.warm.append(dt)
+        else:
+            self.times.append(dt)
+            self.bytes_total += sent
+            self.gc_total += gcs
+        self.i += 1
+
+    def begin_local(self):
+        # For binaries without an MPC environment (bench_btp).
+        self._maybe_collect()
+        self.gc0 = gc_count()
+        self.t0 = time.perf_counter()
+
+    def end_local(self):
+        dt = (time.perf_counter() - self.t0) / float(self.batch)
+        self.last_dt = dt
+        gcs = gc_count() - self.gc0
+        if self.i < self.warmup:
+            self.warm.append(dt)
+        else:
+            self.times.append(dt)
+            self.gc_total += gcs
+        self.i += 1
+
+
+class Bench:
+    binary: str
+    pid: int
+    out_path: str
+    include: List[str]
+    exclude: List[str]
+    names: List[str]
+    flags: Dict[str, str]
+    ran: List[str]
+    reps_scale: float
+    t_start: float
+    current: str
+    case_t0: float
+    pinned: str
+    fork_gc_fixed: bool
+
+    def __init__(self, binary: str, pid: int, cases: List[Tuple[str, str, str]]):
+        self.binary = binary
+        self.pid = pid
+        self.pinned = pin_process(pid)  # before the marker threads start, so that they inherit the pinning
+        self.fork_gc_fixed = "--keep-fork-gc" not in sys.argv
+        if self.fork_gc_fixed:
+            _gc_start_mark_threads()
+        out_dir = arg_value("--out=")
+        if not out_dir:
+            out_dir = "."
+        self.out_path = f"{out_dir}/CP{pid}.tsv"
+        self.include = split_csv(arg_value("--cases="))
+        self.exclude = split_csv(arg_value("--skip="))
+        scale = arg_value("--reps-scale=")
+        self.reps_scale = float(scale) if scale else 1.0
+        self.names = List[str]()
+        self.flags = Dict[str, str]()
+        for name, fl, _ in cases:
+            assert name not in self.flags, f"bench: duplicate case name {name}"
+            self.names.append(name)
+            self.flags[name] = fl
+        self.ran = List[str]()
+        self.t_start = time.perf_counter()
+        self.current = ""
+        self.case_t0 = 0.0
+
+        for p in self.include:
+            hit = False
+            for name in self.names:
+                if pattern_matches(name, p):
+                    hit = True
+            if not hit:
+                print(f"CP{pid}:\tbench: WARNING: --cases pattern '{p}' matches no case of {binary}")
+
+    def selected(self, name: str) -> bool:
+        if self.include:
+            hit = False
+            for p in self.include:
+                if pattern_matches(name, p):
+                    hit = True
+            if not hit:
+                return False
+        for p in self.exclude:
+            if pattern_matches(name, p):
+                return False
+        if self.flags[name].startswith("skip"):
+            # Known-broken cases run only when asked for by their exact name.
+            exact = False
+            for p in self.include:
+                if p == name + "$":
+                    exact = True
+            return exact
+        return True
+
+    def any_selected(self, prefix: str) -> bool:
+        for name in self.names:
+            if name.startswith(prefix) and self.selected(name):
+                return True
+        return False
+
+    def reps(self, n: int) -> int:
+        r = int(float(n) * self.reps_scale + 0.5)
+        return r if r >= 1 else 1
+
+    def start_solo(self, extra: str = ""):
+        # For binaries without an MPC environment (bench_btp).
+        self.start(None, extra)
+
+    def always_solo(self, name: str):
+        assert name in self.flags, f"bench: case {name} is not in the registry of {self.binary}"
+        self.ran.append(name)
+        self.current = name
+        self._case_gc()
+        self.case_t0 = time.perf_counter()
+        print(f"bench: {name}")
+
+    def start(self, mpc, extra: str = ""):
+        with open(self.out_path, "w") as f:
+            f.write(f"# sequre-bench v{HARNESS_VERSION} | binary={self.binary} | pid={self.pid} | parties={NUMBER_OF_PARTIES} "
+                    f"| MPC_INT_SIZE={MPC_INT_SIZE} | NUM_THREADS={NUM_THREADS} | lattiseq_threads={lattiseq_threads()} "
+                    f"| reps_scale={self.reps_scale} | gc_each_rep={int(GC_EACH_REP)} | gc_forced={int(GC_FORCED)} | long_rep_s={LONG_REP_S} | pin={self.pinned} | gc_markers_restarted={int(self.fork_gc_fixed)} "
+                    f"| cases={','.join(self.include)} | skip={','.join(self.exclude)}{extra}\n")
+            f.write(TSV_COLUMNS + "\n")
+        self.t_start = time.perf_counter()
+
+    def want(self, mpc, name: str) -> bool:
+        # Every party calls want() for every case, in the same order. A selected case starts with a barrier.
+        assert name in self.flags, f"bench: case {name} is not in the registry of {self.binary}"
+        if not self.selected(name):
+            return False
+        self.ran.append(name)
+        self.current = name
+        self._case_gc()
+        mpc.comms.sync_parties()
+        self.case_t0 = time.perf_counter()
+        print(f"CP{self.pid}:\tbench: {name}")
+        return True
+
+    def always(self, mpc, name: str):
+        # A case that runs whatever the selection (its work is needed by the others, e.g. MHE key generation).
+        assert name in self.flags, f"bench: case {name} is not in the registry of {self.binary}"
+        self.ran.append(name)
+        self.current = name
+        self._case_gc()
+        mpc.comms.sync_parties()
+        self.case_t0 = time.perf_counter()
+        print(f"CP{self.pid}:\tbench: {name}")
+
+    def _case_gc(self):
+        if GC_EACH_CASE:
+            dt = collect_garbage()
+            print(f"CP{self.pid}:\tbench: gc before {self.current}: {dt:.3f}s, heap {float(int(_gc_heap_size())) / 1048576.0:.0f} MB")
+
+    def any_selected_but(self, prefix: str, but: str) -> bool:
+        for name in self.names:
+            if name.startswith(prefix) and not name.startswith(but) and self.selected(name):
+                return True
+        return False
+
+    def want_solo(self, name: str) -> bool:
+        # For binaries without MPC (bench_btp): no barrier.
+        assert name in self.flags, f"bench: case {name} is not in the registry of {self.binary}"
+        if not self.selected(name):
+            return False
+        self.ran.append(name)
+        self.current = name
+        self._case_gc()
+        self.case_t0 = time.perf_counter()
+        print(f"bench: {name}")
+        return True
+
+    def _row(self, params: str, reps: int, times: List[float], warm: List[float], bytes_per_rep: int, check: float,
+             gc_per_rep: float) -> str:
+        xs = sorted(times)
+        n = len(xs)
+        med = quantile(xs, 0.5)
+        mean = 0.0
+        for x in xs: mean += x
+        mean = mean / float(n) if n else 0.0
+        devs = sorted([abs(x - med) for x in xs])
+        mad_rel = quantile(devs, 0.5) / med if med > 0.0 else 0.0
+        warm_s = 0.0
+        for w in warm: warm_s += w
+        samples = ",".join([f"{x:.4g}" for x in times])
+        wall = time.perf_counter() - self.case_t0
+        return (f"{self.current}\t{params}\t{self.pid}\t{n}\t{fmt(med)}\t{fmt(xs[0] if n else 0.0)}\t{fmt(mean)}\t"
+                f"{fmt(xs[-1] if n else 0.0)}\t{fmt(quantile(xs, 0.25))}\t{fmt(quantile(xs, 0.75))}\t{mad_rel:.4f}\t"
+                f"{fmt(warm_s)}\t{bytes_per_rep}\t{fmt(check)}\t{wall:.3f}\t{samples}\t{gc_per_rep:.3g}")
+
+    def _write(self, line: str):
+        with open(self.out_path, "a") as f:
+            f.write(line + "\n")
+        print(f"CP{self.pid}:\t{line}")
+
+    def report(self, params: str, t: Timer, check: float):
+        bytes_per_rep = t.bytes_total // len(t.times) if len(t.times) else 0
+        p = f"{params};batch={t.batch}" if t.batch > 1 else params
+        gc_per_rep = float(t.gc_total) / float(len(t.times)) if len(t.times) else 0.0
+        self._write(self._row(p, t.reps, t.times, t.warm, bytes_per_rep, check, gc_per_rep))
+
+    def note(self, text: str):
+        self._write(f"# note\t{self.current}\t{text}")
+
+    def finish(self, mpc):
+        mpc.comms.sync_parties()
+        self._finish_common()
+
+    def finish_solo(self):
+        self._finish_common()
+
+    def _finish_common(self):
+        missing = List[str]()
+        for name in self.names:
+            if self.selected(name) and name not in self.ran:
+                missing.append(name)
+        if missing:
+            self._write(f"# missing\t{','.join(missing)}")
+        total = time.perf_counter() - self.t_start
+        self._write(f"__done__\ttotal\t{self.pid}\t1\t{fmt(total)}\t{fmt(total)}\t{fmt(total)}\t{fmt(total)}\t"
+                    f"{fmt(total)}\t{fmt(total)}\t0\t0\t0\t{peak_rss_mb():.1f}\t{total:.3f}\t{fmt(total)}\t{gc_count()}")
+
+
+def shared_floats(mpc, n: int, lo: float, hi: float) -> List[float]:
+    # Same values at every party: draw from the shared global stream. Call at every party.
+    out = List[float](n)
+    with mpc.randomness.seed_switch(-1):
+        for _ in range(n):
+            out.append(lo + (hi - lo) * prg.random())
+    return out
+
+
+def shared_float_matrix(mpc, rows: int, cols: int, lo: float, hi: float) -> List[List[float]]:
+    out = List[List[float]](rows)
+    with mpc.randomness.seed_switch(-1):
+        for _ in range(rows):
+            row = List[float](cols)
+            for _ in range(cols):
+                row.append(lo + (hi - lo) * prg.random())
+            out.append(row)
+    return out
+
+
+def private_floats(n: int, lo: float, hi: float) -> List[float]:
+    # Party-local values from the party's private stream (solo cases).
+    out = List[float](n)
+    for _ in range(n):
+        out.append(lo + (hi - lo) * prg.random())
+    return out
+
+
+def max_abs_err_1d(have, want) -> float:
+    # max |have[i] - want[i]| over the first len(want) elements of two 1-D float containers.
+    err = 0.0
+    for i in range(len(want)):
+        d = abs(float(have[i]) - float(want[i]))
+        if d > err: err = d
+    return err
+
+
+def max_abs_err_2d(have, want) -> float:
+    # max |have[i][j] - want[i][j]| over the shape of want (2-D float containers).
+    err = 0.0
+    for i in range(len(want)):
+        for j in range(len(want[i])):
+            d = abs(float(have[i][j]) - float(want[i][j]))
+            if d > err: err = d
+    return err

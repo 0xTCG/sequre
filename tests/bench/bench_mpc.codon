@@ -1,0 +1,938 @@
+"""
+MPC performance-regression cases: randomness, modular arithmetic, communication, Sharetensor protocols and
+MPC-only end-to-end workloads. No HE: run with --skip-mhe-setup (scripts/bench.sh does).
+
+    sequre build -release tests/bench/bench_mpc.codon -o bench_mpc
+    ./bench_mpc --local --skip-mhe-setup [--cases=...] [--skip=...] [--out=DIR] [--reps-scale=F]
+    ./bench_mpc --list
+
+See tests/bench/harness.codon for the output format and scripts/bench.sh for the workflow.
+"""
+import math
+import prg
+import secure_operator
+
+from sequre import main
+from sequre.constants import MPC_FIELD_SIZE, MPC_MODULUS_BITS, MPC_NBIT_K, MPC_NBIT_F, MPC_NBIT_V, mpc_uint
+from sequre.types.sharetensor import Sharetensor
+from sequre.types.internal import Internal as sq
+from sequre.types.utils import double_to_fp, fp_to_double
+from sequre.utils.utils import zeros_vec, zeros_mat, random_ints
+from sequre.stdlib.lin_alg import l2
+from sequre.stdlib.learn.lin_reg import LinReg
+from sequre.stdlib.numpy.create import array, ones, zeros_like
+
+from harness import (
+    Bench, Timer, handle_list_flag, shared_floats, shared_float_matrix, private_floats,
+    max_abs_err_1d, max_abs_err_2d)
+from ...applications.king import king
+
+
+# (name, flags, description). flags: "" | "iso" (bench.sh runs it in its own process, after the rest)
+#                                     | "skip:<reason>" (known broken; runs only when named exactly: --cases=<name>$)
+CASES = [
+    ("prim.rand.uint_scalar", "", "100k scalar UInt[192].rand draws below the field modulus (the share and mask sampler)"),
+    ("prim.rand.vec_1e5", "", "List.rand of a 1e5 vector (field modulus)"),
+    ("prim.rand.mat_256", "", "List.rand of a 256x256 matrix (field modulus)"),
+    ("prim.rand.bits_vec_1e5", "", "List.rand_bits(160) of a 1e5 vector (truncation masks)"),
+    ("prim.rand.seed_switch_1e4", "", "10k seed_switch enter/exit pairs, one draw each (own stream)"),
+    ("prim.modarith.mul_mod_vec_1e5", "", "List[UInt192].mul_mod element-wise, 1e5"),
+    ("prim.modarith.mul_mod_int_vec_1e5", "", "List[UInt192].mul_mod by an int scalar, 1e5"),
+    ("prim.modarith.add_mod_vec_1e5", "", "List[UInt192].add_mod element-wise, 1e5"),
+    ("prim.modarith.sub_mod_vec_1e5", "", "List[UInt192].sub_mod element-wise, 1e5"),
+    ("prim.modarith.lsh_mod_vec_1e5", "", "List[UInt192].lsh_mod by 32 bits, 1e5"),
+    ("prim.matmul.list_matmul_64", "", "List.matmul (raw, no reduction) 64x64 UInt192 (the ndarray @ Sharetensor kernel)"),
+    ("prim.matmul.matmul_mod_64", "", "List.matmul_mod 64x64 UInt192 (Beaver matmul kernel)"),
+    ("prim.ndarray.matmul_64", "", "float ndarray @ ndarray 64x64"),
+    ("prim.ndarray.matmul_256", "", "float ndarray @ ndarray 256x256"),
+    ("prim.fp.double_to_fp_vec_1e5", "", "double_to_fp of 1e5 floats"),
+    ("prim.fp.fp_to_double_vec_1e5", "", "fp_to_double of 1e5 field elements"),
+    ("net.roundtrip.int_x1000", "", "1000 ping-pongs of one int CP1<->CP2 (latency; UNIX sockets)"),
+    ("net.send.share_mat_256", "", "CP1 -> CP2 -> CP1 round trip of a 256x256 UInt192 matrix (pickling + socket)"),
+    ("net.collect.vec_1e5", "", "comms.collect of a 1e5 UInt192 vector among compute parties"),
+    ("net.broadcast_from.vec_1e5", "", "comms.broadcast_from(CP1) of a 1e5 UInt192 vector"),
+    ("net.reveal.vec_1e5", "", "comms.reveal of a 1e5 share vector"),
+    ("mpc.share.enc_vec_1e5", "", "Sharetensor.enc (dealer-sourced share_from) of 1e5 floats"),
+    ("mpc.share.enc_cp1_vec_1e5", "", "Sharetensor.enc sourced at CP1 (share_from mask sum) of 1e5 floats"),
+    ("mpc.share.enc_mat_256", "", "Sharetensor.enc of a 256x256 float matrix"),
+    ("mpc.share.reveal_vec_1e5", "", "Sharetensor.reveal of a 1e5 fixed-point vector (two reveal rounds)"),
+    ("mpc.share.reveal_mat_256", "", "Sharetensor.reveal of a 256x256 fixed-point matrix"),
+    ("mpc.arith.add_vec_1e5", "", "secret + secret, 1e5 (local)"),
+    ("mpc.beaver.mul_vec_1e4", "", "fp Beaver multiply, fresh operands (2 partitions + reconstruct + trunc), 1e4"),
+    ("mpc.beaver.mul_vec_1e5", "", "fp Beaver multiply, fresh operands, 1e5"),
+    ("mpc.beaver.mul_cached_vec_1e5", "", "fp Beaver multiply, operands with cached partitions, 1e5"),
+    ("mpc.beaver.matmul_64", "", "fp Beaver matmul 64x64, fresh operands"),
+    ("mpc.beaver.matmul_256", "", "fp Beaver matmul 256x256, fresh operands"),
+    ("mpc.beaver.dot_vec_1e5", "", "fp Beaver dot product of two 1e5 vectors"),
+    ("mpc.fp.trunc_vec_1e5", "", "fixed-point truncation of a 1e5 share vector"),
+    ("mpc.cmp.gt_zero_vec_1e3", "", "x > 0 (is_positive), 1e3"),
+    ("mpc.cmp.gt_zero_vec_1e4", "", "x > 0 (is_positive), 1e4"),
+    ("mpc.cmp.gt_float_vec_1e3", "", "x > 0.5 (greater_than_public), 1e3"),
+    ("mpc.cmp.gt_int_vec_1e3", "", "x > 1 with an int constant, 1e3"),
+    ("mpc.cmp.gt_secret_vec_1e3", "", "x > y, both secret, 1e3"),
+    ("mpc.fp.div_vec_1e3", "", "fp division x / y, both secret (fp_div), 1e3"),
+    ("mpc.fp.sqrt_vec_1e3", "", "fp square root + inverse (fp_sqrt), 1e3"),
+    ("mpc.pow.fp_cube_vec_1e4", "", "x ** 3 on fixed point (multiply chain), 1e4"),
+    ("mpc.pow.int_cube_vec_1e4", "", "x ** 3 on integers (powers_cached), 1e4"),
+    ("mpc.public.add_int_vec_1e5", "", "x + 3 (public int), 1e5"),
+    ("mpc.public.add_float_vec_1e5", "", "x + 0.5 (public float), 1e5"),
+    ("mpc.public.sub_int_vec_1e5", "", "x - 3 (public int), 1e5"),
+    ("mpc.public.sub_float_vec_1e5", "", "x - 0.5 (public float), 1e5"),
+    ("mpc.public.mul_int_vec_1e5", "", "x * 3 (public int, local mul_mod), 1e5"),
+    ("mpc.public.mul_float_vec_1e5", "", "x * 0.5 (public float + trunc), 1e5"),
+    ("mpc.public.div_float_vec_1e5", "", "x / 4.0 (public float + trunc), 1e5"),
+    ("mpc.ndarray.matmul_float_128", "", "float ndarray @ fp Sharetensor 128x128"),
+    ("mpc.bcast.add_vec_mat_256", "", "256x256 matrix + 256 vector, both secret (broadcast_add)"),
+    ("e2e.l2.sharetensor_16x512", "", "enc + l2 distance + reveal on Sharetensor, 16x512"),
+    ("e2e.king.sharetensor_16x2048", "", "enc + KING + reveal on Sharetensor, 2x8 individuals x 2048 SNPs"),
+    ("e2e.linreg.sharetensor_1024x31", "", "enc + LinReg BGD fit (10 epochs) + reveal on Sharetensor, 1024x31"),
+]
+
+handle_list_flag("mpc", CASES)
+
+
+def fresh[TP](x: Sharetensor[TP]) -> Sharetensor[TP]:
+    # Same shares, no cached Beaver partitions / sqrt: what an operand looks like the first time it is used.
+    y = Sharetensor(x.share, x.modulus)
+    y.fp = x.fp
+    return y
+
+
+def fp_vec(mpc, n: int, lo: float, hi: float) -> Tuple[List[float], Sharetensor[List[mpc_uint]]]:
+    xs = shared_floats(mpc, n, lo, hi)
+    return xs, Sharetensor.enc(mpc, xs)
+
+
+def fp_mat(mpc, rows: int, cols: int, lo: float, hi: float) -> Tuple[List[List[float]], Sharetensor[List[List[mpc_uint]]]]:
+    xs = shared_float_matrix(mpc, rows, cols, lo, hi)
+    return xs, Sharetensor.enc(mpc, xs)
+
+
+def mismatches(have, want: List[float]) -> float:
+    bad = 0
+    for i in range(len(want)):
+        if abs(float(have[i]) - want[i]) > 0.5:
+            bad += 1
+    return float(bad)
+
+
+def low16(x: mpc_uint) -> float:
+    return float(int(x & mpc_uint(0xffff)))
+
+
+# Witness of the field sampler: the fraction of draws with the modulus' top bit set (bit 173 for the 174-bit field).
+# 0 while masks cover only half the field; about 0.5 once they are uniform over the field.
+TOP_BIT = mpc_uint(1) << mpc_uint(MPC_MODULUS_BITS - 1)
+
+
+def frac_at_least(xs: List[mpc_uint], bound: mpc_uint) -> float:
+    cnt = 0
+    for e in xs:
+        if e >= bound:
+            cnt += 1
+    return float(cnt) / float(len(xs)) if len(xs) else 0.0
+
+
+def count_at_least(xs: List[mpc_uint], bound: mpc_uint) -> float:
+    cnt = 0
+    for e in xs:
+        if e >= bound:
+            cnt += 1
+    return float(cnt)
+
+
+########################## prim: CPU primitives (solo, CP1) ##########################
+
+
+def bench_prim(mpc, b: Bench):
+    modulus = MPC_FIELD_SIZE
+
+    if b.want(mpc, "prim.rand.uint_scalar"):
+        if mpc.pid == 1:
+            n = 100000
+            acc = mpc_uint(0)
+            t = Timer(b.reps(9), sync=False, batch=5)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    for _ in range(n):
+                        acc ^= mpc_uint.rand(modulus, "uniform")
+                t.end(mpc)
+            sample = [mpc_uint.rand(modulus, "uniform") for _ in range(4096)]
+            b.report(f"n={n};check=frac>=2^{MPC_MODULUS_BITS - 1}", t, frac_at_least(sample, TOP_BIT))
+
+    if b.want(mpc, "prim.rand.vec_1e5"):
+        if mpc.pid == 1:
+            n = 100000
+            tmpl = zeros_vec(n)
+            r = tmpl
+            t = Timer(b.reps(9), sync=False, batch=8)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    r = tmpl.rand(modulus, "uniform")
+                t.end(mpc)
+            b.report(f"n={n};check=frac>=2^{MPC_MODULUS_BITS - 1}", t, frac_at_least(r, TOP_BIT))
+
+    if b.want(mpc, "prim.rand.mat_256"):
+        if mpc.pid == 1:
+            tmpl = zeros_mat(256, 256)
+            r = tmpl
+            t = Timer(b.reps(9), sync=False, batch=8)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    r = tmpl.rand(modulus, "uniform")
+                t.end(mpc)
+            b.report(f"256x256;check=frac>=2^{MPC_MODULUS_BITS - 1}", t, frac_at_least(r.flatten(), TOP_BIT))
+
+    if b.want(mpc, "prim.rand.bits_vec_1e5"):
+        if mpc.pid == 1:
+            n = 100000
+            bits = MPC_NBIT_K + MPC_NBIT_F + MPC_NBIT_V
+            tmpl = zeros_vec(n)
+            r = tmpl
+            t = Timer(b.reps(9), sync=False, batch=5)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    r = tmpl.rand_bits(bits)
+                t.end(mpc)
+            b.report(f"n={n};bits={bits};check=frac>=2^{bits - 1}", t, frac_at_least(r, mpc_uint(1) << mpc_uint(bits - 1)))
+
+    if b.want(mpc, "prim.rand.seed_switch_1e4"):
+        if mpc.pid == 1:
+            # Own stream only: switching to a stream shared with another party would desync it.
+            n = 10000
+            acc = mpc_uint(0)
+            t = Timer(b.reps(9), sync=False)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(n):
+                    with mpc.randomness.seed_switch(mpc.pid):
+                        acc ^= mpc_uint.rand(modulus, "uniform")
+                t.end(mpc)
+            b.report(f"n={n};check=draws_ok", t, 1.0 if acc != mpc_uint(0) else 0.0)
+
+    if b.any_selected("prim.modarith."):
+        n = 100000
+        va = zeros_vec(n)
+        vb = zeros_vec(n)
+        if mpc.pid == 1:
+            va = va.rand(modulus, "uniform")
+            vb = vb.rand(modulus, "uniform")
+
+        if b.want(mpc, "prim.modarith.mul_mod_vec_1e5"):
+            if mpc.pid == 1:
+                r = va
+                t = Timer(b.reps(9), sync=False, batch=20)
+                while t.next():
+                    t.begin(mpc)
+                    for _ in range(t.batch):
+                        r = va.mul_mod(vb, modulus)
+                    t.end(mpc)
+                b.report(f"n={n};check=unreduced", t, count_at_least(r, modulus))
+
+        if b.want(mpc, "prim.modarith.mul_mod_int_vec_1e5"):
+            if mpc.pid == 1:
+                r = va
+                t = Timer(b.reps(9), sync=False, batch=20)
+                while t.next():
+                    t.begin(mpc)
+                    for _ in range(t.batch):
+                        r = va.mul_mod(12345, modulus)
+                    t.end(mpc)
+                b.report(f"n={n};check=unreduced", t, count_at_least(r, modulus))
+
+        if b.want(mpc, "prim.modarith.add_mod_vec_1e5"):
+            if mpc.pid == 1:
+                r = va
+                t = Timer(b.reps(9), sync=False, batch=20)
+                while t.next():
+                    t.begin(mpc)
+                    for _ in range(t.batch):
+                        r = va.add_mod(vb, modulus)
+                    t.end(mpc)
+                b.report(f"n={n};check=unreduced", t, count_at_least(r, modulus))
+
+        if b.want(mpc, "prim.modarith.sub_mod_vec_1e5"):
+            if mpc.pid == 1:
+                r = va
+                t = Timer(b.reps(9), sync=False, batch=20)
+                while t.next():
+                    t.begin(mpc)
+                    for _ in range(t.batch):
+                        r = va.sub_mod(vb, modulus)
+                    t.end(mpc)
+                b.report(f"n={n};check=unreduced", t, count_at_least(r, modulus))
+
+        if b.want(mpc, "prim.modarith.lsh_mod_vec_1e5"):
+            if mpc.pid == 1:
+                r = va
+                t = Timer(b.reps(9), sync=False, batch=20)
+                while t.next():
+                    t.begin(mpc)
+                    for _ in range(t.batch):
+                        r = va.lsh_mod(32, modulus)
+                    t.end(mpc)
+                b.report(f"n={n};shift=32;check=unreduced", t, count_at_least(r, modulus))
+
+    if b.any_selected("prim.matmul."):
+        ma = zeros_mat(64, 64)
+        mb = zeros_mat(64, 64)
+        if mpc.pid == 1:
+            ma = ma.rand(modulus, "uniform")
+            mb = mb.rand(modulus, "uniform")
+
+        if b.want(mpc, "prim.matmul.list_matmul_64"):
+            if mpc.pid == 1:
+                r = ma
+                t = Timer(b.reps(9), sync=False, batch=30)
+                while t.next():
+                    t.begin(mpc)
+                    for _ in range(t.batch):
+                        r = ma.matmul(mb)
+                    t.end(mpc)
+                ref = mpc_uint(0)
+                for k in range(64):
+                    ref = ref + ma[5][k] * mb[k][7]
+                b.report("64x64;check=spot_mismatch", t, 0.0 if r[5][7] == ref else 1.0)
+
+        if b.want(mpc, "prim.matmul.matmul_mod_64"):
+            if mpc.pid == 1:
+                r = ma
+                t = Timer(b.reps(9), sync=False, batch=4)
+                while t.next():
+                    t.begin(mpc)
+                    for _ in range(t.batch):
+                        r = ma.matmul_mod(mb, modulus)
+                    t.end(mpc)
+                ref = mpc_uint(0)
+                for k in range(64):
+                    ref = ref.add_mod(ma[5][k].mul_mod(mb[k][7], modulus), modulus)
+                b.report("64x64;check=spot_mismatch", t, 0.0 if r[5][7] == ref else 1.0)
+
+    for size in (64, 256):
+        if b.want(mpc, f"prim.ndarray.matmul_{size}"):
+            if mpc.pid == 1:
+                na = array(private_floats(size * size, -1.0, 1.0)).reshape((size, size))
+                nb = array(private_floats(size * size, -1.0, 1.0)).reshape((size, size))
+                r = na
+                t = Timer(b.reps(9 if size == 64 else 5), sync=False, batch=(20 if size == 64 else 1))
+                while t.next():
+                    t.begin(mpc)
+                    for _ in range(t.batch):
+                        r = na @ nb
+                    t.end(mpc)
+                ref = 0.0
+                for k in range(size):
+                    ref += na[0, k] * nb[k, 0]
+                b.report(f"{size}x{size}", t, abs(r[0, 0] - ref))
+
+    if b.any_selected("prim.fp."):
+        n = 100000
+        fs = private_floats(n, -100.0, 100.0)
+        enc = double_to_fp(fs, modulus)
+
+        if b.want(mpc, "prim.fp.double_to_fp_vec_1e5"):
+            if mpc.pid == 1:
+                r = enc
+                t = Timer(b.reps(9), sync=False, batch=8)
+                while t.next():
+                    t.begin(mpc)
+                    for _ in range(t.batch):
+                        r = double_to_fp(fs, modulus)
+                    t.end(mpc)
+                b.report(f"n={n};check=roundtrip_err", t, max_abs_err_1d(fp_to_double(r, modulus), fs))
+
+        if b.want(mpc, "prim.fp.fp_to_double_vec_1e5"):
+            if mpc.pid == 1:
+                r = fs
+                t = Timer(b.reps(9), sync=False, batch=50)
+                while t.next():
+                    t.begin(mpc)
+                    for _ in range(t.batch):
+                        r = fp_to_double(enc, modulus)
+                    t.end(mpc)
+                b.report(f"n={n};check=roundtrip_err", t, max_abs_err_1d(r, fs))
+
+
+########################## net: communication ##########################
+
+def bench_net(mpc, b: Bench):
+    modulus = MPC_FIELD_SIZE
+
+    if b.want(mpc, "net.roundtrip.int_x1000"):
+        n = 1000
+        acc = 0
+        t = Timer(b.reps(9))
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid == 1:
+                for k in range(n):
+                    mpc.comms.send_as_jar(k, 2)
+                    acc += mpc.comms.receive_as_jar(2, int)
+            elif mpc.pid == 2:
+                for k in range(n):
+                    v = mpc.comms.receive_as_jar(1, int)
+                    mpc.comms.send_as_jar(v, 1)
+            t.end(mpc)
+        if mpc.pid:
+            b.report(f"n={n}", t, float(acc))
+
+    if b.want(mpc, "net.send.share_mat_256"):
+        m = zeros_mat(256, 256)
+        if mpc.pid:
+            m = m.rand(modulus, "uniform")
+        back = m
+        t = Timer(b.reps(9), batch=5)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                if mpc.pid == 1:
+                    mpc.comms.send_as_jar(m, 2)
+                    back = mpc.comms.receive_as_jar(2, List[List[mpc_uint]])
+                elif mpc.pid == 2:
+                    got = mpc.comms.receive_as_jar(1, List[List[mpc_uint]])
+                    mpc.comms.send_as_jar(got, 1)
+            t.end(mpc)
+        if mpc.pid:
+            ok = 1.0 if (mpc.pid != 1 or (back[17][31] == m[17][31] and back[255][255] == m[255][255])) else 0.0
+            b.report("256x256;roundtrip", t, ok)
+
+    if b.any_selected("net.") :
+        n = 100000
+        v = zeros_vec(n)
+        if mpc.pid:
+            v = v.rand(modulus, "uniform")
+
+        if b.want(mpc, "net.collect.vec_1e5"):
+            got = List[List[mpc_uint]]()
+            t = Timer(b.reps(9), batch=5)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    got = mpc.comms.collect(v)
+                t.end(mpc)
+            if mpc.pid:
+                b.report(f"n={n}", t, float(len(got)))
+
+        if b.want(mpc, "net.broadcast_from.vec_1e5"):
+            got = v
+            t = Timer(b.reps(9), batch=10)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    got = mpc.comms.broadcast_from(v, 1)
+                t.end(mpc)
+            if mpc.pid:
+                b.report(f"n={n}", t, float(len(got)))
+
+        if b.want(mpc, "net.reveal.vec_1e5"):
+            got = v
+            t = Timer(b.reps(9), batch=4)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    got = mpc.comms.reveal(v, modulus)
+                t.end(mpc)
+            if mpc.pid:
+                b.report(f"n={n}", t, float(len(got)))
+
+
+########################## mpc: Sharetensor protocols ##########################
+
+def bench_share(mpc, b: Bench):
+    modulus = MPC_FIELD_SIZE
+
+    if b.want(mpc, "mpc.share.enc_vec_1e5"):
+        n = 100000
+        xs = shared_floats(mpc, n, -8.0, 8.0)
+        st = Sharetensor.enc(mpc, xs)
+        t = Timer(b.reps(9), batch=3)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                st = Sharetensor.enc(mpc, xs)
+            t.end(mpc)
+        rv = st.reveal(mpc)
+        b.report(f"n={n};source=0", t, max_abs_err_1d(rv, xs) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.share.enc_cp1_vec_1e5"):
+        n = 100000
+        xs = shared_floats(mpc, n, -8.0, 8.0)
+        st = Sharetensor.enc(mpc, xs, 1, modulus)
+        t = Timer(b.reps(9), batch=3)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                st = Sharetensor.enc(mpc, xs, 1, modulus)
+            t.end(mpc)
+        rv = st.reveal(mpc)
+        b.report(f"n={n};source=1", t, max_abs_err_1d(rv, xs) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.share.enc_mat_256"):
+        xs = shared_float_matrix(mpc, 256, 256, -8.0, 8.0)
+        st = Sharetensor.enc(mpc, xs)
+        t = Timer(b.reps(9), batch=3)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                st = Sharetensor.enc(mpc, xs)
+            t.end(mpc)
+        rv = st.reveal(mpc)
+        b.report("256x256;source=0", t, max_abs_err_2d(rv, xs) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.share.reveal_vec_1e5"):
+        n = 100000
+        xs, st = fp_vec(mpc, n, -8.0, 8.0)
+        rv = st.reveal(mpc)
+        t = Timer(b.reps(9), batch=2)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                rv = st.reveal(mpc)
+            t.end(mpc)
+        b.report(f"n={n}", t, max_abs_err_1d(rv, xs) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.share.reveal_mat_256"):
+        xs, st = fp_mat(mpc, 256, 256, -8.0, 8.0)
+        rv = st.reveal(mpc)
+        t = Timer(b.reps(9), batch=2)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                rv = st.reveal(mpc)
+            t.end(mpc)
+        b.report("256x256", t, max_abs_err_2d(rv, xs) if mpc.pid else 0.0)
+
+
+def bench_arith(mpc, b: Bench):
+    modulus = MPC_FIELD_SIZE
+
+    if b.want(mpc, "mpc.arith.add_vec_1e5"):
+        n = 100000
+        xs, x = fp_vec(mpc, n, -4.0, 4.0)
+        ys, y = fp_vec(mpc, n, -4.0, 4.0)
+        r = x
+        t = Timer(b.reps(9), batch=10)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                r = secure_operator.add(mpc, x, y)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n}", t, max_abs_err_1d(rv, [xs[i] + ys[i] for i in range(n)]) if mpc.pid else 0.0)
+
+    for n in (10000, 100000):
+        name = "mpc.beaver.mul_vec_1e4" if n == 10000 else "mpc.beaver.mul_vec_1e5"
+        if b.want(mpc, name):
+            xs, x = fp_vec(mpc, n, -4.0, 4.0)
+            ys, y = fp_vec(mpc, n, -4.0, 4.0)
+            r = x
+            t = Timer(b.reps(11), batch=(3 if n == 10000 else 1))
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    r = secure_operator.mul(mpc, fresh(x), fresh(y))
+                t.end(mpc)
+            rv = r.reveal(mpc)
+            b.report(f"n={n};fresh", t, max_abs_err_1d(rv, [xs[i] * ys[i] for i in range(n)]) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.beaver.mul_cached_vec_1e5"):
+        n = 100000
+        xs, x = fp_vec(mpc, n, -4.0, 4.0)
+        ys, y = fp_vec(mpc, n, -4.0, 4.0)
+        x.get_partitions(mpc)
+        y.get_partitions(mpc)
+        r = x
+        t = Timer(b.reps(11))
+        while t.next():
+            t.begin(mpc)
+            r = secure_operator.mul(mpc, x, y)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n};cached_partitions", t, max_abs_err_1d(rv, [xs[i] * ys[i] for i in range(n)]) if mpc.pid else 0.0)
+
+    for size in (64, 256):
+        if b.want(mpc, f"mpc.beaver.matmul_{size}"):
+            xs, x = fp_mat(mpc, size, size, -1.0, 1.0)
+            ys, y = fp_mat(mpc, size, size, -1.0, 1.0)
+            r = x
+            t = Timer(b.reps(9 if size == 64 else 3), batch=(2 if size == 64 else 1))
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    r = secure_operator.matmul(mpc, fresh(x), fresh(y))
+                t.end(mpc)
+            rv = r.reveal(mpc)
+            err = 0.0
+            if mpc.pid:
+                ref = array(xs) @ array(ys)
+                err = max_abs_err_2d(rv, ref)
+            b.report(f"{size}x{size};fresh", t, err)
+
+    if b.want(mpc, "mpc.beaver.dot_vec_1e5"):
+        n = 100000
+        xs, x = fp_vec(mpc, n, -1.0, 1.0)
+        ys, y = fp_vec(mpc, n, -1.0, 1.0)
+        r = sq.dot(mpc, fresh(x), fresh(y), 0)
+        t = Timer(b.reps(9))
+        while t.next():
+            t.begin(mpc)
+            r = sq.dot(mpc, fresh(x), fresh(y), 0)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        ref = 0.0
+        for i in range(n): ref += xs[i] * ys[i]
+        b.report(f"n={n};fresh", t, abs(rv - ref) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.fp.trunc_vec_1e5"):
+        n = 100000
+        xs, x = fp_vec(mpc, n, -4.0, 4.0)
+        prod = x.share.mul_mod(double_to_fp(1.5, modulus), modulus)  # 2^(2f)-scaled shares of 1.5 x
+        tr = prod
+        t = Timer(b.reps(9))
+        while t.next():
+            t.begin(mpc)
+            tr = mpc.fp.trunc(prod, modulus)
+            t.end(mpc)
+        res = Sharetensor(tr, modulus)
+        res.fp = True
+        rv = res.reveal(mpc)
+        b.report(f"n={n}", t, max_abs_err_1d(rv, [1.5 * xs[i] for i in range(n)]) if mpc.pid else 0.0)
+
+
+def bench_cmp(mpc, b: Bench):
+    for n in (1000, 10000):
+        name = "mpc.cmp.gt_zero_vec_1e3" if n == 1000 else "mpc.cmp.gt_zero_vec_1e4"
+        if b.want(mpc, name):
+            xs, x = fp_vec(mpc, n, -4.0, 4.0)
+            r = x
+            t = Timer(b.reps(7 if n == 1000 else 3))
+            while t.next():
+                t.begin(mpc)
+                r = secure_operator.gt(mpc, fresh(x), 0)
+                t.end(mpc)
+            rv = r.reveal(mpc)
+            b.report(f"n={n}", t, mismatches(rv, [1.0 if v > 0.0 else 0.0 for v in xs]) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.cmp.gt_float_vec_1e3"):
+        n = 1000
+        xs, x = fp_vec(mpc, n, -4.0, 4.0)
+        r = x
+        t = Timer(b.reps(7))
+        while t.next():
+            t.begin(mpc)
+            r = secure_operator.gt(mpc, fresh(x), 0.5)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n}", t, mismatches(rv, [1.0 if v > 0.5 else 0.0 for v in xs]) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.cmp.gt_int_vec_1e3"):
+        n = 1000
+        xs, x = fp_vec(mpc, n, -4.0, 4.0)
+        r = x
+        t = Timer(b.reps(7))
+        while t.next():
+            t.begin(mpc)
+            r = secure_operator.gt(mpc, fresh(x), 1)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        # check = mismatches against the true x > 1 (nonzero while gt ignores the fixed-point scale of int constants).
+        b.report(f"n={n}", t, mismatches(rv, [1.0 if v > 1.0 else 0.0 for v in xs]) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.cmp.gt_secret_vec_1e3"):
+        n = 1000
+        xs, x = fp_vec(mpc, n, -4.0, 4.0)
+        ys, y = fp_vec(mpc, n, -4.0, 4.0)
+        r = x
+        t = Timer(b.reps(7))
+        while t.next():
+            t.begin(mpc)
+            r = secure_operator.gt(mpc, fresh(x), fresh(y))
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n}", t, mismatches(rv, [1.0 if xs[i] > ys[i] else 0.0 for i in range(n)]) if mpc.pid else 0.0)
+
+
+def bench_fp(mpc, b: Bench):
+    if b.want(mpc, "mpc.fp.div_vec_1e3"):
+        n = 1000
+        xs, x = fp_vec(mpc, n, -4.0, 4.0)
+        ys, y = fp_vec(mpc, n, 1.0, 8.0)
+        r = x
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            r = secure_operator.truediv(mpc, fresh(x), fresh(y))
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n}", t, max_abs_err_1d(rv, [xs[i] / ys[i] for i in range(n)]) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.fp.sqrt_vec_1e3"):
+        n = 1000
+        xs, x = fp_vec(mpc, n, 1.0, 8.0)
+        r = x
+        t = Timer(b.reps(5))
+        while t.next():
+            xf = fresh(x)
+            t.begin(mpc)
+            r = sq.sqrt(mpc, xf)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n}", t, max_abs_err_1d(rv, [math.sqrt(v) for v in xs]) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.pow.fp_cube_vec_1e4"):
+        n = 10000
+        xs, x = fp_vec(mpc, n, -2.0, 2.0)
+        r = x
+        t = Timer(b.reps(9), batch=2)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                r = secure_operator.pow(mpc, fresh(x), 3)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n};p=3", t, max_abs_err_1d(rv, [v * v * v for v in xs]) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.pow.int_cube_vec_1e4"):
+        n = 10000
+        with mpc.randomness.seed_switch(-1):
+            ints = [prg.randint(0, 15) for _ in range(n)]
+        x = Sharetensor.enc(mpc, ints)
+        r = x
+        t = Timer(b.reps(9), batch=3)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                r = secure_operator.pow(mpc, fresh(x), 3)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n};p=3", t, max_abs_err_1d(rv, [float(v * v * v) for v in ints]) if mpc.pid else 0.0)
+
+
+def bench_public(mpc, b: Bench):
+    if not b.any_selected("mpc.public."):
+        return
+    n = 100000
+    xs, x = fp_vec(mpc, n, -4.0, 4.0)
+
+    if b.want(mpc, "mpc.public.add_int_vec_1e5"):
+        r = x
+        t = Timer(b.reps(9), batch=10)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                r = secure_operator.add(mpc, x, 3)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n}", t, max_abs_err_1d(rv, [v + 3.0 for v in xs]) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.public.add_float_vec_1e5"):
+        r = x
+        t = Timer(b.reps(9), batch=10)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                r = secure_operator.add(mpc, x, 0.5)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n}", t, max_abs_err_1d(rv, [v + 0.5 for v in xs]) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.public.sub_int_vec_1e5"):
+        r = x
+        t = Timer(b.reps(9), batch=10)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                r = secure_operator.sub(mpc, x, 3)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n}", t, max_abs_err_1d(rv, [v - 3.0 for v in xs]) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.public.sub_float_vec_1e5"):
+        r = x
+        t = Timer(b.reps(9), batch=10)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                r = secure_operator.sub(mpc, x, 0.5)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n}", t, max_abs_err_1d(rv, [v - 0.5 for v in xs]) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.public.mul_int_vec_1e5"):
+        r = x
+        t = Timer(b.reps(9), batch=10)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                r = secure_operator.mul(mpc, x, 3)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n}", t, max_abs_err_1d(rv, [v * 3.0 for v in xs]) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.public.mul_float_vec_1e5"):
+        r = x
+        t = Timer(b.reps(9))
+        while t.next():
+            t.begin(mpc)
+            r = secure_operator.mul(mpc, x, 0.5)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n}", t, max_abs_err_1d(rv, [v * 0.5 for v in xs]) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.public.div_float_vec_1e5"):
+        r = x
+        t = Timer(b.reps(9))
+        while t.next():
+            t.begin(mpc)
+            r = secure_operator.truediv(mpc, x, 4.0)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n}", t, max_abs_err_1d(rv, [v / 4.0 for v in xs]) if mpc.pid else 0.0)
+
+
+def bench_mixed(mpc, b: Bench):
+    if b.want(mpc, "mpc.ndarray.matmul_float_128"):
+        size = 128
+        ps = shared_float_matrix(mpc, size, size, -1.0, 1.0)
+        xs, x = fp_mat(mpc, size, size, -1.0, 1.0)
+        nd = array(ps)
+        r = x
+        t = Timer(b.reps(9), batch=2)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                r = secure_operator.matmul(mpc, nd, x)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        err = 0.0
+        if mpc.pid:
+            err = max_abs_err_2d(rv, nd @ array(xs))
+        b.report(f"{size}x{size}", t, err)
+
+    if b.want(mpc, "mpc.bcast.add_vec_mat_256"):
+        size = 256
+        ms, m = fp_mat(mpc, size, size, -4.0, 4.0)
+        vs, v = fp_vec(mpc, size, -4.0, 4.0)
+        r = m
+        t = Timer(b.reps(9), batch=20)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                r = secure_operator.add(mpc, fresh(m), fresh(v))
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        err = 0.0
+        if mpc.pid:
+            err = max_abs_err_2d(rv, [[ms[i][j] + vs[j] for j in range(size)] for i in range(size)])
+        b.report(f"{size}x{size}+{size}", t, err)
+
+
+########################## e2e: small end-to-end workloads ##########################
+
+def plain_l2(rows: List[List[float]]) -> List[List[float]]:
+    m = len(rows)
+    out = [[0.0 for _ in range(m)] for _ in range(m)]
+    for i in range(m):
+        for j in range(m):
+            s = 0.0
+            for k in range(len(rows[i])):
+                d = rows[i][k] - rows[j][k]
+                s += d * d
+            out[i][j] = math.sqrt(s)
+    return out
+
+
+def off_diagonal_err(have, want: List[List[float]]) -> float:
+    err = 0.0
+    for i in range(len(want)):
+        for j in range(len(want)):
+            if i != j:
+                d = abs(float(have[i][j]) - want[i][j])
+                if d > err: err = d
+    return err
+
+
+def bench_e2e(mpc, b: Bench):
+    modulus = MPC_FIELD_SIZE
+
+    if b.want(mpc, "e2e.l2.sharetensor_16x512"):
+        rows, cols = 16, 512
+        raw = shared_float_matrix(mpc, rows, cols, -1.0, 1.0)
+        dv = array([[0.0]])
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            st = Sharetensor.enc(mpc, raw)
+            d = l2(mpc, st)
+            dv = d.reveal(mpc)
+            t.end(mpc)
+        b.report(f"{rows}x{cols}", t, off_diagonal_err(dv, plain_l2(raw)) if mpc.pid else 0.0)
+
+    if b.want(mpc, "e2e.king.sharetensor_16x2048"):
+        per_party, cols = 8, 2048
+        rows = per_party * (mpc.comms.number_of_parties - 1)
+        with mpc.randomness.seed_switch(-1):
+            geno = random_ints((rows, cols), 0, 2)
+        raw_data = array(geno, dtype=float)
+        het_scale = float(cols // 100)
+        raw_het_inv = array([[(1.0 / float(row.count(1))) * het_scale for _ in range(rows)] for row in geno], dtype=float)
+        kv = array([[0.0]])
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            sd = Sharetensor.enc(mpc, raw_data)
+            sh = Sharetensor.enc(mpc, raw_het_inv)
+            k = king(mpc, sd, sh)
+            kv = k.reveal(mpc)
+            t.end(mpc)
+        err = 0.0
+        if mpc.pid:
+            ref = king(mpc, raw_data, raw_het_inv)
+            err = off_diagonal_err(kv, ref.tolist())
+        b.report(f"{rows}x{cols}", t, err)
+
+    if b.want(mpc, "e2e.linreg.sharetensor_1024x31"):
+        rows, cols = 1024, 31
+        X = array(shared_float_matrix(mpc, rows, cols, 0.0, 1.0))
+        target_w = array(shared_float_matrix(mpc, cols, 1, 0.0, 1.0))
+        y = X @ target_w + 1.0
+        raw_w0 = ones((cols + 1, 1))
+        step, epochs = 0.0001, 10
+        wv = array([[0.0]])
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            mX = Sharetensor.enc(mpc, X, 0, modulus)
+            my = Sharetensor.enc(mpc, y, 0, modulus)
+            mw = Sharetensor.enc(mpc, raw_w0, 0, modulus)
+            model = LinReg(mw).fit(mpc, X=mX, y=my, step=step, epochs=epochs)
+            wv = model.coef_.reveal(mpc)
+            t.end(mpc)
+        err = 0.0
+        if mpc.pid:
+            ref = LinReg(raw_w0).fit(mpc, X=X, y=y, step=step, epochs=epochs).coef_
+            err = max_abs_err_2d(wv, ref)
+        b.report(f"{rows}x{cols};epochs={epochs}", t, err)
+
+
+@main
+def bench_mpc_main(mpc):
+    b = Bench("mpc", mpc.pid, CASES)
+    b.start(mpc)
+    bench_prim(mpc, b)
+    bench_net(mpc, b)
+    bench_share(mpc, b)
+    bench_arith(mpc, b)
+    bench_cmp(mpc, b)
+    bench_fp(mpc, b)
+    bench_public(mpc, b)
+    bench_mixed(mpc, b)
+    bench_e2e(mpc, b)
+    b.finish(mpc)
+
+
+bench_mpc_main()
