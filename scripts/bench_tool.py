@@ -123,6 +123,9 @@ def read_tsv(path):
             if not line:
                 continue
             if line.startswith("# sequre-bench"):
+                m = re.match(r"# sequre-bench v(\d+)", line)
+                if m:
+                    meta["harness_version"] = m.group(1)
                 for part in line[2:].split("|"):
                     if "=" in part:
                         k, v = part.split("=", 1)
@@ -411,11 +414,14 @@ def sequre_config(res):
     for seg in segment_dirs(res):
         for path in glob.glob(os.path.join(seg, "CP*.tsv")):
             meta = read_tsv(path)[0]
-            for k in ("MPC_INT_SIZE", "NUM_THREADS", "lattiseq_threads", "parties", "reps_scale", "gc_each_rep", "gc_forced", "long_rep_s", "gc_markers_restarted"):
+            for k in ("harness_version", "MPC_INT_SIZE", "NUM_THREADS", "lattiseq_threads", "parties", "reps_scale",
+                      "gc_each_rep", "gc_forced", "long_rep_s", "gc_markers_restarted"):
                 if k in meta:
                     cfg.setdefault(k, meta[k])
             if "pin" in meta:
                 cfg.setdefault("pinned_cpus_by_party", {})[f"CP{meta.get('pid', '?')}"] = meta["pin"]
+            if "gc_parallel" in meta:  # harness v3+: whether the party's collector marked in parallel
+                cfg.setdefault("gc_parallel_by_party", {})[f"CP{meta.get('pid', '?')}"] = meta["gc_parallel"]
             if "params" in meta and meta.get("binary") == "btp":
                 cfg.setdefault("btp_params", meta["params"])
     m = re.search(r"^DEFAULT_PARAMS\s*=\s*(\w+)", read_first(os.path.join(REPO, "stdlib", "sequre", "lattiseq", "params.codon")), re.M)

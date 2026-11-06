@@ -9,11 +9,10 @@ Driven by scripts/bench.sh; see that script for the workflow. A benchmark binary
     --skip=P1,P2,...       drop the cases matching these prefixes (same syntax)
     --out=DIR              write the per-party result files DIR/CP<pid>.tsv (default: the current directory)
     --reps-scale=F         multiply every case's repetition count by F (at least one repetition)
-    --pin=C0:C1:C2         pin party k's process to CPU list Ck (e.g. 0-5:6-11:12-17; a solo binary uses C1), so
-                           that runs do not differ by where the scheduler placed the parties (core boost, caches)
+    --pin=C0:C1:C2         pin every thread of party k to CPU list Ck (e.g. 0-5:6-11:12-17; a solo binary uses C1),
+                           so that runs do not differ by where the scheduler placed the parties (core boost, caches)
     --gc-each-rep          run a full garbage collection before every repetition, outside the timed region
                            (slower; removes most collector pauses from the samples -- for precise targeted runs)
-    --keep-fork-gc         leave the collector as fork() leaves it in the forked parties (see below)
     --gc-none              never force a collection. By default the harness collects, untimed, at the start of every
                            case (so that a case does not pay for the previous case's garbage) and before every
                            repetition that follows one longer than LONG_REP_S (where a pause would otherwise land
@@ -29,10 +28,12 @@ all parties start it together; the time a party records is from the barrier to t
 The gc_per_rep column counts the garbage collections that ran inside the timed repetitions (mean per repetition);
 a change in it between two runs means the allocation volume of the operation changed.
 
-Local mode fork()s CP0 and CP1 from the original process, and the collector's parallel marker threads do not survive
-fork(): their collections run single-threaded (~0.5 s for an MHE party's ~4 GB heap, against ~0.05 s in CP2), which
-makes them both slower and noisier than separate processes (distributed mode). The harness restarts the marker
-threads in every party (GC_start_mark_threads, a no-op where they run) unless --keep-fork-gc is given.
+Local mode fork()s CP0 and CP1 from the original process. fork() leaves a child without the collector's parallel
+marker threads, and Sequre's runtime restarts them in every forked party; the gc_parallel field of the header records
+whether parallel marking was on in that party (0: its collections ran on one thread, ~10x slower for an MHE party's
+~4 GB heap). Those threads exist before the harness runs (they start at fork() in CP0 and CP1, with the process in
+CP2), which is why --pin pins every thread of the party and not only the calling one: an unpinned party's marker
+threads would compete with the other parties' timed work for the cores of their blocks.
 
 The last row of a complete file is the `__done__` row; a file without it belongs to a party that crashed,
 hung or was killed. The `check` column is a correctness witness (an error against plaintext, a checksum, ...)
@@ -55,13 +56,18 @@ from sequre.lattiseq.threads import lattiseq_threads
 
 
 from C import sched_setaffinity(i32, int, cobj) -> i32 as _sched_setaffinity
-from C import GC_start_mark_threads() as _gc_start_mark_threads
+from C import opendir(cobj) -> cobj as _opendir
+from C import readdir(cobj) -> cobj as _readdir
+from C import closedir(cobj) -> i32 as _closedir
 from C import GC_gcollect() as _gc_collect
 from C import GC_get_gc_no() -> u64 as _gc_count
 from C import GC_get_heap_size() -> u64 as _gc_heap_size
+from C import GC_get_parallel() -> i32 as _gc_get_parallel
 
 
-HARNESS_VERSION: int = 2
+# 3: --pin pins every thread of a party (it pinned only the calling thread); the header reports gc_parallel instead of
+#    gc_markers_restarted, and --keep-fork-gc is gone (the runtime restarts the marker threads in forked parties).
+HARNESS_VERSION: int = 3
 TSV_COLUMNS = "case\tparams\tpid\treps\tmedian_s\tmin_s\tmean_s\tmax_s\tq1_s\tq3_s\tmad_rel\twarm_s\tbytes_per_rep\tcheck\twall_s\tsamples\tgc_per_rep"
 GC_EACH_REP: bool = "--gc-each-rep" in sys.argv
 GC_FORCED: bool = "--gc-none" not in sys.argv
@@ -85,9 +91,27 @@ def parse_cpu_list(spec: str) -> List[int]:
     return out
 
 
+def thread_ids() -> List[int]:
+    # The calling process' thread IDs, from /proc/self/task (Linux; [] elsewhere). On 64-bit Linux, glibc's struct
+    # dirent puts d_name at byte 19 (after d_ino: u64, d_off: i64, d_reclen: u16, d_type: u8).
+    out = List[int]()
+    d = _opendir("/proc/self/task".c_str())
+    if not d:
+        return out
+    while True:
+        entry = _readdir(d)
+        if not entry:
+            break
+        name = str.from_ptr(entry + 19)
+        if name and name[0] != ".":
+            out.append(int(name))
+    _closedir(d)
+    return out
+
+
 def pin_process(pid: int) -> str:
-    # Pins the calling process (all its future threads) to the CPU list --pin gives for this party. Returns the list
-    # used, "" without --pin, or "failed".
+    # Pins every thread of the calling process (threads started later inherit the pinning) to the CPU list --pin gives
+    # for this party. Returns the list used, "" without --pin, or "failed".
     spec = arg_value("--pin=")
     if not spec or spec == "none":
         return ""
@@ -99,8 +123,14 @@ def pin_process(pid: int) -> str:
         mask[i] = u64(0)
     for c in cpus:
         mask[c // 64] = mask[c // 64] | (u64(1) << u64(c % 64))
-    rc = _sched_setaffinity(i32(0), 128, mask.as_byte())
-    return chosen if rc == i32(0) else "failed"
+    tids = thread_ids()
+    if not tids:
+        tids.append(0)  # 0: the calling thread
+    failed = False
+    for tid in tids:
+        if _sched_setaffinity(i32(tid), 128, mask.as_byte()) != i32(0):
+            failed = True
+    return "failed" if failed else chosen
 
 
 def gc_count() -> int:
@@ -263,15 +293,11 @@ class Bench:
     current: str
     case_t0: float
     pinned: str
-    fork_gc_fixed: bool
 
     def __init__(self, binary: str, pid: int, cases: List[Tuple[str, str, str]]):
         self.binary = binary
         self.pid = pid
-        self.pinned = pin_process(pid)  # before the marker threads start, so that they inherit the pinning
-        self.fork_gc_fixed = "--keep-fork-gc" not in sys.argv
-        if self.fork_gc_fixed:
-            _gc_start_mark_threads()
+        self.pinned = pin_process(pid)  # every thread, the collector's marker threads included
         out_dir = arg_value("--out=")
         if not out_dir:
             out_dir = "."
@@ -345,7 +371,7 @@ class Bench:
         with open(self.out_path, "w") as f:
             f.write(f"# sequre-bench v{HARNESS_VERSION} | binary={self.binary} | pid={self.pid} | parties={NUMBER_OF_PARTIES} "
                     f"| MPC_INT_SIZE={MPC_INT_SIZE} | NUM_THREADS={NUM_THREADS} | lattiseq_threads={lattiseq_threads()} "
-                    f"| reps_scale={self.reps_scale} | gc_each_rep={int(GC_EACH_REP)} | gc_forced={int(GC_FORCED)} | long_rep_s={LONG_REP_S} | pin={self.pinned} | gc_markers_restarted={int(self.fork_gc_fixed)} "
+                    f"| reps_scale={self.reps_scale} | gc_each_rep={int(GC_EACH_REP)} | gc_forced={int(GC_FORCED)} | long_rep_s={LONG_REP_S} | pin={self.pinned} | gc_parallel={int(_gc_get_parallel())} "
                     f"| cases={','.join(self.include)} | skip={','.join(self.exclude)}{extra}\n")
             f.write(TSV_COLUMNS + "\n")
         self.t_start = time.perf_counter()

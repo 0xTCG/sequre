@@ -134,7 +134,8 @@ SETTINGS = [("machine", "host"), ("machine", "cpu_model"), ("environment", "task
             ("environment", "party_pinning"), ("environment", "gc_flags"), ("environment", "gc_initial_heap_size"),
             ("environment", "reps_scale"), ("environment", "selection"), ("sequre", "parties"),
             ("sequre", "NUM_THREADS"), ("sequre", "lattiseq_threads"), ("sequre", "MPC_INT_SIZE"),
-            ("sequre", "DEFAULT_HE_PARAMS"), ("sequre", "gc_markers_restarted")]
+            ("sequre", "DEFAULT_HE_PARAMS"), ("sequre", "harness_version"), ("sequre", "gc_markers_restarted"),
+            ("sequre", "gc_parallel_by_party")]
 
 
 def settings_differences(mb, mc):

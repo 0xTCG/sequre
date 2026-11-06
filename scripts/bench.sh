@@ -4,7 +4,7 @@
 #   scripts/bench.sh run  [--label NAME] [--cases P1,P2] [--skip P1,P2] [--reps-scale F]
 #                         [--binaries mpc,mhe,btp] [--cpus auto|LIST|none] [--pin auto|C0:C1:C2|none]
 #                         [--timeout SEC] [--iso-timeout SEC]
-#                         [--gc-adaptive | --gc-none] [--keep-fork-gc] [--gc-heap 4G|none] [--rebuild] [--dry-run]
+#                         [--gc-adaptive | --gc-none] [--gc-heap 4G|none] [--rebuild] [--dry-run]
 #   scripts/bench.sh list [--cases P1,P2] [--skip P1,P2]
 #   scripts/bench.sh compare BASE_DIR CAND_DIR [bench_compare.py options]
 #   scripts/bench.sh calibrate RUN1_DIR RUN2_DIR [--out FILE]
@@ -18,15 +18,16 @@
 # default) restricts the binaries to one hardware thread per physical core; --pin auto splits those cores into
 # parties + 1 equal blocks of consecutive cores and gives one to each party (CP0, CP1, CP2; bench_btp uses CP1's),
 # leaving the last block to the system. On a 24-core machine that numbers its SMT siblings 24-47 this is
-# --cpus 0-23 --pin 0-5:6-11:12-17. Both also take explicit lists, or none; the manifest records the resolved
-# values, and compare warns when two runs were placed (or configured) differently.
+# --cpus 0-23 --pin 0-5:6-11:12-17. A party pins all of its threads, the collector's marker threads included.
+# Both options also take explicit lists, or none; the manifest records the resolved values, and compare warns
+# when two runs were placed (or configured) differently.
 # Garbage collection: bench.sh passes --gc-each-rep, so every repetition starts right after an untimed full
 # collection (the samples of allocation-heavy cases otherwise depend on where the heap is in its growth/collection
 # cycle; measured: median run-to-run noise 2.3% with it, 3.5% without, +40 s per suite). --gc-adaptive leaves the
 # binaries' default (collect at the start of every case and before repetitions that follow one longer than 0.25 s);
-# --gc-none never forces a collection. In local mode CP0 and CP1 are fork()ed and their collector loses its parallel
-# marker threads (collections ~10x slower than in CP2 or in separate processes: ~0.5 s for an MHE party's heap); the
-# binaries restart them in every party unless --keep-fork-gc is given. --gc-heap (default 4G) sets the collector's
+# --gc-none never forces a collection. Each party's file records whether its collector marked in parallel
+# (gc_parallel; the runtime restarts the marker threads in forked parties, without which collections there run on one
+# thread, ~10x slower). --gc-heap (default 4G) sets the collector's
 # initial heap (GC_INITIAL_HEAP_SIZE, reserved lazily): the collection trigger scales with the heap size, so without
 # it a case collects more often when run alone (small fresh heap) than late in the full suite -- e.g.
 # mpc.beaver.mul_vec_1e4 measured 4.8 ms in the suite and 8.4 ms alone. Compare runs with the same --cases anyway.
@@ -66,7 +67,7 @@ case "$cmd" in
 esac
 
 LABEL="" CASES="" SKIP="" REPS_SCALE="1" BINS="mpc,mhe,btp" CPUS="auto" TIMEOUT=1200 ISO_TIMEOUT=600 REBUILD=0 DRY=0
-GC_MODE="each-rep" KEEP_FORK_GC=0 GC_HEAP="4G"
+GC_MODE="each-rep" GC_HEAP="4G"
 PIN="auto"
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -83,7 +84,6 @@ while [[ $# -gt 0 ]]; do
         --gc-each-rep) GC_MODE="each-rep"; shift ;;  # the default
         --gc-adaptive) GC_MODE="adaptive"; shift ;;
         --gc-none) GC_MODE="none"; shift ;;
-        --keep-fork-gc) KEEP_FORK_GC=1; shift ;;
         --gc-heap) GC_HEAP="$2"; shift 2 ;;  --gc-heap=*) GC_HEAP="${1#*=}"; shift ;;
         --dry-run) DRY=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -101,7 +101,6 @@ echo "== cpus: ${CPUS:-not restricted}; party pinning: $PIN"
 GC_FLAGS=()
 [[ "$GC_MODE" == "each-rep" ]] && GC_FLAGS+=(--gc-each-rep)
 [[ "$GC_MODE" == "none" ]] && GC_FLAGS+=(--gc-none)
-[[ $KEEP_FORK_GC -eq 1 ]] && GC_FLAGS+=(--keep-fork-gc)
 
 PLAN="$("${TOOL[@]}" plan --cases "$CASES" --skip "$SKIP" --binaries "$BINS")" || exit 2
 echo "== plan"
