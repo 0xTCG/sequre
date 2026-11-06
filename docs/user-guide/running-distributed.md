@@ -36,42 +36,46 @@ sequre run my_protocol.codon 2 --use-ring
 
 ### Test/benchmark flags
 
-When using the built-in test runner (`scripts/invoke.codon`), additional flags select which tests or benchmarks to run:
+When using the built-in test runner (`scripts/invoke.codon`), additional flags select which tests (`run-tests`) or benchmarks (`run-benchmarks`) to run. Each command accepts only the selectors it runs:
 
-| Flag | Selects |
-|---|---|
-| `--all` | All tests/benchmarks |
-| `--unit` | All unit tests |
-| `--e2e` | All end-to-end tests |
-| `--helpers` | Helper utility tests |
-| `--primitives` | MPC primitive tests |
-| `--he` | HE tests |
-| `--mpc` | MPC protocol tests |
-| `--sharetensor` | Sharetensor tests |
-| `--ciphertensor` | Ciphertensor tests |
-| `--mpp` | MPP tests |
-| `--mpa` | MPA tests |
-| `--mpu` | MPU tests |
-| `--ir-passes` | Compiler IR pass tests |
-| `--stdlib-builtin` | Secure stdlib tests |
-| `--lattiseq` | Lattiseq CKKS tests |
-| `--mhe` | MHE protocol tests |
-| `--lin-alg` | Linear algebra tests |
-| `--lin-reg` | Linear regression tests |
-| `--log-reg` | Logistic regression tests |
-| `--lsvm` | Linear SVM tests |
-| `--neural-net` | Neural network tests |
-| `--mi` | Multiple imputation tests |
-| `--pca` | PCA tests |
-| `--king` | KING kinship tests |
-| `--gwas` | GWAS tests (all variants) |
-| `--credit-score` | Credit score application |
-| `--dti` | Drug-target interaction |
-| `--opal` | OPAL metagenomics |
-| `--ganon` | GANON classification |
-| `--genotype-imputation` | Genotype imputation |
-| `--mnist` | MNIST classification |
-| `--ablation` | Ablation studies |
+| Flag | Selects | `run-tests` | `run-benchmarks` |
+|---|---|:-:|:-:|
+| `--all` | Everything the command runs | ✓ | ✓ |
+| `--unit` | All unit tests except `--bootstrapping` | ✓ | |
+| `--e2e` | All end-to-end tests | ✓ | |
+| `--helpers` | Helper utilities | ✓ | |
+| `--primitives` | MPC primitives | ✓ | |
+| `--he` | Homomorphic encryption | ✓ | |
+| `--bootstrapping` | CKKS bootstrapping (about two minutes) | ✓ | |
+| `--mpc` | MPC protocols (in `run-tests`, includes the MHE tests) | ✓ | ✓ |
+| `--mhe` | Multiparty HE protocols | ✓ | ✓ |
+| `--sharetensor` | Sharetensor operations | ✓ | |
+| `--ciphertensor` | Ciphertensor operations | ✓ | |
+| `--mpp` | MPP operations | ✓ | |
+| `--mpa` | MPA operations | ✓ | |
+| `--mpu` | MPU operations | ✓ | |
+| `--ir-passes` | Compiler IR passes | ✓ | |
+| `--stdlib-builtin` | Secure stdlib built-in functions | ✓ | ✓ |
+| `--lattiseq` | Lattiseq CKKS engine | | ✓ |
+| `--lattiseq-mult3` | Lattiseq 3-way multiplication | | ✓ |
+| `--lin-alg` | Linear algebra | ✓ | ✓ |
+| `--lin-reg` | Linear regression | ✓ | |
+| `--log-reg` | Logistic regression | ✓ | |
+| `--lsvm` | Linear SVM | ✓ | |
+| `--neural-net` | Neural network | ✓ | |
+| `--mi` | Multiple imputation | ✓ | ✓ |
+| `--pca` | PCA | ✓ | ✓ |
+| `--king` | KING kinship | ✓ | ✓ |
+| `--gwas` | GWAS | ✓ | |
+| `--gwas-with-norm` | GWAS with normalization | | ✓ |
+| `--gwas-without-norm` | GWAS without normalization | | ✓ |
+| `--credit-score` | Credit score application | | ✓ |
+| `--dti` | Drug-target interaction | ✓ | ✓ |
+| `--genotype-imputation` | Genotype imputation | | ✓ |
+| `--mnist` | MNIST classification | | ✓ |
+| `--ablation` | Ablation studies | | ✓ |
+
+Give at least one selector. The runner stops before starting any party if a flag is unknown, if the chosen command does not run it, or if no selector is given; `sequre run scripts/invoke.codon --help` lists the selectors of each command. `--opal` and `--ganon` currently have no runner.
 
 ```bash
 # Run all tests locally
