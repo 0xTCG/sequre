@@ -58,7 +58,7 @@ What each protocol reveals to the party that combines the shares (the hub):
 - **MPC → HE switching.** The parties open $x - R$, where $R$ is a sum of masks of $64 + f - \log_2 \Delta - b$ bits ($f$ the fixed-point fractional bits, $b$ the bit length of the number of compute parties): 60 bits for the default three parties (two compute parties) at scale $2^{34}$. A value of magnitude $B$ is therefore hidden only up to a statistical distance of about $B \cdot 2^{f} / 2^{60} = B \cdot 2^{-28}$, again a limit of the floating-point encoder.
 - **Collective bootstrapping (refresh).** Partial decryptions are masked with random integers of $\lambda + \log_2 \Delta$ bits in the coefficient domain ($\lambda = 128$), which hide the plaintext and its noise statistically.
 
-Statistically hiding masks for both switching directions need an exact (multi-precision) encoder, which is planned.
+Statistically hiding masks for both switching directions are larger than the floating-point encoder can carry. Lattiseq's exact encoder ([CKKS Operations](../deep-dive-lattiseq/ckks-operations.md#exact-encoding)) carries them; moving the switching protocols onto it is planned.
 
 ## CKKS approximate precision
 

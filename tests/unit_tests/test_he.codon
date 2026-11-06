@@ -5,10 +5,11 @@ import sequre.lattiseq.rlwe as rlwe
 import sequre.lattiseq.dckks as dckks
 import sequre.lattiseq.params as ckks_params
 
+from sequre.lattiseq.exact_encoder import new_exact_encoder
 from sequre.lattiseq.stats import plot_precision_stats
 from sequre.utils.testing import assert_eq
 from sequre.utils.utils import random_complex
-from sequre.constants import LATTISEQ_STANDARD_RING_ENUM
+from sequre.constants import LATTISEQ_STANDARD_RING_ENUM, LATTISEQ_EXACT_INT_SIZE, lattiseq_exact_int
 
 
 def test_encryption_decryption_for_values(values, plaintext, params, encoder, encryptor, decryptor):
@@ -364,10 +365,123 @@ def test_decryption_share_smudging():
         assert_eq(f"Collective decryption share carries its noise (sigma {sigma}, measured {std:.2f})", 0.5 * sigma < std < 1.5 * sigma, True)
 
 
+def random_fixed_point(bits: int) -> lattiseq_exact_int:
+    # A random integer of magnitude below 2^bits, either sign.
+    x = lattiseq_exact_int(0)
+    while bits > 0:
+        take = min(bits, 60)
+        x = (x << lattiseq_exact_int(take)) | lattiseq_exact_int(prg.getrandbits(take))
+        bits -= take
+    return -x if prg.getrandbits(1) else x
+
+
+def max_abs_difference(a: List[lattiseq_exact_int], b: List[lattiseq_exact_int]) -> float:
+    return max(abs((a[i] - b[i]).to_float()) for i in range(len(a)))
+
+
+def test_exact_encoder():
+    # The float encoder's error grows with the values (about |v| * 2^-52 per slot); the exact encoder's must not, for
+    # protocols that hide values under large random masks.
+    params = ckks.new_parameters_from_literal(ckks_params.PN14QP438)
+    exact = new_exact_encoder(params)
+    encoder = ckks.new_encoder_complex(params)
+    sk = ckks.new_key_generator(params).gen_secret_key()
+    encryptor = ckks.new_encryptor(params, sk)
+    decryptor = ckks.new_decryptor(params, sk)
+    n, log_slots, scale, top = params.slots(), params.log_slots, params.default_scale, params.max_level()
+    frac = 32
+    unit = 2.0 ** frac
+    bound = params.n() / (2 * scale)  # CKKS's own error per slot: at most 1/2 per rounded coefficient
+    no_values = List[lattiseq_exact_int]()
+
+    # The float encoder's conventions (slot order, imaginary parts, rounding).
+    values = [complex(2 * prg.random() - 1, 2 * prg.random() - 1) for _ in range(n)]
+    pt_exact = ckks.new_plaintext(params, top, scale)
+    exact.encode(values, pt_exact, log_slots)
+    pt_float = ckks.new_plaintext(params, top, scale)
+    encoder.encode(values, pt_float, log_slots)
+    coeffs_exact = exact.poly_to_coeffs(pt_exact.value, log_slots)
+    coeffs_float = exact.poly_to_coeffs(pt_float.value, log_slots)
+    assert_eq("Exact encoder: same coefficients as the float encoder, up to rounding", max_abs_difference(coeffs_exact, coeffs_float) <= 1, True)
+    decoded = encoder.decode(pt_exact, log_slots)
+    assert_eq("Exact encoder: the float decoder decodes its plaintexts", max(abs(decoded[i] - values[i]) for i in range(n)) < bound, True)
+    decoded = exact.decode(pt_float, log_slots)
+    assert_eq("Exact encoder: decodes the float encoder's plaintexts", max(abs(decoded[i] - values[i]) for i in range(n)) < bound, True)
+
+    # Integer slots at scale 2^40 come back unchanged: the FFTs stay within half a unit, up to 2^185.
+    for bits in (64, 185):
+        real = [random_fixed_point(bits) for _ in range(n)]
+        imag = [random_fixed_point(bits) for _ in range(n)]
+        back_real, back_imag = exact.decode_coeffs(exact.encode_coeffs(real, imag, 0, 2.0 ** 40, log_slots), 2.0 ** 40, log_slots, 0)
+        assert_eq(f"Exact encoder: 2^{bits} integers round-trip unchanged", back_real == real and back_imag == imag, True)
+
+    # Through a plaintext, 2^150 values come back within CKKS's own error, like small ones.
+    real = [random_fixed_point(150 + frac) for _ in range(n)]
+    imag = [random_fixed_point(150 + frac) for _ in range(n)]
+    pt = ckks.new_plaintext(params, top, scale)
+    exact.encode_fixed_point(real, imag, frac, pt, log_slots)
+    back_real, back_imag = exact.decode_fixed_point(pt, log_slots, frac)
+    error = max(max_abs_difference(back_real, real), max_abs_difference(back_imag, imag)) / unit
+    assert_eq(f"Exact encoder: 2^150 values round-trip within N / (2 scale) (error {error:.2e})", error < bound, True)
+
+    # Enc(x - R) + Enc(R) decrypts to x, with R ~ 2^150 (the float encoder loses x entirely).
+    x = [random_fixed_point(frac + 4) for _ in range(n)]
+    r = [random_fixed_point(150 + frac) for _ in range(n)]
+    pt_masked = ckks.new_plaintext(params, top, scale)
+    exact.encode_fixed_point([x[i] - r[i] for i in range(n)], no_values, frac, pt_masked, log_slots)
+    pt_mask = ckks.new_plaintext(params, top, scale)
+    exact.encode_fixed_point(r, no_values, frac, pt_mask, log_slots)
+    ct = encryptor.encrypt_new(pt_masked)
+    ct_mask = encryptor.encrypt_new(pt_mask)
+    for i in range(2): params.ring_q._mm_add_lvl(ct.level(), ct.value[i], ct_mask.value[i], ct.value[i])
+    back_real, back_imag = exact.decode_fixed_point(decryptor.decrypt_new(ct), log_slots, frac)
+    error = max(max_abs_difference(back_real, x), max(abs(v.to_float()) for v in back_imag)) / unit
+    assert_eq(f"Exact encoder: Enc(x - R) + Enc(R) decrypts to x with R ~ 2^150 (error {error:.2e})", error < 1e-6, True)
+
+    # Residues and CRT reconstruction are exact.
+    for level, bits in ((top, 240), (3, 140)):
+        coeffs = [random_fixed_point(bits) for _ in range(2 * n)]
+        pt = ckks.new_plaintext(params, level, scale)
+        exact.coeffs_to_poly(coeffs, log_slots, pt.value)
+        assert_eq(f"Exact encoder: 2^{bits} coefficients at level {level} come back from their residues", exact.poly_to_coeffs(pt.value, log_slots) == coeffs, True)
+
+    # Decoding is linear on additive coefficient shares: decode(m + M) - decode(M) = decode(m) up to rounding.
+    m = [random_fixed_point(60) for _ in range(2 * n)]
+    mask = [random_fixed_point(190) for _ in range(2 * n)]
+    sum_real, sum_imag = exact.decode_coeffs([m[i] + mask[i] for i in range(2 * n)], scale, log_slots, frac)
+    mask_real, mask_imag = exact.decode_coeffs(mask, scale, log_slots, frac)
+    m_real, m_imag = exact.decode_coeffs(m, scale, log_slots, frac)
+    deviation = max(max(abs((sum_real[i] - mask_real[i] - m_real[i]).to_float()), abs((sum_imag[i] - mask_imag[i] - m_imag[i]).to_float())) for i in range(n))
+    assert_eq("Exact encoder: decoding shares with 2^190 masks is linear up to one unit", deviation <= 1, True)
+
+    # Sparse slots, lower levels and a scale that is not a power of two.
+    sparse = [random_fixed_point(80 + frac) for _ in range(32)]
+    pt = ckks.new_plaintext(params, top, scale)
+    exact.encode_fixed_point(sparse, sparse, frac, pt, 5)
+    back_real, back_imag = exact.decode_fixed_point(pt, 5, frac)
+    assert_eq("Exact encoder: 32 sparse slots round-trip", max(max_abs_difference(back_real, sparse), max_abs_difference(back_imag, sparse)) / unit < bound, True)
+    for level, pt_scale in ((0, scale), (3, scale * 1.3719)):
+        small = [random_fixed_point(frac + 3) for _ in range(n)]
+        pt = ckks.new_plaintext(params, level, pt_scale)
+        exact.encode_fixed_point(small, no_values, frac, pt, log_slots)
+        back_real, back_imag = exact.decode_fixed_point(pt, log_slots, frac)
+        error = max(max_abs_difference(back_real, small), max(abs(v.to_float()) for v in back_imag)) / unit
+        assert_eq(f"Exact encoder: round trip at level {level}, scale {pt_scale:.4g}", error < bound, True)
+
+    # Values that do not fit its integers raise instead of losing precision.
+    raised = False
+    try:
+        exact.encode_fixed_point([random_fixed_point(LATTISEQ_EXACT_INT_SIZE - 10)], no_values, frac, ckks.new_plaintext(params, top, scale), log_slots)
+    except ValueError:
+        raised = True
+    assert_eq("Exact encoder: too large values raise ValueError", raised, True)
+
+
 def test_he():
     print('Testing HE ... \n')
 
     test_lattiseq()
     test_decryption_share_smudging()
+    test_exact_encoder()
 
     print('HE tests passed.\n')

@@ -36,7 +36,36 @@ values = encoder.decode(plaintext: Plaintext, log_slots: int) -> list[complex]
 2. Divide by the current scale
 3. Apply the canonical embedding (DFT on roots of unity)
 
-The encoding uses 128-bit complex arithmetic internally for precision.
+The encoding computes in double precision (`complex`, two 64-bit floats), so its error grows with the magnitude of the values: a slot of magnitude $|v|$ comes back off by about $|v| \cdot 2^{-52}$.
+
+### Exact encoding
+
+`ExactEncoder` (`exact_encoder.codon`) removes that growth. Protocols that hide a value under a large random mask, encrypt the masked value and remove the mask under encryption need it: with masks of $2^{150}$, the float encoder's error is about $2^{98}$.
+
+Its values are fixed-point integers: a slot holds $z = Z / 2^{f}$, with the real and imaginary parts of $Z$ given as `lattiseq_exact_int` (`Int[LATTISEQ_EXACT_INT_SIZE]`).
+
+- **Encoding** computes the coefficients $\text{round}(\Delta \cdot \text{IFFT}(z))$ with an FFT on fixed-point integers (products in twice the width, roots of unity computed once in multi-precision floats). The FFT keeps enough fractional bits that the value it rounds is within $2^{-16}$ of the true one, whatever the magnitude.
+- **Decoding** reconstructs the centered coefficients exactly from their residues (CRT) and returns $\text{round}(2^{f} \cdot \text{FFT}(c) / \Delta)$ the same way.
+
+What remains is the error of CKKS itself: each coefficient is rounded to an integer, which costs at most $N / (2\Delta)$ per slot (about $6 \cdot 10^{-9}$ for $N = 2^{14}$ and $\Delta = 2^{34}$, for any magnitude).
+
+```python
+from sequre.lattiseq.exact_encoder import new_exact_encoder
+
+exact = new_exact_encoder(params)
+exact.encode_fixed_point(real, imag, frac_bits, plaintext, log_slots)  # lists of lattiseq_exact_int
+real, imag = exact.decode_fixed_point(plaintext, log_slots, frac_bits)
+```
+
+`encode_coeffs` / `decode_coeffs` do the same on integer coefficient vectors, and `coeffs_to_poly` / `poly_to_coeffs` convert exactly between those and residue form, for protocols that hold shares of a plaintext's coefficients.
+
+Limits:
+
+- **Integer width.** `LATTISEQ_EXACT_INT_SIZE` is 256 bits (512 with 256-bit MPC integers), and about 25 bits of it are working room. Encoding takes $\log_2(\max|z| \cdot \Delta)$ plus those bits. Decoding takes $\log_2 \max|c| + \log_2(\text{slots}) + f - \log_2 \Delta$ plus those bits. Larger values raise `ValueError` instead of losing precision.
+- **Wrapping modulo Q.** Encoded coefficients are reduced modulo the plaintext's moduli without a range check. Reduction is a ring homomorphism, so a sum of encodings of large masked values still decodes to the sum of the values, as long as the sum is itself small.
+- **Ring.** Only the standard ring is supported.
+
+Measured with 4 threads ($2^{13}$ slots, top level of `PN14QP438`): encoding takes 5.5 ms and decoding 4.8 ms, against 1.3 ms and 10 ms for the float encoder.
 
 ## Encrypt / Decrypt
 

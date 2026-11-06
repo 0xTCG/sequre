@@ -22,6 +22,7 @@ All files live under `stdlib/sequre/lattiseq/`:
 | `ringqp.codon` | `ringqp/` | Double-CRT ring $R_Q \times R_P$, uniform sampling |
 | `rlwe.codon` | `rlwe/` | RLWE key types (`SecretKey`, `PublicKey`, `RelinearizationKey`, `RotationKeySet`), RLWE parameters |
 | `ckks.codon` | `ckks/` | CKKS scheme: `Parameters`, `Ciphertext`, `Plaintext`, `Encoder`, `Encryptor`, `Decryptor`, `Evaluator` |
+| `exact_encoder.codon` | `ckks/` (`EncoderBigComplex`) | Exact encoding on fixed-point integers, for values of any magnitude that fits |
 | `drlwe.codon` | `drlwe/` | Distributed RLWE protocols: share types (`CKGShare`, `RKGShare`, `PCKSShare`, `RTGShare`) |
 | `dckks.codon` | `dckks/` | Distributed CKKS: `RefreshProtocol`, E2S/S2E protocols, collective key-gen wrappers |
 | `params.codon` | `ckks/params` | Pre-defined parameter sets (PN12 through PN16) |

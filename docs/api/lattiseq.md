@@ -9,6 +9,7 @@ Lattiseq is a ground-up Codon reimplementation of the Go-based [Lattigo](https:/
 | Module | Description |
 |---|---|
 | `ckks.codon` | CKKS scheme: `Parameters`, `Plaintext`, `Ciphertext`, `Evaluator`, `Encoder`, `Encryptor`, `Decryptor` |
+| `exact_encoder.codon` | `ExactEncoder`: CKKS encoding whose error does not grow with the magnitude of the values |
 | `rlwe.codon` | Ring-LWE primitives: `SecretKey`, `PublicKey`, `RelinearizationKey`, `RotationKeySet` |
 | `ring.codon` | Polynomial ring arithmetic: `Ring`, `Poly`, NTT, modular reduction |
 | `ringqp.codon` | QP-basis ring: `Ring`, `Poly`, `UniformSampler` |
@@ -63,7 +64,22 @@ Performs homomorphic operations on ciphertexts:
 
 ### `EncoderComplex128`
 
-Encodes/decodes vectors of complex numbers into CKKS plaintexts.
+Encodes/decodes vectors of complex numbers into CKKS plaintexts. It computes in double precision, so its error grows with the magnitude of the values: about $|v| \cdot 2^{-52}$ per slot.
+
+### `ExactEncoder`
+
+_Defined in `exact_encoder.codon`._ Encodes and decodes fixed-point values with an error that does not depend on their magnitude: only CKKS's own rounding of the coefficients remains (at most $N / (2\Delta)$ per slot). Built for protocols that hide values under large random masks. See [CKKS Operations](../deep-dive-lattiseq/ckks-operations.md#exact-encoding).
+
+| Method | Description |
+|---|---|
+| `new_exact_encoder(params)` | Creates the encoder (standard ring only) |
+| `encode_fixed_point(real, imag, frac_bits, plaintext, log_slots)` | Encodes the slots $(\text{real} + i \cdot \text{imag}) / 2^{\text{frac\_bits}}$, given as `lattiseq_exact_int` lists, at the plaintext's level and scale |
+| `decode_fixed_point(plaintext, log_slots, frac_bits)` | Returns the real and imaginary parts of the slots times $2^{\text{frac\_bits}}$, rounded |
+| `encode_coeffs(real, imag, frac_bits, scale, log_slots)` / `decode_coeffs(coeffs, scale, log_slots, frac_bits)` | The same on integer coefficient vectors, without residues |
+| `coeffs_to_poly(coeffs, log_slots, poly)` / `poly_to_coeffs(poly, log_slots)` | Exact conversion between integer coefficients and a polynomial in residue (RNS) form |
+| `encode(values, plaintext, log_slots)` / `decode(plaintext, log_slots)` | Float interface, as `EncoderComplex128` |
+
+Values that do not fit its integers (`LATTISEQ_EXACT_INT_SIZE` bits, minus about 25 bits of working room) raise `ValueError` instead of losing precision.
 
 ### `PkEncryptor` / `Decryptor`
 

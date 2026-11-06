@@ -18,10 +18,11 @@ import prg
 import secure_operator
 
 import sequre.lattiseq.ckks as ckks
+from sequre.lattiseq.exact_encoder import new_exact_encoder
 
 from sequre import main
 from sequre.attributes import sequre
-from sequre.constants import MPC_FIELD_SIZE, ENC_ROW, ENC_COL, ENC_DIAG, mpc_uint
+from sequre.constants import MPC_FIELD_SIZE, ENC_ROW, ENC_COL, ENC_DIAG, mpc_uint, lattiseq_exact_int
 from sequre.lattiseq.ckks import Ciphertext, Plaintext
 from sequre.types.ciphertensor import Ciphertensor
 from sequre.types.multiparty_partition import MPP
@@ -45,6 +46,8 @@ CASES = [
     ("mhe.setup.keygen", "always", "mhe.default_setup(): PN14QP438 params + collective pk, relin key, ~150 rotation keys"),
     ("he.encode", "", "CKKS encode of 8192 complex slots at the top level"),
     ("he.decode", "", "CKKS decode of a top-level plaintext (8192 slots)"),
+    ("he.encode_exact", "", "exact (fixed-point) encode of 8192 complex slots of magnitude 2^150 at the top level"),
+    ("he.decode_exact", "", "exact (fixed-point) decode of that plaintext to 32 fractional bits"),
     ("he.encrypt_pk", "", "public-key encryption of a top-level plaintext"),
     ("he.decrypt_sk", "", "secret-key (shard) decryption, local part of a collective decryption"),
     ("he.add", "", "ct + ct (in place), top level"),
@@ -162,6 +165,69 @@ def ct_err_1d(mpc, ct, want) -> float:
 
 ########################## he: local CKKS operations (solo, CP1) ##########################
 
+def exact_random_values(n: int, bits: int, seed: u64) -> List[lattiseq_exact_int]:
+    # Signed values below 2^bits from a local xorshift generator: CP1 alone draws them, so they must not advance any
+    # random stream the parties share.
+    state = seed
+    out = List[lattiseq_exact_int](n)
+    for _ in range(n):
+        x = lattiseq_exact_int(0)
+        left = bits
+        while left > 0:
+            state ^= state << u64(13)
+            state ^= state >> u64(7)
+            state ^= state << u64(17)
+            take = min(left, 60)
+            x = (x << lattiseq_exact_int(take)) | lattiseq_exact_int(int(state >> u64(64 - take)))
+            left -= take
+        out.append(-x if state & u64(1) else x)
+    return out
+
+
+def exact_encoding_error(exact, pt, real: List[lattiseq_exact_int], imag: List[lattiseq_exact_int], frac: int, log_slots: int) -> float:
+    # The largest error in a slot, in real units.
+    back_real, back_imag = exact.decode_fixed_point(pt, log_slots, frac)
+    err = 0.0
+    for i in range(len(real)):
+        err = max(err, abs((back_real[i] - real[i]).to_float()), abs((back_imag[i] - imag[i]).to_float()))
+    return err / 2.0 ** frac
+
+
+def bench_he_exact(mpc, b: Bench, params):
+    # Masked-size values: 2^150 at 32 fractional bits. Witness: the largest error in a slot, which stays at CKKS's own
+    # ~6e-9 whatever the magnitude (the float encoder's would be about 2^150 * 2^-52). Every party prepares the data
+    # (a few milliseconds) and calls want(); CP1 times.
+    frac = 32
+    slots = params.slots()
+    top = params.max_level()
+    exact = new_exact_encoder(params)
+    real = exact_random_values(slots, 150 + frac, u64(0x9E3779B97F4A7C15))
+    imag = exact_random_values(slots, 150 + frac, u64(0xC2B2AE3D27D4EB4F))
+    pt = ckks.new_plaintext(params, top, params.default_scale)
+    exact.encode_fixed_point(real, imag, frac, pt, params.log_slots)
+
+    if b.want(mpc, "he.encode_exact"):
+        if mpc.pid == 1:
+            out = ckks.new_plaintext(params, top, params.default_scale)
+            t = Timer(b.reps(9), sync=False, batch=2)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    exact.encode_fixed_point(real, imag, frac, out, params.log_slots)
+                t.end(mpc)
+            b.report(f"slots={slots};level={top};bits=150", t, exact_encoding_error(exact, out, real, imag, frac, params.log_slots))
+
+    if b.want(mpc, "he.decode_exact"):
+        if mpc.pid == 1:
+            t = Timer(b.reps(9), sync=False, batch=2)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    exact.decode_fixed_point(pt, params.log_slots, frac)
+                t.end(mpc)
+            b.report(f"slots={slots};level={top};bits=150", t, exact_encoding_error(exact, pt, real, imag, frac, params.log_slots))
+
+
 def bench_he(mpc, b: Bench):
     if not b.any_selected("he."):
         return
@@ -210,6 +276,9 @@ def bench_he(mpc, b: Bench):
                 d = abs(dec[i] - vals[i])
                 if d > err: err = d
             b.report(f"slots={slots};level={top}", t, err)
+
+    if b.any_selected("he.encode_exact") or b.any_selected("he.decode_exact"):
+        bench_he_exact(mpc, b, params)
 
     if b.want(mpc, "he.encrypt_pk"):
         if mpc.pid == 1:
