@@ -74,7 +74,7 @@ _Defined in `stdlib/sequre/settings.codon` and `stdlib/sequre/constants.codon`_
 | `LATTISEQ_ROTATION_KEYS_COUNT` | 64 | Number of rotation keys generated |
 | `LATTISEQ_DEFAULT_SIGMA` | 3.2 | Gaussian error distribution standard deviation |
 | `LATTISEQ_SIGMA_SMUDGE` | `SEQURE_SIGMA_SMUDGE` (1024) | Noise standard deviation of collective-decryption shares |
-| `MHE_TO_MPC_MASK_BOUND` | $2^{32}$ | Bound on each party's masks in the HE → MPC switch |
+| `MHE_MPC_SWITCH_LAMBDA` | 128 | Statistical security parameter of the HE → MPC switch masks |
 | `LATTISEQ_EXACT_INT_SIZE` | 256 (512 if `MPC_INT_SIZE` is 256) | Integer width of the exact encoder (`exact_encoder.codon`) |
 
 ### Network

@@ -1,3 +1,4 @@
+import math
 import prg
 
 from sequre.lattiseq.rlwe import \
@@ -56,17 +57,57 @@ from sequre.lattiseq.drlwe import \
     RTGShare, \
     CKSShare
 from sequre.lattiseq.utils import new_prng
+from sequre.lattiseq.exact_encoder import ExactEncoder, new_exact_encoder
 from sequre.types.utils import double_to_fp, fp_to_double
 from sequre.utils.utils import zeros_vec, ones_vec, one_hot_vector, random_floats
 from sequre.utils.io import is_cached, read_cache, store_cache
 from sequre.constants import LATTISEQ_SIGMA_SMUDGE, LATTISEQ_DEFAULT_SIGMA, LATTISEQ_ROTATION_KEYS_COUNT, mpc_uint, MPC_NBIT_F, \
-    MPC_NBIT_K, MHE_TO_MPC_MASK_BOUND
+    MPC_NBIT_K, MPC_MODULUS_BITS, MPC_MERSENNE_OFFSET, MPC_FIELD_SIZE, MPC_RING_SIZE, MHE_MPC_SWITCH_LAMBDA, \
+    LATTISEQ_EXACT_INT_SIZE, lattiseq_exact_int
 
 from stats import MPCStats
 from randomness import MPCRandomness
 from comms import MPCComms
 
 from sequre.settings import DEBUG
+
+
+# _exact_from_modulus returns the centered integer of v modulo modulus, in (-modulus/2, modulus/2].
+def _exact_from_modulus(v: mpc_uint, modulus: mpc_uint) -> lattiseq_exact_int:
+    x = lattiseq_exact_int(UInt[LATTISEQ_EXACT_INT_SIZE](v))
+    if v > (modulus >> mpc_uint(1)): x -= lattiseq_exact_int(UInt[LATTISEQ_EXACT_INT_SIZE](modulus))
+    return x
+
+
+# _exact_to_modulus returns v mod modulus for a signed integer v: by folding for the MPC field (2^b - c) and ring (2^b)
+# moduli, with GMP for any other.
+def _exact_to_modulus(v: lattiseq_exact_int, modulus: mpc_uint) -> mpc_uint:
+    W: Static[int] = LATTISEQ_EXACT_INT_SIZE
+    negative = v < lattiseq_exact_int(0)
+    a = UInt[W](-v if negative else v)
+    low = (UInt[W](1) << UInt[W](MPC_MODULUS_BITS)) - UInt[W](1)
+    if modulus == MPC_RING_SIZE:
+        a &= low
+    elif modulus == MPC_FIELD_SIZE:
+        while a > low: a = (a >> UInt[W](MPC_MODULUS_BITS)) * UInt[W](MPC_MERSENNE_OFFSET) + (a & low)
+        if a >= UInt[W](modulus): a -= UInt[W](modulus)
+    else:
+        a = a.gmp_mod(UInt[W](modulus))
+    r = mpc_uint(a)
+    return modulus - r if negative and r != mpc_uint(0) else r
+
+
+# _slot_coefficients returns the coefficients that hold a plaintext's 2^log_slots slots, as ExactEncoder.decode_coeffs
+# takes them, from all n of its coefficients: those of X^(i * gap) and X^(n/2 + i * gap).
+def _slot_coefficients(coeffs: List[lattiseq_exact_int], log_slots: int) -> List[lattiseq_exact_int]:
+    half = len(coeffs) >> 1
+    slots = 1 << log_slots
+    if slots == half: return coeffs
+    gap = half // slots
+    out = List[lattiseq_exact_int](2 * slots)
+    for i in range(slots): out.append(coeffs[i * gap])
+    for i in range(slots): out.append(coeffs[half + i * gap])
+    return out
 
 
 # CryptoParams aggregates all (d)ckks scheme information
@@ -121,6 +162,7 @@ class MPCMHE[TP]:
     crp_gen: UniformSampler
     crypto_params: CryptoParams
     refresh_protocol: RefreshProtocol
+    exact_encoder: ExactEncoder  # for the MPC <-> HE switches
 
     # Bootstrap safety params
     bootstrap_min_level: int
@@ -171,6 +213,7 @@ class MPCMHE[TP]:
 
         self.crypto_params.initialize(sk_shard, pk, rlk, rtks, prec)
         self.refresh_protocol = new_refresh_protocol(params, self.bootstrap_log_bound, LATTISEQ_DEFAULT_SIGMA)
+        self.exact_encoder = new_exact_encoder(params)
 
         print(f"CP{self.pid}:\tMHE initialized.")
     
@@ -631,33 +674,45 @@ class MPCMHE[TP]:
         self.crypto_params.encryptor._mm_encrypt_zero(ct.get_rlwe_ciphertext())
         return ct
     
+    def _mpc_to_mhe_mask_bits(self, modulus: mpc_uint) -> int:
+        # The compute parties' masks keep x - sum(masks) and x itself below modulus / 2 in magnitude (sum(masks) below
+        # compute parties * 2^bits <= 2^(log2(modulus) - 2), x of at most MPC_NBIT_K bits), where centered values are
+        # exact. The opened x - sum(masks) then hides x up to a statistical distance of 2^(MPC_NBIT_K - 1 - bits): 2^-108
+        # with 192-bit shares and three parties.
+        return int((modulus - mpc_uint(1)).bitlen()) - 2 - (self.comms.number_of_parties - 2).bitlen()
+
+    def _mhe_to_mpc_mask_bits(self, scale: float) -> int:
+        # A plaintext at this scale whose slot values lie in the fixed-point range (real and imaginary parts below
+        # 2^(MPC_NBIT_K - MPC_NBIT_F - 1)) has coefficients below 2^(ceil(log2 scale) + MPC_NBIT_K - MPC_NBIT_F), noise
+        # included. Uniform masks of log2(n) + MHE_MPC_SWITCH_LAMBDA bits more move the hub's view of its n coefficients
+        # by a statistical distance of at most 2^-MHE_MPC_SWITCH_LAMBDA: 208-bit masks at n = 2^14 and scale 2^34.
+        log_scale = int(math.ceil(math.log2(scale)))
+        return MHE_MPC_SWITCH_LAMBDA + self.crypto_params.params.logn + log_scale + MPC_NBIT_K - MPC_NBIT_F
+
+    def _mhe_to_mpc_level(self, mask_bits: int) -> int:
+        # The lowest level whose modulus Q holds the plaintext the hub decrypts: the plaintext plus the masks of the other
+        # compute parties, below compute parties * 2^(mask_bits - 1) in magnitude, must stay below Q / 2. Level 5 for
+        # PN14QP438 with three parties.
+        needed = float(mask_bits + (self.comms.number_of_parties - 1).bitlen())
+        log_q = 0.0
+        for level, q in enumerate(self.crypto_params.params.q()):
+            log_q += math.log2(float(q))
+            if log_q >= needed: return level
+        raise ValueError(f"MHE->MPC switch: its {mask_bits}-bit masks need a ciphertext modulus of {needed:.0f} bits, more than the {log_q:.0f} bits of the parameters")
+
     def additive_share_vector_to_ciphervector(self, shared_tensor, modulus: mpc_uint, is_fp: bool, target_pid: int = -1) -> List[Ciphertext]:
-        slots = self.crypto_params.params.slots()
+        params = self.crypto_params.params
+        slots = params.slots()
         if self.pid == 0:
             return []
 
-        # For integer (non-FP) shares, we need to convert to fixed-point representation first.
-        # This is because CKKS can only encode float values that fit within its scale.
-        # Integer shares are converted to fixed-point by left-shifting by MPC_NBIT_F bits.
-        if not is_fp:
-            # Convert integer shares to fixed-point shares by scaling up by 2^f
-            # Risks overflow as it expects the input to be bounded by MPC_NBIT_K bits.
-            shared_tensor = shared_tensor.lsh_mod(MPC_NBIT_F, modulus)
-            is_fp = True  # Now treat as fixed-point
-
-        # Compute max mask bits based on CKKS encoding limits.
-        # CKKS requires: value * scale < 2^64
-        # After fp_to_double: float ≈ fixed_point / 2^MPC_NBIT_F
-        # Constraint: (mask / 2^MPC_NBIT_F) * scale < 2^64
-        # => mask < 2^(64 + MPC_NBIT_F - log2(scale))
-        # Subtract log2(n_parties - 1) bits because hub party computes sum of shares
-        # which can be up to (n_parties - 1) * max_mask.
-        log_scale = int(self.crypto_params.params.default_scale).bitlen() - 1
-        max_mask_bits = 64 + MPC_NBIT_F - log_scale - int((self.comms.number_of_parties - 1)).bitlen()
-        mask = shared_tensor.rand_bits(max_mask_bits)
-
-        masked_shared_tensor = self.comms.reveal(shared_tensor.sub_mod(mask, modulus), modulus)
-        share = masked_shared_tensor.add_mod(mask, modulus) if self.pid == self.comms.hub_pid else mask
+        # The hub opens x - R, R the sum of the compute parties' masks R_i, and the parties hold integer shares of x:
+        # x - R + R_hub at the hub, R_i at the others. The masks are as large as _mpc_to_mhe_mask_bits allows, so the
+        # opened value hides x statistically, and only the hub sees it. Integer shares are encoded as integers (no
+        # fractional bits).
+        mask = shared_tensor.rand_bits(self._mpc_to_mhe_mask_bits(modulus))
+        masked = self.comms.reveal_at(shared_tensor.sub_mod(mask, modulus), self.comms.hub_pid, modulus)
+        share = masked.add_mod(mask, modulus) if self.pid == self.comms.hub_pid else mask
 
         # Pad shape if ciphertexts are not fully utilized
         shape = shared_tensor.shape
@@ -666,14 +721,66 @@ class MPCMHE[TP]:
             new_shape[-1] = (shape[-1] + slots - 1) // slots * slots
             share = share.resize(new_shape)
 
-        values = fp_to_double(share, modulus)
-        # DEBUG: Log first few double values being encrypted
-        if DEBUG:
-            flat_vals = values.flatten()
-            print(f"  CP{self.pid} mpc_to_mhe: max_mask_bits={max_mask_bits}, n_values={len(flat_vals)}, first4={[flat_vals[j] for j in range(min(4, len(flat_vals)))]}")
-        ciphervector = self.enc_vector(values.flatten(), T=Ciphertext)
-        self.stats.secure_mpc_mhe_switch_count += len(ciphervector)
-        return self._aggregate_cipher_vector(ciphervector, target_pid=target_pid)
+        values = [_exact_from_modulus(v, modulus) for v in share.flatten()]
+        frac_bits = MPC_NBIT_F if is_fp else 0
+
+        # Shares to encryption (Lattigo's S2E): with a common random polynomial a per ciphertext, each party sends
+        # Encode(share_i) - s_i * a + e_i, its share exactly encoded (the error does not grow with the masks). The sum,
+        # paired with a, is a fresh encryption of x under the collective key: no public-key encryption to pay for, and
+        # less noise than one.
+        level = params.max_level()
+        ring_q = params.ring_q
+        sampler = self.crypto_params.encryptor.gaussian_sampler
+        no_imag = List[lattiseq_exact_int]()
+        n_ct = (len(values) + slots - 1) // slots
+        crs = List[ring_Poly](n_ct)
+        c0_shares = List[ring_Poly](n_ct)
+        for k in range(n_ct):
+            a = self.crp_gen._mm_read_new(params).q  # every compute party draws the same
+            a.is_ntt = True
+            crs.append(a)
+            plaintext = new_plaintext(params, level, params.default_scale)
+            self.exact_encoder.encode_fixed_point(values[k * slots:(k + 1) * slots], no_imag, frac_bits, plaintext, params.log_slots)
+            c0 = plaintext.value
+            ring_q._mm_mul_coeffs_montgomery_and_sub_lvl(level, self.crypto_params.sk_shard.value.q, a, c0)
+            e = ring_q.new_poly_lvl(level)
+            sampler._mm_read_lvl(level, e)
+            ring_q._mm_ntt_lvl(level, e, e)
+            ring_q._mm_add_lvl(level, c0, e, c0)
+            c0_shares.append(c0)
+
+        self.stats.secure_mpc_mhe_switch_count += n_ct
+        return self._shares_to_ciphertexts(c0_shares, crs, target_pid)
+
+    def _shares_to_ciphertexts(self, c0_shares: List[ring_Poly], crs: List[ring_Poly], target_pid: int) -> List[Ciphertext]:
+        # Sums the compute parties' c0 shares at target_pid, or at the hub, which then sends the sums to all (target_pid
+        # -1), and pairs each sum with its common polynomial into a ciphertext. Other parties than the target get [].
+        params = self.crypto_params.params
+        level = params.max_level()
+        aggregator = target_pid if target_pid > 0 else self.comms.hub_pid
+        c0 = c0_shares
+        if self.pid == aggregator:
+            for p in range(1, self.comms.number_of_parties):
+                if p != self.pid:
+                    other = self.comms.receive_as_jar(p, List[ring_Poly])
+                    for k in range(len(c0)): params.ring_q._mm_add_lvl(level, c0[k], other[k], c0[k])
+            if target_pid <= 0:
+                for p in range(1, self.comms.number_of_parties):
+                    if p != self.pid: self.comms.send_as_jar(c0, p)
+        else:
+            self.comms.send_as_jar(c0_shares, aggregator)
+            if target_pid > 0: return List[Ciphertext]()
+            c0 = self.comms.receive_as_jar(aggregator, List[ring_Poly])
+
+        out = List[Ciphertext](len(c0))
+        for k in range(len(c0)):
+            ct = new_ciphertext(params, 1, level, params.default_scale)
+            ct.value[0] = c0[k]
+            ct.value[1] = crs[k]
+            ct.value[0].is_ntt = True
+            ct.value[1].is_ntt = True
+            out.append(ct)
+        return out
         
     def ciphervector_to_additive_share_vector(self, ciphervector: List[Ciphertext], number_of_elements: int, modulus: mpc_uint, source_pid: int) -> List[mpc_uint]:
         # """
@@ -692,89 +799,72 @@ class MPCMHE[TP]:
         )
     
     def _mhe_to_mpc(self, ciphervector: List[Ciphertext], number_of_elements: int, modulus: mpc_uint, source_pid: int) -> List[mpc_uint]:
-        slots = self.crypto_params.params.slots()
         shared_vector = zeros_vec(number_of_elements)
         if self.pid == 0:
             return shared_vector
 
         if source_pid >= 0:
             ciphervector = self.comms.broadcast_from(ciphervector, source_pid)
-
-        # Refresh to ensure ciphertexts are at default scale and have enough
-        # levels for the subsequent masking and aggregation steps.
-        self.refresh(ciphervector, is_broadcast=(source_pid > -2), min_level_distance=1)
-
-        # Flatten levels AFTER rescaling (rescaling can change levels)
-        ciphermatrix, level_start = self.flatten_levels([ciphervector])
-        ciphervector = ciphermatrix[0]
+        if not len(ciphervector):
+            return shared_vector
 
         params = self.crypto_params.params
         ring_q = params.ring_q
+        slots = params.slots()
+        hub = self.pid == self.comms.hub_pid
+
+        # Every compute party except the hub sends the hub its decryption share s_i * c1 + e_i, masked by a uniformly
+        # random polynomial M_i, and keeps -M_i. The hub adds its own s_hub * c1 and decrypts c0 + sum(shares) =
+        # m + e + sum(M_i): the plaintext's coefficients under masks it cannot remove. These coefficient shares are
+        # exact integers, so each party decodes its own exactly into fixed-point slot values, its share of x modulo
+        # the MPC modulus. (Lattigo's encryption-to-shares protocol, decoded with the exact encoder.)
+        # The masks must fit the ciphertext modulus: rescale (as refresh does), bootstrap the ciphertexts below the level
+        # whose modulus holds them, and drop the others to that level, which leaves less to compute and send.
+        self.rescale(ciphervector, params.default_scale)
+        max_scale = ciphervector[0].scale
+        for ct in ciphervector: max_scale = max(max_scale, ct.scale)
+        mask_bits = self._mhe_to_mpc_mask_bits(max_scale)
+        level = self._mhe_to_mpc_level(mask_bits)
+        self.bootstrap(ciphervector, is_broadcast=(source_pid > -2), min_level_distance=max(0, level - 1 - self.bootstrap_min_level))
+        ciphervector = self.drop_level(ciphervector, level)
+
         sampler = self.crypto_params.encryptor.gaussian_sampler
-
-        # Each party's mask is what hides x from the hub, which decrypts x + sum(masks). Masks are complex, so that they
-        # fill all N dimensions (real-only masks would leave an N/2-dimensional subspace unmasked through CKKS's conjugate
-        # symmetry), and uniform in [-MHE_TO_MPC_MASK_BOUND, MHE_TO_MPC_MASK_BOUND) per part. They go through the float
-        # encoder, whose rounding grows with them (about bound * 2^-52.5 per slot); 2^32 keeps that near 1e-6 and hides
-        # values up to 2^10 only to about 2^-23 per slot. An exact (big-number) encoder would allow statistically hiding
-        # masks; until then this is an interim bound.
-        mask_bound = MHE_TO_MPC_MASK_BOUND
-        mask_complex_values = [
-            [complex(mask_bound * (2.0 * prg.random() - 1.0), mask_bound * (2.0 * prg.random() - 1.0)) for _ in range(slots)]
-            for _ in range(len(ciphervector))]
-
+        mask_offset = lattiseq_exact_int(1) << lattiseq_exact_int(mask_bits - 1)
         n_ct = len(ciphervector)
-        share = [ring_q.new_poly_lvl(level_start) for _ in range(n_ct)]
-
+        shares = List[ring_Poly](n_ct)
+        masks = List[List[lattiseq_exact_int]](n_ct)
         for k in range(n_ct):
-            # Encode mask as a plaintext polynomial at the ciphertext's scale
-            pt_mask_k = new_plaintext(params, level_start, ciphervector[k].scale)
-            self.crypto_params.encoder.encode(
-                mask_complex_values[k],
-                pt_mask_k,
-                params.log_slots)
+            share = ring_q.new_poly_lvl(level)
+            share.is_ntt = True
+            if not hub:
+                # M_i, uniform in [-2^(mask_bits - 1), 2^(mask_bits - 1)) on every coefficient
+                mask = [lattiseq_exact_int(prg.getrandbits_intn(mask_bits, TP=UInt[LATTISEQ_EXACT_INT_SIZE])) - mask_offset for _ in range(params.n())]
+                self.exact_encoder.coeffs_to_poly(mask, params.max_log_slots(), share)
+                masks.append(mask)
+                # e_i: the masks already hide s_i * c1; this noise only adds depth
+                e = ring_q.new_poly_lvl(level)
+                sampler._mm_read_lvl(level, e)
+                ring_q._mm_ntt_lvl(level, e, e)
+                ring_q._mm_add_lvl(level, share, e, share)
+            ring_q._mm_mul_coeffs_montgomery_and_add_lvl(level, self.crypto_params.sk_shard.value.q, ciphervector[k].value[1], share)
+            shares.append(share)
 
-            # h0 = mask (the encoded mask polynomial, already in NTT form)
-            ring_copy_lvl(level_start, pt_mask_k.value, share[k])
-            share[k].is_ntt = True
+        agg = self._aggregate_at_hub(shares, level)
 
-            # h0 = sk*c1 + mask (NTT domain)
-            ring_q._mm_mul_coeffs_montgomery_and_add_lvl(level_start, self.crypto_params.sk_shard.value.q, ciphervector[k].value[1], share[k])
-
-            # Add smudging noise for defense-in-depth
-            e = ring_q.new_poly_lvl(level_start)
-            sampler._mm_read_lvl(level_start, e)
-            ring_q._mm_ntt_lvl(level_start, e, e)
-            ring_q._mm_add_lvl(level_start, share[k], e, share[k])
-
-        # Aggregate the shares at the hub only: sum(sk_i * c1) + sum(mask_i) + sum(e_i). The other parties' MPC shares are
-        # their negated masks, so they need nothing back (sending them the aggregate would show them x + sum(masks) too).
-        agg = self._aggregate_at_hub(share, level_start)
-
+        decrypted = ring_q.new_poly_lvl(level)
         for i in range(n_ct):
-            rv_out = zeros_vec(slots, TP=complex)
-            if self.pid == self.comms.hub_pid:
-                ct_out = ciphervector[i].copy()
-                ring_q._mm_add_lvl(level_start, ct_out.value[0], agg[i], ct_out.value[0])
-                rv_out = self.crypto_params.encoder.decode(ct_out.plaintext(), self.crypto_params.params.log_slots)
-
-            # Subtract the original float mask values directly (not decode from polynomial)
-            for j in range(slots):
-                rv_out[j] -= mask_complex_values[i][j]
-
-            # Always use fixed-point representation for secure masking.
-            # The float masks require fixed-point arithmetic for correct cancellation.
-            # For int dtype, caller should convert from fixed-point after MPC reveal.
-            # A share is x + other masks or a negated mask, up to (parties - 2) * mask bound + |x| in magnitude: beyond
-            # the 2^(k - f - 1) range double_to_fp accepts for values, yet a valid share mod the modulus. The wider k
-            # (2^39) only lifts that range check; the conversion itself is exact.
-            rv_out_shared = double_to_fp([e.real for e in rv_out], modulus, k=MPC_NBIT_K + 8)
+            if hub:
+                ring_q._mm_add_lvl(level, ciphervector[i].value[0], agg[i], decrypted)
+                decrypted.is_ntt = True
+                coeffs = self.exact_encoder.poly_to_coeffs(decrypted, params.max_log_slots())
+            else:
+                coeffs = [-c for c in masks[i]]
+            real, _ = self.exact_encoder.decode_coeffs(_slot_coefficients(coeffs, params.log_slots), ciphervector[i].scale, params.log_slots, MPC_NBIT_F)
 
             start = i * slots
             count = min(slots, number_of_elements - start)
-
             for idx in range(count):
-                shared_vector[idx + start] = rv_out_shared[idx]
+                shared_vector[start + idx] = _exact_to_modulus(real[idx], modulus)
 
         return shared_vector
     

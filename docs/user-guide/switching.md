@@ -10,8 +10,10 @@ The switching mechanism is built on two low-level Lattiseq distributed protocols
 
 | Protocol | Direction | Description |
 |---|---|---|
-| **E2S** (Encryption-to-Shares) | MHE → MPC | Each party collectively decrypts a ciphertext into additive secret shares |
-| **S2E** (Shares-to-Encryption) | MPC → MHE | Each party re-encrypts its additive share; the ciphertexts are summed to produce a fresh collective ciphertext |
+| **E2S** (Encryption-to-Shares) | MHE → MPC | The parties decrypt a ciphertext collectively under random masks, so that each ends up with an additive share of its values and none sees them |
+| **S2E** (Shares-to-Encryption) | MPC → MHE | Each party encodes its additive share and masks it with its secret-key share; the sum is a fresh collective ciphertext |
+
+Both directions hide the values statistically from every party; [Security Assumptions](../crypto-corner/security-assumptions.md#noise-and-masks-in-the-mhe-protocols) gives the guarantees.
 
 A single round-trip (E2S → compute in MPC → S2E) is what `via_mpc` performs under the hood. The cost of one switch is estimated as:
 

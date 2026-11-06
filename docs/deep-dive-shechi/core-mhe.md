@@ -122,25 +122,22 @@ The `bootstrap_min_level` and `bootstrap_log_bound` parameters control the secur
 
 These methods convert between the HE and MPC representations:
 
+Both directions use statistically hiding masks and the exact encoder (`exact_encoder`), whose error does not grow with the masks. [Security Assumptions](../crypto-corner/security-assumptions.md#noise-and-masks-in-the-mhe-protocols) gives the mask sizes and guarantees.
+
 ### `additive_share_vector_to_ciphervector` (MPC → MHE)
 
-1. Convert integer shares to fixed-point if needed
-2. Mask with random values bounded by `max_mask_bits`
-3. Reveal masked shares
-4. Each party encrypts its portion
-5. Aggregate encrypted vectors at hub
+1. Each compute party subtracts a random mask of `_mpc_to_mhe_mask_bits` bits (171 with 192-bit shares) from its share. The hub alone opens the result, `x - R`.
+2. The parties now hold integer shares of `x`: `x - R + R_hub` at the hub, `R_i` at the others. Each party exactly encodes its share, as fixed point or, for integer shares, as integers.
+3. Shares to encryption: for a common random polynomial `a` per ciphertext (from `crp_gen`), each party computes `encode(share_i) - sk_shard × a + e_i`.
+4. The sum at the hub (or `target_pid`), paired with `a`, is a fresh ciphertext of `x`. The hub sends it to all parties unless there is a target.
 
 ### `ciphervector_to_additive_share_vector` (MHE → MPC)
 
-1. Broadcast ciphertext from source party
-2. Refresh to ensure enough levels
-3. Flatten levels across all ciphertexts
-4. Each party computes `sk_shard × c1 + mask + smudging_noise`
-5. Aggregate at hub → yields `c0 + sum(sk_i × c1) + sum(mask_i) + sum(e_i)`
-6. Hub decodes and subtracts its mask to get its additive share
-7. Other parties use their mask as their additive share
-
-The smudging noise (`gaussian_sampler`) provides defense-in-depth against leakage from the partial decryption shares.
+1. Broadcast ciphertext from source party.
+2. Rescale. Bootstrap the ciphertexts below the lowest level whose modulus holds the masks (`_mhe_to_mpc_level`: level 5 for `PN14QP438`), and drop the others to it.
+3. Each party except the hub computes `sk_shard × c1 + M_i + e_i`, with `M_i` a uniformly random polynomial of `_mhe_to_mpc_mask_bits` bits (208 for N = 2^14), and keeps `-M_i`. The hub computes `sk_shard × c1`.
+4. Aggregate at the hub, which yields `c0 + sum(sk_i × c1) + sum(M_i) + sum(e_i)`: the plaintext's coefficients under the others' masks, reconstructed exactly from their residues.
+5. Every party decodes its coefficient share exactly into fixed-point slot values, its additive share modulo the MPC modulus.
 
 ## Next steps
 

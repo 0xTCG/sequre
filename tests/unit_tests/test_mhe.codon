@@ -9,7 +9,7 @@ import sequre.lattiseq.ringqp as ringqp
 from sequre.utils.stats import precision_stats
 from sequre.utils.testing import assert_eq
 from sequre.utils.utils import random_floats
-from sequre.constants import MPC_FIELD_SIZE, MPC_RING_SIZE
+from sequre.constants import MPC_FIELD_SIZE, MPC_RING_SIZE, MPC_MODULUS_BITS, mpc_uint
 from sequre.types.utils import fp_to_double, double_to_fp
 
 
@@ -475,6 +475,76 @@ def test_mhe_mpc_conversion_from_different_sources(mpc, mpc_modulus):
         assert_eq(f"CP{mpc.pid}:\tMHE->MPC from source_pid=1", stats.min_precision.l2 > 10, True)
 
 
+def test_mhe_mpc_switch_masks(mpc, mpc_modulus):
+    """The MHE->MPC shares hide x: every compute party's share is masked far beyond x, and the shares still sum to x."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    with mpc.randomness.seed_switch(-1):
+        values = random_floats((slots,), scale=4.0)
+
+    if mpc.pid > 0:
+        ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
+        secret_share = mpc.mhe.ciphervector_to_additive_share_vector(ciphervector, slots, mpc_modulus, source_pid=1)
+        own = fp_to_double(secret_share, mpc_modulus, k=MPC_MODULUS_BITS)  # the default k keeps only 63 bits
+        masked = sum(1 for v in own if abs(v) > 2.0 ** 100)
+        assert_eq(f"CP{mpc.pid}:\tMHE->MPC share masked beyond 2^100 ({masked} of {slots} slots)", masked > slots * 99 // 100, True)
+
+        stats = precision_stats(mpc=mpc, result=fp_to_double(mpc.comms.reveal(secret_share, mpc_modulus), mpc_modulus), expected=values)
+        # The worst slot's error is the public-key encryption noise, about 2^-15.6.
+        assert_eq(f"CP{mpc.pid}:\tMHE->MPC masked shares sum to x", stats.min_precision.l2 > 14, True)
+
+
+def test_mhe_mpc_switch_levels(mpc, mpc_modulus):
+    """A ciphertext at the lowest level whose modulus holds the masks converts as it is; one a level lower is first
+    bootstrapped. Both convert correctly."""
+    params = mpc.mhe.crypto_params.params
+    slots = params.slots()
+    with mpc.randomness.seed_switch(-1):
+        values = random_floats((slots,), scale=4.0)
+
+    if mpc.pid > 0:
+        mask_bits = mpc.mhe._mhe_to_mpc_mask_bits(params.default_scale)
+        level = mpc.mhe._mhe_to_mpc_level(mask_bits)
+        assert_eq(f"CP{mpc.pid}:\tMHE->MPC mask bits", mask_bits, 128 + params.logn + 34 + 32)
+        assert_eq(f"CP{mpc.pid}:\tMHE->MPC switch level", level, 5)
+
+        ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
+        for at, bootstraps in ((level, 0), (level - 1, 1)):
+            low = mpc.mhe.drop_level(ciphervector, at)
+            before = mpc.mhe.stats.secure_bootstrap_count
+            secret_share = mpc.mhe.ciphervector_to_additive_share_vector(low, slots, mpc_modulus, source_pid=1)
+            assert_eq(f"CP{mpc.pid}:\tMHE->MPC from level {at}: {bootstraps} bootstrap(s)", mpc.mhe.stats.secure_bootstrap_count - before, bootstraps)
+            stats = precision_stats(mpc=mpc, result=fp_to_double(mpc.comms.reveal(secret_share, mpc_modulus), mpc_modulus), expected=values)
+            assert_eq(f"CP{mpc.pid}:\tMHE->MPC from level {at}", stats.min_precision.l2 > 14, True)
+
+
+def test_mhe_mpc_switch_large_values(mpc, mpc_modulus):
+    """Values up to 2^20 make the round trip MHE -> MPC -> MHE with an absolute error independent of their size."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    with mpc.randomness.seed_switch(-1):
+        values = [(2.0 * prg.random() - 1.0) * 2.0 ** 20 for _ in range(slots)]
+
+    if mpc.pid > 0:
+        ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
+        secret_share = mpc.mhe.ciphervector_to_additive_share_vector(ciphervector, slots, mpc_modulus, source_pid=1)
+        back = mpc.mhe.decode(enc=mpc.mhe.decrypt(mpc.mhe.additive_share_vector_to_ciphervector(secret_share, mpc_modulus, True)), dtype=float)
+        error = max(abs(back[i] - values[i]) for i in range(slots))
+        assert_eq(f"CP{mpc.pid}:\tMHE<->MPC round trip of 2^20 values (error {error:.2e})", error < 1e-3, True)
+
+
+def test_mpc_mhe_switch_integers(mpc, mpc_modulus):
+    """Integer (not fixed-point) shares switch to ciphertexts encoding the integers."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    with mpc.randomness.seed_switch(-1):
+        values = [int(prg.getrandbits(11)) - 1024 for _ in range(slots)]
+
+    if mpc.pid > 0:
+        # CP1 holds the integers modulo the modulus, the other compute parties zero.
+        share = [(mpc_uint(v) if v >= 0 else mpc_modulus - mpc_uint(-v)) if mpc.pid == 1 else mpc_uint(0) for v in values]
+        back = mpc.mhe.decode(enc=mpc.mhe.decrypt(mpc.mhe.additive_share_vector_to_ciphervector(share, mpc_modulus, False)), dtype=float)
+        error = max(abs(back[i] - float(values[i])) for i in range(slots))
+        assert_eq(f"CP{mpc.pid}:\tMPC->MHE of integer shares (error {error:.2e})", error < 1e-4, True)
+
+
 def test_mhe(mpc):
     print(f'CP{mpc.pid}:\tTesting MHE ... \n')
 
@@ -494,7 +564,11 @@ def test_mhe(mpc):
     test_mhe_mpc_conversion_multiple_ciphertexts(mpc, MPC_FIELD_SIZE)
     test_mhe_mpc_conversion_mpc_operations_on_shares(mpc, MPC_FIELD_SIZE)
     test_mhe_mpc_conversion_from_different_sources(mpc, MPC_FIELD_SIZE)
-    
+    test_mhe_mpc_switch_masks(mpc, MPC_FIELD_SIZE)
+    test_mhe_mpc_switch_levels(mpc, MPC_FIELD_SIZE)
+    test_mhe_mpc_switch_large_values(mpc, MPC_FIELD_SIZE)
+    test_mpc_mhe_switch_integers(mpc, MPC_FIELD_SIZE)
+
     # with mpc.default_modulus(MPC_RING_SIZE):
     #     test_cipher_to_additive_share_vec_conversion(mpc, MPC_RING_SIZE)
 
