@@ -59,7 +59,8 @@ from sequre.lattiseq.utils import new_prng
 from sequre.types.utils import double_to_fp, fp_to_double
 from sequre.utils.utils import zeros_vec, ones_vec, one_hot_vector, random_floats
 from sequre.utils.io import is_cached, read_cache, store_cache
-from sequre.constants import LATTISEQ_SIGMA_SMUDGE, LATTISEQ_DEFAULT_SIGMA, LATTISEQ_ROTATION_KEYS_COUNT, mpc_uint, MPC_NBIT_F
+from sequre.constants import LATTISEQ_SIGMA_SMUDGE, LATTISEQ_DEFAULT_SIGMA, LATTISEQ_ROTATION_KEYS_COUNT, mpc_uint, MPC_NBIT_F, \
+    MPC_NBIT_K, MHE_TO_MPC_MASK_BOUND
 
 from stats import MPCStats
 from randomness import MPCRandomness
@@ -711,14 +712,16 @@ class MPCMHE[TP]:
         ring_q = params.ring_q
         sampler = self.crypto_params.encryptor.gaussian_sampler
 
-        # Generate random float mask values with full complex encoding.
-        # Using complex(real, imag) fills all N NTT dimensions, preventing the
-        # N/2-dimensional subspace leak that real-only masks would have due to
-        # CKKS conjugation symmetry.
-        mask_scale = 1.0
-        mask_real = [random_floats((slots,), scale=mask_scale) for _ in range(len(ciphervector))]
-        mask_imag = [random_floats((slots,), scale=mask_scale) for _ in range(len(ciphervector))]
-        mask_complex_values = [[complex(mask_real[i][j], mask_imag[i][j]) for j in range(slots)] for i in range(len(ciphervector))]
+        # Each party's mask is what hides x from the hub, which decrypts x + sum(masks). Masks are complex, so that they
+        # fill all N dimensions (real-only masks would leave an N/2-dimensional subspace unmasked through CKKS's conjugate
+        # symmetry), and uniform in [-MHE_TO_MPC_MASK_BOUND, MHE_TO_MPC_MASK_BOUND) per part. They go through the float
+        # encoder, whose rounding grows with them (about bound * 2^-52.5 per slot); 2^32 keeps that near 1e-6 and hides
+        # values up to 2^10 only to about 2^-23 per slot. An exact (big-number) encoder would allow statistically hiding
+        # masks; until then this is an interim bound.
+        mask_bound = MHE_TO_MPC_MASK_BOUND
+        mask_complex_values = [
+            [complex(mask_bound * (2.0 * prg.random() - 1.0), mask_bound * (2.0 * prg.random() - 1.0)) for _ in range(slots)]
+            for _ in range(len(ciphervector))]
 
         n_ct = len(ciphervector)
         share = [ring_q.new_poly_lvl(level_start) for _ in range(n_ct)]
@@ -744,19 +747,16 @@ class MPCMHE[TP]:
             ring_q._mm_ntt_lvl(level_start, e, e)
             ring_q._mm_add_lvl(level_start, share[k], e, share[k])
 
-        # Aggregate shares at hub: sum(sk_i * c1) + sum(mask_i) + sum(e_i)
-        agg = self._aggregate_refresh_share_vec(share, level_start)
+        # Aggregate the shares at the hub only: sum(sk_i * c1) + sum(mask_i) + sum(e_i). The other parties' MPC shares are
+        # their negated masks, so they need nothing back (sending them the aggregate would show them x + sum(masks) too).
+        agg = self._aggregate_at_hub(share, level_start)
 
-        pt = []
         for i in range(n_ct):
-            ct_out = ciphervector[i].copy()
-            ring_q._mm_add_lvl(level_start, ct_out.value[0], agg[i], ct_out.value[0])
-            pt.append(ct_out.plaintext())
-
-        for i in range(len(pt)):
             rv_out = zeros_vec(slots, TP=complex)
             if self.pid == self.comms.hub_pid:
-                rv_out = self.crypto_params.encoder.decode(pt[i], self.crypto_params.params.log_slots)
+                ct_out = ciphervector[i].copy()
+                ring_q._mm_add_lvl(level_start, ct_out.value[0], agg[i], ct_out.value[0])
+                rv_out = self.crypto_params.encoder.decode(ct_out.plaintext(), self.crypto_params.params.log_slots)
 
             # Subtract the original float mask values directly (not decode from polynomial)
             for j in range(slots):
@@ -765,7 +765,10 @@ class MPCMHE[TP]:
             # Always use fixed-point representation for secure masking.
             # The float masks require fixed-point arithmetic for correct cancellation.
             # For int dtype, caller should convert from fixed-point after MPC reveal.
-            rv_out_shared = double_to_fp([e.real for e in rv_out], modulus)
+            # A share is x + other masks or a negated mask, up to (parties - 2) * mask bound + |x| in magnitude: beyond
+            # the 2^(k - f - 1) range double_to_fp accepts for values, yet a valid share mod the modulus. The wider k
+            # (2^39) only lifts that range check; the conversion itself is exact.
+            rv_out_shared = double_to_fp([e.real for e in rv_out], modulus, k=MPC_NBIT_K + 8)
 
             start = i * slots
             count = min(slots, number_of_elements - start)
@@ -1209,34 +1212,23 @@ class MPCMHE[TP]:
 
         return out
 
-    def _aggregate_refresh_share_vec(self, share: List[ring_Poly], out_level: int) -> List[ring_Poly]:
+    def _aggregate_at_hub(self, share: List[ring_Poly], out_level: int) -> List[ring_Poly]:
+        # Sums the compute parties' polynomial shares at the hub; the other parties send theirs and get [] back.
         context_q = self.crypto_params.params.ring_q
-        share_out = []
-        
-        if self.pid > 0:
-            if self.pid == self.comms.hub_pid:
-                # Initialize
+        share_out = List[ring_Poly]()
+
+        if self.pid == self.comms.hub_pid:
+            for i in range(len(share)):
+                share_out.append(context_q.new_poly_lvl(out_level))
+
+            for p in range(1, self.comms.number_of_parties):
+                if p != self.pid: other = self.comms.receive_as_jar(p, List[ring_Poly])
+                else: other = share
+
                 for i in range(len(share)):
-                    share_out.append(context_q.new_poly_lvl(out_level))
-
-                # Aggregate
-                for p in range(1, self.comms.number_of_parties):
-                    if p != self.pid: other = self.comms.receive_as_jar(p, List[ring_Poly])
-                    else: other = share
-
-                    for i in range(len(share)):
-                        context_q._mm_add_lvl(len(other[i]._buf_coeffs) - 1, other[i], share_out[i], share_out[i])
-
-                # Broadcast
-                for p in range(1, self.comms.number_of_parties):
-                    if p != self.pid:
-                        self.comms.send_as_jar(share_out, p)
-
-            else:
-                # Send share
-                self.comms.send_as_jar(share, self.comms.hub_pid)
-                # Receive result
-                share_out = self.comms.receive_as_jar(self.comms.hub_pid, List[ring_Poly])
+                    context_q._mm_add_lvl(len(other[i]._buf_coeffs) - 1, other[i], share_out[i], share_out[i])
+        elif self.pid > 0:
+            self.comms.send_as_jar(share, self.comms.hub_pid)
 
         return share_out
     

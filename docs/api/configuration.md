@@ -28,6 +28,12 @@ Sequre's behavior is controlled through compile-time constants and environment v
 | `SEQURE_PARTY_CERT_FILE` | `cp{pid}.pem` | Per-party certificate pattern |
 | `SEQURE_PARTY_KEY_FILE` | `cp{pid}-key.pem` | Per-party private key pattern |
 
+### Cryptography
+
+| Variable | Default | Description |
+|---|---|---|
+| `SEQURE_SIGMA_SMUDGE` | `1024` | Standard deviation of the noise each party adds to its share of a collective decryption (at least 3.2). Larger values hide more of the ciphertext noise at the cost of precision; see [Security assumptions](../crypto-corner/security-assumptions.md#noise-and-masks-in-the-mhe-protocols). |
+
 ### Runtime
 
 | Variable | Default | Description |
@@ -67,6 +73,8 @@ _Defined in `stdlib/sequre/settings.codon` and `stdlib/sequre/constants.codon`_
 | `LATTISEQ_MAX_LOGN` | 17 | Maximum polynomial ring degree ($\log N$) |
 | `LATTISEQ_ROTATION_KEYS_COUNT` | 64 | Number of rotation keys generated |
 | `LATTISEQ_DEFAULT_SIGMA` | 3.2 | Gaussian error distribution standard deviation |
+| `LATTISEQ_SIGMA_SMUDGE` | `SEQURE_SIGMA_SMUDGE` (1024) | Noise standard deviation of collective-decryption shares |
+| `MHE_TO_MPC_MASK_BOUND` | $2^{32}$ | Bound on each party's masks in the HE → MPC switch |
 
 ### Network
 

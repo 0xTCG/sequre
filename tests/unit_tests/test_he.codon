@@ -2,6 +2,7 @@ import math, prg
 
 import sequre.lattiseq.ckks as ckks
 import sequre.lattiseq.rlwe as rlwe
+import sequre.lattiseq.dckks as dckks
 import sequre.lattiseq.params as ckks_params
 
 from sequre.lattiseq.stats import plot_precision_stats
@@ -329,9 +330,44 @@ def test_lattiseq():
     test_evaluator(params, encoder, encryptor, decryptor, evaluator, shifts)
     
 
+def measured_decryption_share_noise(params, encoder, encryptor, sk, sigma: float) -> float:
+    # With a zero target key, a collective-decryption (PCKS) share minus s * c1 is exactly the noise the party added.
+    pcks = dckks.new_pcks_protocol(params, sigma)
+    pt = ckks.new_plaintext(params, params.max_level(), params.default_scale)
+    encoder.encode([complex(1.0, 0.0) for _ in range(params.slots())], pt, params.log_slots)
+    ct = encryptor.encrypt_new(pt)
+    level = ct.level()
+    share = pcks.allocate_share(level)
+    pcks._mm_gen_share(sk, rlwe.new_public_key(params.get_rlwe_params()), ct.value[1], share)
+    ring_q = params.ring_q
+    noise = ring_q.new_poly_lvl(level)
+    ring_q._mm_mul_coeffs_montgomery_lvl(level, ct.value[1], sk.value.q, noise)
+    ring_q._mm_sub_lvl(level, share.value[0], noise, noise)
+    ring_q._mm_inv_ntt_lvl(level, noise, noise)
+    q0 = ring_q.modulus[0]
+    total = 0.0
+    for c in noise._buf_coeffs[0]:
+        v = float(c) if c < (q0 >> u64(1)) else -float(q0 - c)
+        total += v * v
+    return math.sqrt(total / float(len(noise._buf_coeffs[0])))
+
+
+def test_decryption_share_smudging():
+    # A decryption share without noise is s_i * c1, from which the party collecting the shares computes s_i = share / c1.
+    # The noise used to be added before a division by the special primes P and vanished (measured std 0).
+    params = ckks.new_parameters_from_literal(ckks_params.PN14QP438)
+    encoder = ckks.new_encoder_complex(params)
+    sk = ckks.new_key_generator(params).gen_secret_key()
+    encryptor = ckks.new_encryptor(params, sk)
+    for sigma in (3.2, 1024.0):
+        std = measured_decryption_share_noise(params, encoder, encryptor, sk, sigma)
+        assert_eq(f"Collective decryption share carries its noise (sigma {sigma}, measured {std:.2f})", 0.5 * sigma < std < 1.5 * sigma, True)
+
+
 def test_he():
     print('Testing HE ... \n')
-    
+
     test_lattiseq()
+    test_decryption_share_smudging()
 
     print('HE tests passed.\n')

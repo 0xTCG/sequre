@@ -9,7 +9,7 @@ This page documents the threat model and cryptographic hardness assumptions that
 Sequre assumes all parties follow the protocol correctly but may try to learn additional information from the messages they observe. This is the standard **semi-honest** model.
 
 - **No malicious behavior**: Parties do not send forged messages, deviate from the protocol, or abort strategically.
-- **No collusion beyond threshold**: For $N$ compute parties, security holds as long as no single party can reconstruct the full secret. In Sequre's additive secret-sharing setting, all $N$ parties must collude to break privacy.
+- **Collusion**: Privacy holds against any single party, and against any coalition of compute parties that leaves at least one compute party out, as long as the trusted dealer (CP0) is not part of it. CP0 deals the correlated randomness (Beaver triples, masks), so CP0 together with any one compute party can recover values that were opened against that randomness. The MHE collective secret key is shared among the compute parties only (CP0 holds a zero share), so a collective decryption needs all of them.
 
 ### Trusted dealer (CP0)
 
@@ -43,19 +43,22 @@ Sequre does **not** use Paillier or other DCR-based schemes. All HE is RLWE-base
 
 ## Additive secret sharing security
 
-For the MPC (non-HE) path, security relies on **information-theoretic** properties of additive sharing:
+For the MPC (non-HE) path, values are additively shared over a prime field (or a power-of-two ring):
 
 $$x = x_1 + x_2 + \cdots + x_N \pmod{p}$$
 
-Each share $x_i$ is uniformly random given any proper subset of shares. This provides **perfect secrecy** against up to $N-1$ colluding parties (in the honest-majority or full-threshold variant used by Sequre).
+Shares and masks are drawn uniformly from the whole field with a cryptographically secure PRG, seeded pairwise between the parties over TLS. The shares seen by a coalition that misses at least one party (subject to the dealer caveat above) are therefore computationally indistinguishable from uniform: security rests on the PRG, not on perfect (information-theoretic) secrecy.
 
-## Smudging noise
+## Noise and masks in the MHE protocols
 
-During protocol switching (HE → MPC), each party reveals $\text{sk}_i \cdot c_1 + \text{mask}_i + e_i$. The smudging noise $e_i$ is sampled from a Gaussian with width controlled by `LATTISEQ_SIGMA_SMUDGE`. This prevents leakage from the partial decryption beyond what the output itself reveals:
+What each protocol reveals to the party that combines the shares (the hub):
 
-$$\text{Statistical distance} \leq 2^{-\lambda}$$
+- **Collective decryption.** Each compute party sends the hub $s_i \cdot c_1 + e_i$, with Gaussian noise $e_i$ of standard deviation `SEQURE_SIGMA_SMUDGE` (default $2^{10}$; values below 3.2 are rejected). Without noise, the hub could compute every key share as $s_i = \text{share} / c_1$; with it, recovering $s_i$ is a ring-LWE problem. The noise does not *flood* the ciphertext noise statistically, so a decrypted result still carries some information about the ciphertext's own noise (the IND-CPA-D setting). Flooding needs a standard deviation of about $2^{20}$ or more together with a larger scale, because the decryption error grows in proportion to it: the measured maximum error at the default scale $2^{34}$ is about $5 \cdot 10^{-5}$ at $2^{10}$, $5 \cdot 10^{-4}$ at $2^{14}$, and $3 \cdot 10^{-2}$ at $2^{20}$.
+- **HE → MPC switching.** Before the hub decrypts, each party adds a uniformly random mask, bounded by $2^{32}$ in each real and imaginary part of every slot; only the hub receives the masked result. A slot value of magnitude $B$ is hidden from the hub only up to a statistical distance of about $B / 2^{33}$ (about $2^{-23}$ for values up to 1000), not $2^{-\lambda}$: the masks go through the floating-point encoder, which limits their size.
+- **MPC → HE switching.** The parties open $x - R$, where $R$ is a sum of masks of $64 + f - \log_2 \Delta - b$ bits ($f$ the fixed-point fractional bits, $b$ the bit length of the number of compute parties): 60 bits for the default three parties (two compute parties) at scale $2^{34}$. A value of magnitude $B$ is therefore hidden only up to a statistical distance of about $B \cdot 2^{f} / 2^{60} = B \cdot 2^{-28}$, again a limit of the floating-point encoder.
+- **Collective bootstrapping (refresh).** Partial decryptions are masked with random integers of $\lambda + \log_2 \Delta$ bits in the coefficient domain ($\lambda = 128$), which hide the plaintext and its noise statistically.
 
-where $\lambda$ is the security parameter (128 bits).
+Statistically hiding masks for both switching directions need an exact (multi-precision) encoder, which is planned.
 
 ## CKKS approximate precision
 
