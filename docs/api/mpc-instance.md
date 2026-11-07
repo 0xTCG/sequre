@@ -462,11 +462,11 @@ Convenience context managers accessible via methods on `MPCEnv`:
 
 ### `mpc.allow_mpc_switch()`
 
-Enables automatic [MPC ↔ MHE switching](../user-guide/switching.md) for the duration of the block. Inside this context, operations like `Ciphertensor.matmul` may automatically convert to Sharetensor (via the E2S protocol), run the operation using Beaver-triple MPC, and convert back (via S2E) when a cost estimator determines this is cheaper than a pure-HE path.
+Enables automatic [MPC ↔ MHE switching](../user-guide/switching.md) for the duration of the block. Inside this context, a `Ciphertensor @ ndarray` product may convert the ciphertensor to a Sharetensor (via the E2S protocol), multiply using Beaver-triple MPC, and convert back (via S2E) when a cost estimator determines this is cheaper than a pure-HE path. Every party runs the product, the trusted dealer included.
 
 ```python
 with mpc.allow_mpc_switch():
-    result = ct_a @ ct_b  # matmul may use MPC path if cheaper
+    result = ct_a @ plain_b  # matmul may use MPC path if cheaper
 ```
 
 See the dedicated [MPC ↔ MHE Switching](../user-guide/switching.md) page for details.

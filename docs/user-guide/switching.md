@@ -72,7 +72,9 @@ with mpc.allow_mpc_switch():
     result = ct_a @ plain_b  # cost estimator picks MHE or via_mpc
 ```
 
-Inside the context, `mpc.default_allow_mpc_switch` is set to `True`. The cost estimator compares four strategies for `Ciphertensor @ ndarray`:
+Every party must run the product, the trusted dealer (CP0) included: the via-MPC path needs it for the Beaver products and truncations. The cost estimator works from public data only (the shapes and layouts of the operands, and `mpc.default_allow_mpc_switch`), so every party picks the same strategy; CP0 joins the via-MPC path when it is chosen and otherwise gets a placeholder with the result's shape and layout.
+
+Inside the context, `mpc.default_allow_mpc_switch` is set to `True`. For a row-wise `Ciphertensor @ ndarray` the cost estimator compares five strategies:
 
 | Strategy | Label | Description |
 |---|---|---|
@@ -80,8 +82,12 @@ Inside the context, `mpc.default_allow_mpc_switch` is set to `True`. The cost es
 | M1 | `M1` | Column-packed HE matmul |
 | M2 | `M2` | Row-packed HE matmul |
 | M3 | `M3` | Diagonal-packed HE matmul |
+| BSGS | `BSGS` | Baby-step giant-step diagonal matmul (square plaintext of at most half the slots) |
 
-The cheapest strategy wins. When `AllowMPCSwitch` is not active, the "Via MPC" cost is set to infinity and only pure-HE paths are considered.
+The cheapest strategy wins, among those whose shape constraints hold (see the matrix products section of the [Ciphertensor API](../api/ciphertensor.md#matrix-products)). When `AllowMPCSwitch` is not active, the "Via MPC" cost is set to infinity and only pure-HE paths are considered. Column-wise (lazily transposed) and diagonal-encoded ciphertensors have no via-MPC path, nor does `Ciphertensor @ Ciphertensor`.
+
+!!! warning
+    MPP and MPA products with a plaintext matrix return at the trusted dealer before they reach the cost estimator, so under `AllowMPCSwitch` a product that picks the via-MPC path deadlocks. Leave `AllowMPCSwitch` off around them.
 
 !!! tip
     Enable `DEBUG` mode to see the cost breakdown printed at each matmul:
@@ -91,6 +97,7 @@ The cheapest strategy wins. When `AllowMPCSwitch` is not active, the "Via MPC" c
           M1: 45.67
           M2: 23.45
           M3: 89.01
+          BSGS: 34.56
     ```
 
 ## Methods that switch automatically
@@ -147,7 +154,7 @@ Use `mpc.stats` or the `mpc.stats_log()` context manager to profile and log swit
 | Scenario | Recommendation |
 |---|---|
 | Comparison operators (`>`, `<`, `==`) | Automatic — always switches |
-| Matrix multiply (ciphertext × plaintext) | Use `AllowMPCSwitch` and let the cost estimator decide |
+| Matrix multiply (ciphertext × plaintext) | Use `AllowMPCSwitch` and let the cost estimator decide; run the product at every party, the trusted dealer included |
 | Matrix inverse, square root | Use `via_mpc` explicitly or call the stdlib `inv`/`sqrt` |
 | Custom non-linear function | Call `via_mpc` directly with a lambda |
 | All operations are linear (add, mul, rotate) | Stay in pure MHE — no switching needed |

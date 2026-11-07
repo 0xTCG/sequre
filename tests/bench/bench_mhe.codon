@@ -91,13 +91,14 @@ CASES = [
     ("ct.matmul.v3_16x16", "", "_matmul_v3 (M3, row x diag): A @ B, B diagonal-encoded, 16x16"),
     ("ct.matmul.v3dd_8x8", "", "_matmul_v3 (M3, diag x diag): A @ B, both diagonal-encoded, 8x8"),
     ("ct.matmul.tnt_16x16", "", "_matmul_tnt: A (col-wise, transposed) @ plaintext B, 16x16"),
-    ("ct.matmul.tnt_128x16", "skip:bad-shape", "_matmul_tnt with a tall 128x16 A: 16 ciphertexts under a [128,16] diagonal shape; reveal asserts in decode"),
+    ("ct.matmul.tnt_128x16", "", "_matmul_tnt with a tall 128x16 A (col-wise) @ plaintext 16x16: a [16,128] diagonal-encoded result"),
+    ("ct.matmul.tn_12x8", "", "_matmul_tn (TNT's fallback): A (col-wise) 12x8 @ encrypted 8x8, a tall result whose 8 columns do not divide its 12 rows"),
     ("ct.matmul.bsgs_8x64", "", "_matmul_bsgs (baby-step giant-step): row-wise A 8x64 @ plaintext 64x64"),
     ("ct.matmul.v3pt_8x64", "", "_matmul_v3 (M3) with a diagonal-encoded plaintext: A 8x64 @ plaintext 64x64 (BSGS reference)"),
     ("ct.matmul.auto_ct_pt_8x64", "", "ct @ ndarray through the cost router (via-MPC excluded), 8x64 @ 64x64"),
     ("ct.matmul.auto_ct_pt_16x16", "", "ct @ ndarray through the cost router (via-MPC excluded), 16x16"),
     ("ct.matmul.pt_mat_ct_vec_64", "", "ndarray 64x64 @ encrypted 64x1 column vector (perf_bench L4 case)"),
-    ("ct.matmul.via_mpc_16x16", "skip:deadlock", "ct @ ndarray under allow_mpc_switch() (the via-MPC route deadlocks)"),
+    ("ct.matmul.via_mpc_16x16", "", "ct @ ndarray under allow_mpc_switch() at every party: the router picks via-MPC (E2S, MPC matmul, S2E)"),
     ("mp.mpp.add_enc", "", "encrypted MPP + encrypted MPP, 2x8x64 partitions"),
     ("mp.mpp.mul_enc", "", "encrypted MPP * encrypted MPP, 2x8x64 partitions"),
     ("mp.mpp.reveal_enc", "", "reveal of an encrypted MPP, 2x8x64 partitions"),
@@ -832,7 +833,8 @@ def bench_ct_matmul(mpc, b: Bench):
     for rows in (16, 128):
         name = "ct.matmul.tnt_16x16" if rows == 16 else "ct.matmul.tnt_128x16"
         if b.want(mpc, name):
-            X = shared_float_matrix(mpc, rows, 16, -1.0, 1.0)
+            # The 128-row A is cut from B64 instead of drawn: no extra draw shifts the shared data of later cases
+            X = shared_float_matrix(mpc, rows, 16, -1.0, 1.0) if rows == 16 else [B64[i // 4][(i % 4) * 16:(i % 4 + 1) * 16] for i in range(rows)]
             ac = Ciphertensor[Ciphertext].enc(mpc, X, encoding=ENC_COL)
             out = ac
             t = Timer(b.reps(2), warmup=0)
@@ -844,6 +846,22 @@ def bench_ct_matmul(mpc, b: Bench):
             err = ct_err_2d(mpc, out, array(X) @ nB16)
             if mpc.pid:
                 b.report(f"col({rows}x16)@16x16", t, err)
+
+    if b.want(mpc, "ct.matmul.tn_12x8"):
+        # A cut from A16 (no extra draw), so its 8 columns do not divide its 12 rows: outside TNT's domain
+        X = [row[:8] for row in A16[:12]]
+        ac = Ciphertensor[Ciphertext].enc(mpc, X, encoding=ENC_COL)
+        bb = Ciphertensor[Ciphertext].enc(mpc, B8, encoding=ENC_ROW)
+        out = ac
+        t = Timer(b.reps(2), warmup=0)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                out = ac._matmul_tn(mpc, bb, debug=False)
+            t.end(mpc)
+        err = ct_err_2d(mpc, out, array(X) @ nB8)
+        if mpc.pid:
+            b.report("col(12x8)@8x8", t, err)
 
     if b.want(mpc, "ct.matmul.bsgs_8x64"):
         a = Ciphertensor[Ciphertext].enc(mpc, A8x64, encoding=ENC_ROW)
@@ -917,9 +935,9 @@ def bench_ct_matmul(mpc, b: Bench):
         t = Timer(b.reps(1), warmup=0)
         while t.next():
             t.begin(mpc)
+            # Every party runs the product, the trusted dealer included: it takes the same route and joins via-MPC
             with mpc.allow_mpc_switch():
-                if mpc.pid:
-                    out = secure_operator.matmul(mpc, a, nB16)
+                out = secure_operator.matmul(mpc, a, nB16)
             t.end(mpc)
         err = ct_err_2d(mpc, out, nA16 @ nB16)
         if mpc.pid:

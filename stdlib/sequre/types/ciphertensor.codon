@@ -20,6 +20,21 @@ from sequre.constants import (
 from sequre.settings import DEBUG
 
 
+# Routes of the matrix-product dispatchers (Ciphertensor.matmul, _switch_matmul_by_cost). Every party, the trusted
+# dealer included, computes the same route from public data: shapes, layout flags, slots and
+# mpc.default_allow_mpc_switch.
+MATMUL_UNSUPPORTED: Static[int] = -1
+MATMUL_VIA_MPC: Static[int] = 0
+MATMUL_V1: Static[int] = 1
+MATMUL_V2: Static[int] = 2
+MATMUL_V3: Static[int] = 3      # _matmul_v3_01: row-wise x diagonal-encoded
+MATMUL_BSGS: Static[int] = 4
+MATMUL_TNT: Static[int] = 5     # column-wise x row-wise, diagonal-encoded result
+MATMUL_V2_T: Static[int] = 6    # M2 on the transposes: (B.T @ A.T).T
+MATMUL_TN: Static[int] = 7      # column-wise x row-wise, M2 with A read by columns (any shape)
+MATMUL_V3_11: Static[int] = 8   # diagonal-encoded x diagonal-encoded
+
+
 class Ciphertensor[ctype]:
     _data: list[ctype]
     shape: list[int]
@@ -444,6 +459,9 @@ class Ciphertensor[ctype]:
             ct._diagonal_contiguous = True
             return ct
         
+        # Row d holds cyclic_diag(d): M[(t + d) % rows][t % cols] for t < max(rows, cols). A wide matrix is stored
+        # whole; a tall one only when its column count divides its row count (otherwise cells are lost).
+        assert Ciphertensor._diagonal_storage_ok(data.shape[0], data.shape[1]), f"Ciphertensor: cannot diagonal-encode a tall {data.shape[0]} x {data.shape[1]} matrix: the diagonal storage of a tall matrix needs its column count to divide its row count"
         diagonals = zeros((min(data.shape), max(data.shape)), dtype=dtype)
         
         for i in range(min(data.shape)):
@@ -922,7 +940,8 @@ class Ciphertensor[ctype]:
 
         if isinstance(ctype, Plaintext):
             # TODO: Read dtype (T) from self (add dtype static to Ciphertensor class)
-            return Ciphertensor[Plaintext].enc(mpc, self.decode(mpc, T=float).replicate(new_size))
+            # Row-wise, the layout replicate produces, whatever the ambient default encoding
+            return Ciphertensor[Plaintext].enc(mpc, self.decode(mpc, T=float).replicate(new_size), encoding=ENC_ROW)
 
         replicate_tensor = self.copy()
 
@@ -1023,14 +1042,21 @@ class Ciphertensor[ctype]:
         return cipher
 
     def reduce_add_tiled(self, mpc, tile_size: int) -> Ciphertensor[ctype]:
+        """
+        Sums the tiles of width tile_size of a vector (of each row of a matrix) into its first tile_size slots:
+        out[t] = sum_j x[t + j * tile_size] for t < tile_size. The width must be a multiple of tile_size.
+        A wide diagonal-encoded matrix (storage [p, W]) reduces the same way to the storage of the result with
+        max(p, tile_size) columns per diagonal, folded into the tall storage [tile_size, p] when tile_size < p.
+        """
         assert mpc.pid, "Not implemented yet: reduce_add_tiled at CP0"
         assert 0 < self.ndim < 3, "Ciphertensor: tiled addition reduction can be applied only to 1-dim and 2-dim tensors"
+        assert tile_size > 0, f"Ciphertensor: invalid tile size {tile_size} for tiled addition reduction"
 
         if self.ndim == 2:
             assert not self._transposed, "Not implemented yet: tiled addition reduction of transposed matrices"
+            actual_tile_size = tile_size
             if self._diagonal_contiguous:
                 assert not self._skinny, "Not implemented yet: tiled addition reduction of skinny diagonal-contiguous matrices"
-                actual_tile_size = tile_size
                 tile_size = max(self.shape[0], tile_size)
 
             reduced_tiled_data = []
@@ -1048,62 +1074,51 @@ class Ciphertensor[ctype]:
             if not self._diagonal_contiguous or actual_tile_size >= self.shape[0]:
                 return ct
             
-            assert tile_size <= self.slots >> 1, "Not implemented yet: reduce add of large skinny matrix"
+            # The p diagonals of width p (p = self.shape[0]) fold into the q = actual_tile_size diagonals of the tall
+            # storage: diag_i = sum_{j < p / q} rot(D_{i + j * q}, -j * q) for i < q, any integer ratio p / q. The
+            # diagonals are replicated over 2p slots and rotated by p first, the margin of the negative rotations.
+            p = tile_size
+            q = actual_tile_size
+            assert p % q == 0, f"Ciphertensor: cannot fold {p} diagonals into {q}: the ratio must be an integer"
+            assert p <= self.slots >> 1, "Not implemented yet: reduce add of large skinny matrix"
             ct._diagonal_contiguous = False
-            patched_ct = ct.replicate(mpc, tile_size << 1)
-            mpc.mhe.irotate(patched_ct._data, tile_size)
-            patched_ct._diagonal_contiguous = True
-            diagonals = [patched_ct.diagonal(i) for i in range(tile_size)]
+            patched_ct = ct.replicate(mpc, p << 1)
+            mpc.mhe.irotate(patched_ct._data, p)
             
-            while actual_tile_size < tile_size:
-                tile_size >>= 1
-                for i in range(tile_size):
-                    mpc.mhe.irotate(diagonals[i + tile_size]._data, -tile_size)
-                    diagonals[i].iadd(mpc, diagonals[i + tile_size])
-
-            mask = mpc.mhe.enc_vector([(1.0 if i < self.shape[0] else 0.0) for i in range(self.slots)], T=Plaintext)
+            evaluator = mpc.mhe.crypto_params.evaluator
+            mask = mpc.mhe.enc_vector([(1.0 if i < p else 0.0) for i in range(self.slots)], T=Plaintext)
             new_data = []
-            for i in range(tile_size):
-                mpc.mhe.imul(diagonals[i]._data, mask)
-                new_data.extend(diagonals[i]._data)
+            for i in range(q):
+                folded = patched_ct._data[i].copy()
+                for j in range(1, p // q):
+                    shifted = [patched_ct._data[i + j * q].copy()]
+                    Ciphertensor._rotate_slots(mpc, shifted, -j * q)
+                    evaluator.add(folded, shifted[0], folded)
+                new_data.extend(mpc.mhe.mul([folded], mask))
             
             return Ciphertensor[ctype](
                 _data=new_data,
-                shape=[tile_size, self.shape[0]],
+                shape=[q, p],
                 slots=self.slots,
                 _transposed=self._transposed,
-                _diagonal_contiguous=self._diagonal_contiguous,
+                _diagonal_contiguous=True,
                 _skinny=True)
         
         if tile_size == 1:
             return self.reduce_add(mpc, keep_dims=False)
         
         size = self.shape[0]
-        cipher_offset = size % self.slots
-        tile_offset = self.slots % tile_size
-        if tile_size > self.slots // 2 or ((cipher_offset or tile_offset) and len(self._data) > 1):
+        assert size % tile_size == 0, f"Ciphertensor: tiled addition reduction needs the size ({size}) to be a multiple of the tile size ({tile_size})"
+        if len(self._data) > 1 and (size % self.slots or self.slots % tile_size):
             raise NotImplementedError(
-                f"CP{mpc.pid}: Ciphertensor: tiled addition reduction case not implemented yet:\n"
-                f"\tCipher size: {size}\n"
-                f"\tTile size: {tile_size}\n"
-                f"\tTile size greater than slots: {tile_size > self.slots}\n"
-                f"\tTile offset: {tile_offset}\n"
-                f"\tCipher offset: {cipher_offset}")
+                f"CP{mpc.pid}: Ciphertensor: tiled addition reduction over several ciphertexts needs the size ({size}) to be a "
+                f"multiple of the slots ({self.slots}) and the tile size ({tile_size}) to divide the slots")
         
         cipher = self._data[0].copy()
-        
         for i in range(1, len(self._data)):
             mpc.mhe.crypto_params.evaluator.add(cipher, self._data[i], cipher)
 
-        rotation_step = tile_size
-        while rotation_step < size:
-            rotated_cipher = mpc.mhe.rotate([cipher], rotation_step)[0]
-            if rotation_step > self.slots // 2:
-                mask = mpc.mhe.enc_vector([(1.0 if i < (self.slots - rotation_step) else 0.0) for i in range(self.slots)], T=Plaintext)
-                mpc.mhe.imul([rotated_cipher], mask)
-            mpc.mhe.crypto_params.evaluator.add(cipher, rotated_cipher, cipher)
-            rotation_step <<= 1
-        
+        cipher = Ciphertensor._tile_sum(mpc, cipher, tile_size, min(size, self.slots) // tile_size)
         mask = mpc.mhe.enc_vector([(1.0 if i < tile_size else 0.0) for i in range(self.slots)], T=Plaintext)
         return Ciphertensor[ctype](
             _data=mpc.mhe.mul([cipher], mask),
@@ -1165,22 +1180,32 @@ class Ciphertensor[ctype]:
         return self.dot(mpc, self, axis)
     
     def matmul(self, mpc, other, debug: Static[bool] = DEBUG) -> Ciphertensor[ctype]:
-        if mpc.pid == 0:
+        # Every party routes, the trusted dealer included: the route depends on public data only, so CP0 takes the
+        # same one as the compute parties. It joins a via-MPC route, and for the others it returns a placeholder
+        # with the result's shape and layout flags, so that its later routing stays aligned (H-17).
+        if isinstance(other, Ciphertensor):
+            assert self.ndim == other.ndim == 2, f"Ciphertensor: at least one of the tensors is not a matrix. Self shape: {self.shape}, other shape: {other.shape}. Ciphertensor matmul supports only matrices at the moment"
             self_shape = self.actual_shape
             other_shape = other.actual_shape
-            new_shape = [self_shape[0], other_shape[1]]
-            return Ciphertensor[ctype].zeros(mpc, new_shape)
+            assert self_shape[1] == other_shape[0], f"Ciphertensor: invalid matrix dimensions for matmul: {self_shape} x {other_shape}"
         
-        assert self.ndim == other.ndim == 2, f"Ciphertensor: at least one of the tensors is not a matrix. Self shape: {self.shape}, other shape: {other.shape}. Ciphertensor matmul supports only matrices at the moment"
+            route, message = Ciphertensor._ct_matmul_route(self, other)
+            if route == MATMUL_UNSUPPORTED:
+                raise ValueError(message)
+            if mpc.pid == 0:
+                return Ciphertensor._matmul_placeholder(mpc, route, self_shape, other_shape)
         
-        if isinstance(other, Ciphertensor):
-            if self._diagonal_contiguous or other._diagonal_contiguous:
-                return self._matmul_v3(mpc, other, debug)
-            elif self._transposed and other._transposed:
+            if route == MATMUL_V3_11:
+                return self._matmul_v3_11(mpc, other, debug)
+            elif route == MATMUL_V3:
+                return self._matmul_v3_01(mpc, other, debug)
+            elif route == MATMUL_V2_T:
                 return other.T._matmul_v2(mpc, self.T, debug).T
-            elif self._transposed:
+            elif route == MATMUL_TNT:
                 return self._matmul_tnt(mpc, other, debug)
-            elif other._transposed:
+            elif route == MATMUL_TN:
+                return self._matmul_tn(mpc, other, debug)
+            elif route == MATMUL_V1:
                 return self._matmul_v1(mpc, other, debug)
             else:
                 return self._matmul_v2(mpc, other, debug)
@@ -1190,6 +1215,61 @@ class Ciphertensor[ctype]:
             return self._switch_matmul_by_cost(mpc, array(other), debug)
         else:
             compile_error("Invalid matmul operand type")
+
+    @staticmethod
+    def _ct_matmul_route(first, other) -> Tuple[int, str]:
+        # The kernel for first @ other (both Ciphertensors), from their logical shapes and layout flags, or
+        # MATMUL_UNSUPPORTED with the reason.
+        first_shape = first.actual_shape
+        other_shape = other.actual_shape
+        p, m, q = first_shape[0], first_shape[1], other_shape[1]
+        slots = first.slots
+
+        if first._diagonal_contiguous and other._diagonal_contiguous:
+            if Ciphertensor._v3_11_supported(p, m, q, slots):
+                return (MATMUL_V3_11, "")
+            return (MATMUL_UNSUPPORTED, f"Ciphertensor: the diagonal-encoded matmul {first_shape} x {other_shape} is not supported (it needs each of p, m, q to divide or be divisible by the others, max(p, m, q) <= {slots} slots, no tall x wide product with fewer result columns than rows, and 2p <= {slots} for a tall result of a wide first operand). Encode one operand row-wise (ENC_ROW).")
+        if first._diagonal_contiguous:
+            return (MATMUL_UNSUPPORTED, f"Not implemented yet: matmul of a diagonal-encoded {first_shape} by a non-diagonal {other_shape} matrix (M3 v10). Encode the first operand row-wise or both diagonal-wise.")
+        if other._diagonal_contiguous:
+            if first._transposed:
+                return (MATMUL_UNSUPPORTED, f"Not implemented yet: matmul of a column-wise {first_shape} by a diagonal-encoded {other_shape} matrix. Encode the first operand row-wise.")
+            if Ciphertensor._v3_01_supported(m, q, other._transposed, slots):
+                return (MATMUL_V3, "")
+            return (MATMUL_UNSUPPORTED, f"Ciphertensor: the M3 matmul {first_shape} x diagonal-encoded {other_shape} is not supported (it needs max(m, q) <= {slots} slots, a margin of max(m, q) + min(m, q) - 1 <= {slots} slots unless m divides the slots, and the larger of m and q to be a multiple of the smaller one when the second operand is tall or lazily transposed). Encode the second operand row-wise.")
+        if first._transposed and other._transposed:
+            return (MATMUL_V2_T, "")
+        if first._transposed:
+            return (MATMUL_TNT if Ciphertensor._tnt_supported(p, q, slots) else MATMUL_TN, "")
+        if other._transposed:
+            return (MATMUL_V1, "")
+        return (MATMUL_V2, "")
+
+    @staticmethod
+    def _matmul_layout(route: int, first_shape: List[int], other_shape: List[int]) -> Tuple[List[int], bool, bool, bool]:
+        # (shape, _transposed, _diagonal_contiguous, _skinny) of the result of a route, from the operands' logical
+        # shapes: what the kernel returns at the compute parties, and CP0's placeholder for it.
+        p, q = first_shape[0], other_shape[1]
+        if route == MATMUL_TNT:
+            if q == 1:
+                return ([1, p], True, False, False)
+            if p == 1:
+                return ([1, q], False, False, False)
+            return ([min(p, q), max(p, q)], False, True, q < p)
+        if route == MATMUL_V3_11:
+            return ([min(p, q), max(p, q)], False, True, q < p)
+        if route == MATMUL_V2_T or (route == MATMUL_TN and q < p):
+            return ([q, p], True, False, False)
+        return ([p, q], False, False, False)
+
+    @staticmethod
+    def _matmul_placeholder(mpc, route: int, first_shape: List[int], other_shape: List[int]) -> Ciphertensor[Ciphertext]:
+        shape, transposed, diagonal, skinny = Ciphertensor._matmul_layout(route, first_shape, other_shape)
+        placeholder = Ciphertensor[Ciphertext].zeros(mpc, shape)
+        placeholder._transposed = transposed
+        placeholder._diagonal_contiguous = diagonal
+        placeholder._skinny = skinny
+        return placeholder
 
     def iget_actual(self, mpc) -> Ciphertensor[ctype]:
         if self.ndim == 1:
@@ -1306,23 +1386,42 @@ class Ciphertensor[ctype]:
             stensor = foo(stensor, *args)
             processed_ctensors[i + 1] = stensor.to_ciphertensor(mpc)
         
-        if mpc.pid == 0 or mpc.pid in exclude_parties:
+        if mpc.pid == 0:
+            # CP0's conversions are placeholders with the result's shape and layout flags: return one, not the
+            # input, so that CP0's later routing matches the compute parties'
+            for placeholder in processed_ctensors.values():
+                return placeholder
+            return self
+
+        if mpc.pid in exclude_parties:
             return self
         
         return processed_ctensors[mpc.pid]
 
     def get_matmul_cost(self, other) -> float:
+        # The cost of the route matmul takes (inf where it raises), from public shapes and flags only
         if isinstance(other, Ciphertensor):
-            if self._diagonal_contiguous or other._diagonal_contiguous:
-                return Ciphertensor._get_matmul_v3_cost(self, other)
-            elif self._transposed and other._transposed:
-                return Ciphertensor._get_matmul_v2_cost(other.T, self.T)
-            elif self._transposed:
-                return Ciphertensor._get_matmul_tnt_cost(self, other)
-            elif other._transposed:
+            first_shape = self.actual_shape
+            other_shape = other.actual_shape
+            route, _ = Ciphertensor._ct_matmul_route(self, other)
+            if route == MATMUL_V3_11:
+                return Ciphertensor._get_matmul_v3_11_cost_by_shape(first_shape, other_shape, self.slots)
+            elif route == MATMUL_V3:
+                return Ciphertensor._get_matmul_v3_cost_by_shape(first_shape, other_shape, self.slots, other._transposed)
+            elif route == MATMUL_V2_T:
+                # M2 of the physical rows: other.T (q x m) @ self.T (m x p)
+                return Ciphertensor._get_matmul_v2_cost_by_shape(other.shape, self.shape, self.slots)
+            elif route == MATMUL_TNT:
+                cost = Ciphertensor._get_matmul_tnt_cost_by_shape(first_shape, other_shape, self.slots)
+                width = max(first_shape[0], other_shape[1])
+                return cost + Ciphertensor._replicate_cost(other_shape[1], width, other_shape[0])
+            elif route == MATMUL_TN:
+                return Ciphertensor._get_matmul_tn_cost_by_shape(first_shape, other_shape, self.slots)
+            elif route == MATMUL_V1:
                 return Ciphertensor._get_matmul_v1_cost(self, other)
-            else:
+            elif route == MATMUL_V2:
                 return Ciphertensor._get_matmul_v2_cost(self, other)
+            return inf
         elif isinstance(other, ndarray) or isinstance(other, list):
             return Ciphertensor._get_matmul_public_cost(self, other)
         else:
@@ -1344,10 +1443,15 @@ class Ciphertensor[ctype]:
 
     @staticmethod
     def _get_matmul_public_cost(first, other):
+        # The cheapest HE kernel for first @ other (plaintext other), from shapes and flags; finite whenever
+        # _switch_matmul_by_cost has a route (via-MPC and BSGS are left out)
         if first._diagonal_contiguous:
-            raise NotImplementedError()
+            return Ciphertensor._get_matmul_v3_11_cost_by_shape(first.actual_shape, other.shape, first.slots)
         if first._transposed:
-            return Ciphertensor._get_matmul_tnt_cost(first, other)
+            first_shape = first.actual_shape
+            return min(
+                Ciphertensor._get_matmul_tnt_cost_by_shape(first_shape, other.shape, first.slots),
+                Ciphertensor._get_matmul_v2_t_cost_by_shape(first_shape, other.shape, first.slots))
         
         return min(
             Ciphertensor._get_matmul_v1_cost(first, other),
@@ -1390,36 +1494,183 @@ class Ciphertensor[ctype]:
         return 1 if step <= LATTISEQ_ROTATION_KEYS_COUNT else step.popcnt()
 
     @staticmethod
-    def _get_matmul_v3_cost_by_shape(first_shape, other_shape, slots):
-        ctx_per_row = (max(max(first_shape), max(other_shape)) + slots - 1) // slots
-        diag_count = min(other_shape)
-        iter_count = first_shape[0] * diag_count
-        masking_overhead = 2 if ctx_per_row > 1 else 1
+    def _divides(a: int, b: int) -> bool:
+        # The larger of two positive sizes is a multiple of the smaller one
+        return max(a, b) % min(a, b) == 0
 
-        # Each diagonal i is handled with a from-scratch rotation by step i
-        # (_matmul_v3_01), so it costs _rot_key_switches(i) -- not 1 -- once i
-        # exceeds the dedicated-key range.
+    @staticmethod
+    def _diagonal_storage_ok(rows: int, cols: int) -> bool:
+        # The diagonal storage (cyclic_diag rows) of a rows x cols matrix holds every cell exactly once: always for a
+        # wide matrix, and for a tall one when its column count divides its row count.
+        return rows <= cols or rows % cols == 0
+
+    @staticmethod
+    def _tnt_supported(n: int, q: int, slots: int) -> bool:
+        # _matmul_tnt for A (n x m, column-wise) @ B (m x q): A's replicated rows (the rotation margin,
+        # max(n, q) + min(n, q) - 1 slots) fit one ciphertext, and the diagonal storage of the n x q result is faithful.
+        if n <= 0 or q <= 0:
+            return False
+        return max(n, q) + min(n, q) - 1 <= slots and Ciphertensor._diagonal_storage_ok(n, q)
+
+    @staticmethod
+    def _v3_01_supported(m: int, q: int, other_transposed: bool, slots: int) -> bool:
+        # _matmul_v3_01 for A (p x m, row-wise) @ B (m x q, diagonal-encoded): faithful storage of B (and of B^T, which
+        # a lazily transposed operand holds), one ciphertext per diagonal, and A's replicated rows covering the
+        # rotation margin (max(m, q) + min(m, q) - 1 slots) or, when m divides the slots, the whole ciphertext, where
+        # slot rotations are cyclic with period m.
+        if m <= 0 or q <= 0:
+            return False
+        if not Ciphertensor._diagonal_storage_ok(m, q):
+            return False
+        if other_transposed and not Ciphertensor._diagonal_storage_ok(q, m):
+            return False
+        width = max(m, q)
+        if width > slots:
+            return False
+        return width + min(m, q) - 1 <= slots or slots % m == 0
+
+    @staticmethod
+    def _v3_11_supported(p: int, m: int, q: int, slots: int) -> bool:
+        # _matmul_v3_11 for A (p x m) @ B (m x q), both diagonal-encoded, as brute-forced against plaintext: each pair of
+        # sizes divides, one ciphertext per diagonal, no tall A times wide B with q < p (unless m == 1), and 2p slots for
+        # the diagonal fold of a wide A whose result is tall (q < p).
+        if min(p, min(m, q)) <= 0 or max(p, max(m, q)) > slots:
+            return False
+        if not (Ciphertensor._divides(p, m) and Ciphertensor._divides(m, q) and Ciphertensor._divides(p, q)):
+            return False
+        if p > m and m <= q and q < p and m > 1:
+            return False
+        if p <= m and q < p and 2 * p > slots:
+            return False
+        return True
+
+    @staticmethod
+    def _rotate_slots(mpc, data: list[Ciphertext], step: int):
+        # Rotates every ciphertext of data in place by step slots (left), the step taken modulo the slots: a small
+        # right rotation uses its dedicated key, anything else a positive step (a dedicated key up to
+        # LATTISEQ_ROTATION_KEYS_COUNT, power-of-two keys beyond), so no rotation key is ever missing.
+        slots = mpc.mhe.crypto_params.params.slots()
+        step %= slots
+        if step == 0:
+            return
+        if slots - step <= LATTISEQ_ROTATION_KEYS_COUNT:
+            mpc.mhe.irotate(data, step - slots)
+        else:
+            mpc.mhe.irotate(data, step)
+
+    @staticmethod
+    def _tile_sum(mpc, cipher: Ciphertext, tile: int, count: int) -> Ciphertext:
+        # Slot t < tile of the result holds sum_{j < count} cipher[t + j * tile]: double-and-add over the binary digits
+        # of count, so any integer count, and it reads only slots below count * tile (no wrap-around). Slots past
+        # tile hold partial sums; the caller masks them.
+        evaluator = mpc.mhe.crypto_params.evaluator
+        acc = cipher.copy()
+        covered = 1
+        for bit in range(count.bitlen() - 2, -1, -1):
+            doubled = [acc.copy()]
+            Ciphertensor._rotate_slots(mpc, doubled, covered * tile)
+            evaluator.add(acc, doubled[0], acc)
+            covered <<= 1
+            if (count >> bit) & 1:
+                added = [cipher.copy()]
+                Ciphertensor._rotate_slots(mpc, added, covered * tile)
+                evaluator.add(acc, added[0], acc)
+                covered += 1
+        return acc
+
+    @staticmethod
+    def _tile_sum_cost(tile: int, count: int, slots: int) -> float:
         rot_switches = 0
-        for i in range(1, diag_count):
-            rot_switches += Ciphertensor._rot_key_switches(i, slots)
+        covered = 1
+        for bit in range(count.bitlen() - 2, -1, -1):
+            rot_switches += Ciphertensor._rot_key_switches(covered * tile, slots)
+            covered <<= 1
+            if (count >> bit) & 1:
+                rot_switches += Ciphertensor._rot_key_switches(covered * tile, slots)
+                covered += 1
+        return rot_switches * HE_ROT_COST_ESTIMATE
 
-        return (ctx_per_row * (iter_count * HE_MUL_COST_ESTIMATE * masking_overhead +
-                               first_shape[0] * rot_switches * HE_ROT_COST_ESTIMATE) +
-                (max(other_shape) - 1).bitlen() * HE_ROT_COST_ESTIMATE)
+    @staticmethod
+    def _replicate_cost(width: int, new_width: int, rows: int) -> float:
+        # Ciphertensor.replicate of rows single-ciphertext rows from width to new_width slots: a shift (a rotation and
+        # two plaintext multiplications) per doubling, then a mask
+        if new_width <= width or width <= 0:
+            return 0.0
+        doublings = 0
+        covered = width
+        while covered < new_width:
+            covered <<= 1
+            doublings += 1
+        return rows * (doublings * (HE_ROT_COST_ESTIMATE + 2 * HE_MUL_COST_ESTIMATE) + HE_MUL_COST_ESTIMATE)
+
+    @staticmethod
+    def _get_matmul_v3_cost_by_shape(first_shape, other_shape, slots, other_transposed: bool = False):
+        # _matmul_v3_01 for A (p x m, row-wise) @ B (m x q, diagonal-encoded); inf outside its domain
+        p, m, q = first_shape[0], first_shape[1], other_shape[1]
+        if not Ciphertensor._v3_01_supported(m, q, other_transposed, slots):
+            return inf
+        width = max(m, q)
+        diag_count = min(m, q)
+        margin = width + diag_count - 1
+        replicated_width = margin if margin <= slots else slots
+
+        # Each diagonal d multiplies a from-scratch rotation of the row by d
+        rot_switches = 0
+        for d in range(1, diag_count):
+            rot_switches += Ciphertensor._rot_key_switches(d, slots)
+
+        cost = (p * (diag_count * HE_MUL_COST_ESTIMATE + rot_switches * HE_ROT_COST_ESTIMATE) +
+                Ciphertensor._replicate_cost(m, replicated_width, p))
+        if q < width:
+            cost += p * (Ciphertensor._tile_sum_cost(q, width // q, slots) + HE_MUL_COST_ESTIMATE)
+        return cost
 
     @staticmethod
     def _get_matmul_tnt_cost_by_shape(first_shape, other_shape, slots):
-        cost_per_cipher = (max(first_shape[0], max(other_shape)) + slots - 1) // slots
-        diag_count = min(first_shape[0], other_shape[1])
-        iter_count = diag_count * other_shape[0]
+        # _matmul_tnt for A (n x m, column-wise) @ B (m x q, row-wise, plaintext: no replication cost for B); inf
+        # outside its domain
+        n, m, q = first_shape[0], other_shape[0], other_shape[1]
+        if not Ciphertensor._tnt_supported(n, q, slots):
+            return inf
+        width = max(n, q)
+        diag_count = min(n, q)
 
-        # Same from-scratch rotation-by-d_idx pattern as v3 (_matmul_tnt).
+        # Each diagonal d multiplies from-scratch rotations of A's m columns by d
         rot_switches = 0
-        for i in range(1, diag_count):
-            rot_switches += Ciphertensor._rot_key_switches(i, slots)
+        for d in range(1, diag_count):
+            rot_switches += Ciphertensor._rot_key_switches(d, slots)
 
-        return cost_per_cipher * (iter_count * HE_MUL_COST_ESTIMATE +
-                                  rot_switches * other_shape[0] * HE_ROT_COST_ESTIMATE)
+        return (m * (diag_count * HE_MUL_COST_ESTIMATE + rot_switches * HE_ROT_COST_ESTIMATE) +
+                Ciphertensor._replicate_cost(n, width + diag_count - 1, m))
+
+    @staticmethod
+    def _get_matmul_tn_cost_by_shape(first_shape, other_shape, slots):
+        # _matmul_tn for A (n x m, column-wise) @ B (m x q, row-wise): one duplication (a mask and a slot sum) and one
+        # multiplication per element of the narrower side times m
+        n, m, q = first_shape[0], other_shape[0], other_shape[1]
+        rows, width = (q, n) if q < n else (n, q)
+        ctx_per_row = (width + slots - 1) // slots
+        dup_rotations = (min(width, slots) - 1).bitlen()
+        return rows * m * (ctx_per_row * HE_MUL_COST_ESTIMATE + HE_MUL_COST_ESTIMATE + dup_rotations * HE_ROT_COST_ESTIMATE)
+
+    @staticmethod
+    def _get_matmul_v2_t_cost_by_shape(first_shape, other_shape, slots):
+        # M2 on the transposes for A (n x m, column-wise) @ plaintext B (m x q): ndarray M2 of B^T (q x m) and A's
+        # columns (the estimate ndarray._get_matmul_v2_cost gives it)
+        m, q = other_shape[0], other_shape[1]
+        cost_per_cipher = (m + slots - 1) // slots
+        return cost_per_cipher * q * m * (HE_MUL_COST_ESTIMATE + HE_ENC_COST_ESTIMATE * cost_per_cipher)
+
+    @staticmethod
+    def _get_matmul_v3_11_cost_by_shape(first_shape, other_shape, slots):
+        # _matmul_v3_11 for A (p x m) @ B (m x q), both diagonal-encoded; inf outside its domain. Each product of two
+        # diagonals takes a cyclic rotation (two rotations, two masks), and B is transposed first.
+        p, m, q = first_shape[0], first_shape[1], other_shape[1]
+        if not Ciphertensor._v3_11_supported(p, m, q, slots):
+            return inf
+        products = (p if p <= m else min(p, q)) * min(m, q)
+        cyclic_rotation = 2 * HE_ROT_COST_ESTIMATE + 3 * HE_MUL_COST_ESTIMATE
+        return products * cyclic_rotation + (min(m, q) - 1) * cyclic_rotation
     
     @staticmethod
     def _get_matmul_via_mpc_cost(first, other):
@@ -1435,11 +1686,20 @@ class Ciphertensor[ctype]:
     
     @staticmethod
     def _get_matmul_v3_cost(first, other):
+        # Row-wise first times a plaintext other encoded diagonal-wise (other's logical shape)
         return Ciphertensor._get_matmul_v3_cost_by_shape(first.shape, other.shape, first.slots)
     
     @staticmethod
     def _get_matmul_tnt_cost(first, other):
         return Ciphertensor._get_matmul_tnt_cost_by_shape(first.actual_shape, other.shape, first.slots)
+
+    def _rows_view(self) -> Ciphertensor[ctype]:
+        # The stored rows (diagonals, or columns of a lazily transposed tensor) as a plain row-wise tensor over the
+        # same ciphertexts: no copy, no layout flags, so the caller's flags are never touched
+        return Ciphertensor[ctype](
+            _data=self._data,
+            shape=self.shape.copy(),
+            slots=self.slots)
 
     def _irotate_raw(self, step: int):
         assert self.ndim > 1, "Ciphertensor: cannot irotate raw from one-dimensional ciphertensor"
@@ -1449,57 +1709,66 @@ class Ciphertensor[ctype]:
         if isinstance(ctype, Plaintext):
             return Ciphertensor[Plaintext].enc(mpc, self.decode(mpc, T=dtype) @ other)
         
+        assert self.ndim == 2, f"Ciphertensor: matmul by a matrix needs a matrix, not shape {self.shape}"
+        self_shape = self.actual_shape
+        other_shape = list(other.shape)
+        assert self_shape[1] == other_shape[0], f"Ciphertensor: invalid matrix dimensions for matmul: {self_shape} x {other_shape}"
+
+        # Every party routes, the trusted dealer included: the route depends on public data only, so CP0 joins a
+        # via-MPC route, and for the others returns a placeholder with the result's shape and layout flags (H-17)
+        route = self._ndarray_matmul_route(other_shape, mpc.default_allow_mpc_switch, mpc.pid, debug)
+        if route == MATMUL_VIA_MPC:
+            return self.via_mpc(mpc, lambda stensor: secure_operator.matmul(mpc, stensor, other), S=Tuple[int, int])
+        if mpc.pid == 0:
+            return Ciphertensor._matmul_placeholder(mpc, route, self_shape, other_shape)
+
+        # Plaintext operands are encoded in the layout the kernel reads, whatever the ambient default encoding
+        if route == MATMUL_V3_11:
+            return self._matmul_v3_11(mpc, Ciphertensor[Plaintext].enc(mpc, other, encoding=ENC_DIAG), debug)
+        elif route == MATMUL_TNT:
+            return self._matmul_tnt(mpc, other, debug)
+        elif route == MATMUL_V2_T:
+            return other.T._matmul_v2(mpc, self.T, debug).T
+        elif route == MATMUL_V1:
+            other_cipher = Ciphertensor[Plaintext].enc(mpc, other.T, encoding=ENC_ROW)
+            other_cipher._transposed = True
+            return self._matmul_v1(mpc, other_cipher, debug)
+        elif route == MATMUL_V2:
+            return self._matmul_v2(mpc, Ciphertensor[Plaintext].enc(mpc, other, encoding=ENC_ROW), debug)
+        elif route == MATMUL_V3:
+            return self._matmul_v3_01(mpc, Ciphertensor[Plaintext].enc(mpc, other, encoding=ENC_DIAG), debug)
+        else:
+            return self._matmul_bsgs(mpc, other, debug)
+
+    def _ndarray_matmul_route(self, other_shape: List[int], allow_mpc_switch: bool, pid: int, debug: Static[bool]) -> int:
+        # The kernel for self @ (plaintext of other_shape): the cheapest within its domain, from public shapes, layout
+        # flags and allow_mpc_switch only, so every party takes the same one
+        self_shape = self.actual_shape
         if self._diagonal_contiguous:
+            p, m, q = self_shape[0], self_shape[1], other_shape[1]
+            if not Ciphertensor._v3_11_supported(p, m, q, self.slots):
+                raise ValueError(f"Ciphertensor: the matmul of a diagonal-encoded {self_shape} matrix by a {other_shape} plaintext is not supported (the plaintext is encoded diagonal-wise, and the product needs each of p, m, q to divide or be divisible by the others, max(p, m, q) <= {self.slots} slots, no tall x wide product with fewer result columns than rows, and 2p <= {self.slots} for a tall result of a wide first operand). Encode the ciphertensor row-wise (ENC_ROW).")
             if debug:
-                print(f"\nCP{mpc.pid}:\tMatmul costs estimation skipped for cyclic-diagonal case. Public operand is coerced into cyclic-diagonal encoding.\n")
-            return self._matmul_v3(mpc, Ciphertensor[Plaintext].enc(mpc, other, encoding=ENC_DIAG), debug)
+                print(f"\nCP{pid}:\tMatmul costs estimation skipped for cyclic-diagonal case. Public operand is coerced into cyclic-diagonal encoding.\n")
+            return MATMUL_V3_11
+
         if self._transposed:
-            costs = (Ciphertensor._get_matmul_tnt_cost(self, other),
-                     ndarray._get_matmul_v2_cost(other, self, transposed=True))
-            
+            transposed_costs = (
+                Ciphertensor._get_matmul_tnt_cost_by_shape(self_shape, other_shape, self.slots),
+                Ciphertensor._get_matmul_v2_t_cost_by_shape(self_shape, other_shape, self.slots))
             if debug:
-                print(f"\nCP{mpc.pid}:\tMatmul costs for transposed case:\n\tTNT: {costs[0]}\n\tM2: {costs[1]}\n")
+                print(f"\nCP{pid}:\tMatmul costs for transposed case:\n\tTNT: {transposed_costs[0]}\n\tM2: {transposed_costs[1]}\n")
+            return MATMUL_TNT if argmin(transposed_costs) == 0 else MATMUL_V2_T
             
-            match argmin(costs):
-                case 0:
-                    return self._matmul_tnt(mpc, other, debug)
-                case 1:
-                    return other.T._matmul_v2(mpc, self.T, debug).T
-                case _:
-                    raise ValueError("Invalid cost index")
-        
-        costs = (Ciphertensor._get_matmul_via_mpc_cost(self, other),
-                 Ciphertensor._get_matmul_v1_cost(self, other),
-                 Ciphertensor._get_matmul_v2_cost(self, other),
-                 Ciphertensor._get_matmul_v3_cost(self, other),
-                 Ciphertensor._get_matmul_bsgs_cost(self, other))
-        
-        m, n = other.shape
-        if m % n and n % m:
-            # TODO: temporary constraint: matmul dimensions need to divisible by each-other in v3 matmul for now"
-            costs = (*costs[:3], inf, costs[4])
-        
-        if not mpc.default_allow_mpc_switch:
-            costs = (inf, *costs[1:])
-        
+        costs = (Ciphertensor._get_matmul_via_mpc_cost_by_shape(self.shape, other_shape, self.slots) if allow_mpc_switch else inf,
+                 Ciphertensor._get_matmul_v1_cost_by_shape(self.shape, other_shape, self.slots),
+                 Ciphertensor._get_matmul_v2_cost_by_shape(self.shape, other_shape, self.slots),
+                 Ciphertensor._get_matmul_v3_cost_by_shape(self.shape, other_shape, self.slots),
+                 Ciphertensor._get_matmul_bsgs_cost_by_shape(self.shape, other_shape, self.slots))
         if debug:
-            print(f"\nCP{mpc.pid}:\tMatmul costs:\n\tVia MPC: {costs[0]}\n\tM1: {costs[1]}\n\tM2: {costs[2]}\n\tM3: {costs[3]}\n\tBSGS: {costs[4]}\n")
-                
-        match argmin(costs):
-            case 0:
-                return self.via_mpc(mpc, lambda stensor: secure_operator.matmul(mpc, stensor, other), S=Tuple[int, int])
-            case 1:
-                other_cipher = Ciphertensor[Plaintext].enc(mpc, other.T)
-                other_cipher._transposed = True
-                return self._matmul_v1(mpc, other_cipher, debug)
-            case 2:
-                return self._matmul_v2(mpc, Ciphertensor[Plaintext].enc(mpc, other, encoding=ENC_ROW), debug)
-            case 3:
-                return self._matmul_v3(mpc, Ciphertensor[Plaintext].enc(mpc, other, encoding=ENC_DIAG), debug)
-            case 4:
-                return self._matmul_bsgs(mpc, other, debug)
-            case _:
-                raise ValueError("Invalid cost index")
+            print(f"\nCP{pid}:\tMatmul costs:\n\tVia MPC: {costs[0]}\n\tM1: {costs[1]}\n\tM2: {costs[2]}\n\tM3: {costs[3]}\n\tBSGS: {costs[4]}\n")
+            
+        return [MATMUL_VIA_MPC, MATMUL_V1, MATMUL_V2, MATMUL_V3, MATMUL_BSGS][argmin(costs)]
 
     @staticmethod
     def _bsgs_split(n: int):
@@ -1512,24 +1781,28 @@ class Ciphertensor[ctype]:
 
     @staticmethod
     def _get_matmul_bsgs_cost(first, other) -> float:
+        return Ciphertensor._get_matmul_bsgs_cost_by_shape(first.shape, other.shape, first.slots)
+
+    @staticmethod
+    def _get_matmul_bsgs_cost_by_shape(first_shape, other_shape, slots) -> float:
         # Eligible only for a non-empty square plaintext operand that fits half
         # the ciphertext slots (so cyclic rotation can be emulated by doubling).
-        if (other.shape[0] == 0
-                or other.shape[0] != other.shape[1]
-                or first.shape[1] != other.shape[0]
-                or other.shape[1] > first.slots >> 1):
+        if (other_shape[0] == 0
+                or other_shape[0] != other_shape[1]
+                or first_shape[1] != other_shape[0]
+                or other_shape[1] > slots >> 1):
             return inf
-        n = other.shape[0]
+        n = other_shape[0]
         baby, giants = Ciphertensor._bsgs_split(n)
-        rows = max(first.shape[0], 1)
+        rows = max(first_shape[0], 1)
         # Key-switch-exact rotations: babies (steps < baby) are single-switch
         # under PN14 params, giants rotate by g*baby and decompose via the
         # butterfly once past the dedicated-key range.
         rot_switches = 0
         for b in range(1, baby):
-            rot_switches += Ciphertensor._rot_key_switches(b, first.slots)
+            rot_switches += Ciphertensor._rot_key_switches(b, slots)
         for g in range(1, giants):
-            rot_switches += Ciphertensor._rot_key_switches(g * baby, first.slots)
+            rot_switches += Ciphertensor._rot_key_switches(g * baby, slots)
         # NOTE: plaintext-encoding cost is intentionally omitted here, matching
         # the v1/v2/v3 estimators -- every method encodes ~n plaintexts, so the
         # term is common to all options and cancels in argmin.
@@ -1553,6 +1826,8 @@ class Ciphertensor[ctype]:
         slots/2), so every baby step has a dedicated rotation key.
         """
         n = other.shape[0]
+        assert self.ndim == 2 and not self._transposed and not self._diagonal_contiguous, "Ciphertensor: _matmul_bsgs expects a row-wise, non-diagonal first operand"
+        assert other.shape[1] == n and self.shape[1] == n and 0 < 2 * n <= self.slots, f"Ciphertensor: _matmul_bsgs needs a square n x n plaintext with n equal to the first operand's column count and 2n <= {self.slots} slots, not {self.shape} x {other.shape}"
         if debug: print(f"CP{mpc.pid}:\tUsing BSGS M3 method for ciphertensor matrix multiplication for {self.shape} x {other.shape} operands")
 
         if self.shape[1] < n:
@@ -1631,7 +1906,8 @@ class Ciphertensor[ctype]:
         self_shape = self.shape
         other_shape = other.shape
         if debug: print(f"CP{mpc.pid}:\tUsing M1 method for ciphertensor matrix multiplication for {self_shape} x {other_shape} operands")
-        assert self_shape[1] == other_shape[1], f"Ciphertensor: invalid matrix dimentions for M1 matmul {self_shape} x {other_shape}"
+        assert self.ndim == other.ndim == 2 and self_shape[1] == other_shape[1], f"Ciphertensor: invalid matrix dimentions for M1 matmul {self_shape} x {other_shape}"
+        assert not self._transposed, "Ciphertensor: the first operand of M1 matrix multiplication must be row-wise (not lazily transposed)"
         assert other._transposed, "Ciphertensor: ciphertensor should be lazily transposed prior to M1 matrix multiplication by it"
         assert not self._diagonal_contiguous and not other._diagonal_contiguous, "Ciphertensor: cannot apply M1 matrix multiplication method to diagonal-contiguous ciphertensors"
 
@@ -1689,9 +1965,7 @@ class Ciphertensor[ctype]:
         return new_ciphertensor
 
     def _matmul_v3(self, mpc, other: Ciphertensor, debug: Static[bool]) -> Ciphertensor[ctype]:        
-        m, n = other.shape
-        assert m % n == 0 or n % m == 0, "Ciphertensor: temporary constraint --- matmul dimensions need to be divisible by eachother --- this is soon to be fixed"
-        
+        # M3 dispatch by which operands are diagonal-encoded; each kernel asserts its own domain
         if self._diagonal_contiguous and other._diagonal_contiguous:
             return self._matmul_v3_11(mpc, other, debug)
         elif self._diagonal_contiguous:
@@ -1703,88 +1977,90 @@ class Ciphertensor[ctype]:
     
     def _matmul_v3_01(self, mpc, other: Ciphertensor, debug: Static[bool]):
         """
-        M3 method from https://arxiv.org/pdf/2304.00129.pdf
-        Case self non-diagonal-contiguous and other is diagonal-contiguous.
+        M3 method from https://arxiv.org/pdf/2304.00129.pdf: A (p x m, row-wise) @ B (m x q, diagonal-encoded:
+        D_d[t] = B[(t + d) % m][t % q] for t < W = max(m, q), d < D = min(m, q)). Row i of the result is
+            r_i[t] = sum_{d < D} rot(a_i, d)[t] * D_d[t] = sum_d A[i][(t + d) % m] * B[(t + d) % m][t % q],  t < W,
+        with a_i replicated with its own period m over W + D - 1 slots (the rotation margin), or over the whole
+        ciphertext when m divides the slots (rotations are then cyclic with period m). For a tall B (q < W = m) the
+        m / q tiles of r_i are summed into its q columns. Domain: _v3_01_supported.
         """
-        self_actual_shape = self.actual_shape
-        other_actual_shape = other.actual_shape
-        
-        self_is_broadcast = self._is_broadcast
-        other_is_broadcast = other._is_broadcast
-        
-        if debug: print(f"CP{mpc.pid}:\tUsing M3 method for ciphertensor matrix multiplication for {self_actual_shape} x {other_actual_shape} operands")
-        assert self_actual_shape[1] == other_actual_shape[0], f"Ciphertensor: Invalid matrix dimensions for M3 matmul {self_actual_shape} x {other_actual_shape}"
+        assert self.ndim == other.ndim == 2, "Ciphertensor: _matmul_v3_01 expects matrices"
+        assert not self._transposed and not self._diagonal_contiguous, "Not implemented yet: col-wise x diagonal-wise matmul case is not added yet"
         assert other._diagonal_contiguous, "Ciphertensor: _matmul_v3_01 expects second operand to be diagonal-contiguous"
-        assert not self._transposed, "Not implemented yet: col-wise x diagonal-wise matmul case is not added yet"
-        if other._transposed:
-            other = other.T.actual_transpose(mpc)
-        assert not other._transposed, "Ciphertensor: internal error"
-
-        if self.shape[1] < other.shape[1]:
+        other_actual_shape = other.actual_shape
+        p, m = self.shape[0], self.shape[1]
+        q = other_actual_shape[1]
+        if debug: print(f"CP{mpc.pid}:\tUsing M3 method for ciphertensor matrix multiplication for {self.shape} x {other_actual_shape} operands")
+        assert m == other_actual_shape[0], f"Ciphertensor: Invalid matrix dimensions for M3 matmul {self.shape} x {other_actual_shape}"
+        assert Ciphertensor._v3_01_supported(m, q, other._transposed, self.slots), f"Ciphertensor: _matmul_v3_01 does not support {self.shape} x diagonal-encoded {other_actual_shape}: it needs max(m, q) <= {self.slots} slots, max(m, q) + min(m, q) - 1 <= {self.slots} unless m divides the slots, and the larger of m and q to be a multiple of the smaller one for a tall (or lazily transposed) second operand"
+        
+        # The diagonal storage of B itself: a lazily transposed operand holds B^T's
+        other_diag = other.T.actual_transpose(mpc) if other._transposed else other
+        other_is_broadcast = True if isinstance(other, Ciphertensor[Plaintext]) else other._is_broadcast
+        is_broadcast = self._is_broadcast and other_is_broadcast
+        
+        width = max(m, q)
+        diag_count = min(m, q)
+        margin = width + diag_count - 1
+        replicated_width = margin if margin <= self.slots else self.slots
+        replicate_self = self
+        if replicated_width > m:
             mpc.mhe.refresh(self._data, self._is_broadcast, min_level_distance=2)
-            replicate_self = self.replicate(mpc, other.shape[1])
-        else: replicate_self = self.copy()
-
-        semi_slot = replicate_self.shape[1] < self.slots >> 1
-        # No need to do actual rotation downstream if data size is less than slots // 2
-        # Patch copy self to double size
-        if semi_slot:
-            replicate_self = replicate_self.replicate(mpc, replicate_self.shape[1] << 1)
-            # Assume diagonals are trailed by zeros and pad them lazily by expanding shape
-            other.shape[1] <<= 1
-        
+            replicate_self = self.replicate(mpc, replicated_width)
         mpc.mhe.refresh(replicate_self._data, self._is_broadcast, min_level_distance=2)
-        if isinstance(other, Ciphertensor[Ciphertext]):
-            mpc.mhe.refresh(other._data, other._is_broadcast)
-        
-        new_data = []
-        debug_counter = 0
-        for row in replicate_self:
-            if debug:
-                debug_counter += 1
-                print(f"CP{mpc.pid}:\tCiphertensor M3 matmul v01: {debug_counter}/{replicate_self.shape[0]} ...")
-            
-            new_row = row.mul(mpc, other.diagonal(0))
-            
-            row._is_broadcast = self_is_broadcast
-            for i in range(1, min(other.shape)):
-                rotated_row = row.copy()
+        if isinstance(other_diag, Ciphertensor[Ciphertext]):
+            mpc.mhe.refresh(other_diag._data, other_diag._is_broadcast)
 
-                if semi_slot:
-                    mpc.mhe.irotate(rotated_row._data, i)
-                else:
-                    rotated_row.irotate(mpc, i)
-                
-                other_diag = other.diagonal(i)
-                other_diag._is_broadcast = other_is_broadcast
-                rotated_row.imul(mpc, other_diag, no_refresh=True)
-                new_row.iadd(mpc, rotated_row)
-            
-            new_data.extend(new_row._data)
-        
-        mpc.mhe.refresh(new_data)
-        
-        new_ciphertensor = Ciphertensor[ctype](
+        evaluator = mpc.mhe.crypto_params.evaluator
+        fold_mask = List[Plaintext]()
+        if q < width:
+            fold_mask = mpc.mhe.enc_vector([(1.0 if i < q else 0.0) for i in range(self.slots)], T=Plaintext)
+        new_data = List[Ciphertext](p)
+        for i in range(p):
+            if debug: print(f"CP{mpc.pid}:\tCiphertensor M3 matmul v01: {i + 1}/{p} ...")
+            row = replicate_self._data[i]
+            new_row = [row.copy()]
+            mpc.mhe.imul(new_row, other_diag._data[:1], no_refresh=True)
+            for d in range(1, diag_count):
+                rotated_row = [row.copy()]
+                Ciphertensor._rotate_slots(mpc, rotated_row, d)
+                mpc.mhe.imul(rotated_row, other_diag._data[d:d + 1], no_refresh=True)
+                evaluator.add(new_row[0], rotated_row[0], new_row[0])
+            new_data.append(new_row[0])
+
+        # The result is left unrescaled (rescaled lazily by the next multiplication): a rescale leaves a scale close to,
+        # but not at, the default one, and a later addition to a default-scale operand does not align the two (M-LAT-06),
+        # an error of about (q / scale - 1) times that operand's values.
+        if q < width:
+            # Tall B: sum the m / q tiles of each row into its first q slots and mask the partial sums past them
+            mpc.mhe.refresh(new_data, is_broadcast)
+            for i in range(p):
+                folded = [Ciphertensor._tile_sum(mpc, new_data[i], q, width // q)]
+                mpc.mhe.refresh(folded, is_broadcast)
+                mpc.mhe.imul(folded, fold_mask, no_refresh=True)
+                new_data[i] = folded[0]
+        return Ciphertensor[ctype](
             _data=new_data,
-            shape=replicate_self.shape,
+            shape=[p, q],
             slots=self.slots)
 
-        if semi_slot:
-            other.shape[1] >>= 1
-        
-        if other_actual_shape[1] < replicate_self.shape[1]:
-            return new_ciphertensor.reduce_add_tiled(mpc, other_actual_shape[1])
-        elif semi_slot:
-            new_ciphertensor.shape[1] >>= 1
-            new_ciphertensor._reset_chunk_size()
-        
-        return new_ciphertensor
-
     def _matmul_v3_10(self, mpc, other: Ciphertensor, debug: Static[bool]):
-        raise NotImplementedError("INTERNAL: _matmul_v3_10 case not implemented yet")
+        raise NotImplementedError(f"Not implemented yet: matmul of a diagonal-encoded {self.actual_shape} by a non-diagonal {other.actual_shape} matrix (M3 v10). Encode the first operand row-wise or both diagonal-wise.")
         return Ciphertensor[ctype]()
     
     def _matmul_v3_11(self, mpc, other: Ciphertensor, debug: Static[bool]):
+        """
+        M3, both operands diagonal-encoded: A (p x m) @ B (m x q). Domain (_v3_11_supported, brute-forced against
+        plaintext): each pair of p, m, q divides, max(p, m, q) <= slots, no tall A times wide B with q < p (unless
+        m == 1), and 2p <= slots for the diagonal fold of a wide A whose result is tall. The result is the diagonal
+        storage [min(p, q), max(p, q)] of the p x q product.
+        """
+        assert self._diagonal_contiguous and other._diagonal_contiguous, "Ciphertensor: _matmul_v3_11 expects both operands to be diagonal-contiguous"
+        self_actual_shape = self.actual_shape
+        other_actual_shape = other.actual_shape
+        assert self_actual_shape[1] == other_actual_shape[0], f"Ciphertensor: Invalid matrix dimensions for M3 matmul {self_actual_shape} x {other_actual_shape}"
+        assert Ciphertensor._v3_11_supported(self_actual_shape[0], self_actual_shape[1], other_actual_shape[1], self.slots), f"Ciphertensor: _matmul_v3_11 does not support diagonal-encoded {self_actual_shape} x {other_actual_shape}: it needs each of p, m, q to divide or be divisible by the others, max(p, m, q) <= {self.slots} slots, no tall x wide product with fewer result columns than rows, and 2p <= {self.slots} for a tall result of a wide first operand"
+
         if self._transposed:
             self_nt = self.T.actual_transpose(mpc)
         else:
@@ -1805,6 +2081,7 @@ class Ciphertensor[ctype]:
             print(f"CP{mpc.pid}:\tUsing M3 (wide) method for ciphertensor matrix multiplication for {self.shape} x {other_actual_shape} operands")
         assert self.shape[1] == other_actual_shape[0], f"Ciphertensor: Invalid matrix dimensions for M3 matmul {self.shape} x {other_actual_shape}"
         assert self._diagonal_contiguous and other._diagonal_contiguous, "Ciphertensor: _matmul_v3_11 expects both operands to be diagonal-contiguous"
+        assert Ciphertensor._v3_11_supported(self.shape[0], self.shape[1], other_actual_shape[1], self.slots), f"Ciphertensor: _matmul_v3_11_wide does not support diagonal-encoded {self.shape} x {other_actual_shape}"
 
         if other._transposed:
             other_t = other.T
@@ -1815,9 +2092,8 @@ class Ciphertensor[ctype]:
 
         replicate_self = self
         if max(self.shape) < max(other_t.shape):
-            # TODO: Write test for this case
-            replicate_self._diagonal_contiguous = False
-            replicate_self = replicate_self.replicate(mpc, max(other_t.shape))
+            # Replicate the diagonals as the rows of a plain view: the caller's layout flags stay as they are
+            replicate_self = self._rows_view().replicate(mpc, max(other_t.shape))
             replicate_self._diagonal_contiguous = True
 
         diag_count = self.shape[0]
@@ -1861,6 +2137,7 @@ class Ciphertensor[ctype]:
         assert self.shape[::-1] == self.actual_shape and self_actual_shape[0] > self_actual_shape[1], f"Ciphertensor: skinny matrix does not have a skinny shape: {self.shape}"
         assert self_actual_shape[1] == other_actual_shape[0], f"Ciphertensor: Invalid matrix dimensions for M3 matmul {self_actual_shape} x {other_actual_shape}"
         assert self._diagonal_contiguous and other._diagonal_contiguous, "Ciphertensor: _matmul_v3_11 expects both operands to be diagonal-contiguous"
+        assert Ciphertensor._v3_11_supported(self_actual_shape[0], self_actual_shape[1], other_actual_shape[1], self.slots), f"Ciphertensor: _matmul_v3_11_tall does not support diagonal-encoded {self_actual_shape} x {other_actual_shape}"
         
         if other._transposed:
             other_t = other.T
@@ -1868,21 +2145,21 @@ class Ciphertensor[ctype]:
             other_t = other.actual_transpose(mpc)
         assert not self._transposed and not other_t._transposed, "Ciphertensor: diagonal x diagonal matmul operands must not be lazy-transposed"
 
+        # Diagonals are replicated as the rows of plain views: the caller's layout flags stay as they are
         replicate_self = self
         if max(self.shape) < max(other_t.shape):
-            # TODO: Write test for this case
-            replicate_self._diagonal_contiguous = False
-            replicate_self = replicate_self.replicate(mpc, max(other_t.shape))
+            replicate_self = self._rows_view().replicate(mpc, max(other_t.shape))
             replicate_self._diagonal_contiguous = True
         elif max(other_t.shape) < max(self.shape):
-            other_t._diagonal_contiguous = False
-            other_t = other_t.replicate(mpc, max(self.shape))
+            other_t = other_t._rows_view().replicate(mpc, max(self.shape))
             other_t._diagonal_contiguous = True
             
         diag_count = min(self_actual_shape[0], other_actual_shape[1])
         new_diags = {}
 
-        if other._skinny:
+        # B's own orientation decides the accumulation (other._skinny describes the stored matrix, B^T for a lazily
+        # transposed other)
+        if other_actual_shape[0] > other_actual_shape[1]:
             for i in range(min(self.shape)):
                 if debug:
                     print(f"CP{mpc.pid}:\tCiphertensor M3 matmul v11 (tall): {i + 1}/{min(self.shape)} ...")
@@ -1932,82 +2209,131 @@ class Ciphertensor[ctype]:
     
     def _matmul_tnt(self, mpc, other, debug: Static[bool]):
         """
-        Case self is c-contiguous transposed and other is c-contiguous not transposed (either ciphertensor or ndarray).
+        A @ B with A (n x m) stored column-wise (self is lazily transposed; its physical rows are A's columns
+        a_k = A[:, k], shape [m, n]) and B (m x q) row-wise (rows b_k): a Ciphertensor or a plaintext ndarray.
+        Diagonal d of the result is
+            R_d[c] = sum_k rot(a_k, d)[c] * b_k[c] = R[(c + d) % n][c % q],  c < W = max(n, q), d < D = min(n, q),
+        the diagonal storage of R, with a_k replicated with its own period n over W + D - 1 slots (the rotation
+        margin) and b_k with its period q over W slots. Domain: _tnt_supported (one ciphertext per replicated row,
+        faithful diagonal storage of R). The result is [D, W] diagonal-encoded (_skinny = q < n); a column (q == 1)
+        comes out as a transposed [1, n] row and a row (n == 1) as a [1, q] row.
         """
-        self_actual_shape = self.actual_shape
-        other_actual_shape = other.shape
-        if debug: print(f"CP{mpc.pid}:\tUsing c-contig transposed-non-transposed method for ciphertensor matrix multiplication for {self_actual_shape} x {other_actual_shape} operands")
-
-        if self.shape[1] > other.shape[1]:
-            other = other.replicate(mpc, self.shape[1])
-
-        if isinstance(other, ndarray):
-            other_cipher = Ciphertensor[Plaintext].enc(mpc, other)
-        elif isinstance(other, Ciphertensor):
-            other_cipher = other
-        else:
+        assert self.ndim == 2 and self._transposed and not self._diagonal_contiguous, "Ciphertensor: _matmul_tnt expects a lazily transposed (column-wise), non-diagonal first operand"
+        if isinstance(other, Ciphertensor):
+            assert other.ndim == 2 and not other._transposed and not other._diagonal_contiguous, "Ciphertensor: _matmul_tnt expects a row-wise, non-diagonal second operand"
+        elif not isinstance(other, ndarray):
             compile_error("Ciphertensor: invalid input for _matmul_tnt")
         
-        assert self_actual_shape[1] == other_cipher.shape[0], f"Ciphertensor: Invalid matrix dimentions for M3 matmul {self_actual_shape} x {other_cipher.shape}"
-        assert not self._diagonal_contiguous and not other_cipher._diagonal_contiguous, "Ciphertensor: _matmul_tnt expects operand to be c-contiguous"
-        assert self._transposed and not other_cipher._transposed, "Ciphertensor: _matmul_tnt expects first operand to be transposed and second operand not to be transposed"
+        m, n = self.shape[0], self.shape[1]
+        q = other.shape[1]
+        if debug: print(f"CP{mpc.pid}:\tUsing c-contig transposed-non-transposed method for ciphertensor matrix multiplication for {self.actual_shape} x {other.shape} operands")
+        assert other.shape[0] == m, f"Ciphertensor: Invalid matrix dimentions for TNT matmul {self.actual_shape} x {other.shape}"
+        assert Ciphertensor._tnt_supported(n, q, self.slots), f"Ciphertensor: _matmul_tnt does not support {self.actual_shape} x {other.shape}: it needs max(n, q) + min(n, q) - 1 <= {self.slots} slots and, for a tall result, q dividing n"
+        width = max(n, q)
+        diag_count = min(n, q)
 
-        if self.shape[1] < other_cipher.shape[1]: replicate_self = self.replicate(mpc, other_cipher.shape[1])
-        else: replicate_self = self.copy()
-
-        semi_slot = replicate_self.shape[1] < self.slots >> 1
-        # No need to do actual rotation downstream if data size is less than slots // 2
-        # Patch copy self to double size
-        if semi_slot:
-            replicate_self = replicate_self.replicate(mpc, replicate_self.shape[1] << 1)
-            # Assume diagonals are trailed by zeros and pad them lazily by expanding shape
-            other_cipher.shape[1] <<= 1
-        
+        # A's columns: the physical rows of self, as a row-wise view (replicate copies them)
+        self_rows = self._rows_view()
+        replicate_self = self_rows
+        if width + diag_count - 1 > n:
+            mpc.mhe.refresh(self._data, self._is_broadcast, min_level_distance=2)
+            replicate_self = self_rows.replicate(mpc, width + diag_count - 1)
         mpc.mhe.refresh(replicate_self._data, self._is_broadcast, min_level_distance=2)
-        if isinstance(other_cipher, Ciphertensor[Ciphertext]):
-            mpc.mhe.refresh(other_cipher._data, other_cipher._is_broadcast)
-        
-        new_data = []
-        debug_counter = 0
-        diagonals_count = min(self_actual_shape[0], other_actual_shape[1])
-        for d_idx in range(diagonals_count):
-            if debug:
-                debug_counter += 1
-                print(f"CP{mpc.pid}:\tCiphertensor M3 matmul (tnt): {debug_counter}/{diagonals_count} ...")
-            
-            rotated_self = replicate_self.copy()
-            if semi_slot and d_idx:
-                mpc.mhe.irotate(rotated_self._data, d_idx)
-            elif d_idx:
-                rotated_self.irotate(mpc, d_idx)
 
-            new_diagonal = rotated_self._get_rows_raw(0).mul(mpc, other_cipher._get_rows_raw(0))
-            for i in range(1, other_cipher.shape[0]):
-                new_diagonal.iadd(mpc, rotated_self._get_rows_raw(i).mul(mpc, other_cipher._get_rows_raw(i)))
-                
-            new_data.extend(new_diagonal._data)
+        # B's rows over the result's width. A plaintext B is replicated in the clear and encoded row-wise whatever the
+        # ambient default encoding (M-MHE-12); the caller's operand is never modified.
+        if isinstance(other, ndarray):
+            other_rows = Ciphertensor[Plaintext].enc(mpc, other.replicate(width) if q < width else other, encoding=ENC_ROW)
+        elif isinstance(other, Ciphertensor[Plaintext]):
+            other_plain = other.decode(mpc, T=float)
+            other_rows = Ciphertensor[Plaintext].enc(mpc, other_plain.replicate(width) if q < width else other_plain, encoding=ENC_ROW)
+        else:
+            other_rows = other
+            if q < width:
+                mpc.mhe.refresh(other._data, other._is_broadcast, min_level_distance=2)
+                other_rows = other.replicate(mpc, width)
+            mpc.mhe.refresh(other_rows._data, other._is_broadcast)
         
-        if semi_slot:
-            replicate_self.shape[1] >>= 1
-            other_cipher.shape[1] >>= 1
+        evaluator = mpc.mhe.crypto_params.evaluator
+        new_data = List[Ciphertext](diag_count)
+        for d_idx in range(diag_count):
+            if debug: print(f"CP{mpc.pid}:\tCiphertensor M3 matmul (tnt): {d_idx + 1}/{diag_count} ...")
+            new_diagonal = [replicate_self._data[0].copy()]
+            Ciphertensor._rotate_slots(mpc, new_diagonal, d_idx)
+            mpc.mhe.imul(new_diagonal, other_rows._data[:1], no_refresh=True)
+            for k in range(1, m):
+                term = [replicate_self._data[k].copy()]
+                Ciphertensor._rotate_slots(mpc, term, d_idx)
+                mpc.mhe.imul(term, other_rows._data[k:k + 1], no_refresh=True)
+                evaluator.add(new_diagonal[0], term[0], new_diagonal[0])
+            new_data.append(new_diagonal[0])
         
-        result_shape = [self_actual_shape[0], other_actual_shape[1]]
-
-        _transposed = False
-        _diagonal_contiguous = False
-        if result_shape[1] == 1:
-            result_shape = result_shape[::-1]
-            _transposed = True
-        elif result_shape[0] > 1:
-            _diagonal_contiguous = True
-        
+        if q == 1:
+            return Ciphertensor[ctype](
+                _data=new_data,
+                shape=[1, n],
+                slots=self.slots,
+                _transposed=True,
+                _diagonal_contiguous=False,
+                _skinny=False)
+        if n == 1:
+            return Ciphertensor[ctype](
+                _data=new_data,
+                shape=[1, q],
+                slots=self.slots)
         return Ciphertensor[ctype](
                 _data=new_data,
-                shape=result_shape,
+                shape=[diag_count, width],
                 slots=self.slots,
-                _transposed=_transposed,
-                _diagonal_contiguous=_diagonal_contiguous,
-                _skinny=(other_actual_shape[1] < self_actual_shape[0]) and _diagonal_contiguous)
+                _transposed=False,
+                _diagonal_contiguous=True,
+                _skinny=q < n)
+
+    def _matmul_tn(self, mpc, other: Ciphertensor, debug: Static[bool]):
+        """
+        A @ B with A (n x m) stored column-wise (self lazily transposed; physical rows a_k = A[:, k]) and B (m x q)
+        row-wise (rows b_k), for every shape (the fallback outside _tnt_supported): M2 with A read by columns. For
+        q < n it builds the rows of R^T, R^T[c] = sum_k B[k][c] * a_k (q * m duplications of width n), and returns
+        them lazily transposed; otherwise the rows of R, R[i] = sum_k A[i][k] * b_k (n * m duplications of width q).
+        """
+        assert self.ndim == other.ndim == 2, "Ciphertensor: _matmul_tn expects matrices"
+        assert self._transposed and not self._diagonal_contiguous, "Ciphertensor: _matmul_tn expects a lazily transposed (column-wise), non-diagonal first operand"
+        assert not other._transposed and not other._diagonal_contiguous, "Ciphertensor: _matmul_tn expects a row-wise, non-diagonal second operand"
+        m, n = self.shape[0], self.shape[1]
+        q = other.shape[1]
+        if debug: print(f"CP{mpc.pid}:\tUsing column-wise x row-wise M2 method for ciphertensor matrix multiplication for {self.actual_shape} x {other.shape} operands")
+        assert other.shape[0] == m, f"Ciphertensor: Invalid matrix dimentions for TN matmul {self.actual_shape} x {other.shape}"
+
+        # A's columns: the physical rows of self, as a row-wise view
+        self_rows = self._rows_view()
+        if q < n:
+            if isinstance(other, Ciphertensor[Plaintext]):
+                # B in the clear: ndarray M2 of B^T (q x m) and A's columns
+                result = other.decode(mpc, T=float).T._matmul_v2(mpc, self_rows, debug)
+            else:
+                result = Ciphertensor[ctype].zeros(mpc, [q, n])
+                mpc.mhe.refresh(other._data, other._is_broadcast, min_level_distance=1)
+                mpc.mhe.refresh(self._data, self._is_broadcast)
+                for c in range(q):
+                    if debug: print(f"CP{mpc.pid}:\tCiphertensor TN matmul: {c + 1}/{q} ...")
+                    new_row = result._get_rows_raw(c)
+                    for k in range(m):
+                        other_elem_duplicated = other._get_rows_raw(k).getitemdup(mpc, c, n)
+                        new_row.iadd(mpc, self_rows._get_rows_raw(k).mul(mpc, other_elem_duplicated))
+            result._transposed = True
+            return result
+        
+        result = Ciphertensor[ctype].zeros(mpc, [n, q])
+        mpc.mhe.refresh(self._data, self._is_broadcast, min_level_distance=1)
+        if isinstance(other, Ciphertensor[Ciphertext]):
+            mpc.mhe.refresh(other._data, other._is_broadcast)
+        for i in range(n):
+            if debug: print(f"CP{mpc.pid}:\tCiphertensor TN matmul: {i + 1}/{n} ...")
+            new_row = result._get_rows_raw(i)
+            for k in range(m):
+                self_elem_duplicated = self_rows._get_rows_raw(k).getitemdup(mpc, i, q)
+                new_row.iadd(mpc, other._get_rows_raw(k).mul(mpc, self_elem_duplicated))
+        return result
 
     def _handle_plaintext_case(self, mpc, op) -> Ciphertensor[Plaintext]:
         raise NotImplementedError("Plaintext univariate operations not implemented yet. Decoding is too expensive.")
@@ -2424,7 +2750,7 @@ class ndarray:
     
     def _matmul_v1[ctype](self, mpc, other: Ciphertensor[ctype], debug: Static[bool]) -> Ciphertensor[ctype]:
         if other._transposed:
-            return Ciphertensor[Plaintext].enc(mpc, self)._matmul_v1(mpc, other, debug)
+            return Ciphertensor[Plaintext].enc(mpc, self, encoding=ENC_ROW)._matmul_v1(mpc, other, debug)
 
         assert self.ndim == other.ndim == 2, f"Ciphertensor: at least one of the tensors is not a matrix. Self shape: {self.shape}, other shape: {other.shape}. Ciphertensor matmul supports only matrices at the moment"
         assert self.shape[1] == other.shape[0], f"Ciphertensor: invalid matrix dimentions for reversed matmul: {self.shape} x {other.shape}"

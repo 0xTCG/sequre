@@ -64,31 +64,22 @@ When `X_tilde` is a `Sharetensor`, this is a standard Beaver-triple matmul — o
 
 ### One layer down: the cost selector
 
-The key function is `_switch_matmul_by_cost` in [stdlib/sequre/types/ciphertensor.codon](https://github.com/0xTCG/sequre/blob/main/stdlib/sequre/types/ciphertensor.codon). When a `Ciphertensor` is multiplied by a plaintext `ndarray`, it estimates the cost of four strategies:
+The key functions are `_switch_matmul_by_cost` and `_ndarray_matmul_route` in [stdlib/sequre/types/ciphertensor.codon](https://github.com/0xTCG/sequre/blob/main/stdlib/sequre/types/ciphertensor.codon). When a row-wise `Ciphertensor` is multiplied by a plaintext `ndarray`, the router estimates the cost of five strategies from the operands' shapes:
 
 ```python
-costs = (Ciphertensor._get_matmul_via_mpc_cost(self, other),   # decrypt, MPC matmul, re-encrypt
-         Ciphertensor._get_matmul_v1_cost(self, other),          # M1: column-packed HE
-         Ciphertensor._get_matmul_v2_cost(self, other),          # M2: row-packed HE
-         Ciphertensor._get_matmul_v3_cost(self, other))          # M3: diagonal-packed HE
-
-if not mpc.default_allow_mpc_switch:
-    costs = (inf, *costs[1:])       # disable MPC path unless opted in
+costs = (Ciphertensor._get_matmul_via_mpc_cost_by_shape(self.shape, other_shape, self.slots) if allow_mpc_switch else inf,  # decrypt, MPC matmul, re-encrypt
+         Ciphertensor._get_matmul_v1_cost_by_shape(self.shape, other_shape, self.slots),    # M1: column-packed HE
+         Ciphertensor._get_matmul_v2_cost_by_shape(self.shape, other_shape, self.slots),    # M2: row-packed HE
+         Ciphertensor._get_matmul_v3_cost_by_shape(self.shape, other_shape, self.slots),    # M3: diagonal-packed HE
+         Ciphertensor._get_matmul_bsgs_cost_by_shape(self.shape, other_shape, self.slots))  # BSGS: baby-step giant-step diagonals
+return [MATMUL_VIA_MPC, MATMUL_V1, MATMUL_V2, MATMUL_V3, MATMUL_BSGS][argmin(costs)]
 ```
 
-Then it picks the cheapest:
+A strategy whose shape constraints do not hold costs `inf`, and the via-MPC path costs `inf` unless `mpc.allow_mpc_switch()` is active. `_switch_matmul_by_cost` then runs the route it returned. Column-wise and diagonal-encoded ciphertensors have routes of their own.
 
-```python
-match argmin(costs):
-    case 0: return self.via_mpc(mpc, lambda stensor: secure_operator.matmul(mpc, stensor, other), ...)
-    case 1: return self._matmul_v1(mpc, other_cipher, debug)
-    case 2: return self._matmul_v2(mpc, ..., debug)
-    case 3: return self._matmul_v3(mpc, ..., debug)
-```
+So the same `@` in the algorithm code can end up as a completely different computation path depending on tensor shapes and whether `mpc.allow_mpc_switch()` is active. Every party computes the same route, the trusted dealer included, because the costs depend on public data only. `DEBUG` mode can be enabled to see the cost breakdown printed at runtime.
 
-So the same `@` in the algorithm code can end up as a completely different computation path depending on tensor shapes and whether `mpc.allow_mpc_switch()` is active. `DEBUG` mode can be enabled to see the cost breakdown printed at runtime.
-
-The three pure-HE strategies (M1, M2, M3) differ in how they pack matrix elements into CKKS ciphertext slots — column-wise, row-wise, or diagonal-wise. Each has different rotation and multiplication costs depending on the matrix dimensions. The "Via MPC" path does the full E2S → Beaver matmul → S2E round-trip.
+The pure-HE strategies differ in how they pack matrix elements into CKKS ciphertext slots: column-wise (M1), row-wise (M2), or diagonal-wise (M3 and BSGS). Each has different rotation and multiplication costs depending on the matrix dimensions. The "Via MPC" path does the full E2S → Beaver matmul → S2E round-trip.
 
 ### Going deeper
 

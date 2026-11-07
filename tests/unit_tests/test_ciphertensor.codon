@@ -5,11 +5,13 @@ import secure_operator
 import sequre.lattiseq.ckks as ckks
 
 from sequre import sequre
-from sequre.types.ciphertensor import Ciphertensor
+from sequre.types.ciphertensor import (
+    Ciphertensor, MATMUL_VIA_MPC, MATMUL_V1, MATMUL_V2, MATMUL_V3, MATMUL_BSGS, MATMUL_TNT, MATMUL_V2_T, MATMUL_TN,
+    MATMUL_V3_11)
 from sequre.utils.stats import precision_stats
 from sequre.utils.testing import assert_eq, assert_neq
 from sequre.utils.utils import zeros, random_floats
-from sequre.constants import ENC_DIAG, ENC_ROW
+from sequre.constants import ENC_DIAG, ENC_ROW, ENC_COL
 
 
 def test_ciphertensor_send_receive(mpc):
@@ -519,9 +521,10 @@ def test_ciphertensor_lazy_bootstrapping(mpc, rows, cols):
         bootstrap_count = mpc.stats.secure_bootstrap_count - bootstrap_count
         assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor lazy bootstrapping (fishing) for shape ({rows}, {cols}): stats", bootstrap_count, 16 * (mpc.comms.number_of_parties - 1))
         bootstrap_count = mpc.stats.secure_bootstrap_count
+        # TNT refreshes its first operand once, before replicating it: the 4 low-level ciphertexts of each party
         power_matrix = power_matrix.T @ Ciphertensor[ckks.Ciphertext].enc(mpc, fat_values)
         bootstrap_count = mpc.stats.secure_bootstrap_count - bootstrap_count
-        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor lazy bootstrapping (fishing) for shape ({rows}, {cols}): stats", bootstrap_count, 8 * (mpc.comms.number_of_parties - 1))
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor lazy bootstrapping (fishing) for shape ({rows}, {cols}): stats", bootstrap_count, 4 * (mpc.comms.number_of_parties - 1))
     
 
 @sequre
@@ -647,10 +650,13 @@ def test_ciphertensor_matrix_multiplication(mpc, rows: int, cols: int, only_gene
                 expected=values_1 @ values_2.transpose())
             assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor _matmul_v2 for shape ({rows}, {cols})", stats.min_precision.l2 > 5, True)
             
-            if rows.popcnt() == 1 and cols.popcnt() == 1:  # Temp constrain. Until arbitrary dimensions are enabled for _matmul_v3.
-                encrypted_values_1_d_contig = Ciphertensor[ckks.Ciphertext].enc(mpc, values_1, encoding=ENC_DIAG)
+            # The M3 kernels run on the shapes inside their domains (diagonal storage of each operand, then the
+            # kernel's own conditions); the router never sends them anything else.
+            slots = mpc.mhe.crypto_params.params.slots()
+            rows_cols_diag = Ciphertensor._diagonal_storage_ok(rows, cols)
+            cols_rows_diag = Ciphertensor._diagonal_storage_ok(cols, rows)
+            if cols_rows_diag and Ciphertensor._v3_01_supported(cols, rows, False, slots):
                 encrypted_values_2_d_contig = Ciphertensor[ckks.Ciphertext].enc(mpc, values_2.transpose(), encoding=ENC_DIAG)
-                
                 result_v3_01 = encrypted_values_1._matmul_v3(mpc, encrypted_values_2_d_contig, debug=True)
                 stats = precision_stats(
                     mpc=mpc,
@@ -658,22 +664,25 @@ def test_ciphertensor_matrix_multiplication(mpc, rows: int, cols: int, only_gene
                     expected=values_1 @ values_2.transpose())
                 assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor _matmul_v3 (row-wise x diag-wise) for shape ({rows}, {cols})", stats.min_precision.l2 > 4, True)
 
+            if rows_cols_diag and cols_rows_diag and Ciphertensor._v3_11_supported(rows, cols, rows, slots):
+                encrypted_values_1_d_contig = Ciphertensor[ckks.Ciphertext].enc(mpc, values_1, encoding=ENC_DIAG)
+                encrypted_values_2_d_contig = Ciphertensor[ckks.Ciphertext].enc(mpc, values_2.transpose(), encoding=ENC_DIAG)
                 result_v3_11 = encrypted_values_1_d_contig._matmul_v3(mpc, encrypted_values_2_d_contig, debug=True)
                 stats = precision_stats(
                     mpc=mpc,
                     result=result_v3_11.reveal(mpc, T=float).tolist(),
                     expected=values_1 @ values_2.transpose())
-                assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor _matmul_v3 (diag-wise x diag-wise case first operand wide) for shape ({rows}, {cols})", stats.min_precision.l2 > 4, True)
+                assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor _matmul_v3 (diag-wise x diag-wise, A @ B.T) for shape ({rows}, {cols})", stats.min_precision.l2 > 4, True)
 
+            if rows_cols_diag and cols_rows_diag and Ciphertensor._v3_11_supported(cols, rows, cols, slots):
                 encrypted_values_1_d_contig = Ciphertensor[ckks.Ciphertext].enc(mpc, values_1.transpose(), encoding=ENC_DIAG)
                 encrypted_values_2_d_contig = Ciphertensor[ckks.Ciphertext].enc(mpc, values_2, encoding=ENC_DIAG)
                 result_v3_11 = encrypted_values_1_d_contig._matmul_v3(mpc, encrypted_values_2_d_contig, debug=True)
-
                 stats = precision_stats(
                     mpc=mpc,
                     result=result_v3_11.reveal(mpc, T=float).tolist(),
                     expected=values_1.transpose() @ values_2)
-                assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor _matmul_v3 (diag-wise x diag-wise case first operand tall) for shape ({rows}, {cols})", stats.min_precision.l2 > 4, True)
+                assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor _matmul_v3 (diag-wise x diag-wise, A.T @ B) for shape ({rows}, {cols})", stats.min_precision.l2 > 4, True)
 
             result_t = encrypted_values_1.T @ values_2
 
@@ -683,14 +692,14 @@ def test_ciphertensor_matrix_multiplication(mpc, rows: int, cols: int, only_gene
                 expected=values_1.transpose() @ values_2)
             assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor matmul transposed general for shape ({rows}, {cols})", stats.min_precision.l2 > 4, True)
         
-        if rows.popcnt() == 1 and cols.popcnt() == 1:  # Temp constraint. Until arbitrary dimensions are enabled for _matmul_v3.
-            result_general = encrypted_values_1 @ values_2.transpose()
+        # The router takes a kernel whose domain holds the shapes (M1 and M2 hold every shape)
+        result_general = encrypted_values_1 @ values_2.transpose()
 
-            stats = precision_stats(
-            mpc=mpc,
-                result=result_general.reveal(mpc, T=float).tolist(),
-                expected=values_1 @ values_2.transpose())
-            assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor matmul general for shape ({rows}, {cols})", stats.min_precision.l2 > 4, True)
+        stats = precision_stats(
+        mpc=mpc,
+            result=result_general.reveal(mpc, T=float).tolist(),
+            expected=values_1 @ values_2.transpose())
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor matmul general for shape ({rows}, {cols})", stats.min_precision.l2 > 4, True)
 
 
 @sequre
@@ -750,6 +759,273 @@ def test_ciphertensor_reversed_matrix_multiplication(mpc, rows, cols):
         assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor reversed matmul for shape ({rows}, {cols})", stats.min_precision.l2 > 7, True)
 
 
+def _matmul_layout_of(ct) -> List[int]:
+    # A matrix product's result: shape, layout flags and ciphertext count
+    return [ct.shape[0], ct.shape[1], int(ct._transposed), int(ct._diagonal_contiguous), int(ct._skinny), len(ct._data)]
+
+
+def _check_matmul_layout(mpc, result, route: int, first_shape: List[int], other_shape: List[int], msg: str):
+    # The kernel's result has the layout the router's CP0 placeholder for that route gets
+    shape, transposed, diagonal, skinny = Ciphertensor._matmul_layout(route, first_shape, other_shape)
+    expected = [shape[0], shape[1], int(transposed), int(diagonal), int(skinny), Ciphertensor._count_ciphers(shape, result.slots)]
+    assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor {msg}: layout", _matmul_layout_of(result), expected)
+
+
+def _check_matmul_value(mpc, result, expected, msg: str):
+    stats = precision_stats(mpc=mpc, result=result.reveal(mpc, T=float).tolist(), expected=expected)
+    assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor {msg}", stats.min_precision.l2 > 4, True)
+
+
+def _check_routed_matmul(mpc, result, expected, msg: str):
+    # Every party, the trusted dealer included, holds a result of the same layout; the compute parties' is correct
+    layouts = mpc.comms.collect(_matmul_layout_of(result), include_trusted_dealer=True)
+    same_layout = True
+    for layout in layouts:
+        same_layout = same_layout and layout == layouts[0]
+    assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor {msg}: same result layout at every party", same_layout, True)
+    if mpc.pid > 0:
+        _check_matmul_value(mpc, result, expected, msg)
+
+
+def _matmul_ct_pt_case(mpc, rows: int, inner: int, cols: int, encoding: str, expected_route: int, label: str):
+    # ct @ ndarray through _switch_matmul_by_cost, at every party
+    with mpc.randomness.seed_switch(-1):
+        values_1 = random_floats((rows, inner), scale=1)
+        values_2 = random_floats((inner, cols), scale=1)
+    msg = f"{label} ({rows}x{inner} @ {inner}x{cols})"
+    other = array(values_2)
+    encrypted = Ciphertensor[ckks.Ciphertext].enc(mpc, values_1, encoding=encoding)
+    route = encrypted._ndarray_matmul_route([inner, cols], mpc.default_allow_mpc_switch, mpc.pid, debug=False)
+    assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor {msg}: route", route, expected_route)
+    result = secure_operator.matmul(mpc, encrypted, other)
+    if mpc.pid > 0 and route != MATMUL_VIA_MPC:
+        _check_matmul_layout(mpc, result, route, [rows, inner], [inner, cols], msg)
+    _check_routed_matmul(mpc, result, values_1 @ values_2, msg)
+
+
+def _matmul_ct_ct_case(mpc, rows: int, inner: int, cols: int, encoding_1: str, encoding_2: str, expected_route: int, label: str):
+    # ct @ ct through Ciphertensor.matmul, at every party
+    with mpc.randomness.seed_switch(-1):
+        values_1 = random_floats((rows, inner), scale=1)
+        values_2 = random_floats((inner, cols), scale=1)
+    msg = f"{label} ({rows}x{inner} {encoding_1} @ {inner}x{cols} {encoding_2})"
+    encrypted_1 = Ciphertensor[ckks.Ciphertext].enc(mpc, values_1, encoding=encoding_1)
+    encrypted_2 = Ciphertensor[ckks.Ciphertext].enc(mpc, values_2, encoding=encoding_2)
+    route, _ = Ciphertensor._ct_matmul_route(encrypted_1, encrypted_2)
+    assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor {msg}: route", route, expected_route)
+    result = secure_operator.matmul(mpc, encrypted_1, encrypted_2)
+    if mpc.pid > 0:
+        _check_matmul_layout(mpc, result, route, [rows, inner], [inner, cols], msg)
+    _check_routed_matmul(mpc, result, values_1 @ values_2, msg)
+
+
+def _matmul_unsupported_case(mpc, rows: int, inner: int, cols: int, encoding_1: str, encoding_2: str, label: str):
+    # A product outside every kernel's domain raises a ValueError at every party, before any communication
+    with mpc.randomness.seed_switch(-1):
+        values_1 = random_floats((rows, inner), scale=1)
+        values_2 = random_floats((inner, cols), scale=1)
+    encrypted_1 = Ciphertensor[ckks.Ciphertext].enc(mpc, values_1, encoding=encoding_1)
+    raised = False
+    if encoding_2:
+        encrypted_2 = Ciphertensor[ckks.Ciphertext].enc(mpc, values_2, encoding=encoding_2)
+        try:
+            secure_operator.matmul(mpc, encrypted_1, encrypted_2)
+        except ValueError:
+            raised = True
+    else:
+        try:
+            secure_operator.matmul(mpc, encrypted_1, array(values_2))
+        except ValueError:
+            raised = True
+    other_label = encoding_2 if encoding_2 else "plaintext"
+    assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor {label} ({rows}x{inner} {encoding_1} @ {inner}x{cols} {other_label}) raises", raised, True)
+
+
+def test_ciphertensor_matmul_routing(mpc):
+    # Router decisions are public: every party (the trusted dealer included) takes the same route, CP0 gets a
+    # placeholder with the result's layout, and the compute parties' result matches the plaintext product.
+    slots = mpc.mhe.crypto_params.params.slots()
+    # ct @ ndarray
+    _matmul_ct_pt_case(mpc, 3, 5, 4, ENC_ROW, MATMUL_V2, "ct @ pt router: M2")
+    _matmul_ct_pt_case(mpc, 2, 6, 2, ENC_ROW, MATMUL_V3, "ct @ pt router: M3 with a tall plaintext (3 tiles)")
+    _matmul_ct_pt_case(mpc, 2, 4, 4, ENC_ROW, MATMUL_BSGS, "ct @ pt router: BSGS")
+    _matmul_ct_pt_case(mpc, 2, 3, slots + 8, ENC_ROW, MATMUL_V2, "ct @ pt router: M2 with rows over two ciphertexts")
+    _matmul_ct_pt_case(mpc, 5, 3, 2, ENC_COL, MATMUL_V2_T, "ct @ pt router: column-wise, TNT outside its domain")
+    _matmul_ct_pt_case(mpc, 4, 2, 8, ENC_COL, MATMUL_TNT, "ct @ pt router: column-wise TNT")
+    _matmul_ct_pt_case(mpc, 3, 6, 3, ENC_DIAG, MATMUL_V3_11, "ct @ pt router: diagonal-encoded")
+    _matmul_unsupported_case(mpc, 4, 2, 2, ENC_DIAG, "", "ct @ pt router: diagonal-encoded tall x wide")
+    # ct @ ct
+    _matmul_ct_ct_case(mpc, 3, 4, 5, ENC_ROW, ENC_ROW, MATMUL_V2, "ct @ ct router: M2")
+    _matmul_ct_ct_case(mpc, 3, 4, 5, ENC_ROW, ENC_COL, MATMUL_V1, "ct @ ct router: M1")
+    _matmul_ct_ct_case(mpc, 5, 3, 2, ENC_COL, ENC_COL, MATMUL_V2_T, "ct @ ct router: both column-wise")
+    _matmul_ct_ct_case(mpc, 6, 2, 3, ENC_COL, ENC_ROW, MATMUL_TNT, "ct @ ct router: TNT, tall result")
+    _matmul_ct_ct_case(mpc, 6, 2, 4, ENC_COL, ENC_ROW, MATMUL_TN, "ct @ ct router: TN, TNT outside its domain")
+    _matmul_ct_ct_case(mpc, slots + 8, 1, 2, ENC_COL, ENC_ROW, MATMUL_TN, "ct @ ct router: TN, columns over two ciphertexts")
+    _matmul_ct_ct_case(mpc, 2, 3, 6, ENC_ROW, ENC_DIAG, MATMUL_V3, "ct @ ct router: M3 row x diagonal")
+    _matmul_ct_ct_case(mpc, 3, 6, 3, ENC_DIAG, ENC_DIAG, MATMUL_V3_11, "ct @ ct router: M3 diagonal x diagonal")
+    _matmul_unsupported_case(mpc, 3, 6, 3, ENC_DIAG, ENC_ROW, "ct @ ct router: diagonal x row-wise")
+    _matmul_unsupported_case(mpc, 2, 3, slots, ENC_ROW, ENC_DIAG, "ct @ ct router: row x diagonal past the rotation margin")
+
+
+def test_ciphertensor_matmul_via_mpc(mpc):
+    # H-17: under allow_mpc_switch() the router may pick via-MPC; the trusted dealer takes the same route and joins it
+    with mpc.allow_mpc_switch():
+        _matmul_ct_pt_case(mpc, 4, 4, 3, ENC_ROW, MATMUL_VIA_MPC, "ct @ pt router under allow_mpc_switch: via MPC")
+
+
+@sequre
+def test_ciphertensor_reversed_matmul_routing(mpc):
+    # ndarray @ ct runs (ct.T @ ndarray.T).T through the router: here column-wise TNT, at every party
+    with mpc.randomness.seed_switch(-1):
+        values_1 = random_floats((3, 4), scale=1)
+        values_2 = random_floats((4, 2), scale=1)
+    encrypted = Ciphertensor[ckks.Ciphertext].enc(mpc, values_2, encoding=ENC_ROW)
+    route = encrypted.T._ndarray_matmul_route([4, 3], mpc.default_allow_mpc_switch, mpc.pid, debug=False)
+    assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor reversed matmul (3x4 @ 4x2): route", route, MATMUL_TNT)
+    result = array(values_1) @ encrypted
+    _check_routed_matmul(mpc, result, values_1 @ values_2, "reversed matmul (3x4 plaintext @ 4x2 row-wise)")
+
+
+def _tnt_case(mpc, n: int, m: int, q: int, plaintext_other: bool, label: str):
+    # _matmul_tnt directly: A (n x m) column-wise @ B (m x q) row-wise
+    with mpc.randomness.seed_switch(-1):
+        values_1 = random_floats((n, m), scale=1)
+        values_2 = random_floats((m, q), scale=1)
+    if mpc.pid > 0:
+        other_label = " plaintext" if plaintext_other else ""
+        msg = f"_matmul_tnt {label} ({n}x{m} @ {m}x{q}{other_label})"
+        encrypted_1 = Ciphertensor[ckks.Ciphertext].enc(mpc, values_1, encoding=ENC_COL)
+        if plaintext_other:
+            result = encrypted_1._matmul_tnt(mpc, array(values_2), debug=False)
+        else:
+            result = encrypted_1._matmul_tnt(mpc, Ciphertensor[ckks.Ciphertext].enc(mpc, values_2, encoding=ENC_ROW), debug=False)
+        _check_matmul_layout(mpc, result, MATMUL_TNT, [n, m], [m, q], msg)
+        _check_matmul_value(mpc, result, values_1 @ values_2, msg)
+
+
+def _tn_case(mpc, n: int, m: int, q: int, label: str):
+    # _matmul_tn directly: A (n x m) column-wise @ B (m x q) row-wise
+    with mpc.randomness.seed_switch(-1):
+        values_1 = random_floats((n, m), scale=1)
+        values_2 = random_floats((m, q), scale=1)
+    if mpc.pid > 0:
+        msg = f"_matmul_tn {label} ({n}x{m} @ {m}x{q})"
+        encrypted_1 = Ciphertensor[ckks.Ciphertext].enc(mpc, values_1, encoding=ENC_COL)
+        result = encrypted_1._matmul_tn(mpc, Ciphertensor[ckks.Ciphertext].enc(mpc, values_2, encoding=ENC_ROW), debug=False)
+        _check_matmul_layout(mpc, result, MATMUL_TN, [n, m], [m, q], msg)
+        _check_matmul_value(mpc, result, values_1 @ values_2, msg)
+
+
+def _v3_01_case(mpc, p: int, m: int, q: int, plaintext_other: bool, transposed_other: bool, label: str):
+    # _matmul_v3_01 directly: A (p x m) row-wise @ B (m x q) diagonal-encoded (or B^T diagonal-encoded, lazily transposed)
+    with mpc.randomness.seed_switch(-1):
+        values_1 = random_floats((p, m), scale=1)
+        values_2 = random_floats((m, q), scale=1)
+    if mpc.pid > 0:
+        other_label = " plaintext" if plaintext_other else (" lazily transposed" if transposed_other else "")
+        msg = f"_matmul_v3_01 {label} ({p}x{m} @ diagonal {m}x{q}{other_label})"
+        encrypted_1 = Ciphertensor[ckks.Ciphertext].enc(mpc, values_1, encoding=ENC_ROW)
+        if plaintext_other:
+            result = encrypted_1._matmul_v3(mpc, Ciphertensor[ckks.Plaintext].enc(mpc, values_2, encoding=ENC_DIAG), debug=False)
+        elif transposed_other:
+            result = encrypted_1._matmul_v3(mpc, Ciphertensor[ckks.Ciphertext].enc(mpc, values_2.transpose(), encoding=ENC_DIAG).T, debug=False)
+        else:
+            result = encrypted_1._matmul_v3(mpc, Ciphertensor[ckks.Ciphertext].enc(mpc, values_2, encoding=ENC_DIAG), debug=False)
+        _check_matmul_layout(mpc, result, MATMUL_V3, [p, m], [m, q], msg)
+        _check_matmul_value(mpc, result, values_1 @ values_2, msg)
+
+
+def _v3_11_case(mpc, p: int, m: int, q: int, transposed_1: bool, transposed_2: bool, label: str):
+    # _matmul_v3_11 directly: A (p x m) @ B (m x q), both diagonal-encoded (or their transposes, lazily transposed)
+    with mpc.randomness.seed_switch(-1):
+        values_1 = random_floats((p, m), scale=1)
+        values_2 = random_floats((m, q), scale=1)
+    if mpc.pid > 0:
+        first_label = " (T)" if transposed_1 else ""
+        second_label = " (T)" if transposed_2 else ""
+        msg = f"_matmul_v3_11 {label} (diagonal {p}x{m}{first_label} @ diagonal {m}x{q}{second_label})"
+        if transposed_1:
+            encrypted_1 = Ciphertensor[ckks.Ciphertext].enc(mpc, values_1.transpose(), encoding=ENC_DIAG).T
+        else:
+            encrypted_1 = Ciphertensor[ckks.Ciphertext].enc(mpc, values_1, encoding=ENC_DIAG)
+        if transposed_2:
+            encrypted_2 = Ciphertensor[ckks.Ciphertext].enc(mpc, values_2.transpose(), encoding=ENC_DIAG).T
+        else:
+            encrypted_2 = Ciphertensor[ckks.Ciphertext].enc(mpc, values_2, encoding=ENC_DIAG)
+        result = encrypted_1._matmul_v3(mpc, encrypted_2, debug=False)
+        _check_matmul_layout(mpc, result, MATMUL_V3_11, [p, m], [m, q], msg)
+        _check_matmul_value(mpc, result, values_1 @ values_2, msg)
+
+
+def test_ciphertensor_matmul_kernels(mpc):
+    # Each kernel against plaintext, one shape per regime of its domain (non-square, non-power-of-two), and its
+    # domain asserts outside it. Brute-force sweeps of the same kernels in a plaintext slot model found no wrong
+    # result inside the domains and wrong results outside them.
+    slots = mpc.mhe.crypto_params.params.slots()
+    _tnt_case(mpc, 6, 3, 2, False, "tall result, 3 tiles")
+    _tnt_case(mpc, 3, 2, 5, True, "wide result, rows not dividing columns")
+    _tnt_case(mpc, 1, 3, 4, False, "one-row result")
+    _tnt_case(mpc, 5, 2, 1, True, "one-column result")
+    _tnt_case(mpc, slots // 2 + 4, 2, 4, True, "rows wider than half the slots")
+    _tn_case(mpc, 6, 2, 4, "result columns not dividing rows")
+    _tn_case(mpc, 2, 3, 5, "wide result")
+    _v3_01_case(mpc, 2, 2, 3, False, False, "wide, inner size not dividing columns")
+    _v3_01_case(mpc, 3, 6, 2, True, False, "tall, 3 tiles")
+    _v3_01_case(mpc, 2, slots, 4, True, False, "inner size equal to the slots")
+    _v3_01_case(mpc, 2, 3, 6, False, True, "wide")
+    _v3_11_case(mpc, 3, 6, 12, False, False, "wide x wide")
+    _v3_11_case(mpc, 3, 6, 3, False, False, "wide x tall, square result")
+    _v3_11_case(mpc, 6, 6, 2, False, False, "wide x tall, tall result (fold of 3)")
+    _v3_11_case(mpc, 6, 3, 1, False, False, "tall x tall")
+    _v3_11_case(mpc, 6, 3, 6, False, False, "tall x wide, square result")
+    _v3_11_case(mpc, 3, 6, 3, True, False, "first lazily transposed")
+    _v3_11_case(mpc, 3, 6, 3, False, True, "second lazily transposed")
+
+    with mpc.randomness.seed_switch(-1):
+        values = random_floats((6, 4), scale=1)
+        vector = random_floats((12,), scale=1)
+        short_vector = random_floats((10,), scale=1)
+    if mpc.pid > 0:
+        # Outside the domains: the kernels assert, the diagonal encoder refuses a tall matrix it cannot hold
+        raised = False
+        try:
+            Ciphertensor[ckks.Ciphertext].enc(mpc, values, encoding=ENC_DIAG)
+        except AssertionError:
+            raised = True
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor diagonal encoding of a tall 6x4 matrix raises", raised, True)
+
+        raised = False
+        try:
+            Ciphertensor[ckks.Ciphertext].enc(mpc, values, encoding=ENC_COL)._matmul_tnt(mpc, array([row[:4] for row in values[:4]]), debug=False)
+        except AssertionError:
+            raised = True
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor _matmul_tnt outside its domain (6x4 @ 4x4) raises", raised, True)
+
+        raised = False
+        try:
+            tall = Ciphertensor[ckks.Ciphertext].enc(mpc, [row[:2] for row in values[:4]], encoding=ENC_DIAG)
+            square = Ciphertensor[ckks.Ciphertext].enc(mpc, [row[:2] for row in values[:2]], encoding=ENC_DIAG)
+            tall._matmul_v3(mpc, square, debug=False)
+        except AssertionError:
+            raised = True
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor _matmul_v3_11 outside its domain (4x2 @ 2x2) raises", raised, True)
+
+        # Tiled reduction with a non-power-of-two tile count, and a size that is not a multiple of the tile
+        encrypted_vector = Ciphertensor[ckks.Ciphertext].enc(mpc, vector)
+        stats = precision_stats(
+            mpc=mpc,
+            result=encrypted_vector.reduce_add_tiled(mpc, 4).reveal(mpc, T=float).flatten().tolist(),
+            expected=[vector[t] + vector[t + 4] + vector[t + 8] for t in range(4)])
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor tiled addition reduction of 12 slots into 4", stats.min_precision.l2 > 10, True)
+
+        raised = False
+        try:
+            Ciphertensor[ckks.Ciphertext].enc(mpc, short_vector).reduce_add_tiled(mpc, 4)
+        except AssertionError:
+            raised = True
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor tiled addition reduction of 10 slots into tiles of 4 raises", raised, True)
+
+
 def test_ciphertensor_vector_operations(mpc, rows, cols):
     test_ciphertensor_getitem(mpc, rows, cols)
     test_ciphertensor_setitem(mpc, rows, cols)
@@ -801,6 +1077,10 @@ def test_ciphertensor_arithmetics(mpc):
     test_ciphertensor_reversed_matrix_multiplication(mpc, 4, 8)
     test_ciphertensor_reversed_matrix_multiplication(mpc, 8, 4)
     test_ciphertensor_reversed_matrix_multiplication(mpc, 7, 7)
+    test_ciphertensor_matmul_kernels(mpc)
+    test_ciphertensor_matmul_routing(mpc)
+    test_ciphertensor_reversed_matmul_routing(mpc)
+    test_ciphertensor_matmul_via_mpc(mpc)
 
 
 def test_ciphertensor(mpc):

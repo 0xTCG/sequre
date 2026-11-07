@@ -45,7 +45,7 @@ ct = Ciphertensor.enc_row_wise(mpc, my_array, padding=16)
 | `Ciphertensor.enc(mpc, data, padding=0, encoding="")` | Encrypt and encode plaintext data into a ciphertensor |
 | `Ciphertensor.enc_public(mpc, data, padding=0, encoding="")` | Encode public data (the same at every party) in `enc`'s layout as trivial encryptions `(Encode(v), 0)`: identical at every party, noiseless, no public-key encryption. Private data needs `enc` |
 | `Ciphertensor.enc_row_wise(mpc, data, padding=0)` | Encrypt in row-wise encoding |
-| `Ciphertensor.enc_diag_wise(mpc, data, padding=0)` | Encrypt 2-D data in diagonal-contiguous encoding |
+| `Ciphertensor.enc_diag_wise(mpc, data, padding=0)` | Encrypt 2-D data in diagonal-contiguous encoding (a tall matrix needs its column count to divide its row count) |
 | `Ciphertensor.enc_replicate(mpc, value, shape)` | Create ciphertensor with a scalar replicated across shape |
 | `Ciphertensor.enc_alpern(mpc, data)` | Encode 3-D arrays in Alpern order |
 | `Ciphertensor.zeros(mpc, shape)` | Zero-initialized ciphertensor with given shape |
@@ -126,6 +126,24 @@ These methods take `mpc` as the first argument and return a new ciphertensor:
 
 !!! note
     `matmul` automatically selects between pure-MHE and [MPC ↔ MHE switching](../user-guide/switching.md) paths based on a cost estimator when `AllowMPCSwitch` is active.
+
+### Matrix products
+
+`a @ b` (or `a.matmul(mpc, b)`) picks a best matrix multiplication algorithm (kernel) based on the operands' layouts and shapes. With A of shape p x m, B of shape m x q, and S slots per ciphertext:
+
+| A | B | Kernel | Shapes |
+|---|---|---|---|
+| row-wise | row-wise | M2 | any |
+| row-wise | column-wise | M1 | any |
+| column-wise | column-wise | M2 on the transposes | any |
+| column-wise | row-wise (ciphertensor or plaintext) | TNT, diagonal-encoded result | max(p, q) + min(p, q) - 1 <= S, and q divides p when q < p |
+| column-wise | row-wise ciphertensor, outside TNT's shapes | M2 reading A by columns | any |
+| row-wise | diagonal-encoded | M3 | max(m, q) <= S; max(m, q) + min(m, q) - 1 <= S unless m divides S; q divides m when q < m, and m divides q when m < q for a lazily transposed B |
+| diagonal-encoded | diagonal-encoded | M3 | each of p, m, q divides or is divisible by the others; max(p, m, q) <= S; no tall A (p > m > 1) times wide B with q < p; 2p <= S when A is wide and q < p |
+| diagonal-encoded | not diagonal-encoded | none | not implemented |
+| column-wise | diagonal-encoded | none | not implemented |
+
+With a plaintext `ndarray` B, the dispatcher estimates the cost of each kernel whose shape constraints hold and runs the cheapest: M1, M2, M3 (B encoded diagonal-wise) and BSGS (a square B of at most S/2 rows) for a row-wise A, plus via-MPC under `mpc.allow_mpc_switch()`; TNT and M2 on the transposes for a column-wise A; M3 for a diagonal-encoded A. `ndarray @ Ciphertensor` runs as `(b.T @ a.T).T`. The choice depends on public data only (shapes, layouts, slots and `mpc.default_allow_mpc_switch`), so every party takes the same one. Run the product at every party, the trusted dealer included: it takes part in the via-MPC path, and otherwise gets a placeholder with the result's shape and layout.
 
 ## Encoding modes
 
