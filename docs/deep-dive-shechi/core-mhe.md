@@ -133,8 +133,8 @@ Both directions use statistically hiding masks and the exact encoder (`exact_enc
 
 ### `ciphervector_to_additive_share_vector` (MHE → MPC)
 
-1. Broadcast ciphertext from source party.
-2. Rescale. Bootstrap the ciphertexts below the lowest level whose modulus holds the masks (`_mhe_to_mpc_level`: level 5 for `PN14QP438`), and drop the others to it.
+1. Rescale, and find the lowest level whose modulus holds the masks (`_mhe_to_mpc_level`: level 5 for `PN14QP438`). A single holder (`source_pid`) drops its ciphertexts above that level to it before it broadcasts them.
+2. Bootstrap the ciphertexts below that level, and drop the others to it.
 3. Each party except the hub computes `sk_shard × c1 + M_i + e_i`, with `M_i` a uniformly random polynomial of `_mhe_to_mpc_mask_bits` bits (208 for N = 2^14), and keeps `-M_i`. The hub computes `sk_shard × c1`.
 4. Aggregate at the hub, which yields `c0 + sum(sk_i × c1) + sum(M_i) + sum(e_i)`: the plaintext's coefficients under the others' masks, reconstructed exactly from their residues.
 5. Every party decodes its coefficient share exactly into fixed-point slot values, its additive share modulo the MPC modulus.
