@@ -40,6 +40,10 @@ class MPA[S, dtype]:
         self._plain = ndarray[S, dtype]()
         self._encryption = Ciphertensor[Ciphertext]() if aggregate else encryption
         self._aggregate = encryption if aggregate else Ciphertensor[Ciphertext]()
+        # An aggregate is the same ciphertexts at every party: refreshes bootstrap it once, collectively, and keep it so.
+        # An encryption is each party's own (also when an operation derived it from a copy of an aggregate).
+        if aggregate: self._aggregate._is_broadcast = True
+        else: self._encryption._is_broadcast = False
 
     @staticmethod
     def _from_plain(mpc: MPCEnv[mpc_uint], plain: ndarray[S, dtype]) -> MPA[S, dtype]:
@@ -54,6 +58,8 @@ class MPA[S, dtype]:
         out = MPA[S, dtype](mpc, plain)
         out._encryption = encryption
         out._aggregate = aggregate
+        if encryption: out._encryption._is_broadcast = False
+        if aggregate: out._aggregate._is_broadcast = True
         return out
     
     def __len__(self) -> int:
@@ -448,7 +454,8 @@ class MPA[S, dtype]:
             if transpose:
                 rand_data = rand_data.T
 
-        enc = Ciphertensor[Ciphertext].enc(mpc, rand_data)
+        # Every party drew the same data: encrypt it trivially, so the aggregate is the same ciphertexts everywhere.
+        enc = Ciphertensor[Ciphertext].enc_public(mpc, rand_data)
         if transpose:
             enc = enc.T
         
@@ -486,13 +493,15 @@ class MPA[S, dtype]:
     @staticmethod
     def _get_matmul_public_cost(first: MPA[S, dtype], other: ndarray[S, dtype]) -> float:
         if first._mpc.pid == 0 or first.has_plain():
-            return first._plain.get_matmul_cost(other)
-        
-        if first.has_aggregate():
-            return first._aggregate.get_matmul_cost(other)
-        
-        assert first.has_encryption(), "MPA: invalid/empty factor"
-        return first._encryption.get_matmul_cost(other)
+            cost = first._plain.get_matmul_cost(other)
+        elif first.has_aggregate():
+            cost = first._aggregate.get_matmul_cost(other)
+        else:
+            assert first.has_encryption(), "MPA: invalid/empty factor"
+            cost = first._encryption.get_matmul_cost(other)
+
+        # Every party, CP0 included, decides on the same estimate: the compute parties' largest.
+        return max(first._mpc.comms.collect(cost, True)[1:])
     
     # Internal typechecker hack
     @property
@@ -756,10 +765,10 @@ class MPA[S, dtype]:
         if other.has_distributed():
             other.encrypt()
             self.aggregate()
-            return MPA[S, dtype](mpc, other._encryption @ self._aggregate)
-        
+            return MPA[S, dtype](mpc, self._aggregate @ other._encryption)
+
         assert self.is_aggregate() and other.is_aggregate(), "MPA: invalid/empty factor"
-        return MPA[S, dtype](mpc, other._aggregate @ self._aggregate, aggregate=True)
+        return MPA[S, dtype](mpc, self._aggregate @ other._aggregate, aggregate=True)
 
     # Temporary helpers
     def slice_local(self, idx: int, *args) -> MPA[S, dtype]:

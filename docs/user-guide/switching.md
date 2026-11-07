@@ -61,6 +61,8 @@ The actual type conversions are implemented in `stdlib/sequre/types/internal.cod
 | `MPA.to_sharetensor(mpc)` | MHE → MPC | Convert aggregated encryption to shares |
 | `Sharetensor.to_mpa(mpc)` | MPC → MHE | Convert shares to aggregated encryption |
 
+The shares that `MPP.to_sharetensor` and `MPA.to_sharetensor` return are fixed point whatever the dtype: partitions switched from MHE come out fixed point, and integer partitions held in the clear are scaled to match, so that every party (the trusted dealer included) takes the same fixed-point steps. Integer values must therefore fit the fixed-point range, $|x| < 2^{k-f-1}$ (2^31 by default).
+
 ## Automatic switching with `AllowMPCSwitch`
 
 For certain operations — notably `Ciphertensor.matmul` with a plaintext operand — Sequre includes a **cost estimator** that automatically chooses between a pure-HE path and a switching path. This is gated by the `AllowMPCSwitch` context manager:

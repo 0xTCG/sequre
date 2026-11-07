@@ -21,7 +21,7 @@ _Defined in `stdlib/sequre/types/ciphertensor.codon`_
 | `_transposed` | `bool` | Whether the tensor is in transposed layout |
 | `_diagonal_contiguous` | `bool` | Whether data is stored in diagonal order |
 | `_skinny` | `bool` | Whether the matrix is "skinny" (rows >> cols) |
-| `_is_broadcast` | `bool` | Whether this tensor was produced by broadcasting from all computing parties |
+| `_is_broadcast` | `bool` | Whether every computing party holds the same ciphertexts (aggregates, trivially encrypted public data). Refreshing such a tensor bootstraps each ciphertext once, collectively, and keeps the copies identical |
 
 ## Construction
 
@@ -43,6 +43,7 @@ ct = Ciphertensor.enc_row_wise(mpc, my_array, padding=16)
 | Method | Description |
 |---|---|
 | `Ciphertensor.enc(mpc, data, padding=0, encoding="")` | Encrypt and encode plaintext data into a ciphertensor |
+| `Ciphertensor.enc_public(mpc, data, padding=0, encoding="")` | Encode public data (the same at every party) in `enc`'s layout as trivial encryptions `(Encode(v), 0)`: identical at every party, noiseless, no public-key encryption. Private data needs `enc` |
 | `Ciphertensor.enc_row_wise(mpc, data, padding=0)` | Encrypt in row-wise encoding |
 | `Ciphertensor.enc_diag_wise(mpc, data, padding=0)` | Encrypt 2-D data in diagonal-contiguous encoding |
 | `Ciphertensor.enc_replicate(mpc, value, shape)` | Create ciphertensor with a scalar replicated across shape |

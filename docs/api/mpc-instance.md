@@ -272,6 +272,7 @@ Multiparty homomorphic encryption based on the CKKS scheme. Provides collective 
 | Method | Signature | Description |
 |---|---|---|
 | `enc_vector[T]` | `(values)` | Encode and encrypt a list of values into a list of `Ciphertext` or `Plaintext` (type selected by `T`) |
+| `enc_public_vector` | `(values)` | Trivial encryptions of public values (the same at every party), laid out as `enc_vector` lays them out: identical at every party, noiseless, no public-key encryption |
 | `decrypt` | `(x, source_pid=-2)` | Collectively decrypt ciphertexts. `source_pid`: specific party, `-2` = round-robin, `-1` = already broadcast |
 | `decode[dtype]` | `(enc)` | Decode a list of `Plaintext` into `list[dtype]` (`int`, `float`, or `complex`) |
 | `reveal[dtype]` | `(x, source_pid=-2)` | Decrypt then decode (convenience wrapper) |
@@ -344,7 +345,8 @@ Multiparty homomorphic encryption based on the CKKS scheme. Provides collective 
 
 | Method | Signature | Description |
 |---|---|---|
-| `zero_cipher` | `()` | Create an encryption of zero |
+| `zero_cipher` | `()` | The trivial encryption of zero, `(0, 0)`: identical at every party and free |
+| `trivial_cipher` | `(plaintext)` | The trivial encryption `(plaintext, 0)` of a public plaintext |
 
 ---
 

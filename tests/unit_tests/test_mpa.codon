@@ -1,9 +1,11 @@
+import secure_operator
+
 from sequre.stdlib.numpy.create import array, ones, zeros_like
 
 from sequre.mpc.env import MPCEnv
 from sequre.types.multiparty_aggregate import MPA
-from sequre.utils.testing import assert_eq_approx
-from sequre.utils.utils import random_floats
+from sequre.utils.testing import assert_eq, assert_eq_approx, same_at_every_party
+from sequre.utils.utils import random_floats, random_ints
 
 
 def test_mpa_getitem(mpa_a, raw_a):
@@ -143,7 +145,81 @@ def test_mpa_matmul_operations(mpa_a, mpa_b, raw_a, raw_b):
     raw_a_row_mat = raw_a[0].expand_dims(axis=0)
     if mpc.pid:
         assert_eq_approx(f"CP{mpc.pid}:\tMPA matrix multiplication transposed x non-transposed w/ dim expansion", row_mat_matmul.reveal(), raw_a_row_mat.T @ raw_a_row_mat, error=0.02)
-    
+
+
+def test_mpa_aggregates_stay_identical(_mpa_a, raw_a):
+    """An aggregate is the same ciphertexts at every party and stays so: through a product of aggregates, a public product
+    (which accumulates into zero ciphertexts), a refresh (one collective bootstrap per ciphertext), and in MPA.rand. The
+    switch to MPC, where every party decrypts with its own copy, depends on it."""
+    mpc = _mpa_a._mpc
+    mpa_a = _mpa_a.copy()
+    with mpc.randomness.seed_switch(-1):
+        W = array(random_floats((raw_a.shape[1], 3)))
+
+    square = mpa_a * mpa_a
+    product = square @ W
+    expected = (raw_a * raw_a) @ W
+    stensor = product.to_sharetensor()
+    random_mpa = MPA[Tuple[int, int], float].rand((3, 8), "uniform", mpc)
+
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tMPA product of aggregates is the same at every party", same_at_every_party(mpc, square._aggregate._data), True)
+        assert_eq(f"CP{mpc.pid}:\tMPA aggregate times public matrix is the same at every party", same_at_every_party(mpc, product._aggregate._data), True)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA aggregate times public matrix -> MPC switch", stensor.reveal(mpc), expected, error=0.02, rel_error=2e-5)
+        assert_eq(f"CP{mpc.pid}:\tMPA.rand is the same at every party", same_at_every_party(mpc, random_mpa._aggregate._data), True)
+
+        refreshed = product._aggregate.copy()
+        refreshed._data = mpc.mhe.drop_level(refreshed._data, mpc.mhe.bootstrap_min_level)
+        before = mpc.mhe.stats.secure_bootstrap_count
+        mpc.mhe.refresh(refreshed._data, refreshed._is_broadcast)
+        assert_eq(f"CP{mpc.pid}:\tMPA aggregate refresh: one bootstrap per ciphertext", mpc.mhe.stats.secure_bootstrap_count - before, len(refreshed._data))
+        assert_eq(f"CP{mpc.pid}:\tMPA aggregate refresh: the same at every party", same_at_every_party(mpc, refreshed._data), True)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA aggregate refresh: decryption of the common copy", refreshed.reveal(mpc, source_pid=-1), expected, error=0.02, rel_error=2e-5)
+
+
+def test_mpa_matmul_operand_order(_mpa_a, _mpa_b, raw_a, raw_b):
+    """Products whose left factor is an aggregate keep the factors' order (non-square factors): with a distributed right
+    factor, and with an aggregate right factor."""
+    mpc = _mpa_a._mpc
+    mpa_a = _mpa_a.copy()
+    square = mpa_a * mpa_a
+
+    mpa_b_t = _mpa_b.T
+    distributed = square @ mpa_b_t
+    mpa_b_t_square = mpa_b_t * mpa_b_t
+    aggregated = square @ mpa_b_t_square
+
+    raw_square = raw_a * raw_a
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA aggregate x distributed matmul", distributed.reveal(), raw_square @ raw_b.T, error=0.05, rel_error=2e-5)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA aggregate x aggregate matmul", aggregated.reveal(), raw_square @ (raw_b.T * raw_b.T), error=0.05, rel_error=2e-5)
+
+
+def test_mpa_matmul_cost_agreement(_mpa_a, raw_a):
+    """Every party, CP0 included, estimates the same cost for a public product of an aggregate: the matmul reorder pass
+    compares such estimates at every party."""
+    mpc = _mpa_a._mpc
+    mpa_a = _mpa_a.copy()
+    square = mpa_a * mpa_a
+    costs = mpc.comms.collect(square.get_matmul_cost(ones((raw_a.shape[1], 3))), True)
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tMPA public product cost is the same at every party", all(c == costs[0] for c in costs), True)
+
+
+def test_mpa_int_to_sharetensor(mpc):
+    """An aggregated int MPA switches to fixed-point shares at every party, CP0 included, so the next fixed-point step
+    (the truncation after a product) runs at all of them."""
+    local = array(random_ints((4, 8), 0, 31))
+    raw = mpc.comms.collect(local).sum() if mpc.pid else zeros_like(local)
+    mpa = MPA(mpc, local)
+    mpa.aggregate()
+    stensor = mpa.to_sharetensor()
+    flags = mpc.comms.collect(stensor.fp, True)
+    squared = secure_operator.mul(mpc, stensor, stensor)
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tMPA int -> MPC switch: the same fixed-point flag at every party", all(f == flags[0] for f in flags), True)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA int -> MPC switch: squared shares", squared.reveal(mpc), (raw * raw).astype(float), error=0.05)
+
 
 def test_mpa[TP](mpc: MPCEnv[TP], modulus: TP):
     mpc.comms.sync_parties()
@@ -175,5 +251,9 @@ def test_mpa[TP](mpc: MPCEnv[TP], modulus: TP):
     test_mpa_mpc_switching(mpa_a, raw_a)
     test_mpa_elem_wise_operations(mpa_a, mpa_b, raw_a, raw_b)
     test_mpa_matmul_operations(mpa_a, mpa_b, raw_a, raw_b)
+    test_mpa_aggregates_stay_identical(mpa_a, raw_a)
+    test_mpa_matmul_operand_order(mpa_a, mpa_b, raw_a, raw_b)
+    test_mpa_matmul_cost_agreement(mpa_a, raw_a)
+    test_mpa_int_to_sharetensor(mpc)
 
     print(f'CP{mpc.pid}:\tSequre MHE MPA tests on {alg_struct} passed.\n')
