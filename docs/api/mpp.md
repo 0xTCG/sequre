@@ -30,6 +30,8 @@ mpp = MPP(mpc, local_ciphertensor)
 !!! note
     Party 0 (trusted dealer) holds a zero-filled placeholder. Actual data resides on parties 1..N.
 
+The compute parties' partitions may differ in size, and a party may hold no rows at all (a ratio of 0). Call every operation at every party, the trusted dealer and parties with empty partitions included: the parties take the same sequence of collective steps whatever their partitions hold.
+
 ## Factory methods
 
 | Method | Description |
@@ -75,8 +77,8 @@ mpp = MPP(mpc, local_ciphertensor)
 | `a / b` | Division by scalar |
 | `a ** n` | Integer exponentiation |
 | `-a` | Negation |
-| `a > b` | Secure greater-than (uses [MPC switching](../user-guide/switching.md) internally) |
-| `a < b` | Secure less-than (uses [MPC switching](../user-guide/switching.md) internally) |
+| `a > b` | Greater-than a public value: local at each compute party if all of them hold their partitions in the clear, otherwise the secure comparison through [MPC switching](../user-guide/switching.md#comparisons) |
+| `a < b` | Less-than a public value, likewise |
 | `a[i]`, `a[i] = v` | Indexing and slicing |
 | `bool(a)` | Non-empty check |
 | `len(a)` | Length of first dimension |
@@ -85,7 +87,7 @@ mpp = MPP(mpc, local_ciphertensor)
 
 | Method | Description |
 |---|---|
-| `.encrypt()` | Encrypt local plaintext to ciphertext |
+| `.encrypt()` | Encrypt local plaintext to ciphertext: row-wise, or column-wise when the MPP is lazily transposed (the same layout at every party, whatever the partitions' shapes) |
 | `.reveal()` | Reveal with secure aggregation to all parties |
 | `.reveal_local()` | Reveal local partition only |
 | `.level()` | Minimum encryption level |
@@ -134,7 +136,7 @@ mpp = MPP(mpc, local_ciphertensor)
 | `.sign(*args)` | Secure sign function |
 
 !!! info
-    Comparisons (`>`, `<`) and certain `matmul` cases automatically use `via_mpc` under the hood. See the [MPC ↔ MHE Switching](../user-guide/switching.md) page.
+    Comparisons (`>`, `<`) and certain `matmul` cases automatically use `via_mpc` under the hood, and a product with a plaintext matrix may under `AllowMPCSwitch`. See the [MPC ↔ MHE Switching](../user-guide/switching.md) page.
 
 ## Conversion and creation
 

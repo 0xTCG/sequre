@@ -33,6 +33,7 @@ from sequre.utils.utils import random_ints
 from sequre.stdlib.lin_alg import l2
 from sequre.stdlib.learn.lin_reg import LinReg
 from sequre.stdlib.numpy.create import array, ones, zeros, zeros_like
+from sequre.stdlib.numpy.ndarray import ndarray
 
 from harness import (
     Bench, Timer, handle_list_flag, shared_floats, shared_float_matrix, private_floats,
@@ -107,11 +108,13 @@ CASES = [
     ("mp.mpp.matmul_ntt", "", "MPP A @ B.T (collect encrypted partitions), 2x8x64 partitions"),
     ("mp.mpp.matmul_tnt", "", "MPP A.T @ B (local products + collect + to_mpp), 2x8x64 partitions"),
     ("mp.mpp.matmul_ntnt", "", "MPP A @ C via MPC (to_sharetensor + Beaver + to_mpp), 16x64 @ 64x16"),
-    ("mp.mpp.gt_local", "skip:desync", "MPP > 0 on local partitions (desyncs CP0's channels)"),
+    ("mp.mpp.matmul_public_via_mpc", "", "encrypted MPP 16x64 @ ndarray 64x3 under allow_mpc_switch(): the whole MPP via MPC (switch, MPC matmul, switch back), every party joins"),
+    ("mp.mpp.gt_local", "", "MPP > 0 on local partitions: one round with every party, then each compute party compares its own, 2x8x64"),
     ("mp.mpp.reveal_local", "skip:insecure", "MPP.reveal_local (decrypts everyone's data)"),
     ("mp.mpa.aggregate", "", "MPA.aggregate of additive 16x64 shares (encrypt + all-to-all collect + sum)"),
     ("mp.mpa.mul", "", "MPA * MPA element-wise (encrypt, aggregate, ct*ct), 16x64"),
     ("mp.mpa.matmul_abt", "", "MPA A @ B.T (encrypt, aggregate, M1 matmul), 4x32"),
+    ("mp.mpa.matmul_public_via_mpc", "", "aggregate MPA 16x64 @ ndarray 64x3 under allow_mpc_switch(): one conversion via MPC and back, every party joins"),
     ("mp.mpu.add_local", "", "MPU(partition) + MPU(partition) on local plaintext partitions, 2x8x64"),
     ("mp.mpu.matmul_ntt", "", "MPU(partition) A @ B.T, 2x8x64 partitions"),
     ("mp.mpu.matmul_mpp_mpa", "", "MPU(partition) 16x64 @ MPU(additive) 64x1"),
@@ -1047,16 +1050,31 @@ def bench_mp(mpc, b: Bench):
         if mpc.pid:
             b.report(f"({rows}x{cols})@({cols}x16)", t, max_abs_err_2d(rv, A @ C))
 
+    if b.want(mpc, "mp.mpp.matmul_public_via_mpc"):
+        # The first three columns of C: no new shared draws, which would change the data of the cases after this one
+        W = array([[C[i, j] for j in range(3)] for i in range(cols)])
+        out = encA
+        t = Timer(b.reps(5))
+        with mpc.allow_mpc_switch():
+            while t.next():
+                t.begin(mpc)
+                out = encA @ W
+                t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"({rows}x{cols})@({cols}x3)", t, max_abs_err_2d(rv, A @ W))
+
     if b.want(mpc, "mp.mpp.gt_local"):
-        out = mppA
-        t = Timer(b.reps(1), warmup=0)
+        out = mppA > 0
+        t = Timer(b.reps(9), batch=10)
         while t.next():
             t.begin(mpc)
-            out = mppA > 0
+            for _ in range(t.batch):
+                out = mppA > 0
             t.end(mpc)
         rv = out.reveal()
         if mpc.pid:
-            b.report(f"{n_cp}x{per}x{cols}", t, 0.0)
+            b.report(f"{n_cp}x{per}x{cols}", t, max_abs_err_2d(rv, (A > 0.0).astype(float)))
 
     if b.want(mpc, "mp.mpp.reveal_local"):
         rv = pA
@@ -1115,6 +1133,25 @@ def bench_mp(mpc, b: Bench):
             rv = out.reveal()
             if mpc.pid:
                 b.report("(4x32)@(4x32).T", t, max_abs_err_2d(rv, ra @ rb.T))
+
+        if b.want(mpc, "mp.mpa.matmul_public_via_mpc"):
+            W = array([[C[i, j] for j in range(3)] for i in range(cols)])
+            aggregated = MPA(mpc, share)
+            aggregated.aggregate()
+            # The aggregate alone: an MPA that also keeps its shares in the clear multiplies those
+            m = MPA[Tuple[int, int], float]._from_parts(
+                mpc, zeros_like(A) if mpc.pid == 0 else ndarray[Tuple[int, int], float](), Ciphertensor[Ciphertext](),
+                aggregated._aggregate if mpc.pid else Ciphertensor[Ciphertext]())
+            out = m
+            t = Timer(b.reps(5))
+            with mpc.allow_mpc_switch():
+                while t.next():
+                    t.begin(mpc)
+                    out = m @ W
+                    t.end(mpc)
+            rv = out.reveal()
+            if mpc.pid:
+                b.report(f"({rows}x{cols})@({cols}x3)", t, max_abs_err_2d(rv, A @ W))
 
     if b.want(mpc, "mp.mpu.add_local"):
         ua = MPU(mpc, pA, "partition")

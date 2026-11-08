@@ -10,7 +10,7 @@ from sequre.mpc.env import MPCEnv
 from sequre.lattiseq.ckks import Ciphertext
 from sequre.stdlib.builtin import sign
 from sequre.types.builtin import *
-from sequre.types.ciphertensor import Ciphertensor
+from sequre.types.ciphertensor import Ciphertensor, MATMUL_VIA_MPC
 from sequre.utils.io import read_ndarray
 from sequre.constants import HE_ENC_COST_ESTIMATE, MHE_MUL_TO_ADD_THRESHOLD
 
@@ -151,6 +151,12 @@ class MPA[S, dtype]:
     
     def __matmul__(self, other):
         _self, _other = self._check_binary_operands(other)
+        if isinstance(_other, ndarray) and static.len(S) == 2:
+            if _self._public_matmul_via_mpc(list(_other.shape)):
+                # One conversion of the whole MPA (the aggregate, or the sum of the encrypted shares) to MPC and back to
+                # an aggregate, at every party, CP0 included
+                mpc = self._mpc
+                return _self.via_mpc(lambda stensor: secure_operator.matmul(mpc, stensor, _other))
         return MPA[S, _self.dtype]._matmul(self._mpc, _self, _other)
     
     def __truediv__(self, other) -> MPA[S, dtype]:
@@ -302,10 +308,12 @@ class MPA[S, dtype]:
         if mpc.pid == 0 or self.has_encryption():
             return
         
-        if self.has_aggregate():
-            self._encryption = self._aggregate if mpc.pid == mpc.comms.hub_pid else Ciphertensor[Ciphertext].zeros(mpc, self._aggregate.shape)
+        if not self.has_plain():
+            # Only an aggregate: it is encrypted already, and held alike at every compute party, which the operations
+            # rely on. Nothing to do (M-MP-19: it used to fall through to the assertion and raise).
+            assert self.has_aggregate(), "MPA: Cannot encrypt empty MPA"
+            return
         
-        assert self.has_plain(), "MPA: Cannot encrypt empty MPA"
         self._encryption = Ciphertensor[Ciphertext].enc(mpc, self._plain)
     
     def aggregate(self):
@@ -742,12 +750,40 @@ class MPA[S, dtype]:
     def _matmul_public[S, dtype](mpc, self: MPA[S, dtype], other: ndarray[S, dtype]) -> MPA[S, dtype]:
         if mpc.pid == 0 or self.has_plain():
             return MPA[S, dtype](mpc, self._plain @ other)
-        
+
+        # Whether to switch to MPC was decided for the whole MPA (_matmul): this product stays in HE, as a switch here
+        # would need CP0 and would convert every party's copy of an aggregate
+        allow_mpc_switch = mpc.default_allow_mpc_switch
+        mpc.default_allow_mpc_switch = False
         if self.has_aggregate():
-            return MPA[S, dtype](mpc, self._aggregate @ other, aggregate=True)
-        
-        assert self.has_encryption(), "MPA: invalid/empty factor"
-        return MPA[S, dtype](mpc, self._encryption @ other)
+            result = MPA[S, dtype](mpc, self._aggregate @ other, aggregate=True)
+        else:
+            assert self.has_encryption(), "MPA: invalid/empty factor"
+            result = MPA[S, dtype](mpc, self._encryption @ other)
+        mpc.default_allow_mpc_switch = allow_mpc_switch
+        return result
+
+    def _public_matmul_via_mpc(self, other_shape: List[int]) -> bool:
+        # Under allow_mpc_switch: whether the product with a plaintext matrix of other_shape switches to MPC (H-53).
+        # The switch is estimated on the MPA's shape as Ciphertensor's router estimates a row-wise tensor's, from public
+        # data; it applies only if the compute parties hold the MPA encrypted (as an aggregate or as encrypted shares)
+        # and row-wise, which CP0 cannot see: one round with every party, CP0 included, settles it. Call it at every
+        # party.
+        mpc = self._mpc
+        if not mpc.default_allow_mpc_switch or static.len(S) != 2:
+            return False
+        slots = mpc.mhe.crypto_params.params.slots()
+        shape = list(self.shape)
+        placeholder = Ciphertensor[Ciphertext].placeholder(shape, slots)
+        if placeholder._ndarray_matmul_route(other_shape, True, mpc.pid, debug=False) != MATMUL_VIA_MPC:
+            return False
+
+        if mpc.pid == 0 or self.has_plain():
+            eligible = mpc.pid == 0
+        else:
+            enc = self._aggregate if self.has_aggregate() else self._encryption
+            eligible = not enc._transposed and not enc._diagonal_contiguous
+        return all(mpc.comms.collect(eligible, include_trusted_dealer=True)[1:])
     
     @sequre
     def _matmul[S, dtype](mpc, self: MPA[S, dtype], other) -> MPA[S, dtype]:

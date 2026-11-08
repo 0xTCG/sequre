@@ -1,11 +1,16 @@
 import secure_operator
+import sequre.lattiseq.ckks as ckks
 
-from sequre.stdlib.numpy.create import array, ones, zeros_like
+from sequre.stdlib.numpy.create import array, ones, zeros, zeros_like
+from sequre.stdlib.numpy.ndarray import ndarray
 
 from sequre.mpc.env import MPCEnv
+from sequre.types.ciphertensor import Ciphertensor
 from sequre.types.multiparty_aggregate import MPA
 from sequre.utils.testing import assert_eq, assert_eq_approx, same_at_every_party
 from sequre.utils.utils import random_floats, random_ints
+
+from multiparty_testing import cohort_matrix, assert_parties_in_step
 
 
 def test_mpa_getitem(mpa_a, raw_a):
@@ -221,6 +226,76 @@ def test_mpa_int_to_sharetensor(mpc):
         assert_eq_approx(f"CP{mpc.pid}:\tMPA int -> MPC switch: squared shares", squared.reveal(mpc), (raw * raw).astype(float), error=0.05)
 
 
+def test_mpa_public_product_via_mpc(mpc):
+    """H-53: MPA @ ndarray under allow_mpc_switch, with the switch to MPC chosen: an aggregate and encrypted shares
+    convert once, at every party (CP0 joins), and come back as an aggregate; shares in the clear multiply locally.
+    Ciphertensor.via_mpc(mirrored=True), the conversion of ciphertexts every compute party holds alike, gives CP0 a
+    placeholder with the result's shape. M-MP-19: encrypt() leaves an MPA that holds only an aggregate as it is, and
+    encrypts each party's own share of one that also holds its shares in the clear."""
+    rows, cols = 4, 64
+    public = cohort_matrix(mpc, cols, 3) * 0.25
+    share = array(random_floats((rows, cols), scale=1.0))
+    raw = mpc.comms.collect(share).sum() if mpc.pid else zeros_like(share)
+    expected = raw @ public
+
+    # An MPA that keeps its shares in the clear multiplies them, whatever else it holds: the other two hold only an
+    # aggregate, or only encrypted shares
+    plain = MPA(mpc, share)
+    aggregated = MPA(mpc, share)
+    aggregated.aggregate()
+    aggregate = MPA[Tuple[int, int], float]._from_parts(mpc, zeros((rows, cols)) if mpc.pid == 0 else ndarray[Tuple[int, int], float](), Ciphertensor[ckks.Ciphertext](), aggregated._aggregate.copy() if mpc.pid else Ciphertensor[ckks.Ciphertext]())
+    encrypted = MPA(mpc, Ciphertensor[ckks.Ciphertext].enc(mpc, share)) if mpc.pid else MPA(mpc, zeros((rows, cols)))
+    with mpc.allow_mpc_switch():
+        switches = [aggregate._public_matmul_via_mpc([cols, 3]), encrypted._public_matmul_via_mpc([cols, 3]), plain._public_matmul_via_mpc([cols, 3])]
+        product_aggregate = aggregate @ public
+        assert_parties_in_step(mpc, "MPA aggregate @ ndarray via MPC")
+        product_encrypted = encrypted @ public
+        assert_parties_in_step(mpc, "MPA encrypted shares @ ndarray via MPC")
+        product_plain = plain @ public
+        assert_parties_in_step(mpc, "MPA shares in the clear @ ndarray under allow_mpc_switch")
+
+    revealed = [product_aggregate.reveal(), product_encrypted.reveal(), product_plain.reveal()]
+    assert_eq(f"CP{mpc.pid}:\tMPA @ ndarray under allow_mpc_switch: routes (aggregate, encrypted shares, in the clear)", switches, [True, True, False])
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA aggregate @ ndarray via MPC", revealed[0], expected, error=0.01)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA encrypted shares @ ndarray via MPC", revealed[1], expected, error=0.01)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA shares in the clear @ ndarray under allow_mpc_switch", revealed[2], expected, error=0.01)
+        assert_eq(f"CP{mpc.pid}:\tMPA aggregate @ ndarray via MPC: an aggregate, the same at every party", product_aggregate.is_aggregate() and same_at_every_party(mpc, product_aggregate._aggregate._data), True)
+
+    # The mirrored conversion directly: CP0 converts a placeholder of the aggregate's layout
+    ciphers = aggregated._aggregate if mpc.pid else Ciphertensor[ckks.Ciphertext].zeros(mpc, [rows, cols])
+    mirrored = ciphers.via_mpc(mpc, lambda stensor: secure_operator.matmul(mpc, stensor, public), mirrored=True, S=Tuple[int, int])
+    shapes = mpc.comms.collect(mirrored.shape, True)
+    assert_eq(f"CP{mpc.pid}:\tCiphertensor via MPC, mirrored: the result's shape at every party, CP0 included", all(sh == [rows, 3] for sh in shapes), True)
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tCiphertensor via MPC, mirrored", mirrored.reveal(mpc, source_pid=-1), expected, error=0.01)
+    assert_parties_in_step(mpc, "Ciphertensor via MPC, mirrored")
+
+    # M-MP-19: encrypt() leaves an MPA that holds only an aggregate as it is: encrypted already, the same at every party
+    aggregate_only = MPA[Tuple[int, int], float]._from_parts(mpc, zeros((rows, cols)) if mpc.pid == 0 else ndarray[Tuple[int, int], float](), Ciphertensor[ckks.Ciphertext](), aggregated._aggregate.copy() if mpc.pid else Ciphertensor[ckks.Ciphertext]())
+    aggregate_only.encrypt()
+    if mpc.pid:
+        same = same_at_every_party(mpc, aggregate_only._aggregate._data)
+        assert_eq(f"CP{mpc.pid}:\tMPA encrypt of an aggregate-only MPA: still only an aggregate, the same at every party", aggregate_only.is_aggregate() and same, True)
+    revealed_aggregate_only = aggregate_only.reveal()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA encrypt of an aggregate-only MPA: its value", revealed_aggregate_only, raw, error=1e-3)
+
+    # An MPA that holds its shares in the clear and an aggregate gets each party's own share encrypted, and keeps the
+    # aggregate as it was
+    all_shares = mpc.comms.collect(share) if mpc.pid else [share]
+    aggregated.encrypt()
+    if mpc.pid:
+        same = same_at_every_party(mpc, aggregated._aggregate._data)
+        assert_eq(f"CP{mpc.pid}:\tMPA encrypt with shares in the clear and an aggregate: the aggregate kept, the same at every party", aggregated.has_aggregate() and aggregated.has_encryption() and same, True)
+    for p in range(1, mpc.comms.number_of_parties):
+        # CP{p}'s encryption alone, zeros (encrypted the same way) at the other parties
+        own = MPA(mpc, aggregated._encryption if mpc.pid == p else Ciphertensor[ckks.Ciphertext].enc(mpc, zeros((rows, cols)))) if mpc.pid else MPA(mpc, zeros((rows, cols)))
+        revealed_own = own.reveal()
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tMPA encrypt with shares in the clear and an aggregate: CP{p}'s encryption holds its own share", revealed_own, all_shares[p - 1], error=1e-3)
+
+
 def test_mpa[TP](mpc: MPCEnv[TP], modulus: TP):
     mpc.comms.sync_parties()
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
@@ -255,5 +330,6 @@ def test_mpa[TP](mpc: MPCEnv[TP], modulus: TP):
     test_mpa_matmul_operand_order(mpa_a, mpa_b, raw_a, raw_b)
     test_mpa_matmul_cost_agreement(mpa_a, raw_a)
     test_mpa_int_to_sharetensor(mpc)
+    test_mpa_public_product_via_mpc(mpc)
 
     print(f'CP{mpc.pid}:\tSequre MHE MPA tests on {alg_struct} passed.\n')

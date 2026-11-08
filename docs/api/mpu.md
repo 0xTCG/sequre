@@ -64,7 +64,7 @@ All standard arithmetic and comparison operators are supported. They dispatch to
 | `a / b` | Division by scalar |
 | `a ** n` | Integer exponentiation |
 | `-a` | Negation |
-| `a > b`, `a < b` | Comparisons (vs. scalars) |
+| `a > b`, `a < b` | Comparisons (vs. scalars): local at each owner for a partition-mode MPU every compute party holds in the clear, otherwise the secure comparison in MPC (see [switching](../user-guide/switching.md#comparisons)) |
 | `a[i]`, `a[i] = v` | Indexing and slicing |
 
 ## Methods

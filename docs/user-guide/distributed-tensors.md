@@ -44,7 +44,9 @@ mask = mpu > 0.5  # Comparison
 row = mpu[i]    # Indexing
 ```
 
-The framework dispatches to the correct protocol (MPC or MHE) based on internal state.
+The framework dispatches to the correct protocol (MPC or MHE) based on internal state. Run every operation at every party, the trusted dealer included. For example, `mpu > 0.5` on a partition-mode MPU that every compute party holds in the clear compares each partition locally at its owner (the trusted dealer takes no part), and on an encrypted one runs the secure comparison in MPC; the parties agree on which in one round, since the trusted dealer cannot see how the data is held.
+
+Partitions may differ in size between the compute parties, and a party may hold none.
 
 ## Under the hood: MPP and MPA
 

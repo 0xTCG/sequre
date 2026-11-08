@@ -86,8 +86,12 @@ Inside the context, `mpc.default_allow_mpc_switch` is set to `True`. For a row-w
 
 The cheapest strategy wins, among those whose shape constraints hold (see the matrix products section of the [Ciphertensor API](../api/ciphertensor.md#matrix-products)). When `AllowMPCSwitch` is not active, the "Via MPC" cost is set to infinity and only pure-HE paths are considered. Column-wise (lazily transposed) and diagonal-encoded ciphertensors have no via-MPC path, nor does `Ciphertensor @ Ciphertensor`.
 
-!!! warning
-    MPP and MPA products with a plaintext matrix return at the trusted dealer before they reach the cost estimator, so under `AllowMPCSwitch` a product that picks the via-MPC path deadlocks. Leave `AllowMPCSwitch` off around them.
+MPP and MPA products with a plaintext matrix take the via-MPC path under `AllowMPCSwitch` too, for the whole tensor at once:
+
+- **MPP @ ndarray:** switching converts every partition's rows and multiplies them in MPC, while the HE path runs each compute party's product on its own partition at the same time (the partitions padded to the most rows). So the estimator compares the via-MPC cost of all the rows with the cheapest HE kernel on the largest partition, from the public ratios and shapes. When the via-MPC path wins, every party, CP0 included, takes one more round to find out whether the compute parties hold their partitions encrypted: only then does the MPP switch, at every party and with empty partitions joining in. Partitions held in the clear multiply locally.
+- **MPA @ ndarray:** an MPA held as an aggregate, or as encrypted shares, converts once (the aggregate's common ciphertexts, or the sum of the shares) and comes back as an aggregate. It is costed like a row-wise `Ciphertensor` of the MPA's shape, with the same extra round. An MPA that keeps its shares in the clear multiplies them locally.
+
+Each partition's own product never switches on its own: that would need the trusted dealer, which takes no part in it.
 
 !!! tip
     Enable `DEBUG` mode to see the cost breakdown printed at each matmul:
@@ -106,12 +110,14 @@ Several built-in operations use `via_mpc` under the hood without requiring `Allo
 
 ### Comparisons
 
-MPP and MPA comparisons (`>`, `<`) always switch to MPC because HE does not natively support comparison:
+HE does not support comparisons, so MPP and MPA comparisons (`>`, `<`) with a public value run the secure comparison in MPC:
 
 ```python
 mask = mpp > 0.0   # internally: mpp.via_mpc(lambda s: secure_operator.gt(mpc, s, 0.0))
 mask = mpa < 1.0   # internally: mpa.via_mpc(lambda s: secure_operator.lt(mpc, s, 1.0))
 ```
+
+The exception is an MPP (or a partition-mode MPU) that every compute party holds in the clear. There each compute party compares its own partition locally, the result stays in the clear at its owner, and the trusted dealer takes no part. The trusted dealer cannot see how the compute parties hold an MPP, so every comparison starts with one round among all parties, CP0 included, to agree on the path. Call comparisons at every party. An MPP that some compute parties hold encrypted and others in the clear goes through MPC as a whole.
 
 ### Layout transformations
 
@@ -153,7 +159,7 @@ Use `mpc.stats` or the `mpc.stats_log()` context manager to profile and log swit
 
 | Scenario | Recommendation |
 |---|---|
-| Comparison operators (`>`, `<`, `==`) | Automatic — always switches |
+| Comparison operators (`>`, `<`) | Automatic — switches, except on an MPP every compute party holds in the clear |
 | Matrix multiply (ciphertext × plaintext) | Use `AllowMPCSwitch` and let the cost estimator decide; run the product at every party, the trusted dealer included |
 | Matrix inverse, square root | Use `via_mpc` explicitly or call the stdlib `inv`/`sqrt` |
 | Custom non-linear function | Call `via_mpc` directly with a lambda |
