@@ -57,8 +57,8 @@ All standard arithmetic and comparison operators are supported. They dispatch to
 
 | Operator | Description |
 |---|---|
-| `a + b` | Addition (MPU, scalar, or ndarray) |
-| `a - b` | Subtraction |
+| `a + b` | Addition (MPU, scalar, or ndarray). An additive-mode MPU plus a partition-mode one whose partitions some compute party holds encrypted needs the additive one's shares encrypted: with shares in the clear, or an aggregate only, it raises `NotImplementedError` at every compute party (unless one party holds every row) |
+| `a - b` | Subtraction (likewise for additive minus partition-mode) |
 | `a * b` | Element-wise multiplication |
 | `a @ b` | Matrix multiplication |
 | `a / b` | Division by scalar |

@@ -46,7 +46,7 @@ row = mpu[i]    # Indexing
 
 The framework dispatches to the correct protocol (MPC or MHE) based on internal state. Run every operation at every party, the trusted dealer included. For example, `mpu > 0.5` on a partition-mode MPU that every compute party holds in the clear compares each partition locally at its owner (the trusted dealer takes no part), and on an encrypted one runs the secure comparison in MPC; the parties agree on which in one round, since the trusted dealer cannot see how the data is held.
 
-Partitions may differ in size between the compute parties, and a party may hold none.
+Partitions may differ in size between the compute parties, and a party may hold none. The compute parties may also hold them differently: in the clear at some and encrypted at others (a mixed cohort, for example after `encrypt()` at some parties only). Element-wise operations, powers and products with a plaintext matrix keep each party's representation, and products of two secret operands encrypt the partitions in the clear of a mixed operand for the product. Operations that may refresh ciphertexts (multiplications, powers, products) first agree, in one round among the compute parties, on how each holds its partition, so that every one runs the same HE steps.
 
 ## Under the hood: MPP and MPA
 

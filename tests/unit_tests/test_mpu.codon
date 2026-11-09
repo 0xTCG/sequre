@@ -1,11 +1,18 @@
 from sequre.stdlib.numpy.create import array, ones, zeros
+from sequre.stdlib.numpy.ndarray import ndarray
 
 from sequre.mpc.env import MPCEnv
+from sequre.constants import ENC_ROW
+from sequre.lattiseq.ckks import Ciphertext
+from sequre.types.ciphertensor import Ciphertensor
+from sequre.types.multiparty_aggregate import MPA
+from sequre.types.multiparty_partition import MPP
 from sequre.types.multiparty_union import MPU
 from sequre.utils.testing import assert_eq, assert_eq_approx
 from sequre.utils.utils import random_floats
 
-from multiparty_testing import unequal_ratios, ratios_with_empty, own_rows, cohort_matrix, assert_parties_in_step
+from multiparty_testing import (
+    unequal_ratios, ratios_with_empty, own_rows, cohort_matrix, assert_parties_in_step, holders)
 
 
 def test_mpu_getitem(mpu_a, raw_a):
@@ -170,6 +177,86 @@ def test_mpu_comparisons(mpc):
             assert_eq_approx(f"CP{mpc.pid}:\tMPU > 0.5 encrypted, ratios {ratios}", revealed_encrypted, expected, error=1e-2)
 
 
+def test_mpu_mixed_cohorts(mpc):
+    """M-MP-21: the MPU per-partition products with an MPP that some compute parties hold encrypted and the others in the
+    clear (unequal and empty partitions): the mixed MPP is encrypted at every party for the product. MPA + MPP and
+    MPA - MPP: an MPA that holds its shares encrypted takes a mixed MPP, and one that holds them in the clear, which
+    MPA's setitem cannot take an encrypted partition into yet (H-23), raises the same error at every compute party. Every
+    party in step after each operation."""
+    n_cp = mpc.comms.number_of_parties - 1
+    for ratios in (unequal_ratios(n_cp), ratios_with_empty(n_cp)):
+        rows = ratios.sum()
+        # Wide partitions (more columns than rows): an MPA encrypts a share in the clear row-wise only when it is wide,
+        # and the sum of encryptions in two layouts deadlocks (M-MHE-21)
+        a = cohort_matrix(mpc, rows, 8)
+        b = cohort_matrix(mpc, rows, 8)
+        start, stop = own_rows(mpc, ratios)
+        parties = holders(ratios)
+        mixed = MPU(mpc, a[start:stop] if mpc.pid else a, "partition")
+        if mpc.pid == parties[0]:
+            mixed.encrypt()
+        other = MPU(mpc, b[start:stop] if mpc.pid else b, "partition")
+        # Additive operands that CP1 holds in full and the others as zeros
+        w = cohort_matrix(mpc, 8, 2) * 0.25
+        bs = cohort_matrix(mpc, rows, 3) * 0.25
+        vs = cohort_matrix(mpc, 2, 8) * 0.25
+        mpa_w = MPU(mpc, w if mpc.pid == 1 else w.zeros(), "additive")
+        mpa_bs = MPU(mpc, bs if mpc.pid == 1 else bs.zeros(), "additive")
+        mpa_vs = MPU(mpc, vs if mpc.pid == 1 else vs.zeros(), "additive")
+        mpa_a = MPU(mpc, a if mpc.pid == 1 else a.zeros(), "additive")
+        label = f"ratios {ratios}"
+
+        product = mixed @ mpa_w
+        assert_parties_in_step(mpc, f"MPU mixed @ MPA, {label}")
+        product_t = mixed.T @ mpa_bs
+        assert_parties_in_step(mpc, f"MPU mixed.T @ MPA, {label}")
+        product_mpa = mpa_vs @ mixed.T
+        assert_parties_in_step(mpc, f"MPU MPA @ mixed.T, {label}")
+        product_mpp = mixed.T @ other
+        assert_parties_in_step(mpc, f"MPU mixed.T @ MPP, {label}")
+        elem_wise = mixed * mpa_a
+        assert_parties_in_step(mpc, f"MPU mixed * MPA, {label}")
+
+        # An MPA holding its shares encrypted only (encrypt() would keep the plain ones beside the encryption, and the sum
+        # would leave one of the two stale: M-MP-02), row-wise as MPP.encrypt() encrypts the partitions (a tall share
+        # encrypted by default is column-wise, and an element-wise op across layouts deadlocks: M-MHE-21)
+        share = a if mpc.pid == 1 else a.zeros()
+        encrypted_mpa = MPA[Tuple[int, int], float]._from_parts(
+            mpc, share if mpc.pid == 0 else ndarray[Tuple[int, int], float](),
+            Ciphertensor[Ciphertext].enc(mpc, share, encoding=ENC_ROW) if mpc.pid else Ciphertensor[Ciphertext](),
+            Ciphertensor[Ciphertext]())
+        summed = MPU[Tuple[int, int], float](_mpp=MPP[Tuple[int, int], float](mpc), _mpa=encrypted_mpa) + mixed
+        assert_parties_in_step(mpc, f"MPU encrypted MPA + mixed, {label}")
+
+        # An MPA with its shares in the clear (a fresh one: mixed * mpa_a above encrypted mpa_a's shares in place): the
+        # parties that hold rows each place theirs, and one of those holds its partition encrypted. With a single holder
+        # the sum takes no setitem and works; the difference always places rows.
+        plain_mpa = MPU(mpc, a if mpc.pid == 1 else a.zeros(), "additive")
+        raised_add, raised_sub = False, False
+        try:
+            plain_mpa + mixed
+        except NotImplementedError:
+            raised_add = True
+        assert_parties_in_step(mpc, f"MPU plain MPA + mixed, {label}")
+        try:
+            plain_mpa - mixed
+        except NotImplementedError:
+            raised_sub = True
+        assert_parties_in_step(mpc, f"MPU plain MPA - mixed, {label}")
+
+        revealed = [product.reveal(), product_t.reveal(), product_mpa.reveal(), product_mpp.reveal(), elem_wise.reveal(), summed.reveal()]
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tMPU mixed @ MPA, {label}", revealed[0], a @ w, error=0.01)
+            assert_eq_approx(f"CP{mpc.pid}:\tMPU mixed.T @ MPA, {label}", revealed[1], a.T @ bs, error=0.01)
+            assert_eq_approx(f"CP{mpc.pid}:\tMPU MPA @ mixed.T, {label}", revealed[2], vs @ a.T, error=0.01)
+            assert_eq_approx(f"CP{mpc.pid}:\tMPU mixed.T @ MPP, {label}", revealed[3], a.T @ b, error=0.01)
+            assert_eq_approx(f"CP{mpc.pid}:\tMPU mixed * MPA, {label}", revealed[4], a * a, error=0.01)
+            assert_eq_approx(f"CP{mpc.pid}:\tMPU encrypted MPA + mixed, {label}", revealed[5], a + a, error=0.01)
+            several = len(parties) > 1
+            assert_eq(f"CP{mpc.pid}:\tMPU plain MPA + mixed raises at every compute party, {label}", raised_add, several)
+            assert_eq(f"CP{mpc.pid}:\tMPU plain MPA - mixed raises at every compute party, {label}", raised_sub, True)
+
+
 def test_mpu[TP](mpc: MPCEnv[TP], modulus: TP):
     mpc.comms.sync_parties()
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
@@ -205,5 +292,6 @@ def test_mpu[TP](mpc: MPCEnv[TP], modulus: TP):
     test_mpu_elem_wise_operations(mpu_a, mpu_b, raw_a, raw_b)
     test_mpu_matmul_operations(mpu_a, mpu_b, raw_a, raw_b)
     test_mpu_comparisons(mpc)
+    test_mpu_mixed_cohorts(mpc)
 
     print(f'CP{mpc.pid}:\tSequre MHE MPU tests on {alg_struct} passed.\n')

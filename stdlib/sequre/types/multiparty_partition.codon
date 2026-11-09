@@ -24,6 +24,135 @@ from sequre.utils.utils import one_hot_vector
 from sequre.settings import DEBUG
 
 
+# Partition kinds and descriptor fields, as MPPAligner agrees on them among the compute parties
+MPP_EMPTY = 0    # no data
+MPP_CLEAR = 1    # in the clear (MPP.is_local(): a unified encryption cached next to the data does not count)
+MPP_UNIFIED = 2  # an encryption of the whole partition and no block in the clear beside it, or a semi-encrypted partition
+                 # with its unified encryption cached (which operations use first)
+MPP_SEMI = 3     # encrypted column blocks left and/or right of a block in the clear, not unified
+
+D_KIND = 0
+D_LOCAL = 1      # the data in the clear: present, columns (a 1-dim partition's length)
+D_UNIFIED = 3    # each encryption: present, columns (length), _transposed, _diagonal_contiguous
+D_LEFT = 7
+D_RIGHT = 11
+D_SIZE = 15
+
+# Modes of MPPAligner
+ALIGN_PAD = 0      # pad unequal partitions to the same rows (or length), and give a semi-encrypted partition the encrypted
+                   # blocks other parties hold (placeholders), so per-block operations (sums) run alike; nothing at equal
+                   # ratios
+ALIGN_ROWS = 1     # as ALIGN_PAD without the extra blocks: for element-wise operations, which run the other parties'
+                   # products on placeholders instead (MPP._run_elem_wise_shadows)
+ALIGN_UNIFORM = 2  # also agree on every partition's descriptor (one round) at equal ratios, and pad as ALIGN_ROWS: for
+                   # products whose HE kernels refresh per row, run on placeholders of the padded shape where a party
+                   # holds no encryption
+ALIGN_ENCRYPT = 3  # as ALIGN_UNIFORM, and every encrypted partition unified, and in a mixed cohort (partitions in the clear
+                   # and encrypted ones) those in the clear encrypted for the duration, in the layout of the encrypted ones:
+                   # for products whose per-party results must share one kind and layout
+
+
+# HE steps of per-partition operations. A compute party runs, on placeholders, every step that another party runs and it
+# does not (MPP._run_elem_wise_shadows), so that every party makes the same number of refresh councils
+STEP_UNIFIED_PT = 0  # element-wise: the unified encryption times data in the clear (a plaintext or a scalar)
+STEP_UNIFIED_CT = 1  # element-wise: the unified encryption times another encryption
+STEP_LEFT_PT = 2     # the same for a semi-encrypted partition's left block
+STEP_LEFT_CT = 3
+STEP_RIGHT_PT = 4    # and for its right block
+STEP_RIGHT_CT = 5
+
+
+def _describe_encryption(d: List[int], field: int, enc: Ciphertensor[Ciphertext]):
+    if enc:
+        d[field] = 1
+        d[field + 1] = enc.shape[0] if (enc.ndim == 2 and enc._transposed) else enc.shape[-1]
+        d[field + 2] = int(enc._transposed)
+        d[field + 3] = int(enc._diagonal_contiguous)
+
+
+def _partition_descriptor(mpp) -> List[int]:
+    # This compute party's partition as MPPAligner's round shares it: its kind and, for each representation it holds,
+    # the columns (a 1-dim partition's length) and, for an encryption, its layout (the D_* fields)
+    d = [0 for _ in range(D_SIZE)]
+    if mpp.is_empty():
+        d[D_KIND] = MPP_EMPTY
+    elif mpp.is_local():
+        d[D_KIND] = MPP_CLEAR
+    elif mpp.has_unified_encryption():
+        d[D_KIND] = MPP_UNIFIED
+    else:
+        d[D_KIND] = MPP_SEMI
+    if mpp.has_local_data():
+        d[D_LOCAL] = 1
+        d[D_LOCAL + 1] = mpp._local_data.shape[-1]
+    _describe_encryption(d, D_UNIFIED, mpp._encryption_unified)
+    _describe_encryption(d, D_LEFT, mpp._encryption_left)
+    _describe_encryption(d, D_RIGHT, mpp._encryption_right)
+    return d
+
+
+def _agree_on_partitions(first, other) -> Tuple[List[List[int]], List[List[int]]]:
+    # The descriptors of two operands' partitions at every compute party, in one round among them
+    mpc = first._mpc
+    mine = _partition_descriptor(first)
+    mine.extend(_partition_descriptor(other))
+    both = mpc.comms.collect(mine)
+    return [d[:D_SIZE] for d in both], [d[D_SIZE:] for d in both]
+
+
+def _encrypted_layout(descriptors: List[List[int]]) -> Tuple[bool, bool, bool]:
+    # The layout (_transposed, _diagonal_contiguous) of the encrypted partitions: a unified encryption's own, or the one
+    # a semi-encrypted partition unifies into (that of its encrypted blocks, as MPP.unify_encryption does), taken from the
+    # first party that holds one (row-wise if none), and whether every encrypted partition has it
+    layouts = List[Tuple[bool, bool]]()
+    for d in descriptors:
+        if d[D_KIND] == MPP_UNIFIED:
+            layouts.append((bool(d[D_UNIFIED + 2]), bool(d[D_UNIFIED + 3])))
+        elif d[D_KIND] == MPP_SEMI:
+            field = D_RIGHT if d[D_RIGHT] else D_LEFT
+            layouts.append((bool(d[field + 2]), bool(d[field + 3])))
+    if not layouts:
+        return False, False, True
+    return layouts[0][0], layouts[0][1], all(l == layouts[0] for l in layouts)
+
+
+def _full_width(d: List[int]) -> int:
+    # A partition's columns (a 1-dim partition's length), all its parts together
+    if d[D_UNIFIED]:
+        return d[D_UNIFIED + 1]
+    return d[D_LOCAL + 1] + d[D_LEFT + 1] + d[D_RIGHT + 1]
+
+
+def _padded_kind(descriptors: List[List[int]]) -> List[int]:
+    # The descriptor an empty partition takes when padded for an operation that is not per block (MPPAligner._fill_empty):
+    # an encryption of the full width, in the layout of the encrypted partitions, if any party holds one; else data in the
+    # clear of the full width; else nothing
+    padded = [0 for _ in range(D_SIZE)]
+    width = 0
+    for d in descriptors:
+        if d[D_KIND] != MPP_EMPTY:
+            width = max(width, _full_width(d))
+    if any(d[D_KIND] == MPP_UNIFIED or d[D_KIND] == MPP_SEMI for d in descriptors):
+        transposed, diagonal, _ = _encrypted_layout(descriptors)
+        padded[D_KIND] = MPP_UNIFIED
+        padded[D_UNIFIED] = 1
+        padded[D_UNIFIED + 1] = width
+        padded[D_UNIFIED + 2] = int(transposed)
+        padded[D_UNIFIED + 3] = int(diagonal)
+    elif any(d[D_KIND] == MPP_CLEAR for d in descriptors):
+        padded[D_KIND] = MPP_CLEAR
+        padded[D_LOCAL] = 1
+        padded[D_LOCAL + 1] = width
+    return padded
+
+
+def _first_holder(descriptors: List[List[int]], field: int) -> int:
+    for q in range(len(descriptors)):
+        if descriptors[q][field]:
+            return q
+    return -1
+
+
 # Multiparty partition
 class MPP[S, dtype]:
     _mpc: MPCEnv[mpc_uint]
@@ -1398,22 +1527,45 @@ class MPP[S, dtype]:
         _local_data = ndarray[S, dtype]()
         _encryption_unified = Ciphertensor[Ciphertext]()
         
-        with first.partition_aligner() as aligner:
-            if not first.is_empty():
-                if first.is_local():
-                    _local_data = first._local_data @ other
-                else:
-                    first.unify_encryption()
-                    # Whether to switch to MPC was decided for the whole MPP (matmul): each partition's own product
-                    # stays in HE, as a switch there would need CP0
-                    allow_mpc_switch = mpc.default_allow_mpc_switch
-                    mpc.default_allow_mpc_switch = False
-                    _encryption_unified = first._encryption_unified @ other
-                    mpc.default_allow_mpc_switch = allow_mpc_switch
+        # The compute parties agree on their partitions (one round), padded to the most rows: the HE kernels refresh per
+        # row. Each multiplies its own partition, in the clear or in HE; if some party holds an encrypted one, those that
+        # hold theirs in the clear (or none) run the same HE product on a placeholder of the same shape and layout, so
+        # every party makes the same refresh councils. Whether to switch to MPC was decided for the whole MPP (matmul):
+        # each partition's own product stays in HE, as a switch there would need CP0.
+        with first.partition_aligner(ALIGN_UNIFORM) as aligner:
+            kind = aligner.own_kind()
+            shadow = MPP._shadow_operand(mpc, aligner.descriptors, max(first._ratios), other.shape[0])
+            allow_mpc_switch = mpc.default_allow_mpc_switch
+            mpc.default_allow_mpc_switch = False
+            if kind == MPP_CLEAR:
+                _local_data = first._local_data @ other
+            elif kind != MPP_EMPTY:
+                first.unify_encryption()
+                _encryption_unified = first._encryption_unified @ other
+            if shadow and (kind == MPP_CLEAR or kind == MPP_EMPTY):
+                shadow @ other
+            mpc.default_allow_mpc_switch = allow_mpc_switch
             
             return aligner.new_mpp(
                 _local_data=_local_data,
                 _encryption_unified=_encryption_unified)
+
+    @staticmethod
+    def _shadow_operand(mpc, descriptors: List[List[int]], rows: int, cols: int) -> Ciphertensor[Ciphertext]:
+        # A nil-ideal placeholder in the shape (rows x cols) and layout of the cohort's encrypted partitions, on which a
+        # party that holds its partition in the clear (or none) runs the others' HE product; empty if no party holds an
+        # encrypted partition. Call it at every compute party: it raises at every one if the layouts disagree.
+        if not any(d[D_KIND] == MPP_UNIFIED or d[D_KIND] == MPP_SEMI for d in descriptors):
+            return Ciphertensor[Ciphertext]()
+        transposed, diagonal, agreed = _encrypted_layout(descriptors)
+        if not agreed:
+            raise ValueError("MPP: the compute parties hold their partitions encrypted in different layouts")
+        if diagonal:
+            raise NotImplementedError("MPP: a product of diagonal-encoded partitions with partitions in the clear or empty ones")
+        slots = mpc.mhe.crypto_params.params.slots()
+        placeholder = Ciphertensor[Ciphertext].placeholder([cols, rows] if transposed else [rows, cols], slots)
+        placeholder._transposed = transposed
+        return placeholder
 
     @staticmethod
     def _public_matmul_via_mpc_wins(mpc, ratios: List[int], other_shape: List[int]) -> bool:
@@ -1454,11 +1606,16 @@ class MPP[S, dtype]:
                 _ratios=MPP.apply_ratios(first._ratios, first._local_data.shape[1]),
                 _local_data=zeros((first._local_data.shape[1], other._local_data.shape[1]), dtype=dtype))
 
-        assert not (first.is_empty() ^ other.is_empty()), "MPP: all or none of the partitions should be empty"
+        # The compute parties agree on both factors in one round. A factor that some of them hold in the clear and others
+        # encrypted is encrypted at every party for the product (ALIGN_ENCRYPT): the per-party products are summed, so
+        # every party must run the same HE product and get a result of the same layout. The partitions' own products
+        # never switch to MPC, which would need CP0.
+        first_descriptors, other_descriptors = _agree_on_partitions(first, other)
+        MPP._check_same_partitions(first_descriptors, other_descriptors)
 
         enc = Ciphertensor[Ciphertext]()
         
-        with first.partition_aligner(), other.partition_aligner():
+        with first.partition_aligner(ALIGN_ENCRYPT, first_descriptors), other.partition_aligner(ALIGN_ENCRYPT, other_descriptors):
             assert first.shape[1] == other.shape[0], f"MPP: Invalid shapes for per-partition matmul. {first.shape} x {other.shape}"
 
             if not first.is_empty():
@@ -1467,6 +1624,8 @@ class MPP[S, dtype]:
                 if not other.is_local():
                     other.unify_encryption()
                 
+                allow_mpc_switch = mpc.default_allow_mpc_switch
+                mpc.default_allow_mpc_switch = False
                 if first.is_local() and other.is_local():
                     enc = Ciphertensor[Ciphertext].enc(mpc, first._local_data.T @ other._local_data)
                 elif first.is_local():
@@ -1475,9 +1634,13 @@ class MPP[S, dtype]:
                     enc = first._encryption_unified.T @ other._local_data
                 else:
                     enc = first._encryption_unified.T @ other._encryption_unified
+                mpc.default_allow_mpc_switch = allow_mpc_switch
 
-        # TODO: Temporary solution. Inefficient.
-        if mpc.council(enc._diagonal_contiguous).any():
+        # Every compute party ran the same product on partitions of the same shape, so the results' layouts agree
+        # without a council. A result that is not row-wise (diagonal, or column-wise: the kernels' layout for an
+        # encrypted factor) is redistributed through MPC, which splits it by its rows; splitting its physical rows
+        # instead returned the wrong layout (H-25). TODO: Temporary solution. Inefficient.
+        if enc._diagonal_contiguous or enc._transposed:
             joined_sum = mpc.comms.collect(enc).sum(mpc)
             return joined_sum.to_sharetensor(
                 mpc, modulus=mpc.default_mpc_modulus, source_pid=-1, S=S, dtype=float).to_mpp(
@@ -1503,18 +1666,20 @@ class MPP[S, dtype]:
         # Every compute party runs the same HE products, with the same shapes, in the same order: a product may refresh
         # its operands, and each refresh is a council among the compute parties (a collective bootstrap), so a party
         # that ran one product more than the others would read another party's next message (M-MP-18). The parties
-        # first agree on how they hold the factors. The partitions' own products never switch to MPC, which would
-        # need CP0 (H-53).
-        with first.partition_aligner() as aligner:
+        # first agree on how they hold the factors, in one round. A first factor that some of them hold in the clear and
+        # others encrypted is encrypted at every party for the product (ALIGN_ENCRYPT). The partitions' own products
+        # never switch to MPC, which would need CP0 (H-53).
+        first_descriptors, other_descriptors = _agree_on_partitions(first, other)
+        with first.partition_aligner(ALIGN_ENCRYPT, first_descriptors) as aligner:
+            first_clear = MPP._cohort_in_the_clear(aligner.descriptors)
+            other_clear = MPP._cohort_in_the_clear(other_descriptors)
             if not first.is_empty():
-                states = mpc.comms.collect(int(first.is_local()) * 2 + int(other.is_local() or other.is_empty()))
-                assert all((s >> 1) == (states[0] >> 1) for s in states), "MPP: not implemented yet: a product whose first factor some compute parties hold in the clear and others encrypted"
                 other_partitions = other.collect()
                 reference_pid = mpc.pid - 1  # Avoid CP0
 
                 allow_mpc_switch = mpc.default_allow_mpc_switch
                 mpc.default_allow_mpc_switch = False
-                if first.is_local() and all(s & 1 for s in states):
+                if first_clear and other_clear:
                     # Both factors in the clear: the own block of the result is a plaintext product, and the other
                     # parties' blocks come from one HE product against their partitions, stacked (the parties before
                     # this one, then those after it) and padded with zero rows to the count every party stacks
@@ -1538,11 +1703,14 @@ class MPP[S, dtype]:
                         _encryption_right = Ciphertensor[Ciphertext]()
                     else:
                         _local_data = first._local_data @ other._local_data.T
-                elif first.is_local():
+                elif first_clear:
                     _encryption_unified = first._local_data @ other_partitions.unfence(mpc).T
                 else:
                     first.unify_encryption()
-                    _encryption_unified = first._encryption_unified @ other_partitions.unfence(mpc).T
+                    if other_clear and MPP._own_block_apart(mpc, aligner.descriptors, other._ratios):
+                        _encryption_unified = MPP._matmul_ntt_own_block_apart(mpc, first._encryption_unified, other, other_partitions)
+                    else:
+                        _encryption_unified = first._encryption_unified @ other_partitions.unfence(mpc).T
                 mpc.default_allow_mpc_switch = allow_mpc_switch
         
             return aligner.new_mpp(
@@ -1550,6 +1718,70 @@ class MPP[S, dtype]:
                 _encryption_left=_encryption_left,
                 _encryption_right=_encryption_right,
                 _encryption_unified=_encryption_unified)
+
+    @staticmethod
+    def _cohort_in_the_clear(descriptors: List[List[int]]) -> bool:
+        # Whether every compute party holds its partition in the clear, or none
+        return all(d[D_KIND] == MPP_CLEAR or d[D_KIND] == MPP_EMPTY for d in descriptors)
+
+    @staticmethod
+    def _check_same_partitions(first_descriptors: List[List[int]], other_descriptors: List[List[int]]):
+        # A per-partition product needs every compute party to hold both factors' partitions, or neither: raised at every
+        # compute party alike
+        for q in range(len(first_descriptors)):
+            if (first_descriptors[q][D_KIND] == MPP_EMPTY) != (other_descriptors[q][D_KIND] == MPP_EMPTY):
+                raise ValueError(f"MPP: all or none of the partitions should be empty (CP{q + 1} holds one factor's partition only)")
+
+    @staticmethod
+    def _own_block_apart(mpc, first_descriptors: List[List[int]], other_ratios: List[int]) -> bool:
+        # Whether A @ B.T with A encrypted and B in the clear can compute each party's own block apart
+        # (_matmul_ntt_own_block_apart): A's partitions row-wise, and a result row plus the own block's padding in one
+        # ciphertext. Public and agreed data only, so every compute party decides alike.
+        transposed, diagonal, _ = _encrypted_layout(first_descriptors)
+        slots = mpc.mhe.crypto_params.params.slots()
+        return not transposed and not diagonal and other_ratios.sum() + max(other_ratios) <= slots
+
+    @staticmethod
+    def _matmul_ntt_own_block_apart(mpc, first_encryption: Ciphertensor[Ciphertext], other: MPP[S, dtype], other_partitions: List[Ciphertensor[Ciphertext]]) -> Ciphertensor[Ciphertext]:
+        # This party's partition of A (encrypted, padded to the most rows) @ B.T, every partition of B in the clear
+        # (L-225). One ct @ ct product (M1) against the other parties' partitions of B, stacked in party order and padded
+        # with nil-ideal rows to the count every party stacks (sum - min(ratios)), each cell written at its final column;
+        # every cell refreshes, which keeps the parties in step cell by cell, so each party's real cells must sit at the
+        # same indices as the others' for the padding to save anything. The own block comes from one ct @ pt product
+        # against the own partition, padded with zero rows to the most rows (all zeros for an empty one: every party runs
+        # it), shifted right to its columns and added. With two equal partitions that halves the ct @ ct cells.
+        pid = mpc.pid
+        ratios = other._ratios
+        slots = first_encryption.slots
+        cols = first_encryption.shape[-1]
+        total = ratios.sum()
+        stacked_rows = total - min(ratios)
+        stacked = Ciphertensor[Ciphertext]()
+        columns = List[int]()
+        start = 0
+        for q in range(len(other_partitions)):
+            if ratios[q] and q != pid - 1:
+                stacked = other_partitions[q].copy() if not stacked else stacked.concat(mpc, other_partitions[q], axis=0)
+                for k in range(ratios[q]):
+                    columns.append(start + k)
+            start += ratios[q]
+        if len(columns) < stacked_rows:
+            padding = Ciphertensor[Ciphertext].placeholder([stacked_rows - len(columns), cols], slots)
+            stacked = padding if not stacked else stacked.concat(mpc, padding, axis=0)
+            while len(columns) < stacked_rows:
+                columns.append(0)  # A nil-ideal row's cells add nothing
+        result = first_encryption._matmul_v1_at(mpc, stacked.T, columns, total) if stacked else Ciphertensor[Ciphertext].zeros(mpc, [first_encryption.shape[0], total])
+
+        rows = max(ratios)
+        own = other._local_data
+        if own.is_empty():
+            own = zeros((rows, cols), dtype=dtype)
+        elif own.shape[0] < rows:
+            own = own.pad(rows - own.shape[0], axis=0)
+        own_block = first_encryption.matmul(mpc, own.T)
+        Ciphertensor._rotate_slots(mpc, own_block._data, -ratios[:pid - 1].sum())
+        mpc.mhe.iadd(result._data, own_block._data)
+        return result
 
     @staticmethod
     def _stack_other_partitions(mpc, partitions: List[Ciphertensor[Ciphertext]], rows: int, cols: int) -> Ciphertensor[Ciphertext]:
@@ -1599,7 +1831,8 @@ class MPP[S, dtype]:
             _encryption_unified = elem_wise_op(mpc, self._encryption_unified, other_data)
         elif self.has_partial_encryption():
             if self._encryption_left:
-                col_end = self._encryption_left.shape[-1]
+                # A block's logical width: the blocks of an A @ B.T result are lazily transposed (M-MP-03)
+                col_end = self._encryption_left.actual_shape[-1]
                 _encryption_left = elem_wise_op(mpc, self._encryption_left, other_data._slice_cols(0, col_end))
             assert self.has_local_data(), "MPP must have local data if it has partial encryption"
             col_start = col_end
@@ -1617,9 +1850,13 @@ class MPP[S, dtype]:
         mpc = self._mpc
         
         if isinstance(other, int) and MUL == 1:
-            if abs(other) < MHE_MUL_TO_ADD_THRESHOLD and not self.is_local():
-                # Do series of additions instead of single multiplication if other operand is small int constant
-                return secure_operator.mul_via_add(mpc, self, other)
+            if abs(other) < MHE_MUL_TO_ADD_THRESHOLD:
+                # By a small int: a series of additions on an encryption (cheaper than a product, and never a refresh),
+                # one product in the clear. Decided on the public factor alone, partition by partition inside one
+                # element-wise operation, so every compute party takes the same collective steps whatever it holds
+                # (M-MP-01: the choice used to depend on the party's own partition)
+                factor = other
+                return self._do_elem_wise_op(other, lambda mpc, x, y: MPP._mul_by_small_int(mpc, x, factor))
         
         _self, _other = self._check_binary_operands(other)
         ac_type = _self.dtype
@@ -1631,18 +1868,50 @@ class MPP[S, dtype]:
                 _local_data=_self._local_data.zeros(),
                 _transposed=self._transposed)
         
+        transposition_mismatch = False
         if isinstance(_other, MPP):
             if _self._ratios != _other._ratios and _other._ratios.sum() == 1:
                 _other = _other.broadcast(_self)
             elif _self._ratios != _other._ratios:
                 _other = _other.align_ratios(_self._ratios, False)
+            transposition_mismatch = _self._transposed ^ _other._transposed
+        
+        # A product refreshes its encrypted operands, and each refresh is a council among the compute parties. So for a
+        # product the compute parties first agree on their partitions, in one round (MPPAligner's descriptors), and each
+        # of them then runs every HE step some party runs: its own on its partition, the others on placeholders
+        # (_run_elem_wise_shadows). Each party computes in its own representation. Sums and differences never refresh:
+        # no round at equal ratios.
+        descriptors = List[List[int]]()
+        other_descriptors = List[List[int]]()
+        if isinstance(_other, MPP):
+            if transposition_mismatch:
+                # The operand goes whole, before anything is padded, through MPC into this one's orientation, and comes
+                # back in the layout of this one's encrypted partitions, which every party passes alike (M-MP-05)
+                descriptors = mpc.comms.collect(_partition_descriptor(_self))
+                transpose_encryption, _, _ = _encrypted_layout(descriptors)
+                other_stensor = _other.to_sharetensor()
+                other_stensor_t = other_stensor if _other._transposed else other_stensor.T
+                _other = other_stensor_t.to_mpp(mpc, _self._ratios, transpose_encryption=transpose_encryption, dtype=ac_type)
+                if MUL == 1:
+                    other_descriptors = mpc.comms.collect(_partition_descriptor(_other))
+            elif MUL == 1:
+                descriptors, other_descriptors = _agree_on_partitions(_self, _other)
+        elif MUL == 1:
+            descriptors = mpc.comms.collect(_partition_descriptor(_self))
+        
+        # Unequal partitions are padded (MPPAligner, with the descriptors already agreed, else one round): an empty
+        # partition takes the cohort's representations and runs the same code path as the others, which matters beyond
+        # the product itself (the broadcast of an encrypted operand replicates it, and its masks refresh). A public
+        # operand with the cohort's rows is cut to this party's rows and padded alike.
+        if isinstance(_other, ndarray):
+            _other = _self._rows_of_public(_other)
         
         _local_data = ndarray[S, ac_type]()
         _encryption_left = Ciphertensor[Ciphertext]()
         _encryption_right = Ciphertensor[Ciphertext]()
         _encryption_unified = Ciphertensor[Ciphertext]()
         
-        with _self.partition_aligner() as aligner, (_other.partition_aligner() if isinstance(_other, MPP) else EmptyWith()):
+        with _self.partition_aligner(ALIGN_ROWS, descriptors) as aligner, (_other.partition_aligner(ALIGN_ROWS, other_descriptors) if isinstance(_other, MPP) else EmptyWith()):
             if not _self.is_empty():
                 other_broadcast = _other.local_broadcast(_self.shape)
 
@@ -1654,20 +1923,12 @@ class MPP[S, dtype]:
                     if static.len(S) == 1:
                         assert _self.shape == other_broadcast.shape, f"MPP: Shapes mismatch in elem-wise operation. {_self.shape} != {other_broadcast.shape}"
 
-                    if _self._transposed ^ other_broadcast._transposed:
-                        transpose_encryption = False
-                        if not _self.is_local():
-                            _self.unify_encryption()
-                            transpose_encryption = _self._encryption_unified._transposed
-                        
-                        other_stensor = other_broadcast.to_sharetensor()
-                        other_stensor_t = other_stensor if other_broadcast._transposed else other_stensor.T
-                        other_t = other_stensor_t.to_mpp(mpc, _self._ratios, transpose_encryption=transpose_encryption, dtype=ac_type)
-                        other_encryption_unified = other_t._encryption_unified
-                        
+                    if transposition_mismatch:
+                        other_encryption_unified = other_broadcast._encryption_unified
                         if _self.is_local():
                             _encryption_unified = elem_wise_op(mpc, _self._local_data, other_encryption_unified)
                         else:
+                            _self.unify_encryption()
                             _encryption_unified = elem_wise_op(mpc, _self._encryption_unified, other_encryption_unified)
                     elif _self.is_local() and other_broadcast.is_local():
                         _local_data = elem_wise_op(mpc, _self._local_data, other_broadcast._local_data)
@@ -1695,11 +1956,125 @@ class MPP[S, dtype]:
                 else:
                     compile_error("Invalid operand type for MPP elem-wise operation")
         
+        
+            if MUL == 1:
+                MPP._run_elem_wise_shadows(mpc, descriptors, other_descriptors, isinstance(_other, ndarray), transposition_mismatch, not _self.cohort_is_aligned())
+            
             return aligner.new_mpp(
                 _local_data=_local_data,
                 _encryption_left=_encryption_left,
                 _encryption_right=_encryption_right,
                 _encryption_unified=_encryption_unified)
+
+    def _rows_of_public[S2, T2](self, data: ndarray[S2, T2]) -> ndarray[S2, T2]:
+        # A public operand with the cohort's rows: this party's rows of it, padded with zero rows to the most rows when
+        # the partitions are unequal, as the aligner pads the partition; anything else as is (a row to broadcast, an
+        # operand of the partition's shape). Untransposed 2-dim MPPs only: transposed ones with public operands are M-MP-04.
+        if static.len(S2) != 2 or self._transposed or data.shape[0] != self._ratios.sum():
+            return data
+        start, end = self.get_relative_indices()
+        rows = max(self._ratios) if not self.cohort_is_aligned() else end - start
+        if end == start:
+            return zeros((rows, data.shape[1]), dtype=T2)
+        own = data[start:end]
+        return own.pad(rows - (end - start), axis=0) if rows > end - start else own
+
+    @staticmethod
+    def _mul_by_small_int(mpc, x, factor: int):
+        # x times a small int: one product in the clear; a series of additions on an encryption, which never refreshes
+        if isinstance(x, ndarray):
+            return x * factor
+        else:
+            if factor == 0:
+                return x.sub(mpc, x)
+            result = x.copy()
+            for _ in range(abs(factor) - 1):
+                result.iadd(mpc, x)
+            return result.ineg(mpc) if factor < 0 else result
+
+    @staticmethod
+    def _steps_against_clear(d: List[int]) -> List[int]:
+        # The HE products of a partition times data in the clear (_do_elem_wise_op_public and ndarray's): its unified
+        # encryption if it has one, else each of its encrypted blocks
+        if d[D_KIND] == MPP_CLEAR:
+            return List[int]()
+        if d[D_UNIFIED]:
+            return [STEP_UNIFIED_PT]
+        steps = List[int]()
+        if d[D_LEFT]: steps.append(STEP_LEFT_PT)
+        if d[D_RIGHT]: steps.append(STEP_RIGHT_PT)
+        return steps
+
+    @staticmethod
+    def _elem_wise_steps(ds: List[int], do: List[int], public: bool, mismatch: bool) -> List[int]:
+        # The HE products a compute party runs in an element-wise product, picked from the descriptors of its partitions
+        # of the two operands as _do_elem_wise_op picks its branch (public: the other operand is an ndarray or a scalar;
+        # mismatch: it came back from MPC encrypted, in this one's orientation)
+        if ds[D_KIND] == MPP_EMPTY:
+            return List[int]()
+        if public:
+            return MPP._steps_against_clear(ds)
+        if do[D_KIND] == MPP_EMPTY:
+            return List[int]()
+        if mismatch:
+            return [STEP_UNIFIED_PT] if ds[D_KIND] == MPP_CLEAR else [STEP_UNIFIED_CT]
+        if ds[D_KIND] == MPP_CLEAR and do[D_KIND] == MPP_CLEAR:
+            return List[int]()
+        if do[D_KIND] == MPP_CLEAR:
+            return MPP._steps_against_clear(ds)
+        if ds[D_KIND] == MPP_CLEAR:
+            return MPP._steps_against_clear(do)
+        if bool(ds[D_UNIFIED]) != bool(do[D_UNIFIED]):
+            return [STEP_UNIFIED_CT]
+        steps = List[int]()
+        if ds[D_LEFT] and do[D_LEFT]: steps.append(STEP_LEFT_CT)
+        if ds[D_RIGHT] and do[D_RIGHT]: steps.append(STEP_RIGHT_CT)
+        if ds[D_UNIFIED] and do[D_UNIFIED]: steps.append(STEP_UNIFIED_CT)
+        return steps
+
+    @staticmethod
+    def _missing_steps(own: List[int], cohort: List[List[int]]) -> List[int]:
+        # The HE steps some compute party runs and this one does not, in a fixed order
+        missing = List[int]()
+        for steps in cohort:
+            for step in steps:
+                if step not in own and step not in missing:
+                    missing.append(step)
+        missing.sort()
+        return missing
+
+    @staticmethod
+    def _run_elem_wise_shadows(mpc, descriptors: List[List[int]], other_descriptors: List[List[int]], public: bool, mismatch: bool, padded: bool):
+        # The element-wise products some compute party runs and this one does not (_elem_wise_steps), on placeholders: a
+        # council's content drives every bootstrap in it, so the parties need only make the same number of refresh calls.
+        # With unequal partitions an empty one was padded, and runs the operation as a partition of that kind.
+        if not descriptors:
+            return
+        selfs = MPP._as_padded(descriptors) if padded else descriptors
+        others = (MPP._as_padded(other_descriptors) if padded else other_descriptors) if other_descriptors else List[List[int]]()
+        empty = [0 for _ in range(D_SIZE)]
+        cohort = List[List[int]]()
+        for q in range(len(selfs)):
+            cohort.append(MPP._elem_wise_steps(selfs[q], others[q] if others else empty, public, mismatch))
+        for step in MPP._missing_steps(cohort[mpc.pid - 1], cohort):
+            MPP._shadow_product(mpc, step % 2 == 1)
+
+    @staticmethod
+    def _as_padded(descriptors: List[List[int]]) -> List[List[int]]:
+        # The descriptors as MPPAligner pads the partitions for an element-wise operation (ALIGN_ROWS): an empty one takes
+        # one block of the cohort's kind (_padded_kind), and runs the operation as a partition of that kind
+        padded = _padded_kind(descriptors)
+        return [padded if d[D_KIND] == MPP_EMPTY else d for d in descriptors]
+
+    @staticmethod
+    def _shadow_product(mpc, ciphertext: bool):
+        # The refresh councils of an element-wise product of an encryption that another compute party runs (MPCMHE.imul
+        # refreshes each ciphertext operand once), on nil-ideal placeholders, which cost no arithmetic
+        x = [Ciphertext.nil_ideal()]
+        if ciphertext:
+            mpc.mhe.imul(x, [Ciphertext.nil_ideal()])
+        else:
+            mpc.mhe.imul(x, [Plaintext.nil_ideal()])
 
     def _pow(self, p: int) -> MPP[S, dtype]:
         mpc = self._mpc
@@ -1711,20 +2086,32 @@ class MPP[S, dtype]:
                 _local_data=self._local_data,
                 _transposed=self._transposed)
         
+        # The power of an encryption refreshes at every product, so the compute parties agree on their partitions first
+        # (one round), and if any of them holds an encrypted one, those that hold theirs in the clear (or none) run the
+        # same power on a placeholder. A refresh is one council per tensor whatever its size: nothing is padded.
+        descriptors = mpc.comms.collect(_partition_descriptor(self))
         _local_data = ndarray[S, dtype]()
         _encryption_unified = Ciphertensor[Ciphertext]()
         
-        with self.partition_aligner() as aligner:
-            if not self.is_empty():
-                if self.is_local():
-                    _local_data = self._local_data ** p
-                else:
-                    self.unify_encryption()
-                    _encryption_unified = secure_operator.pow(self._mpc, self._encryption_unified, p)
-            
-            return aligner.new_mpp(
-                _local_data=_local_data,
-                _encryption_unified=_encryption_unified)
+        if self.is_local():
+            _local_data = self._local_data ** p
+        elif not self.is_empty():
+            self.unify_encryption()
+            _encryption_unified = secure_operator.pow(self._mpc, self._encryption_unified, p)
+        
+        if self.is_local() or self.is_empty():
+            if any(d[D_KIND] == MPP_UNIFIED or d[D_KIND] == MPP_SEMI for d in descriptors):
+                slots = mpc.mhe.crypto_params.params.slots()
+                secure_operator.pow(self._mpc, Ciphertensor[Ciphertext].placeholder([1, 1], slots), p)
+        
+        return MPP[S, dtype](
+            _mpc=mpc,
+            _ratios=self._ratios.copy(),
+            _local_data=_local_data,
+            _encryption_left=Ciphertensor[Ciphertext](),
+            _encryption_right=Ciphertensor[Ciphertext](),
+            _encryption_unified=_encryption_unified,
+            _transposed=self._transposed)
 
     def _getitem_1_dim(self, indices) -> MPP[S, dtype]:
         if isinstance(indices, slice):
@@ -2416,29 +2803,109 @@ class MPP[S, dtype]:
     
 
 class MPPAligner[S, dtype]:
-    # For the duration of a with-block, pads every compute party's partition to the same shape, so that per-partition
-    # HE operations, which may refresh their operands (a collective bootstrap council), run alike at every compute
-    # party. Results built with new_mpp, and the operand itself on exit, are cut back to each party's own size.
-    # A 2-dim partition is padded to the most rows (the ratios). A 1-dim one is padded to the longest vector: a row of a
-    # 2-dim MPP is held by one party, whose ratio is 1 whatever the row's length, and a partitioned vector by several,
-    # whose ratios are their lengths, so the lengths are collected rather than read off the ratios.
+    # For the duration of a with-block, makes per-partition HE operations, which may refresh their operands (each
+    # refresh a collective bootstrap council among the compute parties), run alike at every compute party. It pads each
+    # party's partition to the cohort's shape, and an empty partition takes the representations the others hold (zeros,
+    # or nil-ideal placeholders: encrypted zero rows; block by block for ALIGN_PAD, else one block of the full width),
+    # so that it runs the same operations; a partition in the clear never gets a placeholder encryption, nor an
+    # encrypted one zero data in the clear, since each party's real representations decide what it computes. Results
+    # built with new_mpp, and the operand itself on exit, are cut back to each party's own size. A 2-dim partition is
+    # padded to the most rows (the ratios). A 1-dim one is padded to the longest vector: a row of a 2-dim MPP is held by
+    # one party, whose ratio is 1 whatever the row's length, and a partitioned vector by several, whose ratios are their
+    # lengths. Beyond that (the ALIGN_* modes) it agrees on every partition's descriptor in one round among the compute
+    # parties, which an operation can pass in when it agrees on two operands at once, and in ALIGN_ENCRYPT it unifies
+    # encrypted partitions and encrypts those in the clear of a mixed cohort for the duration.
     mpp: MPP[S, dtype]
+    mode: int
     length: int  # 1-dim and unaligned: this party's vector length on entry (-1 otherwise)
+    descriptors: List[List[int]]  # every compute party's partition (_partition_descriptor), when agreed
+    padded: bool
+    stashed: bool  # ALIGN_ENCRYPT: this party's partition in the clear is set aside for the duration
+    # Set only when stashed: an aligner is built for every element-wise operation, where empty placeholders cost
+    stash_local: Optional[ndarray[S, dtype]]
+    stash_unified: Optional[Ciphertensor[Ciphertext]]
 
-    def __init__(self, mpp: MPP[S, dtype]):
+    def __init__(self, mpp: MPP[S, dtype], mode: int = ALIGN_PAD, descriptors: Optional[List[List[int]]] = None):
         assert mpp._mpc.pid, "MPPAligner should not be called at CP0"
         self.mpp = mpp
+        self.mode = mode
         self.length = -1
+        self.descriptors = descriptors if descriptors is not None else List[List[int]]()
+        self.padded = False
+        self.stashed = False
+        self.stash_local = None
+        self.stash_unified = None
 
     def __enter__(self):
-        if not self.mpp.cohort_is_aligned():
+        mpp = self.mpp
+        unaligned = not mpp.cohort_is_aligned()
+        if (self.mode == ALIGN_PAD or self.mode == ALIGN_ROWS) and not unaligned:
+            return
+        if not self.descriptors:
+            self.descriptors = mpp._mpc.comms.collect(_partition_descriptor(mpp))
+        if self.mode == ALIGN_ENCRYPT:
+            self._unify_for_products()
+        if unaligned:
             if static.len(S) == 1:
-                self.length = MPPAligner._vector_length(self.mpp)
-            MPPAligner._align(self.mpp)
+                self.length = MPPAligner._vector_length(mpp)
+            MPPAligner._align(mpp, self.descriptors, self.mode == ALIGN_PAD)
+            self.padded = True
 
     def __exit__(self):
-        if not self.mpp.cohort_is_aligned():
+        if self.padded:
             MPPAligner._revert(self.mpp, self.length)
+        if self.stashed:
+            self.mpp._local_data = unwrap(self.stash_local)
+            self.mpp._encryption_unified = unwrap(self.stash_unified)
+
+    def own_kind(self) -> int:
+        # This party's partition kind, as agreed (valid once the descriptors are)
+        return self.descriptors[self.mpp._mpc.pid - 1][D_KIND]
+
+    def _unify_for_products(self):
+        # For a product of two secret factors, whose per-party products must match in kind and layout: every encrypted
+        # partition as one unified encryption (a semi-encrypted one unifies before it is padded, so it keeps its width),
+        # and in a mixed cohort (partitions in the clear and encrypted ones) every partition in the clear encrypted for the
+        # duration, by public-key encryption (never trivially: the data is private), in the layout of the encrypted ones,
+        # with its data in the clear set aside and restored on exit. Every party updates its copy of the descriptors alike.
+        descriptors = self.descriptors
+        kinds = [d[D_KIND] for d in descriptors]
+        mixed = MPP_CLEAR in kinds and (MPP_UNIFIED in kinds or MPP_SEMI in kinds)
+        if not mixed and MPP_SEMI not in kinds:
+            return
+        transposed, diagonal, agreed = _encrypted_layout(descriptors)
+        if not agreed:
+            raise ValueError("MPP: the compute parties hold their partitions encrypted in different layouts")
+        mpp = self.mpp
+        mpc = mpp._mpc
+        kind = kinds[mpc.pid - 1]
+        if kind == MPP_SEMI:
+            mpp.unify_encryption()
+        elif kind == MPP_CLEAR and mixed:
+            self.stash_local = mpp._local_data
+            self.stash_unified = mpp._encryption_unified
+            if static.len(S) == 2:
+                data = mpp._local_data.T if transposed else mpp._local_data
+                encryption = Ciphertensor[Ciphertext].enc(mpc, data, encoding=ENC_DIAG if diagonal else ENC_ROW)
+            else:
+                encryption = Ciphertensor[Ciphertext].enc(mpc, mpp._local_data, encoding=ENC_ROW)
+            encryption._transposed = transposed
+            mpp._encryption_unified = encryption
+            mpp._local_data = ndarray[S, dtype]()
+            self.stashed = True
+        for d in descriptors:
+            if d[D_KIND] == MPP_SEMI:
+                d[D_UNIFIED + 1] = d[D_LOCAL + 1] + d[D_LEFT + 1] + d[D_RIGHT + 1]
+            elif d[D_KIND] == MPP_CLEAR and mixed:
+                d[D_UNIFIED + 1] = d[D_LOCAL + 1]
+                d[D_LOCAL] = 0
+                d[D_LOCAL + 1] = 0
+            else:
+                continue
+            d[D_KIND] = MPP_UNIFIED
+            d[D_UNIFIED] = 1
+            d[D_UNIFIED + 2] = int(transposed)
+            d[D_UNIFIED + 3] = int(diagonal)
 
     def new_mpp(self,
             _local_data = None,
@@ -2478,24 +2945,60 @@ class MPPAligner[S, dtype]:
             _transposed=self.mpp._transposed)
     
     @staticmethod
-    def _align(mpp: MPP[S, dtype]):
+    def _align(mpp: MPP[S, dtype], descriptors: List[List[int]], semi_blocks: bool):
+        # Each representation this party holds, padded to the cohort's rows (or length). No round: the descriptors give
+        # every party's widths and layouts. With semi_blocks (ALIGN_PAD, per-block operations such as sums), an empty
+        # partition takes every representation some party holds, and a semi-encrypted one also the encrypted blocks some
+        # other semi-encrypted one has (nil-ideal), so that each block refreshes alike at every party; those blocks add
+        # nothing. Otherwise (a product unifies a semi-encrypted partition, which extra blocks would widen) an empty
+        # partition takes one block of the full width (_fill_empty).
         mpc = mpp._mpc
+        kind = descriptors[mpc.pid - 1][D_KIND]
+        empty = kind == MPP_EMPTY
+        if empty and not semi_blocks:
+            MPPAligner._fill_empty(mpp, descriptors)
+            return
+        blocks = empty or (semi_blocks and kind == MPP_SEMI)
         if static.len(S) == 1:
-            mpp._local_data = MPPAligner._align_vector(mpc, mpp._local_data)
-            mpp._encryption_unified = MPPAligner._align_vector_encryption(mpc, mpp._encryption_unified)
-            mpp._encryption_left = MPPAligner._align_vector_encryption(mpc, mpp._encryption_left)
-            mpp._encryption_right = MPPAligner._align_vector_encryption(mpc, mpp._encryption_right)
+            mpp._local_data = MPPAligner._align_vector(mpp._local_data, descriptors, empty)
+            mpp._encryption_unified = MPPAligner._align_vector_encryption(mpc, mpp._encryption_unified, descriptors, D_UNIFIED, empty)
+            mpp._encryption_left = MPPAligner._align_vector_encryption(mpc, mpp._encryption_left, descriptors, D_LEFT, blocks)
+            mpp._encryption_right = MPPAligner._align_vector_encryption(mpc, mpp._encryption_right, descriptors, D_RIGHT, blocks)
             return
         
-        if mpc.council(not mpp._local_data.is_empty()).any():
-            mpp._local_data = MPPAligner._align_local_data(mpc, mpp._local_data, mpp._ratios)
-        if mpc.council(mpp._encryption_unified).any():
-            mpp._encryption_unified = MPPAligner._align_encryption(mpc, mpp._encryption_unified, mpp._ratios, S=S)
-        if mpc.council(mpp._encryption_left).any():
-            mpp._encryption_left = MPPAligner._align_encryption(mpc, mpp._encryption_left, mpp._ratios, S=S)
-        if mpc.council(mpp._encryption_right).any():
-            mpp._encryption_right = MPPAligner._align_encryption(mpc, mpp._encryption_right, mpp._ratios, S=S)
+        mpp._local_data = MPPAligner._align_local_data(mpc, mpp._local_data, mpp._ratios, descriptors, empty)
+        mpp._encryption_unified = MPPAligner._align_encryption(mpc, mpp._encryption_unified, mpp._ratios, descriptors, D_UNIFIED, empty, S=S)
+        mpp._encryption_left = MPPAligner._align_encryption(mpc, mpp._encryption_left, mpp._ratios, descriptors, D_LEFT, blocks, S=S)
+        mpp._encryption_right = MPPAligner._align_encryption(mpc, mpp._encryption_right, mpp._ratios, descriptors, D_RIGHT, blocks, S=S)
     
+    @staticmethod
+    def _fill_empty(mpp: MPP[S, dtype], descriptors: List[List[int]]):
+        # An empty partition padded for an operation that is not per block (every mode but ALIGN_PAD): one block of the
+        # full width in the cohort's kind, a nil-ideal placeholder in the layout of the encrypted partitions if any party
+        # holds one, else zeros in the clear (_padded_kind gives what it then counts as). Taking each block from another
+        # holder would not add up to the cohort's width.
+        mpc = mpp._mpc
+        padded = _padded_kind(descriptors)
+        if padded[D_KIND] == MPP_EMPTY:
+            return
+        width = padded[D_UNIFIED + 1] if padded[D_KIND] == MPP_UNIFIED else padded[D_LOCAL + 1]
+        if static.len(S) == 1:
+            if padded[D_KIND] == MPP_UNIFIED:
+                placeholder = Ciphertensor[Ciphertext].placeholder([width], mpc.mhe.crypto_params.params.slots())
+                placeholder._transposed = bool(padded[D_UNIFIED + 2])
+                mpp._encryption_unified = placeholder
+            else:
+                mpp._local_data = zeros((width,), dtype=dtype)
+            return
+        rows = max(mpp._ratios)
+        if padded[D_KIND] == MPP_UNIFIED:
+            transposed = bool(padded[D_UNIFIED + 2])
+            placeholder = Ciphertensor[Ciphertext].placeholder([width, rows] if transposed else [rows, width], mpc.mhe.crypto_params.params.slots())
+            placeholder._transposed = transposed
+            mpp._encryption_unified = placeholder
+        else:
+            mpp._local_data = zeros((rows, width), dtype=dtype)
+
     @staticmethod
     def _revert(mpp: MPP[S, dtype], length: int):
         mpc = mpp._mpc
@@ -2524,30 +3027,36 @@ class MPPAligner[S, dtype]:
         return length
 
     @staticmethod
-    def _align_vector[S, dtype](mpc, data: ndarray[S, dtype]) -> ndarray[S, dtype]:
-        # One round among the compute parties: every one pads its vector in the clear to the longest (zeros where it
-        # has none), unless none has one
-        lengths = mpc.comms.collect(0 if data.is_empty() else data.shape[0])
-        target = max(lengths)
+    def _align_vector[S, dtype](data: ndarray[S, dtype], descriptors: List[List[int]], empty: bool) -> ndarray[S, dtype]:
+        # A vector in the clear padded with zeros to the longest one in the clear; an empty partition takes zeros of that
+        # length
+        target = 0
+        for d in descriptors:
+            if d[D_LOCAL] and d[D_LOCAL + 1] > target:
+                target = d[D_LOCAL + 1]
         if target == 0:
             return data
-        if data.is_empty():
-            return zeros((target,), dtype=dtype)
-        return data.pad(target - data.shape[0], axis=0) if data.shape[0] < target else data
+        if not data.is_empty():
+            return data.pad(target - data.shape[0], axis=0) if data.shape[0] < target else data
+        return zeros((target,), dtype=dtype) if empty else data
 
     @staticmethod
-    def _align_vector_encryption(mpc, encryption: Ciphertensor[Ciphertext]) -> Ciphertensor[Ciphertext]:
-        # As _align_vector, for an encrypted vector: its ciphertexts in a placeholder of the longest length (nil-ideal
-        # ciphertexts for the rest), with the layout flag of the first party that has one
-        info = mpc.comms.collect([encryption.shape[-1] if encryption else 0, int(encryption._transposed)])
-        target = max(i[0] for i in info)
+    def _align_vector_encryption(mpc, encryption: Ciphertensor[Ciphertext], descriptors: List[List[int]], field: int, fill: bool) -> Ciphertensor[Ciphertext]:
+        # As _align_vector, for an encrypted vector: its ciphertexts in a placeholder of the longest length among the
+        # parties that hold this encryption (nil-ideal ciphertexts for the rest); without one, a placeholder with the
+        # layout of the first party that holds one if fill
+        target = 0
+        for d in descriptors:
+            if d[field] and d[field + 1] > target:
+                target = d[field + 1]
         if target == 0:
             return encryption
-        transposed = False
-        for i in info:
-            if i[0]:
-                transposed = bool(i[1])
-                break
+        if encryption:
+            transposed = encryption._transposed
+        elif fill:
+            transposed = bool(descriptors[_first_holder(descriptors, field)][field + 2])
+        else:
+            return encryption
         
         slots = mpc.mhe.crypto_params.params.slots()
         placeholder = Ciphertensor[Ciphertext].placeholder([target], slots)
@@ -2579,41 +3088,46 @@ class MPPAligner[S, dtype]:
             _is_broadcast=encryption._is_broadcast)
     
     @staticmethod
-    def _align_local_data[S, dtype](mpc, data: ndarray[S, dtype], ratios: List[int]):
+    def _align_local_data[S, dtype](mpc, data: ndarray[S, dtype], ratios: List[int], descriptors: List[List[int]], empty: bool):
+        # This party's data in the clear padded with zero rows to the most rows; an empty partition takes zero rows when
+        # some party holds data in the clear
         if static.len(S) != 2:
             compile_error("MPPAligner: invalid dimension")
 
         assert ratios.sum() > 0, "MPPAligner: nothing to align -- MPP empty"
-        ref_pid = argmax(ratios) + 1
-        cols = mpc.comms.broadcast_from(0 if data.is_empty() else data.shape[-1], ref_pid)
-
-        if ratios[mpc.pid - 1] == max(ratios):
+        rows = max(ratios)
+        if not data.is_empty():
+            return data.pad(rows - data.shape[0], axis=0) if data.shape[0] < rows else data
+        if not empty:
             return data
-        
-        if data.is_empty():
-            return zeros((max(ratios), cols), dtype=dtype)
-        
-        return data.pad(max(ratios) - ratios[mpc.pid - 1], axis=0)
+        source = _first_holder(descriptors, D_LOCAL)
+        return zeros((rows, descriptors[source][D_LOCAL + 1]), dtype=dtype) if source >= 0 else data
     
     @staticmethod
-    def _align_encryption[S](mpc, encryption: Ciphertensor[Ciphertext], ratios: List[int]):
+    def _align_encryption[S](mpc, encryption: Ciphertensor[Ciphertext], ratios: List[int], descriptors: List[List[int]], field: int, fill: bool):
+        # This party's encryption (field: unified, left or right) padded with nil-ideal rows to the most rows, in its own
+        # layout; without one, a placeholder in the layout and width of the first party that holds one if fill
         if static.len(S) != 2:
             compile_error("MPPAligner: invalid dimension")
 
         assert ratios.sum() > 0, "MPPAligner: nothing to align -- MPP empty"
-        slots = mpc.mhe.crypto_params.params.slots()
-        ref_pid = argmax(ratios) + 1
-        cols = mpc.comms.broadcast_from(encryption.shape[int(encryption._transposed) - 1] if encryption else 0, ref_pid)
-        _transposed = mpc.comms.broadcast_from(encryption._transposed, ref_pid)
-
-        if ratios[mpc.pid - 1] == max(ratios):
+        rows = max(ratios)
+        if encryption:
+            if ratios[mpc.pid - 1] == rows:
+                return encryption
+            own = descriptors[mpc.pid - 1]
+            cols, _transposed = own[field + 1], bool(own[field + 2])
+        elif fill:
+            source = _first_holder(descriptors, field)
+            if source < 0:
+                return encryption
+            cols, _transposed = descriptors[source][field + 1], bool(descriptors[source][field + 2])
+        else:
             return encryption
-        
-        _encryption_placeholder = Ciphertensor[Ciphertext].placeholder([cols, max(ratios)] if _transposed else [max(ratios), cols], slots)
+
+        slots = mpc.mhe.crypto_params.params.slots()
+        _encryption_placeholder = Ciphertensor[Ciphertext].placeholder([cols, rows] if _transposed else [rows, cols], slots)
         _encryption_placeholder._transposed = _transposed
-        
-        assert not ((ratios[mpc.pid - 1] > 0) ^ (len(encryption._data) > 0)), f"MPPAligner: invalid encryption at CP{mpc.pid}. Ratios: {ratios[mpc.pid - 1]}. Ciphertexts len: {len(encryption._data)}. Ciphertensor shape: {encryption.shape}"
-        
         for i, cipher in enumerate(encryption._data):
             _encryption_placeholder._data[i] = cipher
 
@@ -2657,8 +3171,8 @@ class MPPAligner[S, dtype]:
 
 @extend
 class MPP:
-    def partition_aligner(self):
-        return MPPAligner(self)
+    def partition_aligner(self, mode: int = ALIGN_PAD, descriptors: Optional[List[List[int]]] = None):
+        return MPPAligner(self, mode, descriptors)
 
 
 @extend
@@ -2697,23 +3211,22 @@ class ndarray:
             if _self.shape[0] == _other._ratios.sum():
                 start, end = _other.get_relative_indices()
                 _self = _self[start:end]
-
-                # Align partitions for the downstream computation
-                padding = max(_other._ratios) - _other._ratios[mpc.pid - 1]
-                if padding:
-                    _self = _self.pad(padding, axis=0)
             elif not _self.shape[0] == _other.shape[0]:
                 raise ValueError(f"ndarray: shapes missmatch in public elem-wise MPP operation {_self.shape} vs {_other.shape} at CP{mpc.pid}")
         
-        with _other.partition_aligner() as aligner:
-            if not _other.is_empty():
-                _local_data, _encryption_left, _encryption_right, _encryption_unified = _self._do_elem_wise_op_public(_other, elem_wise_op)
+        # A sum or a difference (a product of an ndarray by an MPP does not compile yet: L-095), which never refreshes:
+        # each compute party computes on its own partition, nothing padded, no round
+        if not _other.is_empty():
+            _local_data, _encryption_left, _encryption_right, _encryption_unified = _self._do_elem_wise_op_public(_other, elem_wise_op)
 
-            return aligner.new_mpp(
-                _local_data=_local_data,
-                _encryption_left=_encryption_left,
-                _encryption_right=_encryption_right,
-                _encryption_unified=_encryption_unified)
+        return MPP[S, ac_type](
+            _mpc=mpc,
+            _ratios=_other._ratios.copy(),
+            _local_data=_local_data,
+            _encryption_left=_encryption_left,
+            _encryption_right=_encryption_right,
+            _encryption_unified=_encryption_unified,
+            _transposed=_other._transposed)
 
     def _do_elem_wise_op_public(self, other_mpp: MPP[S, T], elem_wise_op) -> Tuple[ndarray[S, T], Ciphertensor[Ciphertext], Ciphertensor[Ciphertext], Ciphertensor[Ciphertext]]:
         last_dim = self.shape[0] if other_mpp._transposed else self.shape[-1]
@@ -2734,7 +3247,8 @@ class ndarray:
             _encryption_unified = elem_wise_op(mpc, self, other_mpp._encryption_unified)
         elif other_mpp.has_partial_encryption():
             if other_mpp._encryption_left:
-                col_end = other_mpp._encryption_left.shape[-1]
+                # A block's logical width: the blocks of an A @ B.T result are lazily transposed (M-MP-03)
+                col_end = other_mpp._encryption_left.actual_shape[-1]
                 _encryption_left = elem_wise_op(mpc, self._slice_cols(0, col_end), other_mpp._encryption_left)
             assert other_mpp.has_local_data(), "ndarray: MPP must have local data if it has partial encryption"
             col_start = col_end

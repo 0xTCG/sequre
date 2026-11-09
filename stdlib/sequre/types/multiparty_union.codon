@@ -9,7 +9,7 @@ from sequre.attributes import sequre
 from sequre.mpc.env import MPCEnv
 from sequre.lattiseq.ckks import Ciphertext
 from sequre.types.ciphertensor import Ciphertensor
-from sequre.types.multiparty_partition import MPP
+from sequre.types.multiparty_partition import MPP, ALIGN_ENCRYPT, _agree_on_partitions
 from sequre.types.multiparty_aggregate import MPA
 from sequre.constants import HE_ENC_COST_ESTIMATE
 
@@ -853,8 +853,12 @@ class MPU[S, dtype]:
         transposed = mpp._transposed
         new_mpa = mpa.T if transposed else mpa.copy()
         
+        # One round among the compute parties: whether one of them holds the whole MPP, and whether one of them would
+        # place an encrypted partition into an MPA share that holds no encryption (_mpa_lacks_encryption)
+        agreed = mpc.comms.collect([int(mpa.shape == mpp.shape), int(MPU[S, dtype]._mpa_lacks_encryption(mpa, mpp))])
+        
         # Case where MPP partition is present only at a single party
-        if mpc.council(mpa.shape == mpp.shape).any():
+        if any(bool(d[0]) for d in agreed):
             is_non_empty = mpa.shape == mpp.shape
             if mpp.has_local_data():
                 new_mpa += MPA[S, dtype](mpc, mpp._local_data if is_non_empty else zeros(mpa.shape, dtype=dtype))
@@ -872,7 +876,8 @@ class MPU[S, dtype]:
                 new_mpa += MPA[S, dtype](mpc, mpp._encryption_unified)
             return new_mpa
 
-        start, end = mpp.get_relative_indices()        
+        MPU[S, dtype]._check_mpa_takes_partitions(agreed)
+        start, end = mpp.get_relative_indices()
         if end - start:
             if mpp.has_local_data():
                 new_mpa[start:end] += MPA[S, dtype](mpc, mpp._local_data)
@@ -881,6 +886,20 @@ class MPU[S, dtype]:
                 new_mpa[start:end] += MPA[S, dtype](mpc, mpp._encryption_unified)
         
         return new_mpa.T if transposed else new_mpa
+    
+    @staticmethod
+    def _mpa_lacks_encryption(mpa: MPA[S, dtype], mpp: MPP[S, dtype]) -> bool:
+        # Whether this compute party would add its partition (encrypted, or any if the MPA is only an aggregate) into rows
+        # of an MPA share that holds no encryption, which MPA's setitem cannot do yet (H-23)
+        start, end = mpp.get_relative_indices()
+        return end > start and not mpa.has_encryption() and (not mpp.has_local_data() or not mpa.has_plain())
+
+    @staticmethod
+    def _check_mpa_takes_partitions(agreed: List[List[int]]):
+        # Raises at every compute party alike if one of them would hit MPA's setitem assertion: the others would go on
+        # and wait for it (M-MP-21)
+        if any(bool(d[-1]) for d in agreed):
+            raise NotImplementedError("MPU: adding an MPP to an MPA where some compute party holds its partition encrypted and its MPA share not encrypted (or the MPA only as an aggregate) is not implemented yet")
     
     def _sub_mpa_mpp(mpa: MPA[S, dtype], mpp: MPP[S, dtype]) -> MPA[S, dtype]:
         mpc = mpa._mpc
@@ -899,6 +918,7 @@ class MPU[S, dtype]:
                 new_mpa -= MPA[S, dtype](mpc, mpp._encryption_unified)
             return new_mpa
 
+        MPU[S, dtype]._check_mpa_takes_partitions(mpc.comms.collect([int(MPU[S, dtype]._mpa_lacks_encryption(mpa, mpp))]))
         start, end = mpp.get_relative_indices()
         if end - start:
             if mpp.has_local_data():
@@ -958,7 +978,10 @@ class MPU[S, dtype]:
         
         mpa.aggregate()
         _encryption = Ciphertensor[Ciphertext]()
-        with mpp.partition_aligner() as aligner:
+        # Every compute party runs the same HE product: an MPP that some parties hold in the clear and others encrypted is
+        # encrypted at every party for it (ALIGN_ENCRYPT; one round), since a product in the clear and one of an
+        # encryption by the aggregate differ in their refreshes and in their result's layout
+        with mpp.partition_aligner(ALIGN_ENCRYPT) as aligner:
             if not mpp.is_empty():
                 if mpp.is_local():
                     # Each party's own product: it never switches to MPC, which would need CP0 (as in H-53)
@@ -982,20 +1005,45 @@ class MPU[S, dtype]:
             return MPA[S, dtype](mpc, zeros((mpp._local_data.shape[1], mpa._plain.shape[1]), dtype=dtype))
         
         mpa.aggregate()
-        start, stop = mpp.get_relative_indices()
-        other = MPP[S, dtype](mpc, mpa._aggregate[start:stop], mpp._ratios)
+        other = MPP[S, dtype](
+            _mpc=mpc,
+            _ratios=mpp._ratios,
+            _encryption_unified=MPU[S, dtype]._own_aggregate_rows(mpc, mpa._aggregate, mpp._ratios))
         
         _encryption = Ciphertensor[Ciphertext]()
-        with mpp.partition_aligner(), other.partition_aligner():
+        # As _matmul_mpa_mpp_t: a mixed MPP is encrypted at every party for the product. The partitions' own products
+        # never switch to MPC, which would need CP0.
+        with mpp.partition_aligner(ALIGN_ENCRYPT), other.partition_aligner():
             if not mpp.is_empty():
+                allow_mpc_switch = mpc.default_allow_mpc_switch
+                mpc.default_allow_mpc_switch = False
                 if mpp.is_local():
                     _encryption = mpp._local_data.T @ other._encryption_unified
                 else:
                     mpp.unify_encryption()
                     _encryption = mpp._encryption_unified.T @ other._encryption_unified
+                mpc.default_allow_mpc_switch = allow_mpc_switch
             
             return MPA[S, dtype](mpc, _encryption)
     
+    @staticmethod
+    def _own_aggregate_rows(mpc, aggregate: Ciphertensor[Ciphertext], ratios: List[int]) -> Ciphertensor[Ciphertext]:
+        # This compute party's rows of an aggregate (the same ciphertexts at every party), empty for an empty partition
+        # (whose empty slice raised there only). A row-wise aggregate's rows are whole ciphertexts. Slicing the rows of a
+        # column-wise (or diagonal) one is HE work whose refreshes (councils among the compute parties) depend on the
+        # slice, so every party slices every party's rows, in party order, and keeps its own. Every party holds the same
+        # aggregate, so all take the same branch.
+        own = Ciphertensor[Ciphertext]()
+        start = 0
+        row_wise = not aggregate._transposed and not aggregate._diagonal_contiguous
+        for q in range(len(ratios)):
+            if ratios[q] and (q == mpc.pid - 1 or not row_wise):
+                rows = aggregate._getitem(mpc, slice(start=start, stop=start + ratios[q], step=1))
+                if q == mpc.pid - 1:
+                    own = rows
+            start += ratios[q]
+        return own
+
     @sequre
     def _matmul_mpp_nt_mpa(mpc, mpp: MPP[S, dtype], mpa: MPA[S, dtype]) -> MPP[S, dtype]:
         assert not mpp._transposed, "MPU: MPP expected not to be tranposed in transposed x MPA matmul case"
@@ -1009,13 +1057,17 @@ class MPU[S, dtype]:
         mpa.aggregate()
 
         _encryption = Ciphertensor[Ciphertext]()
-        with mpp.partition_aligner() as aligner:
+        # As _matmul_mpa_mpp_t: a mixed MPP is encrypted at every party for the product
+        with mpp.partition_aligner(ALIGN_ENCRYPT) as aligner:
             if not mpp.is_empty():
+                allow_mpc_switch = mpc.default_allow_mpc_switch
+                mpc.default_allow_mpc_switch = False
                 if mpp.is_local():
                     _encryption = mpp._local_data @ mpa._aggregate
                 else:
                     mpp.unify_encryption()
                     _encryption = mpp._encryption_unified @ mpa._aggregate
+                mpc.default_allow_mpc_switch = allow_mpc_switch
             
             return aligner.new_mpp(
                 _encryption_unified=_encryption)
@@ -1025,12 +1077,16 @@ class MPU[S, dtype]:
         if mpc.pid == 0:
             return MPA[S, dtype](first._mpc, zeros((first._local_data.shape[1], other._local_data.shape[1]), dtype=dtype))
 
-        assert not (first.is_empty() ^ other.is_empty()), "MPU: all or none of the partitions should be empty"
+        # The compute parties agree on both factors in one round; a factor that some of them hold in the clear and others
+        # encrypted is encrypted at every party for the product (ALIGN_ENCRYPT), so every party runs the same product
+        # and the result's shares are all in the clear or all encrypted, in one layout
+        first_descriptors, other_descriptors = _agree_on_partitions(first, other)
+        MPP._check_same_partitions(first_descriptors, other_descriptors)
 
         plain = ndarray[S, dtype]()
         enc = Ciphertensor[Ciphertext]()
         
-        with first.partition_aligner(), other.partition_aligner():
+        with first.partition_aligner(ALIGN_ENCRYPT, first_descriptors), other.partition_aligner(ALIGN_ENCRYPT, other_descriptors):
             assert first.shape[1] == other.shape[0], f"MPU: Invalid shapes for per-partition matmul. {first.shape} x {other.shape}"
 
             if not first.is_empty():
@@ -1039,6 +1095,8 @@ class MPU[S, dtype]:
                 if not other.is_local():
                     other.unify_encryption()
                 
+                allow_mpc_switch = mpc.default_allow_mpc_switch
+                mpc.default_allow_mpc_switch = False
                 if first.is_local() and other.is_local():
                     plain = first._local_data.T @ other._local_data
                 elif first.is_local():
@@ -1047,6 +1105,7 @@ class MPU[S, dtype]:
                     enc = first._encryption_unified.T @ other._local_data
                 else:
                     enc = first._encryption_unified.T @ other._encryption_unified
+                mpc.default_allow_mpc_switch = allow_mpc_switch
 
         if enc:
             return MPA[S, dtype](first._mpc, enc)

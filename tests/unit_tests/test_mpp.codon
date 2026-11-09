@@ -11,7 +11,8 @@ from sequre.utils.io import write_ndarray, read_ndarray
 from sequre.utils.utils import random_ints
 
 from multiparty_testing import (
-    unequal_ratios, ratios_with_empty, own_rows, cohort_matrix, partition, column, assert_parties_in_step)
+    unequal_ratios, ratios_with_empty, own_rows, cohort_matrix, partition, column, assert_parties_in_step, encrypted_at,
+    holders)
 
 
 def test_mpp_getitem(mpp_a, raw_a):
@@ -292,12 +293,19 @@ def test_mpp_partitioned_vectors(mpc):
         squared = vector * vector
         mixed = encrypted + vector
         encrypted_squared = encrypted * encrypted
+        # A mixed cohort (M-MP-21): CP1 holds its slice encrypted, the others in the clear
+        mixed_vector = vector.copy()
+        if mpc.pid == 1:
+            mixed_vector.encrypt()
+        mixed_squared = mixed_vector * mixed_vector
+        assert_parties_in_step(mpc, f"MPP mixed partitioned vector squared, ratios {ratios}")
 
         revealed = vector.reveal()
         revealed_doubled = doubled.reveal()
         revealed_squared = squared.reveal()
         revealed_mixed = mixed.reveal()
         revealed_encrypted_squared = encrypted_squared.reveal()
+        revealed_mixed_squared = mixed_squared.reveal()
         revealed_after = vector.reveal()
         revealed_encrypted_after = encrypted.reveal()
         if mpc.pid:
@@ -307,6 +315,7 @@ def test_mpp_partitioned_vectors(mpc):
             assert_eq(f"CP{mpc.pid}:\t{label}: v * v", revealed_squared, expected * expected)
             assert_eq_approx(f"CP{mpc.pid}:\t{label}: encrypted + in the clear", revealed_mixed, expected * 2.0, error=1e-3)
             assert_eq_approx(f"CP{mpc.pid}:\t{label}: encrypted * encrypted", revealed_encrypted_squared, expected * expected, error=1e-2)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: mixed * mixed", revealed_mixed_squared, expected * expected, error=1e-2)
             assert_eq(f"CP{mpc.pid}:\t{label}: operand kept", revealed_after, expected)
             assert_eq_approx(f"CP{mpc.pid}:\t{label}: encrypted operand kept", revealed_encrypted_after, expected, error=1e-3)
         assert_parties_in_step(mpc, f"MPP partitioned vector, ratios {ratios}")
@@ -378,7 +387,14 @@ def test_mpp_cohort_products(mpc):
         revealed_encrypted = product_encrypted.reveal()
         if mpc.pid:
             assert_eq_approx(f"CP{mpc.pid}:\tMPP A @ B.T in the clear, ratios {ratios}", revealed, a_matrix @ b_matrix.T, error=0.01)
-            assert_eq_approx(f"CP{mpc.pid}:\tMPP A @ B.T, A encrypted, ratios {encrypted_ratios}", revealed_encrypted, a_small @ b_small.T, error=0.01)
+            expected_small = a_small @ b_small.T
+            assert_eq_approx(f"CP{mpc.pid}:\tMPP A @ B.T, A encrypted, ratios {encrypted_ratios}", revealed_encrypted, expected_small, error=0.01)
+            # L-225: each party's own block comes from a product of its own, apart from the others' blocks
+            for q in holders(encrypted_ratios):
+                start, stop = own_rows_of(q, encrypted_ratios)
+                assert_eq_approx(
+                    f"CP{mpc.pid}:\tMPP A @ B.T, A encrypted, ratios {encrypted_ratios}: CP{q}'s own block",
+                    block(revealed_encrypted, start, stop), block(expected_small, start, stop), error=0.01)
 
         matrix = cohort_matrix(mpc, ratios.sum(), 64)
         public = cohort_matrix(mpc, 64, 3) * 0.25
@@ -398,6 +414,153 @@ def test_mpp_cohort_products(mpc):
             expected = matrix @ public
             assert_eq_approx(f"CP{mpc.pid}:\tMPP @ ndarray via MPC, encrypted, ratios {ratios}", revealed_via_mpc, expected, error=0.01)
             assert_eq(f"CP{mpc.pid}:\tMPP @ ndarray under allow_mpc_switch, in the clear, ratios {ratios}", revealed_local, expected)
+
+def own_rows_of(q: int, ratios: List[int]) -> Tuple[int, int]:
+    # The rows compute party q holds
+    start = ratios[:q - 1].sum()
+    return start, start + ratios[q - 1]
+
+
+def block(matrix, start: int, stop: int):
+    # A copy of matrix[start:stop, start:stop] (a party's own block of an A @ B.T result)
+    return array([[matrix[i, j] for j in range(start, stop)] for i in range(start, stop)])
+
+
+def test_mpp_mixed_cohorts(mpc):
+    """M-MP-21: element-wise operations, powers and products with a plaintext matrix on mixed cohorts, where some compute
+    parties hold their partition encrypted and the others in the clear: equal partitions, and unequal ones with an empty
+    one (element-wise operations pad nothing). M-MP-01: by a small int (additions on an encrypted partition) at every
+    party alike. M-MP-05: a transposition mismatch, the operand converted before any padding. The semi-encrypted results
+    of A @ B.T in the clear (each party with other blocks, M-MP-03). Every party in step after each operation."""
+    n_cp = mpc.comms.number_of_parties - 1
+    for ratios in ([3 for _ in range(n_cp)], ratios_with_empty(n_cp)):
+        rows = ratios.sum()
+        a = cohort_matrix(mpc, rows, 4)
+        b = cohort_matrix(mpc, rows, 4)
+        public = cohort_matrix(mpc, 4, 3) * 0.25
+        local_a = partition(mpc, a, ratios)
+        local_b = partition(mpc, b, ratios)
+        parties = holders(ratios)
+        # The first party that holds rows encrypts its partition of A; every party but the last encrypts its one of B
+        mixed_a = encrypted_at(mpc, local_a, parties[:1])
+        mixed_b = encrypted_at(mpc, local_b, parties[:-1])
+        label = f"ratios {ratios}"
+
+        names = ["mixed * 0.5", "mixed * ndarray", "mixed * MPP in the clear", "mixed * MPP mixed the other way",
+                 "mixed * 3 (additions)", "mixed * -2 (additions)", "in the clear * 3", "mixed + MPP in the clear",
+                 "mixed - ndarray", "ndarray - mixed", "mixed ** 2", "mixed @ ndarray"]
+        expected = [a * 0.5, a * b, a * b, a * b, a * 3.0, a * -2.0, a * 3.0, a + b, a - b, b - a, a * a, a @ public]
+        results = List[MPP[Tuple[int, int], float]]()
+        for i in range(len(names)):
+            if i == 0: results.append(mixed_a * 0.5)
+            elif i == 1: results.append(mixed_a * b)
+            elif i == 2: results.append(mixed_a * local_b)
+            elif i == 3: results.append(mixed_a * mixed_b)
+            elif i == 4: results.append(mixed_a * 3)
+            elif i == 5: results.append(mixed_a * -2)
+            elif i == 6: results.append(local_a * 3)
+            elif i == 7: results.append(mixed_a + local_b)
+            elif i == 8: results.append(mixed_a - b)
+            elif i == 9: results.append(b - mixed_a)
+            elif i == 10: results.append(mixed_a ** 2)
+            else: results.append(mixed_a @ public)
+            assert_parties_in_step(mpc, f"MPP {names[i]}, {label}")
+        revealed = [result.reveal() for result in results]
+        if mpc.pid:
+            for i in range(len(names)):
+                assert_eq_approx(f"CP{mpc.pid}:\tMPP {names[i]}, {label}", revealed[i], expected[i], error=0.01)
+
+        # A transposition mismatch: the operand goes through MPC whole, into this one's orientation
+        x = cohort_matrix(mpc, rows, rows)
+        local_x = partition(mpc, x, ratios)
+        mixed_x = encrypted_at(mpc, local_x, parties[:1])
+        summed = mixed_x + mixed_x.T
+        assert_parties_in_step(mpc, f"MPP mixed X + X.T, {label}")
+        multiplied = mixed_x * local_x.T
+        assert_parties_in_step(mpc, f"MPP mixed X * X.T, {label}")
+
+        # A @ B.T in the clear leaves each party a block in the clear between encrypted ones, which differ by party. (K by
+        # an encrypted MPP would multiply K's column-wise blocks by a row-wise encryption, which deadlocks: M-MHE-21.)
+        k = local_a @ local_b.T
+        ab = a @ b.T
+        k_scaled = k * 0.5
+        assert_parties_in_step(mpc, f"MPP K * 0.5, K = A @ B.T, {label}")
+        k_minus = k - ab
+        assert_parties_in_step(mpc, f"MPP K - ndarray, {label}")
+        k_clear = k * partition(mpc, ab, ratios)
+        assert_parties_in_step(mpc, f"MPP K * MPP in the clear, {label}")
+        k_squared = k * k
+        assert_parties_in_step(mpc, f"MPP K * K, {label}")
+
+        revealed_summed = summed.reveal()
+        revealed_multiplied = multiplied.reveal()
+        revealed_k_scaled = k_scaled.reveal()
+        revealed_k_minus = k_minus.reveal()
+        revealed_k_clear = k_clear.reveal()
+        revealed_k_squared = k_squared.reveal()
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tMPP mixed X + X.T, {label}", revealed_summed, x + x.T, error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\tMPP mixed X * X.T, {label}", revealed_multiplied, x * x.T, error=0.01)
+            assert_eq_approx(f"CP{mpc.pid}:\tMPP K * 0.5, K = A @ B.T, {label}", revealed_k_scaled, ab * 0.5, error=0.01)
+            assert_eq_approx(f"CP{mpc.pid}:\tMPP K - ndarray, {label}", revealed_k_minus, ab * 0.0, error=0.01)
+            assert_eq_approx(f"CP{mpc.pid}:\tMPP K * MPP in the clear, {label}", revealed_k_clear, ab * ab, error=0.1)
+            assert_eq_approx(f"CP{mpc.pid}:\tMPP K * K, {label}", revealed_k_squared, ab * ab, error=0.1)
+
+
+def test_mpp_mixed_products(mpc):
+    """M-MP-21: products of two secret factors with a mixed one: A.T @ B (also with every partition encrypted, whose
+    result came back in the wrong layout: H-25), and A @ B.T with a mixed first factor (encrypted at every party for the
+    product, then each party's own block apart: L-225) or a mixed second one."""
+    n_cp = mpc.comms.number_of_parties - 1
+    for ratios in (unequal_ratios(n_cp), ratios_with_empty(n_cp)):
+        a = cohort_matrix(mpc, ratios.sum(), 4)
+        b = cohort_matrix(mpc, ratios.sum(), 4)
+        local_a = partition(mpc, a, ratios)
+        local_b = partition(mpc, b, ratios)
+        parties = holders(ratios)
+        mixed_a = encrypted_at(mpc, local_a, parties[:1])
+        encrypted_a = encrypted_at(mpc, local_a, parties)
+        label = f"ratios {ratios}"
+        mixed_t = mixed_a.T @ local_b
+        assert_parties_in_step(mpc, f"MPP mixed.T @ B, {label}")
+        t_mixed = local_b.T @ mixed_a
+        assert_parties_in_step(mpc, f"MPP B.T @ mixed, {label}")
+        encrypted_t = encrypted_a.T @ local_b
+        assert_parties_in_step(mpc, f"MPP encrypted.T @ B, {label}")
+        revealed = [mixed_t.reveal(), t_mixed.reveal(), encrypted_t.reveal()]
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tMPP mixed.T @ B, {label}", revealed[0], a.T @ b, error=0.01)
+            assert_eq_approx(f"CP{mpc.pid}:\tMPP B.T @ mixed, {label}", revealed[1], b.T @ a, error=0.01)
+            assert_eq_approx(f"CP{mpc.pid}:\tMPP encrypted.T @ B, {label}", revealed[2], a.T @ b, error=0.01)
+
+    # The first factor encrypted makes the product one of ciphertexts, about a second per result cell here (M1): small
+    # partitions
+    small = [1 for _ in range(n_cp)]
+    small[-1] = 2
+    a = cohort_matrix(mpc, small.sum(), 4)
+    b = cohort_matrix(mpc, small.sum(), 4)
+    local_a = partition(mpc, a, small)
+    local_b = partition(mpc, b, small)
+    parties = holders(small)
+    mixed_a = encrypted_at(mpc, local_a, parties[:1])
+    mixed_b = encrypted_at(mpc, local_b, parties[1:])
+    label = f"ratios {small}"
+    product = mixed_a @ local_b.T
+    assert_parties_in_step(mpc, f"MPP mixed @ B.T, {label}")
+    product_mixed_b = mixed_a @ mixed_b.T
+    assert_parties_in_step(mpc, f"MPP mixed @ mixed.T, {label}")
+    revealed_product = product.reveal()
+    revealed_mixed_b = product_mixed_b.reveal()
+    if mpc.pid:
+        expected = a @ b.T
+        assert_eq_approx(f"CP{mpc.pid}:\tMPP mixed @ B.T, {label}", revealed_product, expected, error=0.01)
+        for q in parties:
+            start, stop = own_rows_of(q, small)
+            assert_eq_approx(
+                f"CP{mpc.pid}:\tMPP mixed @ B.T, {label}: CP{q}'s own block",
+                block(revealed_product, start, stop), block(expected, start, stop), error=0.01)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPP mixed @ mixed.T, {label}", revealed_mixed_b, expected, error=0.01)
+
 
 def test_mpp[TP](mpc: MPCEnv[TP], modulus: TP):
     mpc.comms.sync_parties()
@@ -446,5 +609,7 @@ def test_mpp[TP](mpc: MPCEnv[TP], modulus: TP):
     test_mpp_partitioned_vectors(mpc)
     test_mpp_cohort_comparisons(mpc)
     test_mpp_cohort_products(mpc)
+    test_mpp_mixed_cohorts(mpc)
+    test_mpp_mixed_products(mpc)
 
     print(f'CP{mpc.pid}:\tSequre MHE MPP tests on {alg_struct} passed.\n')

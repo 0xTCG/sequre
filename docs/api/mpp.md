@@ -32,6 +32,8 @@ mpp = MPP(mpc, local_ciphertensor)
 
 The compute parties' partitions may differ in size, and a party may hold no rows at all (a ratio of 0). Call every operation at every party, the trusted dealer and parties with empty partitions included: the parties take the same sequence of collective steps whatever their partitions hold.
 
+The compute parties may also hold their partitions differently: some in the clear and others encrypted (a *mixed cohort*, for example after `encrypt()` at some of them only), or some semi-encrypted with different blocks (the result of `A @ B.T` in the clear). Element-wise operations, powers and matrix products handle any mix. All of them but the products of two secret MPPs keep each party's own representation: a partition in the clear gives a result in the clear, an encrypted one an encrypted result. Products of two secret MPPs (`A.T @ B`, `A @ B.T`) encrypt the partitions in the clear of a mixed factor for the product, by public-key encryption; their results are encrypted. A product refreshes its encrypted operands, and each refresh is a council among the compute parties, so operations that may refresh (multiplications, powers, products) first agree on how every party holds its partition, in one round among the compute parties; a party that holds no encryption then runs the others' HE steps on placeholders. Sums and differences of partitions of equal size need no round.
+
 ## Factory methods
 
 | Method | Description |
