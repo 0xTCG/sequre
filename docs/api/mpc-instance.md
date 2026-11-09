@@ -273,9 +273,9 @@ Multiparty homomorphic encryption based on the CKKS scheme. Provides collective 
 |---|---|---|
 | `enc_vector[T]` | `(values)` | Encode and encrypt a list of values into a list of `Ciphertext` or `Plaintext` (type selected by `T`) |
 | `enc_public_vector` | `(values)` | Trivial encryptions of public values (the same at every party), laid out as `enc_vector` lays them out: identical at every party, noiseless, no public-key encryption |
-| `decrypt` | `(x, source_pid=-2)` | Collectively decrypt ciphertexts. `source_pid`: specific party, `-2` = round-robin, `-1` = already broadcast |
+| `decrypt` | `(x, source_pid=-2)` | Collectively decrypt ciphertexts. `-2` (default): every compute party gets the plaintexts of its own ciphertexts and no other party learns them; each sends the others only the `c1` of its ciphertexts and gets back their decryption shares, so every compute party must call it, with an empty list if it holds none. A compute party's PID: that party's ciphertexts, decrypted for every compute party. `-1`: ciphertexts that are the same at every compute party (an aggregate), decrypted for every compute party. CP0 takes no part (`source_pid=0` is an error). See [Security assumptions](../crypto-corner/security-assumptions.md#what-each-reveal-discloses) |
 | `decode[dtype]` | `(enc)` | Decode a list of `Plaintext` into `list[dtype]` (`int`, `float`, or `complex`) |
-| `reveal[dtype]` | `(x, source_pid=-2)` | Decrypt then decode (convenience wrapper) |
+| `reveal[dtype]` | `(x, source_pid=-2)` | Decrypt then decode (convenience wrapper; same `source_pid` modes) |
 
 #### E2S / S2E protocol switching
 

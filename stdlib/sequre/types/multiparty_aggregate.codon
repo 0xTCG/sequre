@@ -12,7 +12,14 @@ from sequre.stdlib.builtin import sign
 from sequre.types.builtin import *
 from sequre.types.ciphertensor import Ciphertensor, MATMUL_VIA_MPC
 from sequre.utils.io import read_ndarray
-from sequre.constants import HE_ENC_COST_ESTIMATE, MHE_MUL_TO_ADD_THRESHOLD
+from sequre.types.utils import double_to_fp, fp_to_double
+from sequre.constants import HE_ENC_COST_ESTIMATE, MHE_MUL_TO_ADD_THRESHOLD, MPC_MODULUS_BITS, MPC_NBIT_F
+
+
+# Fixed point of the shares MPA.reveal masks (_masked_plain_share): twice the MPC fraction bits, and as many integer
+# bits as the field leaves once the compute parties' shares are summed (MPA._plain_encoding), so masking adds no
+# range limit a float share would plausibly hit (|x| < 2^105 with 192-bit fields and up to seven compute parties)
+MPA_REVEAL_FRAC_BITS: Static[int] = 2 * MPC_NBIT_F
 
 
 # Multiparty aggregate
@@ -330,15 +337,18 @@ class MPA[S, dtype]:
         self._aggregate = enc.aggregate(mpc)
     
     def reveal(self, *args) -> ndarray[S, dtype]:
+        # The sum of the shares, to every party; nothing else about the shares
         mpc = self._mpc
         if mpc.pid == 0:
             return self._plain
         
-        if mpc.council(self.is_plain() or self.is_empty()).all():
-            print(
-                f"CP{mpc.pid}: WARNING! Revealing MPA partition without secure "
-                f"aggregation since all parties have plaintext data")
-            return mpc.comms.collect(self._plain).sum()
+        # One round among the compute parties decides the branch: whether every one holds its share in the clear (or
+        # none), and the shape of those shares, which a party without one needs
+        mine = [int(self.is_plain() or self.is_empty())]
+        mine.extend(list(self._plain.shape) if self.has_plain() else [0 for _ in range(static.len(S))])
+        council = mpc.comms.collect(mine)
+        if all(bool(d[0]) for d in council):
+            return self._reveal_plain_sum(council)
         
         self.aggregate()
         revealed_matrix = self._aggregate.reveal(mpc, T=dtype)
@@ -351,7 +361,94 @@ class MPA[S, dtype]:
         else:
             compile_error("MPA reveal: invalid shape")
     
+    def _reveal_plain_sum(self, council: List[List[int]]) -> ndarray[S, dtype]:
+        # The sum of the shares every compute party holds in the clear (or none), and nothing else about them (M-MP-15):
+        # each party sends the others its share under pairwise masks that cancel in the sum (_masked_plain_share)
+        mpc = self._mpc
+        shape = List[int]()
+        for d in council:
+            if any(e != 0 for e in d[1:]):
+                shape = d[1:]
+                break
+        if not shape:
+            return self._plain  # every party's share is empty
+        size = 1
+        for e in shape: size *= e
+
+        modulus = self.modulus
+        total = List[mpc_uint](size)
+        for _ in range(size): total.append(mpc_uint(0))
+        for masked in mpc.comms.collect(self._masked_plain_share(size)):
+            total = total.add_mod(masked, modulus)
+        values = MPA._decode_plain_sum(total, modulus, mpc.comms.number_of_parties - 1, T=dtype)
+
+        if static.len(S) == 1:
+            return array(values, dtype=dtype)
+        elif static.len(S) == 2:
+            return array(values, dtype=dtype).reshape((shape[0], shape[1]))
+        else:
+            compile_error("MPA reveal: invalid shape")
+
+    def _masked_plain_share(self, size: int) -> List[mpc_uint]:
+        # This compute party's share in the clear (zeros of the given size if it holds none), in fixed point modulo the
+        # MPC field, plus a uniform mask from the PRG stream it shares with each other compute party: added towards a
+        # higher party and subtracted towards a lower one, so the masks cancel in the sum of every party's vector. With
+        # three or more compute parties the vector each party sends is uniform to any other (it lacks a mask); with two,
+        # the sum and one's own share give the other's anyway. Every compute party calls it, in step (the pairs' streams).
+        mpc = self._mpc
+        modulus = self.modulus
+        if self.has_plain():
+            values = self._plain.flatten().tolist()
+        else:
+            values = [dtype(0) for _ in range(size)]
+        assert len(values) == size, f"MPA reveal: the compute parties' shares differ in size ({len(values)} vs {size})"
+
+        k, f = MPA._plain_encoding(mpc.comms.number_of_parties - 1)
+        encoded = List[mpc_uint](size)
+        for v in values:
+            if isinstance(dtype, float):
+                encoded.append(double_to_fp(v, modulus, k, f))
+            elif isinstance(dtype, int):
+                encoded.append(v.to_int_t(modulus))
+            else:
+                compile_error("MPA reveal: shares in the clear must be float or int")
+
+        for q in range(1, mpc.comms.number_of_parties):
+            if q == mpc.pid:
+                continue
+            with mpc.randomness.seed_switch(q):
+                mask = encoded.rand(modulus, "uniform")
+            encoded = encoded.add_mod(mask, modulus) if mpc.pid < q else encoded.sub_mod(mask, modulus)
+        return encoded
+
+    @staticmethod
+    def _plain_encoding(compute_parties: int) -> Tuple[int, int]:
+        # The fixed point (total bits k, fraction bits f) of a float share in _masked_plain_share: a sum of the compute
+        # parties' shares stays below 2^(MPC_MODULUS_BITS - 2) in magnitude, inside half the field
+        return MPC_MODULUS_BITS - 1 - compute_parties.bitlen(), MPA_REVEAL_FRAC_BITS
+
+    @staticmethod
+    def _decode_plain_sum[T](total: List[mpc_uint], modulus: mpc_uint, compute_parties: int) -> List[T]:
+        # The sum of the masked shares (the masks cancelled) back to values: centered modulo the field
+        out = List[T](len(total))
+        if isinstance(T, float):
+            _, f = MPA._plain_encoding(compute_parties)
+            k_sum = MPC_MODULUS_BITS - 1
+            for v in total:
+                out.append(0.0 if v == mpc_uint(0) else fp_to_double(v, modulus, k_sum, f))
+        elif isinstance(T, int):
+            half = modulus >> mpc_uint(1)
+            for v in total:
+                out.append(int(v) if v <= half else -int(modulus - v))
+        else:
+            compile_error("MPA reveal: shares in the clear must be float or int")
+        return out
+
     def reveal_local(self, *args) -> ndarray[S, dtype]:
+        # This compute party's own share: in the clear as it is; an encrypted share decrypted to this party alone
+        # (MPCMHE.decrypt's default mode, in which every compute party takes part, so call it at every party). An MPA
+        # that holds only its aggregate, the same ciphertexts at every party, has no share of its own: revealing it
+        # reveals the sum, to every party.
         mpc = self._mpc
         if self.has_distributed():
             print(f"CP{mpc.pid}: INFO: Revealing local MPA share")

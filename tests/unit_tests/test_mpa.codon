@@ -10,6 +10,11 @@ from sequre.types.multiparty_aggregate import MPA
 from sequre.utils.testing import assert_eq, assert_eq_approx, same_at_every_party
 from sequre.utils.utils import random_floats, random_ints
 
+from internal.gc import sizeof
+
+from sequre.types.utils import double_to_fp, fp_to_double
+from sequre.constants import MPC_MODULUS_BITS, mpc_uint
+
 from multiparty_testing import cohort_matrix, assert_parties_in_step
 
 
@@ -296,6 +301,67 @@ def test_mpa_public_product_via_mpc(mpc):
             assert_eq_approx(f"CP{mpc.pid}:\tMPA encrypt with shares in the clear and an aggregate: CP{p}'s encryption holds its own share", revealed_own, all_shares[p - 1], error=1e-3)
 
 
+def test_mpa_reveal_sums_only(mpc):
+    """MPA.reveal of shares the compute parties hold in the clear reveals their sum and nothing else (M-MP-15): each
+    party sends the others its share under pairwise masks that cancel in the sum, so a vector a party receives differs
+    from the sender's share (it used to receive the raw share), and reveal sends exactly the branch round and those
+    vectors. Float and int shares, a 1-dim MPA, and a party without a share (it adds zeros); CP0 sends nothing."""
+    n_cp = mpc.comms.number_of_parties - 1
+    rows, cols = 3, 5
+    with mpc.randomness.seed_switch(-1):
+        shares = [array(random_floats((rows, cols))) for _ in range(n_cp)]
+        int_shares = [array(random_ints((rows, cols), -50, 50)) for _ in range(n_cp)]
+    total = shares[0].copy()
+    int_total = int_shares[0].copy()
+    for q in range(1, n_cp):
+        total = total + shares[q]
+        int_total = int_total + int_shares[q]
+    mpa = MPA(mpc, shares[mpc.pid - 1] if mpc.pid else zeros((rows, cols)))
+
+    # The vectors the parties send: each differs from its sender's share in every entry, and they add up to the sum
+    masked = mpa._masked_plain_share(rows * cols) if mpc.pid else List[mpc_uint]()
+    if mpc.pid:
+        modulus = mpc.default_mpc_modulus
+        k, f = MPA._plain_encoding(n_cp)
+        received = mpc.comms.collect(masked)
+        summed = received[0]
+        for q in range(1, n_cp + 1):
+            raw = [double_to_fp(v, modulus, k, f) for v in shares[q - 1].flatten().tolist()]
+            equal = sum(int(raw[i] == received[q - 1][i]) for i in range(len(raw)))
+            assert_eq(f"CP{mpc.pid}:\tMPA reveal: CP{q} sends its share masked (entries equal to the share: {equal})", equal, 0)
+            if q > 1:
+                summed = summed.add_mod(received[q - 1], modulus)
+        flat_total = total.flatten()
+        error = max(abs(fp_to_double(summed[i], modulus, MPC_MODULUS_BITS - 1, f) - flat_total[i]) for i in range(len(summed)))
+        assert_eq(f"CP{mpc.pid}:\tMPA reveal: the masked shares add up to the sum (error {error:.2e})", error < 1e-9, True)
+
+    sent = mpc.stats.bytes_sent
+    revealed = mpa.reveal()
+    sent = mpc.stats.bytes_sent - sent
+    expected = (n_cp - 1) * (2 * sizeof(int) + [1, rows, cols]._pickle_size() + masked._pickle_size()) if mpc.pid else 0
+    assert_eq(f"CP{mpc.pid}:\tMPA reveal sends the branch round and the masked shares only", sent, expected)
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA reveal of shares in the clear: the sum", revealed, total, error=1e-9)
+    assert_parties_in_step(mpc, "MPA reveal of shares in the clear")
+
+    revealed_int = MPA(mpc, int_shares[mpc.pid - 1] if mpc.pid else zeros((rows, cols), dtype=int)).reveal()
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tMPA reveal of int shares in the clear: the exact sum", revealed_int, int_total)
+    assert_parties_in_step(mpc, "MPA reveal of int shares in the clear")
+
+    without_last = MPA(mpc, shares[mpc.pid - 1]) if 0 < mpc.pid < n_cp else MPA[Tuple[int, int], float](mpc) if mpc.pid else MPA(mpc, zeros((rows, cols)))
+    revealed_partial = without_last.reveal()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA reveal with a compute party without a share", revealed_partial, total - shares[n_cp - 1], error=1e-9)
+    assert_parties_in_step(mpc, "MPA reveal with a compute party without a share")
+
+    vector = MPA(mpc, array([1.5, -2.25, 3.0]) if mpc.pid else zeros((3,)))
+    revealed_vector = vector.reveal()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA reveal of a 1-dim MPA", revealed_vector, array([1.5, -2.25, 3.0]) * float(n_cp), error=1e-9)
+    assert_parties_in_step(mpc, "MPA reveal of a 1-dim MPA")
+
+
 def test_mpa[TP](mpc: MPCEnv[TP], modulus: TP):
     mpc.comms.sync_parties()
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
@@ -331,5 +397,6 @@ def test_mpa[TP](mpc: MPCEnv[TP], modulus: TP):
     test_mpa_matmul_cost_agreement(mpa_a, raw_a)
     test_mpa_int_to_sharetensor(mpc)
     test_mpa_public_product_via_mpc(mpc)
+    test_mpa_reveal_sums_only(mpc)
 
     print(f'CP{mpc.pid}:\tSequre MHE MPA tests on {alg_struct} passed.\n')

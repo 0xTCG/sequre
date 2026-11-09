@@ -71,9 +71,11 @@ Collective decryption. Behaviour depends on `source_pid`:
 
 | `source_pid` | Meaning |
 |---|---|
-| `>= 0` | Decrypt ciphertexts held by that party, broadcast result |
-| `-1` | Ciphertexts already shared between all parties |
-| `-2` | Decrypt each party's ciphertexts one-by-one |
+| `-2` (default) | Every compute party gets the plaintexts of its own ciphertexts, and no other party learns them. Each compute party sends the others the `c1` polynomial of each of its ciphertexts (never `c0`); each answers with its PCKS decryption share $s_i \cdot c_1 + e_i$ (smudged, `SEQURE_SIGMA_SMUDGE`), sent to that holder only; the holder adds its own $s \cdot c_1$ and $c_0$. Every compute party takes both rounds, whatever it holds (an empty list included) |
+| `>= 1` | Decrypt the ciphertexts held by that compute party for every compute party (its list is broadcast once, so the others' lists do not matter) |
+| `-1` | Ciphertexts already the same at every compute party (an aggregate), decrypted for every compute party |
+
+CP0 holds a zero key share and takes no part; `source_pid = 0` is an error.
 
 ### `reveal[dtype](x, source_pid) -> list[dtype]`
 

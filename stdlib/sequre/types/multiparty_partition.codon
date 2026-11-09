@@ -941,26 +941,71 @@ class MPP[S, dtype]:
         return arr.T if self._transposed else arr
     
     def reveal_local(self, *args):
+        # This compute party's partition, decrypted to it alone (MPCMHE.decrypt's default mode): no other party learns
+        # it. Every compute party takes part in that decryption whatever it holds (in the clear, encrypted,
+        # semi-encrypted, empty), so it must be called at every party. A semi-encrypted partition's blocks (A @ B.T)
+        # belong to the party that holds them: they are decrypted as they are and joined with the block in the clear,
+        # without unifying them first (an HE concatenation, whose refreshes only the semi-encrypted parties would run).
         mpc = self._mpc
         print(f"CP{mpc.pid}: INFO: Revealing MPP partition")
 
         if mpc.pid == 0:
             return self._local_data.T if self._transposed else self._local_data
 
-        if self.is_local():
-            arr = self._local_data
-        else:
-            self.unify_encryption()
-            arr_mat = self._encryption_unified.reveal(mpc, T=dtype)
+        if static.len(S) > 2:
+            compile_error("MPP: can only be 1-dimensional or 2-dimensional")
 
-            if static.len(S) == 1:
-                arr = arr_mat[0]
-            elif static.len(S) == 2:
-                arr = arr_mat
-            else:
-                compile_error("MPP: can only be 1-dimensional or 2-dimensional")
-        
+        if self.has_unified_encryption():
+            blocks = [self._encryption_unified]
+        else:
+            blocks = [self._encryption_left, self._encryption_right]
+        ciphertexts = List[Ciphertext]()
+        for block in blocks:
+            ciphertexts.extend(block._data)
+        plaintexts = mpc.mhe.decrypt(ciphertexts, -2)
+
+        if self.has_unified_encryption():
+            arr_mat = MPP._decode_block(mpc, self._encryption_unified, plaintexts, T=dtype)
+        elif self.has_partial_encryption():
+            arr_mat = self._join_decrypted_blocks(plaintexts)
+        else:
+            arr = self._local_data
+            return arr.T if self._transposed and not arr.is_empty() else arr  # (an empty array cannot be transposed)
+
+        if static.len(S) == 1:
+            arr = arr_mat[0]
+        else:
+            arr = arr_mat
         return arr.T if self._transposed else arr
+
+    @staticmethod
+    def _decode_block[T](mpc, block: Ciphertensor[Ciphertext], plaintexts: List[Plaintext]) -> ndarray[Tuple[int, int], T]:
+        # The values of an encrypted block from its decryption (a matrix: one row for a 1-dim block)
+        return Ciphertensor[Plaintext](
+            _data=plaintexts,
+            shape=block.shape.copy(),
+            slots=block.slots,
+            _transposed=block._transposed,
+            _diagonal_contiguous=block._diagonal_contiguous,
+            _skinny=block._skinny).decode(mpc, T=T)
+
+    def _join_decrypted_blocks(self, plaintexts: List[Plaintext]) -> ndarray[Tuple[int, int], dtype]:
+        # A semi-encrypted partition in the clear: its left block, the block in the clear, its right block, side by side
+        # (the order MPP.unify_encryption concatenates them in), from the left and right blocks' decryptions in a row
+        if static.len(S) == 1:
+            raise NotImplementedError("MPP: 1-dimensional semi-encrypted partitions are not supported")
+            return ndarray[Tuple[int, int], dtype]()
+        else:
+            mpc = self._mpc
+            n_left = len(self._encryption_left._data)
+            arr = self._local_data.copy()
+            if self._encryption_left:
+                left = MPP._decode_block(mpc, self._encryption_left, plaintexts[:n_left], T=dtype)
+                arr = left if arr.is_empty() else left.hstack(arr)
+            if self._encryption_right:
+                right = MPP._decode_block(mpc, self._encryption_right, plaintexts[n_left:], T=dtype)
+                arr = right if arr.is_empty() else arr.hstack(right)
+            return arr
     
     def level(self) -> int:
         return min(

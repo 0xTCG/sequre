@@ -194,9 +194,9 @@ The `@mhe_enc_opt` compiler pass selects the optimal encoding strategy per matri
 |---|---|
 | `.copy(shallow=False)` | Deep or shallow copy |
 | `.astype(T)` | Type conversion (currently identity) |
-| `.decrypt(mpc, source_pid=-2)` | Decrypt to plaintext |
+| `.decrypt(mpc, source_pid=-2)` | Collective decryption to plaintext. `-2` (default): every compute party gets its own tensor decrypted and learns nothing of the others' (call it at every compute party, even if it's tensor is empty); `-1`: a tensor that is the same at every compute party. See [`MPCMHE.decrypt`](mpc-instance.md) |
 | `.decode(mpc)` | Decode plaintext tensor to `ndarray` |
-| `.reveal(mpc, source_pid=-2)` | Decrypt and decode in one step |
+| `.reveal(mpc, source_pid=-2)` | Decrypt and decode in one step (same `source_pid` modes as `.decrypt`) |
 | `.via_mpc(mpc, fn, *args)` | Execute a function through the [MPC layer](../user-guide/switching.md) (E2S → fn → S2E) |
 
 ## Indexing and iteration

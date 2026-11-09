@@ -12,6 +12,11 @@ from sequre.utils.utils import random_floats
 from sequre.constants import MPC_FIELD_SIZE, MPC_RING_SIZE, MPC_MODULUS_BITS, mpc_uint
 from sequre.types.utils import fp_to_double, double_to_fp
 
+from sequre.stdlib.numpy.create import array
+from sequre.types.ciphertensor import Ciphertensor
+
+from multiparty_testing import decryption_bytes, assert_parties_in_step
+
 
 def test_send_receive_poly(mpc):
     q = ring.new_poly(10, 10)
@@ -592,12 +597,67 @@ def test_mpc_mhe_switch_integers(mpc, mpc_modulus):
         assert_eq(f"CP{mpc.pid}:\tMPC->MHE of integer shares (error {error:.2e})", error < 1e-4, True)
 
 
+def test_decryption_to_holders(mpc):
+    """decrypt's default mode gives each compute party the plaintexts of its own ciphertexts, and no party anything of
+    another's (C-03): a party sends the others only the c1 of its ciphertexts, and each holder only the decryption shares
+    of the holder's own ciphertexts (the old protocol sent every party's whole ciphertexts to every party, and every
+    aggregated share back, so each could decrypt all). Every compute party takes part whatever it holds: CP1 holds no
+    ciphertext, CP2 one and a nil-ideal placeholder (decrypted to zeros), CP3 two. CP0 sends nothing. A single holder's
+    ciphertexts still decrypt for every party, whatever the others pass."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    count = max(mpc.pid - 1, 0)
+    values = random_floats((max(count, 1) * slots,))  # this party's private stream: the others cannot know them
+    ciphertexts = List[ckks.Ciphertext]()
+    if mpc.pid and count:
+        ciphertexts = mpc.mhe.enc_vector(values[:count * slots], T=ckks.Ciphertext)
+    if mpc.pid == 2:
+        ciphertexts.append(ckks.Ciphertext.nil_ideal())
+
+    expected_bytes = decryption_bytes(mpc, ciphertexts) if mpc.pid else 0
+    sent = mpc.stats.bytes_sent
+    plaintexts = mpc.mhe.decrypt(ciphertexts)
+    sent = mpc.stats.bytes_sent - sent
+    assert_eq(f"CP{mpc.pid}:\tMHE decryption to the holders: a party sends c1s and decryption shares only", sent, expected_bytes)
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tMHE decryption to the holders: a plaintext per ciphertext", len(plaintexts), len(ciphertexts))
+        if count:
+            decoded = mpc.mhe.decode(plaintexts[:count], dtype=float)
+            error = max(abs(decoded[i] - values[i]) for i in range(count * slots))
+            assert_eq(f"CP{mpc.pid}:\tMHE decryption to the holders: its own values (error {error:.2e})", error < 1e-3, True)
+        if mpc.pid == 2:
+            placeholder = mpc.mhe.decode(plaintexts[count:], dtype=float)
+            assert_eq(f"CP{mpc.pid}:\tMHE decryption to the holders: a nil-ideal decrypts to zeros", max(abs(v) for v in placeholder), 0.0)
+    assert_parties_in_step(mpc, "MHE decryption to the holders")
+
+    # Ciphertensor.reveal at every compute party with CP1's tensor empty: CP1 still takes part in the decryption (it
+    # returned without a message, and the others then waited for it)
+    held = Ciphertensor[ckks.Ciphertext].enc(mpc, array([values[:8]])) if mpc.pid > 1 else Ciphertensor[ckks.Ciphertext]()
+    revealed_tensor = held.reveal(mpc)
+    if mpc.pid > 1:
+        error = max(abs(revealed_tensor[0, j] - values[j]) for j in range(8))
+        assert_eq(f"CP{mpc.pid}:\tCiphertensor.reveal with CP1's tensor empty: its own values (error {error:.2e})", error < 1e-3, True)
+    elif mpc.pid == 1:
+        assert_eq(f"CP{mpc.pid}:\tCiphertensor.reveal of an empty tensor takes part and returns nothing", revealed_tensor.size, 0)
+    assert_parties_in_step(mpc, "Ciphertensor.reveal with an empty tensor")
+
+    with mpc.randomness.seed_switch(-1):
+        shared = random_floats((slots,))
+    held = mpc.mhe.enc_vector(shared, T=ckks.Ciphertext) if mpc.pid == 2 else List[ckks.Ciphertext]()
+    revealed = mpc.mhe.decrypt(held, 2)
+    if mpc.pid:
+        decoded = mpc.mhe.decode(revealed, dtype=float)
+        error = max(abs(decoded[i] - shared[i]) for i in range(slots))
+        assert_eq(f"CP{mpc.pid}:\tMHE decryption of CP2's ciphertexts for every party, the others passing none (error {error:.2e})", len(revealed) == 1 and error < 1e-3, True)
+    assert_parties_in_step(mpc, "MHE decryption from one holder")
+
+
 def test_mhe(mpc):
     print(f'CP{mpc.pid}:\tTesting MHE ... \n')
 
     test_send_receive_poly(mpc)
     test_send_receive_ciphertext(mpc)
     test_decryption(mpc)
+    test_decryption_to_holders(mpc)
     test_arithmetics(mpc)
     test_collective_bootstrapping(mpc)
     test_cipher_to_additive_plaintext_conversion(mpc)

@@ -58,7 +58,6 @@ from sequre.lattiseq.drlwe import \
     CKSShare
 from sequre.lattiseq.utils import new_prng
 from sequre.lattiseq.exact_encoder import ExactEncoder, new_exact_encoder
-from sequre.types.utils import double_to_fp, fp_to_double
 from sequre.utils.utils import zeros_vec, ones_vec, one_hot_vector, random_floats
 from sequre.utils.io import is_cached, read_cache, store_cache
 from sequre.constants import LATTISEQ_SIGMA_SMUDGE, LATTISEQ_DEFAULT_SIGMA, LATTISEQ_ROTATION_KEYS_COUNT, mpc_uint, MPC_NBIT_F, \
@@ -323,13 +322,85 @@ class MPCMHE[TP]:
     
     def decrypt(self, x: list[Ciphertext], source_pid: int = -2) -> list[Plaintext]:
         """
-        If source_pid is:
-            - PID number (0, 1, 2, ...), then only the ciphers at that PID will be decrypted and broadcast to all parties
-            - -2, then each ciphervector will be collectively decrypted at each party one after the other
-            - -1, then the ciphers are expected to be already shared (the same) between the parties
+        Collective decryption. If source_pid is:
+            - -2 (the default): every compute party gets the plaintexts of its own ciphertexts, and no party learns
+              another's (_decrypt_to_holders). Every compute party must call it, with an empty list if it holds none.
+            - a compute party's PID (1, 2, ...): that party's ciphertexts are decrypted for every compute party (all of
+              them learn the plaintexts); the other parties' x is ignored
+            - -1: the ciphertexts are the same at every compute party (an aggregate); every compute party gets them
+        CP0 holds no key share and takes no part: it gets an empty plaintext per ciphertext of its own x.
         """
+        assert source_pid != 0, "MPCMHE: CP0 holds no ciphertexts to decrypt (source_pid 0)"
         assert source_pid > -3, f"MPCMHE: Invalid source PID: {source_pid}"
-        return self._collective_op(x, MPCMHE._collective_decrypt, source_pid)
+        if self.pid == 0:
+            return [Plaintext() for _ in range(len(x))]
+        if source_pid == -2:
+            return self._decrypt_to_holders(x)
+
+        # A single holder sends its whole list once, its length included, so the other parties' lists do not matter
+        ciphertexts = self.comms.broadcast_from(x, source_pid) if source_pid > 0 else x
+        return [self._collective_decrypt(ct, -1) for ct in ciphertexts]
+
+    def _decrypt_to_holders(self, x: List[Ciphertext]) -> List[Plaintext]:
+        # Each compute party's ciphertexts decrypted to it alone (decrypt's default mode), at every compute party at once:
+        #   1. Every compute party sends the c1 polynomials of its ciphertexts to every other compute party (one collect;
+        #      an empty list if it holds none). Without c0, a c1 tells nothing about the plaintext.
+        #   2. Each sends every other holder its PCKS decryption share s_i * c1 + e of each of that holder's ciphertexts,
+        #      with the smudging noise of a collective decryption (LATTISEQ_SIGMA_SMUDGE), and nothing to a holder with no
+        #      ciphertexts (both sides know it from step 1). Only the first polynomial of a share: the second is zero for
+        #      a decryption (key switch to the zero key).
+        #   3. Each holder adds its own s * c1 (no smudging: it never leaves the holder) and c0: its plaintexts.
+        # Every compute party takes both steps, whatever it holds, in collect's pairwise order: nobody skips a message, and
+        # messages larger than a socket buffer cannot deadlock. Nil-ideal ciphertexts send nothing and decrypt to zeros.
+        params = self.crypto_params.params
+        ring_q = params.ring_q
+        sk = self.crypto_params.sk_shard.value.q
+        parties = self.comms.number_of_parties
+
+        real = [i for i in range(len(x)) if not x[i]._nil_ideal]
+        own_c1s = List[ring_Poly](len(real))
+        for i in real:
+            assert x[i].value[1].is_ntt, "MPCMHE: decryption expects ciphertexts in the NTT domain"
+            own_c1s.append(x[i].value[1])
+        all_c1s = self.comms.collect(own_c1s)
+
+        pcks_protocol = new_pcks_protocol(params, LATTISEQ_SIGMA_SMUDGE)
+        zero_pk = new_public_key(params)
+        shares_for = List[List[ring_Poly]](parties - 1)
+        for q in range(1, parties):
+            shares = List[ring_Poly]()
+            if q != self.pid:
+                for c1 in all_c1s[q - 1]:
+                    dec_share = pcks_protocol.allocate_share(c1.level())
+                    pcks_protocol._mm_gen_share(self.crypto_params.sk_shard, zero_pk, c1, dec_share)
+                    shares.append(dec_share.value[0])
+            shares_for.append(shares)
+
+        received = List[List[ring_Poly]](parties - 2)
+        for q in range(1, self.pid):
+            if len(own_c1s): received.append(self.comms.receive_as_jar(q, List[ring_Poly]))
+            if len(all_c1s[q - 1]): self.comms.send_as_jar(shares_for[q - 1], q)
+        for q in range(self.pid + 1, parties):
+            if len(all_c1s[q - 1]): self.comms.send_as_jar(shares_for[q - 1], q)
+            if len(own_c1s): received.append(self.comms.receive_as_jar(q, List[ring_Poly]))
+
+        out = List[Plaintext](len(x))
+        k = 0
+        for i in range(len(x)):
+            ct = x[i]
+            if ct._nil_ideal:
+                out.append(new_plaintext(params, 0, params.default_scale))
+                continue
+            level = ct.value[1].level()
+            value = ring_q.new_poly_lvl(level)
+            ring_q._mm_mul_coeffs_montgomery_and_add_lvl(level, sk, ct.value[1], value)
+            for shares in received:
+                ring_q._mm_add_lvl(level, value, shares[k], value)
+            ring_q._mm_add_lvl(level, value, ct.value[0], value)
+            value.is_ntt = True
+            out.append(Plaintext(value, ct.scale))
+            k += 1
+        return out
     
     def decode[dtype](self, enc: list[Plaintext]) -> list[dtype]:
         data_decoded = []
@@ -890,23 +961,6 @@ class MPCMHE[TP]:
 
         return shared_vector
     
-    def _mhe_to_mpc_unsafe[dtype=float](self, ciphervector: List[Ciphertext], number_of_elements: int, modulus: mpc_uint, source_pid: int) -> List[mpc_uint]:
-        # Non-secure solution for testing
-        if self.pid == 0:
-            return zeros_vec(number_of_elements, TP=type(modulus))
-        
-        decrypted_vector = self.decrypt(ciphervector, source_pid)
-        if self.pid == self.comms.hub_pid:
-            decoded_values = self.decode(decrypted_vector, dtype=dtype)[:number_of_elements]
-            if isinstance(dtype, float):
-                return double_to_fp(decoded_values, modulus)
-            elif isinstance(dtype, int):
-                return decoded_values.to_int_t(modulus)
-            else:
-                compile_error("Invalid type in ciphervector to additive share vector switch")
-        
-        return zeros_vec(number_of_elements, TP=type(modulus))
-
     def mask_one[T](self, x: T, idx: int, complement: bool = False) -> T:
         slots = self.crypto_params.params.slots()
         
@@ -1344,27 +1398,3 @@ class MPCMHE[TP]:
 
         return share_out
     
-    def _collective_op(self, cipher: Ciphertext, collective_op, source_pid: int, include_trusted_dealer: bool = False):
-        assert source_pid > -3, f"MPCMHE: Invalid source PID: {source_pid}"
-        
-        if source_pid != -2:
-            return collective_op(self, cipher, source_pid)
-        
-        collection = self.comms.collect(cipher, include_trusted_dealer)
-        results = [collective_op(self, cipher, pid + 1 - int(include_trusted_dealer)) for pid, cipher in enumerate(collection)]
-        
-        return results[self.pid - 1 + int(include_trusted_dealer)]
-    
-    def _collective_op(self, x: list[Ciphertext], collective_op, source_pid: int, include_trusted_dealer: bool = False):
-        assert source_pid > -3, f"MPCMHE: Invalid source PID: {source_pid}"
-        
-        if source_pid != -2:
-            return [collective_op(self, cipher, source_pid) for cipher in x]
-        
-        collection = self.comms.collect(x, include_trusted_dealer)
-        results = [
-            [collective_op(self, cipher, pid + 1 - int(include_trusted_dealer))
-             for cipher in ciphervector]
-            for pid, ciphervector in enumerate(collection)]
-        
-        return results[self.pid - 1 + int(include_trusted_dealer)]

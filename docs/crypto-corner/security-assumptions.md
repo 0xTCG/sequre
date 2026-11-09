@@ -54,6 +54,7 @@ Shares and masks are drawn uniformly from the whole field with a cryptographical
 What each protocol reveals to the party that combines the shares (the hub):
 
 - **Collective decryption.** Each compute party sends the hub $s_i \cdot c_1 + e_i$, with Gaussian noise $e_i$ of standard deviation `SEQURE_SIGMA_SMUDGE` (default $2^{10}$; values below 3.2 are rejected). Without noise, the hub could compute every key share as $s_i = \text{share} / c_1$; with it, recovering $s_i$ is a ring-LWE problem. The noise does not *flood* the ciphertext noise statistically, so a decrypted result still carries some information about the ciphertext's own noise (the IND-CPA-D setting). Flooding needs a standard deviation of about $2^{20}$ or more together with a larger scale, because the decryption error grows in proportion to it: the measured maximum error at the default scale $2^{34}$ is about $5 \cdot 10^{-5}$ at $2^{10}$, $5 \cdot 10^{-4}$ at $2^{14}$, and $3 \cdot 10^{-2}$ at $2^{20}$.
+- **Decryption to the holder** (the default of `MPCMHE.decrypt` and `Ciphertensor.reveal`, behind `MPP.reveal_local`). Each compute party decrypts its own ciphertexts: it sends every other compute party the $c_1$ polynomial of each (never $c_0$) and gets back from each a decryption share $s_i \cdot c_1 + e_i$, smudged as above and sent to it alone; it adds its own $s \cdot c_1$ and $c_0$. The holder's view is the hub's view in a collective decryption (the same smudging guarantee). A party that is not the holder sees only $c_1$ polynomials, which are computed from ciphertexts and reveal nothing about the plaintexts under RLWE, and no share of anyone's decryption.
 - **HE → MPC switching** (encryption to shares). Every compute party except the hub sends the hub its decryption share masked by a uniformly random polynomial, and keeps the negated mask. The hub decrypts the plaintext's coefficients under the others' masks, and each party decodes its coefficient share exactly into fixed-point shares (with the [exact encoder](../deep-dive-lattiseq/ckks-operations.md#exact-encoding)).
     - **Masks:** $\lambda + \log_2 N + \lceil \log_2 \Delta \rceil + k - f$ bits, where $\lambda$ = `MHE_MPC_SWITCH_LAMBDA` (128), $k$ and $f$ are the fixed-point total and fractional bits, and $N$ is the ring degree. That is 208 bits for $N = 2^{14}$ at scale $2^{34}$.
     - **Hiding:** for slot values in the fixed-point range ($|v| < 2^{k-f-1}$), the hub's view is within statistical distance $2^{-128}$ of one that depends on neither the plaintext nor its noise.
@@ -64,6 +65,21 @@ What each protocol reveals to the party that combines the shares (the hub):
 - **Collective bootstrapping (refresh).** Partial decryptions are masked with random integers of $\lambda + \log_2 \Delta$ bits in the coefficient domain ($\lambda = 128$), which hide the plaintext and its noise statistically for slot values up to about 1.
 
 Values beyond the fixed-point range are hidden less well, in proportion to their magnitude.
+
+## What each reveal discloses
+
+A reveal discloses its result to the parties named below and nothing else, with the guarantees above (the smudging of decryption shares, the masks of the switches). CP0 learns none of these results: it gets placeholders.
+
+| Operation | Who learns what |
+|---|---|
+| `Sharetensor.reveal` | Every compute party: the value |
+| `MPCMHE.decrypt(x)`, `Ciphertensor.reveal(mpc)` (default) | Each compute party: the plaintexts of its own ciphertexts |
+| `MPCMHE.decrypt(x, p)` | Every compute party: the plaintexts of compute party `p`'s ciphertexts |
+| `MPCMHE.decrypt(x, -1)` | Every compute party: the plaintext of ciphertexts that are the same at all of them (an MPA aggregate) |
+| `MPP.reveal()`, `MPU.reveal()` (partition mode) | Every compute party: the whole matrix (all partitions) |
+| `MPP.reveal_local()` | Each compute party: its own partition, its semi-encrypted blocks included |
+| `MPA.reveal()`, `MPU.reveal()` (additive mode) | Every compute party: the sum of the shares. Shares in the clear go out under pairwise masks that cancel in the sum: each sent vector is uniform to a party that lacks one of its masks, so any coalition learns only the sum of the other parties' shares. With two compute parties, the sum and one's own share give the other's share: that is inherent to revealing a sum |
+| `MPA.reveal_local()`, `MPU.reveal_local()` (additive mode) | Each compute party: its own share (in the clear, or decrypted to it alone). An MPA that holds only its aggregate, the same ciphertexts at every party, reveals the sum to every compute party |
 
 ## CKKS approximate precision
 

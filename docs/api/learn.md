@@ -26,9 +26,9 @@ model = LinReg(initial_weights, optimizer="bgd")      # with initial weights
 | Method | Signature | Description |
 |---|---|---|
 | `fit` | `fit(mpc, X, y, step, epochs, verbose=False)` | Train the model. Returns `self`. |
-| `predict` | `predict(mpc, X, noise_scale=0.0)` | Predict on new data. Optional DP noise. |
+| `predict` | `predict(mpc, X, noise_scale=0.0)` | Predict on new data. With `noise_scale`, each prediction gets `noise_scale` times standard normal noise (the noise of stochastic imputation in [MI](#multiple-imputation-mi); not a privacy mechanism). |
 | `loss` | `loss(mpc, X, y)` | Compute MSE loss $\|y - X\beta\|^2$ |
-| `randomize_weights` | `randomize_weights(mpc, distribution="uniform")` | Reinitialize weights randomly |
+| `randomize_weights` | `randomize_weights(mpc, distribution="uniform")` | Reinitialize weights randomly (public randomness: for a `Sharetensor` model CP1 draws the weights) |
 | `estimate_step` | `LinReg.estimate_step(train, test)` | Static: estimate learning rate from covariance |
 
 ### Attributes
@@ -183,8 +183,10 @@ Multiple imputation with Rubin's combining rules. `IM` is the imputation model t
 | Method | Description |
 |---|---|
 | `MI(factor, impute_model, fit_model)` | Create MI with `factor` imputations |
-| `fit(mpc, data, labels, miss_rows, miss_col, ...)` | Run full MI pipeline: impute `factor` times, fit `FM` on each, combine via Rubin's rules |
+| `fit(mpc, data, labels, miss_rows, miss_col, ...)` | Run full MI pipeline: impute `factor` times, fit `FM` on each, combine via Rubin's rules. `dump_imputed_data` is a debugging aid that reveals every imputed dataset to every party |
 | `MI.rubin(mpc, weights)` | Static: combine weight estimates using Rubin's combining rules |
+
+On `MPU` data held in partitions (`"partition"` mode), each party's imputed values go to that party alone: one `reveal_local` of the predictions per imputation decrypts each party's rows to it, and each writes them into its own partition, in the clear. No other party learns them, and the traffic grows with the number of missing rows. The owner learns the imputation model's predictions for its rows (plus the imputation noise), which is what it imputes with.
 
 ### Imputation modes
 

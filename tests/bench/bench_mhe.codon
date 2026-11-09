@@ -70,7 +70,7 @@ CASES = [
     ("mhe.switch.mhe_to_mpc_1ct", "", "Ciphertensor.to_sharetensor of 8192 values, source CP1"),
     ("mhe.switch.mhe_to_mpc_8ct", "", "Ciphertensor.to_sharetensor of 8x8192 values, source CP1"),
     ("ct.enc.mat_8x1024", "", "Ciphertensor.enc of an 8x1024 matrix (8 ciphertexts)"),
-    ("ct.reveal.mat_8x1024", "", "Ciphertensor.reveal of an 8x1024 matrix (collective decryption at every party)"),
+    ("ct.reveal.mat_8x1024", "", "Ciphertensor.reveal of an 8x1024 matrix at every party (each party's decrypted to it alone)"),
     ("ct.add.mat_8x1024", "", "ct + ct element-wise, 8x1024"),
     ("ct.mul.mat_8x1024", "", "ct * ct element-wise (relin + refresh council), 8x1024"),
     ("ct.mul_public.mat_8x1024", "", "ct * ndarray element-wise (encode + ct*pt), 8x1024"),
@@ -111,17 +111,19 @@ CASES = [
     ("mp.mpp.matmul_ntnt", "", "MPP A @ C via MPC (to_sharetensor + Beaver + to_mpp), 16x64 @ 64x16"),
     ("mp.mpp.matmul_public_via_mpc", "", "encrypted MPP 16x64 @ ndarray 64x3 under allow_mpc_switch(): the whole MPP via MPC (switch, MPC matmul, switch back), every party joins"),
     ("mp.mpp.gt_local", "", "MPP > 0 on local partitions: one round with every party, then each compute party compares its own, 2x8x64"),
-    ("mp.mpp.reveal_local", "skip:insecure", "MPP.reveal_local (decrypts everyone's data)"),
+    ("mp.mpp.reveal_local", "", "MPP.reveal_local of encrypted 2x8x64 partitions: each party's decrypted to it alone"),
     ("mp.mpa.aggregate", "", "MPA.aggregate of additive 16x64 shares (encrypt + all-to-all collect + sum)"),
     ("mp.mpa.mul", "", "MPA * MPA element-wise (encrypt, aggregate, ct*ct), 16x64"),
     ("mp.mpa.matmul_abt", "", "MPA A @ B.T (encrypt, aggregate, M1 matmul), 4x32"),
     ("mp.mpa.matmul_public_via_mpc", "", "aggregate MPA 16x64 @ ndarray 64x3 under allow_mpc_switch(): one conversion via MPC and back, every party joins"),
+    ("mp.mpa.reveal_plain", "", "MPA.reveal of additive 16x64 shares every compute party holds in the clear (the sum to every party)"),
     ("mp.mpu.add_local", "", "MPU(partition) + MPU(partition) on local plaintext partitions, 2x8x64"),
     ("mp.mpu.matmul_ntt", "", "MPU(partition) A @ B.T, 2x8x64 partitions"),
     ("mp.mpu.matmul_mpp_mpa", "", "MPU(partition) 16x64 @ MPU(additive) 64x1"),
     ("e2e.l2.mpu_16x256", "", "l2 distance + reveal on MPU partitions, 2x8x256"),
     ("e2e.king.mpp_16x1024", "", "KING + reveal on MPP partitions, 2x8 individuals x 1024 SNPs"),
     ("e2e.linreg.mpu_16x15", "", "LinReg BGD fit (2 epochs) on MPU partitions with MPA weights + reveal, 16x15"),
+    ("e2e.linreg.mpu_predict_16x15", "", "LinReg predict with noise on MPU partitions with MPA weights (the MI imputation step), 16x15"),
 ]
 
 handle_list_flag("mhe", CASES)
@@ -1098,13 +1100,13 @@ def bench_mp(mpc, b: Bench):
 
     if b.want(mpc, "mp.mpp.reveal_local"):
         rv = pA
-        t = Timer(b.reps(1), warmup=0)
+        t = Timer(b.reps(5))
         while t.next():
             t.begin(mpc)
             rv = encA.reveal_local()
             t.end(mpc)
         if mpc.pid:
-            b.report(f"{n_cp}x{per}x{cols}", t, 0.0)
+            b.report(f"{n_cp}x{per}x{cols}", t, max_abs_err_2d(rv, pA))
 
     if b.any_selected("mp.mpa."):
         # Additive shares: CP1 holds A - R, CP2 holds R (R public to both: fine for timing), sum = A.
@@ -1172,6 +1174,18 @@ def bench_mp(mpc, b: Bench):
             rv = out.reveal()
             if mpc.pid:
                 b.report(f"({rows}x{cols})@({cols}x3)", t, max_abs_err_2d(rv, A @ W))
+
+        if b.want(mpc, "mp.mpa.reveal_plain"):
+            m = MPA(mpc, share)
+            rv = A
+            t = Timer(b.reps(9), batch=10)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    rv = m.reveal()
+                t.end(mpc)
+            if mpc.pid:
+                b.report(f"{rows}x{cols}", t, max_abs_err_2d(rv, A))
 
     if b.want(mpc, "mp.mpu.add_local"):
         ua = MPU(mpc, pA, "partition")
@@ -1305,6 +1319,26 @@ def bench_e2e(mpc, b: Bench):
         if mpc.pid:
             ref = LinReg(raw_w0).fit(mpc, X=X, y=y, step=step, epochs=epochs).coef_
             b.report(f"{rows}x{cols};epochs={epochs}", t, max_abs_err_2d(wv, ref))
+
+    if b.want(mpc, "e2e.linreg.mpu_predict_16x15"):
+        # A tiny noise scale: the case times the noise's generation, and the witness stays the prediction's HE error
+        per, cols = 8, 15
+        rows = per * n_cp
+        noise_scale = 1e-6
+        X = array(shared_float_matrix(mpc, rows, cols, 0.0, 1.0))
+        raw_w = array(shared_float_matrix(mpc, cols + 1, 1, 0.0, 1.0))
+        ux = MPU(mpc, partition_of(mpc, X, per), "partition")
+        model = LinReg(MPU(mpc, raw_w if mpc.pid == 1 else zeros_like(raw_w), "additive"))
+        out = model.predict(mpc, ux, noise_scale)
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            out = model.predict(mpc, ux, noise_scale)
+            t.end(mpc)
+        pv = out.reveal(mpc)
+        if mpc.pid:
+            ref = LinReg(raw_w).predict(mpc, X)
+            b.report(f"{rows}x{cols};noise={noise_scale}", t, max_abs_err_2d(pv, ref))
 
 
 @main

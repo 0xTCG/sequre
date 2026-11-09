@@ -20,7 +20,7 @@ _Defined in `stdlib/sequre/types/multiparty_aggregate.codon`_
 ```python
 from sequre.types.multiparty_aggregate import MPA
 
-# From plaintext (hub party gets actual data, others get zeros)
+# From plaintext: every party's argument is its own share, and the MPA's value is their sum (CP0's is ignored)
 mpa = MPA(mpc, my_plaintext_share)
 
 # From encrypted data
@@ -31,7 +31,7 @@ mpa = MPA(mpc, my_ciphertensor)
 
 | Method | Description |
 |---|---|
-| `MPA.enc(mpc, data)` | Create encrypted MPA (plaintext at party 1 only) |
+| `MPA.enc(mpc, data)` | MPA whose value is `data`: CP1's share is `data`, the others' zeros, all in the clear (`.encrypt()` encrypts them) |
 | `MPA.rand(shape, distribution, mpc, plain=False)` | Random MPA, plaintext or encrypted |
 
 ## Properties and state queries
@@ -76,8 +76,8 @@ mpa = MPA(mpc, my_ciphertensor)
 |---|---|
 | `.encrypt()` | Convert plaintext to encrypted component |
 | `.aggregate()` | Aggregate plaintext/encrypted into aggregated component |
-| `.reveal()` | Reveal with secure aggregation to all parties |
-| `.reveal_local()` | Reveal local share only |
+| `.reveal()` | The sum of the shares, to every compute party, and nothing else about them. Shares every compute party holds in the clear are sent under pairwise masks that cancel in the sum (fixed point with twice the MPC fraction bits for floats, 64 by default; ints exact); encrypted ones go through the aggregate |
+| `.reveal_local()` | This compute party's own share: in the clear as it is, or an encrypted share decrypted to it alone (call it at every compute party). An MPA that holds only its aggregate, the same ciphertexts at every party, has no share of its own: revealing it reveals the sum, to every compute party |
 | `.level()` | Minimum encryption level |
 
 ## Distributed operations

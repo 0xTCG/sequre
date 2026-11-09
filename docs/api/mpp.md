@@ -91,7 +91,7 @@ The compute parties may also hold their partitions differently: some in the clea
 |---|---|
 | `.encrypt()` | Encrypt local plaintext to ciphertext: row-wise, or column-wise when the MPP is lazily transposed (the same layout at every party, whatever the partitions' shapes) |
 | `.reveal()` | Reveal with secure aggregation to all parties |
-| `.reveal_local()` | Reveal local partition only |
+| `.reveal_local()` | This compute party's own partition, decrypted to it alone: no other party learns it. Call it at every compute party, since each takes part in the decryption whatever it holds (in the clear, encrypted, empty). A semi-encrypted partition's blocks (from `A @ B.T`) are its holder's. CP0 gets its placeholder |
 | `.level()` | Minimum encryption level |
 | `.unify_encryption()` | Consolidate left/right encryptions to unified |
 

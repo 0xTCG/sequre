@@ -12,7 +12,8 @@ from sequre.utils.testing import assert_eq, assert_eq_approx
 from sequre.utils.utils import random_floats
 
 from multiparty_testing import (
-    unequal_ratios, ratios_with_empty, own_rows, cohort_matrix, assert_parties_in_step, holders)
+    unequal_ratios, ratios_with_empty, own_rows, cohort_matrix, assert_parties_in_step, holders, decryption_bytes,
+    own_ciphertexts)
 
 
 def test_mpu_getitem(mpu_a, raw_a):
@@ -257,6 +258,76 @@ def test_mpu_mixed_cohorts(mpc):
             assert_eq(f"CP{mpc.pid}:\tMPU plain MPA - mixed raises at every compute party, {label}", raised_sub, True)
 
 
+def test_mpu_reveal_local(mpc):
+    """reveal_local gives each compute party its own partition (or share), decrypted to it alone (C-03): partitions in
+    the clear, encrypted, mixed (CP1 encrypted, the others in the clear), semi-encrypted (A @ B.T) and transposed, equal,
+    unequal and empty. Every compute party takes part whatever it holds. What a party sends is checked to the byte: the
+    c1 of its own ciphertexts to every other compute party, and to every other holder the decryption shares of that
+    holder's ciphertexts, so no party receives another's c0 nor the shares for another's ciphertexts (the old protocol
+    sent each party everybody's whole ciphertexts and the aggregated shares of all of them). Additive MPUs: a share in the
+    clear stays local, an encrypted share decrypts to its holder alone, an aggregate reveals the sum. Every party in step
+    after each."""
+    n_cp = mpc.comms.number_of_parties - 1
+    cols = 6
+    for ratios in ([2 for _ in range(n_cp)], unequal_ratios(n_cp), ratios_with_empty(n_cp)):
+        rows = ratios.sum()
+        a = cohort_matrix(mpc, rows, cols)
+        b = cohort_matrix(mpc, rows, cols)
+        start, stop = own_rows(mpc, ratios)
+        own = a[start:stop]
+        holds = mpc.pid > 0 and ratios[mpc.pid - 1] > 0
+        clear = MPU(mpc, own if mpc.pid else a, "partition")
+        encrypted = clear.copy()
+        encrypted.encrypt()
+        mixed = clear.copy()
+        if mpc.pid == 1:
+            mixed.encrypt()
+        cases = [("in the clear", clear), ("encrypted", encrypted), ("mixed", mixed), ("A @ B.T", clear @ MPU(mpc, b[start:stop] if mpc.pid else b, "partition").T)]
+        for kind, mpu in cases:
+            label = f"{kind}, ratios {ratios}"
+            expected_bytes = decryption_bytes(mpc, own_ciphertexts(mpu._mpp)) if mpc.pid else 0
+            sent = mpc.stats.bytes_sent
+            revealed = mpu.reveal_local()
+            sent = mpc.stats.bytes_sent - sent
+            assert_eq(f"CP{mpc.pid}:\tMPU reveal_local {label}: c1s and decryption shares only", sent, expected_bytes)
+            if holds:
+                want = own @ b.T if kind == "A @ B.T" else own
+                assert_eq_approx(f"CP{mpc.pid}:\tMPU reveal_local {label}: its own partition", revealed, want, error=0.01)
+            elif mpc.pid:
+                assert_eq(f"CP{mpc.pid}:\tMPU reveal_local {label}: an empty partition", revealed.size, 0)
+            assert_parties_in_step(mpc, f"MPU reveal_local {label}")
+        revealed_t = encrypted.T.reveal_local()
+        if holds:
+            assert_eq_approx(f"CP{mpc.pid}:\tMPU reveal_local transposed, ratios {ratios}", revealed_t, own.T, error=0.01)
+        assert_parties_in_step(mpc, f"MPU reveal_local transposed, ratios {ratios}")
+
+    # Additive: each party's share differs (its private stream)
+    share = array(random_floats((3, 5)))
+    plain = MPU(mpc, share, "additive")
+    sent = mpc.stats.bytes_sent
+    revealed_plain = plain.reveal_local()
+    assert_eq(f"CP{mpc.pid}:\tMPU (additive) reveal_local of a share in the clear: local, nothing sent", mpc.stats.bytes_sent - sent, 0)
+    assert_eq(f"CP{mpc.pid}:\tMPU (additive) reveal_local of a share in the clear: its own share", revealed_plain, share if mpc.pid else zeros((3, 5)))
+    plain._mpa.encrypt()
+    encrypted_share = MPU[Tuple[int, int], float](_mpp=MPP[Tuple[int, int], float](mpc), _mpa=MPA[Tuple[int, int], float]._from_parts(
+        mpc, ndarray[Tuple[int, int], float]() if mpc.pid else zeros((3, 5)), plain._mpa._encryption, Ciphertensor[Ciphertext]()))
+    expected_bytes = decryption_bytes(mpc, encrypted_share._mpa._encryption._data) if mpc.pid else 0
+    sent = mpc.stats.bytes_sent
+    revealed_encrypted = encrypted_share.reveal_local()
+    assert_eq(f"CP{mpc.pid}:\tMPU (additive) reveal_local of an encrypted share: c1s and decryption shares only", mpc.stats.bytes_sent - sent, expected_bytes)
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPU (additive) reveal_local of an encrypted share: its own share", revealed_encrypted, share, error=1e-3)
+    assert_parties_in_step(mpc, "MPU (additive) reveal_local of an encrypted share")
+    total = mpc.comms.collect(share).sum() if mpc.pid else zeros((3, 5))
+    plain._mpa.aggregate()
+    aggregate = MPU[Tuple[int, int], float](_mpp=MPP[Tuple[int, int], float](mpc), _mpa=MPA[Tuple[int, int], float]._from_parts(
+        mpc, ndarray[Tuple[int, int], float]() if mpc.pid else zeros((3, 5)), Ciphertensor[Ciphertext](), plain._mpa._aggregate))
+    revealed_aggregate = aggregate.reveal_local()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPU (additive) reveal_local of an aggregate: the sum", revealed_aggregate, total, error=1e-3)
+    assert_parties_in_step(mpc, "MPU (additive) reveal_local of an aggregate")
+
+
 def test_mpu[TP](mpc: MPCEnv[TP], modulus: TP):
     mpc.comms.sync_parties()
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
@@ -293,5 +364,6 @@ def test_mpu[TP](mpc: MPCEnv[TP], modulus: TP):
     test_mpu_matmul_operations(mpu_a, mpu_b, raw_a, raw_b)
     test_mpu_comparisons(mpc)
     test_mpu_mixed_cohorts(mpc)
+    test_mpu_reveal_local(mpc)
 
     print(f'CP{mpc.pid}:\tSequre MHE MPU tests on {alg_struct} passed.\n')

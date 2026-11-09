@@ -72,7 +72,7 @@ All standard arithmetic and comparison operators are supported. They dispatch to
 | Method | Description |
 |---|---|
 | `.reveal()` | Reveal all data with secure aggregation |
-| `.reveal_local()` | Reveal local share without aggregation |
+| `.reveal_local()` | This compute party's own data: its partition (partition mode, as `MPP.reveal_local`) or its share (additive mode, as `MPA.reveal_local`), decrypted to it alone; call it at every compute party |
 | `.encrypt()` | Encrypt plaintext data |
 | `.level()` | Current HE noise-growth level |
 | `.sum(axis)` | Distributed sum reduction |
