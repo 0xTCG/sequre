@@ -1,3 +1,4 @@
+import math
 import time
 
 from sequre.stdlib.numpy.create import ones, array, zeros_like
@@ -6,9 +7,236 @@ from sequre.types.sharetensor import Sharetensor
 from sequre.types.multiparty_partition import MPP
 from sequre.types.multiparty_union import MPU
 from sequre.utils.testing import assert_eq, assert_eq_approx
-from sequre.utils.utils import random_floats
+from sequre.utils.utils import random_floats, random_ints
 from sequre.mpc.env import MPCEnv
 from sequre.stdlib.learn.log_reg import LogReg
+
+
+def _max_abs_diff(a, b) -> float:
+    m = 0.0
+    for i in range(len(a)):
+        for j in range(len(a[i])):
+            m = max(m, abs(a[i][j] - b[i][j]))
+    return m
+
+
+def _binary_loss_definition(X, y, w, interval, d: float) -> Tuple[float, float]:
+    # (LogReg's binary loss in double: -sum(y log p + (1 - y) log(1 - p)), p = sigmoid of [X, 1] w clipped into the
+    # interval, then into [1e-4, 1 - 1e-4]; its spread under a noise d on each p: sum d (y / p + (1 - y) / (1 - p)))
+    total = 0.0
+    spread = 0.0
+    for i in range(X.shape[0]):
+        s = w[X.shape[1], 0]
+        for j in range(X.shape[1]):
+            s += X[i, j] * w[j, 0]
+        s = min(max(s, interval[0]), interval[1])
+        p = min(max(1.0 / (1.0 + math.exp(-s)), 1e-4), 1.0 - 1e-4)
+        total -= y[i, 0] * math.log(p) + (1.0 - y[i, 0]) * math.log(1.0 - p)
+        spread += d * (y[i, 0] / p + (1.0 - y[i, 0]) / (1.0 - p))
+    return total, spread
+
+
+def _row_max_scores(X, w) -> Tuple[float, float]:
+    # (largest, smallest) row maximum of [X, 1] w (the bias column appended, as LogReg does), in double
+    top, low = -1e300, 1e300
+    for i in range(X.shape[0]):
+        best = -1e300
+        for k in range(w.shape[1]):
+            v = w[X.shape[1], k]
+            for j in range(X.shape[1]):
+                v += X[i, j] * w[j, k]
+            best = max(best, v)
+        top, low = max(top, best), min(low, best)
+    return top, low
+
+
+def _fresh[TP](x: Sharetensor[TP]) -> Sharetensor[TP]:
+    # The same shares without cached Beaver partitions: what an input looks like the first time it is used (a run on
+    # inputs another run used would skip their partitions' rounds)
+    y = Sharetensor(x.share, x.modulus)
+    y.fp = x.fp
+    return y
+
+
+def test_log_reg_methods[TP](mpc: MPCEnv[TP], modulus: TP):
+    """
+    The Decor method (binary: MPC; MPU with additive and with partitioned weights), the multinomial variant as a
+    softmax (H-38) with both methods and a fixed shift, the heuristic-multinomial variant (the exp-only activation), and
+    loss() with the bias column (M-ML-03). Weights trained in the clear and securely from the same start agree within
+    1e-3 (1e-2 on MPUs: CKKS noise), and training moved them by at least ten times that.
+    """
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    n_cp = mpc.comms.number_of_parties - 1
+    rows_per_party = 4
+    rows = n_cp * rows_per_party
+    cols = 6
+    tol = 1e-3
+    with mpc.randomness.seed_switch(-1):
+        X = array(random_floats((rows, cols), scale=2.0)) - 1.0
+        target_w = array(random_floats((cols, 1), scale=2.0)) - 1.0
+        labels = array(random_ints((rows, 1), upper_limit=2))
+    scores = X @ target_w
+    y01 = array([[1.0 if scores[i, 0] > 0.0 else 0.0] for i in range(rows)])
+    y_cls = array([[1.0 if int(labels[i, 0]) == k else 0.0 for k in range(3)] for i in range(rows)])
+    mpc_X = Sharetensor.enc(mpc, X, 0, modulus)
+    mpc_y01 = Sharetensor.enc(mpc, y01, 0, modulus)
+    mpc_ycls = Sharetensor.enc(mpc, y_cls, 0, modulus)
+    w0 = array([[0.1 * float((i % 3) - 1)] for i in range(cols + 1)])
+    w0_cls = array([[0.1 * float(((i + k) % 3) - 1) for k in range(3)] for i in range(cols + 1)])
+    step = 0.1
+    epochs = 3
+
+    checks = List[Tuple[str, float, float, float]]()
+
+    # Binary, Decor: in the clear and on Sharetensors
+    raw = LogReg(w0, optimizer="bgd", method="decor").fit(mpc, X=X, y=y01, step=step, epochs=epochs)
+    sec = LogReg(Sharetensor.enc(mpc, w0, 0, modulus), method="decor").fit(mpc, X=mpc_X, y=mpc_y01, step=step, epochs=epochs)
+    checks.append(("binary, Decor (MPC)", _max_abs_diff(raw.coef_.tolist(), sec.coef_.reveal(mpc).tolist()), _max_abs_diff(raw.coef_.tolist(), w0.tolist()), tol))
+
+    # Binary, Decor on MPUs: partitioned rows; additive and partitioned weights
+    start, stop = (mpc.pid - 1) * rows_per_party, mpc.pid * rows_per_party
+    mpu_X = MPU(mpc, zeros_like(X) if mpc.pid == 0 else X[start:stop], "partition")
+    mpu_y = MPU(mpc, zeros_like(y01) if mpc.pid == 0 else y01[start:stop], "partition")
+    mpu_a = LogReg(MPU(mpc, w0 if mpc.pid == 1 else zeros_like(w0), "additive"), method="decor").fit(mpc, X=mpu_X, y=mpu_y, step=step, epochs=epochs)
+    checks.append(("binary, Decor (MPU, additive weights)", _max_abs_diff(raw.coef_.tolist(), mpu_a.coef_.reveal(mpc).tolist()), _max_abs_diff(raw.coef_.tolist(), w0.tolist()), 10.0 * tol))
+    f = cols + 1
+    w_start, w_stop = (mpc.pid - 1) * f // n_cp, mpc.pid * f // n_cp
+    mpu_p = LogReg(MPU(mpc, zeros_like(w0) if mpc.pid == 0 else w0[w_start:w_stop], "partition"), method="decor").fit(mpc, X=mpu_X, y=mpu_y, step=step, epochs=epochs)
+    checks.append(("binary, Decor (MPU, partitioned weights)", _max_abs_diff(raw.coef_.tolist(), mpu_p.coef_.reveal(mpc).tolist()), _max_abs_diff(raw.coef_.tolist(), w0.tolist()), 10.0 * tol))
+
+    # Multinomial (softmax over 3 classes): Chebyshev (passed explicitly; Decor is the variant's default), Decor, and
+    # Decor with a fixed shift
+    for method in ["chebyshev", "decor"]:
+        raw_m = LogReg(w0_cls, optimizer="bgd", variant="multinomial", method=method).fit(mpc, X=X, y=y_cls, step=step, epochs=epochs)
+        sec_m = LogReg(Sharetensor.enc(mpc, w0_cls, 0, modulus), variant="multinomial", method=method).fit(mpc, X=mpc_X, y=mpc_ycls, step=step, epochs=epochs)
+        checks.append((f"multinomial softmax, {method} (MPC)", _max_abs_diff(raw_m.coef_.tolist(), sec_m.coef_.reveal(mpc).tolist()), _max_abs_diff(raw_m.coef_.tolist(), w0_cls.tolist()), tol))
+    # The fixed shift must keep every exponent at most 0 through training (a row maximum above it saturates: the
+    # documented domain), and stay near the row maxima (its error grows as e^(offset - row max)): the largest row maximum
+    # of the scores along the plaintext training from the same start (batched descent: epoch by epoch is the same),
+    # plus a margin
+    traj = LogReg(w0_cls, optimizer="bgd", variant="multinomial", method="decor")
+    top, low = _row_max_scores(X, w0_cls)
+    for _ in range(epochs):
+        traj.fit(mpc, X=X, y=y_cls, step=step, epochs=1)
+        t, l = _row_max_scores(X, traj.coef_)
+        top, low = max(top, t), min(low, l)
+    offset = max(top + 0.5, 0.0)
+    raw_f = LogReg(w0_cls, optimizer="bgd", variant="multinomial", method="decor", fixed_shift_softmax=offset).fit(mpc, X=X, y=y_cls, step=step, epochs=epochs)
+    sec_f = LogReg(Sharetensor.enc(mpc, w0_cls, 0, modulus), variant="multinomial", method="decor", fixed_shift_softmax=offset).fit(mpc, X=mpc_X, y=mpc_ycls, step=step, epochs=epochs)
+    checks.append((f"multinomial softmax, Decor, fixed shift {offset:.2f} (MPC; row maxima in [{low:.2f}, {top:.2f}])", _max_abs_diff(raw_f.coef_.tolist(), sec_f.coef_.reveal(mpc).tolist()), _max_abs_diff(raw_f.coef_.tolist(), w0_cls.tolist()), tol))
+
+    # The default method follows the variant: Decor for the softmax, Chebyshev for heuristic-multinomial, and for binary
+    # the shares' modulus at each call (method_for: Decor on ring Sharetensors, public ones too, where Decor admits the
+    # interval; Chebyshev otherwise; a degree makes it Chebyshev)
+    binary = LogReg(w0, variant="binary")
+    defaults = [LogReg(w0_cls, variant="multinomial").method, binary.method,
+                LogReg(w0_cls, variant="heuristic-multinomial").method, LogReg(w0, variant="binary", degree=12).method]
+    assert_eq(f"CP{mpc.pid}:\tLogReg's default method per variant (multinomial, binary, heuristic, binary with a degree): {defaults}",
+              defaults[0] == "decor" and defaults[1] == "" and defaults[2] == "chebyshev" and defaults[3] == "chebyshev", True)
+    pub_X = Sharetensor.enc(mpc, X, 0, modulus).publish(mpc)
+    picks = [binary.method_for(mpc_X), binary.method_for(X), binary.method_for(mpu_X), binary.method_for(pub_X)]
+    want_pick = "decor" if modulus.popcnt() == 1 else "chebyshev"
+    assert_eq(f"CP{mpc.pid}:\tLogReg's binary default on {alg_struct}: {picks[0]} on Sharetensors, {picks[1]} in the clear, {picks[2]} on MPUs, {picks[3]} on public Sharetensors",
+              picks[0] == want_pick and picks[1] == "chebyshev" and picks[2] == "chebyshev" and picks[3] == want_pick, True)
+    # An interval only Chebyshev admits keeps Chebyshev on the ring too (the former default (-50, 10)), before any round
+    wide = LogReg(w0, variant="binary", interval=(-50.0, 10.0))
+    assert_eq(f"CP{mpc.pid}:\tLogReg's binary default with the interval (-50, 10) on {alg_struct}: {wide.method_for(mpc_X)}",
+              wide.method_for(mpc_X) == "chebyshev" and wide.interval_for(mpc_X) == (-50.0, 10.0), True)
+
+    # The binary default runs method_for's pick in fit, predict and loss: the same rounds and bytes as that method named
+    # explicitly, and not the other's (both counts depend on the protocol and on the Beaver partitions an input has
+    # cached, not on the data: every call takes fresh inputs); and its weights, predictions and loss within the
+    # protocol's noise of the pick's
+    pick = binary.method_for(mpc_X)
+    other = "chebyshev" if pick == "decor" else "decor"
+    w_s = Sharetensor.enc(mpc, w0, 0, modulus)
+    r0, b0 = mpc.stats.rounds, mpc.stats.bytes_sent
+    m_def = LogReg(w_s, optimizer="bgd").fit(mpc, X=_fresh(mpc_X), y=_fresh(mpc_y01), step=step, epochs=epochs)
+    r1, b1 = mpc.stats.rounds, mpc.stats.bytes_sent
+    m_pick = LogReg(w_s, optimizer="bgd", method=pick).fit(mpc, X=_fresh(mpc_X), y=_fresh(mpc_y01), step=step, epochs=epochs)
+    r2, b2 = mpc.stats.rounds, mpc.stats.bytes_sent
+    m_other = LogReg(w_s, optimizer="bgd", method=other).fit(mpc, X=_fresh(mpc_X), y=_fresh(mpc_y01), step=step, epochs=epochs)
+    r3, b3 = mpc.stats.rounds, mpc.stats.bytes_sent
+    pr_def = m_def.predict(mpc, _fresh(mpc_X))
+    r4, b4 = mpc.stats.rounds, mpc.stats.bytes_sent
+    pr_pick = m_pick.predict(mpc, _fresh(mpc_X))
+    r5, b5 = mpc.stats.rounds, mpc.stats.bytes_sent
+    pr_other = m_other.predict(mpc, _fresh(mpc_X))
+    r6, b6 = mpc.stats.rounds, mpc.stats.bytes_sent
+    lo_def = m_def.loss(mpc, _fresh(mpc_X), _fresh(mpc_y01))
+    r7, b7 = mpc.stats.rounds, mpc.stats.bytes_sent
+    lo_pick = m_pick.loss(mpc, _fresh(mpc_X), _fresh(mpc_y01))
+    r8, b8 = mpc.stats.rounds, mpc.stats.bytes_sent
+    lo_other = m_other.loss(mpc, _fresh(mpc_X), _fresh(mpc_y01))
+    r9, b9 = mpc.stats.rounds, mpc.stats.bytes_sent
+    stages = [("fit", (r1 - r0, b1 - b0), (r2 - r1, b2 - b1), (r3 - r2, b3 - b2)),
+              ("predict", (r4 - r3, b4 - b3), (r5 - r4, b5 - b4), (r6 - r5, b6 - b5)),
+              ("loss", (r7 - r6, b7 - b6), (r8 - r7, b8 - b7), (r9 - r8, b9 - b8))]
+    for stage, d, p, o in stages:
+        assert_eq(f"CP{mpc.pid}:\tLogReg's binary default {stage} on {alg_struct} runs {pick}: rounds and bytes {d} = {pick}'s {p}, not {other}'s {o}",
+                  d == p and d != o, True)
+    w_def, w_pick = m_def.coef_.reveal(mpc).tolist(), m_pick.coef_.reveal(mpc).tolist()
+    p_def, p_pick = pr_def.reveal(mpc).tolist(), pr_pick.reveal(mpc).tolist()
+    l_def, l_pick = lo_def.reveal(mpc).tolist(), lo_pick.reveal(mpc).tolist()
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tLogReg's binary default on {alg_struct}: weights and predictions = {pick}'s within 1e-4 ({_max_abs_diff(w_def, w_pick):.1e}, {_max_abs_diff(p_def, p_pick):.1e}), loss within 2e-4 per record",
+                  _max_abs_diff(w_def, w_pick) < 1e-4 and _max_abs_diff(p_def, p_pick) < 1e-4 and abs(l_def[0] - l_pick[0]) < 2e-4 * float(rows), True)
+
+    # Heuristic multinomial: the earlier exp-only activation
+    raw_h = LogReg(w0_cls, optimizer="bgd", variant="heuristic-multinomial").fit(mpc, X=X, y=y_cls, step=step, epochs=epochs)
+    sec_h = LogReg(Sharetensor.enc(mpc, w0_cls, 0, modulus), variant="heuristic-multinomial").fit(mpc, X=mpc_X, y=mpc_ycls, step=step, epochs=epochs)
+    checks.append(("heuristic multinomial, Chebyshev (MPC)", _max_abs_diff(raw_h.coef_.tolist(), sec_h.coef_.reveal(mpc).tolist()), _max_abs_diff(raw_h.coef_.tolist(), w0_cls.tolist()), tol))
+
+    # loss() on MPUs (partitioned rows, additive weights) against its definition (weights x 0.1 and x 1): the log runs
+    # on shares after one conversion per log. The conversions' HE noise d (2e-4 here, as test_losses) on each
+    # prediction p spreads the loss by d (y / p + (1 - y) / (1 - p)) per record; the revealed sum carries 3e-5 more.
+    for scale in [0.1, 1.0]:
+        w_s = array([[scale * float((i % 3) - 1)] for i in range(cols + 1)])
+        mpu_l = LogReg(MPU(mpc, w_s if mpc.pid == 1 else zeros_like(w_s), "additive"), method="decor")
+        loss_mpu = mpu_l.loss(mpc, mpu_X, mpu_y).reveal(mpc).tolist()
+        loss_def, spread = _binary_loss_definition(X, y01, w_s, mpu_l.interval, 2e-4)
+        if mpc.pid:
+            assert_eq(f"CP{mpc.pid}:\tlogistic regression loss() on MPUs (weights x {scale}) = its definition on {alg_struct} ({loss_mpu[0]:.6f}, {loss_def:.6f}, within {spread + 3e-5:.2e})",
+                      abs(loss_mpu[0] - loss_def) <= spread + 3e-5, True)
+
+    # The softmax activations' rows sum to 1 (they did not before: H-38), and loss() takes the features without the bias
+    # column (M-ML-03)
+    probs = sec_m.predict(mpc, mpc_X).reveal(mpc).tolist()
+    loss_raw = raw.loss(mpc, X, y01).tolist()
+    loss_sec = sec.loss(mpc, mpc_X, mpc_y01).reveal(mpc).tolist()
+    # The loss' definition, in double from the plaintext model's predictions (clipped into [1e-4, 1 - 1e-4])
+    act = raw.predict(mpc, X).tolist()
+    want = 0.0
+    for i in range(rows):
+        p = min(max(act[i][0], 1e-4), 1.0 - 1e-4)
+        want -= y01[i, 0] * math.log(p) + (1.0 - y01[i, 0]) * math.log(1.0 - p)
+
+    # The secure inputs stay intact through every fit above, the MPU ones included
+    drift = max(_max_abs_diff(mpc_X.reveal(mpc).tolist(), X.tolist()), _max_abs_diff(mpc_y01.reveal(mpc).tolist(), y01.tolist()),
+                _max_abs_diff(mpc_ycls.reveal(mpc).tolist(), y_cls.tolist()))
+    drift = max(drift, max(_max_abs_diff(mpu_X.reveal(mpc).tolist(), X.tolist()), _max_abs_diff(mpu_y.reveal(mpc).tolist(), y01.tolist())))
+
+    # Decor takes no degree: LogReg refuses one at construction, at every party and before any round
+    w_refuse = Sharetensor.enc(mpc, w0, 0, modulus)
+    r0, b0 = mpc.stats.rounds, mpc.stats.bytes_sent
+    refused = False
+    try:
+        LogReg(w_refuse, method="decor", degree=5)
+    except ValueError:
+        refused = True
+    assert_eq(f"CP{mpc.pid}:\tlogistic regression refuses a degree with Decor before any round on {alg_struct}",
+              refused and mpc.stats.rounds == r0 and mpc.stats.bytes_sent == b0, True)
+
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tlogistic regression's secure inputs intact after the fits on {alg_struct} ({drift:.1e})", drift < 1e-9, True)
+        for name, diff, moved, limit in checks:
+            assert_eq(f"CP{mpc.pid}:\tlogistic regression {name} on {alg_struct}: weights agree (max diff {diff:.2e} < {limit:.0e}) and moved ({moved:.2e})", diff < limit and moved > 10.0 * limit, True)
+        row_sums = [sum(r) for r in probs]
+        assert_eq_approx(f"CP{mpc.pid}:\tlogistic regression multinomial predictions sum to 1 per row on {alg_struct}", row_sums, [1.0 for _ in row_sums], error=1e-3)
+        assert_eq_approx(f"CP{mpc.pid}:\tlogistic regression loss() with the bias column (M-ML-03) on {alg_struct}", loss_sec, loss_raw, error=1e-2)
+        # clipped_log's error (Decor exp's, about 1e-5 at F = 32) per record, and the secure activations' (1e-5)
+        assert_eq(f"CP{mpc.pid}:\tlogistic regression loss() = its definition on {alg_struct} ({loss_raw[0]:.6f}, {loss_sec[0]:.6f}, {want:.6f})",
+                  abs(loss_raw[0] - want) < 1e-9 * float(rows) + 1e-9 and abs(loss_sec[0] - want) < 1e-4 * float(rows), True)
 
 
 def test_log_reg[TP](mpc: MPCEnv[TP], modulus: TP):
@@ -50,6 +278,10 @@ def test_log_reg[TP](mpc: MPCEnv[TP], modulus: TP):
     e = time.time()
     plaintext_time = e - s
     print(f'CP{mpc.pid}:\tPlaintext runtime: {plaintext_time}s\n')
+    # The secure default follows the shares' modulus (binary: Decor on the ring), and its plaintext reference takes the
+    # same method; the MPU fits below run Chebyshev, the plaintext default
+    raw_ref_w = raw_log_reg.coef_ if modulus.popcnt() != 1 else \
+        LogReg(raw_initial_w, optimizer="bgd", method="decor").fit(mpc, X=X, y=y, step=step_size, epochs=epochs).coef_
 
     s = time.time()
     mpc_log_reg = LogReg(mpc_initial_w).fit(mpc, X=mpc_X, y=mpc_y, step=step_size, epochs=epochs)
@@ -63,7 +295,7 @@ def test_log_reg[TP](mpc: MPCEnv[TP], modulus: TP):
     if mpc.pid == 0:
         assert_eq(f"CP{mpc.pid}:\tSafe-checking logistic regression result shape (MPC) on {alg_struct}", mpc_w.shape, list(raw_w.shape))
     else:
-        assert_eq_approx(f"CP{mpc.pid}:\tSequre logistic regression (MPC) on {alg_struct}", mpc_w.reveal(mpc), raw_w)
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre logistic regression (MPC, default method) on {alg_struct}", mpc_w.reveal(mpc), raw_ref_w)
     
     mpp_initial_w = MPP(
         mpc, zeros_like(raw_initial_w) if mpc.pid == 0 else raw_initial_w[
@@ -98,6 +330,8 @@ def test_log_reg[TP](mpc: MPCEnv[TP], modulus: TP):
         assert_eq(f"CP{mpc.pid}:\tSafe-checking logistic regression result shape (MPU via MPP weights) on {alg_struct}", mpu_w.shape, raw_w.shape)
     else:
         assert_eq_approx(f"CP{mpc.pid}:\tSequre logistic regression (MPU via MPP weights) on {alg_struct}", mpu_w.reveal(mpc), raw_w, error=5.0)  # Figure out why this test fails when error is removed. Probably in sqrt.
+
+    test_log_reg_methods(mpc, modulus)
 
     print(f'CP{mpc.pid}:\tSequre logistic regression on {alg_struct} tests passed.\n')
     print(f'CP{mpc.pid}:\tRuntimes:\n\t\tPlaintext: {plaintext_time}s\n\t\tMPC: {mpc_time}s\n\t\tMPU/MPA: {mpu_via_mpa_time}s\n\t\tMPU/MPP: {mpu_via_mpp_time}s\n')

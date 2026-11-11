@@ -405,14 +405,18 @@ class UInt:
         return self >> UInt[N](other)
     
     def __mod__(self: UInt[N], other: UInt[N]) -> UInt[N]:
-        if other == MPC_RING_SIZE:
-            return self.__fast_mod_ring()
-        elif other == MPC_FIELD_SIZE:
-            return self.__fast_mod_field()
-        elif N > 128:
+        # The fast paths recognize the two MPC moduli, which are mpc_uint-wide; narrower or wider operands (a bitwise
+        # protocol's operational modulus, say) skip them at compile time.
+        if N == MPC_INT_SIZE:
+            if other == MPC_RING_SIZE:
+                return self.__fast_mod_ring()
+            elif other == MPC_FIELD_SIZE:
+                return self.__fast_mod_field()
+
+        if N > 128:
             return self.gmp_mod(other)
-        else:
-            return self.__naive_mod(other)
+
+        return self.__naive_mod(other)
     
     def __repr__(self: UInt[N]) -> str:
         # TODO: Implement faster solution
@@ -464,6 +468,36 @@ class UInt:
     
     def bit_reverse_subset(self: UInt[N], bitlen: int) -> UInt[N]:
         return self.bit_reverse() >> UInt[N](N - bitlen)
+
+    def rand_full(self: UInt[N]) -> UInt[N]:
+        """
+        Uniform over the whole register width.
+
+        Unlike rand(base, ...), which is uniform below base and leaves the top bits of a full-width register fixed,
+        every bit is random. XOR (bitwise) sharing needs every bit of a mask to be random, so it draws through this.
+        """
+        return prg.getrandbits_intn(N, TP=UInt[N])
+
+    def _shl_no_wrap(self: UInt[N], shift: int) -> UInt[N]:
+        # Left shift that gives zero instead of an undefined value when shift >= N.
+        if shift >= N:
+            return UInt[N](0)
+
+        return self << UInt[N](shift)
+
+    def bit_replicate(self: UInt[N], k) -> UInt[N]:
+        """
+        Copies every set bit of self into the k positions below it (k a power of two; the bit's own position is not
+        kept). Aligns the operands of the bitwise prefix operation.
+        """
+        if DEBUG:
+            assert k.popcnt() == 1, f"k must be a power of two, got {k}"
+
+        x = self >> UInt[N](1)
+        for i in range(int(k.bitlen() - 1)):
+            x = (x >> UInt[N](1 << i)) | x
+
+        return x
     
     def __fast_mod_mersenne(self: UInt[N], field_size: UInt[N] = MPC_FIELD_SIZE):
         """
@@ -625,7 +659,7 @@ class UInt:
     
     @staticmethod
     def rand_bits(bitlen: int) -> UInt[N]:
-        return __rand_bits(bitlen)
+        return __rand_bits(bitlen, TP=UInt[N])
     
     @staticmethod
     def zeros() -> UInt[N]:
@@ -1121,6 +1155,98 @@ class List:
         l = list[T](len(self))
         for s in self: l.append(s ^ scalar)
         return l
+
+    # Element-wise bitwise operations. Bitwise (XOR) shared MPC represents a secret as a list of registers, so these
+    # are its workhorse operations.
+    def __iand__(self: list[T], other: list[T]) -> list[T]:
+        for i in range(len(self)):
+            self[i] &= other[i]
+        return self
+
+    def __and__(self: list[T], other: list[T]) -> list[T]:
+        l = list[T](len(self))
+        for i in range(len(self)): l.append(self[i] & other[i])
+        return l
+
+    def __ior__(self: list[T], other: list[T]) -> list[T]:
+        for i in range(len(self)):
+            self[i] |= other[i]
+        return self
+
+    def __or__(self: list[T], other: list[T]) -> list[T]:
+        l = list[T](len(self))
+        for i in range(len(self)): l.append(self[i] | other[i])
+        return l
+
+    def __ixor__(self: list[T], other: list[T]) -> list[T]:
+        for i in range(len(self)):
+            self[i] ^= other[i]
+        return self
+
+    def __xor__(self: list[T], other: list[T]) -> list[T]:
+        l = list[T](len(self))
+        for i in range(len(self)): l.append(self[i] ^ other[i])
+        return l
+
+    # Scalar variants for unsigned integers of any width (size_t registers, for one).
+    def __iand__(self: list[T], scalar: UInt[M], M: Static[int]) -> list[T]:
+        for i in range(len(self)):
+            self[i] &= scalar
+        return self
+
+    def __and__(self: list[T], scalar: UInt[M], M: Static[int]) -> list[T]:
+        l = list[T](len(self))
+        for s in self: l.append(s & scalar)
+        return l
+
+    def __ior__(self: list[T], scalar: UInt[M], M: Static[int]) -> list[T]:
+        for i in range(len(self)):
+            self[i] |= scalar
+        return self
+
+    def __or__(self: list[T], scalar: UInt[M], M: Static[int]) -> list[T]:
+        l = list[T](len(self))
+        for s in self: l.append(s | scalar)
+        return l
+
+    def __ixor__(self: list[T], scalar: UInt[M], M: Static[int]) -> list[T]:
+        for i in range(len(self)):
+            self[i] ^= scalar
+        return self
+
+    def __xor__(self: list[T], scalar: UInt[M], M: Static[int]) -> list[T]:
+        l = list[T](len(self))
+        for s in self: l.append(s ^ scalar)
+        return l
+
+    def get_bit(self: list[T], bit: Static[int]) -> list[T]:
+        # Bit number `bit` of each register, as 0 or 1 in the register's type.
+        if isinstance(T, list):
+            return [x.get_bit(bit) for x in self]
+
+        return [(x >> T(bit)) & T(1) for x in self]
+
+    def bit_reverse(self: list[T]) -> list[T]:
+        return [x.bit_reverse() for x in self]
+
+    def bit_reverse_subset(self: list[T], bitlen: int) -> list[T]:
+        return [x.bit_reverse_subset(bitlen) for x in self]
+
+    def bit_replicate(self: list[T], k) -> list[T]:
+        return [x.bit_replicate(k) for x in self]
+
+    def ext_to(self: list[T], bitlen: Static[int]):
+        return [x.ext_to(bitlen) for x in self]
+
+    def trunc_to(self: list[T], bitlen: Static[int]):
+        return [x.trunc_to(bitlen) for x in self]
+
+    def popcnt(self: list[T]):
+        return [x.popcnt() for x in self]
+
+    def rand_full(self: list[T]) -> list[T]:
+        # Uniform over every bit of every register (XOR masks).
+        return [x.rand_full() for x in self]
 
     def __ilshift__(self: list[T], scalar: mpc_uint) -> list[T]:
         for i in range(len(self)):
@@ -1660,13 +1786,14 @@ class List:
             return __rand_vec(len(self), base)
     
     def rand_bits(self: list[T], bitlen: int):
+        # Keeps the element type: a list of size_t registers draws size_t values.
         if isinstance(self, list[list[list]]):
             compile_error("Sequre does not support dimensions higher than 2.")
 
         if isinstance(self, list[list]):
-            return __rand_mat_bits(self.shape, bitlen)
+            return __rand_mat_bits(self.shape, bitlen, TP=type(self[0][0]))
         else:
-            return __rand_vec_bits(len(self), bitlen)
+            return __rand_vec_bits(len(self), bitlen, TP=T)
     
     def get_identity(self: list[T]) -> list[T]:
         identity = self.zeros()
@@ -1687,6 +1814,10 @@ class List:
         compile_error('Invalid type within a fixed value method')
     
     def zeros(self: list[T]) -> list[T]:
+        if isinstance(T, UInt):
+            # UInt.zeros is a static method without arguments, so self[i].zeros() would fall back (UFCS) to the numpy
+            # zeros(shape) imported above, with the element as the shape: an ndarray for narrow widths.
+            return [T.zeros() for _ in range(len(self))]
         return [self[i].zeros() for i in range(len(self))]
     
     def ones(self: list[T]) -> list[T]:

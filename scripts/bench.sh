@@ -9,10 +9,10 @@
 #   scripts/bench.sh compare BASE_DIR CAND_DIR [bench_compare.py options]
 #   scripts/bench.sh calibrate RUN1_DIR RUN2_DIR [--out FILE]
 #
-# run: builds the needed binaries in release mode (cached by a hash of tests/bench, applications/king.codon, the
-# whole stdlib and the toolchain; --rebuild forces a build), and runs each binary from a fresh temporary directory
-# (local mode leaves sock.* files behind) under `timeout`, with the AVX alignment shim preloaded as the `sequre`
-# launcher does. Cases flagged "iso" in the registry, and known-broken cases asked for by exact name
+# run: builds the needed binaries in release mode (cached by a hash of tests/bench, the applications the bench files
+# import, the whole stdlib and the toolchain; --rebuild forces a build), and runs each binary from a fresh temporary
+# directory (local mode leaves sock.* files behind) under `timeout`, with the AVX alignment shim preloaded as the
+# `sequre` launcher does. Cases flagged "iso" in the registry, and known-broken cases asked for by exact name
 # (--cases name$), run in processes of their own after the rest.
 # CPU placement is fixed so that runs do not differ by where the scheduler put the parties. --cpus auto (the
 # default) restricts the binaries to one hardware thread per physical core; --pin auto splits those cores into
@@ -34,7 +34,8 @@
 # Every run is checked for completeness (each party's file must end with a __done__ row and hold every selected
 # case), not by exit status. Results: results/bench/<label>/
 #     manifest.json   git sha + dirty-tree hash, machine, load, shim, thread and HE settings, build and run times
-#     summary.tsv     one row per case (the slowest compute party's median and min, MAD, witness)
+#     summary.tsv     one row per case (the slowest compute party's median and min, MAD, witness, openings per
+#                     repetition from harness v4 on)
 #     runs/<binary>.<main|case>/CP<pid>.tsv, stdout.log, check.json      raw per-party results
 #     build/<binary>.log
 # Exit status: 0 complete, 1 a run incomplete (results kept), 2 usage.

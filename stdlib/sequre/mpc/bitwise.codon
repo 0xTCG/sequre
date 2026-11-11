@@ -1,0 +1,769 @@
+"""
+Bitwise (XOR) secret sharing.
+
+The protocols in mpc/boolean.codon work on arithmetic shares of bits. Here the compute parties instead hold registers
+whose XOR is the secret, packed so that one machine instruction covers PACKING_SIZE secret bits. The dealer (CP0)
+supplies the masks through the pairwise PRG streams, as for the arithmetic Beaver partitions: every party draws the same
+number of values from each shared stream, in the same order. On top of the bit operations sit a carry computation of
+logarithmic depth, a sign test for ring shares and a normalizer for ring shares (the power of two that scales a value
+into [1/4, 1)).
+
+The carry and prefix protocols are adapted from
+https://faui1-files.cs.fau.de/filepool/publications/octavian_securescm/SecureSCM-D.9.2.pdf, as in the original Decor code.
+"""
+
+from sequre.constants import DEBUG, MPC_INT_SIZE, MPC_NBIT_K, PACKING_SIZE, mpc_uint, size_t
+from sequre.utils.utils import zeros_mat, zeros_vec
+from sequre.types.utils import num_to_bits_packed
+
+from stats import MPCStats
+from randomness import MPCRandomness
+from comms import MPCComms
+from arithmetic import MPCArithmetic
+
+
+class MPCBitwise[TP]:
+    pid: int
+    stats: MPCStats
+    randomness: MPCRandomness
+    comms: MPCComms[TP]
+    arithmetic: MPCArithmetic[TP]
+
+    def __init__(self, arithmetic: MPCArithmetic[TP]):
+        self.pid = arithmetic.pid
+        self.stats = arithmetic.stats
+        self.randomness = arithmetic.randomness
+        self.comms = arithmetic.comms
+        self.arithmetic = arithmetic
+
+    # ------------------------------------------------------------------------------------------------------------------
+    # XOR sharing. Every mask is drawn with rand_full: uniform over all bits of the register.
+    # ------------------------------------------------------------------------------------------------------------------
+
+    def share_from(self, data, source_pid: int):
+        """ XOR-shares data held by source_pid among the compute parties (CP0 holds zeros unless it is the source). """
+        from_dealer = source_pid == 0
+
+        if self.pid == source_pid:
+            r = data.zeros()
+            for p in range(2 if from_dealer else 1, self.comms.number_of_parties):
+                if p != source_pid:
+                    with self.randomness.seed_switch(p):
+                        r ^= data.rand_full()
+
+            blinded_data = data ^ r
+
+            if from_dealer:
+                self.comms.send_as_jar(blinded_data, 1)
+                return data.zeros()
+
+            return blinded_data
+        elif self.pid == 1 and from_dealer:
+            return self.comms.receive_as_jar(0, T=type(data))
+        elif self.pid == 0 and not from_dealer:
+            return data.zeros()
+        else:
+            with self.randomness.seed_switch(source_pid):
+                return data.rand_full()
+
+    def share_from_trusted_dealer(self, data):
+        return self.share_from(data, 0)
+
+    def reveal(self, value):
+        """ XOR of the compute parties' shares, to every compute party (CP0 gets its own input back). One round. """
+        if self.pid == 0:
+            return value
+
+        self.stats.rounds += 1
+        if self.pid == 1:
+            for i in range(2, self.comms.number_of_parties):
+                value = value ^ self.comms.receive_as_jar(i, type(value))
+
+            for i in range(2, self.comms.number_of_parties):
+                self.comms.send_as_jar(value, i)
+
+            return value
+
+        self.comms.send_as_jar(value, 1)
+        return self.comms.receive_as_jar(1, type(value))
+
+    def reveal_ring(self, value):
+        """
+        Sum mod 2^N of the compute parties' UInt[N] shares (arithmetic shares over the ring of the register width:
+        size_t shares are shares mod 2^K), to every compute party. One round.
+        """
+        if self.pid == 0:
+            return value
+
+        self.stats.rounds += 1
+        if self.pid == 1:
+            for i in range(2, self.comms.number_of_parties):
+                value = _wrapping_add(value, self.comms.receive_as_jar(i, type(value)))
+
+            for i in range(2, self.comms.number_of_parties):
+                self.comms.send_as_jar(value, i)
+
+            return value
+
+        self.comms.send_as_jar(value, 1)
+        return self.comms.receive_as_jar(1, type(value))
+
+    def _beaver_partition(self, value):
+        # (value XOR r opened, r): CP0 knows r, the XOR of the masks it shares with each compute party.
+        self.stats.partitions_count += 1
+
+        if self.pid == 0:
+            r = value.zeros()
+            for i in range(1, self.comms.number_of_parties):
+                with self.randomness.seed_switch(i):
+                    r ^= value.rand_full()
+
+            return value.zeros(), r
+
+        with self.randomness.seed_switch(0):
+            r = value.rand_full()
+
+        return self.reveal(value ^ r), r
+
+    def _beaver_partition_bulk(self, *values):
+        """ Partitions several values in one round. """
+        concatenated_values = []
+        for value in values:
+            concatenated_values.extend(value)
+
+        partitions = self._beaver_partition(concatenated_values)
+
+        result = []
+        start_idx = 0
+        for value in values:
+            end_idx = start_idx + len(value)
+            result.append((partitions[0][start_idx:end_idx], partitions[1][start_idx:end_idx]))
+            start_idx = end_idx
+
+        return result
+
+    def _beaver_land(self, x_r, r_1, y_r, r_2):
+        # x & y = (x_r ^ r_1) & (y_r ^ r_2); CP0 holds r_1 & r_2, which _beaver_reconstruct shares.
+        if self.pid == 0:
+            return r_1 & r_2
+
+        xy = (x_r & r_2) ^ (y_r & r_1)
+        if self.pid == 1:
+            xy ^= x_r & y_r
+
+        return xy
+
+    def _beaver_reconstruct(self, value):
+        self.stats.reconstructs_count += 1
+
+        if self.pid == 0:
+            mask = value.zeros()
+            for i in range(2, self.comms.number_of_parties):
+                with self.randomness.seed_switch(i):
+                    mask ^= value.rand_full()
+
+            r = value ^ mask
+            self.comms.send(r, 1)
+
+            return r
+        elif self.pid == 1:
+            return value ^ self.comms.receive(0, T=type(value))
+        else:
+            with self.randomness.seed_switch(0):
+                return value ^ value.rand_full()
+
+    def _land(self, x_1_r, r_1, x_2_r, r_2):
+        return self._beaver_reconstruct(self._beaver_land(x_1_r, r_1, x_2_r, r_2))
+
+    def land(self, a, b):
+        """ a AND b, bit by bit, for XOR-shared a and b. """
+        x_1_r, r_1 = self._beaver_partition(a)
+        x_2_r, r_2 = self._beaver_partition(b)
+        return self._land(x_1_r, r_1, x_2_r, r_2)
+
+    def _lor(self, x_1_r, r_1, x_2_r, r_2):
+        # a | b = a ^ b ^ (a & b), with a = x_1_r ^ r_1 (x_1_r public, counted once at the hub).
+        c = r_1 ^ r_2 ^ self._land(x_1_r, r_1, x_2_r, r_2)
+        if self.pid == self.comms.hub_pid:
+            c ^= x_1_r ^ x_2_r
+
+        return c
+
+    def lor(self, a, b):
+        """ a OR b, bit by bit, for XOR-shared a and b. """
+        return a ^ b ^ self.land(a, b)
+
+    def lor_public(self, a, b_pub):
+        """ a OR b_pub for XOR-shared a and public b_pub (local). """
+        s = (a & b_pub) ^ a
+        if self.pid == self.comms.hub_pid:
+            s ^= b_pub
+        return s
+
+    # ------------------------------------------------------------------------------------------------------------------
+    # Dealer randomness: a random value with arithmetic and XOR shares.
+    # ------------------------------------------------------------------------------------------------------------------
+
+    def share_random_bits_packed[T](
+            self, n: int, modulus: T, bitlen: Static[int]) -> Tuple[list[T], list[list[size_t]]]:
+        """
+        n random bitlen-bit values r: arithmetic shares mod modulus, and XOR shares of their bits packed into size_t
+        registers (num_to_bits_packed layout). The arithmetic masks are uniform below modulus, the XOR masks over every
+        bit.
+        """
+        r = zeros_vec(n, TP=T)
+        rbits = num_to_bits_packed(r, bitlen=bitlen)
+
+        if self.pid == 0:
+            r = r.rand_bits(bitlen)
+            rbits = num_to_bits_packed(r, bitlen=bitlen)
+
+            r_mask = r.zeros()
+            rbits_mask = rbits.zeros()
+            for p in range(2, self.comms.number_of_parties):
+                with self.randomness.seed_switch(p):
+                    r_mask = r_mask.add_mod(r.rand(modulus, "uniform"), modulus)
+                    rbits_mask ^= rbits.rand_full()
+
+            r = r.sub_mod(r_mask, modulus)
+            rbits ^= rbits_mask
+
+            self.comms.send(r, 1)
+            self.comms.send(rbits, 1)
+
+            return r, rbits
+
+        if self.pid == 1:
+            r = self.comms.receive(0, T=type(r))
+            rbits = self.comms.receive(0, T=type(rbits))
+            return r, rbits
+
+        with self.randomness.seed_switch(0):
+            return r.rand(modulus, "uniform"), rbits.rand_full()
+
+    def share_random_ring_word(self, n: int) -> Tuple[list[size_t], list[size_t]]:
+        """
+        n uniform K-bit values r (K = PACKING_SIZE = MPC_NBIT_K): arithmetic shares mod 2^K as size_t (wrapping
+        arithmetic) and XOR shares, both uniform over the register.
+        """
+        r = zeros_vec(n, TP=size_t)
+        r_xor = zeros_vec(n, TP=size_t)
+
+        if self.pid == 0:
+            r = r.rand_full()
+            r_xor = r.copy()
+
+            for p in range(2, self.comms.number_of_parties):
+                with self.randomness.seed_switch(p):
+                    r = _wrapping_sub(r, r.rand_full())
+                    r_xor ^= r_xor.rand_full()
+
+            self.comms.send(r, 1)
+            self.comms.send(r_xor, 1)
+
+            return r, r_xor
+
+        if self.pid == 1:
+            r = self.comms.receive(0, T=type(r))
+            r_xor = self.comms.receive(0, T=type(r_xor))
+            return r, r_xor
+
+        with self.randomness.seed_switch(0):
+            return r.rand_full(), r_xor.rand_full()
+
+    def share_random_bit_vectors(self, n: int, bits: int, modulus: TP) -> Tuple[list[size_t], list[list[TP]]]:
+        """
+        n random bits-bit values rho (bits <= PACKING_SIZE): XOR shares of rho in one size_t each, and arithmetic shares
+        mod modulus of each of its bits (n x bits; column t holds bit t). For exact bit-to-arithmetic conversions.
+        """
+        rho = zeros_vec(n, TP=size_t)
+        rho_bits = zeros_mat(n, bits, TP=TP)
+
+        if self.pid == 0:
+            low = (size_t(1) << size_t(bits)) - size_t(1) if bits < PACKING_SIZE else size_t(-1)
+            rho = [x & low for x in rho.rand_full()]
+            rho_bits = [[TP(int((rho[i] >> size_t(t)) & size_t(1))) for t in range(bits)] for i in range(n)]
+
+            rho_mask = rho.zeros()
+            bits_mask = rho_bits.zeros()
+            for p in range(2, self.comms.number_of_parties):
+                with self.randomness.seed_switch(p):
+                    rho_mask ^= rho.rand_full()
+                    bits_mask = bits_mask.add_mod(rho_bits.rand(modulus, "uniform"), modulus)
+
+            rho = rho ^ rho_mask
+            rho_bits = rho_bits.sub_mod(bits_mask, modulus)
+
+            self.comms.send(rho, 1)
+            self.comms.send(rho_bits, 1)
+
+            return rho, rho_bits
+
+        if self.pid == 1:
+            rho = self.comms.receive(0, T=type(rho))
+            rho_bits = self.comms.receive(0, T=type(rho_bits))
+            return rho, rho_bits
+
+        with self.randomness.seed_switch(0):
+            return rho.rand_full(), rho_bits.rand(modulus, "uniform")
+
+    # ------------------------------------------------------------------------------------------------------------------
+    # Carries and prefix operations.
+    # ------------------------------------------------------------------------------------------------------------------
+
+    def carry_out_aux(self, d_prop, d_gen, num_bits: int):
+        """
+        Carry out of num_bits-bit additions from their (propagate, generate) bits: rows of size_t registers, the leading
+        (most significant) row first, exactly 1 + (num_bits - 1) // PACKING_SIZE rows, one column per value. Each round
+        combines adjacent (propagate, generate) pairs and halves the width: log2(num_bits) rounds.
+        """
+        if num_bits == 1:
+            rv = d_gen[-1]
+            for i in range(len(rv)):
+                rv[i] &= size_t(1)
+            return rv
+
+        num_bits_head = num_bits % PACKING_SIZE
+        # The unused top bits of the leading register propagate (1) and do not generate (0).
+        if num_bits_head > 0:
+            tip_mask = size_t(-1) << size_t(num_bits_head)  # 11..1100..00
+            tip_mask_inv = tip_mask ^ size_t(-1)
+
+            if self.pid == self.comms.hub_pid:
+                d_prop[0] |= tip_mask
+            else:
+                d_prop[0] &= tip_mask_inv
+
+            d_gen[0] &= tip_mask_inv
+
+        d_gen_shift = d_gen >> 1
+
+        x_1, x_3 = self._beaver_partition_bulk(d_prop, d_gen)
+        _x_1, _r_1 = x_1  # d_prop
+        _x_2, _r_2 = _x_1 >> 1, _r_1 >> 1  # d_prop shifted
+        _x_3, _r_3 = x_3  # d_gen
+
+        d_prop_out = self._land(_x_2, _r_2, _x_1, _r_1)
+        d_gen_out = self._land(_x_2, _r_2, _x_3, _r_3) ^ d_gen_shift
+
+        # Gather the bits at even positions into the low half of each register: 0a0b0c0d -> 0000abcd (linear in GF(2)).
+        for i in range(1, (PACKING_SIZE - 1).bitlen()):
+            mask_1 = (size_t(-1) // (size_t(1)._shl_no_wrap(1 << (i + 1)) - size_t(1))) * \
+                (((size_t(1) << size_t(1 << i)) - size_t(1)) << size_t(1 << i))
+            mask_2 = size_t(-1) ^ ((size_t(-1) // ((size_t(1) << size_t(1 << i)) - size_t(1))) *
+                (((size_t(1) << size_t(1 << (i - 1))) - size_t(1)) << size_t(1 << (i - 1))))
+            mask_move = mask_1 & mask_2
+            mask_keep = (size_t(-1) ^ mask_1) & mask_2
+
+            d_prop_out = ((d_prop_out & mask_move) >> (1 << (i - 1))) | (d_prop_out & mask_keep)
+            d_gen_out = ((d_gen_out & mask_move) >> (1 << (i - 1))) | (d_gen_out & mask_keep)
+
+        # Pack the low halves of adjacent registers into one: (0000abcd, 0000efgh) -> abcdefgh.
+        half_bits = PACKING_SIZE // 2
+        half_mask = (size_t(1) << size_t(half_bits)) - size_t(1)
+
+        num_bits_out = (num_bits + 1) // 2
+        nelem_out = 1 + ((num_bits_out - 1) // PACKING_SIZE)
+        nelem_in = 1 + ((num_bits - 1) // PACKING_SIZE)
+        if DEBUG:
+            assert len(d_prop) == nelem_in, f"carry_out_aux: {len(d_prop)} registers for {num_bits} bits"
+
+        n = len(d_gen[0])
+        start_idx = 0
+        out_idx = 0
+        d_prop_out_halved = zeros_mat(nelem_out, n, TP=size_t)
+        d_gen_out_halved = zeros_mat(nelem_out, n, TP=size_t)
+
+        if nelem_in % 2 != 0:
+            start_idx += 1
+            out_idx += 1
+
+            for k in range(n):
+                d_prop_out_halved[0][k] = d_prop_out[0][k]
+                d_gen_out_halved[0][k] = d_gen_out[0][k]
+
+        for i in range(start_idx, nelem_in, 2):
+            for k in range(n):
+                d_prop_out_halved[out_idx][k] = \
+                    ((d_prop_out[i][k] & half_mask) << size_t(half_bits)) | (d_prop_out[i + 1][k] & half_mask)
+                d_gen_out_halved[out_idx][k] = \
+                    ((d_gen_out[i][k] & half_mask) << size_t(half_bits)) | (d_gen_out[i + 1][k] & half_mask)
+
+            out_idx += 1
+
+        return self.carry_out_aux(d_prop_out_halved, d_gen_out_halved, num_bits_out)
+
+    def carry_out_public(self, a_pub, b, num_bits: int):
+        """
+        Carry out of a_pub + b for num_bits-bit numbers: a_pub public, b XOR-shared; both are rows of size_t registers
+        (leading row first, 1 + (num_bits - 1) // PACKING_SIZE rows, one column per number). XOR shares of the carry
+        bit, one size_t per number.
+        """
+        d_prop = b.copy()
+        if self.pid == self.comms.hub_pid:
+            d_prop ^= a_pub
+
+        d_gen = b & a_pub
+
+        return self.carry_out_aux(d_prop, d_gen, num_bits)
+
+    @staticmethod
+    def _get_prefix_mask(k: int, levels: int, dtype: type) -> dtype:
+        # Positions that are multiples of 2^(k + 1), below 2^(k + levels); positions beyond the width drop out.
+        mask = dtype(1)
+        for i in range(levels - 1):
+            mask = mask._shl_no_wrap(1 << (k + i + 1)) | mask
+        return mask
+
+    def _prefix_op(self, x, op, bitlen: Static[int], dtype: type = mpc_uint):
+        """
+        Prefix of the associative op over the bits of x from the most significant end down: afterwards bit j holds
+        op(x_top, ..., x_j), top = bitlen - 1 (bits above bitlen must hold op's neutral element). ceil(log2(bitlen))
+        rounds. op takes partitioned operands (x_r_1, r_1, x_r_2, r_2): the higher-position operand first.
+        """
+        levels = (bitlen - 1).bitlen()
+        prev_mask = dtype(-1)
+        for k in range(levels):
+            x_r, r = self._beaver_partition(x)
+            mask = MPCBitwise._get_prefix_mask(k, levels, dtype=dtype)
+            input_mask = mask ^ prev_mask
+            tzs = (prev_mask - dtype(1)).cttz()
+            set_mask = input_mask.bit_replicate(tzs)
+
+            x_r_op_1 = (x_r & input_mask).bit_replicate(tzs)
+            x_r_op_2 = x_r & set_mask
+            r_op_1 = (r & input_mask).bit_replicate(tzs)
+            r_op_2 = r & set_mask
+
+            x = (x & (dtype(-1) ^ set_mask)) | (op(x_r_op_1, r_op_1, x_r_op_2, r_op_2) & set_mask)
+            prev_mask = mask
+
+        return x
+
+    def prefix_or(self, x, bitlen: Static[int], dtype: type = mpc_uint):
+        """ Bit j of the result: OR of the bits bitlen - 1 ... j of x (XOR-shared; bits above bitlen zero). """
+        return self._prefix_op(
+            x, lambda x_r_1, r_1, x_r_2, r_2: self._lor(x_r_1, r_1, x_r_2, r_2), bitlen=bitlen, dtype=dtype)
+
+    # ------------------------------------------------------------------------------------------------------------------
+    # Ring sign test.
+    # ------------------------------------------------------------------------------------------------------------------
+
+    def is_positive_ring(self, a, modulus: TP, operational_modulus: TP, op_mod_bitlen: Static[int]):
+        """
+        Arithmetic shares mod modulus (field or ring) of [a > 0] for ring shares a mod operational_modulus =
+        2^op_mod_bitlen, valid for |a| < 2^(op_mod_bitlen - 1). Strict, as the field is_positive: 0 gives 0. A scalar,
+        a list or a matrix of mpc_uint.
+
+        [a > 0] is the sign bit of -a. The parties open -a + r for a dealer-shared r (uniform mod 2^op_mod_bitlen: the
+        opening is uniform), then add the public -a + r + 1 to the XOR shares of NOT r bit by bit: the sign bit of
+        -a = (-a + r + 1) + NOT r is the carry into bit op_mod_bitlen - 1 XORed with both top bits.
+        Rounds: 2 + log2(op_mod_bitlen).
+        """
+        if isinstance(a, mpc_uint):
+            return self._is_positive_ring([a], modulus, operational_modulus, op_mod_bitlen=op_mod_bitlen)[0]
+        elif isinstance(a, list[mpc_uint]):
+            return self._is_positive_ring(a, modulus, operational_modulus, op_mod_bitlen=op_mod_bitlen)
+        elif isinstance(a, list[list[mpc_uint]]):
+            return self._is_positive_ring(
+                a.flatten(), modulus, operational_modulus, op_mod_bitlen=op_mod_bitlen).reshape(a.shape)
+        else:
+            compile_error("is_positive_ring: expected mpc_uint, a list or a matrix of it")
+
+    def sign_ring(self, a, modulus: TP, bits: Static[int]):
+        """
+        is_positive_ring ([a > 0]) on the low `bits` bits of ring shares a mod modulus = 2^L (a local reduction): valid
+        for |a| < 2^(bits - 1) in raw units. bits = MPC_NBIT_K + 1 covers any difference of two fixed-point values.
+        """
+        assert modulus.popcnt() == 1, "sign_ring: needs ring shares (a power-of-two modulus)"
+        if bits >= MPC_INT_SIZE:
+            compile_error("sign_ring: bits must be below MPC_INT_SIZE")
+
+        op_modulus = mpc_uint(1) << mpc_uint(bits)
+        return self.is_positive_ring(_low_bits(a, op_modulus), modulus, op_modulus, op_mod_bitlen=bits)
+
+    def _is_positive_ring(self, x, modulus: TP, operational_modulus: TP, op_mod_bitlen: Static[int]):
+        if op_mod_bitlen < 2:
+            compile_error("is_positive_ring: needs at least 2 bits")
+        if op_mod_bitlen >= MPC_INT_SIZE:
+            compile_error("is_positive_ring: op_mod_bitlen must be below MPC_INT_SIZE")
+        assert operational_modulus == TP(1) << TP(op_mod_bitlen), \
+            "is_positive_ring: operational_modulus must be 2^op_mod_bitlen"
+
+        n = len(x)
+        if n == 0:
+            # Every party returns here, before any draw or message
+            return list[TP]()
+        nbits: Static[int] = op_mod_bitlen
+        msb_pos: Static[int] = (nbits - 1) % PACKING_SIZE
+        # Registers of an nbits-bit number, and of its nbits - 1 low bits: when nbits - 1 is a multiple of
+        # PACKING_SIZE the sign bit sits alone in the leading register, which the carry over the low bits skips.
+        regs: Static[int] = 1 + (nbits - 1) // PACKING_SIZE
+        carry_regs: Static[int] = 1 + (nbits - 2) // PACKING_SIZE
+        low_mask = operational_modulus - TP(1)
+
+        r, r_bits = self.share_random_bits_packed(n, operational_modulus, bitlen=nbits)
+        r_bits = r_bits.transpose()
+
+        # a = -x + r, uniform mod 2^nbits (each party negates its share)
+        a = self.comms.reveal([(operational_modulus - x[i] + r[i]) & low_mask for i in range(n)] if self.pid else x.zeros(),
+                              operational_modulus)
+
+        # Bitwise NOT r = -(r + 1) mod 2^nbits (the hub flips its shares; bits above nbits are ignored)
+        if self.pid == self.comms.hub_pid:
+            r_bits ^= size_t(-1)
+
+        # -x = (a + 1) + NOT r mod 2^nbits
+        a = [(e + TP(1)) & low_mask for e in a]
+        a_bits = num_to_bits_packed(a, bitlen=nbits).transpose()
+
+        carry_msb = self.carry_out_public(a_bits[regs - carry_regs:], r_bits[regs - carry_regs:], nbits - 1)
+
+        a_msb = a_bits[0].get_bit(msb_pos)
+        r_msb = r_bits[0].get_bit(msb_pos)
+
+        # The sign bit of -x: 1 exactly when x > 0
+        msb = carry_msb ^ r_msb
+        if self.pid == self.comms.hub_pid:
+            msb ^= a_msb  # the public top bit, counted once
+
+        return self._bit_to_arithmetic(msb, modulus)
+
+    def carry_out_public_arithmetic(self, a_pub: list[size_t], b: list[size_t], num_bits: int, modulus: TP) -> list[TP]:
+        """
+        Arithmetic shares mod modulus (field or ring) of the carry out of a_pub + b over num_bits <= PACKING_SIZE bits,
+        for public a_pub and XOR-shared b, one register per value (bits above num_bits ignored). log2(num_bits) + 1
+        rounds. Decor's wraparound carry: the fractional bits of the opening plus the dealer's mask.
+        """
+        assert num_bits <= PACKING_SIZE, "carry_out_public_arithmetic: num_bits must fit one register"
+        if len(a_pub) == 0:
+            return list[TP]()
+        low = size_t(-1) if num_bits == PACKING_SIZE else (size_t(1) << size_t(num_bits)) - size_t(1)
+        carry = self.carry_out_public([[e & low for e in a_pub]], [[e & low for e in b]], num_bits)
+        return self._bit_to_arithmetic(carry, modulus)
+
+    def _bit_to_arithmetic(self, bit, modulus: TP) -> list[TP]:
+        # XOR-shared bits (one per size_t, in bit 0) to arithmetic shares mod modulus, from a dealer bit b:
+        # open v = bit ^ b; bit = b + v - 2 v b.
+        if len(bit) == 0:
+            return list[TP]()
+
+        r_conv, r_conv_bit = self.share_random_bits_packed(len(bit), modulus, bitlen=1)
+        r_conv_bit = r_conv_bit.transpose()
+
+        masked = bit ^ r_conv_bit[0]
+        # Widened to the share type before the conversion, so any target modulus works.
+        v = [TP(int(e & size_t(1))) for e in self.reveal(masked)]
+
+        if self.pid == 0:
+            return r_conv
+
+        res = r_conv.sub_mod(r_conv.mul_mod([e * TP(2) for e in v], modulus), modulus)
+        if self.pid == self.comms.hub_pid:
+            res = res.add_mod(v, modulus)
+
+        return res
+
+    # ------------------------------------------------------------------------------------------------------------------
+    # Ring normalizer.
+    # ------------------------------------------------------------------------------------------------------------------
+
+    def normalizer(self, x, modulus: TP):
+        """
+        For ring shares x mod modulus = 2^L of a value 0 < X < 2^(K - 1) (raw units, K = MPC_NBIT_K): arithmetic
+        shares of s = 4^i and s_sqrt = 2^i with X * s in [2^(K - 2), 2^K): the convention of the field normalizer
+        (MPCFP.__normalizer_even_exp). X = 0 gives s = s_sqrt = 0. Returns (s, s_sqrt).
+
+        Callers pass |X| (the sign through the ring sign test). The bits of X come from one opening and a K-bit
+        addition, the leading one from a prefix OR, and the exponent pair (2t, 2t + 1) maps to i = K/2 - 1 - t; the
+        one-hot result converts to arithmetic shares exactly, from dealer bits: no squaring round, no sign ambiguity.
+        A scalar works too. Rounds: 2 + 3 log2(K).
+        """
+        if isinstance(x, list[list[mpc_uint]]):
+            s, s_sqrt = self._normalizer(x.flatten(), modulus)
+            return s.reshape(x.shape), s_sqrt.reshape(x.shape)
+        elif isinstance(x, list[mpc_uint]):
+            return self._normalizer(x, modulus)
+        elif isinstance(x, mpc_uint):
+            s, s_sqrt = self._normalizer([x], modulus)
+            return s[0], s_sqrt[0]
+        else:
+            compile_error("normalizer: expected a scalar, a list or a matrix of mpc_uint")
+
+    def _normalizer(self, x: list[TP], modulus: TP) -> Tuple[list[TP], list[TP]]:
+        if PACKING_SIZE != MPC_NBIT_K:
+            compile_error("normalizer: needs PACKING_SIZE == MPC_NBIT_K")
+        assert modulus.popcnt() == 1, "normalizer: needs ring shares (a power-of-two modulus)"
+
+        n = len(x)
+        if n == 0:
+            # Every party returns here, before any draw or message
+            return list[TP](), list[TP]()
+        K: Static[int] = MPC_NBIT_K
+        half: Static[int] = MPC_NBIT_K // 2
+
+        # 1. Bits of X: open c = X - r mod 2^K (the low K bits of a ring share are a share mod 2^K), add r back bitwise.
+        r, r_xor = self.share_random_ring_word(n)
+        c = self.reveal_ring(_wrapping_sub([e.trunc_to(K) for e in x], r) if self.pid else r.zeros())
+        x_bits = self.add_public(r_xor, c, bitlen=K, dtype=size_t)
+
+        # 2. Leading one: prefix OR from the top, then p ^ (p >> 1).
+        p = self.prefix_or(x_bits, bitlen=K, dtype=size_t)
+        m = p ^ (p >> 1)
+
+        # 3. Fold each exponent pair (2t, 2t + 1) into bit t (at most one bit is set: XOR = OR; local).
+        q = _compress_even_bits(m) ^ _compress_even_bits(m >> 1)
+
+        # 4. Exact bit-to-arithmetic conversion of q's half-K bits: open v = q ^ rho; q_t = v_t + (1 - 2 v_t) rho_t.
+        rho, rho_bits = self.share_random_bit_vectors(n, half, modulus)
+        v = self.reveal(q ^ rho)
+
+        s = zeros_vec(n, TP=TP)
+        s_sqrt = zeros_vec(n, TP=TP)
+        if self.pid == 0:
+            return s, s_sqrt
+
+        for i in range(n):
+            si = TP(0)
+            si_sqrt = TP(0)
+            vi = v[i]
+            for t in range(half):
+                v_t = int((vi >> size_t(t)) & size_t(1))
+                q_t = rho_bits[i][t] if v_t == 0 else rho_bits[i][t].neg_mod(modulus)
+                if v_t and self.pid == self.comms.hub_pid:
+                    q_t = q_t.add_mod(TP(1), modulus)
+                si_sqrt = si_sqrt.add_mod(q_t.lsh_mod(half - 1 - t, modulus), modulus)
+                si = si.add_mod(q_t.lsh_mod(2 * (half - 1 - t), modulus), modulus)
+            s[i] = si
+            s_sqrt[i] = si_sqrt
+
+        return s, s_sqrt
+
+
+class SharedCarry[T]:
+    """
+    A (propagate, generate) pair under XOR sharing. Carries compose associatively,
+    (p, g) o (p', g') = (p & p', g | p & g'), which lets _prefix_op resolve every carry of an addition in
+    logarithmically many rounds.
+    """
+    mpc_bitwise: MPCBitwise[mpc_uint]
+    p: T
+    g: T
+
+    def __init__(self, mpc_bitwise: MPCBitwise[mpc_uint], p: T, g: T):
+        self.mpc_bitwise = mpc_bitwise
+        self.p = p
+        self.g = g
+
+    def __and__(self, other: UInt) -> SharedCarry[T]:
+        return SharedCarry(self.mpc_bitwise, self.p & other, self.g & other)
+
+    def __or__(self, value: SharedCarry[T]) -> SharedCarry[T]:
+        return SharedCarry(self.mpc_bitwise, self.p | value.p, self.g | value.g)
+
+    def bit_replicate(self, k) -> SharedCarry[T]:
+        return SharedCarry(self.mpc_bitwise, self.p.bit_replicate(k), self.g.bit_replicate(k))
+
+
+@extend
+class MPCBitwise:
+    def _beaver_partition(self, value):
+        if isinstance(value, SharedCarry):
+            p_, g_ = self._beaver_partition_bulk(value.p, value.g)
+            p_x_r, p_r = p_
+            g_x_r, g_r = g_
+            return SharedCarry(self, p_x_r, g_x_r), SharedCarry(self, p_r, g_r)
+
+        return superf(self, value)
+
+    def _carry(self, self_x_r, self_r, other_x_r, other_r) -> SharedCarry:
+        """ (p, g) o (p', g') = (p & p', g | p & g'): self is the more significant group. """
+        self_p_r, self_g_r = self_x_r.p, self_x_r.g
+        self_r_p, self_r_g = self_r.p, self_r.g
+        other_p_r, other_g_r = other_x_r.p, other_x_r.g
+        other_r_p, other_r_g = other_r.p, other_r.g
+
+        pg = self._land(self_p_r, self_r_p, other_g_r, other_r_g)
+        pg_x_r, pg_r = self._beaver_partition(pg)
+
+        p = self._land(self_p_r, self_r_p, other_p_r, other_r_p)
+        g = self._lor(self_g_r, self_r_g, pg_x_r, pg_r)
+
+        return SharedCarry(self, p, g)
+
+    def add_public(self, x_share, y_pub, bitlen: Static[int] = MPC_INT_SIZE, dtype: type = mpc_uint):
+        """
+        x + y_pub mod 2^bitlen for XOR-shared x and public y_pub (registers of dtype, bitlen = its width): XOR shares of
+        the sum. The bits are reversed so that the prefix runs from the least significant bit up. 2 ceil(log2(bitlen))
+        rounds.
+        """
+        p = x_share.copy()
+        if self.pid == self.comms.hub_pid:
+            p ^= y_pub
+
+        g = x_share & y_pub
+
+        carry = self._prefix_op(
+            SharedCarry(self, p.bit_reverse(), g.bit_reverse()),
+            lambda a_x_r, a_r, b_x_r, b_r: self._carry(b_x_r, b_r, a_x_r, a_r),
+            bitlen=bitlen, dtype=dtype)
+        c = carry.g.bit_reverse()
+
+        s = x_share ^ (c << 1)
+        if self.pid == self.comms.hub_pid:
+            s ^= y_pub
+
+        return s
+
+
+def _wrapping_add(a, b):
+    if isinstance(a, list):
+        return [_wrapping_add(a[i], b[i]) for i in range(len(a))]
+    return a.wrapping_add(b)
+
+
+def _wrapping_sub(a, b):
+    if isinstance(a, list):
+        return [_wrapping_sub(a[i], b[i]) for i in range(len(a))]
+    return a.wrapping_sub(b)
+
+
+def _low_bits(a, op_modulus: mpc_uint):
+    # a mod op_modulus for a power-of-two op_modulus (exact for ring shares)
+    mask = op_modulus - mpc_uint(1)
+    if isinstance(a, list):
+        return [_low_bits(e, op_modulus) for e in a]
+    return a & mask
+
+
+def _compress_mask(j: int) -> size_t:
+    # Blocks of 2^j ones every 2^(j + 1) bits: 0x5555.. (j = 0), 0x3333.. (j = 1), 0x0f0f.. (j = 2), ...
+    block = (size_t(1) << size_t(1 << j)) - size_t(1)
+    mask = size_t(0)
+    for pos in range(0, PACKING_SIZE, 1 << (j + 1)):
+        mask |= block << size_t(pos)
+    return mask
+
+
+def _compress_masks() -> list[size_t]:
+    # The masks of the even-bit compression: one per halving step, for j = 0 .. log2(PACKING_SIZE) - 1.
+    steps = 0
+    while (1 << steps) < PACKING_SIZE:
+        steps += 1
+    return [_compress_mask(j) for j in range(steps)]
+
+
+_COMPRESS_MASKS = _compress_masks()
+
+
+def _compress_even_bits(x: list[size_t]) -> list[size_t]:
+    # Bits at the even positions 0, 2, 4, ... of each register moved to positions 0, 1, 2, ... (the high half ends up
+    # zero). Each step is XOR, shift and AND with a public mask: linear in GF(2), so it applies share by share. On the
+    # value itself the XOR combines disjoint bits, i.e. acts as the OR of the usual compression.
+    res = list[size_t](len(x))
+    for e in x:
+        v = e & _COMPRESS_MASKS[0]
+        for j in range(1, len(_COMPRESS_MASKS)):
+            v = (v ^ (v >> size_t(1 << (j - 1)))) & _COMPRESS_MASKS[j]
+        res.append(v)
+    return res

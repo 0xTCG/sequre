@@ -52,41 +52,70 @@ model = LinReg(initial_weights, optimizer="bgd")      # with initial weights
 
 _Defined in `stdlib/sequre/stdlib/learn/log_reg.codon`_
 
-Secure logistic regression supporting binary (sigmoid) and multinomial (softmax) classification via Chebyshev-approximated activation functions.
+Secure logistic regression with a bias, trained by batch (`"bgd"`) or mini-batch (`"mbgd"`) gradient descent on the
+cross-entropy. The activation is evaluated by Chebyshev interpolation or by Decor, through
+[`sequre.stdlib.nonlinear`](../user-guide/nonlinear-functions.md). The default follows the variant: for `"binary"` the
+shares' modulus, at each `fit`, `predict` and `loss` (`method_for(X)`): Decor on ring Sharetensors (11% faster than
+Chebyshev there, and exact) where Decor admits the interval (its default interval always), Chebyshev on field
+Sharetensors (about 3.4 times faster there, since Decor's sigmoid divides with the field's division), in the clear, on
+the multiparty types (on their own arithmetic) and for an interval only Chebyshev admits, such as (−50, 10); a
+`degree` makes it Chebyshev. `interval_for(X)` gives the interval a call uses; `interval` stays `(0, 0)` for this
+default without an explicit interval. Train on secret Sharetensors (or entirely in the clear): a public Sharetensor
+operand of the secure matrix product is not supported. Chebyshev for `"heuristic-multinomial"`, and Decor for `"multinomial"` (the softmax trains faster
+with Decor on both moduli: 4% on the field, 2.1 times on the ring).
 
 ### Construction
 
 ```python
 from sequre.stdlib.learn.log_reg import LogReg
 
-model = LogReg(initial_weights, optimizer="bgd", interval=(-50.0, 10.0), variant="binary")
-model = LogReg(initial_weights, variant="multinomial", interval=(-20.0, 0.0))
+model = LogReg(initial_weights)                                        # binary: Decor on the ring, Chebyshev on the field
+model = LogReg(initial_weights, method="decor")                        # binary, Decor's sigmoid on (-10, 10)
+model = LogReg(initial_weights, variant="multinomial")                 # softmax over the classes, Decor's exp
+model = LogReg(initial_weights, variant="multinomial", fixed_shift_softmax=4.0)
 ```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `initial_weights` | `T` | — | (features + 1) × classes; the bias row last |
+| `optimizer` | `str` | `"bgd"` | `"bgd"` or `"mbgd"` |
+| `interval` | `tuple[float, float]` | `(0, 0)` | the activation's interval; `(0, 0)` picks the default below |
+| `variant` | `str` | `"binary"` | `"binary"`, `"multinomial"` or `"heuristic-multinomial"` |
+| `method` | `str` | `""` | `"chebyshev"` or `"decor"`; `""`: the variant's default (Decor for `"multinomial"`, Chebyshev for `"heuristic-multinomial"`, the shares' modulus for `"binary"`) |
+| `degree` | `int` | `0` | Chebyshev degree (`0`: the default, 20) |
+| `fixed_shift_softmax` | `float` | `-1.0` | `>= 0`: shift the softmax by this public offset instead of each row's maximum (no comparisons) |
+
+### Variants
+
+| Variant | Activation | Default interval: Chebyshev / Decor |
+|---|---|---|
+| `"binary"` | $\sigma(z)$, input clipped to the interval | (−50, 10) / (−10, 10) at F = 32 (for `method=""`, the one of the method each call uses) |
+| `"multinomial"` | the softmax of each row of $\tilde{X}w$ | (−20, 0] / (−16, 0] |
+| `"heuristic-multinomial"` | the shifted exp, not normalized (the earlier behavior, kept for comparison) | (−20, 0] / (−16, 0] |
+
+The multinomial variants evaluate the exponent on $(-W, 0]$: the row maximum is subtracted first (`shift="max"`), or
+the public `fixed_shift_softmax` when it is set (the rows' maxima must then stay near it; see `softmax` in
+[Nonlinear Functions](../user-guide/nonlinear-functions.md)).
 
 ### Methods
 
 | Method | Signature | Description |
 |---|---|---|
 | `fit` | `fit(mpc, X, y, step, epochs, verbose=False)` | Train the model. Returns `self`. |
-| `predict` | `predict(mpc, X)` | Predict class probabilities |
-| `loss` | `loss(mpc, X, y)` | Compute cross-entropy loss |
-| `randomize_weights` | `randomize_weights(mpc, distribution="uniform")` | Reinitialize weights randomly |
+| `predict` | `predict(mpc, X)` | Class probabilities: the activation of $\tilde{X}w$ |
+| `loss` | `loss(mpc, X, y)` | The cross-entropy, with the bias column as in training; its log is accurate on (1e-4, 1] (`clipped_log`) |
+| `method_for` | `method_for(X)` | The method a call on `X` uses (`"decor"` or `"chebyshev"`): the stored one; for the binary default, Decor on ring Sharetensors where Decor admits the interval, Chebyshev otherwise |
+| `interval_for` | `interval_for(X)` | The activation's interval a call on `X` uses: the given one, or that method's default |
+| `randomize_weights` | `randomize_weights(mpc, distribution="uniform")` | Reinitialize the weights randomly |
 
 ### Attributes
 
 | Attribute | Type | Description |
 |---|---|---|
-| `coef_` | `T` | Learned weight matrix |
-| `optimizer` | `str` | `"bgd"` or `"mbgd"` |
-| `variant` | `str` | `"binary"` (sigmoid activation) or `"multinomial"` (softmax activation) |
-| `interval` | `tuple[float, float]` | Chebyshev approximation interval for the activation function |
-
-### Activation functions
-
-| Variant | Activation | Chebyshev approximation |
-|---|---|---|
-| `"binary"` | $\sigma(z) = \frac{1}{1+e^{-z}}$ | `chebyshev_sigmoid` with clipping |
-| `"multinomial"` | $\text{softmax}(z) = \frac{e^{z_i - \max(z)}}{\sum e^{z_j - \max(z)}}$ | `chebyshev_exp` with shift and clipping |
+| `coef_` | `T` | The learned weights, (features + 1) × classes (the bias row last) |
+| `optimizer`, `variant`, `method`, `degree` | | As constructed |
+| `interval` | `tuple[float, float]` | The activation's interval: the given one, or the variant's and method's default when `(0, 0)` is passed; the binary default (`method=""`) keeps `(0, 0)` and picks per call (`interval_for`) |
+| `fixed_shift_softmax` | `float` | The softmax's public shift (`-1`: the row maximum) |
 
 ---
 
@@ -238,55 +267,108 @@ model = Sequential(layers).compile(mpc, loss="hinge", optimizer="bgd")
 | `"bgd"` | Batch gradient descent: full-dataset gradient each epoch |
 | `"mbgd"` | Mini-batch gradient descent: splits data into batches of `batch_size` |
 
+### `compile`
+
+```python
+model = Sequential(layers).compile(mpc, loss="binary_crossentropy", optimizer="bgd", loss_interval=(1e-4, 1.0))
+```
+
+`loss_interval` is the interval of the cross-entropies' log: predictions are clipped into it, and its lower end must be
+at least `1e-4`. A sigmoid output with `"binary_crossentropy"`, or a softmax output with `"categorical_crossentropy"`,
+backpropagates the fused gradient $\hat{y} - y$ (exact, no division; with the softmax it needs label rows that sum to
+1, one-hot or soft). Softmax has no element-wise derivative, so it is
+accepted only as the output layer with the categorical cross-entropy. Nothing is revealed except, with `verbose`, the
+training loss summed over the records (and over the output columns on Sharetensors; on the multiparty types one sum per
+output column).
+
 ### Layers
 
 _Defined in `stdlib/sequre/stdlib/learn/neural_net/layers.codon`_
 
 #### `Input[ctype]`
 
-The input layer. Holds no trainable parameters — simply passes through data.
+The input layer. Holds no trainable parameters; it passes the data through.
 
 ```python
 Input[type(X)](size)
 ```
 
-| Parameter | Type | Description |
-|---|---|---|
-| `size` | `int` | Number of input features |
-
 #### `Dense[ctype]`
 
-A fully-connected layer with configurable activation and weight initialization.
+A fully connected layer computing $f(s \cdot (xW + b))$.
 
 ```python
-Dense[type(X)](activation, size, kernel_initializer="uniform", bias_initializer="uniform")
+Dense[type(X)](activation, size, kernel_initializer="uniform", bias_initializer="uniform",
+               kernel_interval=(0.0, 1.0), kernel_scale=1.0, pre_act_scale=1.0, method="chebyshev",
+               activation_interval=(0.0, 0.0), activation_degree=0, activation_clip=True,
+               activation_reduction=False)
 ```
 
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `activation` | `str` | — | Activation function: `"relu"` or `"linear"` |
-| `size` | `int` | — | Number of neurons |
-| `kernel_initializer` | `str` | `"uniform"` | Weight initializer: `"uniform"`, `"normal"`, `"zeros"`, or `"ones"` |
-| `bias_initializer` | `str` | `"uniform"` | Bias initializer (same options) |
+| Parameter | Default | Description |
+|---|---|---|
+| `activation` | — | one of the activations below |
+| `size` | — | number of neurons |
+| `kernel_initializer`, `bias_initializer` | `"uniform"` | `"uniform"`, `"normal"`, `"zeros"` or `"ones"` |
+| `kernel_interval`, `kernel_scale` | `(0, 1)`, `1` | map the initializer's draw onto `kernel_interval`, then scale it (for example, SIREN's $U(-\sqrt{6/n}/\omega, \sqrt{6/n}/\omega)$); computed locally, no communication |
+| `pre_act_scale` | `1` | the factor $s$ (SIREN's $\omega$); the backward pass carries it too |
+| `method` | `"chebyshev"` | `"chebyshev"` (Sequre's method before Decor, as for binary `LogReg`) or `"decor"` (exact up to the fixed-point encodings; on the field its dividing activations cost a few times more, on the ring about the same) |
+| `activation_interval` | `(0, 0)` | the activation's interval (`(0, 0)`: the method's default) |
+| `activation_degree` | `0` | Chebyshev degree (`0`: the default) |
+| `activation_clip` | `True` | clip pre-activations to the interval first (not for Decor's periodic sin, cos, tan, cot) |
+| `activation_reduction` | `False` | Chebyshev sin and cos only: reduce the argument modulo $2\pi$ first, so the interpolant runs on $(-\pi, (2n_{cp} + 1)\pi)$ (replaces `activation_interval`; nothing is clipped). `Sharetensor` layers on ring shares and `ndarray` layers; other layer types raise `ValueError` at construction, field shares when the weights are drawn (at `compile`, before any round) |
 
-Weight updates use **Nesterov accelerated gradient** with the `momentum` parameter passed to `fit`.
+A training forward pass keeps the activation's derivative for the backward pass; on Sharetensor and ndarray layers it
+is the clipped function's beyond a clipped interval: 0 for the saturating activations, $0.5 (1 + t)$ for gelu and $s$ for
+silu (their inner tanh or sigmoid is clipped). Other layer types keep $f'$ at the clipped point, and gelu's and silu's
+inner term there (gelu's grows like $|x|^3$ beyond the inner interval).
+On Sharetensor layers Decor's sin and cos with a `pre_act_scale` fold the scale into Decor's own scaling, and sin keeps
+cos from the same opening. With the default method a sin, cos, tan or cot layer saturates beyond
+(−π, π), (−π, π), (−1.2, 1.2) or (0.4, 2.7): size `activation_interval` to the pre-activations, or use
+`method="decor"` (any argument). On the field a Decor sigmoid, tanh, tan, cot, silu or gelu layer costs a few times a
+Chebyshev one (the field's division); on the ring about as much as the default Chebyshev (degree 20, which errs by
+about $2 \times 10^{-3}$ for sigmoid and $4 \times 10^{-3}$ for tanh, against about $4 \times 10^{-6}$ for Decor), and
+less than a Chebyshev interpolant as accurate as Decor.
+
+Weight updates use **Nesterov accelerated gradient** with the `momentum` passed to `fit`.
 
 ### Activations
 
 _Defined in `stdlib/sequre/stdlib/learn/neural_net/activations.codon`_
 
-| Activation | Function | Derivative |
+Each activation `f` comes as `f(mpc, x, method="chebyshev", interval, degree, clip)`, its derivative `df(...)`, and
+`f_with_derivative(...)`, which returns both from one evaluation where it can. `activate`, `dactivate` and
+`activate_with_derivative` dispatch on a runtime name. The neural-net stack defaults to Chebyshev (the nonlinear module
+to Decor, and for sigmoid and tanh to `"auto"`).
+
+| Activation | Function | Evaluated by |
 |---|---|---|
-| `"relu"` | $\text{ReLU}(x) = x \cdot \mathbf{1}[x > 0]$ | $\mathbf{1}[x > 0]$ |
-| `"linear"` | $f(x) = x$ | $1$ |
+| `"linear"` | $x$ | — |
+| `"relu"`, `"leaky_relu"` | $\max(0, x)$; $x$ for $x > 0$, $0.01x$ otherwise | comparisons |
+| `"hardtanh"`, `"relu6"` | $\min(\max(x, -1), 1)$; $\min(\max(x, 0), 6)$ | comparisons (one call for both masks) |
+| `"asigmoid"` | $x / \sqrt{x^2 + 1}$ | square root and division |
+| `"sigmoid"`, `"tanh"`, `"exp"` | | `method` (Decor or Chebyshev) |
+| `"sin"`, `"cos"`, `"tan"`, `"cot"` | radians | `method`; Decor takes any $x$ |
+| `"sinh"`, `"cosh"` | | `method` |
+| `"gelu"` | $\frac{x}{2}\left(1 + \tanh\left(\sqrt{2/\pi}\,(x + 0.044715x^3)\right)\right)$ | composed, by `method` |
+| `"silu"` | $x\,\sigma(x)$ | composed, by `method` |
+| `"softmax"` | each row | Decor's division; its exp by `method`; output layer only, with the categorical cross-entropy |
+| `"erf"` | | Chebyshev under either method; its derivative's exp by `method` |
 
 ### Losses
 
 _Defined in `stdlib/sequre/stdlib/learn/neural_net/loss.codon`_
 
+Each loss is averaged over the records.
+
 | Loss | Function | Derivative |
 |---|---|---|
-| `"hinge"` | $\frac{1}{n}\sum \max(0,\; 1 - y \hat{y})$ | $\frac{1}{n}(-y \cdot \mathbf{1}[1 - y\hat{y} > 0])$ |
+| `"hinge"` | $\max(0, 1 - y\hat{y})$ | $-y \cdot \mathbf{1}[1 - y\hat{y} > 0]$ |
+| `"mse"` | $(y - \hat{y})^2 / 2$ | $\hat{y} - y$ |
+| `"binary_crossentropy"` | $-(y \log \hat{y} + (1 - y)\log(1 - \hat{y}))$ | $(\hat{y} - y) / (\hat{y}(1 - \hat{y}))$; $\hat{y} - y$ fused with a sigmoid output |
+| `"categorical_crossentropy"` | $-\sum y \log \hat{y}$ | $-y / \hat{y}$; $\hat{y} - y$ fused with a softmax output |
+
+The cross-entropies clip $\hat{y}$ into `loss_interval` and take an accurate log there (`clipped_log`: the Chebyshev
+interpolant refined by Newton's iteration through Decor's exp).
 
 ### Examples
 
@@ -322,3 +404,50 @@ layers = (
 model = Sequential(layers).compile(mpc, loss="hinge", optimizer="bgd")
 model.fit(mpc, X=X, y=y, step=0.2, epochs=50, momentum=0.9, batch_size=16)
 ```
+
+#### SIREN — [applications/siren.codon](https://github.com/0xTCG/sequre/blob/main/applications/siren.codon)
+
+An implicit neural representation with periodic activations: two sine layers and a linear output fit an image as a
+function of its pixel coordinates. `siren_model` builds and compiles it for ndarray and Sharetensor (the tested
+types; training on MPU layers is an open defect of `Sequential`), with SIREN's
+initialization and $\omega$ as `pre_act_scale`.
+
+```python
+from applications.siren import synthetic_image, siren_model
+
+X, y = synthetic_image(8)                     # coordinates in [-1, 1]^2, pixels in [-1, 1]
+mX, my = Sharetensor.enc(mpc, X), Sharetensor.enc(mpc, y)
+with mpc.randomness.seed_switch(-1):           # every party draws the same initial weights
+    model = siren_model(mpc, type(mX), 2, 16, 30.0)             # Decor's sin
+model.fit(mpc, X=mX, y=my, step=0.01, epochs=4, momentum=0.9)
+```
+
+The backward pass carries $\omega$ (the chain rule), so a step that trains the plaintext model trains the secure one:
+step 0.01 with momentum 0.9 gets an 8 × 8 image below $10^{-4}$ in 100 epochs for every initialization tried, while
+0.03 stalls for some. With `method="chebyshev"`, the interpolant needs enough degree for the interval's periods: on the
+default interval (about (−90, 90) at $\omega = 30$) degree 20 is off by about 2. `degree=0` picks the smallest multiple
+of 10 within `SIREN_SIN_TOLERANCE` ($10^{-6}$): 120 on (−90, 90). With `reduce_interval=True` (ring shares; the field
+raises `ValueError` when the model is built) the argument is reduced modulo $2\pi$ first, and degree 30 suffices for up
+to four compute parties.
+
+#### GWAS by logistic association — [applications/gwas_logreg.codon](https://github.com/0xTCG/sequre/blob/main/applications/gwas_logreg.codon)
+
+One binary logistic regression per SNP, on the SNP, the covariates and a bias. `gwas_logreg` returns each SNP's
+coefficient (its log odds ratio) and the fraction of individuals its model classifies right; only those aggregates are
+revealed.
+
+```python
+from applications.gwas_logreg import load_gwas_data, gwas_logreg
+
+geno, pheno, cov = load_gwas_data("geno.txt", "pheno.txt", "cov.txt", standardize_covariates=True)
+w0 = array([[0.0] for _ in range(cov.shape[1] + 2)])  # the SNP's, the covariates' and the bias' coefficients
+betas, accuracies = gwas_logreg(mpc, Sharetensor.enc(mpc, geno), Sharetensor.enc(mpc, pheno),
+                                Sharetensor.enc(mpc, cov), Sharetensor.enc(mpc, w0))  # Decor on the ring, Chebyshev on the field
+```
+
+Genotypes are allele counts (0, 1 or 2; a missing call raises `ValueError`). `step` (default 1.0) is per individual,
+so one default suits any cohort size; it assumes features of unit scale, hence `standardize_covariates`. The defaults
+train 50 epochs per SNP on the interval (−10, 10), where Decor's sigmoid is exact and Chebyshev's degree-20 interpolant
+is within $1.8 \times 10^{-3}$. The method defaults to LogReg's binary default: Decor on ring shares (11% faster there
+in the benchmarks), Chebyshev on field shares (about 3.5 times faster there); pass `method="decor"` or `"chebyshev"`
+to fix it.

@@ -1,0 +1,867 @@
+""" Decor: delegated computation on randomness for nonlinear functions in MPC.
+
+Beaver triples let parties multiply because a dealer precomputes randomness that fits the identity
+xy = (x - a)(y - b) + (x - a) b + (y - b) a + ab. Decor generalizes this. Whenever f admits a decomposition
+f(u + v) = G(g(u), h(v)) with G cheap in MPC, the dealer shares [h(r)] for a fresh random mask r, the parties open
+x - r, evaluate g(x - r) in the clear and combine. The nonlinear work happens on plaintext, so the result carries the
+errors of the fixed-point encodings rather than those of a polynomial approximation.
+
+Reference: Smajlovic et al., "Decor: Delegated Computation on Randomness for Secure Evaluation of Nonlinear
+Functions", IEEE S&P 2026.
+
+Protocol, per call (fresh mask every time):
+- Scaling: t = (x - a) / period in fixed point, with 1 / period (a double) encoded at F + e bits
+  (e = floor(log2(period)) in [1 - F, F]) and one truncation by F + e bits, so t carries one unit of 2^-F from the
+  truncation, and the double's 2^-53 relative error where the true period matters (sin, cos: 1 / (2 pi)).
+- Periodic functions of period 2 pi (sin, cos, and tan, cot through division): t = x / (2 pi), open t - r; with
+  u = 2 pi frac(t - r) and v = 2 pi frac(r), u + v = x modulo 2 pi.
+- Bounded functions on an interval [a, b]: the decomposition runs on [a', b'] = [a - d, b + d], d = 2^-(F/2) (b - a),
+  of period p = b' - a', taken as the period the encoded 1 / p stands for (so the scaling adds nothing beyond its
+  truncation): t = (x - a') / p, open t - r; the parties take u = frac(t - r) p + shift + a', the dealer
+  v = frac(r) p - shift; u + v = x + c p with the carry c = [frac(r) > frac(t)] (the carry out of the opening's
+  fractional bits plus the mask's, which the dealer XOR-shares: log2(F) + 1 rounds), so the parties also evaluate g at
+  u - p and select with c. Only the selected value is truncated: the other branch (f at x + p or x - p) is never
+  truncated or opened. The result is f(a' + frac(t) p): f(x) for x in [a', b'), and f(x - k p) for an input k periods
+  outside, on every draw (clip=True clips inputs that may leave the interval).
+- Ring: the fractional bits of the opening and of the mask add up exactly. Field (modulus 2^L - c): the opening, t - r
+  for the signed t, is negative except with probability below |t| 2^(F - L), so its reduction adds the modulus, which
+  shifts its fractional bits by the modulus mod 2^F; the parties undo the shift, so the decomposition is exact on the
+  field too. Comparisons and divisions run the field protocols there.
+"""
+
+import math
+
+from sequre.attributes import sequre
+from sequre.constants import (
+    DEBUG, FBITS_MASK, MPC_NBIT_K, MPC_NBIT_F, DECOR_SIGMOID_COMBINER, DECOR_TOLERANCE, PACKING_SIZE, mpc_uint, size_t,
+    DECOR_INTERVAL_EXP, DECOR_INTERVAL_SIGMOID, DECOR_INTERVAL_TANH, DECOR_INTERVAL_SINH)
+from sequre.types.sharetensor import Sharetensor
+from sequre.types.utils import double_to_fp, fp_to_double
+
+from functions import recursive_reduce, poly_eval, poly_shifted_coeffs, sigmoid, tanh
+from primitives import ring_gt, decor_div, decor_mul_inv, _hub_held
+
+
+TWO_PI = 2.0 * math.pi
+# Largest magnitude a fixed-point value holds: double_to_fp clamps beyond 2^(K - F - 1)
+FP_MAX = 2.0 ** float(MPC_NBIT_K - MPC_NBIT_F - 1)
+# One unit of the fixed-point encoding (double_to_fp truncates toward zero: up to one unit per encoded value), and the
+# relative error of a plaintext evaluation in double precision
+ULP = 2.0 ** -float(MPC_NBIT_F)
+DOUBLE_EPS = 2.0 ** -52.0
+# Smallest divisor the division admits (decor_mul_inv)
+MIN_DIVISOR = 2.0 ** -float(MPC_NBIT_F - 12)
+# Grid points of the admissibility check per evaluation domain, and per axis of its grid of (x, v) pairs
+_GRID = 257
+_PAIR_GRID = 65
+# The decomposition runs on [a - d, b + d] with d = DOMAIN_MARGIN * (b - a): the carry reads the fractional bits of
+# t = (x - a + d) / (b - a + 2d) only, so every x in [a, b] must map strictly inside [0, 1), also when its encoding
+# falls a unit below a or the scaling's truncation rounds up at b. d is far above those errors (2^-16 of the width at
+# F = 32) and moves the evaluation domains by as much, nothing else.
+DOMAIN_MARGIN = 2.0 ** -float(MPC_NBIT_F // 2)
+
+
+def _decomposition_domain(interval) -> Tuple[float, float]:
+    # (a - d, b - a + 2d): the start and the period of the decomposition for the user's interval [a, b]
+    a, b = interval
+    d = (b - a) * DOMAIN_MARGIN
+    return a - d, (b - a) + 2.0 * d
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Small list helpers (element-wise over scalars, lists and lists of lists)
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _cat(a, b):
+    # Concatenation (rows for matrices); Sequre's list + adds element-wise
+    c = a.copy()
+    c.extend(b)
+    return c
+
+
+def _affine(value, scale: float, offset: float):
+    return recursive_reduce(lambda e: e * scale + offset, value)
+
+
+def _per_term(u, terms, n_terms: int):
+    # terms(e) -> List[float] of length n_terms for one element; returns n_terms nested lists shaped like u
+    if isinstance(u, list[list]):
+        rows = [_per_term(row, terms, n_terms) for row in u]
+        return [[rows[i][t] for i in range(len(rows))] for t in range(n_terms)]
+    res = [List[float](len(u)) for _ in range(n_terms)]
+    for e in u:
+        vals = terms(e)
+        for t in range(n_terms):
+            res[t].append(vals[t])
+    return res
+
+
+def _opening_fraction(x_r, modulus: mpc_uint):
+    # frac(t - r) in [0, 1) from the opening. On the field its reduction added the modulus (t - r < 0 except with
+    # negligible probability), which moved its fractional bits by modulus mod 2^F: undo it. Nothing to undo on the ring.
+    adj = (mpc_uint(1) << mpc_uint(MPC_NBIT_F)) - (modulus & FBITS_MASK)
+    return recursive_reduce(lambda e: fp_to_double((e + adj) & FBITS_MASK, modulus), x_r)
+
+
+def _mask_fraction(r, modulus: mpc_uint):
+    # frac(r) in [0, 1) at the dealer (it knows r)
+    return recursive_reduce(lambda e: fp_to_double(e & FBITS_MASK, modulus), r)
+
+
+def _turns(mpc, x, a: float, period: float):
+    """
+    t = (x - a) / period for a fixed-point Sharetensor x: 1 / period encoded at F + e bits, e = floor(log2(period)) in
+    [1 - F, F] (negative for periods below 1), and one truncation by F + e bits (one round). The product stays below
+    2^(K + F), the default truncation bound, for every |x - a| < 2^(K - F), since 2^e <= period (any period of at least
+    2^(1 - F)). Returns t and the (a, period) it stands for: t = (x - a_eff) / period_eff up to the truncation's unit
+    of 2^-F, where a_eff is a's encoding and 1 / period_eff the encoded constant.
+    """
+    modulus = x.modulus
+    e = max(1 - MPC_NBIT_F, min(MPC_NBIT_F, int(math.floor(math.log2(period)))))
+    m = MPC_NBIT_F + e
+    a_fp = double_to_fp(a, modulus)
+    scale = double_to_fp(1.0 / period, modulus, f=m)
+    shifted = x.share.sub_mod(a_fp, modulus) if mpc.pid == 1 else x.share
+    t = _fp_tensor(mpc.fp.trunc(shifted.mul_mod(scale, modulus), modulus, MPC_NBIT_K + MPC_NBIT_F, m), modulus)
+    return t, fp_to_double(a_fp, modulus), 1.0 / fp_to_double(scale, modulus, f=m)
+
+
+def _share_terms(mpc, terms, modulus: mpc_uint):
+    # Dealer terms (equal shapes; zeros at the compute parties) shared in one message, split back per term
+    n = len(terms[0])
+    flat = terms[0].copy()
+    for k in range(1, len(terms)):
+        flat.extend(terms[k])
+    shared = mpc.comms.share_from_trusted_dealer(flat, modulus)
+    return [shared[k * n:(k + 1) * n] for k in range(len(terms))]
+
+
+def _as_fp(mpc, x):
+    # Decor's input in fixed point; a public tensor (each party holds the whole value) as a sharing held by the hub
+    y = _hub_held(mpc, x)
+    return y if y.is_fp() else y.to_fp()
+
+
+def _is_empty(x) -> bool:
+    # No elements (a public shape: every party takes the same branch)
+    if isinstance(x.share, list[list]):
+        return len(x.share) == 0 or len(x.share[0]) == 0
+    return len(x.share) == 0
+
+
+def _empty_like(x):
+    return _fp_tensor(x.share.copy(), x.modulus)
+
+
+def _max_abs(values) -> float:
+    m = 0.0
+    for v in values:
+        if v != v or abs(v) > m:
+            m = float("inf") if v != v else abs(v)
+    return m
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Periodic functions (period 2 pi): no wraparound select
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _sincos_shares(mpc, x, scale: float = 1.0):
+    # Shares of sin(scale x) and cos(scale x) from one opening: one truncation for both (a positive scale joins the
+    # public factor 1 / (2 pi) of the turns: period 2 pi / scale). Rounds: 3 (scaling, opening, truncation).
+    t, _, _ = _turns(mpc, _as_fp(mpc, x), 0.0, TWO_PI / scale)
+    modulus = t.modulus
+    x_r, r = mpc.arithmetic.__beaver_partition(t.share, modulus)
+
+    if mpc.pid == 0:
+        v = _affine(_mask_fraction(r, modulus), TWO_PI, 0.0)
+        terms = [double_to_fp(recursive_reduce(math.sin, v), modulus),
+                 double_to_fp(recursive_reduce(math.cos, v), modulus)]
+    else:
+        terms = [r.zeros(), r.zeros()]
+    shared = _share_terms(mpc, terms, modulus)
+    sin_v, cos_v = shared[0], shared[1]
+
+    u = _affine(_opening_fraction(x_r, modulus), TWO_PI, 0.0)
+    su = recursive_reduce(math.sin, u)
+    cu = recursive_reduce(math.cos, u)
+    neg_su = recursive_reduce(lambda e: -e, su)
+
+    # sin(u + v) = sin u cos v + cos u sin v;  cos(u + v) = cos u cos v - sin u sin v
+    both = mpc.fp.weighted_sum([_cat(cos_v, cos_v), _cat(sin_v, sin_v)], [_cat(su, cu), _cat(cu, neg_su)], modulus)
+    n = len(su)
+    return both[:n], both[n:], modulus
+
+
+def trig_error_bound(x: float) -> float:
+    """
+    Worst-case absolute error of Decor's sin and cos at x: the encoded 1 / (2 pi) (its F + 2-bit encoding, and the
+    double it comes from: 2^-52 relative, which dominates at F = 64; both make the scaled input's error grow with |x|),
+    the scaling's truncation (one unit of a turn), the encodings of sin u, cos u, sin v, cos v (up to 2 sqrt 2 units)
+    and the final truncation (one unit), and the double-precision rounding of the angles u, v and of their sines and
+    cosines.
+    """
+    phase = abs(x) * (2.0 ** -float(MPC_NBIT_F + 2) + DOUBLE_EPS / TWO_PI) + ULP + DOUBLE_EPS
+    return TWO_PI * phase + 4.0 * ULP + 4.0 * DOUBLE_EPS
+
+
+def via_decor_sincos(mpc, x, scale: float = 1.0):
+    """
+    sin(scale x) and cos(scale x) (radians, any x) from one Decor opening: 3 rounds; error at most
+    trig_error_bound(scale x) for scale 1. A positive public scale (a layer's pre-activation factor) costs nothing extra:
+    it joins the opening's scaling by 1 / (2 pi), encoded at F + e bits with 2^e <= 2 pi / scale, so the phase term of
+    the bound can grow by up to 27% (scales just above 2 pi 2^k); the other terms are unchanged.
+    """
+    mpc.fp.require_truncation("via_decor_sincos")
+    if not (scale > 0.0):
+        raise ValueError(f"via_decor_sincos: the scale must be positive, not {scale}")
+    if _is_empty(x):
+        return _empty_like(x), _empty_like(x)
+    s, c, modulus = _sincos_shares(mpc, x, scale)
+    return _fp_tensor(s, modulus), _fp_tensor(c, modulus)
+
+
+def via_decor_trig(mpc, x, func: Static[str]):
+    """
+    sin, cos, tan or cot of x (radians). sin and cos: 3 rounds, any x, error at most trig_error_bound(x).
+    tan = sin / cos and cot = cos / sin through Decor division (the K + 1-bit sign test, the normalizer and Goldschmidt:
+    about 50 more rounds on the ring); the divisor must stay away from 0 (|cos x| or |sin x| >= 2^-(F - 12)), i.e. x
+    away from the poles, and the quotient's error grows like 1 / divisor^2 near them.
+    """
+    mpc.fp.require_truncation("via_decor_trig")
+    if _is_empty(x):
+        return _empty_like(x)
+    s, c = via_decor_sincos(mpc, x)
+    if func == "sin":
+        return s
+    elif func == "cos":
+        return c
+    elif func == "tan":
+        return decor_div(mpc, s, c)
+    elif func == "cot":
+        return decor_div(mpc, c, s)
+    else:
+        compile_error("via_decor_trig: unknown function " + func + " (sin, cos, tan or cot)")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Bounded functions on an interval: decomposition, wraparound select
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _bounded_opening(mpc, x, interval, shift_frac: float):
+    # t = (x - a') / p and its fresh opening. Returns t (fp Sharetensor), the parties' u (public doubles; garbage at
+    # CP0), the dealer's v (doubles; garbage at the compute parties), the carry c (0/1 Sharetensor) and p (the
+    # effective period of the scaling).
+    a_dom, p_dom = _decomposition_domain(interval)
+    t, a, p = _turns(mpc, _as_fp(mpc, x), a_dom, p_dom)
+    shift = p * shift_frac
+    modulus = t.modulus
+    x_r, r = mpc.arithmetic.__beaver_partition(t.share, modulus)
+
+    # Carry c = [frac(t - r) + frac(r) >= 1]: the carry out of the opening's public fractional bits plus the mask's,
+    # which the dealer XOR-shares (it knows r). One F-bit carry and a bit conversion: log2(F) + 1 rounds, bitwise work
+    # only, the same on the ring and on the field.
+    adj = (mpc_uint(1) << mpc_uint(MPC_NBIT_F)) - (modulus & FBITS_MASK)
+    r_flat = r.flatten() if isinstance(r, list[list]) else r
+    x_r_flat = x_r.flatten() if isinstance(x_r, list[list]) else x_r
+    frac_r = [(e & FBITS_MASK).trunc_to(PACKING_SIZE) for e in r_flat] if mpc.pid == 0 else \
+        [size_t(0) for _ in range(len(r_flat))]
+    frac_r = mpc.bitwise.share_from_trusted_dealer(frac_r)
+    frac_x_r = [((e + adj) & FBITS_MASK).trunc_to(PACKING_SIZE) for e in x_r_flat]
+    c = mpc.bitwise.carry_out_public_arithmetic(frac_x_r, frac_r, MPC_NBIT_F, modulus)
+    c_st = Sharetensor(c.reshape(t.shape) if isinstance(t.share, list[list]) else c, modulus)
+
+    v = _affine(_mask_fraction(r, modulus), p, -shift)
+    u = _affine(_opening_fraction(x_r, modulus), p, shift + a)
+    return t, u, v, c_st, p
+
+
+def _bilinear(mpc, x, interval, shift_frac: float, h_terms, g_weights, n_terms: int, n_outputs: int):
+    """
+    Outputs f_o(x) = sum_t g_ot(u) h_t(v) for decompositions bilinear in g and h (exp, sinh/cosh, polynomials).
+
+    Per output, A = sum_t h_t g_ot(u) and S = sum_t h_t g_ot(u - p) are local (public weights); with the carry c,
+    f_o(x) = A + c (S - A). The product c (S - A) is one Beaver product (masks uniform over the modulus), and only
+    A + c (S - A) = f_o(x) is truncated: the evaluation of the branch that is not taken (f at x + p or x - p, often far
+    beyond the fixed-point range) is never truncated or opened. All outputs share one product round and one truncation.
+    """
+    t, u, v, c_st, p = _bounded_opening(mpc, x, interval, shift_frac)
+    modulus = t.modulus
+
+    if mpc.pid == 0:
+        hs = [double_to_fp(h, modulus) for h in h_terms(v)]
+    else:
+        hs = [t.share.zeros() for _ in range(n_terms)]
+    hs = _share_terms(mpc, hs, modulus)
+
+    gm = g_weights(u)                    # n_outputs * n_terms nested lists (output-major)
+    gs = g_weights(_affine(u, 1.0, -p))
+    a_raw = t.share.zeros()
+    b_raw = t.share.zeros()
+    for o in range(n_outputs):
+        a_o = t.share.zeros()
+        s_o = t.share.zeros()
+        if mpc.pid > 0:
+            for k in range(n_terms):
+                a_o = a_o.add_mod(hs[k].mul_mod(double_to_fp(gm[o * n_terms + k], modulus), modulus), modulus)
+                s_o = s_o.add_mod(hs[k].mul_mod(double_to_fp(gs[o * n_terms + k], modulus), modulus), modulus)
+        a_raw = a_o if o == 0 else _cat(a_raw, a_o)
+        b_raw = s_o.sub_mod(a_o, modulus) if o == 0 else _cat(b_raw, s_o.sub_mod(a_o, modulus))
+
+    cond = c_st.share
+    conds = cond if n_outputs == 1 else _repeat(cond, n_outputs)
+    res = mpc.fp.trunc(a_raw.add_mod(_one_round_product(mpc, conds, b_raw, modulus), modulus), modulus)
+
+    n = len(t.share)
+    return [_fp_tensor(res[o * n:(o + 1) * n], modulus) for o in range(n_outputs)]
+
+
+def _fp_tensor(share, modulus: mpc_uint):
+    st = Sharetensor(share, modulus)
+    st.fp = True
+    return st
+
+
+def _one_round_product(mpc, a, b, modulus: mpc_uint):
+    # a * b element-wise (no truncation), both operands partitioned in one opening
+    n = len(a)
+    x_r, r = mpc.arithmetic.__beaver_partition(_cat(a, b), modulus)
+    c = mpc.arithmetic.__beaver_mul(x_r[:n], r[:n], x_r[n:], r[n:], modulus)
+    return mpc.arithmetic.__beaver_reconstruct(c, modulus)
+
+
+def _repeat(a, times: int):
+    c = a.copy()
+    for _ in range(times - 1):
+        c.extend(a)
+    return c
+
+
+def _selected(mpc, x, interval, shift_frac: float, h_func, g_func):
+    # [h(v)] and the selected [g(u_c)] with u_c = u - c p (both fixed point): the selection is local (the carry, a
+    # shared 0/1, times public values), so the untaken branch never enters a product.
+    t, u, v, c_st, p = _bounded_opening(mpc, x, interval, shift_frac)
+    modulus = t.modulus
+    h = double_to_fp(h_func(v), modulus) if mpc.pid == 0 else t.share.zeros()
+    h_st = _fp_tensor(mpc.comms.share_from_trusted_dealer(h, modulus), modulus)
+
+    g_main = g_func(u)
+    g_diff = _sub_lists(g_func(_affine(u, 1.0, -p)), g_main)
+    return h_st, _select_public(mpc, c_st, g_main, g_diff)
+
+
+def _sub_lists(a, b):
+    if isinstance(a, list[list]):
+        return [_sub_lists(a[i], b[i]) for i in range(len(a))]
+    return [a[i] - b[i] for i in range(len(a))]
+
+
+@sequre
+def _select_public(mpc, cond, g_main, g_diff):
+    # g_main + cond * g_diff for public g_main, g_diff and a shared 0/1 cond: local
+    return cond * g_diff + g_main
+
+
+@sequre
+def _sigmoid_combine(mpc, h, g):
+    # sigma(u + v) = sigma(u) sigma(v) / (sigma(u) sigma(v) + (1 - sigma(u)) (1 - sigma(v)))
+    num = h * g
+    return num, num * 2 - g - h + 1.0
+
+
+@sequre
+def _tanh_combine(mpc, h, g):
+    # tanh(u + v) = (tanh u + tanh v) / (1 + tanh u tanh v)
+    return h + g, h * g + 1.0
+
+
+def _decor_sigmoid(mpc, x, interval):
+    h, g = _selected(mpc, x, interval, 0.5, sigmoid, sigmoid)
+    num, den = _sigmoid_combine(mpc, h, g)
+    return decor_div(mpc, num, den, sign_check=False)
+
+
+def _decor_tanh(mpc, x, interval):
+    h, g = _selected(mpc, x, interval, 0.5, tanh, tanh)
+    num, den = _tanh_combine(mpc, h, g)
+    return decor_div(mpc, num, den, sign_check=False)
+
+
+@sequre
+def _negated(mpc, x):
+    return -x
+
+
+@sequre
+def _doubled(mpc, x):
+    return x + x
+
+
+def _decor_exp_raw(mpc, x, interval, shift_frac: float):
+    return _bilinear(mpc, x, interval, shift_frac,
+                     lambda v: [recursive_reduce(math.exp, v)],
+                     lambda u: [recursive_reduce(math.exp, u)], 1, 1)[0]
+
+
+@sequre
+def _one_plus(mpc, e):
+    return e + 1.0
+
+
+@sequre
+def _one_minus_twice(mpc, q):
+    return 1.0 - q * 2.0
+
+
+def _decor_sigmoid_exp(mpc, x, interval):
+    # sigma(x) = 1 / (1 + e^-x): Decor exp of -x on [-b, -a], then an inverse of a divisor >= 1
+    a, b = interval
+    e = _decor_exp_raw(mpc, _negated(mpc, _as_fp(mpc, x)), (-b, -a), _exp_shift((-b, -a)))
+    return decor_mul_inv(mpc, _one_plus(mpc, e), sign_check=False)
+
+
+def _decor_tanh_exp(mpc, x, interval):
+    # tanh(x) = 1 - 2 / (e^(2x) + 1)
+    a, b = interval
+    e = _decor_exp_raw(mpc, _doubled(mpc, _as_fp(mpc, x)), (2.0 * a, 2.0 * b), _exp_shift((2.0 * a, 2.0 * b)))
+    return _one_minus_twice(mpc, decor_mul_inv(mpc, _one_plus(mpc, e), sign_check=False))
+
+
+def _poly_terms(coeffs: List[float]):
+    # The polynomial's decomposition P(u + v) = sum_j W_j(u) v^j, W_j = P^(j)(u) / j!: h_j = v^j, g_j = W_j(u)
+    d = len(coeffs) - 1
+    h_terms = lambda v: [recursive_reduce(lambda e: e ** float(j), v) for j in range(d + 1)]
+    g_weights = lambda u: _per_term(u, lambda e: poly_shifted_coeffs(coeffs, e), d + 1)
+    return h_terms, g_weights
+
+
+def _exp_shift(interval) -> float:
+    # Shift fraction balancing the largest g = e^(b + s) against the largest h = e^(p - s): s = (p - b) / 2, in [0, p]
+    a, b = interval
+    p = b - a
+    s = (p - b) / 2.0
+    return max(0.0, min(p, s)) / p
+
+
+def _exp_parts():
+    return (lambda v: [recursive_reduce(math.exp, v)]), (lambda u: [recursive_reduce(math.exp, u)])
+
+
+def _sinhcosh_parts():
+    # h = (cosh v, sinh v); sinh(u + v) = sinh u cosh v + cosh u sinh v, cosh(u + v) = cosh u cosh v + sinh u sinh v
+    h_terms = lambda v: [recursive_reduce(math.cosh, v), recursive_reduce(math.sinh, v)]
+    g_weights = lambda u: [recursive_reduce(math.sinh, u), recursive_reduce(math.cosh, u),
+                           recursive_reduce(math.cosh, u), recursive_reduce(math.sinh, u)]
+    return h_terms, g_weights
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Admissibility and error bounds (public, before any communication)
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _grid_n(lo: float, hi: float, n: int) -> List[float]:
+    return [lo + (hi - lo) * float(i) / float(n - 1) for i in range(n)]
+
+
+def _grid(lo: float, hi: float) -> List[float]:
+    return _grid_n(lo, hi, _GRID)
+
+
+def _check_interval(func: str, interval):
+    if not (interval[1] > interval[0]):
+        raise ValueError(f"Decor {func}: the interval {interval} must have a < b")
+
+
+def _check_range(func: str, interval, what: str, values: List[float]):
+    m = _max_abs(values)
+    if not (m < FP_MAX):
+        raise ValueError(
+            f"Decor {func} on {interval}: {what} reaches {m:.4g}, beyond the fixed-point range {FP_MAX:.4g} "
+            f"(MPC_NBIT_K - MPC_NBIT_F - 1 = {MPC_NBIT_K - MPC_NBIT_F - 1} integer bits); narrow the interval or use "
+            f"another method")
+
+
+def _max_slope(values: List[float], step: float) -> float:
+    # max |f'| from the finite differences of f on a grid
+    m = 0.0
+    for i in range(len(values) - 1):
+        d = abs(values[i + 1] - values[i]) / step
+        if d != d or d > m:
+            m = float("inf") if d != d else d
+    return m
+
+
+def _bilinear_bound(func: str, interval, shift_frac: float, h_terms, g_weights, f) -> Tuple[float, float]:
+    """
+    (bound, scale) of a bilinear decomposition f(x) = sum_k g_k(u) h_k(v) on interval. Raises ValueError when a value
+    the protocol encodes leaves the fixed-point range: h on [-s, p - s], g on the taken branch's domain
+    (a' - p + s, b' + s] (the untaken branch's g never enters a truncated product), f on [a, b].
+    bound is the worst-case absolute error: over the pairs (u, v) the protocol can take (u + v = x in [a', b']), one
+    unit of 2^-F per encoded factor times the other factor and one unit for the final truncation, plus 2^-52 of
+    sum_k |g_k h_k| for the double-precision evaluations of g and h (the terms may cancel: sinh and cosh), plus
+    max |f'| times the input's shift: the scaled input's unit (p 2^-F) and the rounding of u and v to double
+    (2^-52 (max |u| + max |v| + 2p)). scale is max(1, max |f| on [a, b]).
+    """
+    _check_interval(func, interval)
+    a2, p = _decomposition_domain(interval)
+    b2 = a2 + p
+    s = p * shift_frac
+    hs = h_terms(_grid(-s, p - s))
+    gs = g_weights(_grid(a2 - p + s, b2 + s))
+    for k in range(len(hs)):
+        _check_range(func, interval, f"h term {k} (dealer side, v in [{-s:.4g}, {p - s:.4g}])", hs[k])
+    for k in range(len(gs)):
+        _check_range(func, interval, f"g term {k} (opened side, u in [{a2 - p + s:.4g}, {b2 + s:.4g}])", gs[k])
+    fs = f(_grid(interval[0], interval[1]))
+    _check_range(func, interval, "the result", fs)
+
+    xs = _grid_n(a2, b2, _PAIR_GRID)
+    vs = _grid_n(-s, p - s, _PAIR_GRID)
+    hp = h_terms(vs)
+    gp = g_weights([x - v for x in xs for v in vs])
+    worst = 0.0
+    for i in range(len(xs)):
+        for j in range(len(vs)):
+            enc, dbl = 1.0, 0.0
+            for k in range(len(hp)):
+                g, h = gp[k][i * len(vs) + j], hp[k][j]
+                enc += abs(g) + abs(h)
+                dbl += abs(g * h)
+            e = ULP * enc + DOUBLE_EPS * dbl
+            if e != e or e > worst:
+                worst = float("inf") if e != e else e
+    slope = _max_slope(f(_grid(a2, b2)), p / float(_GRID - 1))
+    return worst + slope * _input_shift(a2, p, s), max(1.0, _max_abs(fs))
+
+
+def _input_shift(a2: float, p: float, s: float) -> float:
+    # The decomposition's shift of the input: the scaled input's unit (p 2^-F) and the rounding of the doubles
+    # u in (a' - p + s, a' + p + s] and v in [-s, p - s] (the opened fraction times p, plus the offsets). g and h are
+    # evaluated at the same rounded u and v for every term, so the sum is f at the shifted input: max |f'| times this.
+    u_max = max(abs(a2 - p + s), abs(a2 + p + s))
+    v_max = max(abs(s), abs(p - s))
+    return p * ULP + DOUBLE_EPS * (u_max + v_max + 2.0 * p)
+
+
+def _log_sigmoid(x: float) -> float:
+    return -math.log1p(math.exp(-x)) if x >= 0.0 else x - math.log1p(math.exp(x))
+
+
+def _log_cosh(x: float) -> float:
+    y = abs(x)
+    return y + math.log1p(math.exp(-2.0 * y)) - math.log(2.0)
+
+
+def _combiner_denominator(func: str, u: float, v: float) -> float:
+    # The select combiners' denominators in closed form, without cancellation in double:
+    # sigma(u) sigma(v) + sigma(-u) sigma(-v) = sigma(u) sigma(v) / sigma(u + v), and
+    # 1 + tanh u tanh v = cosh(u + v) / (cosh u cosh v)
+    if func == "sigmoid":
+        return math.exp(_log_sigmoid(u) + _log_sigmoid(v) - _log_sigmoid(u + v))
+    return math.exp(_log_cosh(u + v) - _log_cosh(u) - _log_cosh(v))
+
+
+def _select_bound(func: str, interval) -> Tuple[float, float]:
+    """
+    (bound, 1) of the select combiners of sigmoid and tanh on interval. Their denominator falls with the interval's
+    width (to about e^-(p/2) for sigmoid and 2 e^-p for tanh over the pairs the protocol can take); raises ValueError
+    when it falls below the division's smallest divisor 2^-(F - 12). bound: the encodings' units (5) and the
+    double-precision evaluations of g and h (2 * 2^-52), both divided by the smallest denominator, plus the division's
+    own error (4 units) and max |f'| times the input's shift (see _input_shift).
+    """
+    _check_interval(func, interval)
+    a2, p = _decomposition_domain(interval)
+    s = 0.5 * p
+    den_min = float("inf")
+    for x in _grid_n(a2, a2 + p, _PAIR_GRID):
+        for v in _grid_n(-s, p - s, _PAIR_GRID):
+            den_min = min(den_min, _combiner_denominator(func, x - v, v))
+    if not (den_min >= MIN_DIVISOR):
+        raise ValueError(
+            f"Decor {func} on {interval}: the combiner's denominator falls to {den_min:.3g}, below the division's "
+            f"smallest divisor {MIN_DIVISOR:.3g} (2^-(F - 12)); narrow the interval or use another method")
+    slope = 0.25 if func == "sigmoid" else 1.0
+    return (5.0 * ULP + 2.0 * DOUBLE_EPS) / den_min + 4.0 * ULP + slope * _input_shift(a2, p, s), 1.0
+
+
+def _bound(func: Static[str], interval, coeffs: List[float]) -> Tuple[float, float]:
+    # (bound, scale) of a bounded function on interval; raises ValueError when the interval is not admissible for the
+    # fixed-point range (or, for sigmoid and tanh, the division)
+    if func == "exp":
+        h_terms, g_weights = _exp_parts()
+        return _bilinear_bound(func, interval, _exp_shift(interval), h_terms, g_weights,
+                               lambda xs: recursive_reduce(math.exp, xs))
+    elif func == "sinh" or func == "cosh":
+        h_terms, g_weights = _sinhcosh_parts()
+        sel = 0 if func == "sinh" else 2
+        g_one = lambda u: g_weights(u)[sel:sel + 2]
+        if func == "sinh":
+            return _bilinear_bound(func, interval, 0.5, h_terms, g_one, lambda xs: recursive_reduce(math.sinh, xs))
+        return _bilinear_bound(func, interval, 0.5, h_terms, g_one, lambda xs: recursive_reduce(math.cosh, xs))
+    elif func == "sigmoid" or func == "tanh":
+        if DECOR_SIGMOID_COMBINER == "exp":
+            # exp of -x on [-b, -a] (sigmoid) or of 2x on [2a, 2b] (tanh), then 1 / (1 + e): no small divisor, and the
+            # inverse passes at most the exp's absolute error (twice for tanh)
+            a, b = interval
+            h_terms, g_weights = _exp_parts()
+            iv = (-b, -a) if func == "sigmoid" else (2.0 * a, 2.0 * b)
+            e, _ = _bilinear_bound("exp (" + func + ")", iv, _exp_shift(iv), h_terms, g_weights,
+                                   lambda xs: recursive_reduce(math.exp, xs))
+            return e * (1.0 if func == "sigmoid" else 2.0), 1.0
+        return _select_bound(func, interval)
+    elif func == "polynomial":
+        h_terms, g_weights = _poly_terms(coeffs)
+        return _bilinear_bound(func, interval, 0.5, h_terms, g_weights, lambda xs: [poly_eval(coeffs, e) for e in xs])
+    else:
+        compile_error("Decor: unknown bounded function " + func + " (exp, sinh, cosh, sigmoid, tanh or polynomial)")
+
+
+def _require_precision(func: str, interval, bound: float, scale: float, tolerance: float):
+    if not (bound <= tolerance * scale):
+        raise ValueError(
+            f"Decor {func} on {interval}: the estimated worst-case error {bound:.3g} exceeds the tolerance "
+            f"{tolerance:.3g} times {scale:.4g} (max(1, max |f|) on the interval); narrow the interval, pass a larger "
+            f"tolerance or use another method")
+
+
+def _resolve_interval(func: Static[str], interval) -> Tuple[float, float]:
+    # (0, 0) stands for "not given": the function's default interval. Any other interval with a >= b is refused.
+    a, b = float(interval[0]), float(interval[1])
+    if a == 0.0 and b == 0.0:
+        if func == "polynomial":
+            raise ValueError("via_decor: a polynomial needs its interval")
+        return default_interval(func)
+    if not (b > a):
+        raise ValueError(f"Decor {func}: the interval {(a, b)} must have a < b")
+    return (a, b)
+
+
+def decor_error_bound(func: Static[str], interval = (0.0, 0.0), coeffs: List[float] = List[float]()) -> float:
+    """
+    The estimated worst-case absolute error of via_decor(func) on interval (the function's default interval when not
+    given; a polynomial needs one and its coeffs) for inputs in the interval: a public computation, no communication.
+    Raises ValueError when the interval is not admissible for the fixed-point range or the division. sin and cos: see
+    trig_error_bound.
+    """
+    if func == "polynomial" and len(coeffs) == 0:
+        raise ValueError("decor_error_bound: a polynomial needs coefficients")
+    bound, _ = _bound(func, _resolve_interval(func, interval), coeffs)
+    return bound
+
+
+# Calls that passed the check: (function, a, b, tolerance) for the named functions, and (a, b, tolerance, coefficients)
+# for polynomials (compared exactly; at most _ADMITTED_POLYNOMIALS_MAX kept). The check is public and deterministic
+# (every party computes the same verdict), so a repeated call skips it (0.2 to 0.8 ms, about 1.5 ms for degree 10).
+_ADMITTED = Set[Tuple[str, float, float, float]]()
+_ADMITTED_POLYNOMIALS = List[Tuple[float, float, float, List[float]]]()
+_ADMITTED_POLYNOMIALS_MAX = 64
+
+
+def _same_coeffs(a: List[float], b: List[float]) -> bool:
+    if len(a) != len(b):
+        return False
+    for i in range(len(a)):
+        if a[i] != b[i]:
+            return False
+    return True
+
+
+def _polynomial_admitted(interval, coeffs: List[float], tolerance: float) -> bool:
+    for e in _ADMITTED_POLYNOMIALS:
+        same_interval = e[0] == float(interval[0]) and e[1] == float(interval[1])
+        if same_interval and e[2] == tolerance and _same_coeffs(e[3], coeffs):
+            return True
+    return False
+
+
+def _admit(func: Static[str], interval, coeffs: List[float], tolerance: float):
+    # via_decor's public checks, at every party before any communication
+    key = (func, float(interval[0]), float(interval[1]), tolerance)
+    if func == "polynomial":
+        if _polynomial_admitted(interval, coeffs, tolerance):
+            return
+    elif key in _ADMITTED:
+        return
+    bound, scale = _bound(func, interval, coeffs)
+    if not (DECOR_SIGMOID_COMBINER == "exp" and (func == "sigmoid" or func == "tanh")):
+        _require_precision(func, interval, bound, scale, tolerance)
+    if func == "polynomial":
+        if len(_ADMITTED_POLYNOMIALS) < _ADMITTED_POLYNOMIALS_MAX:
+            _ADMITTED_POLYNOMIALS.append((float(interval[0]), float(interval[1]), tolerance, coeffs.copy()))
+    else:
+        _ADMITTED.add(key)
+
+
+def _decor_polynomial(mpc, x, interval, coeffs: List[float]):
+    # The polynomial's decomposition on interval, once _admit has passed (via_decor, via_chebyshev)
+    h_terms, g_weights = _poly_terms(coeffs)
+    return _bilinear(mpc, x, interval, 0.5, h_terms, g_weights, len(coeffs), 1)[0]
+
+
+def _validate_domain(mpc, x, interval, func: str):
+    # DEBUG only: opens x to warn about inputs outside [a, b] (every party opens; outside DEBUG nothing is opened)
+    if DEBUG:
+        a, b = interval
+        vals = x.reveal(mpc).flatten().tolist()
+        outside = sum(1 for e in vals if e < a or e > b)
+        if outside and mpc.pid == 1:
+            print(f"WARNING: Decor {func}: {outside} input value(s) outside the interval {interval}; each gives f at x "
+                  f"shifted by a whole number of periods (clip=True clips them)")
+
+
+@sequre
+def _clip_differences(mpc, x, low: float, high: float):
+    return low - x, x - high
+
+
+@sequre
+def _keep_mask(mpc, low_mask, high_mask):
+    # 1 - low_mask - high_mask: 0/1 integers
+    return 1 - (low_mask + high_mask)
+
+
+def _clip_select(mpc, x, keep, low_mask, high_mask, low: float, high: float):
+    # x keep + low_mask low + high_mask high, keep = 1 - low_mask - high_mask: one product (an integer 0/1 factor: no
+    # truncation), both operands partitioned in one opening; the public ends are added locally
+    modulus = x.modulus
+    res = _one_round_product(mpc, x.share, keep.share, modulus)
+    res = res.add_mod(low_mask.share.mul_mod(double_to_fp(low, modulus), modulus), modulus)
+    res = res.add_mod(high_mask.share.mul_mod(double_to_fp(high, modulus), modulus), modulus)
+    return _fp_tensor(res, modulus)
+
+
+def _clip_masks(mpc, x, low: float, high: float):
+    # [x < low] and [x > high] as 0/1 integer Sharetensors shaped as x (not empty), from one comparison of
+    # (low - x, x - high) with 0: the K + 1-bit sign test on the ring, the field comparison on the field
+    modulus = x.modulus
+    below, above = _clip_differences(mpc, x, low, high)
+    if isinstance(x.share, list[list]):
+        rows = len(x.share)
+        cols = len(x.share[0])
+        n = rows * cols
+        both = _fp_tensor(_cat(below.share.flatten(), above.share.flatten()), modulus)
+        masks = ring_gt(mpc, both, 0.0, bits=MPC_NBIT_K + 1).share
+        return (Sharetensor([masks[i * cols:(i + 1) * cols] for i in range(rows)], modulus),
+                Sharetensor([masks[n + i * cols:n + (i + 1) * cols] for i in range(rows)], modulus))
+    n = len(x.share)
+    masks = ring_gt(mpc, _fp_tensor(_cat(below.share, above.share), modulus), 0.0, bits=MPC_NBIT_K + 1).share
+    return Sharetensor(masks[:n], modulus), Sharetensor(masks[n:], modulus)
+
+
+def _clip_keep(mpc, x, low: float, high: float):
+    # (x clipped to [low, high], keep = 1 - [x < low] - [x > high] as 0/1 integer shares): one comparison call and one
+    # product, 9 rounds on the ring and 12 on the field. keep masks a clipped function's derivative (the clipped
+    # function is flat beyond the ends). An empty x is returned as both (a public shape: every party takes that branch).
+    if _is_empty(x):
+        return x, x
+    # a public x (each party holds the whole value) as a sharing held by the hub: the product below counts it once
+    x = _hub_held(mpc, x)
+    low_mask, high_mask = _clip_masks(mpc, x, low, high)
+    keep = _keep_mask(mpc, low_mask, high_mask)
+    return _clip_select(mpc, x, keep, low_mask, high_mask, low, high), keep
+
+
+def _clip(mpc, x, low: float, high: float):
+    # x clipped to [low, high] (see _clip_keep)
+    return _clip_keep(mpc, x, low, high)[0]
+
+
+def _times_mask(mpc, x, mask):
+    # A fixed-point Sharetensor times a 0/1 integer mask of its shape: one product, no truncation (a public x as a
+    # sharing held by the hub)
+    if _is_empty(x):
+        return x
+    x = _hub_held(mpc, x)
+    return _fp_tensor(_one_round_product(mpc, x.share, mask.share, x.modulus), x.modulus)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Public entry points
+# ---------------------------------------------------------------------------------------------------------------------
+
+def via_decor_sinhcosh(mpc, x, interval, tolerance: float = DECOR_TOLERANCE):
+    """ sinh(x) and cosh(x) for x in interval, from one opening (one product round, one truncation); see via_decor. """
+    mpc.fp.require_truncation("via_decor_sinhcosh")
+    iv = (float(interval[0]), float(interval[1]))
+    _admit("sinh", iv, List[float](), tolerance)
+    _admit("cosh", iv, List[float](), tolerance)
+    if _is_empty(x):
+        return _empty_like(x), _empty_like(x)
+    h_terms, g_weights = _sinhcosh_parts()
+    outs = _bilinear(mpc, x, iv, 0.5, h_terms, g_weights, 2, 2)
+    return outs[0], outs[1]
+
+
+def default_interval(func: Static[str]) -> Tuple[float, float]:
+    """ The default Decor interval of a bounded function (constants DECOR_INTERVAL_*; set from the numerics study). """
+    if func == "exp":
+        return DECOR_INTERVAL_EXP
+    elif func == "sigmoid":
+        return DECOR_INTERVAL_SIGMOID
+    elif func == "tanh":
+        return DECOR_INTERVAL_TANH
+    elif func == "sinh" or func == "cosh":
+        return DECOR_INTERVAL_SINH
+    else:
+        return (0.0, 0.0)
+
+
+def via_decor(mpc, x, func: Static[str], interval = (0.0, 0.0), coeffs: List[float] = List[float](), clip: bool = False,
+              tolerance: float = DECOR_TOLERANCE):
+    """
+    func(x) by Decor for a fixed-point Sharetensor x (1-D or 2-D, ring or field).
+
+    func: "sin", "cos", "tan", "cot" (x in radians, any x; interval unused; see via_decor_trig), "exp", "sinh",
+    "cosh", "sigmoid", "tanh" (x in interval), "polynomial" (coeffs: monomial coefficients in x, constant first; x in
+    interval).
+
+    Interval: the domain [a, b] (default_interval(func) when not given; a polynomial needs one). Inputs in [a, b], and
+    up to 2^-(F/2) of the width beyond either end, give f(x). An input outside gives f(x - k p) on every draw, for the
+    number k of periods p = (b - a)(1 + 2^(1 - F/2)) it lies beyond the interval (sigmoid(10.5) on (-10, 10) gives
+    sigmoid(10.5 - p) = 7.5e-5): clip=True clips x to [a, b] first (one comparison and one product: 9 rounds on the
+    ring, 12 on the field).
+
+    Admissibility: a public check raises ValueError at every party before any communication when a value the
+    protocol encodes leaves the fixed-point range, when sigmoid's or tanh's denominator falls below the division's
+    smallest divisor, or when the estimated worst-case error decor_error_bound(func, interval) exceeds tolerance times
+    max(1, max |f| on the interval) (default DECOR_TOLERANCE = 2^-(F/2 - 4)).
+
+    Precision: the encodings' errors grow with the interval's width: on (-b, b) about 2^-F e^(1.5 b) for exp,
+    2^-F e^(2b) for sinh and cosh (the addition theorem's terms cancel), and 5 * 2^-F / den_min for sigmoid and tanh
+    (den_min about e^-b, and 2 e^-2b). decor_error_bound gives the bound; the measured errors are 1.4 to 30 times
+    lower.
+    Refuses to run inside MPCEnv.delayed_truncation().
+    """
+    mpc.fp.require_truncation("via_decor")
+    if func == "sin" or func == "cos" or func == "tan" or func == "cot":
+        return via_decor_trig(mpc, x, func=func)
+
+    iv = _resolve_interval(func, interval)
+    a, b = iv
+    if func == "polynomial" and len(coeffs) == 0:
+        raise ValueError("via_decor: a polynomial needs coefficients")
+    _admit(func, iv, coeffs, tolerance)
+    if _is_empty(x):
+        return _empty_like(x)
+    if clip:
+        x = _clip(mpc, _as_fp(mpc, x), a, b)
+    _validate_domain(mpc, x, iv, func)
+
+    if func == "exp":
+        h_terms, g_weights = _exp_parts()
+        return _bilinear(mpc, x, iv, _exp_shift(iv), h_terms, g_weights, 1, 1)[0]
+    elif func == "sinh" or func == "cosh":
+        h_terms, g_weights = _sinhcosh_parts()
+        sel = 0 if func == "sinh" else 2
+        return _bilinear(mpc, x, iv, 0.5, h_terms, lambda u: g_weights(u)[sel:sel + 2], 2, 1)[0]
+    elif func == "sigmoid":
+        if DECOR_SIGMOID_COMBINER == "exp":
+            return _decor_sigmoid_exp(mpc, x, iv)
+        return _decor_sigmoid(mpc, x, iv)
+    elif func == "tanh":
+        if DECOR_SIGMOID_COMBINER == "exp":
+            return _decor_tanh_exp(mpc, x, iv)
+        return _decor_tanh(mpc, x, iv)
+    elif func == "polynomial":
+        return _decor_polynomial(mpc, x, iv, coeffs)
+    else:
+        compile_error("via_decor: unknown function " + func)

@@ -28,6 +28,12 @@ all parties start it together; the time a party records is from the barrier to t
 The gc_per_rep column counts the garbage collections that ran inside the timed repetitions (mean per repetition);
 a change in it between two runs means the allocation volume of the operation changed.
 
+The rounds_per_rep column (harness v4) counts the openings in a timed repetition (mean per repetition): the
+increments of mpc.stats.rounds, which comms.reveal and the bitwise reveals make at every compute party (CP0 counts
+none; solo cases 0). Other exchanges are not counted: collect and broadcast, agreement rounds, the MHE collective
+steps (decryption, switching, bootstrapping), so the MHE binary's cases mostly record 0. The counts are
+deterministic, so a change between two runs is a change in the protocol's openings.
+
 Local mode fork()s CP0 and CP1 from the original process. fork() leaves a child without the collector's parallel
 marker threads, and Sequre's runtime restarts them in every forked party; the gc_parallel field of the header records
 whether parallel marking was on in that party (0: its collections ran on one thread, ~10x slower for an MHE party's
@@ -67,8 +73,9 @@ from C import GC_get_parallel() -> i32 as _gc_get_parallel
 
 # 3: --pin pins every thread of a party (it pinned only the calling thread); the header reports gc_parallel instead of
 #    gc_markers_restarted, and --keep-fork-gc is gone (the runtime restarts the marker threads in forked parties).
-HARNESS_VERSION: int = 3
-TSV_COLUMNS = "case\tparams\tpid\treps\tmedian_s\tmin_s\tmean_s\tmax_s\tq1_s\tq3_s\tmad_rel\twarm_s\tbytes_per_rep\tcheck\twall_s\tsamples\tgc_per_rep"
+# 4: the rounds_per_rep column (openings per repetition), appended; the timing is unchanged (v3 files compare).
+HARNESS_VERSION: int = 4
+TSV_COLUMNS = "case\tparams\tpid\treps\tmedian_s\tmin_s\tmean_s\tmax_s\tq1_s\tq3_s\tmad_rel\twarm_s\tbytes_per_rep\tcheck\twall_s\tsamples\tgc_per_rep\trounds_per_rep"
 GC_EACH_REP: bool = "--gc-each-rep" in sys.argv
 GC_FORCED: bool = "--gc-none" not in sys.argv
 GC_EACH_CASE: bool = GC_FORCED
@@ -199,6 +206,11 @@ def fmt(x: float) -> str:
     return f"{x:.6g}"
 
 
+def fmt_count(x: float) -> str:
+    # A count's mean: the integer when it is one (every repetition opens as often), else 10 significant digits
+    return str(int(x)) if x == float(int(x)) else f"{x:.10g}"
+
+
 class Timer:
     # One repetition = `batch` back-to-back executions of the operation between begin() and end(); the recorded
     # time (and bytes) are per execution. Batching amortizes the garbage collector: a sub-millisecond operation
@@ -210,6 +222,8 @@ class Timer:
     t0: float
     bytes0: int
     bytes_total: int
+    rounds0: int
+    rounds_total: int
     gc0: int
     gc_total: int
     last_dt: float
@@ -225,6 +239,8 @@ class Timer:
         self.t0 = 0.0
         self.bytes0 = 0
         self.bytes_total = 0
+        self.rounds0 = 0
+        self.rounds_total = 0
         self.gc0 = 0
         self.gc_total = 0
         self.last_dt = 0.0
@@ -245,6 +261,7 @@ class Timer:
         if self.sync:
             mpc.comms.sync_parties()
         self.bytes0 = mpc.stats.bytes_sent
+        self.rounds0 = mpc.stats.rounds
         self.gc0 = gc_count()
         self.t0 = time.perf_counter()
 
@@ -253,11 +270,13 @@ class Timer:
         self.last_dt = dt
         gcs = gc_count() - self.gc0
         sent = (mpc.stats.bytes_sent - self.bytes0) // self.batch
+        rounds = (mpc.stats.rounds - self.rounds0) // self.batch
         if self.i < self.warmup:
             self.warm.append(dt)
         else:
             self.times.append(dt)
             self.bytes_total += sent
+            self.rounds_total += rounds
             self.gc_total += gcs
         self.i += 1
 
@@ -423,7 +442,7 @@ class Bench:
         return True
 
     def _row(self, params: str, reps: int, times: List[float], warm: List[float], bytes_per_rep: int, check: float,
-             gc_per_rep: float) -> str:
+             gc_per_rep: float, rounds_per_rep: float) -> str:
         xs = sorted(times)
         n = len(xs)
         med = quantile(xs, 0.5)
@@ -438,7 +457,7 @@ class Bench:
         wall = time.perf_counter() - self.case_t0
         return (f"{self.current}\t{params}\t{self.pid}\t{n}\t{fmt(med)}\t{fmt(xs[0] if n else 0.0)}\t{fmt(mean)}\t"
                 f"{fmt(xs[-1] if n else 0.0)}\t{fmt(quantile(xs, 0.25))}\t{fmt(quantile(xs, 0.75))}\t{mad_rel:.4f}\t"
-                f"{fmt(warm_s)}\t{bytes_per_rep}\t{fmt(check)}\t{wall:.3f}\t{samples}\t{gc_per_rep:.3g}")
+                f"{fmt(warm_s)}\t{bytes_per_rep}\t{fmt(check)}\t{wall:.3f}\t{samples}\t{gc_per_rep:.3g}\t{fmt_count(rounds_per_rep)}")
 
     def _write(self, line: str):
         with open(self.out_path, "a") as f:
@@ -449,7 +468,8 @@ class Bench:
         bytes_per_rep = t.bytes_total // len(t.times) if len(t.times) else 0
         p = f"{params};batch={t.batch}" if t.batch > 1 else params
         gc_per_rep = float(t.gc_total) / float(len(t.times)) if len(t.times) else 0.0
-        self._write(self._row(p, t.reps, t.times, t.warm, bytes_per_rep, check, gc_per_rep))
+        rounds_per_rep = float(t.rounds_total) / float(len(t.times)) if len(t.times) else 0.0
+        self._write(self._row(p, t.reps, t.times, t.warm, bytes_per_rep, check, gc_per_rep, rounds_per_rep))
 
     def note(self, text: str):
         self._write(f"# note\t{self.current}\t{text}")

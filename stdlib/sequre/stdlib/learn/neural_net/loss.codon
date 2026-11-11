@@ -1,5 +1,44 @@
+""" Neural-net losses (element-wise; Sequential divides by the number of records).
+
+hinge: max(0, 1 - y o). mse: (y - o)^2 / 2 (the 1/2 makes the derivative o - y). binary_crossentropy:
+-(y log o + (1 - y) log(1 - o)); categorical_crossentropy: -y log o (summed over the classes by the caller). The
+cross-entropies clip the predictions into `interval` (low >= 1e-4, the default LOSS_LOG_INTERVAL (1e-4, 1)) and take an
+accurate log there (clipped_log: the Chebyshev interpolant, refined by Newton's iteration through Decor's exp), and their
+derivatives (o - y) / (o (1 - o)) and -y / o by one division of a positive divisor (Decor division without its sign test
+on the ring, the field's division on the field). Paired with their output activations (sigmoid and softmax) the
+derivative is fused instead: o - y at the activation's input (exact, no division; for the softmax it needs label
+rows that sum to 1).
+
+On the HE types (MPP of ciphertexts, MPA, MPU, Ciphertensor) each log and each derivative's division converts the
+predictions to shares once (via_mpc) and clips and evaluates there, exactly as on a Sharetensor; the predictions' own HE
+noise d then gives an error of about d / o in log o, so a floor around 1e-2 suits them (loss_interval). Plaintext types
+and MPP partitions in the clear evaluate the definitions in double.
+"""
+
+import math
+
 from sequre import sequre
-from sequre.constants import SUPPORTED_LOSSES, HINGE_LOSS
+from sequre.constants import (
+    SUPPORTED_LOSSES, HINGE_LOSS, MSE_LOSS, BCE_LOSS, CCE_LOSS, LOSS_LOG_INTERVAL, METHOD_DECOR, METHOD_CHEBYSHEV,
+    MPC_NBIT_F)
+from sequre.types.sharetensor import Sharetensor
+from sequre.types.ciphertensor import Ciphertensor
+from sequre.types.multiparty_partition import MPP
+from sequre.types.multiparty_aggregate import MPA
+from sequre.types.multiparty_union import MPU
+from sequre.stdlib.numpy.ndarray import ndarray
+from sequre.stdlib.builtin import clip
+from sequre.stdlib.nonlinear import log as nl_log, inv as nl_inv, exp as nl_exp, _mpp_in_the_clear
+from sequre.decor.primitives import decor_mul_inv
+from sequre.decor.functions import recursive_reduce
+
+
+# Newton's iterations after the Chebyshev start. The start errs by -0.28 to +2.23 on (1e-4, 1); each step
+# y <- y - 1 + p e^(-y) takes the error e to e - 1 + e^(-e) (about e^2 / 2 near 0): from 2.23, 6 steps leave 1.6e-9,
+# below Decor exp's error at F = 32 (about 2e-6), and 7 leave 1e-18, for F = 64
+LOG_NEWTON_ITERATIONS = 6 if MPC_NBIT_F <= 32 else 7
+# The smallest floor the log takes: below it the Chebyshev start errs by more (4.5 at 1e-5) than the steps correct
+LOG_LOW_MIN = 1e-4
 
 
 @sequre
@@ -14,22 +53,231 @@ def dhinge_loss(mpc, y, output):
 
 
 @sequre
-def loss(mpc, y, output, loss: str):
-    assert loss in SUPPORTED_LOSSES, f"Neural net: loss {loss} is not supported"
-    
-    if loss == HINGE_LOSS:
-        _loss = hinge_loss(mpc, y, output)
-
-    # Pre-normalize for downstream computation
-    return _loss / len(y)
+def mse_loss(mpc, y, output):
+    dist = y - output
+    return dist * dist * 0.5
 
 
 @sequre
-def dloss(mpc, y, output, loss: str):
-    assert loss in SUPPORTED_LOSSES, f"Neural net: loss {loss} is not supported"
-    
-    if loss == HINGE_LOSS:
-        _dloss = dhinge_loss(mpc, y, output)
+def dmse_loss(mpc, y, output):
+    # Free in communication: a subtraction
+    return output - y
 
+
+@sequre
+def _one_minus(mpc, x):
+    return 1 - x
+
+
+@sequre
+def _negative(mpc, x):
+    return -x
+
+
+@sequre
+def _newton_step(mpc, y, p, e):
+    # y - 1 + p e^(-y), with e = e^(-y)
+    return y - 1 + p * e
+
+
+def _on_shares(mpc, x, shares_fn, plain_fn):
+    # x through shares_fn on its secret-shared form: directly on a Sharetensor, after one conversion on the HE types
+    # (one via_mpc: MPP of ciphertexts, MPA, MPU, Ciphertensor); plain_fn (one float to one float) element-wise on the
+    # plaintext types and on MPP partitions in the clear. Every party takes the same branch (the types are static; the
+    # in-the-clear check is a collective step).
+    if isinstance(x, Sharetensor):
+        return shares_fn(x)
+    elif isinstance(x, MPP):
+        if x._cohort_in_the_clear():
+            return _mpp_in_the_clear(x, plain_fn)
+        return x.via_mpc(shares_fn)
+    elif isinstance(x, MPA):
+        return x.via_mpc(shares_fn)
+    elif isinstance(x, MPU):
+        x.check_valid()
+        if x.is_mpp():
+            return type(x)(_mpp=_on_shares(mpc, x._mpp, shares_fn, plain_fn), _mpa=type(x._mpa)(mpc))
+        return type(x)(_mpp=type(x._mpp)(mpc), _mpa=_on_shares(mpc, x._mpa, shares_fn, plain_fn))
+    elif isinstance(x, Ciphertensor):
+        if x.ndim == 1:
+            return x.via_mpc(mpc, shares_fn, S=Tuple[int])
+        return x.via_mpc(mpc, shares_fn, S=Tuple[int, int])
+    elif isinstance(x, ndarray):
+        return x.astype(float)._propagate_call(plain_fn)
+    else:
+        return recursive_reduce(lambda v: plain_fn(float(v)), x)
+
+
+def _check_floor(low: float, high: float):
+    # A public check at every party, before any round
+    if not (LOG_LOW_MIN <= low < high <= 1.0):
+        raise ValueError(f"clipped_log: the interval ({low}, {high}) must lie in [{LOG_LOW_MIN}, 1] with low < high")
+
+
+def _log_shares(mpc, p, low: float):
+    # log p for a fixed-point Sharetensor p in [low, 1] exactly (clipped there): the degree-20 Chebyshev interpolant on
+    # (low, 1), refined by Newton's steps. The iterates stay in [log low, 0] (the start errs by -0.28 to +2.23; the
+    # first step lands above log p and the others descend to it), so Decor's exp sees -y one unit inside its interval
+    # (-1, 1 - log low) at both ends and needs no clip.
+    y = nl_log(mpc, p, interval=(low, 1.0))
+    exp_interval = (-1.0, 1.0 - math.log(low))
+    for _ in range(LOG_NEWTON_ITERATIONS):
+        e = nl_exp(mpc, _negative(mpc, y), method=METHOD_DECOR, interval=exp_interval)
+        y = _newton_step(mpc, y, p, e)
+    return y
+
+
+def clipped_log(mpc, p, low: float, high: float = 1.0):
+    """
+    log of p clipped into [low, high] (LOG_LOW_MIN = 1e-4 <= low < high <= 1; a ValueError at every party otherwise).
+    On a Sharetensor the clip is exact, then the degree-20 Chebyshev interpolant on (low, 1), whose error reaches 2.2
+    near low, is refined by LOG_NEWTON_ITERATIONS Newton steps y <- y - 1 + p e^(-y) for e^y = p, each through Decor's
+    exp on (-1, 1 - log low): error about Decor exp's, 2e-6 at F = 32. The HE types convert once (via_mpc) and do the
+    same on the shares (their predictions' HE noise d adds about d / p). Plaintext types and MPP partitions in the
+    clear: log(min(max(p, low), high)) in double.
+    """
+    _check_floor(low, high)
+    return _on_shares(mpc, p, lambda st: _log_shares(mpc, clip(mpc, st, low, high), low),
+                      lambda v: math.log(min(max(v, low), high)))
+
+
+def _stack(a, b):
+    # [a; b] (rows of matrices, elements of vectors) as one fixed-point Sharetensor
+    both = a.share.copy()
+    both.extend(b.share)
+    st = Sharetensor(both, a.modulus)
+    st.fp = True
+    return st
+
+
+def _part(x, start: int, stop: int):
+    st = Sharetensor(x.share[start:stop], x.modulus)
+    st.fp = True
+    return st
+
+
+def bce_logs(mpc, output, low: float):
+    """
+    (log p, log(1 - p)) for p = output clipped into [low, 1 - low] (both in the log's [low, 1]). A Sharetensor clips
+    once and takes both logs in one call over [p; 1 - p] (half the rounds of two); the HE types convert once per log;
+    plaintext types in double.
+    """
+    _check_floor(low, 1.0 - low)
+    if isinstance(output, Sharetensor):
+        if isinstance(output.share, list):
+            p = clip(mpc, output, low, 1.0 - low)
+            n = len(p.share)
+            both = _log_shares(mpc, _stack(p, _one_minus(mpc, p)), low)
+            return _part(both, 0, n), _part(both, n, 2 * n)
+    return clipped_log(mpc, output, low, 1.0 - low), clipped_log(mpc, _one_minus(mpc, output), low, 1.0 - low)
+
+
+def _positive_inv(mpc, x):
+    # 1 / x for x known to be positive: Decor division without its sign test on ring Sharetensors (12 rounds fewer),
+    # nonlinear.inv otherwise
+    if isinstance(x, Sharetensor):
+        if x.modulus.popcnt() == 1:
+            return decor_mul_inv(mpc, x, sign_check=False)
+    return nl_inv(mpc, x)
+
+
+@sequre
+def _bce(mpc, y, log_p, log_q):
+    return -(y * log_p + (1 - y) * log_q)
+
+
+@sequre
+def _cce(mpc, y, log_p):
+    return -(y * log_p)
+
+
+@sequre
+def _bce_slope(mpc, y, p, inv_pq):
+    # (p - y) / (p (1 - p))
+    return (p - y) * inv_pq
+
+
+@sequre
+def _pq(mpc, p):
+    return p * (1 - p)
+
+
+@sequre
+def _cce_slope(mpc, y, inv_p):
+    return -(y * inv_p)
+
+
+def binary_crossentropy_loss(mpc, y, output, interval = LOSS_LOG_INTERVAL):
+    # o clipped to [a, 1 - a], so that both o and 1 - o lie in the log's [a, 1]
+    log_p, log_q = bce_logs(mpc, output, interval[0])
+    return _bce(mpc, y, log_p, log_q)
+
+
+def _clamp(v: float, low: float, high: float) -> float:
+    return min(max(v, low), high)
+
+
+def dbinary_crossentropy_loss(mpc, y, output, interval = LOSS_LOG_INTERVAL):
+    # (p - y) / (p (1 - p)) for p = o clipped to [a, 1 - a]; the HE types clip and divide on shares (one conversion
+    # each for p and for the inverse)
+    low, high = interval[0], 1.0 - interval[0]
+    _check_floor(low, high)
+    if isinstance(output, Sharetensor):
+        p = clip(mpc, output, low, high)
+        return _bce_slope(mpc, y, p, _positive_inv(mpc, _pq(mpc, p)))
+    p = _on_shares(mpc, output, lambda st: clip(mpc, st, low, high), lambda v: _clamp(v, low, high))
+    inv_pq = _on_shares(mpc, output, lambda st: _positive_inv(mpc, _pq(mpc, clip(mpc, st, low, high))),
+                        lambda v: 1.0 / (_clamp(v, low, high) * (1.0 - _clamp(v, low, high))))
+    return _bce_slope(mpc, y, p, inv_pq)
+
+
+def categorical_crossentropy_loss(mpc, y, output, interval = LOSS_LOG_INTERVAL):
+    return _cce(mpc, y, clipped_log(mpc, output, interval[0], interval[1]))
+
+
+def dcategorical_crossentropy_loss(mpc, y, output, interval = LOSS_LOG_INTERVAL):
+    # -y / o (with its sign), o clipped into the interval; the HE types clip and divide on shares (one conversion)
+    low, high = interval[0], interval[1]
+    _check_floor(low, high)
+    inv_p = _on_shares(mpc, output, lambda st: _positive_inv(mpc, clip(mpc, st, low, high)),
+                       lambda v: 1.0 / _clamp(v, low, high))
+    return _cce_slope(mpc, y, inv_p)
+
+
+@sequre
+def _normalized(mpc, x, n: int):
     # Pre-normalize for downstream computation
-    return _dloss / len(y)
+    return x / n
+
+
+def loss(mpc, y, output, loss: str, interval = LOSS_LOG_INTERVAL):
+    assert loss in SUPPORTED_LOSSES, f"Neural net: loss {loss} is not supported"
+
+    if loss == HINGE_LOSS:
+        _loss = hinge_loss(mpc, y, output)
+    elif loss == MSE_LOSS:
+        _loss = mse_loss(mpc, y, output)
+    elif loss == BCE_LOSS:
+        _loss = binary_crossentropy_loss(mpc, y, output, interval)
+    else:
+        _loss = categorical_crossentropy_loss(mpc, y, output, interval)
+
+    return _normalized(mpc, _loss, len(y))
+
+
+def dloss(mpc, y, output, loss: str, interval = LOSS_LOG_INTERVAL, fused: bool = False):
+    """ The loss' derivative in the output, or with fused (its paired output activation) o - y at the activation's input. """
+    assert loss in SUPPORTED_LOSSES, f"Neural net: loss {loss} is not supported"
+
+    if fused:
+        _dloss = dmse_loss(mpc, y, output)  # o - y
+    elif loss == HINGE_LOSS:
+        _dloss = dhinge_loss(mpc, y, output)
+    elif loss == MSE_LOSS:
+        _dloss = dmse_loss(mpc, y, output)
+    elif loss == BCE_LOSS:
+        _dloss = dbinary_crossentropy_loss(mpc, y, output, interval)
+    else:
+        _dloss = dcategorical_crossentropy_loss(mpc, y, output, interval)
+
+    return _normalized(mpc, _dloss, len(y))

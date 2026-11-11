@@ -170,9 +170,28 @@ rm -f sock.*
 
 ---
 
-## `--use-ring` instability
+## Nonlinear functions refuse an interval or a degree
 
-The `--use-ring` flag (ring modulus instead of field modulus) is currently unstable. Division and square root operations may produce incorrect results approximately 50% of the time due to a modulus-switching bug. Avoid this flag for production workloads.
+Before any communication, every party checks the nonlinear function's parameters (see
+[Nonlinear Functions](nonlinear-functions.md#intervals-clipping-and-admissibility)). A failed check raises `ValueError`
+at every party, so the parties stay in step. The messages, and what to do:
+
+| Message (default build, F = 32) | Cause | Fix |
+|---|---|---|
+| `Decor exp on (-16, 16): h term 0 (dealer side, v in [-8, 24]) reaches 2.651e+10, beyond the fixed-point range 2.147e+09 (MPC_NBIT_K - MPC_NBIT_F - 1 = 31 integer bits); narrow the interval or use another method` | a value the protocol encodes (here a power of $e$ on the dealer's side) leaves the fixed-point range, $2^{K-F-1}$ | narrow the interval (exp up to about ±14 at F = 32), or use a 256-bit build (F = 64) |
+| `Decor sigmoid on (-14, 14): the combiner's denominator falls to 8.31e-07, below the division's smallest divisor 9.54e-07 (2^-(F - 12)); narrow the interval or use another method` | sigmoid's or tanh's denominator gets too small to divide by on this interval | narrow the interval (sigmoid up to about ±12.3 at F = 32, tanh about ±6.5) |
+| `Decor <function> on <interval>: the estimated worst-case error <bound> exceeds the tolerance <tolerance> times <scale> (max(1, max |f|) on the interval); narrow the interval, pass a larger tolerance or use another method` | `decor_error_bound` exceeds `tolerance` times $\max(1, \max \lvert f \rvert)$ on the interval | narrow the interval, pass a larger `tolerance`, or use another method |
+| `nonlinear.exp (chebyshev) on (-20, 20): Clenshaw's intermediates reach 4.411e+09, beyond the fixed-point range 2.147e+09; narrow the interval or lower the degree` | the Chebyshev coefficients are too large for this interval and degree | narrow the interval or lower the degree |
+| `nonlinear.sin: Decor's sin takes no interval`, `nonlinear.sin: clip applies to functions on an interval (Decor's sin takes none)`, `nonlinear.sin: Decor takes no degree` | Decor's sin, cos, tan and cot take any input (inv any admissible divisor), and Decor takes no degree | drop the argument, or pick a polynomial method |
+| `nonlinear.sigmoid: the auto method picks the Chebyshev degree on field shares itself (method chebyshev takes a degree)` | sigmoid's and tanh's default, `"auto"`, chooses the degree of its field interpolant from Decor's error bound | drop the degree, or pass `method="chebyshev"` with it |
+| `nonlinear.exp: the Taylor method takes no default interval (a Taylor polynomial is accurate near its centre only): pass one` | Taylor without an interval | pass an interval that suits the series (well inside its radius around the centre) |
+| `via_chebyshev (naive) of degree 44 on (-8, 8): the estimated worst-case error 8.36 exceeds the tolerance 0.000244 ...`, `... the powers or the sum reach ...`, `... the scaling to [-1, 1] errs by up to ...` | the secure-powers evaluation of a Chebyshev or Taylor polynomial: large monomial coefficients, powers of a half-width above 1, or a very wide interval | lower the degree, narrow the interval, or use Clenshaw (Chebyshev) or Decor's evaluation |
+| `via_decor: cannot run inside MPCEnv.delayed_truncation(): its internal truncations cannot be deferred` | division, square root, Decor and Chebyshev's recurrence truncate internally | call them outside the `delayed_truncation()` block |
+
+Inputs outside the interval do not raise: with `clip=False` they give method-dependent results (for example, Decor's
+bounded functions give $f(x - kp)$ on secure types). Pass `clip=True` when inputs may leave the interval. The
+Chebyshev method checks only its range, not its accuracy: an interval that reaches a singularity (log on (0, 8)) is
+accepted, and the interpolant is inaccurate near it.
 
 ---
 

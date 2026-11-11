@@ -18,7 +18,7 @@ from utils import double_to_fp
 
 from sequre.stdlib.fp import fp_div, fp_sqrt
 from sequre.stdlib.builtin import sign
-from sequre.constants import mpc_uint, ENC_COL, ENC_DIAG
+from sequre.constants import mpc_uint, MPC_NBIT_F, MPC_NBIT_K, MPC_MODULUS_BITS, ENC_COL, ENC_DIAG
 from sequre.decorators import flatten
 from sequre.attributes import sequre
 
@@ -326,6 +326,18 @@ def pow_wrapper(mpc, x, p):
     return sv
 
 
+def _trunc_public(value, modulus: mpc_uint, m: int = MPC_NBIT_F):
+    # Local truncation of a public fixed-point value (scalar, list or matrix) by m bits: values above modulus / 2 are
+    # negative, so they shift as -((modulus - v) >> m) (a plain >> would be wrong for them). Rounds toward zero.
+    if isinstance(value, list):
+        return [_trunc_public(e, modulus, m) for e in value]
+
+    if value > (modulus >> mpc_uint(1)):
+        q = (modulus - value) >> mpc_uint(m)
+        return modulus - q if q else mpc_uint(0)
+    return value >> mpc_uint(m)
+
+
 class InternalMPC:
     def evalp(mpc, x_, coefs_, exps_):
         assert isinstance(x_[0], Sharetensor), "Secure polynomial evaluation is enabled only for Sharetensor"
@@ -355,14 +367,23 @@ class InternalMPC:
         return sv
 
     def add(mpc, x, y):
-        if isinstance(x, float):
-            return InternalMPC.__add_public(mpc, x.to_fp(y.modulus), y, False)
+        # Public float vectors/matrices (Decor adds public evaluations at the opened point): fixed-point encoded, added
+        # once (at the hub) to a fixed-point tensor.
+        if isinstance(x, Sharetensor) and (isinstance(y, List[float]) or isinstance(y, List[List[float]])):
+            x_fp = x.to_fp()
+            if x_fp.public:
+                return InternalMPC.__public_plus_floats(x_fp, y)
+            return InternalMPC.__add_public(mpc, y.to_fp(x_fp.modulus), x_fp, False)
+        elif isinstance(y, Sharetensor) and (isinstance(x, List[float]) or isinstance(x, List[List[float]])):
+            return InternalMPC.add(mpc, y, x)
+        elif isinstance(x, float):
+            return InternalMPC.__plus_constant(mpc, x.to_fp(y.modulus), y)
         elif isinstance(y, float):
-            return InternalMPC.__add_public(mpc, y.to_fp(x.modulus), x, False)
+            return InternalMPC.__plus_constant(mpc, y.to_fp(x.modulus), x)
         elif isinstance(x, int):
-            return InternalMPC.__add_public(mpc, x.to_fp(y.modulus) if y.fp else mpc_uint(x), y, False)
+            return InternalMPC.__plus_constant(mpc, x.to_fp(y.modulus) if y.fp else mpc_uint(x), y)
         elif isinstance(y, int):
-            return InternalMPC.__add_public(mpc, y.to_fp(x.modulus) if x.fp else mpc_uint(y), x, False)
+            return InternalMPC.__plus_constant(mpc, y.to_fp(x.modulus) if x.fp else mpc_uint(y), x)
         elif isinstance(x, Sharetensor[list[list[mpc_uint]]]) and isinstance(y, Sharetensor[list[mpc_uint]]):
             return x.broadcast_add(y)
         elif isinstance(x, Sharetensor[list[mpc_uint]]) and isinstance(y, Sharetensor[mpc_uint]):
@@ -370,6 +391,8 @@ class InternalMPC:
         else:
             if not x.is_public() and not y.is_public():
                 return x + y
+            elif x.is_public() and y.is_public():
+                return InternalMPC.__public_sum(x, y.share)
             elif x.is_public():
                 return InternalMPC.__add_public(mpc, x.share, y, x.diagonal)
             elif y.is_public():
@@ -378,14 +401,24 @@ class InternalMPC:
             raise ValueError("Invalid type of addends in secure add")
 
     def sub(mpc, x, y):
-        if isinstance(x, float):
-            return InternalMPC.__add_public(mpc, x.to_fp(y.modulus), -y, False)
+        if isinstance(x, Sharetensor) and (isinstance(y, List[float]) or isinstance(y, List[List[float]])):
+            x_fp = x.to_fp()
+            if x_fp.public:
+                return InternalMPC.__public_plus_floats(x_fp, -y)
+            return InternalMPC.__add_public(mpc, (-y).to_fp(x_fp.modulus), x_fp, False)
+        elif isinstance(y, Sharetensor) and (isinstance(x, List[float]) or isinstance(x, List[List[float]])):
+            y_fp = y.to_fp()
+            if y_fp.public:
+                return InternalMPC.__public_plus_floats(-y_fp, x)
+            return InternalMPC.__add_public(mpc, x.to_fp(y_fp.modulus), -y_fp, False)
+        elif isinstance(x, float):
+            return InternalMPC.__plus_constant(mpc, x.to_fp(y.modulus), -y)
         elif isinstance(y, float):
-            return InternalMPC.__add_public(mpc, (-y).to_fp(x.modulus), x, False)
+            return InternalMPC.__plus_constant(mpc, (-y).to_fp(x.modulus), x)
         elif isinstance(x, int):
-            return InternalMPC.__add_public(mpc, x.to_fp(y.modulus) if y.fp else mpc_uint(x), -y, False)
+            return InternalMPC.__plus_constant(mpc, x.to_fp(y.modulus) if y.fp else mpc_uint(x), -y)
         elif isinstance(y, int):
-            return InternalMPC.__add_public(mpc, (-y).to_fp(x.modulus) if x.fp else (x.modulus - y), x, False)
+            return InternalMPC.__plus_constant(mpc, (-y).to_fp(x.modulus) if x.fp else (x.modulus - y), x)
         elif isinstance(x, Sharetensor[list[list[mpc_uint]]]) and isinstance(y, Sharetensor[list[mpc_uint]]):
             return x.broadcast_add(-y)
         elif isinstance(x, Sharetensor[list[mpc_uint]]) and isinstance(y, Sharetensor[mpc_uint]):
@@ -393,6 +426,8 @@ class InternalMPC:
         else:
             if not x.is_public() and not y.is_public():
                 return x + (-y)
+            elif x.is_public() and y.is_public():
+                return InternalMPC.__public_sum(x, y.share.neg_mod(x.modulus))
             elif x.is_public():
                 return InternalMPC.__add_public(mpc, x.share, -y, x.diagonal)
             elif y.is_public():
@@ -401,18 +436,51 @@ class InternalMPC:
             raise ValueError("Invalid type of addends in sub")
 
     def mul(mpc, x, y):
-        if isinstance(y, float):
+        if isinstance(x, Sharetensor) and (isinstance(y, List[float]) or isinstance(y, List[List[float]])):
+            # Element-wise scaling by a public float vector/matrix (Decor's public evaluations)
+            modulus = x.modulus
+            c_share = x.share.mul_mod(double_to_fp(y, modulus), modulus)
+
+            if x.is_fp() and x.public:
+                c_share = _trunc_public(c_share, modulus)
+            elif x.is_fp():
+                c_share = mpc.fp.trunc(c_share, modulus)
+
+            sv = Sharetensor(c_share, modulus)
+            sv.fp = True
+            sv.public = x.public
+            return sv
+        elif isinstance(y, Sharetensor) and (isinstance(x, List[float]) or isinstance(x, List[List[float]])):
+            return InternalMPC.mul(mpc, y, x)
+        elif isinstance(x, float):
+            return InternalMPC.mul(mpc, y, x)
+        elif isinstance(y, float):
             y_fp = double_to_fp(y, x.modulus)
             sv = x * y_fp
             # TODO: #117 Implement clever joint truncations pattern matcher
-            if x.is_fp(): sv = sv.trunc(mpc.fp)
+            if x.is_fp():
+                if x.public:
+                    sv = Sharetensor(_trunc_public(sv.share, x.modulus), x.modulus)
+                else:
+                    sv = sv.trunc(mpc.fp)
             sv.fp = True
+            sv.public = x.public
             return sv
         else:
             if x.public or y.public:
-                c_share = x.share.mul_mod(y.share, x.modulus if y.public else y.modulus)
-                sv = Sharetensor(c_share, x.modulus if y.public else y.modulus)
+                # A public operand multiplies each share locally. Two fixed-point factors leave the product at scale
+                # 2^(2F): a secret product needs the truncation protocol, a public one (both factors public) a local
+                # signed shift (M-MPC-08).
+                modulus = x.modulus if y.public else y.modulus
+                c_share = x.share.mul_mod(y.share, modulus)
+                if x.is_fp() and y.is_fp():
+                    if x.public and y.public:
+                        c_share = _trunc_public(c_share, modulus)
+                    else:
+                        c_share = mpc.fp.trunc(c_share, modulus)
+                sv = Sharetensor(c_share, modulus)
                 sv.fp = x.is_fp() or y.is_fp()
+                sv.public = x.public and y.public
                 return sv
             
             assert x.modulus == y.modulus, f"Non-matching moduli for factors: {x.modulus} != {y.modulus}"
@@ -452,63 +520,152 @@ class InternalMPC:
         # Resolve issue #26 and change code below in order to fix this.
         if isinstance(y, float) or isinstance(y, int):
             sv = x * double_to_fp(1.0 / y, x.modulus)
-            if x.is_fp(): sv = sv.trunc(mpc.fp)
+            if x.is_fp():
+                if x.public:
+                    sv = Sharetensor(_trunc_public(sv.share, x.modulus), x.modulus)
+                else:
+                    sv = sv.trunc(mpc.fp)
             sv.fp = True
+            sv.public = x.public
             return sv
         else:
             # TODO: Efficiently calculate beaver partitions of sv here
             return fp_div(mpc, x, y)
     
-    def gt(mpc, x, y):
-        # TODO: #26 Currently does not work for complex algebraic structures.
-        # Resolve issue #26 and change code below in order to fix this.
-        if isinstance(y, int) or isinstance(y, TP):
-            modulus = x.modulus
-            if y == 0:
-                return Sharetensor(mpc.boolean.is_positive(x.share, modulus), modulus)
+    def __as_shares(mpc, x):
+        # A public tensor holds its value at every party; as a comparison operand it becomes a sharing held by the hub
+        # (CP1, where add_public adds) with zeros elsewhere, so the difference and the sign test count it once
+        if not x.public:
+            return x
+        sv = Sharetensor(x.share if mpc.pid == 1 else x.share.zeros(), x.modulus)
+        sv.fp = x.fp
+        return sv
 
-            return Sharetensor(mpc.boolean.greater_than_public(x.share, TP(y), modulus), modulus)
-        elif isinstance(y, float):
-            modulus = x.modulus
-            return Sharetensor(mpc.boolean.greater_than_public(x.to_fp().share, double_to_fp(y, modulus), modulus), modulus)
+    def __fp_constant(c: float, modulus: TP, scaled_integers: bool):
+        # (fixed-point encoding of a public constant, wide). Against fixed-point values (|x| < 2^(K - F - 1)) a constant
+        # beyond that range is clamped to +-2^(K - F) exactly, which leaves every in-range comparison as it is
+        # (double_to_fp would saturate it and lose its sign), and the difference is wide. Against integer shares scaled
+        # into fixed point (values up to about 2^(L - F - 2)) it is encoded over L - 1 bits, exactly below
+        # 2^(L - F - 2) and clamped beyond, and the difference is always wide.
+        if scaled_integers:
+            wide_bound = 2.0 ** (MPC_MODULUS_BITS - MPC_NBIT_F - 2)
+            if c >= wide_bound or c <= -wide_bound:
+                w = TP(1) << TP(MPC_MODULUS_BITS - 2)
+                if c > 0:
+                    return w, True
+                return (modulus - w) % modulus, True
+            return double_to_fp(c, modulus, k=MPC_MODULUS_BITS - 1), True
+        bound = 2.0 ** (MPC_NBIT_K - MPC_NBIT_F - 1)
+        if c >= bound or c <= -bound:
+            v = TP(1) << TP(MPC_NBIT_K)
+            if c > 0:
+                return v, True
+            return (modulus - v) % modulus, True
+        return double_to_fp(c, modulus), False
+
+    def __minus_public(mpc, s, c, reverse: bool):
+        # (s - c, wide), or (c - s, wide) if reverse, for a Sharetensor s (not public) and a public constant c: an int,
+        # a float or a raw TP. A raw TP stays raw; an int meets integer shares raw and fixed-point ones in fixed point
+        # (H-10); a float puts integer shares in fixed point first. Negative constants are reduced mod the
+        # modulus (M-MPC-10's comparison part). Other constant types are refused (they would be mis-scaled).
+        modulus = s.modulus
+        if isinstance(c, TP):
+            enc = c % modulus
+            magnitude = enc if enc <= (modulus >> TP(1)) else modulus - enc
+            wide = s.is_fp() and magnitude >= (TP(1) << TP(MPC_NBIT_K - 1))
+        elif isinstance(c, int):
+            if s.is_fp():
+                enc, wide = InternalMPC.__fp_constant(float(c), modulus, False)
+            else:
+                enc, wide = c.to_int_t(modulus), False
+        elif isinstance(c, float):
+            if s.is_fp():
+                enc, wide = InternalMPC.__fp_constant(c, modulus, False)
+            else:
+                s = s.to_fp()
+                enc, wide = InternalMPC.__fp_constant(c, modulus, True)
         else:
-            assert x.modulus == y.modulus
-            modulus = x.modulus
-            return Sharetensor(mpc.boolean.greater_than(x.share, y.share, modulus), modulus)
-        
-        # TODO: Efficiently calculate beaver partitions of sv here
+            compile_error("Sequre comparison: a public operand must be an int, a float or an mpc_uint")
+        if reverse:
+            share = mpc.arithmetic.add_public(s.share.zeros().sub_mod(s.share, modulus), enc, modulus)
+        else:
+            share = mpc.arithmetic.add_public(s.share, (modulus - enc) % modulus, modulus)
+        d = Sharetensor(share, modulus)
+        d.fp = s.fp
+        return d, wide
+
+    def __difference(mpc, x, y):
+        # (x - y, wide) for a comparison; x or y is a Sharetensor, the other a Sharetensor or a public int, float or
+        # raw TP. Public tensors count once (__as_shares). Fixed point on either side puts both in fixed point: int and
+        # float constants are encoded in fixed point (H-10), non-fixed-point Sharetensors scaled. wide: the difference
+        # may leave the K + 1 bits of two fixed-point values (an integer operand scaled into fixed point, or a constant
+        # beyond the fixed-point range), so the ring's sign test takes the modulus' L bits.
+        if isinstance(x, Sharetensor) and isinstance(y, Sharetensor):
+            xs = InternalMPC.__as_shares(mpc, x)
+            ys = InternalMPC.__as_shares(mpc, y)
+            if xs.is_fp() != ys.is_fp():
+                return InternalMPC.sub(mpc, xs.to_fp(), ys.to_fp()), True
+            return InternalMPC.sub(mpc, xs, ys), False
+        elif isinstance(x, Sharetensor):
+            return InternalMPC.__minus_public(mpc, InternalMPC.__as_shares(mpc, x), y, False)
+        else:
+            return InternalMPC.__minus_public(mpc, InternalMPC.__as_shares(mpc, y), x, True)
+
+    def __positive_share(mpc, d, wide: bool):
+        # Shares of [d > 0] (strict: 0 gives 0). Ring: the ring sign test over K + 1 bits for a fixed-point d (any
+        # difference of two fixed-point values), K + F + 1 inside MPCEnv.delayed_truncation() (products keep scale
+        # 2^(2F) there), the modulus' L bits for integers and wide differences. Field: is_positive.
+        modulus = d.modulus
+        if modulus.popcnt() == 1:
+            if wide or not d.is_fp():
+                return mpc.bitwise.sign_ring(d.share, modulus, bits=MPC_MODULUS_BITS)
+            elif mpc.fp.truncation_allowed():
+                return mpc.bitwise.sign_ring(d.share, modulus, bits=MPC_NBIT_K + 1)
+            else:
+                return mpc.bitwise.sign_ring(d.share, modulus, bits=MPC_NBIT_K + MPC_NBIT_F + 1)
+        return mpc.boolean.is_positive(d.share, modulus)
+
+    def __ne_ring(mpc, flat, fp: bool, wide: bool, modulus):
+        # [d != 0] for a list of ring shares of d: [d > 0] + [-d > 0] from one sign test of the concatenation
+        n = len(flat)
+        both = flat.copy()
+        both.extend(flat.zeros().sub_mod(flat, modulus))
+        both_st = Sharetensor(both, modulus)
+        both_st.fp = fp
+        signs = InternalMPC.__positive_share(mpc, both_st, wide)
+        return signs[:n].add_mod(signs[n:], modulus)
+
+    def gt(mpc, x, y):
+        # [x > y] as 0/1 integer shares, on both moduli (H-10, H-12); x or y is a Sharetensor, the other may be a public
+        # int, float or raw TP
+        d, wide = InternalMPC.__difference(mpc, x, y)
+        return Sharetensor(InternalMPC.__positive_share(mpc, d, wide), d.modulus)
 
     def lt(mpc, x, y):
-        # TODO: #26 Currently does not work for complex algebraic structures.
-        # Resolve issue #26 and change code below in order to fix this.
-        if isinstance(y, int) or isinstance(y, TP):
-            modulus = x.modulus
-            if y == 0:
-                return Sharetensor(mpc.boolean.is_positive(x.share.neg_mod(modulus), modulus), modulus)
-            
-            return Sharetensor(mpc.boolean.less_than_public(x.share, TP(y), modulus), modulus)
-        elif isinstance(y, float):
-            modulus = x.modulus
-            return Sharetensor(mpc.boolean.less_than_public(x.to_fp().share, double_to_fp(y, modulus), modulus), modulus)
-        else:
-            assert x.modulus == y.modulus
-            modulus = x.modulus
-            return Sharetensor(mpc.boolean.less_than(x.share, y.share, modulus), modulus)
-        
-        # TODO: #23 Efficiently calculate beaver partitions of sv here
-    
+        # [x < y] = [y - x > 0]
+        d, wide = InternalMPC.__difference(mpc, y, x)
+        return Sharetensor(InternalMPC.__positive_share(mpc, d, wide), d.modulus)
+
     def eq(mpc, x, y):
         return InternalMPC.sub(mpc, 1, InternalMPC.ne(mpc, x, y))
-    
-    def ne(mpc, x, y):
-        if x.modulus.popcnt() == 1:
-            # TODO: #158 Make comparisons stable on rings.
-            l = InternalMPC.gt(mpc, InternalMPC.sub(mpc, x, y), 0)
-            r = InternalMPC.gt(mpc, InternalMPC.sub(mpc, y, x), 0)
-            return InternalMPC.add(mpc, l, r)
 
-        sub = InternalMPC.sub(mpc, x, y)
-        return InternalMPC.gt(mpc, InternalMPC.mul(mpc, sub, sub), 0)
+    def ne(mpc, x, y):
+        d, wide = InternalMPC.__difference(mpc, x, y)
+        modulus = d.modulus
+        if modulus.popcnt() == 1:
+            # [d > 0] + [-d > 0] from one sign test of (d, -d)
+            if isinstance(d.share, TP):
+                res = InternalMPC.__ne_ring(mpc, [d.share], d.fp, wide, modulus)
+                return Sharetensor(res[0], modulus)
+            elif isinstance(d.share, list[list]):
+                res = InternalMPC.__ne_ring(mpc, d.share.flatten(), d.fp, wide, modulus)
+                return Sharetensor(res.reshape(d.shape), modulus)
+            else:
+                return Sharetensor(InternalMPC.__ne_ring(mpc, d.share, d.fp, wide, modulus), modulus)
+
+        # Field: the squared difference against 0 (unchanged: wrong when d^2 leaves the field comparison's range,
+        # |d| >= about 2^47.5 raw units, and for fixed-point differences below about 2^(-F/2), which square to 0)
+        return InternalMPC.gt(mpc, InternalMPC.mul(mpc, d, d), 0)
 
     def sqrt_inv(mpc, x, y):
         # TODO: #26 Currently does not work for complex algebraic structures.
@@ -639,6 +796,31 @@ class InternalMPC:
 
         raise NotImplementedError(f'Distribution {name} not implemented yet.')
     
+    def __plus_constant(mpc, c, y):
+        # A public constant (encoded) plus y: added once (at the hub) to shares; added at every party to a public tensor,
+        # which stays public (each party holds the whole value)
+        if y.public:
+            sv = Sharetensor(y.share.add_mod(c, y.modulus), y.modulus)
+            sv.fp = y.fp
+            sv.public = True
+            return sv
+        return InternalMPC.__add_public(mpc, c, y, False)
+
+    def __public_sum(x, other_share):
+        # Two public tensors (every party holds both values): added at every party, and the sum stays public (adding x
+        # once at the hub to a public y gave x + n_cp y)
+        sv = Sharetensor(x.share.add_mod(other_share, x.modulus), x.modulus)
+        sv.fp = x.fp
+        sv.public = True
+        return sv
+
+    def __public_plus_floats(x, y):
+        # A public tensor holds its value at every party: the constant goes to every party, and the sum stays public.
+        sv = Sharetensor(x.share.add_mod(y.to_fp(x.modulus), x.modulus), x.modulus)
+        sv.fp = True
+        sv.public = True
+        return sv
+
     def __add_public(mpc, x_public, y, diagonal):
         share = y.share
         modulus = y.modulus

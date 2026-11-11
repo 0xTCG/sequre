@@ -120,6 +120,73 @@ assert MPC_SECOND_FIELD_SIZE < 128, "Second field size must be less than 128"
 assert MPC_THIRD_FIELD_SIZE < 128, "Third field size must be less than 128"
 assert MPC_NBIT_K + MPC_NBIT_F + MPC_NBIT_V + 2 < MPC_MODULUS_BITS, "FP config overflows the size of modulus."
 
+# Bitwise (XOR) shared MPC (mpc/bitwise.codon). The bits of a shared value are packed into registers of PACKING_SIZE
+# bits, so one bitwise operation on a size_t covers PACKING_SIZE secret bits. PACKING_SIZE equals MPC_NBIT_K, so a
+# fixed-point value's K bits fit one register (64 bits in the 128- and 192-bit builds, 128 in the 256-bit build).
+PACKING_SIZE: Static[int] = MPC_NBIT_K
+size_t = UInt[PACKING_SIZE]
+
+# Decor
+# Mask selecting the fractional bits of a fixed-point value.
+FBITS_MASK = (mpc_uint(1) << mpc_uint(MPC_NBIT_F)) - mpc_uint(1)
+# Decor compares values in [0, 1) over a reduced ring of MPC_NBIT_F + 1 bits: the fractional bits plus a sign bit.
+MPC_DECOR_MODULUS_BITS: Static[int] = MPC_NBIT_F + 1
+MPC_DECOR_RING_SIZE = mpc_uint(1) << mpc_uint(MPC_DECOR_MODULUS_BITS)
+# Decor division: methods and default iteration counts. The initial estimate 5b^2 - 10b + 5.943 of 1/b on [0.25, 1)
+# has a relative error of at most 0.107, and each iteration squares it: 0.107^(2^n) < 2^-(F + 1) needs n = 4 at F = 32
+# and n = 5 at F = 64. Goldschmidt's two products per iteration are independent and share their rounds (2 per
+# iteration, Newton's dependent pair 4): 49 rounds per inverse at the defaults (a division x / y adds the product with
+# x and its truncation: 51), Newton 55, both within a few units of 2^-F.
+DECOR_NEWTON_METHOD: Static[str] = "newton"
+DECOR_GOLDSCHMIDT_METHOD: Static[str] = "goldschmidt"
+DECOR_DIV_DEFAULT_METHOD: Static[str] = DECOR_GOLDSCHMIDT_METHOD
+DECOR_DIV_DEFAULT_NITER: Static[int] = 4 if MPC_NBIT_F <= 32 else 5
+# Combiner of Decor's sigmoid and tanh: "select" (the logistic / tanh addition theorems: select the opened branch, one
+# product, a division by a positive denominator) or "exp" (Decor exp, then the inverse of 1 + e^-x).
+DECOR_SIGMOID_COMBINER: Static[str] = "select"
+# Fourier terms whose two coefficients are both below one unit of the fixed-point encoding are dropped (no dealer
+# randomness, no local work).
+DECOR_FOURIER_EPSILON: float = 2.0 ** -float(MPC_NBIT_F)
+# Decor's admissibility check raises when the estimated worst-case error of a bounded function on its interval exceeds
+# DECOR_TOLERANCE times max(1, max |f| on the interval): at least F/2 - 4 correct bits relative to the function's scale
+# (2.4e-4 at F = 32, 3.7e-9 at F = 64). via_decor takes a per-call tolerance.
+DECOR_TOLERANCE: float = 2.0 ** -float(MPC_NBIT_F // 2 - 4)
+
+# Default Decor intervals per function. F = 32 (a numerics study, 400 points, ring and field alike): max abs error
+# on these (typical runs) exp 3e-5 (relative 1e-8 at e^8), sigmoid 4e-6, tanh 3e-6, sinh/cosh 2e-6; decor_error_bound
+# gives 4.9e-5, 2.6e-5, 1.3e-5 and 5.3e-6. Wider intervals lose precision; the check admits at F = 32 symmetric widths
+# up to |b| ~ 14 for exp and ~ 11 for sinh/cosh (fixed-point range), ~ 12.3 for sigmoid and ~ 6.5 for tanh (tolerance).
+# F = 64 (256-bit build): from the error bound, which a plaintext simulation of the protocol's arithmetic confirms;
+# the plaintext evaluations in double precision (2^-52) cap the precision there. The 256-bit build passes the decor,
+# bitwise, activations and nonlinear tests on both moduli, whose tolerances come from these bounds.
+DECOR_INTERVAL_EXP = (-8.0, 8.0) if MPC_NBIT_F <= 32 else (-20.0, 20.0)
+DECOR_INTERVAL_SIGMOID = (-10.0, 10.0) if MPC_NBIT_F <= 32 else (-15.0, 15.0)
+DECOR_INTERVAL_TANH = (-5.0, 5.0) if MPC_NBIT_F <= 32 else (-8.0, 8.0)
+DECOR_INTERVAL_SINH = (-5.0, 5.0) if MPC_NBIT_F <= 32 else (-8.0, 8.0)
+
+# Nonlinear-function methods, and the evaluation of a polynomial (Chebyshev, Taylor)
+METHOD_DECOR: Static[str] = "decor"
+METHOD_CHEBYSHEV: Static[str] = "chebyshev"
+METHOD_FOURIER: Static[str] = "fourier"
+METHOD_TAYLOR: Static[str] = "taylor"
+# sigmoid's and tanh's default: Decor on ring shares, a Chebyshev interpolant within Decor's error bound (at least
+# NONLINEAR_AUTO_FLOOR) on field shares
+METHOD_AUTO: Static[str] = "auto"
+POLY_EVAL_CLENSHAW: Static[str] = "clenshaw"
+POLY_EVAL_DECOR: Static[str] = "decor"
+POLY_EVAL_NAIVE: Static[str] = "naive"
+# sequre.stdlib.nonlinear: default degrees of the Fourier and Taylor methods (Chebyshev's is CHEBYSHEV_DEGREE), and the
+# width W of softmax's exponent interval (-W, 0] (below -W it saturates at e^-W; e^-16 = 1.1e-7)
+NONLINEAR_FOURIER_DEGREE: int = 16
+NONLINEAR_TAYLOR_DEGREE: int = 8
+NONLINEAR_SOFTMAX_WIDTH: float = 16.0
+# The highest Chebyshev degree the auto method may pick on field shares (it refuses an interval that needs more), and
+# the floor of its truncation target: half of max(decor_error_bound, NONLINEAR_AUTO_FLOOR). Double-precision
+# coefficients carry about 1e-15 each, so a target far below 2^-44 is out of reach (F = 64 on narrow intervals, where
+# Decor's bound falls below 1e-15)
+NONLINEAR_AUTO_MAX_DEGREE: int = 512
+NONLINEAR_AUTO_FLOOR: float = 2.0 ** -44
+
 # Echo MPC config
 print(f"MPC config:\n\tMPC Galois field / Z_(2^k) ring size: {MPC_MODULUS_BITS} bits")
 
@@ -246,6 +313,10 @@ class _RUN_TOGGLES:
     IR_PASSES_TEST_FLAG: str = "--ir-passes"
     STDLIB_BUILTIN_TEST_FLAG: str = "--stdlib-builtin"
     BOOTSTRAPPING_TEST_FLAG: str = "--bootstrapping"
+    BITWISE_TEST_FLAG: str = "--bitwise"
+    DECOR_TEST_FLAG: str = "--decor"
+    NONLINEAR_TEST_FLAG: str = "--nonlinear"
+    ACTIVATIONS_TEST_FLAG: str = "--activations"
 
     LATTISEQ_FLAG: str = "--lattiseq"
     LATTISEQ_MULT3_FLAG: str = "--lattiseq-mult3"
@@ -263,6 +334,8 @@ class _RUN_TOGGLES:
     GWAS_W_NORM_FLAG: str = "--gwas-with-norm"
     GWAS_WO_NORM_FLAG: str = "--gwas-without-norm"
     DTI_FLAG: str = "--dti"
+    SIREN_FLAG: str = "--siren"
+    GWAS_LOGREG_FLAG: str = "--gwas-logreg"
     OPAL_FLAG: str = "--opal"
     GANON_FLAG: str = "--ganon"
     GENOTYPE_IMPUTATION_FLAG: str = "--genotype-imputation"
@@ -299,9 +372,35 @@ MI_STOCHASTIC_MODE: Static[str] = "stochastic"
 ## Activations
 RELU_ACTIVATION: Static[str] = "relu"
 LINEAR_ACTIVATION: Static[str] = "linear"
+ASIGMOID_ACTIVATION: Static[str] = "asigmoid"
+SIGMOID_ACTIVATION: Static[str] = "sigmoid"
+TANH_ACTIVATION: Static[str] = "tanh"
+EXP_ACTIVATION: Static[str] = "exp"
+SIN_ACTIVATION: Static[str] = "sin"
+COS_ACTIVATION: Static[str] = "cos"
+TAN_ACTIVATION: Static[str] = "tan"
+COT_ACTIVATION: Static[str] = "cot"
+SINH_ACTIVATION: Static[str] = "sinh"
+COSH_ACTIVATION: Static[str] = "cosh"
+LEAKY_RELU_ACTIVATION: Static[str] = "leaky_relu"
+HARDTANH_ACTIVATION: Static[str] = "hardtanh"
+RELU6_ACTIVATION: Static[str] = "relu6"
+GELU_ACTIVATION: Static[str] = "gelu"
+SILU_ACTIVATION: Static[str] = "silu"
+SOFTMAX_ACTIVATION: Static[str] = "softmax"
+ERF_ACTIVATION: Static[str] = "erf"
+LEAKY_RELU_SLOPE: float = 0.01
+# gelu's tanh form (Hendrycks and Gimpel): 0.5 x (1 + tanh(GELU_ALPHA (x + GELU_BETA x^3))), GELU_ALPHA = sqrt(2 / pi)
+GELU_ALPHA: float = 0.7978845608028654
+GELU_BETA: float = 0.044715
 
 ## Losses
 HINGE_LOSS: Static[str] = "hinge"
+MSE_LOSS: Static[str] = "mse"
+BCE_LOSS: Static[str] = "binary_crossentropy"
+CCE_LOSS: Static[str] = "categorical_crossentropy"
+# The log in the cross-entropies runs on this interval by default (predictions are clipped into it): log(1e-4) = -9.2
+LOSS_LOG_INTERVAL = (0.0001, 1.0)
 
 ## Optimizers
 BGD_OPTIMIZER: Static[str] = "bgd"
@@ -319,10 +418,36 @@ ONES_INITIALIZER: Static[str] = ONES_DISTRIBUTION
 ## Supported methods
 SUPPORTED_ACTIVATIONS = [
     RELU_ACTIVATION,
-    LINEAR_ACTIVATION
+    LINEAR_ACTIVATION,
+    ASIGMOID_ACTIVATION,
+    SIGMOID_ACTIVATION,
+    TANH_ACTIVATION,
+    EXP_ACTIVATION,
+    SIN_ACTIVATION,
+    COS_ACTIVATION,
+    TAN_ACTIVATION,
+    COT_ACTIVATION,
+    SINH_ACTIVATION,
+    COSH_ACTIVATION,
+    LEAKY_RELU_ACTIVATION,
+    HARDTANH_ACTIVATION,
+    RELU6_ACTIVATION,
+    GELU_ACTIVATION,
+    SILU_ACTIVATION,
+    SOFTMAX_ACTIVATION,
+    ERF_ACTIVATION
 ]
 SUPPORTED_LOSSES = [
-    HINGE_LOSS
+    HINGE_LOSS,
+    MSE_LOSS,
+    BCE_LOSS,
+    CCE_LOSS
+]
+# The evaluation methods a layer or LogReg can store (a runtime string; sequre.stdlib.nonlinear takes them as
+# compile-time strings)
+SUPPORTED_ML_METHODS = [
+    METHOD_DECOR,
+    METHOD_CHEBYSHEV
 ]
 SUPPORTED_OPTIMIZERS = [
     BGD_OPTIMIZER,

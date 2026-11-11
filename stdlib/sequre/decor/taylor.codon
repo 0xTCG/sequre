@@ -1,0 +1,87 @@
+""" Taylor polynomials, evaluated through Decor's polynomial decomposition or by secure powers.
+
+Coefficients come from closed-form derivatives keyed by function name (functions.derivatives): no finite differences,
+no degree cap. A Taylor polynomial is accurate near its pivot (the interval's centre) only.
+"""
+
+from sequre.attributes import sequre
+from sequre.constants import POLY_EVAL_DECOR, POLY_EVAL_NAIVE, DECOR_TOLERANCE
+from sequre.stdlib.numpy.create import array
+
+from functions import taylor_coeffs, secure_powers, poly_eval
+from core import via_decor, _as_fp, _fp_tensor, _grid, _max_abs, FP_MAX, ULP
+
+
+@sequre
+def _centred(mpc, x, pivot: float):
+    return x - pivot
+
+
+def _naive_admit(label: str, coeffs: List[float], r: float, tolerance: float):
+    """
+    The naive evaluation's public check, at every party before any round, for sum_k c_k x^k with |x| <= r: the powers,
+    the coefficients and the sum must stay inside the fixed-point range, and the estimated worst-case error within
+    tolerance times max(1, max |p|) for |x| <= r. Each power truncates once more than the one before (up to 2 units of
+    2^-F, carried through the later products), each coefficient's encoding errs by up to a unit (times |x|^k), and the
+    sum truncates once: 2^-F (2 + sum_k r^k + 2 sum_k |c_k| sum_{j < k - 1} r^j).
+    """
+    err = 2.0
+    mag = 0.0
+    for k in range(len(coeffs)):
+        rk = r ** float(k)
+        mag += abs(coeffs[k]) * rk
+        carried = 0.0
+        for j in range(k - 1):
+            carried += r ** float(j)
+        err += rk + 2.0 * abs(coeffs[k]) * carried
+    err *= ULP
+    reach = max(max(1.0, r) ** float(len(coeffs) - 1), max(mag, _max_abs(coeffs)))
+    if not (reach < FP_MAX):
+        raise ValueError(
+            f"{label}: the powers or the sum reach {reach:.4g} for |x| <= {r:.4g}, beyond the fixed-point range "
+            f"{FP_MAX:.4g}; narrow the interval, lower the degree or use another evaluation")
+    scale = max(1.0, _max_abs([poly_eval(coeffs, t) for t in _grid(-r, r)]))
+    if not (err <= tolerance * scale):
+        raise ValueError(
+            f"{label}: the estimated worst-case error {err:.3g} exceeds the tolerance {tolerance:.3g} times {scale:.4g} "
+            f"(max(1, max |p|) for |x| <= {r:.4g}); lower the degree or use another evaluation")
+
+
+@sequre
+def _naive_polynomial(mpc, x, coeffs: List[float]):
+    # sum_k c_k x^k with x^k by repeated products (about 2 (degree - 1) rounds) and one truncation for the sum (a
+    # weighted sum of the powers' shares with the public coefficients, reduced mod the modulus); 1-D x
+    pows = secure_powers(mpc, x, len(coeffs) - 1)
+    return _fp_tensor(mpc.fp.weighted_sum([row for row in pows.share], coeffs, x.modulus), x.modulus)
+
+
+def via_taylor(mpc, x, func: Static[str], interval, degree: int, evaluation: Static[str] = POLY_EVAL_DECOR,
+               tolerance: float = DECOR_TOLERANCE):
+    """
+    func(x) by its degree-`degree` Taylor polynomial around the interval's centre. evaluation: "decor" (Decor's
+    polynomial decomposition: constant rounds, admissibility-checked against tolerance; see via_decor) or "naive"
+    (secure powers: about 2 degree rounds; refused before any round when the powers of the half-width r leave the
+    fixed-point range or the estimated error, 2^-F (2 + sum_k r^k + 2 sum_k |c_k| sum_{j < k - 1} r^j), exceeds
+    tolerance; for half-widths above 1 that grows like 2^-F r^degree, so Taylor inv on (0.5, 8) is admitted up to
+    degree 10 at F = 32, with an error of about 1e-4). func: sin, cos, exp, sinh, cosh, log, sqrt, inv, sigmoid, tanh,
+    tan, cot, erf. x: a 1-D or 2-D fixed-point Sharetensor (a public one as a sharing held by CP1). Refuses to run
+    inside MPCEnv.delayed_truncation().
+    """
+    mpc.fp.require_truncation("via_taylor")
+    lo, hi = float(interval[0]), float(interval[1])
+    pivot = (lo + hi) / 2.0
+    coeffs = taylor_coeffs(func, pivot, degree)
+    if evaluation == POLY_EVAL_NAIVE:
+        _naive_admit(f"via_taylor {func} (naive) on {(lo, hi)}", coeffs, (hi - lo) / 2.0, tolerance)
+    centred = _centred(mpc, _as_fp(mpc, x), pivot)
+
+    if evaluation == POLY_EVAL_DECOR:
+        return via_decor(mpc, centred, func="polynomial", interval=(lo - pivot, hi - pivot), coeffs=coeffs,
+                         tolerance=tolerance)
+    elif evaluation == POLY_EVAL_NAIVE:
+        if isinstance(centred.share, list[list]):
+            shape = centred.shape
+            return _naive_polynomial(mpc, centred.flatten(), coeffs).reshape(shape)
+        return _naive_polynomial(mpc, centred, coeffs)
+    else:
+        compile_error("via_taylor: unknown evaluation " + evaluation + " (decor or naive)")

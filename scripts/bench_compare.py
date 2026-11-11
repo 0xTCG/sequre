@@ -20,11 +20,15 @@ dealer, is never used; solo cases exist only on CP1). For each case:
 The witness column (`check`: an error against plaintext, a mismatch count, a fraction...) is compared too; a change
 of more than 30x, or between zero and non-zero, is listed as CHECK (a change in results, not in speed). A change of
 at least 0.5 garbage collections per repetition is shown in parentheses (allocation volume; informational only:
-collection counts also vary a little between runs of identical code).
+collection counts also vary a little between runs of identical code). A change in the openings per repetition (harness
+v4 files on both sides; comms.reveal and the bitwise reveals: collect/broadcast, agreement and MHE collective rounds
+are not counted) is listed as ROUNDS and in the closing summary: the counts are deterministic, so it is a change in
+the protocol's openings.
 
 --calibrate writes, per case, the run-to-run change of the median and of the minimum between two runs of the same
 code and noise_pct = max(|dmed|, |dmin|, se); compare reads it with --noise (default: results/bench/noise.tsv when
-present). Exit status: 0, or 1 with --fail-on-regression when a case regressed; 2 on bad input.
+present). Exit status: 0, or 1 with --fail-on-regression when a case regressed or opens more often per repetition; 2
+on bad input.
 """
 import argparse
 import json
@@ -138,6 +142,10 @@ SETTINGS = [("machine", "host"), ("machine", "cpu_model"), ("environment", "task
             ("sequre", "gc_parallel_by_party")]
 
 
+# Harness versions whose timings compare: v4 only appended the rounds_per_rep column.
+TIMING_EQUIVALENT_HARNESS = {"4": "3"}
+
+
 def settings_differences(mb, mc):
     """The SETTINGS that differ between two manifests, as 'key (base vs cand)' strings."""
     if not mb or not mc:
@@ -145,7 +153,11 @@ def settings_differences(mb, mc):
     out = []
     for section, key in SETTINGS:
         b, c = mb.get(section, {}).get(key), mc.get(section, {}).get(key)
-        if b != c:
+        if key == "harness_version":
+            same = TIMING_EQUIVALENT_HARNESS.get(str(b), str(b)) == TIMING_EQUIVALENT_HARNESS.get(str(c), str(c))
+        else:
+            same = b == c
+        if not same:
             out.append(f"{key} ({b} vs {c})")
     return out
 
@@ -157,7 +169,7 @@ def compare(base, cand, args):
     noise_path = args.noise if args.noise else (DEFAULT_NOISE if os.path.exists(DEFAULT_NOISE) else "")
     noise = load_noise(noise_path)
     common = ordered(c for c in set(tb) & set(tc) if in_selection(c, patterns))
-    regressions, faster, checks = [], [], []
+    regressions, faster, checks, rounds_changes, rounds_up = [], [], [], [], []
     lines = []
     for c in common:
         b, n = tb[c], tc[c]
@@ -179,11 +191,17 @@ def compare(base, cand, args):
             chk = f"CHECK {bench_tool.fmt_check(b['check'])} -> {bench_tool.fmt_check(n['check'])}"
             checks.append(c)
         note = chk
+        rb, rc = b.get("rounds_per_rep", float("nan")), n.get("rounds_per_rep", float("nan"))
+        if rb == rb and rc == rc and abs(rc - rb) > 1e-9:
+            note = (note + " " if note else "") + f"ROUNDS {bench_tool.fmt_count(rb)} -> {bench_tool.fmt_count(rc)}"
+            rounds_changes.append(f"{c} ({bench_tool.fmt_count(rb)} -> {bench_tool.fmt_count(rc)})")
+            if rc > rb:
+                rounds_up.append(c)
         gcb, gcc = b.get("gc_per_rep", float("nan")), n.get("gc_per_rep", float("nan"))
         if gcb == gcb and gcc == gcc and abs(gcc - gcb) >= 0.5:
             # informational: collection counts also vary between runs of identical code (small MPC heaps)
             note = (note + " " if note else "") + f"(gc/rep {gcb:.2g} -> {gcc:.2g})"
-        if args.changed and verdict == "~" and not chk:
+        if args.changed and verdict == "~" and not chk and "ROUNDS" not in note:
             continue
         lines.append(f"{c:<36} {bench_tool.fmt_time(b['median_s']):>11} {bench_tool.fmt_time(n['median_s']):>11} {dmed:>+7.1f} "
                      f"{bench_tool.fmt_time(b['min_s']):>11} {bench_tool.fmt_time(n['min_s']):>11} {dmin:>+7.1f} "
@@ -227,12 +245,14 @@ def compare(base, cand, args):
         print("WARNING: the runs differ in " + "; ".join(differ) + "; their timings may not be comparable")
 
     print(f"\n{len(common)} cases compared: {len(regressions)} regression(s), {len(faster)} faster, "
-          f"{len(checks)} witness change(s)")
+          f"{len(checks)} witness change(s), {len(rounds_changes)} openings change(s)")
     if regressions:
         print("REGRESSIONS: " + ", ".join(regressions))
     if checks:
         print("WITNESS CHANGES: " + ", ".join(checks))
-    return 1 if (args.fail_on_regression and regressions) else 0
+    if rounds_changes:
+        print("ROUNDS CHANGES: " + ", ".join(rounds_changes))
+    return 1 if (args.fail_on_regression and (regressions or rounds_up)) else 0
 
 
 def main():
@@ -245,8 +265,8 @@ def main():
     ap.add_argument("--min-pct", type=float, default=5.0, help="threshold floor in %% (default 5)")
     ap.add_argument("--k", type=float, default=2.0, help="threshold = max(min-pct, k x noise) (default 2)")
     ap.add_argument("--cases", default="", help="compare only cases matching these prefixes")
-    ap.add_argument("--changed", action="store_true", help="list only regressions, improvements and witness changes")
-    ap.add_argument("--fail-on-regression", action="store_true", help="exit 1 when a case regressed")
+    ap.add_argument("--changed", action="store_true", help="list only regressions, improvements, witness changes and openings changes")
+    ap.add_argument("--fail-on-regression", action="store_true", help="exit 1 when a case regressed or opens more often per repetition")
     args = ap.parse_args()
     for d in args.dirs:
         if not os.path.isdir(os.path.join(d, "runs")):

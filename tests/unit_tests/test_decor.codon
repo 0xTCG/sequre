@@ -1,0 +1,740 @@
+""" Decor core: trigonometric and bounded functions, polynomials, Fourier series, Taylor polynomials and the Chebyshev
+evaluation options, on the field and the ring. Run with 3 and 4 parties (SEQURE_CP_COUNT). """
+
+import math
+import prg
+
+from sequre.constants import *
+from sequre.stdlib.numpy.create import array
+from sequre.types.sharetensor import Sharetensor
+from sequre.types.utils import double_to_fp, fp_to_double
+from sequre.utils.testing import assert_eq, assert_eq_approx as _assert_eq_approx
+from sequre.stdlib.chebyshev import via_chebyshev, chebyshev_coeffs, chebyshev_nodes
+from sequre.decor import (
+    via_decor, via_decor_trig, via_decor_sincos, via_decor_sinhcosh, via_fourier, fourier_coeffs, fourier_evaluate,
+    FourierSeries, via_taylor, taylor_coeffs, modulo_float, linspace, cheb2poly, poly_eval, derivatives,
+    default_interval, decor_error_bound, trig_error_bound)
+
+
+# The checks compare in double precision: no tolerance goes below double precision (2^-50 of the expected value). It
+# matters at F = 64, where a unit of 2^-F is below it.
+def assert_eq_approx(name, result, expected, error: float = 0.018, silent_pass: bool = False, rel_error: float = 0.0):
+    _assert_eq_approx(name, result, expected, error, silent_pass, max(rel_error, 2.0 ** -50))
+
+
+ULP = 2.0 ** -MPC_NBIT_F
+DOUBLE_EPS = 2.0 ** -52.0
+PI = math.pi
+# The TODO's test intervals
+INTERVALS = [(-PI / 4.0, PI / 4.0), (PI / 4.0, 3.0 * PI / 4.0), (-3.0 * PI, 3.0 * PI), (-20.0, 20.0)]
+
+
+def _name(modulus) -> str:
+    return "ring" if modulus.popcnt() == 1 else "field"
+
+
+def _fpr(v: float, modulus: mpc_uint) -> float:
+    return fp_to_double(double_to_fp(v, modulus), modulus)
+
+
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x)) if x >= 0.0 else math.exp(x) / (1.0 + math.exp(x))
+
+
+def _points(interval, n: int) -> List[float]:
+    a, b = interval
+    return linspace(a, b, n)
+
+
+def _expect_inadmissible(func: str, interval) -> bool:
+    # The admissibility check's verdicts on the TODO's intervals (fixed-point range, the division's smallest divisor,
+    # the error bound against DECOR_TOLERANCE):
+    # F = 32: all five on (-20, 20) (exp, sinh, cosh: g or h beyond 2^31; sigmoid, tanh: the denominator below 2^-20),
+    #   and tanh on (-3 pi, 3 pi) (its denominator falls to 1.3e-8)
+    # F = 64: all but exp on (-20, 20), and sinh, cosh and tanh on (-3 pi, 3 pi): the double-precision evaluations of
+    #   g and h (2^-52) dominate their error there
+    w = interval[1] - interval[0]
+    wide, mid = w > 30.0, 10.0 < w <= 30.0
+    if MPC_NBIT_F <= 32:
+        return wide or (mid and func == "tanh")
+    return (wide and func != "exp") or (mid and (func == "sinh" or func == "cosh" or func == "tanh"))
+
+
+def _plain(func: str, x: float) -> float:
+    if func == "exp": return math.exp(x)
+    if func == "sinh": return math.sinh(x)
+    if func == "cosh": return math.cosh(x)
+    if func == "sigmoid": return _sigmoid(x)
+    if func == "tanh": return math.tanh(x)
+    if func == "sin": return math.sin(x)
+    if func == "cos": return math.cos(x)
+    if func == "tan": return math.tan(x)
+    return 1.0 / math.tan(x)
+
+
+def _decor(mpc, x, func: str, interval, clip: bool = False):
+    if func == "exp": return via_decor(mpc, x, func="exp", interval=interval, clip=clip)
+    if func == "sinh": return via_decor(mpc, x, func="sinh", interval=interval, clip=clip)
+    if func == "cosh": return via_decor(mpc, x, func="cosh", interval=interval, clip=clip)
+    if func == "sigmoid": return via_decor(mpc, x, func="sigmoid", interval=interval, clip=clip)
+    return via_decor(mpc, x, func="tanh", interval=interval, clip=clip)
+
+
+def _bound(func: str, interval) -> float:
+    # The documented worst-case error (decor_error_bound); the measured errors are 1.4 to 30 times lower
+    if func == "exp": return decor_error_bound("exp", interval)
+    if func == "sinh": return decor_error_bound("sinh", interval)
+    if func == "cosh": return decor_error_bound("cosh", interval)
+    if func == "sigmoid": return decor_error_bound("sigmoid", interval)
+    return decor_error_bound("tanh", interval)
+
+
+def _intact(mpc, label: str, x, xs, modulus: mpc_uint):
+    # The input Sharetensor is unchanged by the call (2-D inputs as nested lists)
+    got = x.reveal(mpc).tolist()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\t{label}: input intact on the {_name(modulus)}", got, recursive_fpr(xs, modulus), error=ULP, silent_pass=True)
+
+
+def recursive_fpr(xs, modulus: mpc_uint):
+    if isinstance(xs, List[List[float]]):
+        return [[_fpr(v, modulus) for v in row] for row in xs]
+    return [_fpr(v, modulus) for v in xs]
+
+
+def _raises_before_any_round(mpc, label: str, op):
+    # The call raises ValueError at every party, CP0 included, before any round and before sending anything
+    r0, b0 = mpc.stats.rounds, mpc.stats.bytes_sent
+    raised = False
+    try:
+        op()
+    except ValueError:
+        raised = True
+    assert_eq(f"CP{mpc.pid}:\t{label} raises before any round", raised and mpc.stats.rounds == r0 and mpc.stats.bytes_sent == b0, True)
+
+
+def _check_bound_caps(mpc):
+    # decor_error_bound at a few cases against twice its value from an independent plaintext port of the bound
+    # (F = 32 | F = 64): the default intervals, tanh on (-3, 3), the cubic on (-3, 3), Taylor exp of degree 8 on
+    # (-1, 1), and the Chebyshev interpolant of sigmoid on (-6, 6) of degree 10 (monomial form on (-1, 1))
+    f32 = MPC_NBIT_F <= 32
+    cheb = cheb2poly(chebyshev_coeffs(_sigmoid, chebyshev_nodes(11, (-6.0, 6.0)), (-6.0, 6.0)))
+    taylor = taylor_coeffs("exp", 0.0, 8)
+    cases = [("exp (default)", decor_error_bound("exp"), 4.868e-5 if f32 else 1.665e-5),
+             ("sinh (default)", decor_error_bound("sinh"), 5.335e-6 if f32 else 2.941e-6),
+             ("cosh (default)", decor_error_bound("cosh"), 5.335e-6 if f32 else 2.941e-6),
+             ("sigmoid (default)", decor_error_bound("sigmoid"), 2.565e-5 if f32 else 1.453e-9),
+             ("tanh (default)", decor_error_bound("tanh"), 1.283e-5 if f32 else 1.974e-9),
+             ("tanh on (-3, 3)", decor_error_bound("tanh", (-3.0, 3.0)), 2.372e-7 if f32 else 9.430e-14),
+             ("cubic on (-3, 3)", decor_error_bound("polynomial", (-3.0, 3.0), [1.0, -2.0, 0.5, 0.25]), 4.293e-8 if f32 else 8.153e-14),
+             ("Taylor exp, degree 8", decor_error_bound("polynomial", (-1.0, 1.0), taylor), 8.249e-9 if f32 else 8.653e-15),
+             ("Chebyshev sigmoid, degree 10", decor_error_bound("polynomial", (-1.0, 1.0), cheb), 4.616e-6 if f32 else 4.401e-12)]
+    for label, got, ref in cases:
+        assert_eq(f"CP{mpc.pid}:\tDecor error bound of {label}: {got:.3e}, within twice the independent {ref:.3e}", got <= 2.0 * ref, True)
+
+
+def test_trig(mpc, modulus: mpc_uint):
+    # sin, cos (joint and alone), tan, cot: any x for sin/cos (error within trig_error_bound(x), which grows with |x|
+    # through the encoded 1 / (2 pi)); tan/cot away from their poles
+    name = _name(modulus)
+    with mpc.randomness.seed_switch(-1):
+        xs = [prg.random() * 200.0 - 100.0 for _ in range(40)]
+    xs.extend([0.0, PI, -PI / 2.0, 2.0 * PI])
+    x = Sharetensor.enc(mpc, xs, 0, modulus)
+    r0 = mpc.stats.rounds
+    s, c = via_decor_sincos(mpc, x)
+    rounds = mpc.stats.rounds - r0
+    s1 = via_decor_trig(mpc, x, func="sin")
+    c1 = via_decor(mpc, x, func="cos")
+    rs, rc, rs1, rc1 = s.reveal(mpc).tolist(), c.reveal(mpc).tolist(), s1.reveal(mpc).tolist(), c1.reveal(mpc).tolist()
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tDecor sin and cos from one opening: 3 rounds on the {name}", rounds, 3)
+        tol = [trig_error_bound(v) for v in xs]
+        for label, got, f in (("sin", rs, math.sin), ("cos", rc, math.cos), ("sin alone", rs1, math.sin), ("cos alone", rc1, math.cos)):
+            ok = all(abs(got[i] - f(_fpr(xs[i], modulus))) <= tol[i] for i in range(len(xs)))
+            assert_eq(f"CP{mpc.pid}:\tDecor {label} on the {name} (|x| <= 100)", ok, True)
+    _intact(mpc, "Decor trig", x, xs, modulus)
+
+    # tan and cot through Decor division, on [-1.2, 1.2] and [0.4, 2.7] (away from the poles): the division adds a
+    # few units of 2^-F relative to the quotient, up to |tan| ~ 2.6
+    xt = linspace(-1.2, 1.2, 25)
+    xc = linspace(0.4, 2.7, 25)
+    xt_st = Sharetensor.enc(mpc, xt, 0, modulus)
+    xc_st = Sharetensor.enc(mpc, xc, 0, modulus)
+    t = via_decor(mpc, xt_st, func="tan").reveal(mpc).tolist()
+    ct = via_decor(mpc, xc_st, func="cot").reveal(mpc).tolist()
+    if mpc.pid:
+        # A fixed allowance at F = 32 (7.5 times the model: sin and cos's error over the divisor plus the division's few
+        # units); at F = 64 the model with margin (trig_error_bound(2.7) = 2.5e-15 over cos(1.2) = 0.36, the division's
+        # units relative to |q| <= 2.6)
+        tq_abs, tq_rel = (1e-7, 1e-7) if MPC_NBIT_F <= 32 else (4.0 * trig_error_bound(2.7) / 0.36, 64.0 * ULP + 64.0 * DOUBLE_EPS)
+        assert_eq_approx(f"CP{mpc.pid}:\tDecor tan on the {name}", t, [math.tan(_fpr(v, modulus)) for v in xt], error=tq_abs, rel_error=tq_rel)
+        assert_eq_approx(f"CP{mpc.pid}:\tDecor cot on the {name}", ct, [1.0 / math.tan(_fpr(v, modulus)) for v in xc], error=tq_abs, rel_error=tq_rel)
+    _intact(mpc, "Decor tan", xt_st, xt, modulus)
+    _intact(mpc, "Decor cot", xc_st, xc, modulus)
+
+    # 2-D input
+    m = [[xs[i * 4 + j] for j in range(4)] for i in range(5)]
+    m_st = Sharetensor.enc(mpc, m, 0, modulus)
+    sm, cm = via_decor_sincos(mpc, m_st)
+    rsm, rcm = sm.reveal(mpc).tolist(), cm.reveal(mpc).tolist()
+    if mpc.pid:
+        ok_s = all(abs(rsm[i][j] - math.sin(_fpr(m[i][j], modulus))) <= trig_error_bound(m[i][j]) for i in range(5) for j in range(4))
+        ok_c = all(abs(rcm[i][j] - math.cos(_fpr(m[i][j], modulus))) <= trig_error_bound(m[i][j]) for i in range(5) for j in range(4))
+        assert_eq(f"CP{mpc.pid}:\tDecor sin of a matrix on the {name}", ok_s, True)
+        assert_eq(f"CP{mpc.pid}:\tDecor cos of a matrix on the {name}", ok_c, True)
+    _intact(mpc, "Decor sin and cos of a matrix", m_st, m, modulus)
+
+
+def test_bounded(mpc, modulus: mpc_uint):
+    # exp, sinh, cosh, sigmoid, tanh on the TODO's intervals (both ends included), within decor_error_bound where
+    # admissible; inadmissible intervals raise ValueError at every party before any round
+    name = _name(modulus)
+    for interval in INTERVALS:
+        xs = _points(interval, 41)
+        x = Sharetensor.enc(mpc, xs, 0, modulus)
+        for func in ("exp", "sinh", "cosh", "sigmoid", "tanh"):
+            r0 = mpc.stats.rounds
+            raised = False
+            got = List[float]()
+            try:
+                got = _decor(mpc, x, func, interval).reveal(mpc).tolist()
+            except ValueError:
+                raised = True
+            assert_eq(f"CP{mpc.pid}:\tDecor {func} on {interval} on the {name}: admissible as expected", raised, _expect_inadmissible(func, interval))
+            if raised:
+                assert_eq(f"CP{mpc.pid}:\tDecor {func} on {interval} on the {name}: no round before the raise", mpc.stats.rounds, r0, silent_pass=True)
+            if raised or not mpc.pid:
+                continue
+            want = [_plain(func, _fpr(v, modulus)) for v in xs]
+            assert_eq_approx(f"CP{mpc.pid}:\tDecor {func} on {interval} on the {name}", got, want, error=_bound(func, interval))
+        _intact(mpc, f"Decor on {interval}", x, xs, modulus)
+
+    # The accuracy checks take their tolerances from decor_error_bound: cap the bound itself at twice values computed
+    # independently (a plaintext port of the bound), so an inflated bound cannot loosen every check at once
+    if mpc.pid == 1:
+        _check_bound_caps(mpc)
+
+    # sinh pairs its factors cross-wise. At x = 0 sinh = 0 and cosh = 1; the original's like-with-like pairing gave
+    # cosh for sinh. Joint outputs from one opening (10 rounds at F = 32, as exp; 11 at F = 64: the carry over the F
+    # fractional bits has log2 F levels) match the single calls.
+    xs = [0.0, 0.5, -0.5, 1.5, -2.0]
+    x = Sharetensor.enc(mpc, xs, 0, modulus)
+    sh = via_decor(mpc, x, func="sinh", interval=(-3.0, 3.0)).reveal(mpc).tolist()
+    r0 = mpc.stats.rounds
+    jsh, jch = via_decor_sinhcosh(mpc, x, (-3.0, 3.0))
+    joint_rounds = mpc.stats.rounds - r0
+    r0 = mpc.stats.rounds
+    ex = via_decor(mpc, x, func="exp", interval=(-3.0, 3.0))
+    exp_rounds = mpc.stats.rounds - r0
+    rjsh, rjch, rex = jsh.reveal(mpc).tolist(), jch.reveal(mpc).tolist(), ex.reveal(mpc).tolist()
+    if mpc.pid:
+        tol = decor_error_bound("sinh", (-3.0, 3.0))
+        assert_eq_approx(f"CP{mpc.pid}:\tDecor sinh is sinh, not cosh, on the {name}", sh, [math.sinh(v) for v in xs], error=tol)
+        assert_eq(f"CP{mpc.pid}:\tDecor sinh(0) is 0, far from cosh(0) = 1, on the {name}", abs(sh[0]) < 1e-6, True)
+        assert_eq_approx(f"CP{mpc.pid}:\tDecor joint sinh on the {name}", rjsh, [math.sinh(v) for v in xs], error=tol)
+        assert_eq_approx(f"CP{mpc.pid}:\tDecor joint cosh on the {name}", rjch, [math.cosh(v) for v in xs], error=decor_error_bound("cosh", (-3.0, 3.0)))
+        assert_eq_approx(f"CP{mpc.pid}:\tDecor exp on (-3, 3) on the {name}", rex, [math.exp(v) for v in xs], error=decor_error_bound("exp", (-3.0, 3.0)))
+        carry_rounds = 10 if MPC_NBIT_F <= 32 else 11
+        assert_eq(f"CP{mpc.pid}:\tDecor joint sinh and cosh: {carry_rounds} rounds on the {name}", joint_rounds, carry_rounds)
+        assert_eq(f"CP{mpc.pid}:\tDecor exp: {carry_rounds} rounds on the {name}", exp_rounds, carry_rounds)
+    _intact(mpc, "Decor sinh, joint sinh/cosh and exp", x, xs, modulus)
+
+    # Inputs just outside [a, b], within the decomposition's margin (2^-(F/2) of the width), and inputs whose encoding
+    # rounds across an end, come out right; the margin is far above the encoding's unit
+    interval = (-2.0, 3.0)
+    margin = (interval[1] - interval[0]) * 2.0 ** -float(MPC_NBIT_F // 2)
+    xe = [interval[0] - 0.5 * margin, interval[0], interval[0] + ULP, interval[1] - ULP, interval[1], interval[1] + 0.5 * margin]
+    xe_st = Sharetensor.enc(mpc, xe, 0, modulus)
+    for func in ("exp", "sigmoid"):
+        got = _decor(mpc, xe_st, func, interval).reveal(mpc).tolist()
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tDecor {func} at the interval's ends and just outside on the {name}", got,
+                             [_plain(func, _fpr(v, modulus)) for v in xe], error=_bound(func, interval))
+    _intact(mpc, "Decor at the interval's ends", xe_st, xe, modulus)
+
+    # Narrow intervals (width below 1: the scaling encodes 1 / p with fewer than F fractional bits, e < 0)
+    for func, interval in (("exp", (0.1, 0.4)), ("sigmoid", (-0.25, 0.25)), ("exp", (1.0, 1.001))):
+        xn = _points(interval, 11)
+        xn_st = Sharetensor.enc(mpc, xn, 0, modulus)
+        got = _decor(mpc, xn_st, func, interval).reveal(mpc).tolist()
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tDecor {func} on the narrow interval {interval} on the {name}", got,
+                             [_plain(func, _fpr(v, modulus)) for v in xn], error=_bound(func, interval))
+        _intact(mpc, f"Decor {func} on {interval}", xn_st, xn, modulus)
+
+    # Inputs farther outside wrap by whole periods p = (b - a)(1 + 2^(1 - F/2)) on every draw (the exact carry): f(x - p)
+    # above the interval, f(x + p) below it; clip=True gives f at the clipped input instead
+    for func, interval, xo in (("sigmoid", (-10.0, 10.0), [10.5, -10.5, 13.0, -17.0]), ("exp", (-2.0, 3.0), [3.3, -2.6, 4.0])):
+        a, b = interval
+        p = (b - a) * (1.0 + 2.0 * 2.0 ** -float(MPC_NBIT_F // 2))
+        xo_st = Sharetensor.enc(mpc, xo, 0, modulus)
+        wrapped = _decor(mpc, xo_st, func, interval).reveal(mpc).tolist()
+        clipped = _decor(mpc, xo_st, func, interval, clip=True).reveal(mpc).tolist()
+        if mpc.pid:
+            xo_f = [_fpr(v, modulus) for v in xo]
+            assert_eq_approx(f"CP{mpc.pid}:\tDecor {func} on {interval} wraps inputs outside by one period on the {name}", wrapped,
+                             [_plain(func, v - p if v > b else v + p) for v in xo_f], error=_bound(func, interval))
+            assert_eq_approx(f"CP{mpc.pid}:\tDecor {func} on {interval} with clip=True on the {name}", clipped,
+                             [_plain(func, min(max(v, a), b)) for v in xo_f], error=_bound(func, interval))
+        _intact(mpc, f"Decor {func} with clip=True", xo_st, xo, modulus)
+
+    # Default intervals, clip (1-D and 2-D), and matrix inputs
+    xd = [-12.0, -9.5, 0.3, 9.5, 12.0]
+    xd_st = Sharetensor.enc(mpc, xd, 0, modulus)
+    d = via_decor(mpc, xd_st, func="sigmoid", clip=True).reveal(mpc).tolist()
+    lo, hi = default_interval(func="sigmoid")
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tDecor sigmoid on its default interval, clipped, on the {name}", d,
+                         [_sigmoid(min(max(v, lo), hi)) for v in xd], error=decor_error_bound("sigmoid"))
+    _intact(mpc, "Decor sigmoid on its default interval, clipped", xd_st, xd, modulus)
+    m = [[0.1, -0.7, 1.3], [2.2, -1.9, 0.0]]
+    mc = [[0.1, -3.7, 1.3], [5.2, -1.9, 0.0]]
+    m_st = Sharetensor.enc(mpc, m, 0, modulus)
+    mc_st = Sharetensor.enc(mpc, mc, 0, modulus)
+    em = via_decor(mpc, m_st, func="exp", interval=(-3.0, 3.0)).reveal(mpc).tolist()
+    tm = via_decor(mpc, m_st, func="tanh", interval=(-3.0, 3.0)).reveal(mpc).tolist()
+    r0 = mpc.stats.rounds
+    cm_st = via_decor(mpc, mc_st, func="exp", interval=(-3.0, 3.0), clip=True)
+    clip_rounds = mpc.stats.rounds - r0
+    cm = cm_st.reveal(mpc).tolist()
+    if mpc.pid:
+        # exp's rounds plus the clip: one comparison and one product. At F = 32: 10 + 8 + 1 on the ring, 10 + 11 + 1 on
+        # the field; at F = 64 (K = 128) the carry and the ring's sign test each take one level more (11 + 9 + 1), and
+        # the 256-bit field comparison one round more (11 + 11 + 1)
+        want_clip = (19 if modulus.popcnt() == 1 else 22) if MPC_NBIT_F <= 32 else (21 if modulus.popcnt() == 1 else 23)
+        assert_eq(f"CP{mpc.pid}:\tDecor exp with clip=True: {clip_rounds} rounds on the {name}", clip_rounds, want_clip)
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tDecor exp of a matrix on the {name}", em, [[math.exp(v) for v in row] for row in m], error=decor_error_bound("exp", (-3.0, 3.0)))
+        assert_eq_approx(f"CP{mpc.pid}:\tDecor tanh of a matrix on the {name}", tm, [[math.tanh(v) for v in row] for row in m], error=decor_error_bound("tanh", (-3.0, 3.0)))
+        assert_eq_approx(f"CP{mpc.pid}:\tDecor exp of a matrix with clip=True on the {name}", cm,
+                         [[math.exp(min(max(_fpr(v, modulus), -3.0), 3.0)) for v in row] for row in mc], error=decor_error_bound("exp", (-3.0, 3.0)))
+    _intact(mpc, "Decor exp and tanh of a matrix", m_st, m, modulus)
+    _intact(mpc, "Decor exp of a matrix with clip=True", mc_st, mc, modulus)
+
+    # Inadmissible intervals raise before any round, with clip=True too: sigmoid on (-30, 30) and tanh on (-15, 15)
+    # (their denominators fall below the division's smallest divisor at F = 32; at F = 64 the error bound refuses
+    # them), exp on (-60, 60) (beyond the fixed-point range in both builds); a reversed or degenerate interval
+    x1 = Sharetensor.enc(mpc, [0.5], 0, modulus)
+    _raises_before_any_round(mpc, f"Decor sigmoid on (-30, 30) on the {name}", lambda: via_decor(mpc, x1, func="sigmoid", interval=(-30.0, 30.0)))
+    _raises_before_any_round(mpc, f"Decor tanh on (-15, 15) on the {name}", lambda: via_decor(mpc, x1, func="tanh", interval=(-15.0, 15.0)))
+    _raises_before_any_round(mpc, f"Decor exp on (-60, 60) with clip=True on the {name}", lambda: via_decor(mpc, x1, func="exp", interval=(-60.0, 60.0), clip=True))
+    _raises_before_any_round(mpc, f"Decor exp with a reversed interval on the {name}", lambda: via_decor(mpc, x1, func="exp", interval=(1.0, -1.0)))
+    _raises_before_any_round(mpc, f"Decor exp with a degenerate interval on the {name}", lambda: via_decor(mpc, x1, func="exp", interval=(2.0, 2.0)))
+
+    # Empty inputs, 1-D and 2-D, with clip=True as well: empty results, every party in step (an inadmissible interval
+    # still raises)
+    empty1 = Sharetensor(List[mpc_uint](), modulus)
+    empty1.fp = True
+    empty2 = Sharetensor(List[List[mpc_uint]](), modulus)
+    empty2.fp = True
+    n_out = len(via_decor(mpc, empty1, func="exp", interval=(-3.0, 3.0), clip=True).share)
+    n_out += len(via_decor(mpc, empty2, func="sigmoid", interval=(-3.0, 3.0), clip=True).share)
+    n_out += len(via_decor(mpc, empty2, func="exp", interval=(-3.0, 3.0)).share)
+    n_out += len(via_decor(mpc, empty1, func="tan").share)
+    s_e, c_e = via_decor_sinhcosh(mpc, empty1, (-3.0, 3.0))
+    n_out += len(s_e.share) + len(c_e.share)
+    n_out += len(fourier_evaluate(mpc, empty1, fourier_coeffs(math.sin, (-PI, PI), 2)).share)
+    assert_eq(f"CP{mpc.pid}:\tDecor of empty inputs (clip=True too) is empty on the {name}", n_out, 0)
+    _raises_before_any_round(mpc, f"Decor of an empty input on an inadmissible interval on the {name}", lambda: via_decor(mpc, empty1, func="exp", interval=(-60.0, 60.0)))
+
+    # The tolerance: a tight one refuses an interval the default admits; at F = 32 sigmoid on (-12.5, 12.5) exceeds the
+    # default (bound 3e-4) and runs, within its bound, with a looser one
+    _raises_before_any_round(mpc, f"Decor exp with tolerance 1e-20 on the {name}", lambda: via_decor(mpc, x1, func="exp", interval=(-1.0, 1.0), tolerance=1e-20))
+    if MPC_NBIT_F <= 32:
+        iv = (-12.5, 12.5)
+        xw = _points(iv, 21)
+        _raises_before_any_round(mpc, f"Decor sigmoid on {iv} at the default tolerance on the {name}", lambda: via_decor(mpc, x1, func="sigmoid", interval=iv))
+        xw_st = Sharetensor.enc(mpc, xw, 0, modulus)
+        got = via_decor(mpc, xw_st, func="sigmoid", interval=iv, tolerance=1e-3).reveal(mpc).tolist()
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tDecor sigmoid on {iv} with tolerance 1e-3 on the {name}", got, [_sigmoid(_fpr(v, modulus)) for v in xw], error=decor_error_bound("sigmoid", iv))
+        _intact(mpc, f"Decor sigmoid on {iv} with tolerance 1e-3", xw_st, xw, modulus)
+
+
+def test_polynomial(mpc, modulus: mpc_uint):
+    # P(u + v) = sum_j W_j(u) v^j: exact for polynomials up to the encodings of the W_j and v^j (decor_error_bound)
+    name = _name(modulus)
+    cubic = [1.0, -2.0, 0.5, 0.25]
+    cases = [(cubic, iv) for iv in INTERVALS]
+    cases.append(([0.3, 0.0, -1.0, 0.0, 0.2, 0.0, -0.01], (-2.0, 4.0)))
+    for coeffs, interval in cases:
+        xs = _points(interval, 41)
+        x = Sharetensor.enc(mpc, xs, 0, modulus)
+        got = via_decor(mpc, x, func="polynomial", interval=interval, coeffs=coeffs).reveal(mpc).tolist()
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tDecor polynomial of degree {len(coeffs) - 1} on {interval} on the {name}", got,
+                             [poly_eval(coeffs, _fpr(v, modulus)) for v in xs], error=decor_error_bound("polynomial", interval, coeffs))
+        _intact(mpc, f"Decor polynomial on {interval}", x, xs, modulus)
+
+    # Many random inputs of a degree-20 polynomial: its terms v^j and W_j(u) fall below 2^-170 for small |v| or |u|
+    # (about once per 1400 elements), where the encoder's shift used to leave garbage up to 2^21; every element within
+    # the bound
+    n_many = 12000
+    with mpc.randomness.seed_switch(-1):
+        many = [2.0 * prg.random() - 1.0 for _ in range(n_many)]
+    deg20 = [0.0 for _ in range(20)]
+    deg20.append(1e-4)
+    x_many = Sharetensor.enc(mpc, many, 0, modulus)
+    got_many = via_decor(mpc, x_many, func="polynomial", interval=(-1.0, 1.0), coeffs=deg20).reveal(mpc).tolist()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tDecor polynomial of degree 20 at {n_many} random points on the {name}", got_many,
+                         [poly_eval(deg20, _fpr(v, modulus)) for v in many], error=decor_error_bound("polynomial", (-1.0, 1.0), deg20))
+    _intact(mpc, "Decor polynomial of degree 20 at random points", x_many, many, modulus)
+
+    # 2-D input
+    m = [[0.1, -2.7, 1.3], [2.2, -1.9, 3.0]]
+    m_st = Sharetensor.enc(mpc, m, 0, modulus)
+    got = via_decor(mpc, m_st, func="polynomial", interval=(-3.0, 3.0), coeffs=cubic).reveal(mpc).tolist()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tDecor polynomial of a matrix on the {name}", got,
+                         [[poly_eval(cubic, _fpr(v, modulus)) for v in row] for row in m], error=decor_error_bound("polynomial", (-3.0, 3.0), cubic))
+    _intact(mpc, "Decor polynomial of a matrix", m_st, m, modulus)
+
+    # Inadmissible: a polynomial whose shifted coefficients overflow the fixed-point range raises at every party
+    x1 = Sharetensor.enc(mpc, [0.5], 0, modulus)
+    # (its leading coefficient is twice the fixed-point range itself, whatever the build)
+    big = [0.0 for _ in range(11)]
+    big.append(2.0 ** float(MPC_NBIT_K - MPC_NBIT_F))
+    _raises_before_any_round(mpc, f"Decor polynomial beyond the fixed-point range on the {name}",
+                             lambda: via_decor(mpc, x1, func="polynomial", interval=(-1.0, 1.0), coeffs=big))
+
+
+def test_fourier(mpc, modulus: mpc_uint):
+    # The Decor evaluation of a Fourier series against the same series in double precision: the protocol adds the
+    # encoding error of the weights, about 2^-F per unit of sum_k (|a_k| + |b_k|), and the phase's (bound: 8 units)
+    name = _name(modulus)
+    cases = [("sin", (-PI, PI), 3), ("cos", (-PI, PI), 5), ("sigmoid", (-5.0, 5.0), 10), ("exp", (-1.0, 1.0), 8),
+             ("square", (-PI, PI), 15), ("sawtooth", (-PI, PI), 15), ("tanh", (-3.0, 3.0), 12),
+             ("sinh", (-1.0, 1.0), 6), ("cosh", (-1.0, 1.0), 6), ("tan", (-0.7, 0.7), 6), ("cot", (0.5, 1.2), 6)]
+    for label, interval, degree in cases:
+        if label == "sin": series = fourier_coeffs(math.sin, interval, degree)
+        elif label == "cos": series = fourier_coeffs(math.cos, interval, degree)
+        elif label == "sigmoid": series = fourier_coeffs(_sigmoid, interval, degree)
+        elif label == "exp": series = fourier_coeffs(math.exp, interval, degree)
+        elif label == "square": series = fourier_coeffs(lambda v: 1.0 if math.cos(v * 2.0) > 0.0 else -1.0, interval, degree)
+        elif label == "sawtooth": series = fourier_coeffs(lambda v: v / PI - math.floor(v / PI + 0.5), interval, degree)
+        elif label == "tanh": series = fourier_coeffs(math.tanh, interval, degree)
+        elif label == "sinh": series = fourier_coeffs(math.sinh, interval, degree)
+        elif label == "cosh": series = fourier_coeffs(math.cosh, interval, degree)
+        elif label == "tan": series = fourier_coeffs(math.tan, interval, degree)
+        else: series = fourier_coeffs(lambda v: 1.0 / math.tan(v), interval, degree)
+        xs = _points(interval, 31)
+        x = Sharetensor.enc(mpc, xs, 0, modulus)
+        got = fourier_evaluate(mpc, x, series).reveal(mpc).tolist()
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tDecor Fourier series of {label} (degree {degree}) on {interval} on the {name}", got,
+                             [series(_fpr(v, modulus)) for v in xs], error=_fourier_bound(series, degree))
+        _intact(mpc, f"Decor Fourier series of {label}", x, xs, modulus)
+
+    # 2-D input
+    series = fourier_coeffs(_sigmoid, (-5.0, 5.0), 10)
+    m = [[0.1, -2.7, 1.3], [4.2, -4.9, 3.0]]
+    m_st = Sharetensor.enc(mpc, m, 0, modulus)
+    got = fourier_evaluate(mpc, m_st, series).reveal(mpc).tolist()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tDecor Fourier series of a matrix on the {name}", got,
+                         [[series(_fpr(v, modulus)) for v in row] for row in m], error=_fourier_bound(series, 10))
+    _intact(mpc, "Decor Fourier series of a matrix", m_st, m, modulus)
+
+    # A periodic target is the series itself: sin from one harmonic, within the evaluation's bound plus the series' own
+    # error against sin (its coefficients come from numerical integration), measured in double
+    xs = _points((-PI, PI), 31)
+    xs_st = Sharetensor.enc(mpc, xs, 0, modulus)
+    got = via_fourier(mpc, xs_st, math.sin, (-PI, PI), 2).reveal(mpc).tolist()
+    if mpc.pid:
+        s1 = fourier_coeffs(math.sin, (-PI, PI), 2)
+        series_err = max([abs(s1(_fpr(v, modulus)) - math.sin(_fpr(v, modulus))) for v in xs])
+        assert_eq_approx(f"CP{mpc.pid}:\tDecor Fourier sin approximates sin on the {name}", got, [math.sin(_fpr(v, modulus)) for v in xs],
+                         error=_fourier_bound(s1, 2) + series_err)
+    _intact(mpc, "Decor Fourier sin from one harmonic", xs_st, xs, modulus)
+
+    # Coefficients beyond the fixed-point range raise before any round
+    x1 = Sharetensor.enc(mpc, [0.5], 0, modulus)
+    _raises_before_any_round(mpc, f"Decor Fourier series with coefficients beyond the fixed-point range on the {name}",
+                             lambda: fourier_evaluate(mpc, x1, FourierSeries(1e20, [1.0], [0.0], (-1.0, 1.0))))
+
+
+def _fourier_bound(series, degree: int) -> float:
+    # fourier_evaluate's model: about 8 units per unit of sum |a_k| + |b_k|, times the phase's growth with the harmonic;
+    # plus the phase's double-precision term (2^-52 of a turn, times 2 pi k (|a_k| + |b_k|)), twice (the reference's
+    # own phase rounds the same way), and the reference's rounding. At F = 32 a fixed 1e-9 stands for the last two.
+    weight = abs(series.a0)
+    phase = 0.0
+    for k in range(series.degree()):
+        weight += abs(series.a[k]) + abs(series.b[k])
+        phase += float(k + 1) * (abs(series.a[k]) + abs(series.b[k]))
+    extra = 1e-9 if MPC_NBIT_F <= 32 else 4.0 * PI * phase * DOUBLE_EPS + 8.0 * DOUBLE_EPS * (1.0 + weight)
+    return 8.0 * ULP * weight * (1.0 + 2.0 * PI * float(degree)) + extra
+
+
+def _abs_poly(coeffs: List[float], r: float) -> float:
+    # sum_k |c_k| r^k: the scale of the double-precision reference's rounding
+    s = 0.0
+    for k in range(len(coeffs)):
+        s += abs(coeffs[k]) * r ** float(k)
+    return s
+
+
+def test_taylor(mpc, modulus: mpc_uint):
+    # Taylor polynomials (closed-form derivatives) evaluated by Decor and naively, against the same polynomial in double
+    name = _name(modulus)
+    # Intervals and degrees with a Taylor remainder below 1e-4 (sigmoid's series converges within |x| < pi, tanh's within
+    # pi / 2, log's and sqrt's within 1 of the pivot)
+    for func, interval, degree in (("exp", (-1.0, 1.0), 8), ("sin", (-1.0, 1.0), 9), ("sigmoid", (-1.0, 1.0), 9),
+                                   ("log", (0.8, 1.2), 6), ("sqrt", (0.8, 1.2), 6), ("tanh", (-0.5, 0.5), 9)):
+        xs = _points(interval, 21)
+        x = Sharetensor.enc(mpc, xs, 0, modulus)
+        pivot = (interval[0] + interval[1]) / 2.0
+        if func == "exp":
+            coeffs = taylor_coeffs("exp", pivot, degree)
+            d = via_taylor(mpc, x, func="exp", interval=interval, degree=degree)
+            nv = via_taylor(mpc, x, func="exp", interval=interval, degree=degree, evaluation="naive")
+        elif func == "sin":
+            coeffs = taylor_coeffs("sin", pivot, degree)
+            d = via_taylor(mpc, x, func="sin", interval=interval, degree=degree)
+            nv = via_taylor(mpc, x, func="sin", interval=interval, degree=degree, evaluation="naive")
+        elif func == "sigmoid":
+            coeffs = taylor_coeffs("sigmoid", pivot, degree)
+            d = via_taylor(mpc, x, func="sigmoid", interval=interval, degree=degree)
+            nv = via_taylor(mpc, x, func="sigmoid", interval=interval, degree=degree, evaluation="naive")
+        elif func == "log":
+            coeffs = taylor_coeffs("log", pivot, degree)
+            d = via_taylor(mpc, x, func="log", interval=interval, degree=degree)
+            nv = via_taylor(mpc, x, func="log", interval=interval, degree=degree, evaluation="naive")
+        elif func == "sqrt":
+            coeffs = taylor_coeffs("sqrt", pivot, degree)
+            d = via_taylor(mpc, x, func="sqrt", interval=interval, degree=degree)
+            nv = via_taylor(mpc, x, func="sqrt", interval=interval, degree=degree, evaluation="naive")
+        else:
+            coeffs = taylor_coeffs("tanh", pivot, degree)
+            d = via_taylor(mpc, x, func="tanh", interval=interval, degree=degree)
+            nv = via_taylor(mpc, x, func="tanh", interval=interval, degree=degree, evaluation="naive")
+        rd, rn = d.reveal(mpc).tolist(), nv.reveal(mpc).tolist()
+        if mpc.pid:
+            want = [poly_eval(coeffs, _fpr(v, modulus) - pivot) for v in xs]
+            r = (interval[1] - interval[0]) / 2.0
+            floor = 4.0 * DOUBLE_EPS * (1.0 + _abs_poly(coeffs, r))
+            # Decor: its error bound; naive powers truncate once per power (about k units of 2^-F for x^k). Both plus
+            # the double-precision reference's rounding
+            tol_d = decor_error_bound("polynomial", (interval[0] - pivot, interval[1] - pivot), coeffs) + floor
+            tol_n = (4.0 + 2.0 * float(degree)) * ULP * (1.0 + _abs_poly(coeffs, 1.0)) + floor
+            assert_eq_approx(f"CP{mpc.pid}:\tTaylor {func} (degree {degree}, Decor) on the {name}", rd, want, error=tol_d)
+            assert_eq_approx(f"CP{mpc.pid}:\tTaylor {func} (degree {degree}, naive) on the {name}", rn, want, error=tol_n)
+            # and it approximates the function near the pivot (Taylor remainder on this interval)
+            assert_eq_approx(f"CP{mpc.pid}:\tTaylor {func} approximates {func} on {interval} on the {name}", rd, [_taylor_target(func, _fpr(v, modulus)) for v in xs], error=1e-4)
+        _intact(mpc, f"Taylor {func}", x, xs, modulus)
+
+    # 2-D input, both evaluations
+    m = [[0.1, -0.7, 0.3], [0.9, -0.9, 0.0]]
+    m_st = Sharetensor.enc(mpc, m, 0, modulus)
+    coeffs = taylor_coeffs("exp", 0.0, 8)
+    dm = via_taylor(mpc, m_st, func="exp", interval=(-1.0, 1.0), degree=8).reveal(mpc).tolist()
+    nm = via_taylor(mpc, m_st, func="exp", interval=(-1.0, 1.0), degree=8, evaluation="naive").reveal(mpc).tolist()
+    if mpc.pid:
+        want = [[poly_eval(coeffs, _fpr(v, modulus)) for v in row] for row in m]
+        floor = 4.0 * DOUBLE_EPS * (1.0 + _abs_poly(coeffs, 1.0))
+        assert_eq_approx(f"CP{mpc.pid}:\tTaylor exp of a matrix (Decor) on the {name}", dm, want, error=decor_error_bound("polynomial", (-1.0, 1.0), coeffs) + floor)
+        assert_eq_approx(f"CP{mpc.pid}:\tTaylor exp of a matrix (naive) on the {name}", nm, want, error=20.0 * ULP * (1.0 + _abs_poly(coeffs, 1.0)) + floor)
+    _intact(mpc, "Taylor of a matrix", m_st, m, modulus)
+
+
+def _taylor_target(func: str, x: float) -> float:
+    if func == "exp": return math.exp(x)
+    if func == "sin": return math.sin(x)
+    if func == "sigmoid": return _sigmoid(x)
+    if func == "log": return math.log(x)
+    if func == "sqrt": return math.sqrt(x)
+    return math.tanh(x)
+
+
+def test_derivatives():
+    # The closed-form tables against finite differences of the function (h = 1e-4, central, second order: error ~h^2)
+    h = 1e-4
+    for func in ("sin", "cos", "exp", "sinh", "cosh", "log", "sqrt", "inv", "sigmoid", "tanh", "tan", "cot", "erf"):
+        x = 0.7
+        if func == "sin": d = derivatives("sin", x, 4)
+        elif func == "cos": d = derivatives("cos", x, 4)
+        elif func == "exp": d = derivatives("exp", x, 4)
+        elif func == "sinh": d = derivatives("sinh", x, 4)
+        elif func == "cosh": d = derivatives("cosh", x, 4)
+        elif func == "log": d = derivatives("log", x, 4)
+        elif func == "sqrt": d = derivatives("sqrt", x, 4)
+        elif func == "inv": d = derivatives("inv", x, 4)
+        elif func == "sigmoid": d = derivatives("sigmoid", x, 4)
+        elif func == "tanh": d = derivatives("tanh", x, 4)
+        elif func == "tan": d = derivatives("tan", x, 4)
+        elif func == "cot": d = derivatives("cot", x, 4)
+        else: d = derivatives("erf", x, 4)
+        for n in range(1, 5):
+            hi = _derivative_value(func, x + h, n - 1)
+            lo = _derivative_value(func, x - h, n - 1)
+            fd = (hi - lo) / (2.0 * h)
+            assert_eq_approx(f"derivative {n} of {func} at {x} (closed form vs finite difference)", d[n], fd, error=1e-5, rel_error=1e-5, silent_pass=n < 4)
+
+
+def _derivative_value(func: str, x: float, n: int) -> float:
+    if func == "sin": return derivatives("sin", x, n)[n]
+    if func == "cos": return derivatives("cos", x, n)[n]
+    if func == "exp": return derivatives("exp", x, n)[n]
+    if func == "sinh": return derivatives("sinh", x, n)[n]
+    if func == "cosh": return derivatives("cosh", x, n)[n]
+    if func == "log": return derivatives("log", x, n)[n]
+    if func == "sqrt": return derivatives("sqrt", x, n)[n]
+    if func == "inv": return derivatives("inv", x, n)[n]
+    if func == "sigmoid": return derivatives("sigmoid", x, n)[n]
+    if func == "tanh": return derivatives("tanh", x, n)[n]
+    if func == "tan": return derivatives("tan", x, n)[n]
+    if func == "cot": return derivatives("cot", x, n)[n]
+    return derivatives("erf", x, n)[n]
+
+
+def _max_slope(coeffs: List[float], lo: float, hi: float) -> float:
+    m = 0.0
+    xs = linspace(lo, hi, 201)
+    for i in range(len(xs) - 1):
+        m = max(m, abs(poly_eval(coeffs, xs[i + 1]) - poly_eval(coeffs, xs[i])) / (xs[i + 1] - xs[i]))
+    return m
+
+
+def _cheb_tolerances(coeffs: List[float], mono: List[float], interval, degree: int) -> Tuple[float, float, float]:
+    # Clenshaw truncates once per step (|T_k| <= 1): (4 + 2 degree) units per unit of sum |c_k|; naive powers: k
+    # truncations for x^k, times |m_k|; Decor: its error bound plus the scaling's truncation (max |P'| units, times the
+    # encoded 2 / (b - a)'s error); the last two plus the double-precision reference's rounding
+    a, b = interval
+    floor = 8.0 * DOUBLE_EPS * (1.0 + _abs_poly(mono, 1.0))
+    # (1e-9 at F = 32 for the references' rounding; at F = 64 the double-precision floor stands for it)
+    fixed = 1e-9 if MPC_NBIT_F <= 32 else 0.0
+    tol_cl = (4.0 + 2.0 * float(degree)) * ULP * (1.0 + sum([abs(c) for c in coeffs])) + fixed + floor
+    tol_nv = 4.0 * ULP * (1.0 + sum([float(k + 1) * abs(mono[k]) for k in range(len(mono))])) + fixed + floor
+    tol_de = decor_error_bound("polynomial", (-1.0, 1.0), mono) + _max_slope(mono, -1.0, 1.0) * ULP * (2.0 + max(abs(a), abs(b))) + floor
+    return tol_cl, tol_de, tol_nv
+
+
+def _chebyshev_case(mpc, modulus: mpc_uint, label: str, op, interval, degree: int):
+    name = _name(modulus)
+    xs = _points(interval, 21)
+    x = Sharetensor.enc(mpc, xs, 0, modulus)
+    coeffs = chebyshev_coeffs(op, chebyshev_nodes(degree + 1, interval), interval)
+    mono = cheb2poly(coeffs)
+    a, b = interval
+    want = [poly_eval(mono, (2.0 * _fpr(v, modulus) - a - b) / (b - a)) for v in xs]
+    r0 = mpc.stats.rounds
+    cl = via_chebyshev(mpc, x, op, interval, degree)
+    cl_rounds = mpc.stats.rounds - r0
+    de = via_chebyshev(mpc, x, op, interval, degree, evaluation="decor")
+    nv = via_chebyshev(mpc, x, op, interval, degree, evaluation="naive")
+    rcl, rde, rnv = cl.reveal(mpc).tolist(), de.reveal(mpc).tolist(), nv.reveal(mpc).tolist()
+    if mpc.pid:
+        tol_cl, tol_de, tol_nv = _cheb_tolerances(coeffs, mono, interval, degree)
+        assert_eq_approx(f"CP{mpc.pid}:\tChebyshev {label} degree {degree} (Clenshaw) on the {name}", rcl, want, error=tol_cl)
+        assert_eq_approx(f"CP{mpc.pid}:\tChebyshev {label} degree {degree} (Decor) on the {name}", rde, want, error=tol_de)
+        assert_eq_approx(f"CP{mpc.pid}:\tChebyshev {label} degree {degree} (naive) on the {name}", rnv, want, error=tol_nv)
+        if degree == 0:
+            assert_eq(f"CP{mpc.pid}:\tChebyshev degree 0 (Clenshaw) spends no round on the {name}", cl_rounds, 0)
+    _intact(mpc, f"Chebyshev {label} degree {degree}", x, xs, modulus)
+
+
+def test_chebyshev(mpc, modulus: mpc_uint):
+    # The three evaluations of a Chebyshev interpolant agree with the same interpolant in double precision; degrees
+    # below 3 work (M-MPC-16)
+    name = _name(modulus)
+    _chebyshev_case(mpc, modulus, "exp", math.exp, (-2.0, 2.0), 8)
+    _chebyshev_case(mpc, modulus, "sigmoid", _sigmoid, (-6.0, 6.0), 10)
+    _chebyshev_case(mpc, modulus, "exp", math.exp, (-1.0, 1.0), 0)
+    _chebyshev_case(mpc, modulus, "exp", math.exp, (-1.0, 1.0), 1)
+    _chebyshev_case(mpc, modulus, "exp", math.exp, (-1.0, 1.0), 2)
+
+    # 2-D input, the three evaluations
+    m = [[0.1, -2.7, 1.3], [4.2, -4.9, 3.0]]
+    m_st = Sharetensor.enc(mpc, m, 0, modulus)
+    coeffs = chebyshev_coeffs(_sigmoid, chebyshev_nodes(9, (-6.0, 6.0)), (-6.0, 6.0))
+    mono = cheb2poly(coeffs)
+    want = [[poly_eval(mono, _fpr(v, modulus) / 6.0) for v in row] for row in m]
+    tols = _cheb_tolerances(coeffs, mono, (-6.0, 6.0), 8)
+    for ev in ("clenshaw", "decor", "naive"):
+        if ev == "clenshaw": got, tol = via_chebyshev(mpc, m_st, _sigmoid, (-6.0, 6.0), 8).reveal(mpc).tolist(), tols[0]
+        elif ev == "decor": got, tol = via_chebyshev(mpc, m_st, _sigmoid, (-6.0, 6.0), 8, evaluation="decor").reveal(mpc).tolist(), tols[1]
+        else: got, tol = via_chebyshev(mpc, m_st, _sigmoid, (-6.0, 6.0), 8, evaluation="naive").reveal(mpc).tolist(), tols[2]
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tChebyshev sigmoid of a matrix ({ev}) on the {name}", got, want, error=tol)
+    _intact(mpc, "Chebyshev of a matrix", m_st, m, modulus)
+
+    # Decor's evaluation refuses a degree whose shifted coefficients on [-2, 2] grow too large: sigmoid on (-8, 8)
+    # at degree 20 (at F = 32 a shifted coefficient reaches 3.4e9, beyond the fixed-point range; at F = 64 the error
+    # bound exceeds the tolerance)
+    x1 = Sharetensor.enc(mpc, [0.5], 0, modulus)
+    _raises_before_any_round(mpc, f"Chebyshev sigmoid degree 20 (Decor) on the {name}",
+                             lambda: via_chebyshev(mpc, x1, _sigmoid, (-8.0, 8.0), 20, evaluation="decor"))
+
+
+def _max_abs_list(values: List[float]) -> float:
+    m = 0.0
+    for v in values:
+        m = max(m, abs(v))
+    return m
+
+
+def test_modulo_float(mpc):
+    # Ring only: the fractional part of x / period, share by share; sin is periodic, so sin(modulo_float(x)) = sin(x)
+    ring = MPC_RING_SIZE
+    xs = [-20.0, -3.3, 0.4, 7.7, 25.1]
+    x = Sharetensor.enc(mpc, xs, 0, ring)
+    y = modulo_float(mpc, x, 2.0 * PI)
+    got = via_decor(mpc, y, func="sin").reveal(mpc).tolist()
+    if mpc.pid:
+        # The reduction: x / (2 pi) errs by |x| times the encoding of 1 / (2 pi) (up to a unit) plus its truncation (up to
+        # 2 units), times 2 pi; the fractional part plus c < n_cp turns, times the encoded 2 pi, by n_cp units plus the
+        # truncation's 2. Then Decor's sin at |y| < 2 pi n_cp, and x's own encoding (a unit). Twice that.
+        n_cp = mpc.comms.number_of_parties - 1
+        reduction = 2.0 * PI * (_max_abs_list(xs) * ULP + 2.0 * ULP) + (float(n_cp) + 2.0) * ULP
+        tol = 2.0 * (trig_error_bound(2.0 * PI * float(n_cp)) + reduction + ULP)
+        assert_eq_approx(f"CP{mpc.pid}:\tsin(modulo_float(x, 2 pi)) = sin(x) on the ring", got, [math.sin(v) for v in xs], error=tol)
+    _intact(mpc, "modulo_float", x, xs, ring)
+
+
+def test_refusal(mpc, modulus: mpc_uint):
+    # Decor's nonlinear functions, Fourier, Taylor and Chebyshev (every evaluation) refuse to run inside
+    # delayed_truncation: every party raises before any round
+    name = _name(modulus)
+    x1 = Sharetensor.enc(mpc, [0.5, -0.3], 0, modulus)
+    series = fourier_coeffs(math.sin, (-PI, PI), 2)
+    with mpc.delayed_truncation():
+        _raises_before_any_round(mpc, f"Decor exp inside delayed_truncation on the {name}", lambda: via_decor(mpc, x1, func="exp", interval=(-1.0, 1.0)))
+        _raises_before_any_round(mpc, f"Decor sin inside delayed_truncation on the {name}", lambda: via_decor(mpc, x1, func="sin"))
+        _raises_before_any_round(mpc, f"Fourier inside delayed_truncation on the {name}", lambda: fourier_evaluate(mpc, x1, series))
+        _raises_before_any_round(mpc, f"Taylor (naive) inside delayed_truncation on the {name}", lambda: via_taylor(mpc, x1, func="exp", interval=(-1.0, 1.0), degree=4, evaluation="naive"))
+        _raises_before_any_round(mpc, f"Chebyshev (Clenshaw) inside delayed_truncation on the {name}", lambda: via_chebyshev(mpc, x1, math.exp, (-1.0, 1.0), 6))
+        _raises_before_any_round(mpc, f"Chebyshev (naive) inside delayed_truncation on the {name}", lambda: via_chebyshev(mpc, x1, math.exp, (-1.0, 1.0), 6, evaluation="naive"))
+
+    # The naive evaluations refuse, before any round, powers beyond the fixed-point range (Taylor inv on (0.5, 8): 3.75^17
+    # passes 2^31 at F = 32, 3.75^34 passes 2^63 at F = 64) and estimated errors beyond the tolerance (the Chebyshev
+    # interpolant of sigmoid on (-8, 8): monomial coefficients up to 1.2e8 at degree 44 and 2.2e9 at degree 50, their
+    # sums 6.3e8 and 1.3e10), and an interval whose scaling to [-1, 1] alone errs beyond it (the identity, scaled, on
+    # (-1e7, 1e7): (1e7 + 3) 2^-32 = 2.3e-3 at F = 32; (-1e15, 1e15) at F = 64)
+    f32 = MPC_NBIT_F <= 32
+    _raises_before_any_round(mpc, f"Taylor inv (naive) with powers beyond the fixed-point range on the {name}",
+                             lambda: via_taylor(mpc, x1, func="inv", interval=(0.5, 8.0), degree=17 if f32 else 34, evaluation="naive"))
+    _raises_before_any_round(mpc, f"Chebyshev sigmoid (naive) beyond its precision on the {name}",
+                             lambda: via_chebyshev(mpc, x1, _sigmoid, (-8.0, 8.0), 44 if f32 else 50, evaluation="naive"))
+    wide = 1e7 if f32 else 1e15
+    _raises_before_any_round(mpc, f"Chebyshev (naive) on an interval whose scaling errs beyond the tolerance on the {name}",
+                             lambda: via_chebyshev(mpc, x1, lambda v: v / wide, (-wide, wide), 3, evaluation="naive"))
+    _raises_before_any_round(mpc, f"Chebyshev (decor) on an interval whose scaling errs beyond the tolerance on the {name}",
+                             lambda: via_chebyshev(mpc, x1, lambda v: v / wide, (-wide, wide), 3, evaluation="decor"))
+
+
+def test_decor(mpc):
+    print(f"CP{mpc.pid}:\tTesting Decor ...\n")
+    if mpc.pid == 1:
+        test_derivatives()
+    for modulus in (MPC_RING_SIZE, MPC_FIELD_SIZE):
+        test_trig(mpc, modulus)
+        test_bounded(mpc, modulus)
+        test_polynomial(mpc, modulus)
+        test_fourier(mpc, modulus)
+        test_taylor(mpc, modulus)
+        test_chebyshev(mpc, modulus)
+        test_refusal(mpc, modulus)
+    test_modulo_float(mpc)
+    print(f"CP{mpc.pid}:\tDecor tests passed.\n")

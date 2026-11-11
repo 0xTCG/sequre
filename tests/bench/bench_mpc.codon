@@ -11,21 +11,32 @@ See tests/bench/harness.codon for the output format and scripts/bench.sh for the
 import math
 import prg
 import secure_operator
+import internal.static as static
 
 from sequre import main
-from sequre.constants import MPC_FIELD_SIZE, MPC_MODULUS_BITS, MPC_NBIT_K, MPC_NBIT_F, MPC_NBIT_V, mpc_uint
+from sequre.constants import (
+    MPC_FIELD_SIZE, MPC_RING_SIZE, MPC_MODULUS_BITS, MPC_NBIT_K, MPC_NBIT_F, MPC_NBIT_V, PACKING_SIZE, mpc_uint, size_t)
+from sequre.decor import decor_div, via_decor, via_fourier, via_taylor, fourier_coeffs
+from sequre.stdlib.chebyshev import via_chebyshev
+from sequre.stdlib.nonlinear import (
+    approx as nl_approx, exp as nl_exp, sigmoid as nl_sigmoid, tanh as nl_tanh, auto_degree as nl_auto_degree)
 from sequre.types.sharetensor import Sharetensor
 from sequre.types.internal import Internal as sq
 from sequre.types.utils import double_to_fp, fp_to_double
 from sequre.utils.utils import zeros_vec, zeros_mat, random_ints
 from sequre.stdlib.lin_alg import l2
 from sequre.stdlib.learn.lin_reg import LinReg
+from sequre.stdlib.learn.log_reg import LogReg
+from sequre.stdlib.learn.neural_net.model import Sequential
+from sequre.stdlib.learn.neural_net.layers import Input, Dense
 from sequre.stdlib.numpy.create import array, ones, zeros_like
 
 from harness import (
     Bench, Timer, handle_list_flag, shared_floats, shared_float_matrix, private_floats,
     max_abs_err_1d, max_abs_err_2d)
 from ...applications.king import king
+from ...applications.siren import synthetic_image, siren_model
+from ...applications.gwas_logreg import gwas_logreg, simulate_gwas_data
 
 
 # (name, flags, description). flags: "" | "iso" (bench.sh runs it in its own process, after the rest)
@@ -67,7 +78,7 @@ CASES = [
     ("mpc.fp.trunc_vec_1e5", "", "fixed-point truncation of a 1e5 share vector"),
     ("mpc.cmp.gt_zero_vec_1e3", "", "x > 0 (is_positive), 1e3"),
     ("mpc.cmp.gt_zero_vec_1e4", "", "x > 0 (is_positive), 1e4"),
-    ("mpc.cmp.gt_float_vec_1e3", "", "x > 0.5 (greater_than_public), 1e3"),
+    ("mpc.cmp.gt_float_vec_1e3", "", "x > 0.5 (the difference x - 0.5, then is_positive), 1e3"),
     ("mpc.cmp.gt_int_vec_1e3", "", "x > 1 with an int constant, 1e3"),
     ("mpc.cmp.gt_secret_vec_1e3", "", "x > y, both secret, 1e3"),
     ("mpc.fp.div_vec_1e3", "", "fp division x / y, both secret (fp_div), 1e3"),
@@ -86,6 +97,74 @@ CASES = [
     ("e2e.l2.sharetensor_16x512", "", "enc + l2 distance + reveal on Sharetensor, 16x512"),
     ("e2e.king.sharetensor_16x2048", "", "enc + KING + reveal on Sharetensor, 2x8 individuals x 2048 SNPs"),
     ("e2e.linreg.sharetensor_1024x31", "", "enc + LinReg BGD fit (10 epochs) + reveal on Sharetensor, 1024x31"),
+    ("decor.prim.xor_add_vec_1e4", "", "XOR-shared + public addition (add_public) of 1e4 K-bit registers (ring)"),
+    ("decor.prim.sign_f1_vec_1e4", "", "ring sign test over F + 1 bits (Decor's comparison of [0, 1) values), 1e4"),
+    ("decor.prim.sign_k1_vec_1e4", "", "ring sign test over K + 1 bits (any fixed-point difference), 1e4"),
+    ("decor.prim.sign_l_vec_1e3", "", "ring sign test over the full L bits, 1e3"),
+    ("decor.prim.normalizer_vec_1e3", "", "K-bit ring normalizer (s = 4^i, s_sqrt = 2^i), 1e3"),
+    ("decor.prim.div_vec_1e3", "", "Decor division x / y on the ring (sign test, normalizer, 4 Goldschmidt steps), 1e3"),
+    ("decor.fn.sin_ring_vec_1e3", "", "Decor sin (radians, any x): 3 rounds (the scaling to turns, one opening, one truncation), ring, 1e3"),
+    ("decor.fn.sin_field_vec_1e3", "", "Decor sin (radians, any x): 3 rounds (the scaling to turns, one opening, one truncation), field, 1e3"),
+    ("decor.fn.cos_ring_vec_1e3", "", "Decor cos (radians, any x), ring, 1e3"),
+    ("decor.fn.cos_field_vec_1e3", "", "Decor cos (radians, any x), field, 1e3"),
+    ("decor.fn.exp_ring_vec_1e3", "", "Decor exp on (-8, 8): one opening, the carry of the dealer's XOR-shared bits, one product, ring, 1e3"),
+    ("decor.fn.exp_field_vec_1e3", "", "Decor exp on (-8, 8): one opening, the carry of the dealer's XOR-shared bits, one product, field, 1e3"),
+    ("decor.fn.sigmoid_ring_vec_1e3", "", "Decor sigmoid on (-10, 10): select-then-divide (the carry, one product, a division by a positive denominator), ring, 1e3"),
+    ("decor.fn.sigmoid_field_vec_1e3", "", "Decor sigmoid on (-10, 10): select-then-divide (the carry, one product, Sequre's field division), field, 1e3"),
+    ("decor.fn.tanh_ring_vec_1e3", "", "Decor tanh on (-5, 5): select-then-divide, ring, 1e3"),
+    ("decor.fn.tanh_field_vec_1e3", "", "Decor tanh on (-5, 5): select-then-divide, field, 1e3"),
+    ("decor.fn.sinh_ring_vec_1e3", "", "Decor sinh on (-5, 5), ring, 1e3"),
+    ("decor.fn.sinh_field_vec_1e3", "", "Decor sinh on (-5, 5), field, 1e3"),
+    ("decor.fn.cosh_ring_vec_1e3", "", "Decor cosh on (-5, 5), ring, 1e3"),
+    ("decor.fn.cosh_field_vec_1e3", "", "Decor cosh on (-5, 5), field, 1e3"),
+    ("decor.fn.poly3_ring_vec_1e3", "", "Decor degree-3 polynomial on (-3, 3), O(d) decomposition, ring, 1e3"),
+    ("decor.fn.poly3_field_vec_1e3", "", "Decor degree-3 polynomial on (-3, 3), O(d) decomposition, field, 1e3"),
+    ("decor.fourier.expsin_deg8_ring_vec_1e3", "", "Fourier series of exp(sin x) on (-pi, pi), 8 harmonics, via Decor, ring, 1e3"),
+    ("decor.fourier.expsin_deg8_field_vec_1e3", "", "Fourier series of exp(sin x) on (-pi, pi), 8 harmonics, via Decor, field, 1e3"),
+    ("decor.taylor.exp_deg8_decor_ring_vec_1e3", "", "Taylor polynomial of exp on (-1, 1), degree 8, Decor evaluation, ring, 1e3"),
+    ("decor.taylor.exp_deg8_decor_field_vec_1e3", "", "Taylor polynomial of exp on (-1, 1), degree 8, Decor evaluation, field, 1e3"),
+    ("decor.taylor.exp_deg8_naive_ring_vec_1e3", "", "Taylor polynomial of exp on (-1, 1), degree 8, secure powers, ring, 1e3"),
+    ("decor.taylor.exp_deg8_naive_field_vec_1e3", "", "Taylor polynomial of exp on (-1, 1), degree 8, secure powers, field, 1e3"),
+    ("cheby.sigmoid_deg10_clenshaw_ring_vec_1e3", "", "Chebyshev interpolant of sigmoid on (-8, 8), degree 10, clenshaw evaluation, ring, 1e3"),
+    ("cheby.sigmoid_deg10_clenshaw_field_vec_1e3", "", "Chebyshev interpolant of sigmoid on (-8, 8), degree 10, clenshaw evaluation, field, 1e3"),
+    ("cheby.sigmoid_deg10_decor_ring_vec_1e3", "", "Chebyshev interpolant of sigmoid on (-8, 8), degree 10, decor evaluation, ring, 1e3"),
+    ("cheby.sigmoid_deg10_decor_field_vec_1e3", "", "Chebyshev interpolant of sigmoid on (-8, 8), degree 10, decor evaluation, field, 1e3"),
+    ("mpc.cmp.gt_zero_ring_vec_1e3", "", "x > 0 on ring shares (the K + 1-bit ring sign test), 1e3"),
+    ("mpc.cmp.gt_float_ring_vec_1e3", "", "x > 0.5 on ring shares, 1e3"),
+    ("mpc.cmp.gt_int_ring_vec_1e3", "", "x > 1 with an int constant on ring shares, 1e3"),
+    ("mpc.cmp.gt_secret_ring_vec_1e3", "", "x > y, both secret, on ring shares, 1e3"),
+    ("mpc.cmp.ne_ring_vec_1e3", "", "x != y, both secret, on ring shares (one sign test of (d, -d)), 1e3"),
+    ("mpc.fp.div_ring_vec_1e3", "", "fp division x / y, both secret, on ring shares (fp_div with the ring normalizer), 1e3"),
+    ("mpc.fp.sqrt_ring_vec_1e3", "", "fp square root + inverse on ring shares (fp_sqrt with the ring normalizer), 1e3"),
+    ("e2e.linreg.sharetensor_ring_1024x31", "", "enc + LinReg BGD fit (10 epochs) + reveal on ring-shared Sharetensor, 1024x31"),
+    ("e2e.nn.decor_sharetensor_64x8", "", "enc + Sequential fit (Decor tanh 16 + sigmoid, binary cross-entropy, 2 epochs) + reveal, 64x8"),
+    ("e2e.nn.decor_sharetensor_ring_64x8", "", "the same on ring shares"),
+    ("e2e.nn.chebyshev_sharetensor_64x8", "", "the same with Chebyshev activations (the reference method)"),
+    ("e2e.logreg.multinomial_sharetensor_256x8x3", "", "enc + LogReg multinomial (softmax, Decor) BGD fit (5 epochs) + reveal, 256x8, 3 classes"),
+    ("e2e.logreg.multinomial_sharetensor_ring_256x8x3", "", "the same on ring shares"),
+    ("e2e.logreg.multinomial_chebyshev_sharetensor_256x8x3", "", "the same with the Chebyshev exp in the softmax"),
+    ("e2e.siren.sharetensor_8x8", "", "enc + SIREN fit (2 Decor sine layers of 16, omega 30, MSE, 2 epochs) on a synthetic 8x8 image + reveal"),
+    ("e2e.siren.sharetensor_ring_8x8", "", "the same on ring shares"),
+    ("e2e.gwas_logreg.sharetensor_64x3", "", "enc + GWAS logistic association (Decor; 3 SNPs, 2 covariates, 64 individuals, 10 epochs per SNP) + reveal of the coefficients and accuracies"),
+    ("e2e.gwas_logreg.sharetensor_ring_64x3", "", "the same on ring shares"),
+    ("e2e.gwas_logreg.chebyshev_sharetensor_64x3", "", "the same with Chebyshev's sigmoid"),
+    ("e2e.gwas_logreg.chebyshev_sharetensor_ring_64x3", "", "the same on ring shares"),
+    # Like-for-like twins for the default-method decisions, and the Fourier coefficients' share of their case's time
+    ("e2e.nn.chebyshev_sharetensor_ring_64x8", "", "the Chebyshev NN (e2e.nn.chebyshev_sharetensor_64x8) on ring shares: the twin of e2e.nn.decor_sharetensor_ring_64x8"),
+    ("e2e.logreg.multinomial_chebyshev_sharetensor_ring_256x8x3", "", "the Chebyshev-exp softmax LogReg on ring shares: the twin of e2e.logreg.multinomial_sharetensor_ring_256x8x3"),
+    ("decor.fn.tan_ring_vec_1e3", "", "Decor tan on (-1.2, 1.2): sin and cos from one opening, then Decor's division, ring, 1e3"),
+    ("decor.fn.tan_field_vec_1e3", "", "Decor tan on (-1.2, 1.2): sin and cos from one opening, then Sequre's field division, field, 1e3"),
+    ("decor.fn.cot_ring_vec_1e3", "", "Decor cot on (0.4, 2.7): sin and cos from one opening, then Decor's division, ring, 1e3"),
+    ("decor.fn.cot_field_vec_1e3", "", "Decor cot on (0.4, 2.7): sin and cos from one opening, then Sequre's field division, field, 1e3"),
+    ("cheby.sigmoid_deg40_clenshaw_ring_vec_1e3", "", "Chebyshev interpolant of sigmoid on (-10, 10), degree 40 (as accurate as Decor's sigmoid: approx_err in params), Clenshaw, ring, 1e3"),
+    ("cheby.sigmoid_deg40_clenshaw_field_vec_1e3", "", "Chebyshev interpolant of sigmoid on (-10, 10), degree 40 (as accurate as Decor's sigmoid: approx_err in params), Clenshaw, field, 1e3"),
+    ("cheby.tanh_deg44_clenshaw_ring_vec_1e3", "", "Chebyshev interpolant of tanh on (-5, 5), degree 44 (as accurate as Decor's tanh: approx_err in params), Clenshaw, ring, 1e3"),
+    ("cheby.tanh_deg44_clenshaw_field_vec_1e3", "", "Chebyshev interpolant of tanh on (-5, 5), degree 44 (as accurate as Decor's tanh: approx_err in params), Clenshaw, field, 1e3"),
+    ("decor.fourier.coeffs_expsin_deg8", "", "the coefficients decor.fourier.expsin_deg8_* computes in every call (8 harmonics, 1000 nodes, in the clear at every party): its data-independent part"),
+    ("nl.sigmoid_auto_ring_vec_1e3", "", "nonlinear.sigmoid's default (auto) on its default interval ((-10, 10) at F = 32), inputs in (-10, 10): Decor on ring shares, ring, 1e3"),
+    ("nl.sigmoid_auto_field_vec_1e3", "", "nonlinear.sigmoid's default (auto) on its default interval ((-10, 10) at F = 32), inputs in (-10, 10): on field shares the Chebyshev interpolant of auto_degree (degree in params), field, 1e3"),
+    ("nl.tanh_auto_ring_vec_1e3", "", "nonlinear.tanh's default (auto) on its default interval ((-5, 5) at F = 32), inputs in (-5, 5): Decor on ring shares, ring, 1e3"),
+    ("nl.tanh_auto_field_vec_1e3", "", "nonlinear.tanh's default (auto) on its default interval ((-5, 5) at F = 32), inputs in (-5, 5): on field shares the Chebyshev interpolant of auto_degree (degree in params), field, 1e3"),
 ]
 
 handle_list_flag("mpc", CASES)
@@ -639,7 +718,7 @@ def bench_cmp(mpc, b: Bench):
             r = secure_operator.gt(mpc, fresh(x), 1)
             t.end(mpc)
         rv = r.reveal(mpc)
-        # check = mismatches against the true x > 1 (nonzero while gt ignores the fixed-point scale of int constants).
+        # check = mismatches against the true x > 1 (0 when the int constant is put in fixed point; H-10 compared it raw).
         b.report(f"n={n}", t, mismatches(rv, [1.0 if v > 1.0 else 0.0 for v in xs]) if mpc.pid else 0.0)
 
     if b.want(mpc, "mpc.cmp.gt_secret_vec_1e3"):
@@ -654,6 +733,104 @@ def bench_cmp(mpc, b: Bench):
             t.end(mpc)
         rv = r.reveal(mpc)
         b.report(f"n={n}", t, mismatches(rv, [1.0 if xs[i] > ys[i] else 0.0 for i in range(n)]) if mpc.pid else 0.0)
+
+
+def bench_ring_cmp_fp(mpc, b: Bench):
+    # The ring twins of mpc.cmp.* and mpc.fp.div/sqrt: ring shares built explicitly, whatever the binary's modulus
+    ring = MPC_RING_SIZE
+    n = 1000
+    for case, c in (("mpc.cmp.gt_zero_ring_vec_1e3", 0.0), ("mpc.cmp.gt_float_ring_vec_1e3", 0.5)):
+        if b.want(mpc, case):
+            xs = shared_floats(mpc, n, -4.0, 4.0)
+            x = Sharetensor.enc(mpc, xs, 0, ring)
+            r = x
+            t = Timer(b.reps(7))
+            while t.next():
+                t.begin(mpc)
+                r = secure_operator.gt(mpc, fresh(x), c) if c != 0.0 else secure_operator.gt(mpc, fresh(x), 0)
+                t.end(mpc)
+            rv = r.reveal(mpc)
+            b.report(f"n={n}", t, mismatches(rv, [1.0 if v > c else 0.0 for v in xs]) if mpc.pid else 0.0)
+    if b.want(mpc, "mpc.cmp.gt_int_ring_vec_1e3"):
+        xs = shared_floats(mpc, n, -4.0, 4.0)
+        x = Sharetensor.enc(mpc, xs, 0, ring)
+        r = x
+        t = Timer(b.reps(7))
+        while t.next():
+            t.begin(mpc)
+            r = secure_operator.gt(mpc, fresh(x), 1)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n}", t, mismatches(rv, [1.0 if v > 1.0 else 0.0 for v in xs]) if mpc.pid else 0.0)
+    for case in ("mpc.cmp.gt_secret_ring_vec_1e3", "mpc.cmp.ne_ring_vec_1e3"):
+        if b.want(mpc, case):
+            xs = shared_floats(mpc, n, -4.0, 4.0)
+            ys = shared_floats(mpc, n, -4.0, 4.0)
+            for i in range(0, n, 4):
+                ys[i] = xs[i]  # equal pairs for !=
+            x = Sharetensor.enc(mpc, xs, 0, ring)
+            y = Sharetensor.enc(mpc, ys, 0, ring)
+            r = x
+            t = Timer(b.reps(7))
+            while t.next():
+                t.begin(mpc)
+                r = secure_operator.gt(mpc, fresh(x), fresh(y)) if case == "mpc.cmp.gt_secret_ring_vec_1e3" else sq.secure_ne(mpc, fresh(x), fresh(y))
+                t.end(mpc)
+            rv = r.reveal(mpc)
+            if case == "mpc.cmp.gt_secret_ring_vec_1e3":
+                want = [1.0 if xs[i] > ys[i] else 0.0 for i in range(n)]
+            else:
+                want = [1.0 if xs[i] != ys[i] else 0.0 for i in range(n)]
+            b.report(f"n={n}", t, mismatches(rv, want) if mpc.pid else 0.0)
+    if b.want(mpc, "mpc.fp.div_ring_vec_1e3"):
+        xs = shared_floats(mpc, n, -4.0, 4.0)
+        ys = shared_floats(mpc, n, 1.0, 8.0)
+        x = Sharetensor.enc(mpc, xs, 0, ring)
+        y = Sharetensor.enc(mpc, ys, 0, ring)
+        r = x
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            r = secure_operator.truediv(mpc, fresh(x), fresh(y))
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n}", t, max_abs_err_1d(rv, [xs[i] / ys[i] for i in range(n)]) if mpc.pid else 0.0)
+    if b.want(mpc, "mpc.fp.sqrt_ring_vec_1e3"):
+        xs = shared_floats(mpc, n, 1.0, 8.0)
+        x = Sharetensor.enc(mpc, xs, 0, ring)
+        r = x
+        t = Timer(b.reps(5))
+        while t.next():
+            xf = fresh(x)
+            t.begin(mpc)
+            r = sq.sqrt(mpc, xf)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n}", t, max_abs_err_1d(rv, [math.sqrt(v) for v in xs]) if mpc.pid else 0.0)
+
+    if b.want(mpc, "e2e.linreg.sharetensor_ring_1024x31"):
+        ring = MPC_RING_SIZE
+        rows, cols = 1024, 31
+        X = array(shared_float_matrix(mpc, rows, cols, 0.0, 1.0))
+        target_w = array(shared_float_matrix(mpc, cols, 1, 0.0, 1.0))
+        y = X @ target_w + 1.0
+        raw_w0 = ones((cols + 1, 1))
+        step, epochs = 0.0001, 10
+        wv = array([[0.0]])
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            mX = Sharetensor.enc(mpc, X, 0, ring)
+            my = Sharetensor.enc(mpc, y, 0, ring)
+            mw = Sharetensor.enc(mpc, raw_w0, 0, ring)
+            model = LinReg(mw).fit(mpc, X=mX, y=my, step=step, epochs=epochs)
+            wv = model.coef_.reveal(mpc)
+            t.end(mpc)
+        err = 0.0
+        if mpc.pid:
+            ref = LinReg(raw_w0).fit(mpc, X=X, y=y, step=step, epochs=epochs).coef_
+            err = max_abs_err_2d(wv, ref)
+        b.report(f"{rows}x{cols};epochs={epochs}", t, err)
 
 
 def bench_fp(mpc, b: Bench):
@@ -919,6 +1096,425 @@ def bench_e2e(mpc, b: Bench):
         b.report(f"{rows}x{cols};epochs={epochs}", t, err)
 
 
+def _nn_layers(ctype: type, method: str):
+    return (Input[ctype](8), Dense[ctype]("tanh", 16, "normal", "zeros", method=method),
+            Dense[ctype]("sigmoid", 1, "normal", "zeros", method=method))
+
+
+def _copy_initial_weights(mpc, src, dst):
+    # dst (a plaintext model) takes src's (a Sharetensor model's) initial weights and biases, revealed (CP0 gets zeros).
+    # Every party drew them in the clear under the shared seed (Sharetensor.rand), so the reveal discloses nothing new;
+    # it keeps the plaintext reference on the same start without rewinding a stream (see the module docstring of
+    # harness.codon on reset_global_seed).
+    for i in static.range(1, static.len(src.layers)):
+        dst.layers[i].weights = src.layers[i].weights.reveal(mpc)
+        dst.layers[i].bias = src.layers[i].bias.reveal(mpc)
+
+
+def _bench_nn(mpc, b: Bench, case: str, mod, method: str):
+    # Training with the new activations; check = the max difference of the trained weights from the plaintext path's
+    # (from the same initial weights)
+    if b.want(mpc, case):
+        rows = 64
+        X = array(shared_float_matrix(mpc, rows, 8, -1.0, 1.0))
+        y = array([[1.0 if X[i, 0] + X[i, 1] > 0.0 else 0.0] for i in range(rows)])
+        wv = array([[0.0]])
+        ref = Sequential(_nn_layers(type(X), method)).compile(mpc, loss="binary_crossentropy", optimizer="bgd")
+        t = Timer(b.reps(3))
+        while t.next():
+            with mpc.randomness.seed_switch(-1):
+                model = Sequential(_nn_layers(Sharetensor[List[List[mpc_uint]]], method)).compile(
+                    mpc, loss="binary_crossentropy", optimizer="bgd", modulus=mod)
+            _copy_initial_weights(mpc, model, ref)
+            t.begin(mpc)
+            mX = Sharetensor.enc(mpc, X, 0, mod)
+            my = Sharetensor.enc(mpc, y, 0, mod)
+            model.fit(mpc, X=mX, y=my, step=0.5, epochs=2, momentum=0.9)
+            wv = model.layers[1].weights.reveal(mpc)
+            t.end(mpc)
+        # The reference from the last repetition's initial weights
+        ref.fit(mpc, X=X, y=y, step=0.5, epochs=2, momentum=0.9)
+        err = max_abs_err_2d(wv, ref.layers[1].weights.tolist()) if mpc.pid else 0.0
+        b.report(f"{rows}x8;epochs=2", t, err)
+
+
+def _bench_multinomial(mpc, b: Bench, case: str, mod, method: str):
+    # The softmax LogReg; check = the max difference of the trained weights from the plaintext path's
+    if b.want(mpc, case):
+        rows, cols, classes = 256, 8, 3
+        X = array(shared_float_matrix(mpc, rows, cols, -1.0, 1.0))
+        Wt = array(shared_float_matrix(mpc, cols, classes, -1.0, 1.0))
+        scores = X @ Wt
+        y = array([[1.0 if scores[i, k] >= max(scores[i, 0], scores[i, 1], scores[i, 2]) else 0.0 for k in range(classes)] for i in range(rows)])
+        w0 = array([[0.0 for _ in range(classes)] for _ in range(cols + 1)])
+        step, epochs = 0.01, 5
+        wv = array([[0.0]])
+        t = Timer(b.reps(3))
+        while t.next():
+            t.begin(mpc)
+            mX = Sharetensor.enc(mpc, X, 0, mod)
+            my = Sharetensor.enc(mpc, y, 0, mod)
+            mw = Sharetensor.enc(mpc, w0, 0, mod)
+            model = LogReg(mw, variant="multinomial", method=method).fit(mpc, X=mX, y=my, step=step, epochs=epochs)
+            wv = model.coef_.reveal(mpc)
+            t.end(mpc)
+        err = 0.0
+        if mpc.pid:
+            ref = LogReg(w0, variant="multinomial", method=method).fit(mpc, X=X, y=y, step=step, epochs=epochs).coef_
+            err = max_abs_err_2d(wv, ref)
+        b.report(f"{rows}x{cols}x{classes};epochs={epochs}", t, err)
+
+
+def bench_ml(mpc, b: Bench):
+    # Training with the new activations and the softmax LogReg
+    for case, mod, method in (("e2e.nn.decor_sharetensor_64x8", MPC_FIELD_SIZE, "decor"),
+                              ("e2e.nn.decor_sharetensor_ring_64x8", MPC_RING_SIZE, "decor"),
+                              ("e2e.nn.chebyshev_sharetensor_64x8", MPC_FIELD_SIZE, "chebyshev")):
+        _bench_nn(mpc, b, case, mod, method)
+
+    for case, mod, method in (("e2e.logreg.multinomial_sharetensor_256x8x3", MPC_FIELD_SIZE, "decor"),
+                              ("e2e.logreg.multinomial_sharetensor_ring_256x8x3", MPC_RING_SIZE, "decor"),
+                              ("e2e.logreg.multinomial_chebyshev_sharetensor_256x8x3", MPC_FIELD_SIZE, "chebyshev")):
+        _bench_multinomial(mpc, b, case, mod, method)
+
+
+def bench_apps(mpc, b: Bench):
+    # The applications themselves (applications/siren.codon, applications/gwas_logreg.codon); check = the max
+    # difference of the secure path's result (first-layer weights, SNP coefficients) from the plaintext path's
+    for case, mod in (("e2e.siren.sharetensor_8x8", MPC_FIELD_SIZE), ("e2e.siren.sharetensor_ring_8x8", MPC_RING_SIZE)):
+        if b.want(mpc, case):
+            side, neurons, omega, step, epochs = 8, 16, 30.0, 0.01, 2
+            X, y = synthetic_image(side)
+            wv = array([[0.0]])
+            ref = siren_model(mpc, type(X), 2, neurons, omega)
+            # About 0.06 s a repetition: 9 of them for a stable median
+            t = Timer(b.reps(9))
+            while t.next():
+                with mpc.randomness.seed_switch(-1):
+                    model = siren_model(mpc, Sharetensor[List[List[mpc_uint]]], 2, neurons, omega, modulus=mod)
+                _copy_initial_weights(mpc, model, ref)
+                t.begin(mpc)
+                mX = Sharetensor.enc(mpc, X, 0, mod)
+                my = Sharetensor.enc(mpc, y, 0, mod)
+                model.fit(mpc, X=mX, y=my, step=step, epochs=epochs, momentum=0.9)
+                wv = model.layers[1].weights.reveal(mpc)
+                t.end(mpc)
+            # The reference from the last repetition's initial weights
+            ref.fit(mpc, X=X, y=y, step=step, epochs=epochs, momentum=0.9)
+            err = max_abs_err_2d(wv, ref.layers[1].weights.tolist()) if mpc.pid else 0.0
+            b.report(f"{side}x{side};neurons={neurons};epochs={epochs}", t, err)
+
+    for case, mod, method in (("e2e.gwas_logreg.sharetensor_64x3", MPC_FIELD_SIZE, "decor"),
+                              ("e2e.gwas_logreg.sharetensor_ring_64x3", MPC_RING_SIZE, "decor"),
+                              ("e2e.gwas_logreg.chebyshev_sharetensor_64x3", MPC_FIELD_SIZE, "chebyshev"),
+                              ("e2e.gwas_logreg.chebyshev_sharetensor_ring_64x3", MPC_RING_SIZE, "chebyshev")):
+        if b.want(mpc, case):
+            n, snps, covs, step, epochs = 64, 3, 2, 1.0, 10  # step per individual (gwas_logreg divides by n)
+            interval = (-10.0, 10.0)
+            with mpc.randomness.seed_switch(-1):
+                geno = array(random_ints((n, snps), upper_limit=2)).astype(float)
+                betas, pheno, cov = simulate_gwas_data(geno, covs)
+            w0 = array([[0.0] for _ in range(covs + 2)])
+            got = List[float]()
+            t = Timer(b.reps(3))
+            while t.next():
+                t.begin(mpc)
+                sg = Sharetensor.enc(mpc, geno, 0, mod)
+                sp = Sharetensor.enc(mpc, pheno, 0, mod)
+                sc = Sharetensor.enc(mpc, cov, 0, mod)
+                sw = Sharetensor.enc(mpc, w0, 0, mod)
+                got, _ = gwas_logreg(mpc, sg, sp, sc, sw, method, step, epochs, interval=interval)
+                t.end(mpc)
+            ref, _ = gwas_logreg(mpc, geno, pheno, cov, w0, method, step, epochs, interval=interval)
+            b.report(f"{n}x{snps};covs={covs};epochs={epochs}", t, max_abs_err_1d(got, ref) if mpc.pid else 0.0)
+
+
+########################## decor.prim: bitwise protocols and Decor division (ring shares) ##########################
+
+
+def bench_decor_prim(mpc, b: Bench):
+    # Ring shares built explicitly (MPC_RING_SIZE), so the binary's default modulus does not matter. The params
+    # record each operation's rounds, counted once at the end.
+    ring = MPC_RING_SIZE
+
+    if b.want(mpc, "decor.prim.xor_add_vec_1e4"):
+        n = 10000
+        with mpc.randomness.seed_switch(-1):
+            xs = [prg.getrandbits_intn(PACKING_SIZE, TP=size_t) for _ in range(n)]
+            ys = [prg.getrandbits_intn(PACKING_SIZE, TP=size_t) for _ in range(n)]
+        x = mpc.bitwise.share_from_trusted_dealer(xs)
+        s = x
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            s = mpc.bitwise.add_public(x, ys, bitlen=PACKING_SIZE, dtype=size_t)
+            t.end(mpc)
+        r0 = mpc.stats.rounds
+        s = mpc.bitwise.add_public(x, ys, bitlen=PACKING_SIZE, dtype=size_t)
+        rounds = mpc.stats.rounds - r0
+        rv = mpc.bitwise.reveal(s)
+        bad = 0.0
+        if mpc.pid:
+            for i in range(n):
+                if rv[i] != xs[i].wrapping_add(ys[i]):
+                    bad += 1.0
+        b.report(f"n={n};rounds={rounds};check=mismatches", t, bad)
+
+    for case, n, lo, hi in (("decor.prim.sign_f1_vec_1e4", 10000, -0.999, 0.999),
+                            ("decor.prim.sign_k1_vec_1e4", 10000, -4.0, 4.0),
+                            ("decor.prim.sign_l_vec_1e3", 1000, -4.0, 4.0)):
+        if b.want(mpc, case):
+            xs = shared_floats(mpc, n, lo, hi)
+            xr = Sharetensor.enc(mpc, xs, 0, ring)
+            g = xr.share
+            t = Timer(b.reps(5))
+            r0 = mpc.stats.rounds
+            while t.next():
+                t.begin(mpc)
+                if case == "decor.prim.sign_f1_vec_1e4":
+                    g = mpc.bitwise.sign_ring(xr.share, ring, bits=MPC_NBIT_F + 1)
+                elif case == "decor.prim.sign_k1_vec_1e4":
+                    g = mpc.bitwise.sign_ring(xr.share, ring, bits=MPC_NBIT_K + 1)
+                else:
+                    g = mpc.bitwise.is_positive_ring(xr.share, ring, ring, op_mod_bitlen=MPC_MODULUS_BITS)
+                t.end(mpc)
+            rounds = (mpc.stats.rounds - r0) // (t.warmup + t.reps)
+            rv = Sharetensor(g, ring).reveal(mpc)
+            b.report(f"n={n};rounds={rounds};check=mismatches", t,
+                     mismatches(rv, [1.0 if v > 0.0 else 0.0 for v in xs]) if mpc.pid else 0.0)
+
+    if b.want(mpc, "decor.prim.normalizer_vec_1e3"):
+        n = 1000
+        xs = shared_floats(mpc, n, 0.001, 1000.0)
+        xr = Sharetensor.enc(mpc, xs, 0, ring)
+        sv, _ = mpc.bitwise.normalizer(xr.share, ring)
+        t = Timer(b.reps(5))
+        r0 = mpc.stats.rounds
+        while t.next():
+            t.begin(mpc)
+            sv, _ = mpc.bitwise.normalizer(xr.share, ring)
+            t.end(mpc)
+        rounds = (mpc.stats.rounds - r0) // (t.warmup + t.reps)
+        rs = mpc.comms.reveal(sv, ring)
+        bad = 0.0
+        if mpc.pid:
+            lo_b, hi_b = mpc_uint(1) << mpc_uint(MPC_NBIT_K - 2), mpc_uint(1) << mpc_uint(MPC_NBIT_K)
+            raw = double_to_fp(xs, ring)
+            for i in range(n):
+                if not (lo_b <= raw[i] * rs[i] < hi_b):
+                    bad += 1.0
+        b.report(f"n={n};rounds={rounds};check=out_of_range", t, bad)
+
+    if b.want(mpc, "decor.prim.div_vec_1e3"):
+        n = 1000
+        xs = shared_floats(mpc, n, -4.0, 4.0)
+        ys = shared_floats(mpc, n, 1.0, 8.0)
+        x = Sharetensor.enc(mpc, xs, 0, ring)
+        y = Sharetensor.enc(mpc, ys, 0, ring)
+        r = x
+        t = Timer(b.reps(5))
+        r0 = mpc.stats.rounds
+        while t.next():
+            t.begin(mpc)
+            r = decor_div(mpc, fresh(x), fresh(y))
+            t.end(mpc)
+        rounds = (mpc.stats.rounds - r0) // (t.warmup + t.reps)
+        rv = r.reveal(mpc)
+        b.report(f"n={n};rounds={rounds}", t, max_abs_err_1d(rv, [xs[i] / ys[i] for i in range(n)]) if mpc.pid else 0.0)
+
+
+########################## decor.fn / fourier / taylor, cheby: nonlinear functions (ring and field) ##########################
+
+
+def _sigmoid(v: float) -> float:
+    return 1.0 / (1.0 + math.exp(-v)) if v >= 0.0 else math.exp(v) / (1.0 + math.exp(v))
+
+
+def _poly3(v: float) -> float:
+    return 1.0 - 2.0 * v + 0.5 * v * v + 0.25 * v * v * v
+
+
+def _decor_fn(mpc, x, fn: str):
+    if fn == "sin": return via_decor(mpc, x, func="sin")
+    if fn == "cos": return via_decor(mpc, x, func="cos")
+    if fn == "exp": return via_decor(mpc, x, func="exp", interval=(-8.0, 8.0))
+    if fn == "sigmoid": return via_decor(mpc, x, func="sigmoid", interval=(-10.0, 10.0))
+    if fn == "tanh": return via_decor(mpc, x, func="tanh", interval=(-5.0, 5.0))
+    if fn == "sinh": return via_decor(mpc, x, func="sinh", interval=(-5.0, 5.0))
+    if fn == "cosh": return via_decor(mpc, x, func="cosh", interval=(-5.0, 5.0))
+    if fn == "tan": return via_decor(mpc, x, func="tan")
+    if fn == "cot": return via_decor(mpc, x, func="cot")
+    return via_decor(mpc, x, func="polynomial", interval=(-3.0, 3.0), coeffs=[1.0, -2.0, 0.5, 0.25])
+
+
+def _plain_fn(fn: str, v: float) -> float:
+    if fn == "sin": return math.sin(v)
+    if fn == "cos": return math.cos(v)
+    if fn == "exp": return math.exp(v)
+    if fn == "sigmoid": return _sigmoid(v)
+    if fn == "tanh": return math.tanh(v)
+    if fn == "sinh": return math.sinh(v)
+    if fn == "cosh": return math.cosh(v)
+    if fn == "tan": return math.tan(v)
+    if fn == "cot": return 1.0 / math.tan(v)
+    return _poly3(v)
+
+
+def _fn_range(fn: str) -> Tuple[float, float]:
+    if fn == "exp": return (-8.0, 8.0)
+    if fn == "sigmoid": return (-10.0, 10.0)
+    if fn == "tanh" or fn == "sinh" or fn == "cosh": return (-5.0, 5.0)
+    if fn == "poly3": return (-3.0, 3.0)
+    if fn == "tan": return (-1.2, 1.2)
+    if fn == "cot": return (0.4, 2.7)
+    return (-10.0, 10.0)
+
+
+def _max_err(a: List[float], b: List[float]) -> float:
+    m = 0.0
+    for i in range(len(a)):
+        m = max(m, abs(a[i] - b[i]))
+    return m
+
+
+def _timed_fn(mpc, b: Bench, case: str, n: int, xs: List[float], x, op, want: List[float], extra: str = ""):
+    r = op(mpc, x)
+    t = Timer(b.reps(5))
+    r0 = mpc.stats.rounds
+    while t.next():
+        t.begin(mpc)
+        r = op(mpc, x)
+        t.end(mpc)
+    rounds = (mpc.stats.rounds - r0) // (t.warmup + t.reps)
+    rv = r.reveal(mpc)
+    b.report(f"n={n};rounds={rounds}{extra}", t, max_abs_err_1d(rv, want) if mpc.pid else 0.0)
+
+
+def bench_decor_fn(mpc, b: Bench):
+    n = 1000
+    for fn in ("sin", "cos", "exp", "sigmoid", "tanh", "sinh", "cosh", "poly3"):
+        for mod in ("ring", "field"):
+            case = f"decor.fn.{fn}_{mod}_vec_1e3"
+            if b.want(mpc, case):
+                modulus = MPC_RING_SIZE if mod == "ring" else MPC_FIELD_SIZE
+                lo, hi = _fn_range(fn)
+                xs = shared_floats(mpc, n, lo, hi)
+                x = Sharetensor.enc(mpc, xs, 0, modulus)
+                want = [_plain_fn(fn, fp_to_double(double_to_fp(v, modulus), modulus)) for v in xs]
+                _timed_fn(mpc, b, case, n, xs, x, lambda mpc, x: _decor_fn(mpc, x, fn), want)
+
+    for mod in ("ring", "field"):
+        case = f"decor.fourier.expsin_deg8_{mod}_vec_1e3"
+        if b.want(mpc, case):
+            # A smooth periodic target: its series converges fast (a non-periodic one rings at the ends, Gibbs)
+            modulus = MPC_RING_SIZE if mod == "ring" else MPC_FIELD_SIZE
+            xs = shared_floats(mpc, n, -math.pi, math.pi)
+            x = Sharetensor.enc(mpc, xs, 0, modulus)
+            # check: against the series itself in double (at the encoded inputs); its error against exp(sin x) goes to
+            # params
+            enc = [fp_to_double(double_to_fp(v, modulus), modulus) for v in xs]
+            want = nl_approx(mpc, enc, lambda v: math.exp(math.sin(v)), (-math.pi, math.pi), method="fourier", degree=8)
+            extra = f";approx_err={_max_err(want, [math.exp(math.sin(v)) for v in enc]):.2e}"
+            _timed_fn(mpc, b, case, n, xs, x, lambda mpc, x: via_fourier(mpc, x, lambda v: math.exp(math.sin(v)), (-math.pi, math.pi), 8),
+                      want, extra)
+
+    for ev in ("decor", "naive"):
+        for mod in ("ring", "field"):
+            case = f"decor.taylor.exp_deg8_{ev}_{mod}_vec_1e3"
+            if b.want(mpc, case):
+                modulus = MPC_RING_SIZE if mod == "ring" else MPC_FIELD_SIZE
+                xs = shared_floats(mpc, n, -1.0, 1.0)
+                x = Sharetensor.enc(mpc, xs, 0, modulus)
+                # check: against the Taylor polynomial itself in double (at the encoded inputs); its error against exp
+                # goes to params
+                enc = [fp_to_double(double_to_fp(v, modulus), modulus) for v in xs]
+                want = nl_exp(mpc, enc, method="taylor", interval=(-1.0, 1.0), degree=8)
+                extra = f";approx_err={_max_err(want, [math.exp(v) for v in enc]):.2e}"
+                if ev == "decor":
+                    _timed_fn(mpc, b, case, n, xs, x, lambda mpc, x: via_taylor(mpc, x, func="exp", interval=(-1.0, 1.0), degree=8), want, extra)
+                else:
+                    _timed_fn(mpc, b, case, n, xs, x, lambda mpc, x: via_taylor(mpc, x, func="exp", interval=(-1.0, 1.0), degree=8, evaluation="naive"), want, extra)
+
+    for ev in ("clenshaw", "decor"):
+        for mod in ("ring", "field"):
+            case = f"cheby.sigmoid_deg10_{ev}_{mod}_vec_1e3"
+            if b.want(mpc, case):
+                modulus = MPC_RING_SIZE if mod == "ring" else MPC_FIELD_SIZE
+                xs = shared_floats(mpc, n, -8.0, 8.0)
+                x = Sharetensor.enc(mpc, xs, 0, modulus)
+                # check: against the degree-10 interpolant itself in double (at the encoded inputs); its error against
+                # sigmoid goes to params
+                enc = [fp_to_double(double_to_fp(v, modulus), modulus) for v in xs]
+                want = nl_approx(mpc, enc, _sigmoid, (-8.0, 8.0), method="chebyshev", degree=10)
+                extra = f";approx_err={_max_err(want, [_sigmoid(v) for v in enc]):.2e}"
+                if ev == "clenshaw":
+                    _timed_fn(mpc, b, case, n, xs, x, lambda mpc, x: via_chebyshev(mpc, x, _sigmoid, (-8.0, 8.0), 10), want, extra)
+                else:
+                    _timed_fn(mpc, b, case, n, xs, x, lambda mpc, x: via_chebyshev(mpc, x, _sigmoid, (-8.0, 8.0), 10, evaluation="decor"), want, extra)
+
+
+def bench_twins(mpc, b: Bench):
+    # Like-for-like twins for the default-method decisions (Chebyshev on the ring for the NN and the softmax LogReg,
+    # Decor's dividing tan and cot, Chebyshev sigmoid and tanh at Decor's accuracy), and the Fourier coefficients' share
+    # of their case. After every earlier section: the earlier cases' shared data stay as they were.
+    _bench_nn(mpc, b, "e2e.nn.chebyshev_sharetensor_ring_64x8", MPC_RING_SIZE, "chebyshev")
+    _bench_multinomial(mpc, b, "e2e.logreg.multinomial_chebyshev_sharetensor_ring_256x8x3", MPC_RING_SIZE, "chebyshev")
+
+    n = 1000
+    for fn in ("tan", "cot"):
+        for mod in ("ring", "field"):
+            case = f"decor.fn.{fn}_{mod}_vec_1e3"
+            if b.want(mpc, case):
+                modulus = MPC_RING_SIZE if mod == "ring" else MPC_FIELD_SIZE
+                lo, hi = _fn_range(fn)
+                xs = shared_floats(mpc, n, lo, hi)
+                x = Sharetensor.enc(mpc, xs, 0, modulus)
+                want = [_plain_fn(fn, fp_to_double(double_to_fp(v, modulus), modulus)) for v in xs]
+                _timed_fn(mpc, b, case, n, xs, x, lambda mpc, x: _decor_fn(mpc, x, fn), want)
+
+    for fn, degree in (("sigmoid", 40), ("tanh", 44)):
+        for mod in ("ring", "field"):
+            case = f"cheby.{fn}_deg{degree}_clenshaw_{mod}_vec_1e3"
+            if b.want(mpc, case):
+                modulus = MPC_RING_SIZE if mod == "ring" else MPC_FIELD_SIZE
+                lo, hi = _fn_range(fn)
+                xs = shared_floats(mpc, n, lo, hi)
+                x = Sharetensor.enc(mpc, xs, 0, modulus)
+                # check: against the interpolant itself in double (at the encoded inputs); its error against the
+                # function goes to params (Decor's own error is decor.fn.{sigmoid,tanh}_*'s check)
+                enc = [fp_to_double(double_to_fp(v, modulus), modulus) for v in xs]
+                want = nl_approx(mpc, enc, lambda v: _plain_fn(fn, v), (lo, hi), method="chebyshev", degree=degree)
+                extra = f";approx_err={_max_err(want, [_plain_fn(fn, v) for v in enc]):.2e}"
+                _timed_fn(mpc, b, case, n, xs, x, lambda mpc, x: via_chebyshev(mpc, x, lambda v: _plain_fn(fn, v), (lo, hi), degree), want, extra)
+
+    if b.want(mpc, "decor.fourier.coeffs_expsin_deg8"):
+        # check: the series against exp(sin x) on a fixed grid (no draw from the shared stream)
+        target = lambda v: math.exp(math.sin(v))
+        series = fourier_coeffs(target, (-math.pi, math.pi), 8)
+        t = Timer(b.reps(9))
+        while t.next():
+            t.begin(mpc)
+            series = fourier_coeffs(target, (-math.pi, math.pi), 8)
+            t.end(mpc)
+        grid = [-math.pi + 2.0 * math.pi * float(i) / float(n) for i in range(n)]
+        b.report("degree=8;nodes=1000", t, _max_err([series(v) for v in grid], [target(v) for v in grid]))
+
+    # sigmoid's and tanh's default, auto: Decor on ring shares, a Chebyshev interpolant within Decor's error bound on
+    # field shares. check: against the function itself (at the encoded inputs), within Decor's bound on either modulus
+    for fn in ("sigmoid", "tanh"):
+        for mod in ("ring", "field"):
+            case = f"nl.{fn}_auto_{mod}_vec_1e3"
+            if b.want(mpc, case):
+                modulus = MPC_RING_SIZE if mod == "ring" else MPC_FIELD_SIZE
+                lo, hi = _fn_range(fn)
+                xs = shared_floats(mpc, n, lo, hi)
+                x = Sharetensor.enc(mpc, xs, 0, modulus)
+                want = [_plain_fn(fn, fp_to_double(double_to_fp(v, modulus), modulus)) for v in xs]
+                degree = nl_auto_degree("sigmoid") if fn == "sigmoid" else nl_auto_degree("tanh")
+                extra = f";method={'decor' if mod == 'ring' else 'chebyshev'};field_degree={degree}"
+                _timed_fn(mpc, b, case, n, xs, x, lambda mpc, x: nl_sigmoid(mpc, x) if fn == "sigmoid" else nl_tanh(mpc, x), want, extra)
+
+
 @main
 def bench_mpc_main(mpc):
     b = Bench("mpc", mpc.pid, CASES)
@@ -932,6 +1528,14 @@ def bench_mpc_main(mpc):
     bench_public(mpc, b)
     bench_mixed(mpc, b)
     bench_e2e(mpc, b)
+    bench_decor_prim(mpc, b)
+    bench_decor_fn(mpc, b)
+    # New sections run after every earlier one (each selected case draws from the shared stream: the earlier cases'
+    # data stay as they were): the ring comparisons and division, then training, then the applications
+    bench_ring_cmp_fp(mpc, b)
+    bench_ml(mpc, b)
+    bench_apps(mpc, b)
+    bench_twins(mpc, b)
     b.finish(mpc)
 
 

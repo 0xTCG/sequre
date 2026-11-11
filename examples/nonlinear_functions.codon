@@ -1,0 +1,99 @@
+"""
+Nonlinear functions on secret data.
+
+Sequre evaluates nonlinear functions through one API, sequre.stdlib.nonlinear. The same call runs on plaintext
+ndarrays, secret-shared Sharetensors (MPC) and multiparty MPU tensors, and the method picks what is computed:
+
+  - "decor": the function itself, by Decor's decomposition, up to the errors of its fixed-point encodings (the default
+    for exp, sin, cos and most others)
+  - "chebyshev": a Chebyshev interpolant on an interval (the reference method, and the default for log and erf)
+  - "auto" (sigmoid's and tanh's default): Decor on ring shares; on field shares, where Decor's division is slow, a
+    Chebyshev interpolant within Decor's error bound
+
+The MPU here holds each compute party's rows in the clear, so every party evaluates its own rows locally, in double
+precision (an encrypted or additively shared MPU goes through MPC instead). Revealing it prints Sequre's warning that
+plaintext partitions are revealed without secure aggregation: expected for this demo, whose data are synthetic.
+
+Workflow:
+  1. Synthetic data shared by every party
+  2. sigmoid by Decor and by Chebyshev on ndarray, Sharetensor and MPU, against the exact values
+  3. sin on a wide range: Decor takes any input, a degree-20 interpolant cannot follow it
+  4. log (Chebyshev) and a row-wise softmax (Decor)
+
+See also: docs/user-guide/nonlinear-functions.md
+"""
+
+import math
+import prg
+
+from sequre.stdlib.numpy.create import array, zeros_like
+
+from sequre import main
+from sequre.types.sharetensor import Sharetensor
+from sequre.types.multiparty_union import MPU
+from sequre.stdlib.nonlinear import sigmoid, sin, log, softmax
+
+
+def max_error(have, want) -> float:
+    err = 0.0
+    for i in range(len(want)):
+        for j in range(len(want[i])):
+            err = max(err, abs(float(have[i][j]) - float(want[i][j])))
+    return err
+
+
+@main
+def run(mpc):
+    # --- Synthetic data: 4 rows per compute party x 4 columns, in (-8, 8) ---
+    rows_per_party, cols = 4, 4
+    rows = (mpc.comms.number_of_parties - 1) * rows_per_party
+    with mpc.randomness.seed_switch(-1):  # the same data at every party
+        raw = array([[16.0 * prg.random() - 8.0 for _ in range(cols)] for _ in range(rows)])
+
+    exact = [[1.0 / (1.0 + math.exp(-raw[i, j])) for j in range(cols)] for i in range(rows)]
+
+    # ── 1. sigmoid on three types, two methods ──────────
+    plain_decor = sigmoid(mpc, raw, method="decor")                   # in the clear: the function itself
+    plain_cheb = sigmoid(mpc, raw, method="chebyshev")                # in the clear: the interpolant
+
+    shared = Sharetensor.enc(mpc, raw)                                # field shares (run with --use-ring for ring)
+    mpc_decor = sigmoid(mpc, shared, method="decor").reveal(mpc)
+    mpc_cheb = sigmoid(mpc, shared, method="chebyshev").reveal(mpc)
+
+    local = zeros_like(raw[:rows_per_party]) if mpc.pid == 0 else \
+        raw[(mpc.pid - 1) * rows_per_party:mpc.pid * rows_per_party]
+    # Each compute party holds its own rows in the clear: it evaluates them locally, in double precision (encrypted or
+    # additively shared multiparty tensors go through MPC instead)
+    mpu = MPU(mpc, local, "partition")
+    mpu_decor = sigmoid(mpc, mpu, method="decor").reveal(mpc)
+
+    if mpc.pid:
+        print(f"CP{mpc.pid}:\tsigmoid, max error vs exact:")
+        print(f"CP{mpc.pid}:\t  ndarray      decor {max_error(plain_decor.tolist(), exact):.1e}   chebyshev {max_error(plain_cheb.tolist(), exact):.1e}")
+        print(f"CP{mpc.pid}:\t  Sharetensor  decor {max_error(mpc_decor.tolist(), exact):.1e}   chebyshev {max_error(mpc_cheb.tolist(), exact):.1e}")
+        print(f"CP{mpc.pid}:\t  MPU          decor {max_error(mpu_decor.tolist(), exact):.1e}")
+
+    # ── 2. sin on (-30, 30) ─────────────────────────────
+    wide = array([[60.0 * float(i * cols + j) / float(rows * cols - 1) - 30.0 for j in range(cols)] for i in range(rows)])
+    sin_exact = [[math.sin(wide[i, j]) for j in range(cols)] for i in range(rows)]
+    wide_shared = Sharetensor.enc(mpc, wide)
+    sin_decor = sin(mpc, wide_shared).reveal(mpc)                                       # any x
+    sin_cheb = sin(mpc, wide_shared, method="chebyshev", interval=(-30.0, 30.0)).reveal(mpc)  # degree 20
+    if mpc.pid:
+        print(f"CP{mpc.pid}:\tsin on (-30, 30), max error: decor {max_error(sin_decor.tolist(), sin_exact):.1e}, "
+              f"chebyshev degree 20 {max_error(sin_cheb.tolist(), sin_exact):.1e}")
+
+    # ── 3. log (Chebyshev) and softmax (Decor) ──────────
+    positive = array([[0.5 + 7.5 * float(i * cols + j) / float(rows * cols - 1) for j in range(cols)] for i in range(rows)])
+    log_exact = [[math.log(positive[i, j]) for j in range(cols)] for i in range(rows)]
+    log_mpc = log(mpc, Sharetensor.enc(mpc, positive)).reveal(mpc)                    # (0.5, 8), degree 20
+
+    probabilities = softmax(mpc, shared).reveal(mpc)
+    row_sums = [sum(probabilities.tolist()[i]) for i in range(rows)]
+    if mpc.pid:
+        print(f"CP{mpc.pid}:\tlog on (0.5, 8), max error: {max_error(log_mpc.tolist(), log_exact):.1e}")
+        print(f"CP{mpc.pid}:\tsoftmax rows sum to {min(row_sums):.6f} .. {max(row_sums):.6f}")
+
+
+if __name__ == "__main__":
+    run()

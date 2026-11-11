@@ -4,11 +4,16 @@ from sequre.attributes import sequre
 from sequre.decorators import flatten
 
 from sequre.types.sharetensor import Sharetensor
-from sequre.constants import MPC_NBIT_K, MPC_NBIT_F
+from sequre.constants import MPC_NBIT_K, MPC_NBIT_F, DECOR_DIV_DEFAULT_NITER
 
 
 def __normalizer_even_exponent(mpc, a, modulus):
-    s_val, s_sqrt_val = mpc.fp.__nee_wrapper(a.share, modulus)
+    # s = 4^i, s_sqrt = 2^i with a * s in [2^(K - 2), 2^K) (raw units): the ring normalizer (mpc.bitwise, from dealer
+    # bits) on the ring, the field's on the field, in one convention
+    if modulus.popcnt() == 1:
+        s_val, s_sqrt_val = mpc.bitwise.normalizer(a.share, modulus)
+    else:
+        s_val, s_sqrt_val = mpc.fp.__nee_wrapper(a.share, modulus)
     s = Sharetensor(s_val, modulus)
     s_sqrt = Sharetensor(s_sqrt_val, modulus)
     return s, s_sqrt
@@ -20,7 +25,12 @@ def __fp_mul_inv(mpc, b):
         b = b.to_fp()
 
     modulus = b.modulus
-    niter = int(2 * math.ceil(math.log2(MPC_NBIT_K / 3.5))) + 1
+    # Goldschmidt iterations before the final step. The ring normalizer scales into [1/4, 1), where the quadratic
+    # estimate's error x0 is at most 0.107; each iteration squares it and the final step once more, so niter iterations
+    # leave x0^(2^(niter + 1)): one fewer than Decor's division count (3 at F = 32: x0^16 = 3e-16; 4 at F = 64). The
+    # field's normalizer can land lower, so the field keeps its count.
+    ring = modulus.popcnt() == 1
+    niter = DECOR_DIV_DEFAULT_NITER - 1 if ring else int(2 * math.ceil(math.log2(MPC_NBIT_K / 3.5))) + 1
 
     denominator_sign = (b > 0) * 2 - 1
     b = b * denominator_sign
@@ -60,7 +70,9 @@ def __fp_div(mpc, a, b):
 @sequre
 def __fp_sqrt(mpc, a):
     modulus = a.modulus
-    niter = int(2 * math.ceil(math.log2(MPC_NBIT_K / 3.5)))
+    # Newton iterations for (sqrt, 1 / (2 sqrt)). On the ring's [1/4, 1) the estimate's relative error is at most 0.076
+    # and each iteration takes e to about 1.5 e^2: 4 iterations at F = 32, 5 at F = 64. The field keeps its count.
+    niter = DECOR_DIV_DEFAULT_NITER if modulus.popcnt() == 1 else int(2 * math.ceil(math.log2(MPC_NBIT_K / 3.5)))
     s, s_sqrt = __normalizer_even_exponent(mpc, a, modulus)
 
     a_scaled = a * s
@@ -84,32 +96,20 @@ def __fp_sqrt(mpc, a):
 
 @flatten(1)
 def fp_div(mpc, a, b):
-    modulus = b.modulus
-
-    if modulus.popcnt() == 1:
-        if isinstance(a, Sharetensor):
-            a.to_field(mpc)
-        b.to_field(mpc)
-        
-        res = __fp_div(mpc, a, b)
-        res.to_ring(mpc)
-        
-        b.to_ring(mpc)
-        if isinstance(a, Sharetensor):
-            a.to_ring(mpc)
-        return res
+    """ a / b for fixed-point Sharetensors on either modulus (the normalizer of the shares' own modulus). """
+    mpc.fp.require_truncation("fp_div")
     return __fp_div(mpc, a, b)
-    
+
+
+@flatten(0)
+def fp_mul_inv(mpc, b):
+    """ 1 / b for a fixed-point Sharetensor b on either modulus: the sign, the normalizer, Goldschmidt iterations. """
+    mpc.fp.require_truncation("fp_mul_inv")
+    return __fp_mul_inv(mpc, b)
+
 
 @flatten(0)
 def fp_sqrt(mpc, a):
-    modulus = a.modulus
-
-    if modulus.popcnt() == 1:
-        a.to_field(mpc)
-        res, res_inv = __fp_sqrt(mpc, a)
-        res.to_ring(mpc)
-        res_inv.to_ring(mpc)
-        a.to_ring(mpc)
-        return res, res_inv
+    """ (sqrt(a), 1 / sqrt(a)) for a fixed-point Sharetensor a >= 0 on either modulus. """
+    mpc.fp.require_truncation("fp_sqrt")
     return __fp_sqrt(mpc, a)

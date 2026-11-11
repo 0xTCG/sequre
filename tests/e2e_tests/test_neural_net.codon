@@ -1,3 +1,5 @@
+import math
+
 from sequre.stdlib.numpy.create import array, zeros_like
 
 from sequre.types.sharetensor import Sharetensor
@@ -7,9 +9,277 @@ from sequre.utils.utils import random_floats, random_ints
 from sequre.mpc.env import MPCEnv
 from sequre.stdlib.learn.neural_net.model import Sequential
 from sequre.stdlib.learn.neural_net.layers import Input, Dense
-from sequre.constants import mpc_uint
+from sequre.stdlib.learn.neural_net.loss import loss as nn_loss, dloss as nn_dloss
+from sequre.constants import mpc_uint, MPC_NBIT_F, CHEBYSHEV_DEGREE, LOSS_LOG_INTERVAL, NONLINEAR_SOFTMAX_WIDTH
+from sequre.decor import decor_error_bound, trig_error_bound, cheb2poly
+from sequre.stdlib.chebyshev import chebyshev_coeffs, chebyshev_nodes
 
 from internal.gc import sizeof
+
+
+def _max_abs_diff(a, b) -> float:
+    m = 0.0
+    for i in range(len(a)):
+        for j in range(len(a[i])):
+            m = max(m, abs(a[i][j] - b[i][j]))
+    return m
+
+
+def _train_pair(mpc, modulus, X, y, layers_plain, layers_mpc, loss: str, epochs: int, step: float):
+    # The same model in the clear and on Sharetensors from the same initial weights (the shared seed); returns the
+    # first Dense layer's initial and trained weights, in the clear and revealed
+    mpc_X = Sharetensor.enc(mpc, X, 0, modulus)
+    mpc_y = Sharetensor.enc(mpc, y, 0, modulus)
+    mpc.randomness.reset_global_seed()
+    with mpc.randomness.seed_switch(-1):
+        raw_model = Sequential(layers_plain).compile(mpc, loss=loss, optimizer="bgd")
+    raw_init = raw_model.layers[1].weights.tolist()
+    raw_model.fit(mpc, X=X, y=y, step=step, epochs=epochs, momentum=0.9)
+    mpc.randomness.reset_global_seed()
+    with mpc.randomness.seed_switch(-1):
+        mpc_model = Sequential(layers_mpc).compile(mpc, loss=loss, optimizer="bgd", modulus=modulus)
+    mpc_model.fit(mpc, X=mpc_X, y=mpc_y, step=step, epochs=epochs, momentum=0.9)
+    drift = max(_max_abs_diff(mpc_X.reveal(mpc).tolist(), X.tolist()), _max_abs_diff(mpc_y.reveal(mpc).tolist(), y.tolist()))
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tneural net training leaves its secure inputs intact ({drift:.1e})", drift < 1e-9, True)
+    return raw_init, raw_model.layers[1].weights.tolist(), mpc_model.layers[1].weights.reveal(mpc).tolist()
+
+
+def test_neural_net_activations[TP](mpc: MPCEnv[TP], modulus: TP):
+    """
+    Models with the new activations, trained in the clear and on Sharetensors from the same initial weights:
+    tanh + sigmoid with the binary cross-entropy (Decor; the fused output gradient), a sin layer with kernel shaping and
+    a pre-activation scale (Decor; the scale joins Decor's own scaling on Sharetensors, the chain-rule factor), relu
+    + softmax with the categorical cross-entropy (fused), and a Chebyshev tanh with the hinge loss. The trained
+    first-layer weights agree (2 epochs) within tolerances derived from the activations' error bounds (see tol_for),
+    and training moved them by at least ten times that. Both paths run the same backward code, so these checks compare the protocols, not the
+    gradients' formulas: test_neural_net_gradients checks those against finite differences.
+    """
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    rows_per_party = 4
+    rows = (mpc.comms.number_of_parties - 1) * rows_per_party
+    epochs, step = 2, 0.5
+    with mpc.randomness.seed_switch(-1):
+        X = array(random_floats((rows, 8), scale=2.0)) - 1.0
+        y01 = (array(random_ints((rows, 1), upper_limit=1))).astype(float)
+        y_pm = y01 * 2.0 - 1.0
+        y_reg = array(random_floats((rows, 1), scale=1.0))
+        labels = array(random_ints((rows, 1), upper_limit=2))
+    y_cls = array([[1.0 if int(labels[i, 0]) == k else 0.0 for k in range(3)] for i in range(rows)])
+
+    checks = List[Tuple[str, float, float, float]]()
+    # Each activation's error bound e (its error model), carried to the weights: an error e in an activation changes a weight's
+    # gradient by at most rows * max |x| * e per step (the gradient sums rows terms), so epochs * step * rows * max |x|
+    # * e bounds it after training; 8 times that covers the derivative's and the products' own errors
+    def tol_for(e: float) -> float:
+        return 8.0 * float(epochs) * step * float(rows) * 1.0 * e + 1e-7
+    e_tanh_sigmoid = max(decor_error_bound("tanh"), decor_error_bound("sigmoid"))
+    e_sin = trig_error_bound(30.0)
+    e_softmax = 5.0 * decor_error_bound("exp", (-NONLINEAR_SOFTMAX_WIDTH, 0.0)) + 64.0 * 2.0 ** -float(MPC_NBIT_F)
+    cheb_tanh = chebyshev_coeffs(lambda v: math.tanh(v), chebyshev_nodes(CHEBYSHEV_DEGREE + 1, (-5.0, 5.0)), (-5.0, 5.0))
+    e_cheb = (4.0 + 2.0 * float(CHEBYSHEV_DEGREE)) * 2.0 ** -float(MPC_NBIT_F) * (1.0 + sum([abs(c) for c in cheb_tanh]))
+
+    raw_init, raw_w, mpc_w = _train_pair(
+        mpc, modulus, X, y01,
+        (Input[type(X)](8), Dense[type(X)]("tanh", 6, "normal", "zeros", method="decor"), Dense[type(X)]("sigmoid", 1, "normal", "zeros", method="decor")),
+        (Input[Sharetensor[List[List[TP]]]](8), Dense[Sharetensor[List[List[TP]]]]("tanh", 6, "normal", "zeros", method="decor"),
+         Dense[Sharetensor[List[List[TP]]]]("sigmoid", 1, "normal", "zeros", method="decor")),
+        "binary_crossentropy", epochs, step)
+    checks.append(("tanh + sigmoid, binary cross-entropy (Decor, fused)", _max_abs_diff(raw_w, mpc_w), _max_abs_diff(raw_w, raw_init), tol_for(e_tanh_sigmoid)))
+
+    raw_init, raw_w, mpc_w = _train_pair(
+        mpc, modulus, X, y_reg,
+        (Input[type(X)](8), Dense[type(X)]("sin", 6, "uniform", "zeros", kernel_interval=(-1.0, 1.0), kernel_scale=0.5, pre_act_scale=3.0, method="decor"),
+         Dense[type(X)]("linear", 1, "normal", "zeros")),
+        (Input[Sharetensor[List[List[TP]]]](8),
+         Dense[Sharetensor[List[List[TP]]]]("sin", 6, "uniform", "zeros", kernel_interval=(-1.0, 1.0), kernel_scale=0.5, pre_act_scale=3.0, method="decor"),
+         Dense[Sharetensor[List[List[TP]]]]("linear", 1, "normal", "zeros")),
+        "mse", epochs, step)
+    checks.append(("sin with kernel shaping and pre_act_scale 3, MSE (Decor)", _max_abs_diff(raw_w, mpc_w), _max_abs_diff(raw_w, raw_init), tol_for(e_sin)))
+
+    # Kernel shaping runs no protocol (inside the shared seed a protocol's draws would desynchronize the
+    # streams): compiling a shaped Sharetensor model sends nothing and opens nothing, at every party
+    bytes0, rounds0 = mpc.stats.bytes_sent, mpc.stats.rounds
+    with mpc.randomness.seed_switch(-1):
+        Sequential((Input[Sharetensor[List[List[TP]]]](8),
+                    Dense[Sharetensor[List[List[TP]]]]("sin", 6, "uniform", "zeros", kernel_interval=(-1.0, 1.0), kernel_scale=0.5, pre_act_scale=3.0),
+                    Dense[Sharetensor[List[List[TP]]]]("linear", 1, "uniform", "zeros", kernel_interval=(-1.0, 1.0), kernel_scale=0.25))).compile(
+            mpc, loss="mse", optimizer="bgd", modulus=modulus)
+    shaping_sent, shaping_rounds = mpc.stats.bytes_sent - bytes0, mpc.stats.rounds - rounds0
+    assert_eq(f"CP{mpc.pid}:\tneural net kernel shaping on {alg_struct} runs no protocol ({shaping_sent} bytes, {shaping_rounds} rounds)", shaping_sent == 0 and shaping_rounds == 0, True)
+
+    raw_init, raw_w, mpc_w = _train_pair(
+        mpc, modulus, X, y_cls,
+        (Input[type(X)](8), Dense[type(X)]("relu", 6, "normal", "zeros"), Dense[type(X)]("softmax", 3, "normal", "zeros", method="decor")),
+        (Input[Sharetensor[List[List[TP]]]](8), Dense[Sharetensor[List[List[TP]]]]("relu", 6, "normal", "zeros"),
+         Dense[Sharetensor[List[List[TP]]]]("softmax", 3, "normal", "zeros", method="decor")),
+        "categorical_crossentropy", epochs, step)
+    checks.append(("relu + softmax, categorical cross-entropy (Decor, fused)", _max_abs_diff(raw_w, mpc_w), _max_abs_diff(raw_w, raw_init), tol_for(e_softmax)))
+
+    raw_init, raw_w, mpc_w = _train_pair(
+        mpc, modulus, X, y_pm,
+        (Input[type(X)](8), Dense[type(X)]("tanh", 6, "normal", "zeros", method="chebyshev"), Dense[type(X)]("linear", 1, "normal", "zeros")),
+        (Input[Sharetensor[List[List[TP]]]](8), Dense[Sharetensor[List[List[TP]]]]("tanh", 6, "normal", "zeros", method="chebyshev"),
+         Dense[Sharetensor[List[List[TP]]]]("linear", 1, "normal", "zeros")),
+        "hinge", epochs, step)
+    checks.append(("tanh (Chebyshev), hinge", _max_abs_diff(raw_w, mpc_w), _max_abs_diff(raw_w, raw_init), tol_for(e_cheb)))
+
+    # The neural-net stack defaults to Chebyshev (as binary LogReg does); the models above pass Decor explicitly
+    default_method = Dense[type(X)]("sigmoid", 1, "normal", "zeros").method
+    assert_eq(f"CP{mpc.pid}:\tDense defaults to the Chebyshev method ({default_method})", default_method == "chebyshev", True)
+
+    # MPUs: not here. Training on MPUs computes wrong first-layer updates for every activation (an open defect of
+    # Sequential on MPUs, relu included); the activations themselves are checked on MPUs in test_activations.
+
+    if mpc.pid:
+        for name, diff, moved, limit in checks:
+            assert_eq(f"CP{mpc.pid}:\tneural net {name} on {alg_struct}: weights agree (max diff {diff:.2e} < {limit:.0e}) and moved ({moved:.2e})", diff < limit and moved > 10.0 * limit, True)
+
+
+def _fd_check(mpc, layers, X, y, loss: str, h: float) -> Tuple[float, float]:
+    # (worst |analytic - central difference| relative to max(1, |gradient|), largest |gradient|) over every weight of
+    # the first and the output layer, the analytic gradients from one training step of size 0 (the backward pass)
+    mpc.randomness.reset_global_seed()
+    with mpc.randomness.seed_switch(-1):
+        model = Sequential(layers).compile(mpc, loss=loss, optimizer="bgd")
+    model.fit(mpc, X=X, y=y, step=0.0, epochs=1, momentum=0.0)
+    worst, largest = 0.0, 0.0
+    for k in (1, 2):
+        grad = model.layers[1].dw.tolist() if k == 1 else model.layers[2].dw.tolist()
+        rows, cols = len(grad), len(grad[0])
+        for i in range(rows):
+            for j in range(cols):
+                w = model.layers[1].weights if k == 1 else model.layers[2].weights
+                w0 = w[i, j]
+                w[i, j] = w0 + h
+                up = model.get_loss(mpc, X, y).sum()
+                w[i, j] = w0 - h
+                down = model.get_loss(mpc, X, y).sum()
+                w[i, j] = w0
+                fd = (up - down) / (2.0 * h)
+                worst = max(worst, abs(grad[i][j] - fd) / max(1.0, abs(fd)))
+                largest = max(largest, abs(grad[i][j]))
+    return worst, largest
+
+
+def test_neural_net_gradients(mpc):
+    """
+    The backward pass against central differences of the loss (in the clear, ndarray, Decor activations): a sin layer with
+    pre_act_scale 3 (the chain-rule factor), sigmoid + binary cross-entropy and softmax + categorical cross-entropy
+    (the fused gradient y_hat - y), sigmoid + categorical cross-entropy (not fused: -y / o through sigmoid', with
+    its sign) and sigmoid + MSE. Activations are exact in the clear and the cross-entropies' log is accurate (clipped_log),
+    so the backward pass must match within the differences' own error (step 1e-5: about 1e-6).
+    """
+    rows = 8
+    with mpc.randomness.seed_switch(-1):
+        X = (array(random_floats((rows, 3), scale=1.0)) - 0.5)
+        y01 = array(random_ints((rows, 1), upper_limit=1)).astype(float)
+        labels = array(random_ints((rows, 1), upper_limit=2))
+        y_reg = array(random_floats((rows, 1), scale=1.0)) - 0.5
+    y_cls = array([[1.0 if int(labels[i, 0]) == k else 0.0 for k in range(3)] for i in range(rows)])
+    small = (-0.5, 0.5)
+    cases = List[Tuple[str, float, float]]()
+    worst, largest = _fd_check(mpc, (Input[type(X)](3),
+        Dense[type(X)]("sin", 4, "uniform", "zeros", kernel_interval=small, pre_act_scale=3.0, method="decor"),
+        Dense[type(X)]("linear", 1, "uniform", "zeros", kernel_interval=small)), X, y_reg, "mse", 1e-5)
+    cases.append(("sin with pre_act_scale 3, MSE", worst, largest))
+    worst, largest = _fd_check(mpc, (Input[type(X)](3),
+        Dense[type(X)]("tanh", 4, "uniform", "zeros", kernel_interval=small, method="decor"),
+        Dense[type(X)]("sigmoid", 1, "uniform", "zeros", kernel_interval=small, method="decor")), X, y01, "binary_crossentropy", 1e-5)
+    cases.append(("sigmoid + binary cross-entropy (fused)", worst, largest))
+    worst, largest = _fd_check(mpc, (Input[type(X)](3),
+        Dense[type(X)]("tanh", 4, "uniform", "zeros", kernel_interval=small, method="decor"),
+        Dense[type(X)]("softmax", 3, "uniform", "zeros", kernel_interval=small, method="decor")), X, y_cls, "categorical_crossentropy", 1e-5)
+    cases.append(("softmax + categorical cross-entropy (fused)", worst, largest))
+    worst, largest = _fd_check(mpc, (Input[type(X)](3),
+        Dense[type(X)]("tanh", 4, "uniform", "zeros", kernel_interval=small, method="decor"),
+        Dense[type(X)]("sigmoid", 1, "uniform", "zeros", kernel_interval=small, method="decor")), X, y01, "categorical_crossentropy", 1e-5)
+    cases.append(("sigmoid + categorical cross-entropy (not fused)", worst, largest))
+    worst, largest = _fd_check(mpc, (Input[type(X)](3),
+        Dense[type(X)]("tanh", 4, "uniform", "zeros", kernel_interval=small, method="decor"),
+        Dense[type(X)]("sigmoid", 1, "uniform", "zeros", kernel_interval=small, method="decor")), X, y_reg, "mse", 1e-5)
+    cases.append(("sigmoid + MSE (not fused)", worst, largest))
+    if mpc.pid:
+        for name, worst, largest in cases:
+            assert_eq(f"CP{mpc.pid}:\tneural net gradients, {name}: backward pass = central differences (worst {worst:.1e}, gradients up to {largest:.2f})", worst < 1e-5 and largest > 1e-3, True)
+
+
+def _plain_loss(name: str, y: float, o: float, low: float) -> Tuple[float, float]:
+    # (loss, derivative) of one element, in double, before the division by the number of records
+    if name == "hinge":
+        return max(0.0, 1.0 - y * o), (-y if 1.0 - y * o > 0.0 else 0.0)
+    if name == "mse":
+        return 0.5 * (y - o) * (y - o), o - y
+    if name == "binary_crossentropy":
+        p = min(max(o, low), 1.0 - low)
+        return -(y * math.log(p) + (1.0 - y) * math.log(1.0 - p)), (p - y) / (p * (1.0 - p))
+    p = min(max(o, low), 1.0)
+    return -y * math.log(p), -y / p
+
+
+def test_losses[TP](mpc: MPCEnv[TP], modulus: TP):
+    """
+    The four losses and their derivatives on Sharetensors against their definitions in double (clipped predictions for
+    the cross-entropies), field or ring: hinge and MSE within a few units; the cross-entropies' values within
+    clipped_log's error (Decor exp's on (-1, 1 - log 1e-4)) times |y| + |1 - y|; their derivatives within 1e-5 relative
+    (one division).
+    """
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    ys = [[1.0], [0.0], [1.0], [0.0], [1.0], [0.0], [1.0], [0.0]]
+    os = [[0.9], [0.2], [0.35], [0.7], [0.00001], [0.99999], [0.5], [0.05]]
+    n = len(ys)
+    low = LOSS_LOG_INTERVAL[0]
+    y = Sharetensor.enc(mpc, ys, 0, modulus)
+    o = Sharetensor.enc(mpc, os, 0, modulus)
+    ulp = 2.0 ** -float(MPC_NBIT_F)
+    log_error = decor_error_bound("exp", (-1.0, 1.0 - math.log(low))) + 64.0 * ulp
+    for name in ["hinge", "mse", "binary_crossentropy", "categorical_crossentropy"]:
+        got = nn_loss(mpc, y, o, name).reveal(mpc).tolist()
+        dgot = nn_dloss(mpc, y, o, name).reveal(mpc).tolist()
+        if mpc.pid:
+            for i in range(n):
+                want, dwant = _plain_loss(name, ys[i][0], os[i][0], low)
+                ce = name == "binary_crossentropy" or name == "categorical_crossentropy"
+                vtol = (2.0 * log_error if ce else 8.0 * ulp) / float(n) + 8.0 * ulp
+                dtol = (1e-5 * abs(dwant) if ce else 8.0 * ulp) / float(n) + 8.0 * ulp
+                assert_eq(f"CP{mpc.pid}:\tloss {name} on {alg_struct}, element {i}: {got[i][0] * n:.6f} = {want:.6f}, derivative {dgot[i][0] * n:.6f} = {dwant:.6f}",
+                          abs(got[i][0] - want / float(n)) <= vtol and abs(dgot[i][0] - dwant / float(n)) <= dtol, True)
+    # Inputs intact
+    y_after = y.reveal(mpc).tolist()
+    o_after = o.reveal(mpc).tolist()
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tlosses leave their inputs intact on {alg_struct}", _max_abs_diff(y_after, ys) < 1e-9 and _max_abs_diff(o_after, os) < 1e-9, True)
+
+    # The cross-entropies on an HE type (an MPU of additive shares): one conversion to shares per log and per inverse,
+    # the clip and the log on the shares. The conversions carry HE noise (about 1e-5 for a round trip,
+    # measured; d = 2e-4 here) that reaches log p as d / p and the derivatives through 1 / |p - y| and
+    # |1 - 2p| / (p (1 - p)); the revealed outputs carry 3e-5 more. The check takes the predictions away from the clip
+    # (o in [0.05, 0.95]): near it the noise decides on which side of the floor a prediction lands.
+    d = 2e-4
+    mpu_y = MPU(mpc, array(ys) if mpc.pid == 1 else zeros_like(array(ys)), "additive")
+    mpu_o = MPU(mpc, array(os) if mpc.pid == 1 else zeros_like(array(os)), "additive")
+    for name in ["binary_crossentropy", "categorical_crossentropy"]:
+        got = nn_loss(mpc, mpu_y, mpu_o, name).reveal(mpc).tolist()
+        dgot = nn_dloss(mpc, mpu_y, mpu_o, name).reveal(mpc).tolist()
+        if mpc.pid:
+            for i in range(n):
+                pv, yv = os[i][0], ys[i][0]
+                if pv < 0.05 or pv > 0.95:
+                    continue
+                want, dwant = _plain_loss(name, yv, pv, low)
+                if name == "binary_crossentropy":
+                    vspread = d * (abs(yv) / pv + abs(1.0 - yv) / (1.0 - pv))
+                    dspread = abs(dwant) * d * (1.0 / abs(pv - yv) + abs(1.0 - 2.0 * pv) / (pv * (1.0 - pv)))
+                else:
+                    vspread = d * abs(yv) / pv
+                    dspread = abs(dwant) * d / pv
+                vtol = 3e-5 + vspread / float(n)
+                dtol = 3e-5 + dspread / float(n)
+                assert_eq(f"CP{mpc.pid}:\tloss {name} on an additive MPU on {alg_struct}, element {i}: {got[i][0] * n:.6f} = {want:.6f}, derivative {dgot[i][0] * n:.6f} = {dwant:.6f}",
+                          abs(got[i][0] - want / float(n)) <= vtol and abs(dgot[i][0] - dwant / float(n)) <= dtol, True)
+    mpu_o_after = mpu_o.reveal(mpc).tolist()
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tlosses leave an MPU input intact on {alg_struct}", _max_abs_diff(mpu_o_after, os) < 1e-4, True)
 
 
 def test_neural_net[TP](mpc: MPCEnv[TP], modulus: TP):
@@ -107,6 +377,59 @@ def test_neural_net[TP](mpc: MPCEnv[TP], modulus: TP):
     verbose_bytes = mpc.stats.bytes_sent - sent - quiet_bytes - loss_bytes
     per_record = sizeof(int) + [[mpc_uint(0) for _ in range(output_size)] for _ in range(rows)]._pickle_size()
     assert_eq(f"CP{mpc.pid}:\tNeural net verbose loss reveals no per-record values ({verbose_bytes} bytes, one per-record reveal {per_record})", verbose_bytes < per_record, True)
+
+    # With three outputs the loss is summed over the output columns too before its one reveal: verbose sends one scalar
+    # reveal beyond the loss's own computation (a reveal of the three column sums sends more)
+    def three_out_model():
+        layers = (
+            Input[type(mpc_X)](input_size),
+            Dense[type(mpc_X)]("relu", 4, "normal", "zeros"),
+            Dense[type(mpc_X)]("linear", 3, "normal", "zeros"))
+        return Sequential(layers).compile(mpc, loss="mse", optimizer="bgd", modulus=modulus)
+
+    with mpc.randomness.seed_switch(-1):
+        y3 = array(random_floats((rows, 3), scale=1.0))
+    mpc_y3 = Sharetensor.enc(mpc, y3, 0, modulus)
+    quiet3 = three_out_model()
+    sent = mpc.stats.bytes_sent
+    quiet3.fit(mpc, X=mpc_X, y=mpc_y3, step=step_size, epochs=1, momentum=momentum)
+    quiet3_bytes = mpc.stats.bytes_sent - sent
+    sent = mpc.stats.bytes_sent
+    quiet3.loss_(mpc, mpc_y3)
+    loss3_bytes = mpc.stats.bytes_sent - sent
+    loud3 = three_out_model()
+    sent = mpc.stats.bytes_sent
+    loud3.fit(mpc, X=mpc_X, y=mpc_y3, step=step_size, epochs=1, momentum=momentum, verbose=True)
+    verbose3_bytes = mpc.stats.bytes_sent - sent - quiet3_bytes - loss3_bytes
+    column_sums = quiet3.loss_(mpc, mpc_y3).sum(0)
+    total = column_sums.sum(0)
+    sent = mpc.stats.bytes_sent
+    total.reveal(mpc)
+    scalar_bytes = mpc.stats.bytes_sent - sent
+    sent = mpc.stats.bytes_sent
+    column_sums.reveal(mpc)
+    columns_bytes = mpc.stats.bytes_sent - sent
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tNeural net verbose loss with three outputs reveals one sum ({verbose3_bytes} bytes; one scalar reveal {scalar_bytes}, the column sums {columns_bytes})",
+                  verbose3_bytes <= scalar_bytes and scalar_bytes < columns_bytes, True)
+
+    # compile refuses a binary cross-entropy floor at or above 0.5 (it would clip every prediction into [low, 1 - low]),
+    # at every party and before any round
+    r0, b0 = mpc.stats.rounds, mpc.stats.bytes_sent
+    refused = False
+    try:
+        layers_bce = (
+            Input[type(mpc_X)](input_size),
+            Dense[type(mpc_X)]("sigmoid", 1, "normal", "zeros"))
+        Sequential(layers_bce).compile(mpc, loss="binary_crossentropy", optimizer="bgd", loss_interval=(0.5, 1.0), modulus=modulus)
+    except AssertionError:
+        refused = True
+    assert_eq(f"CP{mpc.pid}:\tNeural net compile refuses a binary cross-entropy floor of 0.5 before any round",
+              refused and mpc.stats.rounds == r0 and mpc.stats.bytes_sent == b0, True)
+
+    test_neural_net_activations(mpc, modulus)
+    test_neural_net_gradients(mpc)
+    test_losses(mpc, modulus)
 
     print(f'CP{mpc.pid}:\tSequre neural net on {alg_struct} tests passed.\n')
     

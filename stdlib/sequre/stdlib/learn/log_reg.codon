@@ -3,109 +3,258 @@
 from sequre.stdlib.numpy.ndarray import ndarray
 
 from sequre.attributes import sequre
-from sequre.stdlib.builtin import maximum_axis, chebyshev_sigmoid, chebyshev_log, chebyshev_exp, clip
+from sequre.stdlib.builtin import maximum_axis, clip
 from sequre.settings import DEBUG
 from sequre.mpc.env import MPCEnv
+from sequre.constants import (
+    METHOD_DECOR, METHOD_CHEBYSHEV, SUPPORTED_ML_METHODS, DECOR_INTERVAL_SIGMOID, DECOR_TOLERANCE, LOSS_LOG_INTERVAL,
+    NONLINEAR_SOFTMAX_WIDTH)
+from sequre.decor.core import _admit
+from sequre.stdlib.nonlinear import sigmoid as nl_sigmoid, exp as nl_exp, softmax as nl_softmax
+from sequre.stdlib.learn.neural_net.loss import clipped_log, bce_logs
+from sequre.types.sharetensor import Sharetensor
 
 from sequre import MPU
 from utils import batch
 
 
+LOGREG_VARIANTS = ["binary", "multinomial", "heuristic-multinomial"]
+
+
 class LogReg[T]:
+    """
+    Logistic regression by (mini-batched) gradient descent on the cross-entropy: w -= X~^T (act - y) step, with X~ the
+    features with a bias column appended (the last coefficient is the bias).
+
+    variant "binary": act = sigmoid(X~ w), its input clipped to the interval. "multinomial": act = the softmax of each
+    row of X~ w (H-38): the exp on the interval (-W, 0], the max shift (default) or, with fixed_shift_softmax >= 0,
+    that public shift (no comparisons for the maximum; the rows' maxima must stay near it: see nonlinear.softmax).
+    "heuristic-multinomial": the earlier exp-only activation (the shifted exp, not normalized), kept for comparison.
+    method: "chebyshev" (Chebyshev degree `degree`, 0 the default) or "decor" (sequre.stdlib.nonlinear); "" (the default)
+    takes the variant's: Decor for "multinomial" (the softmax: faster on both moduli in the benchmarks, 4% on the field
+    and 2.1x on the ring), Chebyshev for "heuristic-multinomial" (the earlier behavior), and for "binary" the shares'
+    modulus, at each fit, predict and loss (method_for): Decor on ring Sharetensors (11% faster than Chebyshev there,
+    and exact) where Decor admits the interval (its default interval always), Chebyshev on field Sharetensors (3.4x
+    faster than Decor there), plaintext, the multiparty types (on their own arithmetic) and intervals only Chebyshev
+    admits (the earlier (-50, 10)); a degree makes it Chebyshev.
+    Default intervals (per call for binary's "", interval_for): binary (-50, 10) with Chebyshev, Decor's sigmoid interval
+    with Decor ((-10, 10) at F = 32; the wider intervals are not admissible for it); the softmax variants (-20, 0) with
+    Chebyshev, (-16, 0) with Decor. `interval` keeps (0, 0) for binary's "" without an interval.
+    Under DEBUG (compile time) training prints the mean weight and the loss, revealed.
+    """
     coef_: T
     optimizer: str
     variant: str
     interval: tuple[float, float]
+    method: str
+    degree: int
+    fixed_shift_softmax: float
 
     def __init__(self):
         self.coef_ = T()
         self.optimizer = ""
         self.variant = ""
         self.interval = (0.0, 0.0)
-    
+        self.method = METHOD_CHEBYSHEV
+        self.degree = 0
+        self.fixed_shift_softmax = -1.0
+
     def __init__(self, mpc: MPCEnv):
         self.coef_ = T(mpc) if isinstance(T, MPU) else T()
         self.optimizer = ""
         self.variant = ""
         self.interval = (0.0, 0.0)
-    
+        self.method = METHOD_CHEBYSHEV
+        self.degree = 0
+        self.fixed_shift_softmax = -1.0
+
     def __init__(
-            self, 
+            self,
             initial_weights: T,
             optimizer: str = "bgd",
             interval: tuple[float, float] = (0.0, 0.0),
-            variant: str = "binary"):
+            variant: str = "binary",
+            method: str = "",
+            degree: int = 0,
+            fixed_shift_softmax: float = -1.0):
+        assert variant in LOGREG_VARIANTS, f"LogReg: invalid variant {variant} ({LOGREG_VARIANTS})"
+        if not method:
+            if variant == "multinomial":
+                method = METHOD_DECOR
+            elif variant == "heuristic-multinomial" or degree != 0:
+                method = METHOD_CHEBYSHEV
+            # binary without a degree keeps "": the shares' modulus picks the method at each call (method_for)
+        if method:
+            assert method in SUPPORTED_ML_METHODS, f"LogReg: invalid method {method} ({SUPPORTED_ML_METHODS})"
+        if method == METHOD_DECOR and degree != 0:
+            raise ValueError(f"LogReg: Decor takes no degree (degree {degree} with method decor, variant {variant})")
+        assert degree >= 0, f"LogReg: the degree must not be negative (0: the method's default), not {degree}"
         self.coef_ = initial_weights.copy()
         self.optimizer = optimizer
         self.variant = variant
-        self.interval = interval if interval != (0.0, 0.0) else (-50.0, 10.0) if variant == "binary" else (-20.0, 0.0)
+        self.method = method
+        self.degree = degree
+        self.fixed_shift_softmax = fixed_shift_softmax
+        self.interval = interval if interval != (0.0, 0.0) or not method else LogReg._default_interval(variant, method)
+        if variant != "binary":
+            assert self.interval[1] == 0.0 and self.interval[0] < 0.0, f"LogReg: the {variant} variant's interval is (-W, 0], not {self.interval}"
+
+    def method_for(self, X) -> str:
+        """
+        The method a fit, predict or loss on X uses: the stored one, or for binary's "" Decor when X is a ring
+        Sharetensor and Decor admits the interval (public, no communication), Chebyshev otherwise.
+        """
+        if self.method:
+            return self.method
+        if isinstance(X, Sharetensor):
+            if X.modulus.popcnt() == 1:
+                if self.interval == (0.0, 0.0) or LogReg._decor_admits(self.interval):
+                    return METHOD_DECOR
+        return METHOD_CHEBYSHEV
+
+    def interval_for(self, X) -> tuple[float, float]:
+        """ The activation's interval for a call on X: the given one, or the default of the method it uses. """
+        return self._interval_for(self.method_for(X))
+
+    def _decor_admits(interval) -> bool:
+        # Decor's admissibility check for sigmoid on the interval (public, cached once admitted)
+        try:
+            _admit("sigmoid", interval, List[float](), DECOR_TOLERANCE)
+        except ValueError:
+            return False
+        return True
+
+    def _interval_for(self, method: str) -> tuple[float, float]:
+        return self.interval if self.interval != (0.0, 0.0) else LogReg._default_interval(self.variant, method)
 
     def fit(self, mpc, X: T, y: T, step: float, epochs: int, verbose: bool = False) -> LogReg[T]:
-        self.coef_ = LogReg._fit(mpc, X, y, self.coef_, self.interval, step, epochs, self.optimizer, self.variant, verbose)
+        method = self.method_for(X)
+        interval = self._interval_for(method)
+        if method == METHOD_DECOR:
+            self.coef_ = LogReg._fit(mpc, X, y, self.coef_, interval, step, epochs, self.optimizer, self.variant,
+                                     verbose, self.fixed_shift_softmax, 0, method=METHOD_DECOR)
+        else:
+            self.coef_ = LogReg._fit(mpc, X, y, self.coef_, interval, step, epochs, self.optimizer, self.variant,
+                                     verbose, self.fixed_shift_softmax, self.degree, method=METHOD_CHEBYSHEV)
         return self
-    
+
     def predict(self, mpc, X: T, *args) -> T:
-        return LogReg._predict(mpc, X, self.coef_, self.interval, self.variant)
-    
-    def loss(self, mpc, X: T, y: T) -> T:
-        return LogReg._loss(mpc, X, y, self.coef_, self.interval, self.variant)
+        method = self.method_for(X)
+        interval = self._interval_for(method)
+        if method == METHOD_DECOR:
+            return LogReg._predict(mpc, X, self.coef_, interval, self.variant, self.fixed_shift_softmax, 0,
+                                   method=METHOD_DECOR)
+        else:
+            return LogReg._predict(mpc, X, self.coef_, interval, self.variant, self.fixed_shift_softmax,
+                                   self.degree, method=METHOD_CHEBYSHEV)
+
+    def loss(self, mpc, X: T, y: T):
+        # X with the bias column appended (its last column), as in training (M-ML-03)
+        X_tilde = X.pad_with_value(1, 1, 1, mpc)
+        method = self.method_for(X)
+        interval = self._interval_for(method)
+        if method == METHOD_DECOR:
+            return LogReg._loss(mpc, X_tilde, y, self.coef_, interval, self.variant, self.fixed_shift_softmax, 0,
+                                method=METHOD_DECOR)
+        else:
+            return LogReg._loss(mpc, X_tilde, y, self.coef_, interval, self.variant, self.fixed_shift_softmax,
+                                self.degree, method=METHOD_CHEBYSHEV)
 
     def randomize_weights(self, mpc, distribution: str = "uniform"):
         self.coef_ = self.coef_.rand(distribution, mpc)
-    
-    def _fit(mpc, X: T, y: T, initial_w: T, interval: tuple[float, float], step: float, epochs: int, optimizer: str, variant: str, verbose: bool, debug: Static[bool] = DEBUG) -> T:
+
+    def _default_interval(variant: str, method: str) -> tuple[float, float]:
+        if variant == "binary":
+            return DECOR_INTERVAL_SIGMOID if method == METHOD_DECOR else (-50.0, 10.0)
+        return (-NONLINEAR_SOFTMAX_WIDTH, 0.0) if method == METHOD_DECOR else (-20.0, 0.0)
+
+    def _fit(mpc, X: T, y: T, initial_w: T, interval: tuple[float, float], step: float, epochs: int, optimizer: str,
+             variant: str, verbose: bool, fixed_shift: float, degree: int, method: Static[str],
+             debug: Static[bool] = DEBUG) -> T:
         # Adding bias
         X_tilde = X.pad_with_value(1, 1, 1, mpc)
 
         # Gradient descent
         if optimizer == "bgd":
-            return LogReg._bgd(mpc, X_tilde, y, initial_w, interval, variant, step, epochs, verbose, debug)
+            return LogReg._bgd(mpc, X_tilde, y, initial_w, interval, variant, step, epochs, verbose, fixed_shift,
+                               degree, method=method, debug=debug)
         if optimizer == "mbgd":
-            return LogReg._mbgd(mpc, X_tilde, y, initial_w, interval, variant, step, epochs, 10, verbose, debug)
+            return LogReg._mbgd(mpc, X_tilde, y, initial_w, interval, variant, step, epochs, 10, verbose, fixed_shift,
+                                degree, method=method, debug=debug)
         else:
             raise ValueError(f"LogReg: invalid optimizer passed: {optimizer}")
-    
+
     @sequre
-    def _act(mpc, X_tilde, w, interval, variant):
-        dot = X_tilde @ w
+    def _dot(mpc, X_tilde, w):
+        return X_tilde @ w
+
+    @sequre
+    def _shifted(mpc, dot, shift):
+        return dot - shift
+
+    def _act(mpc, X_tilde, w, interval, variant: str, fixed_shift: float, degree: int, method: Static[str]):
+        dot = LogReg._dot(mpc, X_tilde, w)  # m x c
         if variant == "binary":
-            shift = clip(mpc, dot, *interval)
-            return chebyshev_sigmoid(mpc, shift, interval)  # m x 1
+            if method == METHOD_DECOR:
+                return nl_sigmoid(mpc, dot, method=method, interval=interval, clip=True)
+            else:
+                # As before: the generic clip, then Chebyshev on the input's own arithmetic (in HE on MPP/MPA/MPU)
+                return nl_sigmoid(mpc, clip(mpc, dot, interval[0], interval[1]), method=method, interval=interval,
+                                  degree=degree)
         if variant == "multinomial":
-            shift = (dot - maximum_axis(mpc, dot, axis=1, keepdims=True))
-            shift = clip(mpc, shift, *interval)
-            return chebyshev_exp(mpc, shift, interval)  # m x 1
-            
+            width = -interval[0]
+            deg = degree if method == METHOD_CHEBYSHEV else 0
+            if fixed_shift >= 0.0:
+                return nl_softmax(mpc, dot, method=method, shift="fixed", width=width, offset=fixed_shift, degree=deg)
+            return nl_softmax(mpc, dot, method=method, shift="max", width=width, degree=deg)
+        if variant == "heuristic-multinomial":
+            shift = LogReg._shifted(mpc, dot, fixed_shift) if fixed_shift >= 0.0 else \
+                LogReg._shifted(mpc, dot, maximum_axis(mpc, dot, axis=1, keepdims=True))
+            if method == METHOD_DECOR:
+                return nl_exp(mpc, shift, method=method, interval=interval, clip=True)
+            else:
+                return nl_exp(mpc, clip(mpc, shift, interval[0], interval[1]), method=method, interval=interval,
+                              degree=degree)
+
         raise ValueError(f"LogReg: invalid variant passed: {variant}")
 
     @sequre
-    def _bgd(mpc, X_tilde: T, y: T, initial_w: T, interval: tuple[float, float], variant: str, step: float, epochs: int, verbose: bool, debug: Static[bool] = DEBUG) -> T:
+    def _step(mpc, X_tilde, act, y, step: float):
+        return X_tilde.T @ (act - y) * step
+
+    def _bgd(mpc, X_tilde: T, y: T, initial_w: T, interval: tuple[float, float], variant: str, step: float, epochs: int,
+             verbose: bool, fixed_shift: float, degree: int, method: Static[str], debug: Static[bool] = DEBUG) -> T:
         if debug:
             print(f"CP{mpc.pid}:\tLog. reg. BGD step size:", step)
-        
+
         # Batched gradient descent
         w = initial_w  # n x 1
         for _ in range(epochs):
             if verbose:
                 print(f"CP{mpc.pid}:\tLog. reg. BGD epoch {_ + 1}/{epochs}")
             if debug:
-                print(f"CP{mpc.pid}:\t\t weigts avg {w.reveal(mpc).mean()} | loss: {LogReg._loss(mpc, X_tilde, y, w, interval, variant).reveal(mpc)}")
-            
-            act = LogReg._act(mpc, X_tilde, w, interval, variant)
-            dw = X_tilde.T @ (act - y) * step
-            w -= dw  # n x 1
-        
+                print(f"CP{mpc.pid}:\t\t weigts avg {w.reveal(mpc).mean()} | loss: {LogReg._loss(mpc, X_tilde, y, w, interval, variant, fixed_shift, degree, method=method).reveal(mpc)}")
+
+            act = LogReg._act(mpc, X_tilde, w, interval, variant, fixed_shift, degree, method=method)
+            w = LogReg._descend(mpc, w, LogReg._step(mpc, X_tilde, act, y, step))  # n x 1
+
         return w
-    
+
     @sequre
-    def _mbgd(mpc, X_tilde: T, y: T, initial_w: T, interval: tuple[float, float], variant: str, step: float, epochs: int, batches: int, verbose: bool, debug: Static[bool] = DEBUG) -> T:
+    def _descend(mpc, w, dw):
+        w -= dw
+        return w
+
+    def _mbgd(mpc, X_tilde: T, y: T, initial_w: T, interval: tuple[float, float], variant: str, step: float,
+              epochs: int, batches: int, verbose: bool, fixed_shift: float, degree: int, method: Static[str],
+              debug: Static[bool] = DEBUG) -> T:
         if debug:
             print(f"CP{mpc.pid}:\tLog. reg. BGD step size:", step)
-        
+
         # Compute mini-batches
         X_mini_batches = batch(mpc, X_tilde, batch_count=batches)
         y_mini_batches = batch(mpc, y, batch_count=batches)
-        
+
         # Mini-batched gradient descent
         w = initial_w
         for _ in range(epochs):
@@ -113,26 +262,34 @@ class LogReg[T]:
                 if verbose:
                     print(f"CP{mpc.pid}:\tLog. reg. MBGD epoch {_ + 1}/{epochs} -- batch {i + 1}/{batches}")
                 if debug:
-                    print(f"CP{mpc.pid}:\t\t weigts avg {w.reveal(mpc).mean()} | loss: {LogReg._loss(mpc, X_mini_batches[i], y_mini_batches[i], w, interval, variant).reveal(mpc)}")
-                
-                act = LogReg._act(mpc, X_mini_batches[i], w, interval, variant)
-                w -= X_mini_batches[i].T @ (act - y_mini_batches[i]) * step
-        
-        return w
-    
-    @sequre
-    def _predict(mpc, X: T, w: T, interval: tuple[float, float], variant: str) -> T:
-        X_tilde = X.pad_with_value(1, 1, 1, mpc)
-        return LogReg._act(mpc, X_tilde, w, interval, variant)
-        
-    
-    @sequre
-    def _loss(mpc, X: T, y: T, w: T, interval: tuple[float, float], variant: str):
-        act = LogReg._act(mpc, X, w, interval, variant)
-        
-        if variant == "binary":
-            return (-y * chebyshev_log(mpc, act, (0.0, 1.0)) - (1 - y) * chebyshev_log(mpc, 1 - act, (0.0, 1.0))).sum(axis=0)
-        if variant == "multinomial":
-            return -((y * chebyshev_log(mpc, act, (0.0, 1.0))).sum(axis=0) / len(X))
+                    print(f"CP{mpc.pid}:\t\t weigts avg {w.reveal(mpc).mean()} | loss: {LogReg._loss(mpc, X_mini_batches[i], y_mini_batches[i], w, interval, variant, fixed_shift, degree, method=method).reveal(mpc)}")
 
-        raise ValueError(f"LogReg: invalid variant passed: {variant}")
+                act = LogReg._act(mpc, X_mini_batches[i], w, interval, variant, fixed_shift, degree, method=method)
+                w = LogReg._descend(mpc, w, LogReg._step(mpc, X_mini_batches[i], act, y_mini_batches[i], step))
+
+        return w
+
+    def _predict(mpc, X: T, w: T, interval: tuple[float, float], variant: str, fixed_shift: float, degree: int,
+                 method: Static[str]) -> T:
+        X_tilde = X.pad_with_value(1, 1, 1, mpc)
+        return LogReg._act(mpc, X_tilde, w, interval, variant, fixed_shift, degree, method=method)
+
+    @sequre
+    def _binary_ce(mpc, y, log_p, log_q):
+        return (-y * log_p - (1 - y) * log_q).sum(axis=0)
+
+    @sequre
+    def _categorical_ce(mpc, y, log_p, n: int):
+        return -((y * log_p).sum(axis=0) / n)
+
+    def _loss(mpc, X_tilde: T, y: T, w: T, interval: tuple[float, float], variant: str, fixed_shift: float,
+              degree: int, method: Static[str]):
+        # The cross-entropy (summed over the records for binary, averaged for the softmax variants) of the activations,
+        # clipped into LOSS_LOG_INTERVAL, with the accurate log of the neural-net losses (bce_logs, clipped_log: the HE
+        # types convert to shares once per log)
+        act = LogReg._act(mpc, X_tilde, w, interval, variant, fixed_shift, degree, method=method)
+        low = LOSS_LOG_INTERVAL[0]
+        if variant == "binary":
+            log_p, log_q = bce_logs(mpc, act, low)
+            return LogReg._binary_ce(mpc, y, log_p, log_q)
+        return LogReg._categorical_ce(mpc, y, clipped_log(mpc, act, low, 1.0), len(X_tilde))

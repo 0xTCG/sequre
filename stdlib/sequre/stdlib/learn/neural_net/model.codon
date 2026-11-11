@@ -1,24 +1,53 @@
 import internal.static as static
 
-from sequre.constants import BGD_OPTIMIZER, MBGD_OPTIMIZER, SUPPORTED_OPTIMIZERS, SUPPORTED_LOSSES
+from sequre.constants import (
+    BGD_OPTIMIZER, MBGD_OPTIMIZER, SUPPORTED_OPTIMIZERS, SUPPORTED_LOSSES, BCE_LOSS, CCE_LOSS, SIGMOID_ACTIVATION,
+    SOFTMAX_ACTIVATION, LOSS_LOG_INTERVAL)
 from loss import loss, dloss
 from ..utils import batch
+from sequre.types.sharetensor import Sharetensor
 
 
 class Sequential[L]:
+    """
+    A sequence of layers (an Input first). compile picks the loss and the optimizer; loss_interval is the interval of
+    the cross-entropies' log (predictions are clipped into it). A sigmoid output with the binary cross-entropy, or a
+    softmax output with the categorical one, backpropagates the fused gradient y_hat - y (exact, no division; with the
+    softmax for label rows that sum to 1, one-hot or soft labels, and y_hat sum(y) - y in general); softmax has no
+    element-wise derivative otherwise and is accepted only as the output with the categorical cross-entropy. Nothing is
+    revealed except, with verbose, the training loss summed over the records (over the output columns too on
+    Sharetensors; one sum per output column on the multiparty types) (M-ML-02).
+    """
     layers: L
     loss: str
     optimizer: str
+    loss_interval: tuple[float, float]
+    fused_output: bool
 
     def __init__(self, layers: L):
         assert static.len(L) <= 1024, "Sequential model too large: cannot have more than 1024 layers"
         self.layers = layers
+        self.loss_interval = LOSS_LOG_INTERVAL
+        self.fused_output = False
     
-    def compile(self, mpc, loss: str, optimizer: str, *args, **kwargs) -> Sequential:
+    def compile(self, mpc, loss: str, optimizer: str, *args, loss_interval: tuple[float, float] = LOSS_LOG_INTERVAL,
+                **kwargs) -> Sequential:
         assert loss in SUPPORTED_LOSSES, f"Dense neural net layer: {loss} loss is not supported. Supported losses: {SUPPORTED_LOSSES}"
         assert optimizer in SUPPORTED_OPTIMIZERS, f"Dense neural net layer: {optimizer} optimizer is not supported. Supported optimizers: {SUPPORTED_OPTIMIZERS}"
+        assert 1e-4 <= loss_interval[0] < loss_interval[1] <= 1.0, f"Sequential neural net: loss_interval {loss_interval} must lie in [1e-4, 1] (the cross-entropies' log is accurate there)"
+        assert loss != BCE_LOSS or loss_interval[0] < 0.5, f"Sequential neural net: the binary cross-entropy clips predictions into [low, 1 - low]: loss_interval's lower end {loss_interval[0]} must be below 0.5"
         self.loss = loss
         self.optimizer = optimizer
+        self.loss_interval = loss_interval
+        output_activation = self.layers[-1].activation
+        self.fused_output = ((output_activation == SIGMOID_ACTIVATION and loss == BCE_LOSS) or
+                             (output_activation == SOFTMAX_ACTIVATION and loss == CCE_LOSS))
+        for i in static.range(1, static.len(self.layers) - 1):
+            assert self.layers[i].activation != SOFTMAX_ACTIVATION, "Sequential neural net: softmax has no element-wise derivative; use it only as the output layer with the categorical cross-entropy"
+        if output_activation == SOFTMAX_ACTIVATION:
+            assert loss == CCE_LOSS, "Sequential neural net: a softmax output needs the categorical cross-entropy (its fused gradient y_hat - y)"
+        # The fused gradient is taken at the output activation's input: its derivative is never used
+        self.layers[-1].skip_derivative = self.fused_output
 
         for i in static.range(1, static.len(self.layers)):  # Skip input layer
             self.layers[i].initialize(
@@ -36,11 +65,11 @@ class Sequential[L]:
             raise ValueError(f"Sequential neural net: non-supported optimizer: {self.optimizer}. Supported optimizers: {SUPPORTED_OPTIMIZERS}")
     
     def get_loss(self, mpc, X, y):
-        self._forward(mpc, X)
+        self._forward(mpc, X, False)
         return self._loss(mpc, y, self.layers[-1].output)
     
     def predict(self, mpc, X):
-        self._forward(mpc, X)
+        self._forward(mpc, X, False)
         return self.layers[-1].output
 
     def loss_(self, mpc, y):
@@ -48,13 +77,20 @@ class Sequential[L]:
         return self._loss(mpc, y, self.layers[-1].output)
     
     def _gd(self, mpc, X, y, step: float, momentum: float, verbose: bool):
-        self._forward(mpc, X)
+        self._forward(mpc, X, True)
         self._backward(mpc, y)
         self._update(mpc, step, momentum)
 
         if verbose:
-            # The loss summed over the records before it is revealed: each record's loss is its own (M-ML-02)
-            print(f"CP{mpc.pid}:\t\tTraining loss: {self.loss_(mpc, y).sum(0).reveal(mpc).sum()}")
+            # The loss summed over the records (and, on Sharetensors, the output columns) before it is revealed: each
+            # record's loss is its own (M-ML-02)
+            print(f"CP{mpc.pid}:\t\tTraining loss: {self._summed_loss(mpc, y)}")
+
+    def _summed_loss(self, mpc, y) -> float:
+        column_sums = self.loss_(mpc, y).sum(0)
+        if isinstance(column_sums, Sharetensor):
+            return column_sums.sum(0).reveal(mpc)
+        return column_sums.reveal(mpc).sum()
     
     def _bgd(self, mpc, X, y, step: float, epochs: int, momentum: float, verbose: bool):
         for _ in range(epochs):
@@ -76,10 +112,11 @@ class Sequential[L]:
                     print(f"CP{mpc.pid}:\tSequential neural net: MBGD epoch {_ + 1}/{epochs} -- batch {i + 1}/{batches}")
                 self._gd(mpc, X_mini_batches[i], y_mini_batches[i], step, momentum, verbose)
     
-    def _forward(self, mpc, X):
+    def _forward(self, mpc, X, training: bool):
+        # training: the layers keep their activations' derivatives for the backward pass
         last_output = X
         for layer in self.layers:
-            layer.evaluate(mpc, last_output)
+            layer.evaluate(mpc, last_output, training)
             last_output = layer.output
     
     def _backward(self, mpc, y):
@@ -88,14 +125,16 @@ class Sequential[L]:
         for i in static.range(1, static.len(self.layers)):
             IDX: Static[int] = static.len(self.layers) - i
             prev_output = self.layers[IDX - 1].output
-            dhidden = self.layers[IDX].derive(mpc, prev_output, dhidden, LAYER_IDX=IDX)
+            # The output layer's fused gradient is already taken at its activation's input
+            fused = self.fused_output and i == 1
+            dhidden = self.layers[IDX].derive(mpc, prev_output, dhidden, fused, LAYER_IDX=IDX)
     
     def _update(self, mpc, step: float, momentum: float):
         for layer in self.layers[1:]:
             layer.update(mpc, step, momentum)
     
     def _loss(self, mpc, y, output):
-        return loss(mpc, y, output, self.loss)
+        return loss(mpc, y, output, self.loss, self.loss_interval)
     
     def _dloss(self, mpc, y, output):
-        return dloss(mpc, y, output, self.loss)
+        return dloss(mpc, y, output, self.loss, self.loss_interval, self.fused_output)

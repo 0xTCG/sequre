@@ -1,0 +1,166 @@
+""" GWAS by logistic association: one logistic regression per SNP on (the SNP, the covariates) plus a bias.
+
+gwas_logreg fits, for each SNP column of the genotypes, a binary LogReg of the phenotype (0/1) on the SNP and the
+covariates, and returns each SNP's coefficient (its log odds ratio) and the model's accuracy. It runs on ndarrays (in
+the clear) and Sharetensors, with the method "decor" (Decor's sigmoid), "chebyshev" (its Chebyshev interpolant, degree
+`degree`) or "" (the default: Decor on ring shares, Chebyshev on field shares and in the clear, as LogReg's binary
+default).
+
+Only aggregates are revealed: each SNP's coefficient (the association's result; the covariates' and the bias'
+coefficients stay secret) and its number of correctly classified individuals; the accuracy compares the predictions
+rounded at 0.5 with the phenotype element-wise, both as (n, 1) columns (the earlier metric compared mismatched shapes).
+
+load_gwas_data reads whitespace- or comma-separated text files without a header (genotypes: one individual per line, one
+SNP per column; phenotypes: one 0/1 per line; covariates: one individual per line), optionally keeping the SNP columns
+listed in a file of indices; simulate_gwas_data draws a phenotype and covariates for given genotypes.
+"""
+
+import math
+import prg
+
+from sequre.stdlib.numpy.create import array
+from sequre.stdlib.numpy.ndarray import ndarray
+from sequre.stdlib.learn.log_reg import LogReg
+from sequre.attributes import sequre
+
+
+def _read_rows(path: str, rows: int, cols: int) -> List[List[float]]:
+    # Up to `rows` lines (0: all) of whitespace- or comma-separated numbers, the first `cols` of each (0: all)
+    out = List[List[float]]()
+    with open(path, "r") as f:
+        for line in f:
+            fields = line.replace(",", " ").split()
+            if not fields:
+                continue
+            values = [float(v) for v in fields]
+            out.append(values[:cols] if cols > 0 else values)
+            if rows > 0 and len(out) == rows:
+                break
+    return out
+
+
+def _standardized(cov: List[List[float]]) -> List[List[float]]:
+    # Each column minus its mean, divided by its standard deviation (a constant column: minus its mean only)
+    n = len(cov)
+    if n == 0:
+        return cov
+    out = [row.copy() for row in cov]
+    for k in range(len(cov[0])):
+        mean = 0.0
+        for i in range(n):
+            mean += cov[i][k]
+        mean /= float(n)
+        var = 0.0
+        for i in range(n):
+            var += (cov[i][k] - mean) * (cov[i][k] - mean)
+        sd = math.sqrt(var / float(n))
+        for i in range(n):
+            out[i][k] = (cov[i][k] - mean) / sd if sd > 0.0 else cov[i][k] - mean
+    return out
+
+
+def load_gwas_data(geno_path: str, pheno_path: str, cov_path: str, rows: int = 0, covs: int = 0,
+                   snp_list_path: str = "", standardize_covariates: bool = False):
+    """
+    (genotypes, phenotypes, covariates) as ndarrays (n x snps, n x 1, n x covs) from text files: `rows` individuals
+    (0: all), `covs` covariates (0: all), and, with snp_list_path, only the SNP columns whose 0-based indices it lists
+    (one per line). Genotypes must be complete allele counts: a value other than 0, 1 or 2 (a missing call coded -1,
+    say) raises ValueError. standardize_covariates centres and scales each covariate column to unit variance, in the
+    clear: gwas_logreg's default step assumes features of unit scale.
+    """
+    geno = _read_rows(geno_path, rows, 0)
+    if snp_list_path:
+        keep = [int(r[0]) for r in _read_rows(snp_list_path, 0, 1)]
+        geno = [[row[j] for j in keep] for row in geno]
+    for row in geno:
+        for v in row:
+            if v != 0.0 and v != 1.0 and v != 2.0:
+                raise ValueError(f"load_gwas_data: genotype {v} is not an allele count (0, 1 or 2; missing calls are not supported)")
+    pheno = [[r[0]] for r in _read_rows(pheno_path, rows, 1)]
+    cov = _read_rows(cov_path, rows, covs)
+    if not (len(geno) == len(pheno) == len(cov)):
+        raise ValueError(f"load_gwas_data: {len(geno)} genotype, {len(pheno)} phenotype and {len(cov)} covariate rows")
+    if standardize_covariates:
+        cov = _standardized(cov)
+    return array(geno), array(pheno), array(cov)
+
+
+def simulate_gwas_data(geno, covs: int = 5, effect_sd: float = 1.0, noise_sd: float = 0.1, center: bool = True):
+    """
+    (betas, phenotypes, covariates) for the genotypes geno (n x snps): betas ~ N(0, effect_sd^2) per SNP, a phenotype
+    drawn as Bernoulli(sigmoid(s + N(0, noise_sd^2))) for the score s = geno betas, centred (its mean subtracted, so the
+    cases and controls balance) unless center is False, covariates ~ N(0, 1) (n x covs). Draws from the stream in use
+    (prg): call it under mpc.randomness.seed_switch(-1) for data every party agrees on.
+    """
+    n, snps = geno.shape[0], geno.shape[1]
+    betas = array([[prg.gauss(0.0, effect_sd)] for _ in range(snps)])
+    scores = geno @ betas
+    mean = 0.0
+    if center:
+        for i in range(n):
+            mean += scores[i, 0]
+        mean /= float(n)
+    pheno = List[List[float]]()
+    for i in range(n):
+        p = 1.0 / (1.0 + math.exp(-(scores[i, 0] - mean + prg.gauss(0.0, noise_sd))))
+        pheno.append([1.0 if prg.random() < p else 0.0])
+    cov = array([[prg.gauss(0.0, 1.0) for _ in range(covs)] for _ in range(n)])
+    return betas, array(pheno), cov
+
+
+@sequre
+def _correct(mpc, prediction, labels):
+    # [prediction > 0.5] == labels for 0/1 labels: hit = h y + (1 - h)(1 - y)
+    hit = (prediction > 0.5).astype(type(prediction._internal_type))
+    return hit * labels + (1 - hit) * (1 - labels)
+
+
+def _snp_design(geno, cov, j: int):
+    # [geno[:, j], cov] (n x (1 + covs)): the SNP's column, then the covariates
+    n = geno.shape[0]
+    if isinstance(geno, ndarray):
+        return geno[:, j].reshape((n, 1)).hstack(cov)
+    else:
+        return geno[:, j].expand_dims().reshape([n, 1]).hstack(cov)
+
+
+def _clear(mpc, x):
+    # x in the clear: itself for an ndarray, revealed (to the compute parties) otherwise
+    if isinstance(x, ndarray):
+        return x
+    else:
+        return x.reveal(mpc)
+
+
+def gwas_logreg(mpc, geno, pheno, cov, initial_w, method: str = "", step: float = 1.0, epochs: int = 50,
+                degree: int = 0, interval: Tuple[float, float] = (-10.0, 10.0)):
+    """
+    For each SNP j (column of geno, n x snps): a binary LogReg of pheno (n x 1) on [geno[:, j], cov] (n x (1 + covs))
+    plus a bias, fitted by batched gradient descent from initial_w ((2 + covs) x 1: the SNP's, the covariates', the
+    bias' coefficients) for `epochs` epochs, with `method` (and `degree` for Chebyshev, 0: its default 20) on
+    `interval`; method "" picks as LogReg's binary default (LogReg.method_for): Decor on the ring, 11% faster there than
+    Chebyshev in the benchmarks, and Chebyshev on the field, about 3.5x faster there than Decor. step is per individual:
+    LogReg's gradient sums over the n individuals, so the fit takes step / n, which keeps one default stable for any
+    cohort size (a fixed step diverges once n reaches a few hundred). The default assumes features of unit scale (mean
+    square about 1: genotypes 0/1/2, standardized covariates); a feature with mean square s^2 needs a step below about
+    8 / s^2 (raw ages in years diverge at the default: load_gwas_data's standardize_covariates). The default interval
+    (-10, 10) suits both methods (Decor's sigmoid interval at F = 32; Chebyshev's degree-20 interpolant is within 1.8e-3
+    there, against 6e-2 on LogReg's own Chebyshev default (-50, 10)); (0, 0) takes LogReg's default for the method.
+    geno, pheno, cov and initial_w share one type (ndarray or Sharetensor). Returns (betas, accuracies): each SNP's
+    coefficient and the fraction of individuals its model classifies right, in the clear at the compute parties (CP0:
+    zeros).
+    """
+    snps = geno.shape[1]
+    n = geno.shape[0]
+    betas = List[float]()
+    accuracies = List[float]()
+    for j in range(snps):
+        X = _snp_design(geno, cov, j)
+        model = LogReg(initial_w, optimizer="bgd", variant="binary", method=method, degree=degree, interval=interval)
+        model.fit(mpc, X=X, y=pheno, step=step / float(n), epochs=epochs)
+        # Row 0 of the coefficients (the SNP's) only
+        beta = _clear(mpc, model.coef_[0])
+        hits = _clear(mpc, _correct(mpc, model.predict(mpc, X), pheno).sum(axis=0))
+        betas.append(float(beta[0]) if mpc.pid else 0.0)
+        accuracies.append(float(hits[0]) / float(n) if mpc.pid else 0.0)
+    return betas, accuracies

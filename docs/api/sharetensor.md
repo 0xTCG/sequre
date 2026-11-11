@@ -139,8 +139,6 @@ Manual truncation is available via `.trunc(mpc.fp)` / `.itrunc(mpc)` for advance
 | Method | Description |
 |---|---|
 | `.to_fp()` | Convert to fixed-point representation |
-| `.to_ring(mpc)` | Convert from field to ring |
-| `.to_field(mpc)` | Convert from ring to field |
 | `.to_bits(mpc, bitlen, delimiter_prime)` | Bit decomposition |
 | `.diag(other)` | Create diagonal matrix with values from `other` |
 | `.diagonal_contig(antidiagonal=False)` | Extract diagonal elements into a contiguous vector |
