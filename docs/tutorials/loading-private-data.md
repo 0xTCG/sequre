@@ -10,7 +10,7 @@ In production, **each party holds its own data on disk** and brings it into the 
 
 | | Test / synthetic | Production / file-based |
 |---|---|---|
-| **How** | `mpc.randomness.seed_switch(-1)` + manual slicing | `MPU.collective_load(mpc, path, rows, cols, binary, collective_type=...)` |
+| **How** | `mpc.randomness.global_stream()` + manual slicing | `MPU.collective_load(mpc, path, rows, cols, binary, collective_type=...)` |
 | **Who generates data?** | Every party generates the same array from a shared seed | Each party reads its own private file |
 | **Trusted dealer (CP0)** | Holds a zero-filled slice | Receives metadata only (row counts); holds zeros |
 | **When to use** | Unit tests, quick experiments | Real deployments with private data |

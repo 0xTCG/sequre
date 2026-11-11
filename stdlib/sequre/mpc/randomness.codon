@@ -11,12 +11,31 @@ from C import memcpy(cobj, cobj, int)
 
 
 class MPCRandomness:
-    # Performance warning: States are pretty big arrays. Might introduce some overhead.
+    """
+    A party's PRG streams, all served by the process's one generator (prg._rnd): its private stream (key: its own pid;
+    seeded from RAND_bytes, known to it alone), one stream shared with each other party p (key p; the seed the two
+    exchanged) and the global stream (key -1; the seed CP0 broadcast, known to every party). One stream is live at a
+    time, and draws come from it; prg_states holds the saved state of every other stream.
+
+    Switches nest. switch_seed(q) pushes the live stream onto a stack and makes q live; restore_seed(q) closes the
+    innermost switch, which must be one to q, and makes the stream below it live again. A switch to the stream already
+    live continues it. Outside every switch the private stream is live.
+
+    Protocols name the stream of each secret draw: the dealer's values and each party's switching masks come from the
+    private stream (private()), masks a pair agrees on from their pairwise stream. So a protocol run inside a caller's
+    global_stream() (seed_switch(-1)) keeps its secrets private and leaves the global stream alone. Draws that name no
+    stream (initial weights, Sharetensor.rand, data a caller draws) come from the live stream: the caller picks it.
+    MPA.rand is the exception: an MPA's random data is public, so it always draws from the global stream, and so do
+    MPU's default (additive) rand and initial weights and noise on MPA-backed data.
+    """
     pid: int
     stats: MPCStats
     prg_states: dict[int, tuple[array[u32], int]]
     other_seeds: dict[int, seed_t]
     global_seed: seed_t
+    live: int  # the stream loaded in the generator
+    switch_stack: List[int]  # one entry per open switch: the stream live before it
+    frozen_states: dict[int, tuple[array[u32], int]]  # freeze_seed's saved states, keyed by the switch's stack depth
 
     def __init__(self: MPCRandomness, stats: MPCStats):
         self.pid = stats.pid
@@ -24,14 +43,19 @@ class MPCRandomness:
         self.prg_states = dict[int, tuple[array[u32], int]]()
         self.other_seeds = dict[int, seed_t]()
         self.global_seed = seed_t(0)
+        self.live = self.pid
+        self.switch_stack = List[int]()
+        self.frozen_states = dict[int, tuple[array[u32], int]]()
 
         for other_pid in set(range(NUMBER_OF_PARTIES)) - {self.pid}:
             self.other_seeds[other_pid] = seed_t(hash(
                 (min(self.pid, other_pid), max(self.pid, other_pid))))
 
         self.reset_streams()  # Deterministically seed all streams by default
-        
+
     def reset_streams(self):
+        # Seeds every stream afresh: at construction, and again once MPCComms has exchanged the seeds
+        assert len(self.switch_stack) == 0, f"CP{self.pid}: reset_streams inside a seed switch (stream {self.live} is live)"
         self.reset_global_seed()
         for other_pid in set(range(NUMBER_OF_PARTIES)) - {self.pid}:
             self.reset_seed(other_pid, self.other_seeds[other_pid])
@@ -53,55 +77,148 @@ class MPCRandomness:
             print(f"CP{self.pid}: PRNG streams securely seeded with cryptographically random bytes.")
 
     def reset_global_seed(self):
-        # Reset the global seed stream (pid = -1) to the exchanged global seed.
+        # Rewinds the global stream (pid = -1) to the exchanged global seed, the same at every party. No other stream
+        # changes, and the live stream stays live.
         self.reset_seed(-1, self.global_seed)
-    
+
     def get_state(self: MPCRandomness) -> tuple[array[u32], int]:
+        # A copy of the live stream's state
         return prg._rnd.gen.get_state()
-    
+
     def set_state(self: MPCRandomness, state: tuple[array[u32], int]):
-        prg._rnd.gen.set_state(state)
+        # Puts a copy of state into the live stream (later draws leave state as it is)
+        prg._rnd.gen.set_state((copy(state[0]), state[1]))
 
     def reset_seed(self: MPCRandomness, pid: int, seed: seed_t):
+        # Re-seeds stream pid. The live stream is left where it was, unless it is pid's.
         # Shared streams are securely seeded via __secure_seed_exchange in MPCComms.
         # The default hash-based seed is only a placeholder until the exchange occurs.
+        if pid == self.live:
+            prg.seed(seed)
+            return
+
+        gen = prg._rnd.gen
+        live_state = gen.swap_state((array[u32](prg.N), 0))
         prg.seed(seed)
-        self.prg_states[pid] = self.get_state()
-        
+        self.prg_states[pid] = gen.swap_state(live_state)
+
     def switch_seed(self: MPCRandomness, pid: int):
-        self.prg_states[self.pid] = self.get_state()
-        self.set_state(self.prg_states[pid])
-    
+        # Opens a switch to stream pid: draws come from it until the matching restore_seed(pid). A switch to the stream
+        # already live continues it. `with seed_switch(pid):` closes the switch even when the block raises.
+        back = self.live
+        if pid != back:
+            self._make_live(pid)  # raises before anything changes if there is no stream pid
+        self.switch_stack.append(back)
+
     def restore_seed(self: MPCRandomness, pid: int):
-        self.prg_states[pid] = self.get_state()
-        self.set_state(self.prg_states[self.pid])
-    
+        # Closes the innermost switch, which must be one to stream pid, and saves pid's state
+        if len(self.switch_stack) == 0:
+            raise ValueError(f"CP{self.pid}: restore_seed({pid}) without a matching switch_seed: no switch is open")
+        if pid != self.live:
+            raise ValueError(
+                f"CP{self.pid}: restore_seed({pid}) does not match the innermost switch, which is to stream {self.live}")
+        self._close()
+
     def freeze_seed(self: MPCRandomness, pid: int):
-        self.prg_states[self.pid] = self.get_state()
-        new_state, new_next = self.prg_states[pid]
-        self.set_state((copy(new_state), new_next))
-    
+        # Opens a switch to stream pid as switch_seed does, and remembers where the stream is: each unfreeze_seed(pid)
+        # rewinds it there (the draws after it repeat the same values), and restore_seed(pid) closes the switch. Only the
+        # global stream may be frozen: rewinding a stream protocols draw from (the private stream, a pairwise one) would
+        # make them reuse masks, and two openings against one mask reveal the difference of their inputs.
+        if pid != -1:
+            raise ValueError(
+                f"CP{self.pid}: freeze_seed({pid}): only the global stream (-1) can be frozen; protocols draw masks from "
+                f"stream {pid}, and rewinding it would make them reuse masks")
+        self.switch_seed(pid)
+        self.frozen_states[len(self.switch_stack)] = self.get_state()
+
     def unfreeze_seed(self: MPCRandomness, pid: int):
-        self.set_state(self.prg_states[pid])
+        # Rewinds stream pid to where freeze_seed(pid) found it, as often as called. The innermost switch must be that
+        # freeze_seed(pid)'s; it stays open until restore_seed(pid).
+        depth = len(self.switch_stack)
+        if pid != self.live or depth not in self.frozen_states:
+            raise ValueError(
+                f"CP{self.pid}: unfreeze_seed({pid}) needs freeze_seed({pid}) to have opened the innermost switch (the "
+                f"innermost is to stream {self.live})")
+        frozen = self.frozen_states[depth]
+        prg._rnd.gen.swap_state((copy(frozen[0]), frozen[1]))
+
+    def _make_live(self, pid: int):
+        # The live state goes back to the live stream's slot and pid's comes out of its own, moved rather than copied:
+        # the live stream has no saved state, so nothing can go stale or alias the generator's state
+        if pid not in self.prg_states:
+            raise ValueError(f"CP{self.pid}: there is no PRG stream {pid}")
+        state = self.prg_states.pop(pid)
+        self.prg_states[self.live] = prg._rnd.gen.swap_state(state)
+        self.live = pid
+
+    def _close(self):
+        # Closes the innermost switch: the stream live before it becomes live again
+        depth = len(self.switch_stack)
+        if len(self.frozen_states) and depth in self.frozen_states:
+            self.frozen_states.pop(depth)
+        back = self.switch_stack.pop()
+        if back != self.live:
+            self._make_live(back)
+
+    def _close_switch(self, pid: int, depth: int):
+        # The exit of `with seed_switch(pid)`, opened at stack depth `depth`. Closes switches still open inside it (an
+        # exception skipped their restore_seed, or one is missing), then its own, and raises if it had to close any.
+        open_inside = len(self.switch_stack) - depth - 1
+        if open_inside == 0 and pid == self.live:
+            self._close()
+            return
+        innermost = self.live
+        while len(self.switch_stack) > depth:
+            self._close()
+        if open_inside <= 0:
+            # Its own switch was closed inside the block (another one opened in its place is closed now)
+            raise ValueError(
+                f"CP{self.pid}: seed_switch({pid}) exits after its switch was closed inside the block (a restore_seed "
+                f"too many)")
+        raise ValueError(
+            f"CP{self.pid}: seed_switch({pid}) exits with {open_inside} switch(es) opened inside the block still open "
+            f"(the innermost to stream {innermost}): an exception skipped their restore_seed, or one is missing. This "
+            f"error replaces an exception the block raised.")
 
 
 class SeedSwitch:
         randomness: MPCRandomness
         switch_pid: int
+        depth: int
 
         def __init__(self, randomness: MPCRandomness, switch_pid: int):
             self.randomness = randomness
             self.switch_pid = switch_pid
+            self.depth = 0
 
         def __enter__(self):
+            self.depth = len(self.randomness.switch_stack)
             self.randomness.switch_seed(self.switch_pid)
 
         def __exit__(self):
-            self.randomness.restore_seed(self.switch_pid)
+            self.randomness._close_switch(self.switch_pid, self.depth)
 
 
 @extend
 class MPCRandomness:
     def seed_switch(self, pid: int):
-        # TODO: #29 Enable nested seed switching
+        # `with seed_switch(pid):` draws from stream pid inside the block. Switches nest (see switch_seed).
         return SeedSwitch(self, pid)
+
+    def private(self):
+        # `with private():` draws from this party's private stream inside the block, whatever stream is live outside it
+        return SeedSwitch(self, self.pid)
+
+    def global_stream(self):
+        # `with global_stream():` draws from the global stream inside the block: values every party draws alike (call
+        # it at every party, CP0 too, with the same draws). An alias of seed_switch(-1).
+        return SeedSwitch(self, -1)
+
+    def stream_digest(self, pid: int) -> int:
+        # A digest of where stream pid is, from its state (nothing is drawn): parties that drew alike from a stream they
+        # share get equal digests
+        words, next_index = prg._rnd.gen.get_state() if pid == self.live else self.prg_states[pid]
+        h = u64(0xcbf29ce484222325) ^ u64(next_index)
+        for i in range(len(words)):
+            h = (h ^ u64(words[i])) * u64(0x100000001b3)
+        return int(h >> u64(2))

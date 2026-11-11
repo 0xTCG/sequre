@@ -165,6 +165,7 @@ CASES = [
     ("nl.sigmoid_auto_field_vec_1e3", "", "nonlinear.sigmoid's default (auto) on its default interval ((-10, 10) at F = 32), inputs in (-10, 10): on field shares the Chebyshev interpolant of auto_degree (degree in params), field, 1e3"),
     ("nl.tanh_auto_ring_vec_1e3", "", "nonlinear.tanh's default (auto) on its default interval ((-5, 5) at F = 32), inputs in (-5, 5): Decor on ring shares, ring, 1e3"),
     ("nl.tanh_auto_field_vec_1e3", "", "nonlinear.tanh's default (auto) on its default interval ((-5, 5) at F = 32), inputs in (-5, 5): on field shares the Chebyshev interpolant of auto_degree (degree in params), field, 1e3"),
+    ("prim.rand.seed_switch_global_1e4", "", "10k seed_switch(-1) enter/exit pairs from the private stream, one draw each, at every party: a switch between two streams"),
 ]
 
 handle_list_flag("mpc", CASES)
@@ -875,7 +876,7 @@ def bench_fp(mpc, b: Bench):
 
     if b.want(mpc, "mpc.pow.int_cube_vec_1e4"):
         n = 10000
-        with mpc.randomness.seed_switch(-1):
+        with mpc.randomness.global_stream():
             ints = [prg.randint(0, 15) for _ in range(n)]
         x = Sharetensor.enc(mpc, ints)
         r = x
@@ -1052,7 +1053,7 @@ def bench_e2e(mpc, b: Bench):
     if b.want(mpc, "e2e.king.sharetensor_16x2048"):
         per_party, cols = 8, 2048
         rows = per_party * (mpc.comms.number_of_parties - 1)
-        with mpc.randomness.seed_switch(-1):
+        with mpc.randomness.global_stream():
             geno = random_ints((rows, cols), 0, 2)
         raw_data = array(geno, dtype=float)
         het_scale = float(cols // 100)
@@ -1104,8 +1105,8 @@ def _nn_layers(ctype: type, method: str):
 def _copy_initial_weights(mpc, src, dst):
     # dst (a plaintext model) takes src's (a Sharetensor model's) initial weights and biases, revealed (CP0 gets zeros).
     # Every party drew them in the clear under the shared seed (Sharetensor.rand), so the reveal discloses nothing new;
-    # it keeps the plaintext reference on the same start without rewinding a stream (see the module docstring of
-    # harness.codon on reset_global_seed).
+    # it keeps the plaintext reference on the same start without rewinding the global stream (see the module
+    # docstring of harness.codon).
     for i in static.range(1, static.len(src.layers)):
         dst.layers[i].weights = src.layers[i].weights.reveal(mpc)
         dst.layers[i].bias = src.layers[i].bias.reveal(mpc)
@@ -1122,7 +1123,7 @@ def _bench_nn(mpc, b: Bench, case: str, mod, method: str):
         ref = Sequential(_nn_layers(type(X), method)).compile(mpc, loss="binary_crossentropy", optimizer="bgd")
         t = Timer(b.reps(3))
         while t.next():
-            with mpc.randomness.seed_switch(-1):
+            with mpc.randomness.global_stream():
                 model = Sequential(_nn_layers(Sharetensor[List[List[mpc_uint]]], method)).compile(
                     mpc, loss="binary_crossentropy", optimizer="bgd", modulus=mod)
             _copy_initial_weights(mpc, model, ref)
@@ -1190,7 +1191,7 @@ def bench_apps(mpc, b: Bench):
             # About 0.06 s a repetition: 9 of them for a stable median
             t = Timer(b.reps(9))
             while t.next():
-                with mpc.randomness.seed_switch(-1):
+                with mpc.randomness.global_stream():
                     model = siren_model(mpc, Sharetensor[List[List[mpc_uint]]], 2, neurons, omega, modulus=mod)
                 _copy_initial_weights(mpc, model, ref)
                 t.begin(mpc)
@@ -1211,7 +1212,7 @@ def bench_apps(mpc, b: Bench):
         if b.want(mpc, case):
             n, snps, covs, step, epochs = 64, 3, 2, 1.0, 10  # step per individual (gwas_logreg divides by n)
             interval = (-10.0, 10.0)
-            with mpc.randomness.seed_switch(-1):
+            with mpc.randomness.global_stream():
                 geno = array(random_ints((n, snps), upper_limit=2)).astype(float)
                 betas, pheno, cov = simulate_gwas_data(geno, covs)
             w0 = array([[0.0] for _ in range(covs + 2)])
@@ -1239,7 +1240,7 @@ def bench_decor_prim(mpc, b: Bench):
 
     if b.want(mpc, "decor.prim.xor_add_vec_1e4"):
         n = 10000
-        with mpc.randomness.seed_switch(-1):
+        with mpc.randomness.global_stream():
             xs = [prg.getrandbits_intn(PACKING_SIZE, TP=size_t) for _ in range(n)]
             ys = [prg.getrandbits_intn(PACKING_SIZE, TP=size_t) for _ in range(n)]
         x = mpc.bitwise.share_from_trusted_dealer(xs)
@@ -1515,6 +1516,24 @@ def bench_twins(mpc, b: Bench):
                 _timed_fn(mpc, b, case, n, xs, x, lambda mpc, x: nl_sigmoid(mpc, x) if fn == "sigmoid" else nl_tanh(mpc, x), want, extra)
 
 
+def bench_streams(mpc, b: Bench):
+    # After every other section: its draws from the shared stream move no other case's data
+    if b.want(mpc, "prim.rand.seed_switch_global_1e4"):
+        # Every party switches from its private stream to the global one and back, and draws the same values from the
+        # global stream, which stays in step. prim.rand.seed_switch_1e4 switches to the stream already live.
+        modulus = MPC_FIELD_SIZE
+        n = 10000
+        acc = mpc_uint(0)
+        t = Timer(b.reps(9))
+        while t.next():
+            t.begin(mpc)
+            for _ in range(n):
+                with mpc.randomness.global_stream():
+                    acc ^= mpc_uint.rand(modulus, "uniform")
+            t.end(mpc)
+        b.report(f"n={n};check=draws_ok", t, 1.0 if acc != mpc_uint(0) else 0.0)
+
+
 @main
 def bench_mpc_main(mpc):
     b = Bench("mpc", mpc.pid, CASES)
@@ -1536,6 +1555,7 @@ def bench_mpc_main(mpc):
     bench_ml(mpc, b)
     bench_apps(mpc, b)
     bench_twins(mpc, b)
+    bench_streams(mpc, b)
     b.finish(mpc)
 
 

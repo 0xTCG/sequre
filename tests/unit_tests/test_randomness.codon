@@ -1,0 +1,530 @@
+"""
+The PRG streams (mpc/randomness.codon). A party's private stream must stay private, whatever a caller switches to, and a
+stream several parties share must stay in step: every party draws the same values from it, CP0 included. The checks
+compare private draws across parties, a disclosure for testing only: they protect nothing here.
+"""
+import prg
+import secure_operator
+
+import sequre.lattiseq.ckks as ckks
+
+from sequre.attributes import sequre
+from sequre.constants import mpc_uint, MPC_RING_SIZE, MPC_NBIT_K, MPC_NBIT_F, MPC_NBIT_V, MPC_MODULUS_BITS, \
+    MPC_SECOND_RING_SIZE, MPC_SECOND_FIELD_SIZE
+from sequre.stdlib.numpy.create import array, zeros_like
+from sequre.stdlib.learn.pca import RandomSketching
+from sequre.stdlib.learn.neural_net.model import Sequential
+from sequre.stdlib.learn.neural_net.layers import Input, Dense
+from sequre.stdlib.protocols import bit_decomposition as bit_decomposition_protocol
+from sequre.types.internal import InternalMPC
+from sequre.types.sharetensor import Sharetensor
+from sequre.types.multiparty_union import MPU
+from sequre.types.utils import double_to_fp, fp_to_double
+from sequre.utils.stats import precision_stats
+from sequre.utils.testing import assert_eq, assert_eq_approx
+from sequre.utils.utils import random_floats, zeros_vec
+
+from multiparty_testing import assert_parties_in_step
+
+
+def _draw() -> int:
+    # Two words of the live stream, with no rejection step: draws at different points of a stream never coincide
+    return prg.getrandbits(62)
+
+
+def _draws_from(mpc, state, n: int) -> List[int]:
+    # The next n draws from a saved stream state, leaving the live stream where it is
+    r = mpc.randomness
+    current = r.get_state()
+    r.set_state(state)
+    out = [_draw() for _ in range(n)]
+    r.set_state(current)
+    return out
+
+
+def _same_state(a, b) -> bool:
+    if a[1] != b[1] or len(a[0]) != len(b[0]):
+        return False
+    for i in range(len(a[0])):
+        if a[0][i] != b[0][i]:
+            return False
+    return True
+
+
+def _global_next(mpc) -> int:
+    # The global stream's next draw, leaving the stream where it is
+    with mpc.randomness.global_stream():
+        return _draws_from(mpc, mpc.randomness.get_state(), 1)[0]
+
+
+def _pairwise_next(mpc) -> List[int]:
+    # The next draw of the stream shared with each other party (at that party's index; 0 at this party's own)
+    out = [0 for _ in range(mpc.comms.number_of_parties)]
+    for q in range(mpc.comms.number_of_parties):
+        if q != mpc.pid:
+            with mpc.randomness.seed_switch(q):
+                out[q] = _draws_from(mpc, mpc.randomness.get_state(), 1)[0]
+    return out
+
+
+def _check_streams(mpc, label: str):
+    # The global stream and every pairwise stream in step at both ends; every party's next private draw (CP0's too)
+    # differs from the other parties' and from the next draw of every party's global stream. A private stream that
+    # became a copy of a shared one repeats another party's draws.
+    pid = mpc.pid
+    n = mpc.comms.number_of_parties
+    glob = mpc.comms.collect(_global_next(mpc), include_trusted_dealer=True)
+    pair = mpc.comms.collect(_pairwise_next(mpc), include_trusted_dealer=True)
+    priv = mpc.comms.collect(_draw(), include_trusted_dealer=True)
+    glob_ok = all(g == glob[0] for g in glob)
+    pair_ok = all(pair[q][pid] == pair[pid][q] for q in range(n) if q != pid)
+    priv_ok = len(set(priv)) == n and not any(g in priv for g in glob)
+    assert_eq(f"CP{pid}:\tstreams {label}: global stream in step", glob_ok, True)
+    assert_eq(f"CP{pid}:\tstreams {label}: pairwise streams in step", pair_ok, True)
+    assert_eq(f"CP{pid}:\tstreams {label}: private draws differ between the parties and from the global stream", priv_ok, True)
+
+
+def _check_shared_seed_run(mpc, label: str, p0, g0, g1, private_untouched: bool):
+    # After an operation run inside seed_switch(-1): it left the global stream where it was at this party (g0, g1:
+    # before and after), and a party that draws nothing privately in it finds its private stream where it was (p0)
+    pid = mpc.pid
+    assert_eq(f"CP{pid}:\tstreams: {label} under the shared seed leaves the global stream alone", _same_state(g0, g1), True)
+    if private_untouched:
+        assert_eq(f"CP{pid}:\tstreams: {label} under the shared seed leaves this party's private stream where it was",
+                  _draw(), _draws_from(mpc, p0, 1)[0])
+    _check_streams(mpc, f"after {label} under the shared seed")
+
+
+@sequre
+def _gt_zero(mpc, x):
+    return x > 0.0
+
+
+def test_nested_switches(mpc, modulus):
+    pid = mpc.pid
+    n = mpc.comms.number_of_parties
+    r = mpc.randomness
+
+    # Two levels of the same stream: the inner switch continues the outer one
+    p0 = r.get_state()
+    with r.global_stream():
+        g0 = r.get_state()
+        with r.global_stream():
+            a = _draw()
+        b = _draw()
+    assert_eq(f"CP{pid}:\tstreams: seed_switch(-1) inside seed_switch(-1) continues the global stream", [a, b], _draws_from(mpc, g0, 2))
+    assert_eq(f"CP{pid}:\tstreams: after it the private stream continues where it was", _draw(), _draws_from(mpc, p0, 1)[0])
+
+    # global_stream() is seed_switch(-1)
+    with r.global_stream():
+        g0 = r.get_state()
+    with r.global_stream():
+        a = _draw()
+        live_in = r.live
+    assert_eq(f"CP{pid}:\tstreams: global_stream() draws from the global stream", [a, live_in], [_draws_from(mpc, g0, 1)[0], -1])
+
+    # Two and three levels of different streams: the global stream, each pairwise one inside it, and the private and
+    # the global stream inside those. Every party draws once from each pairwise stream, so they stay in step.
+    p0 = r.get_state()
+    glob = List[int]()
+    priv = List[int]()
+    with r.global_stream():
+        g0 = r.get_state()
+        glob.append(_draw())
+        for q in range(n):
+            if q == pid:
+                continue
+            with r.seed_switch(q):
+                _draw()
+                with r.private():
+                    priv.append(_draw())
+                with r.global_stream():
+                    glob.append(_draw())
+        glob.append(_draw())
+    priv.append(_draw())
+    assert_eq(f"CP{pid}:\tstreams: global draws through nested switches are the global stream's", glob, _draws_from(mpc, g0, len(glob)))
+    assert_eq(f"CP{pid}:\tstreams: private draws through nested switches are the private stream's", priv, _draws_from(mpc, p0, len(priv)))
+    _check_streams(mpc, "after nested switches")
+
+    # A protocol inside nested switches (a different pairwise stream at each party)
+    x = Sharetensor.enc(mpc, [1.5, -2.0, 3.25], 0, modulus)
+    with r.global_stream():
+        with r.seed_switch(1 if pid != 1 else 2):
+            y = secure_operator.mul(mpc, x, x)
+    rv = y.reveal(mpc)
+    if pid:
+        assert_eq_approx(f"CP{pid}:\tstreams: a product inside nested switches", rv, array([2.25, 4.0, 10.5625]), error=1e-3)
+    _check_streams(mpc, "after a product inside nested switches")
+
+    # An exception inside seed_switch closes the switch on its way out
+    p0 = r.get_state()
+    with r.global_stream():
+        g0 = r.get_state()
+    try:
+        with r.global_stream():
+            _draw()
+            raise IndexError("test")
+    except IndexError:
+        pass
+    with r.global_stream():
+        after = _draw()
+    assert_eq(f"CP{pid}:\tstreams: an exception inside seed_switch(-1) closes it (private stream where it was, global "
+              f"stream one draw on)", [_draw(), after], [_draws_from(mpc, p0, 1)[0], _draws_from(mpc, g0, 2)[1]])
+
+    # freeze_seed / unfreeze_seed repeat a stream's draws, also inside another switch
+    with r.global_stream():
+        g0 = r.get_state()
+    with r.seed_switch(pid):
+        r.freeze_seed(-1)
+        first = [_draw() for _ in range(3)]
+        r.unfreeze_seed(-1)
+        again = [_draw() for _ in range(3)]
+        r.restore_seed(-1)
+    with r.global_stream():
+        next_draw = _draw()
+    want = _draws_from(mpc, g0, 4)
+    assert_eq(f"CP{pid}:\tstreams: unfreeze_seed rewinds to freeze_seed's point", [first, again], [want[:3], want[:3]])
+    assert_eq(f"CP{pid}:\tstreams: restore_seed after unfreeze_seed keeps the draws since unfreeze_seed", next_draw, want[3])
+
+    # unfreeze_seed rewinds as often as it is called (the same permutation of three lists)
+    with r.global_stream():
+        g0 = r.get_state()
+    r.freeze_seed(-1)
+    first = [_draw() for _ in range(2)]
+    r.unfreeze_seed(-1)
+    second = [_draw() for _ in range(2)]
+    r.unfreeze_seed(-1)
+    third = [_draw() for _ in range(2)]
+    r.restore_seed(-1)
+    want = _draws_from(mpc, g0, 2)
+    assert_eq(f"CP{pid}:\tstreams: a second unfreeze_seed rewinds again", [first, second, third], [want, want, want])
+
+    # A switch left open inside seed_switch (an exception skipped its restore_seed) is closed at the block's exit,
+    # which reports it
+    raised = False
+    try:
+        with r.global_stream():
+            r.switch_seed(pid)
+            raise IndexError("test")
+    except ValueError:
+        raised = True
+    except IndexError:
+        pass
+    assert_eq(f"CP{pid}:\tstreams: seed_switch's exit closes a switch left open inside it and raises",
+              raised and len(r.switch_stack) == 0 and r.live == pid, True)
+
+    # A block whose own switch was closed inside it, and another opened in its place: the exit raises and closes that
+    # other switch too (nothing is drawn from the pairwise stream)
+    raised = False
+    try:
+        with r.global_stream():
+            r.restore_seed(-1)
+            r.switch_seed(1 if pid != 1 else 2)
+    except ValueError:
+        raised = True
+    assert_eq(f"CP{pid}:\tstreams: seed_switch's exit after its own switch was closed inside raises and leaves no switch open",
+              raised and len(r.switch_stack) == 0 and r.live == pid, True)
+
+    # A switch to a stream that does not exist raises and opens nothing
+    raised = False
+    try:
+        with r.seed_switch(n + 5):
+            _draw()
+    except ValueError:
+        raised = True
+    assert_eq(f"CP{pid}:\tstreams: a switch to a stream that does not exist raises and leaves no switch open",
+              raised and len(r.switch_stack) == 0 and r.live == pid, True)
+
+    # freeze_seed refuses every stream but the global one (rewinding a stream protocols draw from would replay their
+    # masks), and changes nothing
+    refused = 0
+    for q in range(n):
+        try:
+            r.freeze_seed(q)
+        except ValueError:
+            refused += 1
+    assert_eq(f"CP{pid}:\tstreams: freeze_seed refuses the private stream and every pairwise stream",
+              refused == n and len(r.switch_stack) == 0 and r.live == pid, True)
+
+    # Mismatched exits raise and change nothing
+    r.switch_seed(-1)
+    raised = False
+    try:
+        r.restore_seed(pid)
+    except ValueError:
+        raised = True
+    r.restore_seed(-1)
+    assert_eq(f"CP{pid}:\tstreams: a restore_seed that does not match the innermost switch raises", raised, True)
+    raised = False
+    try:
+        r.restore_seed(-1)
+    except ValueError:
+        raised = True
+    assert_eq(f"CP{pid}:\tstreams: a restore_seed without an open switch raises", raised, True)
+    raised = False
+    with r.global_stream():
+        try:
+            r.unfreeze_seed(-1)
+        except ValueError:
+            raised = True
+    assert_eq(f"CP{pid}:\tstreams: unfreeze_seed without freeze_seed raises", raised, True)
+    _check_streams(mpc, "after the raising exits")
+
+
+def test_protocols_under_shared_seed(mpc, modulus):
+    pid = mpc.pid
+    r = mpc.randomness
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+
+    # Truncation: CP0's mask comes from its private stream (replayed from where it was), so CP1, replaying the same
+    # draw on its copy of the global stream, cannot predict CP0's next private draw (the Decor review's probe)
+    vals = [1.5, -2.0, 3.25, 0.125]
+    x = Sharetensor.enc(mpc, vals, 0, modulus)
+    a = x.share.lsh_mod(MPC_NBIT_F, modulus)  # 2F fractional bits: the truncation by F gives x back
+    p0 = r.get_state()
+    with r.global_stream():
+        g0 = r.get_state()
+        t = mpc.fp.trunc(a, modulus)
+        g1 = r.get_state()
+    rv = fp_to_double(mpc.comms.reveal(t, modulus), modulus)
+    if pid:
+        assert_eq_approx(f"CP{pid}:\tstreams: a truncation under the shared seed on {alg_struct}", rv, vals, error=1e-6)
+    if pid == 0:
+        current = r.get_state()
+        r.set_state(p0)
+        a.zeros().rand_bits(MPC_NBIT_K + MPC_NBIT_F + MPC_NBIT_V)
+        want = _draw()
+        r.set_state(current)
+        actual = _draw()
+        assert_eq(f"CP0:\tstreams: the truncation's mask came from CP0's private stream on {alg_struct}", actual, want)
+        mpc.comms.send(actual, 1)
+    elif pid == 1:
+        actual = mpc.comms.receive(0, T=int)
+        current = r.get_state()
+        r.set_state(g0)
+        a.zeros().rand_bits(MPC_NBIT_K + MPC_NBIT_F + MPC_NBIT_V)
+        predicted = _draw()
+        r.set_state(current)
+        assert_eq(f"CP1:\tstreams: CP1 cannot predict CP0's private draw after a truncation under the shared seed on {alg_struct}",
+                  predicted != actual, True)
+    _check_shared_seed_run(mpc, f"a truncation on {alg_struct}", p0, g0, g1, pid > 0)
+
+    # Comparison (the field's is_positive; the ring's sign test)
+    x = Sharetensor.enc(mpc, [1.5, -2.0, 3.25, -0.125], 0, modulus)
+    p0 = r.get_state()
+    with r.global_stream():
+        g0 = r.get_state()
+        c = _gt_zero(mpc, x)
+        g1 = r.get_state()
+    rv = c.reveal(mpc)
+    if pid:
+        assert_eq(f"CP{pid}:\tstreams: a comparison under the shared seed on {alg_struct}", rv, array([1.0, 0.0, 1.0, 0.0]))
+    _check_shared_seed_run(mpc, f"a comparison on {alg_struct}", p0, g0, g1, pid > 0)
+
+    # Bit decomposition (the dealer's random bits)
+    small_modulus = MPC_SECOND_RING_SIZE if modulus.popcnt() == 1 else MPC_SECOND_FIELD_SIZE
+    bits_in = Sharetensor(mpc.comms.share_from_trusted_dealer([mpc_uint(0), mpc_uint(1), mpc_uint(7)], modulus), modulus)
+    p0 = r.get_state()
+    with r.global_stream():
+        g0 = r.get_state()
+        bits = bit_decomposition_protocol(mpc, bits_in, bitlen=MPC_MODULUS_BITS, small_modulus=small_modulus, modulus=modulus)
+        g1 = r.get_state()
+    rv = mpc.comms.reveal(bits.share.to_int(), small_modulus)
+    if pid:
+        want = [zeros_vec(MPC_MODULUS_BITS, TP=int) for _ in range(3)]
+        want[1][0] = 1
+        for i in range(3):
+            want[2][i] = 1
+        assert_eq(f"CP{pid}:\tstreams: a bit decomposition under the shared seed on {alg_struct}", rv, want)
+    _check_shared_seed_run(mpc, f"a bit decomposition on {alg_struct}", p0, g0, g1, pid > 0)
+
+    # The dealer's Gaussians (InternalMPC.dist: dti's initial weights): CP1 cannot replay them from the global stream
+    p0 = r.get_state()
+    with r.global_stream():
+        g0 = r.get_state()
+        w = InternalMPC.dist(mpc, (3, 4), 'normal', modulus, (0.0, 1.0))
+        g1 = r.get_state()
+    wv = fp_to_double(mpc.comms.reveal(w.share, modulus), modulus)
+    if pid == 1:
+        current = r.get_state()
+        r.set_state(g0)
+        replay = [[prg.gauss(0.0, 1.0) for _ in range(4)] for _ in range(3)]
+        r.set_state(current)
+        predicted = sum(1 for i in range(3) for j in range(4) if abs(replay[i][j] - wv[i][j]) < 1e-6)
+        assert_eq(f"CP1:\tstreams: CP1 cannot predict the dealer's Gaussians under the shared seed on {alg_struct} "
+                  f"({predicted} of 12)", predicted, 0)
+    _check_shared_seed_run(mpc, f"the dealer's Gaussians on {alg_struct}", p0, g0, g1, pid > 0)
+
+    # The ring normalizer on XOR-shared bits (the bitwise dealer: random ring words, bit vectors, the sign test's bits)
+    ring = MPC_RING_SIZE
+    raw = double_to_fp([0.75, 3.0, 100.0, 0.001], ring)
+    xs = mpc.comms.share_from_trusted_dealer(raw, ring)
+    p0 = r.get_state()
+    with r.global_stream():
+        g0 = r.get_state()
+        s, s_sqrt = mpc.bitwise.normalizer(xs, ring)
+        g1 = r.get_state()
+    rs = mpc.comms.reveal(s, ring)
+    if pid:
+        low, high = mpc_uint(1) << mpc_uint(MPC_NBIT_K - 2), mpc_uint(1) << mpc_uint(MPC_NBIT_K)
+        assert_eq(f"CP{pid}:\tstreams: the ring normalizer under the shared seed", [low <= raw[i] * rs[i] < high for i in range(4)],
+                  [True for _ in range(4)])
+    _check_shared_seed_run(mpc, "the ring normalizer", p0, g0, g1, pid > 0)
+
+
+def test_switches_under_shared_seed(mpc, modulus):
+    # MHE -> MPC, MPC -> MHE and a collective bootstrap inside seed_switch(-1), at the compute parties (CP0 takes no
+    # part): each party's masks come from its private stream, the bootstrap's from Lattiseq's own PRNG
+    pid = mpc.pid
+    r = mpc.randomness
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    slots = mpc.mhe.crypto_params.params.slots()
+    with r.global_stream():
+        values = random_floats((slots,), scale=1.0)
+    ct = mpc.mhe.enc_vector(values, T=ckks.Ciphertext) if pid else List[ckks.Ciphertext]()
+
+    p0 = r.get_state()
+    shares = List[mpc_uint]()
+    with r.global_stream():
+        g0 = r.get_state()
+        if pid:
+            shares = mpc.mhe.ciphervector_to_additive_share_vector(ct, slots, modulus, source_pid=1)
+        g1 = r.get_state()
+    rv = fp_to_double(mpc.comms.reveal(shares if pid else zeros_vec(slots, TP=mpc_uint), modulus), modulus)
+    if pid:
+        assert_eq_approx(f"CP{pid}:\tstreams: MHE -> MPC under the shared seed on {alg_struct}", rv, values, error=1e-3)
+    _check_shared_seed_run(mpc, f"MHE -> MPC on {alg_struct}", p0, g0, g1, False)
+
+    with r.global_stream():
+        g0 = r.get_state()
+        back = mpc.mhe.additive_share_vector_to_ciphervector(shares, modulus, True) if pid else List[ckks.Ciphertext]()
+        g1 = r.get_state()
+    if pid:
+        stats = precision_stats(mpc=mpc, result=mpc.mhe.decode(enc=mpc.mhe.decrypt(back), dtype=float), expected=values)
+        assert_eq(f"CP{pid}:\tstreams: MPC -> MHE under the shared seed on {alg_struct}", stats.min_precision.l2 > 10, True)
+    _check_shared_seed_run(mpc, f"MPC -> MHE on {alg_struct}", p0, g0, g1, False)
+
+    p0 = r.get_state()
+    with r.global_stream():
+        g0 = r.get_state()
+        if pid:
+            boot = mpc.comms.broadcast_from(ct[0], mpc.comms.hub_pid)
+            initial_level = boot.level()
+            mpc.mhe.crypto_params.evaluator.drop_level(boot, initial_level - mpc.mhe.bootstrap_min_level - 1)
+            mpc.mhe._collective_bootstrap(boot, -1)
+            stats = precision_stats(mpc=mpc, result=mpc.mhe.decode(enc=mpc.mhe.decrypt([boot], -1), dtype=float), expected=values)
+            assert_eq(f"CP{pid}:\tstreams: a collective bootstrap under the shared seed", stats.min_precision.l2 > 13 and boot.level() == initial_level, True)
+        g1 = r.get_state()
+    _check_shared_seed_run(mpc, "a collective bootstrap", p0, g0, g1, True)
+
+
+def test_model_compiled_under_shared_seed(mpc):
+    # The Decor review's trigger: an MPU model compiled under seed_switch(-1) runs MPA.rand, whose own seed_switch(-1)
+    # nests. The private streams stay where they were.
+    pid = mpc.pid
+    r = mpc.randomness
+    rows_per_party, cols = 2, 4
+    with r.global_stream():
+        X = array(random_floats(((mpc.comms.number_of_parties - 1) * rows_per_party, cols), scale=1.0))
+    partition = zeros_like(X) if pid == 0 else X[(pid - 1) * rows_per_party:pid * rows_per_party]
+    mpu_X = MPU(mpc, partition, "partition")
+    layers = (
+        Input[type(mpu_X)](cols),
+        Dense[type(mpu_X)]("relu", 3, "normal", "zeros"),
+        Dense[type(mpu_X)]("linear", 1, "normal", "zeros"))
+    p0 = r.get_state()
+    with r.global_stream():
+        g0 = r.get_state()
+        model = Sequential(layers).compile(mpc, loss="hinge", optimizer="bgd")
+        g1 = r.get_state()
+    assert_eq(f"CP{pid}:\tstreams: an MPU model compiled under the shared seed draws its weights from the global stream",
+              not _same_state(g0, g1), True)
+    assert_eq(f"CP{pid}:\tstreams: ... and leaves the private stream where it was", _draw(), _draws_from(mpc, p0, 1)[0])
+    _check_streams(mpc, "after compiling an MPU model under the shared seed")
+
+
+def test_reset_global_seed(mpc):
+    # H-04: reset_global_seed rewinds the global stream, the same at every party, and leaves the private stream alone
+    pid = mpc.pid
+    r = mpc.randomness
+    p0 = r.get_state()
+    r.reset_global_seed()
+    with r.global_stream():
+        first = [_draw() for _ in range(3)]
+    r.reset_global_seed()
+    with r.global_stream():
+        second = [_draw() for _ in range(3)]
+    everyone = mpc.comms.collect(first[0], include_trusted_dealer=True)
+    assert_eq(f"CP{pid}:\tstreams: reset_global_seed restarts the global stream", second, first)
+    assert_eq(f"CP{pid}:\tstreams: reset_global_seed restarts it the same at every party", all(e == everyone[0] for e in everyone), True)
+    assert_eq(f"CP{pid}:\tstreams: reset_global_seed leaves the private stream where it was", _draw(), _draws_from(mpc, p0, 1)[0])
+    with r.global_stream():
+        r.reset_global_seed()
+        third = _draw()
+    assert_eq(f"CP{pid}:\tstreams: reset_global_seed inside seed_switch(-1) rewinds the live global stream", third, first[0])
+    _check_streams(mpc, "after reset_global_seed")
+
+
+def test_sync_parties(mpc):
+    # M-NET-05: the barrier draws nothing, and still catches parties whose global streams differ (after the exchange,
+    # so no message is left behind). M-NET-04: without the dealer, CP0 sends nothing.
+    pid = mpc.pid
+    r = mpc.randomness
+    with r.global_stream():
+        g0 = r.get_state()
+    mpc.comms.sync_parties()
+    mpc.comms.sync_parties(lite=False)
+    with r.global_stream():
+        g1 = r.get_state()
+    assert_eq(f"CP{pid}:\tstreams: sync_parties draws nothing from the global stream", _same_state(g0, g1), True)
+
+    # A global draw made at CP1 alone fails the barrier at every party, in both modes, after the exchange
+    for lite in (True, False):
+        if pid == 1:
+            with r.global_stream():
+                _draw()  # a draw no other party makes
+        failed = False
+        try:
+            mpc.comms.sync_parties(lite=lite)
+        except AssertionError:
+            failed = True
+        caught = mpc.comms.collect(failed, include_trusted_dealer=True)
+        if pid != 1:
+            with r.global_stream():
+                _draw()  # back in step
+        mpc.comms.sync_parties()
+        assert_eq(f"CP{pid}:\tstreams: sync_parties(lite={lite}) catches a global draw made at CP1 alone, at every party",
+                  all(caught), True)
+
+    # Without the dealer: CP0 returns at once when it calls the barrier, and may skip it
+    mpc.comms.sync_parties(include_trusted_dealer=False)
+    if pid:
+        mpc.comms.sync_parties(include_trusted_dealer=False)
+    mpc.comms.sync_parties()
+    assert_parties_in_step(mpc, "sync_parties without the dealer (CP0 calling it or not), then with it")
+
+
+def test_pca_sketch(mpc):
+    # M-ML-06 and L-155: PCA's public sketch (through vectorized, sketch @ identity) is the same at every party without a
+    # reset of any stream, and has no row of zeros (64 rows of 2 entries: about 16 such rows per draw without the redraw)
+    pid = mpc.pid
+    sketch = RandomSketching.vectorized(mpc, array([[1.0, 0.0], [0.0, 1.0]]), 64)
+    flat = [sketch[i, j] for i in range(64) for j in range(2)]
+    everyone = mpc.comms.collect(flat, include_trusted_dealer=True)
+    assert_eq(f"CP{pid}:\tstreams: PCA's sketch is the same at every party", all(e == everyone[0] for e in everyone), True)
+    assert_eq(f"CP{pid}:\tstreams: PCA's sketch rows each sum to 1 (no row of zeros)",
+              all(abs(sketch[i, 0] + sketch[i, 1] - 1.0) < 1e-12 for i in range(64)), True)
+    _check_streams(mpc, "after PCA's sketch")
+
+
+def test_randomness(mpc, modulus):
+    print(f'CP{mpc.pid}:\tTesting the PRG streams ... \n')
+    with mpc.default_modulus(modulus):
+        test_nested_switches(mpc, modulus)
+        test_protocols_under_shared_seed(mpc, modulus)
+        test_switches_under_shared_seed(mpc, modulus)
+        test_model_compiled_under_shared_seed(mpc)
+        test_reset_global_seed(mpc)
+        test_sync_parties(mpc)
+        test_pca_sketch(mpc)
+    print(f'CP{mpc.pid}:\tPRG stream tests passed.\n')

@@ -49,6 +49,8 @@ $$x = x_1 + x_2 + \cdots + x_N \pmod{p}$$
 
 Shares and masks are drawn uniformly from the whole field with a cryptographically secure PRG, seeded pairwise between the parties over TLS. The shares seen by a coalition that misses at least one party (subject to the dealer caveat above) are therefore computationally indistinguishable from uniform: security rests on the PRG, not on perfect (information-theoretic) secrecy.
 
+Values a single party must keep to itself come from its private stream, seeded from the operating system's randomness: the dealer's masks and random bits (truncation, comparisons, bit decomposition, the bitwise protocols) and each compute party's MPC ↔ MHE switching masks. The HE protocols' masks (collective bootstrapping, encryption to shares) come from Lattiseq's own generators, seeded the same way. Every such draw names its stream, so it stays private when a caller runs the protocol under the global stream (`global_stream()`, which every party, CP0 included, can compute). See [the PRG streams](../api/mpc-instance.md#mpcrandomness-mpcrandomness).
+
 ## Decor and bitwise (XOR) sharing
 
 Sequre's nonlinear functions ([Nonlinear Functions](../user-guide/nonlinear-functions.md)) and its ring comparisons,

@@ -250,7 +250,7 @@ Network communication layer for MPC. Handles point-to-point messaging, collectiv
 | `broadcast_from[T]` | `(value, source_pid)` | One-to-all broadcast from a source party |
 | `send_to_all_from` | `(value, source_pid, include_trusted_dealer=False)` | Send a value from one party to all others |
 | `is_broadcast` | `(value)` | Broadcast a boolean consensus: collect, AND-reduce, and broadcast result |
-| `sync_parties` | `(lite=True, include_trusted_dealer=True)` | Barrier synchronization across all parties |
+| `sync_parties` | `(lite=True, include_trusted_dealer=True)` | Barrier across the parties. Also checks that every party's global PRG stream is at the same point: otherwise it fails ("out of sync") at every party taking part, after the exchange. Draws nothing. Without the dealer, CP0 takes no part (it returns at once, and may skip the call) |
 
 #### Dealer buffer management
 
@@ -382,14 +382,41 @@ Multiparty homomorphic encryption based on the CKKS scheme. Provides collective 
 
 _Defined in `stdlib/sequre/mpc/randomness.codon`_
 
-PRG (pseudorandom generator) stream management for MPC. Each pair of parties shares a PRG stream seeded via a secure key exchange during initialization.
+PRG (pseudorandom generator) streams. Every party has:
+
+- a **private stream** (key: its own pid), seeded from the operating system's randomness and known to it alone;
+- a **pairwise stream** with each other party `p` (key `p`), seeded with a seed the two exchange at startup;
+- the **global stream** (key `-1`), seeded with a seed CP0 broadcasts at startup and known to every party:
+  `with randomness.global_stream():` (the same as `seed_switch(-1)`).
+
+The seeds are fresh every run. One stream is live at a time, and draws (`rand`, `prg.random()`, ...) come from it.
+Outside every switch the private stream is live.
+
+**Switches nest.** Inside `with randomness.seed_switch(p):` stream `p` is live; when the block exits, the stream that
+was live before it is live again, and every stream continues from where it stopped. A switch to the stream already
+live continues it. Exits must match: `restore_seed(p)` closes the innermost switch, which must be one to `p`
+(`ValueError` otherwise, and nothing changes). Prefer the `with` form: its exit runs even when the block raises, and it
+also closes a switch left open inside the block, then raises `ValueError`, which replaces an exception the block raised.
+
+**Which stream a draw uses.** Protocols name the stream of each secret draw: the dealer's values (truncation and
+comparison masks, random bits) and each party's MPC ↔ MHE switching masks come from the party's private stream, masks
+two parties agree on from their pairwise stream, and the HE protocols' masks (collective bootstrapping, encryption to
+shares) from Lattiseq's own generators. So a protocol called inside `global_stream()` keeps its secrets private and
+draws nothing from the global stream. Draws that name no stream come from the live one: initial weights
+(`randomize_weights`, a model's `compile`), `Sharetensor.rand`, MI's imputation noise, and data you draw yourself.
+`MPA.rand` is the exception: an MPA's random data is public, so it always draws from the global stream, and so do MPU's
+default (additive) `rand` and initial weights and noise on MPA-backed data.
+Draw values every party must agree on (public data, initial weights to compare with a plaintext run) under
+`global_stream()`, making the same draws at every party, CP0 included: otherwise the global stream falls out of step,
+and `sync_parties` fails.
 
 #### Fields
 
 | Field | Type | Description |
 |---|---|---|
 | `pid` | `int` | This party's ID |
-| `prg_states` | `dict[int, tuple[array[u32], int]]` | Saved PRG states keyed by party ID |
+| `live` | `int` | The live stream's key |
+| `prg_states` | `dict[int, tuple[array[u32], int]]` | The saved state of every stream except the live one, keyed by stream (−1: global; own pid: private; other pids: pairwise) |
 | `other_seeds` | `dict[int, seed_t]` | Seeds shared with each other party |
 | `global_seed` | `seed_t` | Global seed shared via trusted dealer broadcast |
 
@@ -397,16 +424,23 @@ PRG (pseudorandom generator) stream management for MPC. Each pair of parties sha
 
 | Method | Signature | Description |
 |---|---|---|
-| `reset_streams` | `()` | Reset all PRG streams (private, shared, and global) using current seeds |
-| `reset_global_seed` | `()` | Reset the global seed stream (pid = −1) |
-| `reset_seed` | `(pid, seed)` | Re-seed and save the PRG state for a specific stream |
-| `get_state` | `()` | Get the current PRG generator state |
-| `set_state` | `(state)` | Set the PRG generator state |
-| `switch_seed` | `(pid)` | Save current private PRG state and load the shared stream for `pid` |
-| `restore_seed` | `(pid)` | Save shared stream state for `pid` and restore private PRG state |
-| `freeze_seed` | `(pid)` | Like `switch_seed`, but copies the state so the shared stream is not advanced |
-| `unfreeze_seed` | `(pid)` | Restore from the frozen shared stream state |
-| `seed_switch` | `(pid)` | Context manager: `with randomness.seed_switch(pid): ...` — switches to the shared PRG for `pid` and restores on exit |
+| `seed_switch` | `(pid)` | Context manager: `with randomness.seed_switch(pid): ...` draws from stream `pid` inside the block (switches nest) |
+| `global_stream` | `()` | Context manager: `with randomness.global_stream(): ...` draws from the global stream inside the block, for values every party draws alike (call it at every party, CP0 too). An alias of `seed_switch(-1)` |
+| `private` | `()` | Context manager: `with randomness.private(): ...` draws from this party's private stream inside the block, whatever stream is live |
+| `switch_seed` | `(pid)` | Opens a switch to stream `pid`, until the matching `restore_seed(pid)` |
+| `restore_seed` | `(pid)` | Closes the innermost switch, which must be one to `pid` (`ValueError` otherwise) |
+| `freeze_seed` | `(pid)` | Opens a switch to stream `pid`, as `switch_seed`, and remembers where the stream is. Only the global stream (`pid = -1`) can be frozen: any other `pid` raises `ValueError` (see below) |
+| `unfreeze_seed` | `(pid)` | Rewinds stream `pid` to where `freeze_seed(pid)` found it, as often as called, so that the next draws repeat the earlier ones. The innermost switch must be that `freeze_seed`'s (`ValueError` otherwise); it stays open until `restore_seed(pid)`, which keeps the draws made since the last `unfreeze_seed`. Example, the same shuffle of two lists: `freeze_seed(-1)`, `prg.shuffle(X)`, `unfreeze_seed(-1)`, `prg.shuffle(y)`, `restore_seed(-1)` |
+| `get_state` | `()` | A copy of the live stream's state |
+| `set_state` | `(state)` | Sets the live stream's state to a copy of `state` |
+| `stream_digest` | `(pid)` | A digest of where stream `pid` is (nothing is drawn): parties that drew alike from a stream they share get equal digests |
+| `reset_seed` | `(pid, seed)` | Re-seeds stream `pid`. The live stream stays where it is, unless it is `pid`'s |
+| `reset_global_seed` | `()` | Rewinds the global stream to its seed, the same at every party: to repeat shared draws, for example to run a plaintext and a secure computation from the same initial weights. No other stream changes |
+| `reset_streams` | `()` | Re-seeds every stream from the current seeds; runs at startup. No switch may be open |
+
+Rewind only the global stream (`freeze_seed`/`unfreeze_seed`, `set_state`, `reset_global_seed`). Rewinding a stream
+protocols draw from, your private stream or a pairwise one, makes the protocols reuse their masks, and two openings
+against the same mask reveal the difference of their inputs. `freeze_seed` refuses those streams.
 
 ---
 

@@ -160,9 +160,9 @@ Randomized PCA for dimensionality reduction, designed for secure distributed set
 
 | Method | Description |
 |---|---|
-| `iterative(mpc, data, miss, data_mean, top_k, oversampling)` | Build a sketch from data with missing values via random bucketing |
-| `vectorized(mpc, data, sketch_size)` | Build a sketch using random matrix multiplication |
-| `generate_sketch_matrix(shape)` | Generate a random sketching matrix (plaintext) |
+| `iterative(mpc, data, miss, data_mean, top_k, oversampling)` | Build a sketch from data with missing values via random bucketing (buckets and signs from the global stream: the same at every party) |
+| `vectorized(mpc, data, sketch_size)` | Build a sketch using random matrix multiplication (the matrix from the global stream: the same at every party) |
+| `generate_sketch_matrix(shape)` | A random sketching matrix: 0/1 entries, each row scaled to sum to 1 (a row of zeros is redrawn). It draws from the live stream: call it inside `mpc.randomness.global_stream()`, at every party (CP0 included), for a matrix every party agrees on, as `vectorized` and `random_pca_without_projection` do |
 
 #### `PowersStep`
 
@@ -417,7 +417,7 @@ from applications.siren import synthetic_image, siren_model
 
 X, y = synthetic_image(8)                     # coordinates in [-1, 1]^2, pixels in [-1, 1]
 mX, my = Sharetensor.enc(mpc, X), Sharetensor.enc(mpc, y)
-with mpc.randomness.seed_switch(-1):           # every party draws the same initial weights
+with mpc.randomness.global_stream():          # every party draws the same initial weights
     model = siren_model(mpc, type(mX), 2, 16, 30.0)             # Decor's sin
 model.fit(mpc, X=mX, y=my, step=0.01, epochs=4, momentum=0.9)
 ```
