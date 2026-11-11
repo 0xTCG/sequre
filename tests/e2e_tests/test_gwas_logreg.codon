@@ -1,0 +1,192 @@
+""" GWAS by logistic association (applications/gwas_logreg.codon): simulated genotypes, phenotypes (balanced: centred
+scores) and covariates (the shared seed); per-SNP coefficients and accuracies in the clear and on Sharetensors, both
+methods on the interval (-10, 10). Decor's coefficients agree with the plaintext Decor path's within 1e-3 (their sigmoids
+agree within about 1e-5), Chebyshev's with the plaintext Chebyshev path's within 1e-3 and with the exact (Decor) path's
+within the interpolant's error e (degree 20 on (-10, 10), computed here) carried through training: epochs * step *
+max |x| * e (each epoch's gradient sums n terms of size at most max |x| e, and the step per individual is divided by n). Each accuracy is checked against the count
+of the definition, computed here independently of the application: the plaintext model's predictions, rounded at 0.5,
+equal to the phenotype element by element (the plaintext path exactly, the secure paths up to one individual). The
+secure inputs stay intact. load_gwas_data reads files each party writes for itself (tests/data, named by its process
+id, removed afterwards):
+values, the SNP list, comma separators, a blank line and standardized covariates; unequal row counts, a header line and
+a genotype outside {0, 1, 2} raise ValueError. """
+
+import math
+
+from sequre.constants import METHOD_DECOR, METHOD_CHEBYSHEV
+from sequre.stdlib.numpy.create import array
+from sequre.types.sharetensor import Sharetensor
+from sequre.utils.testing import assert_eq
+from sequre.utils.utils import random_ints
+from sequre.stdlib.chebyshev import chebyshev_coeffs, chebyshev_nodes
+from sequre.stdlib.learn.log_reg import LogReg
+from sequre.decor import cheb2poly, poly_eval
+
+from .. import gwas_logreg, simulate_gwas_data, load_gwas_data
+
+from C import getpid() -> i32 as _getpid
+from C import unlink(cobj) -> i32 as _unlink
+
+
+INTERVAL = (-10.0, 10.0)
+
+
+def _sigmoid_interpolation_error(interval, degree: int) -> float:
+    # max |interpolant - sigmoid| on a fine grid of the interval
+    a, b = interval
+    sig = lambda v: 1.0 / (1.0 + math.exp(-v))
+    mono = cheb2poly(chebyshev_coeffs(sig, chebyshev_nodes(degree + 1, interval), interval))
+    err = 0.0
+    for i in range(2001):
+        v = a + (b - a) * float(i) / 2000.0
+        err = max(err, abs(poly_eval(mono, (2.0 * v - a - b) / (b - a)) - sig(v)))
+    return err
+
+
+def _defined_accuracies(mpc, geno, pheno, cov, w0, method: str, step: float, epochs: int) -> List[float]:
+    # The accuracy's definition, independently of the application: per SNP, a plaintext LogReg on [SNP, covariates],
+    # its predictions rounded at 0.5 compared with the phenotype element by element (n x 1 against n x 1)
+    n, snps = geno.shape[0], geno.shape[1]
+    out = List[float]()
+    for j in range(snps):
+        # rows [SNP, covariates], built by append (Sequre's list + adds element-wise)
+        rows = List[List[float]]()
+        for i in range(n):
+            row = [geno[i, j]]
+            for k in range(cov.shape[1]):
+                row.append(cov[i, k])
+            rows.append(row)
+        X = array(rows)
+        model = LogReg(w0, optimizer="bgd", variant="binary", method=method, interval=INTERVAL)
+        model.fit(mpc, X=X, y=pheno, step=step / float(n), epochs=epochs)
+        pred = model.predict(mpc, X)
+        hits = 0
+        for i in range(n):
+            hits += 1 if (1.0 if pred[i, 0] > 0.5 else 0.0) == pheno[i, 0] else 0
+        out.append(float(hits) / float(n))
+    return out
+
+
+def _fresh[TP](x: Sharetensor[TP]) -> Sharetensor[TP]:
+    # The same shares without cached Beaver partitions: what an input looks like the first time it is used (a run on
+    # inputs another run used would skip their partitions' rounds)
+    y = Sharetensor(x.share, x.modulus)
+    y.fp = x.fp
+    return y
+
+
+def _max_abs_diff(a, b) -> float:
+    m = 0.0
+    for i in range(len(a)):
+        for j in range(len(a[i])):
+            m = max(m, abs(a[i][j] - b[i][j]))
+    return m
+
+
+def test_gwas_logreg(mpc, modulus):
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    print(f'CP{mpc.pid}:\tTesting GWAS logistic association on {alg_struct} ... \n')
+
+    n_cp = mpc.comms.number_of_parties - 1
+    n, snps, covs = 16 * n_cp, 3, 2
+    with mpc.randomness.seed_switch(-1):
+        geno = array(random_ints((n, snps), upper_limit=2)).astype(float)
+        betas, pheno, cov = simulate_gwas_data(geno, covs)
+    w0 = array([[0.0] for _ in range(covs + 2)])
+    step, epochs = 1.0, 10
+
+    plain_d, plain_d_acc = gwas_logreg(mpc, geno, pheno, cov, w0, METHOD_DECOR, step, epochs, interval=INTERVAL)
+    plain_c, plain_c_acc = gwas_logreg(mpc, geno, pheno, cov, w0, METHOD_CHEBYSHEV, step, epochs, interval=INTERVAL)
+    want_d_acc = _defined_accuracies(mpc, geno, pheno, cov, w0, METHOD_DECOR, step, epochs)
+    want_c_acc = _defined_accuracies(mpc, geno, pheno, cov, w0, METHOD_CHEBYSHEV, step, epochs)
+    sg = Sharetensor.enc(mpc, geno, 0, modulus)
+    sp = Sharetensor.enc(mpc, pheno, 0, modulus)
+    sc = Sharetensor.enc(mpc, cov, 0, modulus)
+    sw = Sharetensor.enc(mpc, w0, 0, modulus)
+    r0, b0 = mpc.stats.rounds, mpc.stats.bytes_sent
+    sec_d, sec_d_acc = gwas_logreg(mpc, _fresh(sg), _fresh(sp), _fresh(sc), _fresh(sw), METHOD_DECOR, step, epochs, interval=INTERVAL)
+    r1, b1 = mpc.stats.rounds, mpc.stats.bytes_sent
+    sec_c, sec_c_acc = gwas_logreg(mpc, _fresh(sg), _fresh(sp), _fresh(sc), _fresh(sw), METHOD_CHEBYSHEV, step, epochs, interval=INTERVAL)
+    r2, b2 = mpc.stats.rounds, mpc.stats.bytes_sent
+    # The default method: Decor on the ring, Chebyshev on the field (LogReg's binary default). The rounds and bytes tell
+    # which method ran (they depend on the protocol and on the Beaver partitions an input has cached, not on the data:
+    # every run takes fresh inputs); the betas and accuracies match that method's secure run
+    sec_a, sec_a_acc = gwas_logreg(mpc, _fresh(sg), _fresh(sp), _fresh(sc), _fresh(sw), step=step, epochs=epochs, interval=INTERVAL)
+    r3, b3 = mpc.stats.rounds, mpc.stats.bytes_sent
+    ring = modulus.popcnt() == 1
+    cost_d, cost_c, cost_a = (r1 - r0, b1 - b0), (r2 - r1, b2 - b1), (r3 - r2, b3 - b2)
+    assert_eq(f"CP{mpc.pid}:\tGWAS logistic default method on {alg_struct}: rounds and bytes {cost_a} = {'Decor' if ring else 'Chebyshev'}'s ({cost_d if ring else cost_c}), not the other's",
+              cost_a == (cost_d if ring else cost_c) and cost_d != cost_c, True)
+    drift = max(_max_abs_diff(sg.reveal(mpc).tolist(), geno.tolist()), _max_abs_diff(sp.reveal(mpc).tolist(), pheno.tolist()),
+                _max_abs_diff(sc.reveal(mpc).tolist(), cov.tolist()), _max_abs_diff(sw.reveal(mpc).tolist(), w0.tolist()))
+    max_x = 1.0
+    cases = 0.0
+    for i in range(n):
+        max_x = max(max_x, abs(geno[i, 0]), abs(geno[i, 1]), abs(geno[i, 2]), abs(cov[i, 0]), abs(cov[i, 1]))
+        cases += pheno[i, 0]
+    cheb_bound = float(epochs) * step * max_x * _sigmoid_interpolation_error(INTERVAL, 20)
+
+    if mpc.pid:
+        one = 1.0 / float(n) + 1e-9
+        for j in range(snps):
+            assert_eq(f"CP{mpc.pid}:\tGWAS logistic SNP {j} (Decor) on {alg_struct}: beta {sec_d[j]:.5f} = plaintext {plain_d[j]:.5f} within 1e-3", abs(sec_d[j] - plain_d[j]) < 1e-3, True)
+            assert_eq(f"CP{mpc.pid}:\tGWAS logistic SNP {j} (Chebyshev) on {alg_struct}: beta {sec_c[j]:.5f} = plaintext {plain_c[j]:.5f} within 1e-3, exact {plain_d[j]:.5f} within {cheb_bound:.3f}", abs(sec_c[j] - plain_c[j]) < 1e-3 and abs(sec_c[j] - plain_d[j]) < cheb_bound, True)
+            assert_eq(f"CP{mpc.pid}:\tGWAS logistic SNP {j} on {alg_struct}: accuracies = the definition's count (plaintext {plain_d_acc[j]:.3f} = {want_d_acc[j]:.3f}, {plain_c_acc[j]:.3f} = {want_c_acc[j]:.3f}; secure {sec_d_acc[j]:.3f}, {sec_c_acc[j]:.3f}; {cases:.0f} cases of {n})",
+                      abs(plain_d_acc[j] - want_d_acc[j]) < 1e-9 and abs(plain_c_acc[j] - want_c_acc[j]) < 1e-9 and abs(sec_d_acc[j] - want_d_acc[j]) <= one and abs(sec_c_acc[j] - want_c_acc[j]) <= one, True)
+        for j in range(snps):
+            want_a = sec_d[j] if ring else sec_c[j]
+            want_acc = sec_d_acc[j] if ring else sec_c_acc[j]
+            assert_eq(f"CP{mpc.pid}:\tGWAS logistic SNP {j}, default method ({'Decor' if ring else 'Chebyshev'}) on {alg_struct}: beta {sec_a[j]:.6f} = that method's secure {want_a:.6f} within 1e-4, accuracy {sec_a_acc[j]:.3f} = {want_acc:.3f} within one individual",
+                      abs(sec_a[j] - want_a) < 1e-4 and abs(sec_a_acc[j] - want_acc) <= one, True)
+        assert_eq(f"CP{mpc.pid}:\tGWAS logistic association on {alg_struct}: inputs intact ({drift:.1e})", drift < 1e-9, True)
+
+    _test_loader(mpc)
+
+    print(f'CP{mpc.pid}:\tGWAS logistic association on {alg_struct} tests passed.\n')
+
+
+def _write(path: str, text: str):
+    with open(path, "w") as f:
+        f.write(text)
+
+
+def _test_loader(mpc):
+    # Each party writes its own files (no communication), loads them, and removes them
+    base = f"tests/data/gwas_logreg_{int(_getpid())}_"
+    paths = [base + name for name in ["geno.txt", "pheno.txt", "cov.txt", "snps.txt", "short_cov.txt", "header.txt", "missing.txt"]]
+    _write(paths[0], "0 1 2\n1,1,0\n\n2 0 1\n")
+    _write(paths[1], "1\n0\n1\n")
+    _write(paths[2], "0.5 -1.0\n1.5 2.0\n-0.25 0.75\n")
+    _write(paths[3], "2\n0\n")
+    _write(paths[4], "0.5 -1.0\n1.5 2.0\n")
+    _write(paths[5], "a b\n0.5 -1.0\n1.5 2.0\n-0.25 0.75\n")
+    _write(paths[6], "0 1 2\n1,-1,0\n2 0 1\n")
+    values_ok, short_raised, header_raised, missing_raised, std_ok = False, False, False, False, True
+    try:
+        geno, pheno, cov = load_gwas_data(paths[0], paths[1], paths[2], snp_list_path=paths[3])
+        values_ok = geno.tolist() == [[2.0, 0.0], [0.0, 1.0], [1.0, 2.0]] and pheno.tolist() == [[1.0], [0.0], [1.0]] and cov.tolist() == [[0.5, -1.0], [1.5, 2.0], [-0.25, 0.75]]
+        try:
+            load_gwas_data(paths[0], paths[1], paths[4])
+        except ValueError:
+            short_raised = True
+        try:
+            load_gwas_data(paths[0], paths[1], paths[5])
+        except ValueError:
+            header_raised = True
+        try:
+            load_gwas_data(paths[6], paths[1], paths[2])
+        except ValueError:
+            missing_raised = True
+        _, _, std = load_gwas_data(paths[0], paths[1], paths[2], standardize_covariates=True)
+        for k in range(2):
+            mean, square = 0.0, 0.0
+            for i in range(3):
+                mean += std[i, k]
+                square += std[i, k] * std[i, k]
+            std_ok = std_ok and abs(mean / 3.0) < 1e-12 and abs(square / 3.0 - 1.0) < 1e-12
+    finally:
+        for path in paths:
+            _unlink(path.c_str())
+    assert_eq(f"CP{mpc.pid}:\tload_gwas_data reads values, the SNP list, commas and blank lines", values_ok, True)
+    assert_eq(f"CP{mpc.pid}:\tload_gwas_data refuses unequal row counts, a header line and a missing genotype", short_raised and header_raised and missing_raised, True)
+    assert_eq(f"CP{mpc.pid}:\tload_gwas_data standardizes the covariates (mean 0, variance 1)", std_ok, True)

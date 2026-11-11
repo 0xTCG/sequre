@@ -25,6 +25,7 @@ _Defined in `stdlib/sequre/mpc/env.codon`_
 | `arithmetic` | `MPCArithmetic[TP]` | Beaver-triple multiplication and partitioning |
 | `polynomial` | `MPCPolynomial[TP]` | Lagrange interpolation, polynomial evaluation |
 | `boolean` | `MPCBoolean[TP]` | Bit decomposition, boolean circuits |
+| `bitwise` | `MPCBitwise[TP]` | XOR-shared (bitwise) protocols: carries, the ring sign test and normalizer |
 | `fp` | `MPCFP[TP]` | Fixed-point truncation and normalization |
 | `mhe` | `MPCMHE[TP]` | Multiparty homomorphic encryption (CKKS) |
 
@@ -34,6 +35,9 @@ _Defined in `stdlib/sequre/mpc/env.codon`_
 |---|---|
 | `council(value)` | Collect boolean votes from all parties. Returns `list[bool]`. Used to check and communicate certain properties between parties (e.g., if a variable is CKKS encrypted at each parties). |
 | `done()` | Synchronize parties and close all connections |
+
+The context managers (`allow_mpc_switch`, `default_modulus`, `default_encoding`, `delayed_truncation`, `detach_dealer`,
+`stats_log`) are described under [Context managers](#context-managers).
 
 ## Initialization
 
@@ -98,8 +102,6 @@ Beaver-triple based secure arithmetic over secret-shared values.
 | `beaver_inner_prod_pair` | `(ar, am, br, bm, modulus)` | Pairwise inner product on pre-partitioned Beaver shares |
 | `multiply_bulk` | `(a, b, modulus)` | Batch element-wise multiplication over a list of matrices |
 | `multiply_mat_bulk` | `(a, b, modulus)` | Batch matrix multiplication over a list of matrices |
-| `ring_to_field` | `(target)` | Convert a secret-shared value from ring modulus to field modulus |
-| `field_to_ring` | `(target)` | Convert a secret-shared value from field modulus to ring modulus |
 | `validate_partitions` | `(x, x_r, r, modulus, message)` | Debug utility: assert that Beaver partitions are correct |
 | `reset_stats` | `()` | Reset arithmetic operation counters |
 | `print_stats` | `(file_stream=None)` | Print arithmetic stats (partitions, reconstructions) |
@@ -123,7 +125,7 @@ Boolean circuits and comparison protocols over secret-shared values. Implements 
 | `fan_in_and` | `(a, modulus)` | Compute AND reduction (via De Morgan + `fan_in_or`) |
 | `prefix_and` | `(a, modulus)` | Compute prefix-AND (via De Morgan + `prefix_or`) |
 | `flip_bit` | `(a, modulus)` | Negate shared bits: $1 - a$ |
-| `is_positive` | `(a, modulus)` | Test whether a secret-shared value is positive. Returns shared bit |
+| `is_positive` | `(a, modulus)` | $[a > 0]$ as a shared bit. On the ring: the sign test over the modulus' bits (`mpc.bitwise.sign_ring`); on the field: the field protocol |
 | `less_than_bits_public` | `(a, b_pub, modulus)` | Bitwise comparison $a < b$ where `b` is public |
 | `less_than_bits` | `(a, b, modulus)` | Bitwise comparison $a < b$ where both are secret-shared |
 | `less_than_public` | `(a, bpub, modulus)` | Comparison $a < b$ where `b` is public. Works on scalars, 1D, and 2D inputs |
@@ -134,6 +136,29 @@ Boolean circuits and comparison protocols over secret-shared values. Implements 
 | `greater_than` | `(a, b, modulus)` | Comparison $a > b$ on secret-shared values |
 | `not_greater_than` | `(a, b, modulus)` | Comparison $a \leq b$ on secret-shared values |
 | `not_greater_than_public` | `(a, bpub, modulus)` | Comparison $a \leq b$ where `b` is public |
+
+---
+
+### `mpc.bitwise` — `MPCBitwise[TP]`
+
+_Defined in `stdlib/sequre/mpc/bitwise.codon`_
+
+Bitwise (XOR) secret sharing. The compute parties hold registers whose XOR is the secret, packed so that one machine
+instruction covers `PACKING_SIZE` secret bits. The dealer (CP0) supplies the masks through the pairwise PRG streams, as
+for the arithmetic Beaver partitions. On top of the bit operations sit a carry computation of logarithmic depth, a sign
+test for ring shares and a normalizer for ring shares. Comparisons, division and square root on the ring, and Decor's
+carry, use them.
+
+| Method | Signature | Description |
+|---|---|---|
+| `share_from` | `(data, source_pid)` | XOR-share data held by `source_pid` among the compute parties |
+| `share_from_trusted_dealer` | `(data)` | XOR-share the dealer's data |
+| `reveal` | `(value)` | Open XOR shares to the compute parties |
+| `land`, `lor`, `lor_public` | `(a, b)` | AND (two rounds: each operand is partitioned in its own opening; the carry and prefix circuits partition both in one), OR (the same), OR with a public operand (local) |
+| `carry_out_public` | `(a_pub, b, num_bits)` | The carry out of adding a public value and an XOR-shared one ($\log_2$ depth) |
+| `carry_out_public_arithmetic` | `(a_pub, b, num_bits, modulus)` | The same carry, returned as arithmetic shares |
+| `sign_ring` | `(a, modulus, bits)` | $[a > 0]$ for ring shares whose value lies in $(-2^{bits - 1}, 2^{bits - 1})$ |
+| `normalizer` | `(x, modulus)` | $(4^i, 2^i)$ with $x \cdot 4^i \in [2^{K-2}, 2^K)$: scales a positive ring value into $[1/4, 1)$ for division and square root |
 
 ---
 
@@ -148,6 +173,9 @@ Fixed-point arithmetic protocols for secret-shared values.
 | `trunc` | `(a, modulus, k=MPC_NBIT_K+MPC_NBIT_F, m=MPC_NBIT_F)` | Fixed-point truncation. Divides by $2^m$ under the secret-sharing. Supports both power-of-two and prime moduli |
 | `reset_stats` | `()` | Reset truncation counters |
 | `print_stats` | `(file_stream=None)` | Print fixed-point stats (truncation count) |
+| `weighted_sum` | `(shares, weights, modulus, k, m)` | $\sum_i w_i \cdot \text{shares}_i$ for public float weights, with one truncation |
+| `truncation_allowed` | `()` | `False` inside `mpc.delayed_truncation()` |
+| `require_truncation` | `(caller)` | Raise `ValueError` at every party when called inside `mpc.delayed_truncation()` (division, square root and Decor call it) |
 
 ---
 
@@ -488,6 +516,31 @@ Temporarily switch the default ciphertensor encoding string. Restores the origin
 ```python
 with mpc.default_encoding("diagonal"):
     ...
+```
+
+### `mpc.delayed_truncation()`
+
+Suspends fixed-point truncation for the block: `mpc.fp.trunc` returns its input, and products keep scale $2^{2F}$.
+Truncate the result once after the block. For a sum of single fixed-point products this saves an opening per product,
+and it is valid while the untruncated sum stays below the truncation bound ($2^{K+F}$ by default). Protocols whose own
+truncations cannot be deferred (division, square root, Decor's nonlinear functions, Chebyshev's recurrence) raise
+`ValueError` inside the block, at every party before any round. Scopes nest; nothing is truncated on exit.
+
+```python
+with mpc.delayed_truncation():
+    acc = a * b + c * d          # scale 2^(2F): no truncation yet
+acc.itrunc(mpc)                  # one truncation for the whole sum (in place)
+```
+
+### `mpc.detach_dealer()`
+
+Buffers the dealer's (CP0's) sends while the block runs and flushes them when the outermost block exits, so that a
+benchmark can time the online phase without the dealer's traffic. A measurement aid only: the dealer must not receive
+inside the block (`MPCComms` raises if it does), and the buffer holds the whole block's traffic in memory. Blocks nest.
+
+```python
+with mpc.detach_dealer():
+    y = sigmoid(mpc, x)          # CP0's masks are buffered, then sent at the end of the block
 ```
 
 ### `mpc.stats_log(msg, file_path, mode, file_only)`

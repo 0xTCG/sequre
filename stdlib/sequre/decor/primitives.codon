@@ -1,0 +1,183 @@
+"""
+Sharetensor-level primitives of Decor: comparisons over a reduced ring and division.
+
+On a ring (2^L) they run the bitwise protocols of mpc/bitwise.codon. On the field they fall back to Sequre's field
+protocols (comparison through is_positive, division through fp_div), which the field's shares need.
+"""
+
+import secure_operator
+
+from sequre.attributes import sequre
+from sequre.constants import (
+    MPC_NBIT_K, MPC_NBIT_F, MPC_DECOR_MODULUS_BITS,
+    DECOR_NEWTON_METHOD, DECOR_GOLDSCHMIDT_METHOD, DECOR_DIV_DEFAULT_METHOD, DECOR_DIV_DEFAULT_NITER)
+from sequre.types.sharetensor import Sharetensor
+from sequre.types.utils import double_to_fp
+from sequre.stdlib.fp import fp_div, fp_mul_inv
+
+
+def ring_gt(mpc, x, y, bits: Static[int]):
+    """
+    [x > y] as a Sharetensor of 0/1 integers (strict, as Sequre's field comparison: 0 at x == y), from the sign of
+    x - y over the ring of its low `bits` bits. x is a Sharetensor, y a Sharetensor or a public int or float. Operands
+    are compared at one scale: a float y, or a fixed-point operand on the other side, puts a non-fixed-point x in fixed
+    point first (as Sequre's generic comparison does).
+
+    Valid while |x - y| < 2^(bits - 1) in raw units: bits = MPC_NBIT_F + 1 for operands in [0, 1) (Decor's decor_gt),
+    MPC_NBIT_K + 1 for any two fixed-point values, MPC_MODULUS_BITS for any two ring elements whose difference does not
+    wrap. Costs 2 + log2(bits) rounds. On the field it is the field comparison (bits is ignored).
+    """
+    if x.modulus.popcnt() != 1:
+        return secure_operator.gt(mpc, x, y)
+
+    # public operands (each party holds the whole value) as sharings held by the hub: the sign test counts them once
+    xs = _hub_held(mpc, x)
+    if isinstance(y, Sharetensor):
+        ys = _hub_held(mpc, y)
+        if xs.is_fp() != ys.is_fp():
+            diff = secure_operator.sub(mpc, xs.to_fp(), ys.to_fp())
+        else:
+            diff = secure_operator.sub(mpc, xs, ys)
+    elif isinstance(y, float):
+        diff = secure_operator.sub(mpc, xs.to_fp(), y)
+    elif isinstance(y, int):
+        diff = secure_operator.sub(mpc, xs, y)
+    else:
+        compile_error("ring_gt: y must be a Sharetensor, an int or a float")
+
+    return Sharetensor(mpc.bitwise.sign_ring(diff.share, diff.modulus, bits=bits), x.modulus)
+
+
+def decor_gt(mpc, x, y):
+    """ ring_gt over MPC_NBIT_F + 1 bits: for operands in [0, 1) (Decor's wraparound select), |x - y| < 1. """
+    return ring_gt(mpc, x, y, bits=MPC_DECOR_MODULUS_BITS)
+
+
+def _hub_held(mpc, x):
+    # A public Sharetensor holds its whole value at every party (as after publish): as a protocol's input it becomes a
+    # sharing held by CP1 (zeros elsewhere), so the protocol counts it once. Anything else is returned as it is.
+    if not x.public:
+        return x
+    sv = Sharetensor(x.share if mpc.pid == 1 else x.share.zeros(), x.modulus)
+    sv.fp = x.fp
+    return sv
+
+
+def _goldschmidt(mpc, estimate, err, niter: int):
+    # inv <- inv * (1 + err) and err <- err^2, niter times. The two products of an iteration are independent: one
+    # Beaver partition round for both operands and one truncation round for both products. (1 + err)'s partition is
+    # err's, shifted by the public 1. Every party, CP0 included, runs the same calls.
+    modulus = estimate.modulus
+    one = double_to_fp(1.0, modulus)
+    inv_share = estimate.share
+    err_share = err.share
+    n = len(inv_share)
+
+    for _ in range(niter):
+        operands = inv_share.copy()
+        operands.extend(err_share)
+        x_r, r = mpc.arithmetic.__beaver_partition(operands, modulus)
+        inv_x_r, err_x_r = x_r[:n], x_r[n:]
+        inv_r, err_r = r[:n], r[n:]
+        err_1_x_r = err_x_r.add_mod(one, modulus)
+
+        products = mpc.arithmetic.__beaver_mul(inv_x_r, inv_r, err_1_x_r, err_r, modulus)
+        products.extend(mpc.arithmetic.__beaver_mul(err_x_r, err_r, err_x_r, err_r, modulus))
+        products = mpc.fp.trunc(mpc.arithmetic.__beaver_reconstruct(products, modulus), modulus)
+        inv_share, err_share = products[:n], products[n:]
+
+    inv = Sharetensor(inv_share, modulus)
+    inv.fp = True
+    return inv
+
+
+@sequre
+def _ring_mul_inv(mpc, b, niter: int, sign_check: bool, method: Static[str]):
+    modulus = b.modulus
+
+    if sign_check:
+        sign = ring_gt(mpc, b, 0, bits=MPC_NBIT_K + 1) * 2 - 1
+        b = b * sign
+
+    # s = 4^i with |B| * s in [2^(K - 2), 2^K) (raw units): b * s scaled down by K - F bits lies in [1/4, 1).
+    s_share, _ = mpc.bitwise.normalizer(b.share, modulus)
+    s = Sharetensor(s_share, modulus)
+
+    b_scaled = b * s
+    b_scaled.share = mpc.fp.trunc(b_scaled.share, modulus, MPC_NBIT_K, MPC_NBIT_K - MPC_NBIT_F)
+
+    # Initial estimate of 1 / b_scaled on [1/4, 1): relative error at most 0.107
+    estimate = b_scaled * b_scaled * 5 - b_scaled * 10 + 5.9430
+
+    if method == DECOR_NEWTON_METHOD:
+        # Self-correcting; two dependent products per iteration
+        inv = estimate
+        for _ in range(niter):
+            inv = inv * (2 - b_scaled * inv)
+    elif method == DECOR_GOLDSCHMIDT_METHOD:
+        # Two independent products per iteration, batched into one partition and one truncation round
+        inv = _goldschmidt(mpc, estimate, 1 - b_scaled * estimate, niter)
+    else:
+        compile_error("decor_mul_inv: unknown method " + method)
+
+    # 1 / b = inv * s / 2^(K - F); inv <= 4 + error and s <= 2^(K - 2), so the product stays below 2^(K + F + 2)
+    res = inv * s
+    res.share = mpc.fp.trunc(res.share, modulus, MPC_NBIT_K + MPC_NBIT_F + 2, MPC_NBIT_K - MPC_NBIT_F)
+
+    if sign_check:
+        res = res * sign
+
+    return res
+
+
+def decor_mul_inv(mpc, b, niter: int = DECOR_DIV_DEFAULT_NITER, sign_check: bool = True,
+                  method: Static[str] = DECOR_DIV_DEFAULT_METHOD):
+    """
+    1 / b for a Sharetensor b (made fixed point if it is not).
+
+    Ring: |b| through the K + 1-bit sign test (skipped when sign_check is False, for divisors known to be positive),
+    scaled into [1/4, 1) by the ring normalizer, then `niter` Goldschmidt (default) or Newton iterations from a
+    quadratic estimate (error at most 0.107, squared by each iteration). The default niter reaches full precision
+    (4 at F = 32, 5 at F = 64). Admissible divisors: 2^-(F - 12) <= |b| <= 2^(K - F - 2); b = 0 gives 0.
+    Precision: the result carries an absolute error of a few units of 2^-F (measured at F = 32: within 3 units, and
+    within 3 units relative to 1/b for |b| <= 1), so the relative error grows with |b| (about |b| * 2^-F for large
+    divisors). Small divisors lose relative precision in their own fixed-point encoding (b = 2^-20 holds 12 bits).
+    Field: Sequre's field division (fp_mul_inv); niter, sign_check and method are ignored there.
+    Refuses to run inside MPCEnv.delayed_truncation().
+    """
+    mpc.fp.require_truncation("decor_mul_inv")
+    b_held = _hub_held(mpc, b)
+    b_fp = b_held if b_held.is_fp() else b_held.to_fp()
+    if b_fp.modulus.popcnt() != 1:
+        return fp_mul_inv(mpc, b_fp)
+
+    return _ring_mul_inv(mpc, b_fp, niter, sign_check, method=method)
+
+
+@sequre
+def _scalar_div(mpc, x, y: float):
+    return x * (1.0 / y)
+
+
+@sequre
+def _times(mpc, x, y):
+    return x * y
+
+
+def decor_div(mpc, x, y, niter: int = DECOR_DIV_DEFAULT_NITER, sign_check: bool = True,
+              method: Static[str] = DECOR_DIV_DEFAULT_METHOD):
+    """
+    x / y for a Sharetensor x and a Sharetensor or public int/float y. A public divisor costs one product with 1/y
+    and its truncation (a local shift if x is public). A secret one is decor_mul_inv(y) * x on the ring (absolute error
+    about (|x| + 2) units of 2^-F for |y| > 1, a few units relative to x / y for |y| <= 1) and Sequre's fp_div on the
+    field. A secret divisor refuses to run inside MPCEnv.delayed_truncation().
+    """
+    if isinstance(y, float) or isinstance(y, int):
+        return _scalar_div(mpc, x, float(y))
+
+    mpc.fp.require_truncation("decor_div")
+    if y.modulus.popcnt() != 1:
+        y_held = _hub_held(mpc, y)
+        return fp_div(mpc, x, y_held if y_held.is_fp() else y_held.to_fp())
+
+    return _times(mpc, decor_mul_inv(mpc, y, niter, sign_check, method=method), x)

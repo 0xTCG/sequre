@@ -1,0 +1,160 @@
+""" SIREN (applications/siren.codon): the synthetic 8 x 8 image, a plaintext (ndarray) and a Sharetensor model from the
+same initial weights (the secure model's, copied into the plaintext one). Decor and Chebyshev on the default interval
+(the degree siren_model picks) on the run's modulus; Chebyshev on the reduced interval (modulo_float) on the ring only
+(the field refuses it when the model is built).
+
+- Accuracy, before training: the secure first sine layer's outputs against sin(omega (x W + b)) in double from the same
+  weights. The sensitivity is 1, so the tolerance is the activation's own bound: trig_error_bound(max |argument|) for
+  Decor, times 1.27 for the scale fused into its opening (via_decor_sincos); for Chebyshev SIREN_SIN_TOLERANCE, Clenshaw's
+  fixed-point error (degree + 1)(degree + 2) ULP and the interval mapping's ((b - a) / 2 times (max |argument| + 1) ULP:
+  2 / (b - a) encoded at F bits, the interpolant's slope in the mapped variable at most (b - a) / 2), plus the
+  reduction's error on the reduced interval; plus omega times the encodings' and the affine product's error, and the
+  double reference's rounding. A wrong degree choice fails it (degree 20 on (-90, 90) is off by 2).
+- Training, 4 epochs: the trained first-layer weights agree within the activation error between the two paths plus a
+  floor of 256 ULP for the updates' truncations: the weights move by at most an activation error at SIREN's
+  initialization (measured 0.005 to 0.035 times it). The losses agree within 8 times a first-layer change: the output
+  moves by at most 3.2 times one (omega sum |W2| <= sqrt(6 n), sum |W3| <= sqrt(6 n) / omega), the loss by at most twice
+  the output.
+- The loss falls; a plaintext fit of 100 epochs at the documented step gets below 1e-3; the inputs stay intact. """
+
+import math
+import internal.static as static
+
+from sequre.constants import METHOD_DECOR, METHOD_CHEBYSHEV, MPC_NBIT_F
+from sequre.types.sharetensor import Sharetensor
+from sequre.utils.testing import assert_eq
+from sequre.decor import trig_error_bound
+
+from .. import synthetic_image, siren_model, chebyshev_sin_error, SIREN_SIN_TOLERANCE
+
+
+SIDE = 8
+NEURONS = 16
+OMEGA = 30.0
+STEP = 0.01
+EPOCHS = 4
+MOMENTUM = 0.9
+LONG_EPOCHS = 100
+ULP = 2.0 ** -float(MPC_NBIT_F)
+FLOOR = 256.0 * ULP
+
+
+def _max_abs_diff(a, b) -> float:
+    m = 0.0
+    for i in range(len(a)):
+        for j in range(len(a[i])):
+            m = max(m, abs(a[i][j] - b[i][j]))
+    return m
+
+
+def _copy_initial_weights(mpc, src, dst):
+    # dst (the plaintext model) takes src's (the Sharetensor model's) initial weights and biases, revealed (CP0 gets
+    # zeros; it checks nothing). Every party drew them in the clear under the shared seed (Sharetensor.rand).
+    for i in static.range(1, static.len(src.layers)):
+        dst.layers[i].weights = src.layers[i].weights.reveal(mpc)
+        dst.layers[i].bias = src.layers[i].bias.reveal(mpc)
+
+
+def _first_layer_exact(model, X) -> Tuple[List[List[float]], float]:
+    # sin(omega (x W + b)) in double from the model's first-layer weights, and the largest |argument|
+    W = model.layers[1].weights
+    b = model.layers[1].bias
+    out = List[List[float]]()
+    zmax = 0.0
+    for i in range(X.shape[0]):
+        row = List[float]()
+        for k in range(W.shape[1]):
+            z = b[0, k]
+            for j in range(X.shape[1]):
+                z += X[i, j] * W[j, k]
+            z *= OMEGA
+            zmax = max(zmax, abs(z))
+            row.append(math.sin(z))
+        out.append(row)
+    return out, zmax
+
+
+def _errors(mpc, method: str, reduce: bool, degree: int, interval: Tuple[float, float], zmax: float) -> Tuple[float, float]:
+    # (the forward tolerance against sin, the activation error between the two paths)
+    encoding = OMEGA * 8.0 * ULP  # x, W and b encoded, the affine product truncated, times omega (|x| <= 1)
+    reference = (4.0 * zmax + 1.0) * 2.0 ** -52.0  # the double computation of sin(omega (x W + b))
+    if method == METHOD_DECOR:
+        e = 1.27 * trig_error_bound(zmax)
+        return e + encoding + reference, e
+    clenshaw = float((degree + 1) * (degree + 2)) * ULP
+    if not reduce:
+        mapping = 0.5 * (interval[1] - interval[0]) * (zmax + 1.0) * ULP
+        return SIREN_SIN_TOLERANCE + clenshaw + mapping + encoding + reference, clenshaw + mapping
+    n_cp = mpc.comms.number_of_parties - 1
+    reduced = (-math.pi, float(2 * n_cp + 1) * math.pi)
+    reduction = 2.0 * math.pi * zmax * ULP + 4.0 * ULP  # modulo_float's encoded 1 / (2 pi)
+    mapping = 0.5 * (reduced[1] - reduced[0]) * (reduced[1] + 1.0) * ULP
+    interpolation = chebyshev_sin_error(reduced, degree)
+    return (SIREN_SIN_TOLERANCE + clenshaw + mapping + reduction + encoding + reference,
+            clenshaw + mapping + 2.0 * interpolation + reduction)
+
+
+def _check(mpc, alg_struct: str, label: str, method: str, reduce: bool, modulus):
+    X, y = synthetic_image(SIDE)
+    mX = Sharetensor.enc(mpc, X, 0, modulus)
+    my = Sharetensor.enc(mpc, y, 0, modulus)
+    with mpc.randomness.seed_switch(-1):
+        sec = siren_model(mpc, type(mX), 2, NEURONS, OMEGA, method, reduce_interval=reduce, modulus=modulus)
+    raw = siren_model(mpc, type(X), 2, NEURONS, OMEGA, method, reduce_interval=reduce)
+    _copy_initial_weights(mpc, sec, raw)
+
+    # Accuracy: the secure first sine layer against sin, before training
+    exact, zmax = _first_layer_exact(raw, X)
+    sec.layers[1].evaluate(mpc, mX)
+    first = sec.layers[1].output.reveal(mpc).tolist()
+    fwd_tol, e_act = _errors(mpc, method, reduce, sec.layers[1].activation_degree, sec.layers[1].activation_interval, zmax)
+    degree_note = f", degree {sec.layers[1].activation_degree}" if method == METHOD_CHEBYSHEV else ""
+    tol_w = e_act + FLOOR
+    tol_loss = 8.0 * (e_act + OMEGA * 2.0 * tol_w)
+
+    # Training
+    loss0 = raw.get_loss(mpc, X, y).sum()
+    raw.fit(mpc, X=X, y=y, step=STEP, epochs=EPOCHS, momentum=MOMENTUM)
+    loss1 = raw.get_loss(mpc, X, y).sum()
+    sec.fit(mpc, X=mX, y=my, step=STEP, epochs=EPOCHS, momentum=MOMENTUM)
+    sec_loss = sec.get_loss(mpc, mX, my).sum(axis=0).reveal(mpc).tolist()[0]
+    diff = _max_abs_diff(raw.layers[1].weights.tolist(), sec.layers[1].weights.reveal(mpc).tolist())
+    drift = max(_max_abs_diff(mX.reveal(mpc).tolist(), X.tolist()), _max_abs_diff(my.reveal(mpc).tolist(), y.tolist()))
+
+    if mpc.pid:
+        fwd = _max_abs_diff(first, exact)
+        assert_eq(f"CP{mpc.pid}:\tSIREN ({label}) on {alg_struct}: first sine layer = sin within {fwd_tol:.1e} (max diff {fwd:.2e}{degree_note}, |argument| <= {zmax:.1f})", fwd < fwd_tol, True)
+        assert_eq(f"CP{mpc.pid}:\tSIREN ({label}) on {alg_struct}: the loss falls ({loss0:.4f} -> {loss1:.4f})", loss1 < loss0, True)
+        assert_eq(f"CP{mpc.pid}:\tSIREN ({label}) on {alg_struct}: trained weights within {tol_w:.1e} (max diff {diff:.2e}), secure loss {sec_loss:.8f} = plaintext {loss1:.8f} within {tol_loss:.1e}",
+                  diff < tol_w and abs(sec_loss - loss1) < tol_loss, True)
+        assert_eq(f"CP{mpc.pid}:\tSIREN ({label}) on {alg_struct}: inputs intact ({drift:.1e})", drift < 1e-9, True)
+
+
+def test_siren(mpc, modulus):
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    print(f'CP{mpc.pid}:\tTesting SIREN on {alg_struct} ... \n')
+
+    _check(mpc, alg_struct, "Decor", METHOD_DECOR, False, modulus)
+    _check(mpc, alg_struct, "Chebyshev, default interval", METHOD_CHEBYSHEV, False, modulus)
+    if modulus.popcnt() == 1:
+        _check(mpc, alg_struct, "Chebyshev, reduced interval", METHOD_CHEBYSHEV, True, modulus)
+    else:
+        X, y = synthetic_image(SIDE)
+        mX = Sharetensor.enc(mpc, X, 0, modulus)
+        raised = False
+        try:
+            siren_model(mpc, type(mX), 2, NEURONS, OMEGA, METHOD_CHEBYSHEV, reduce_interval=True, modulus=modulus)
+        except ValueError:
+            raised = True
+        assert_eq(f"CP{mpc.pid}:\tSIREN with the reduced interval refused on the field (when the model is built)", raised, True)
+
+    # The documented step trains (in the clear): 100 epochs get the loss below 1e-3 (every initialization tried at
+    # 8 x 8 with 16 neurons; step 0.03 stalls near the image's variance for 12 of 40)
+    X, y = synthetic_image(SIDE)
+    with mpc.randomness.seed_switch(-1):
+        plain = siren_model(mpc, type(X), 2, NEURONS, OMEGA)
+    plain.fit(mpc, X=X, y=y, step=STEP, epochs=LONG_EPOCHS, momentum=MOMENTUM)
+    long_loss = plain.get_loss(mpc, X, y).sum()
+    assert_eq(f"CP{mpc.pid}:\tSIREN in the clear on {alg_struct}: {LONG_EPOCHS} epochs at step {STEP} reach {long_loss:.2e} < 1e-3", long_loss < 1e-3, True)
+
+    print(f'CP{mpc.pid}:\tSIREN on {alg_struct} tests passed.\n')

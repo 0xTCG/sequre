@@ -1,0 +1,127 @@
+""" SIREN: implicit neural representations with periodic activations (Sitzmann et al., 2020), on Sequre's neural nets.
+
+A SIREN fits an image as a function of its pixel coordinates: two sine layers and a linear output, trained by gradient
+descent on the mean squared error. siren_model builds and compiles it for ndarray (in the clear) and Sharetensor (the
+tested types; others as far as Sequential supports them); fit it with Sequential.fit.
+
+- Initialization (SIREN's): the first layer's weights uniform on (-1/d, 1/d) for d inputs, the hidden and output
+  layers' uniform on (-sqrt(6/n)/omega, sqrt(6/n)/omega) for n neurons, through Dense's kernel_interval and
+  kernel_scale; biases uniform on [0, 1).
+- The sine layers compute sin(omega (x W + b)) (pre_act_scale omega). The backward pass carries the factor omega (the
+  chain rule), so a step that trains the ndarray path trains the secure paths too. Step 0.01 with momentum 0.9
+  (Sequential.fit's step and momentum): at 8 x 8 with 16 neurons every initialization tried (40) gets the loss below
+  1e-4 in 100 epochs, while step 0.03 stalls near the image's variance for 12 of 40, and the step the original used
+  without the chain rule's factor (0.2) stalls for all tried.
+- method "decor" (default): Decor's sin, any argument, exact up to the fixed-point encodings; omega joins Decor's own
+  scaling on Sharetensors. "chebyshev": the degree-`degree` Chebyshev interpolant of sin on `interval` (clipped: the
+  interval must cover omega (x W + b); by default it is sized from the initialization, about (-90, 90) at omega 30), or
+  with reduce_interval on the reduced interval (-pi, (2 n_cp + 1) pi) after reducing the argument modulo 2 pi (ring
+  shares only: modulo_float).
+- The interpolant follows sin only with enough degree for the interval's periods: on (-90, 90) degree 20 is off by
+  about 2 and degree 120 is within 1e-8; on the reduced interval degree 20 is within 2e-6 for two compute parties, 4e-4
+  for three and 2e-2 for four, degree 30 within 3e-7 up to four. degree = 0 picks the smallest multiple of 10 whose
+  interpolant is within SIREN_SIN_TOLERANCE (1e-6) on the interval (120 for (-90, 90), 30 for the reduced intervals up
+  to four compute parties), computed in double when the model is built; Clenshaw costs 2 degree + 2 rounds.
+
+synthetic_image(side) makes a smooth test image in Codon. A loader for real images through Python (numpy and Pillow) is
+applications/siren_image.codon's load_image; it is a module of its own because importing a module with a @python
+function starts the Python interpreter.
+"""
+
+import math
+
+from sequre.constants import METHOD_DECOR, METHOD_CHEBYSHEV, MSE_LOSS, BGD_OPTIMIZER
+from sequre.stdlib.numpy.create import array
+from sequre.stdlib.chebyshev import chebyshev_coeffs, chebyshev_nodes
+from sequre.stdlib.learn.neural_net.layers import Input, Dense
+from sequre.stdlib.learn.neural_net.model import Sequential
+
+
+# The largest error of the Chebyshev interpolant of sin that degree = 0 accepts, and the largest degree it tries
+SIREN_SIN_TOLERANCE = 1e-6
+SIREN_MAX_DEGREE = 300
+
+
+def synthetic_image(side: int):
+    """
+    (coordinates, pixels) of a side x side test image: the coordinates on the grid of [-1, 1]^2 (side^2 x 2, row-major),
+    the pixels 0.8 sin(pi u) cos(pi v / 2) + 0.1 u v (side^2 x 1, in [-1, 1]).
+    """
+    coords = List[List[float]]()
+    pixels = List[List[float]]()
+    for i in range(side):
+        for j in range(side):
+            u = -1.0 + 2.0 * float(i) / float(side - 1)
+            v = -1.0 + 2.0 * float(j) / float(side - 1)
+            coords.append([u, v])
+            pixels.append([0.8 * math.sin(math.pi * u) * math.cos(math.pi * v / 2.0) + 0.1 * u * v])
+    return array(coords), array(pixels)
+
+
+def chebyshev_sin_error(interval: Tuple[float, float], degree: int) -> float:
+    """ The largest error of the degree-`degree` Chebyshev interpolant of sin on interval (2001 points, in double). """
+    a, b = interval
+    coeffs = chebyshev_coeffs(math.sin, chebyshev_nodes(degree + 1, interval), interval)
+    err = 0.0
+    for i in range(2001):
+        v = a + (b - a) * float(i) / 2000.0
+        u = (2.0 * v - a - b) / (b - a)
+        b1, b2 = 0.0, 0.0
+        for k in range(len(coeffs) - 1, 0, -1):
+            b1, b2 = 2.0 * u * b1 - b2 + coeffs[k], b1
+        err = max(err, abs(u * b1 - b2 + coeffs[0] - math.sin(v)))
+    return err
+
+
+def chebyshev_sin_degree(interval: Tuple[float, float], tolerance: float = SIREN_SIN_TOLERANCE) -> int:
+    """
+    The smallest multiple of 10 (up to SIREN_MAX_DEGREE) whose Chebyshev interpolant of sin is within tolerance on
+    interval; a ValueError (at every party, before any round) when none is.
+    """
+    for degree in range(10, SIREN_MAX_DEGREE + 1, 10):
+        if chebyshev_sin_error(interval, degree) <= tolerance:
+            return degree
+    raise ValueError(f"siren: no Chebyshev degree up to {SIREN_MAX_DEGREE} interpolates sin within {tolerance} on {interval}")
+    return 0
+
+
+def _siren_layers(ctype: type, input_dim: int, n_neurons: int, omega: float, method: str = METHOD_DECOR,
+                 interval: Tuple[float, float] = (0.0, 0.0), reduce_interval: bool = False, degree: int = 0):
+    # Input -> Dense(sin) -> Dense(sin) -> Dense(linear, 1) with SIREN's initialization, for siren_model, which sizes the
+    # Chebyshev interval and degree
+    hidden_scale = math.sqrt(6.0 / float(n_neurons)) / omega
+    clip = method == METHOD_CHEBYSHEV and not reduce_interval
+    return (
+        Input[ctype](input_dim),
+        Dense[ctype]("sin", n_neurons, "uniform", "uniform", kernel_interval=(-1.0, 1.0),
+                     kernel_scale=1.0 / float(input_dim), pre_act_scale=omega, method=method,
+                     activation_interval=interval, activation_degree=degree, activation_clip=clip,
+                     activation_reduction=reduce_interval),
+        Dense[ctype]("sin", n_neurons, "uniform", "uniform", kernel_interval=(-1.0, 1.0),
+                     kernel_scale=hidden_scale, pre_act_scale=omega, method=method,
+                     activation_interval=interval, activation_degree=degree, activation_clip=clip,
+                     activation_reduction=reduce_interval),
+        Dense[ctype]("linear", 1, "uniform", "uniform", kernel_interval=(-1.0, 1.0), kernel_scale=hidden_scale))
+
+
+def siren_model(mpc, ctype: type, input_dim: int, n_neurons: int, omega: float, method: str = METHOD_DECOR,
+                interval: Tuple[float, float] = (0.0, 0.0), reduce_interval: bool = False, degree: int = 0, *args,
+                **kwargs):
+    """
+    A compiled SIREN (MSE loss, batched gradient descent with Nesterov momentum: Sequential.fit's step and momentum).
+    Extra arguments go to the layers' initializers (e.g. modulus=...). Draws its initial weights from the stream in
+    use: under mpc.randomness.seed_switch(-1) every party draws the same weights. With method "chebyshev" and degree 0
+    the degree is chebyshev_sin_degree of the interval the layers evaluate on (see the module docstring).
+    """
+    if method == METHOD_CHEBYSHEV and not reduce_interval and interval[0] == 0.0 and interval[1] == 0.0:
+        # omega (x W + b) at initialization: |x W| <= 1 (first layer), sqrt(6 n) / omega (hidden), b in [0, 1)
+        bound = omega * max(1.0, math.sqrt(6.0 * float(n_neurons)) / omega) + omega
+        interval = (-1.5 * bound, 1.5 * bound)
+    if method == METHOD_CHEBYSHEV and degree == 0:
+        if reduce_interval:
+            n_cp = mpc.comms.number_of_parties - 1
+            degree = chebyshev_sin_degree((-math.pi, float(2 * n_cp + 1) * math.pi))
+        else:
+            degree = chebyshev_sin_degree(interval)
+    layers = _siren_layers(ctype, input_dim, n_neurons, omega, method, interval, reduce_interval, degree)
+    return Sequential(layers).compile(mpc, MSE_LOSS, BGD_OPTIMIZER, *args, **kwargs)

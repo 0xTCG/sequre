@@ -14,7 +14,7 @@ These flags can be passed to any Sequre program:
 
 | Flag | Description |
 |---|---|
-| `--use-ring` | Use a power-of-two ring modulus instead of a prime field modulus. **Warning:** currently unstable — division and square root may produce incorrect results ~50% of the time due to a modulus-switching bug. |
+| `--use-ring` | Use the power-of-two ring $\mathbb{Z}_{2^k}$ instead of the prime field as the secret-sharing modulus. Every operation runs on either modulus: on the ring, comparisons, division, square root and the nonlinear functions use ring protocols (sign tests and normalizers built from shared random bits). |
 | `--skip-mhe-setup` | Skip the multiparty homomorphic encryption key-generation phase. Useful when the protocol only uses secret sharing (MPC) without any HE operations. |
 | `-h`, `--help` | Print usage information and exit. |
 
@@ -56,6 +56,10 @@ When using the built-in test runner (`scripts/invoke.codon`), additional flags s
 | `--mpu` | MPU operations | ✓ | |
 | `--ir-passes` | Compiler IR passes | ✓ | |
 | `--stdlib-builtin` | Secure stdlib built-in functions | ✓ | ✓ |
+| `--bitwise` | Bitwise (XOR) MPC, the ring sign test and normalizer, Decor division | ✓ | |
+| `--decor` | Decor nonlinear functions, Fourier, Taylor and Chebyshev evaluation | ✓ | |
+| `--nonlinear` | The nonlinear-function API (`sequre.stdlib.nonlinear`) over plaintext and every secure type | ✓ | |
+| `--activations` | Neural-net activations and their derivatives (ndarray, Sharetensor, MPU; Decor and Chebyshev) | ✓ | |
 | `--lattiseq` | Lattiseq CKKS engine | | ✓ |
 | `--lattiseq-mult3` | Lattiseq 3-way multiplication | | ✓ |
 | `--lin-alg` | Linear algebra | ✓ | ✓ |
@@ -67,6 +71,8 @@ When using the built-in test runner (`scripts/invoke.codon`), additional flags s
 | `--pca` | PCA | ✓ | ✓ |
 | `--king` | KING kinship | ✓ | ✓ |
 | `--gwas` | GWAS | ✓ | |
+| `--siren` | SIREN on a synthetic image (Decor; Chebyshev on the default interval, and on the reduced interval on the ring) | ✓ | |
+| `--gwas-logreg` | GWAS by logistic association on simulated data (Decor and Chebyshev) | ✓ | |
 | `--gwas-with-norm` | GWAS with normalization | | ✓ |
 | `--gwas-without-norm` | GWAS without normalization | | ✓ |
 | `--credit-score` | Credit score application | | ✓ |

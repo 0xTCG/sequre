@@ -147,6 +147,8 @@ def read_tsv(path):
                     row[k] = float("nan")
             row["samples"] = [float(x) for x in cols[15].split(",") if x]
             row["gc_per_rep"] = float(cols[16]) if len(cols) > 16 and cols[16] else float("nan")
+            # harness v4: openings per repetition (missing in v3 files)
+            row["rounds_per_rep"] = float(cols[17]) if len(cols) > 17 and cols[17] else float("nan")
             if row["case"] == "__done__":
                 done = True
                 row["peak_rss_mb"] = row["check"]
@@ -203,6 +205,12 @@ def check_segment(seg, binary, cases_arg):
             "cases_found": len([c for c in expected if c not in missing])}
 
 
+def max_finite(values):
+    # The largest value that is not NaN (NaN when there is none): max() with a NaN depends on the order
+    vals = [v for v in values if v == v]
+    return max(vals) if vals else float("nan")
+
+
 def case_table(res, party="max"):
     """{case: summary dict} over every segment of a result dir. party: 'max' = slowest compute party per statistic,
     or a party id ('1', '2', ...)."""
@@ -239,6 +247,7 @@ def case_table(res, party="max"):
                 "samples": slowest["samples"],
                 "cp0_median_s": next((r["median_s"] for r in rows if r["pid"] == 0), float("nan")),
                 "gc_per_rep": max(r.get("gc_per_rep", float("nan")) for r in chosen),
+                "rounds_per_rep": max_finite(r.get("rounds_per_rep", float("nan")) for r in chosen),
             }
             table[case] = entry
     return table
@@ -282,10 +291,23 @@ def toolchain_files():
     return [p for p in cands if os.path.exists(p)]
 
 
+APP_IMPORT_RE = re.compile(r"^from \.\.\.applications\.(\w+) import", re.M)
+
+
+def bench_app_files():
+    # The applications the bench files import (`from ...applications.<name> import ...`): their sources are part of
+    # the binaries, so they are part of the cache key
+    names = set()
+    for p in glob.glob(os.path.join(BENCH_DIR, "*.codon")):
+        with open(p) as f:
+            names.update(APP_IMPORT_RE.findall(f.read()))
+    return [os.path.join(REPO, "applications", n + ".codon") for n in sorted(names)]
+
+
 def cache_key(binary):
     h = hashlib.sha256()
     h.update(f"bench-cache-v1|{binary}|-release".encode())
-    for p in sorted(glob.glob(os.path.join(BENCH_DIR, "*.codon"))) + [os.path.join(REPO, "applications", "king.codon")]:
+    for p in sorted(glob.glob(os.path.join(BENCH_DIR, "*.codon"))) + bench_app_files():
         h.update(os.path.relpath(p, REPO).encode())
         sha256_file(p, h)
     h.update(stdlib_hash().encode())
@@ -523,17 +545,24 @@ def fmt_check(c):
     return f"{c:.4g}"
 
 
+def fmt_count(x):
+    """A count's mean (openings per repetition): the integer when it is one, else 10 significant digits; nan stays."""
+    if x != x:
+        return "nan"
+    return str(int(x)) if x == int(x) else f"{x:.10g}"
+
+
 def write_summary(res, party="max", quiet=False):
     table = case_table(res, party)
     order = {name: i for i, (_, name, _, _) in enumerate(registry())}
     rows = sorted(table.values(), key=lambda e: order.get(e["case"], 10 ** 6))
     path = os.path.join(res, "summary.tsv")
     with open(path, "w") as f:
-        f.write("case\tbinary\tparams\tparty\tparties\treps\tmedian_s\tmin_s\tmad_rel\twarm_s\tcheck\tbytes_per_rep\tcp0_median_s\tgc_per_rep\n")
+        f.write("case\tbinary\tparams\tparty\tparties\treps\tmedian_s\tmin_s\tmad_rel\twarm_s\tcheck\tbytes_per_rep\tcp0_median_s\tgc_per_rep\trounds_per_rep\n")
         for e in rows:
             f.write(f"{e['case']}\t{e['binary']}\t{e['params']}\t{e['party']}\t{e['parties']}\t{e['reps']}\t"
                     f"{e['median_s']:.6g}\t{e['min_s']:.6g}\t{e['mad_rel']:.4f}\t{e['warm_s']:.6g}\t{e['check']:.6g}\t"
-                    f"{e['bytes_per_rep']}\t{e['cp0_median_s']:.6g}\t{e['gc_per_rep']:.3g}\n")
+                    f"{e['bytes_per_rep']}\t{e['cp0_median_s']:.6g}\t{e['gc_per_rep']:.3g}\t{fmt_count(e['rounds_per_rep'])}\n")
     if not quiet:
         print(f"{'case':<36} {'params':<34} {'reps':>4} {'median':>11} {'min':>11} {'mad%':>6} {'gc/rep':>6} {'check':>10}")
         for e in rows:

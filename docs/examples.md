@@ -15,10 +15,12 @@ Sequre includes several end-to-end privacy-preserving applications that demonstr
 | **GANON** | `ganon.codon` | Classification | MPU | Secure metagenomic classification |
 | **Genotype Imputation** | `genotype_imputation.codon` | Linear regression | MPP / MPU | Impute missing genotypes across distributed cohorts |
 | **GWAS** | `gwas.codon` | PCA + linear regression | MPU (partition) | Genome-wide association study with secure PCA |
+| **GWAS (logistic)** | `gwas_logreg.codon` | Logistic regression per SNP | Sharetensor | Genome-wide association by logistic regression; Decor's sigmoid on the ring and Chebyshev's on the field by default; reveals only each SNP's coefficient and accuracy |
 | **KING** | `king.codon` | Kinship coefficients | Sharetensor | Secure kinship estimation (KING-robust method) |
 | **MI** | `mi.codon` | Multiple imputation | MPU | Secure multiple imputation with Rubin's rules |
 | **MNIST** | `mnist.codon` | Multinomial logistic regression | MPU | Handwritten digit classification |
 | **OPAL** | `opal.codon` | Linear SVM | MPU | Metagenomic profiling (secure OPAL pipeline) |
+| **SIREN** | `siren.codon` | Neural network (sine activations) | Sharetensor | Implicit neural representation of an image (SIREN), with Decor's sin or Chebyshev interpolants |
 
 ---
 
@@ -56,6 +58,7 @@ Applications compose Sequre's ML modules:
 - `lsvm_train` → OPAL
 - PCA (`random_pca_*`) → GWAS
 - MI (`Imputer`, `MI`, `MICE`) → MI application
+- `Sequential` with sine layers → SIREN; `LogReg` (binary, Decor or Chebyshev) → GWAS (logistic)
 
 ---
 

@@ -102,6 +102,9 @@ def test_sqrt(mpc, elem, raw_elem):
     if mpc.pid != 0:
         assert_eq_approx("Sequre sqrt", mpc.comms.print_fp(sqrt.share, modulus), expected_sqrt)
         assert_eq_approx("Sequre sqrt_inv", mpc.comms.print_fp(sqrt_inv.share, modulus), expected_sqrt_inv)
+        # fp_sqrt leaves its input and its modulus alone (L-011: the ring path switched them in place)
+        assert_eq(f"Sequre sqrt input modulus intact on {alg_struct}", elem.modulus == modulus, True)
+        assert_eq_approx(f"Sequre sqrt input intact on {alg_struct}", mpc.comms.print_fp(elem.share, modulus), raw_elem)
     
 
 @sequre
@@ -120,10 +123,15 @@ def test_division(mpc, elem_1, elem_2):
         # TODO: #61 Find a way to reuse partitions in truncation
         # assert_eq_approx("Sequre division partitions", (div * factor).beaver_reveal(mpc), mpc.comms.print_fp(fp_elem.share))
     
+    divisor_before = fp_elem_2.reveal(mpc)
     div = fp_elem_1 / fp_elem_2
+    divisor_after = fp_elem_2.reveal(mpc)
     res = div * fp_elem_2
     if mpc.pid != 0:
         assert_eq_approx("Sequre division 2", res.reveal(mpc), array(mpc.comms.print_fp(fp_elem_1.share, modulus)))
+        # fp_div leaves its divisor and its modulus alone (L-011: the ring path switched them in place)
+        assert_eq(f"Sequre division divisor modulus intact on {alg_struct}", fp_elem_2.modulus == modulus, True)
+        assert_eq_approx(f"Sequre division divisor intact on {alg_struct}", divisor_after, divisor_before, error=1e-9)
     
     with mpc.randomness.seed_switch(-1):
         raw_matrix_a = rand((2, 2), "uniform")
@@ -216,6 +224,154 @@ def test_comparisons(mpc, vec):
         assert_eq("Sequre not gt 2", not_gt_2.reveal(mpc), zeros_vector)
 
 
+@sequre
+def test_comparison_constants[TP](mpc, modulus: TP):
+    """Comparisons on both moduli: a public int constant against a fixed-point value is put in fixed point
+    (H-10: x > 1 compared against 2^-32), public constants carry no modular bias (M-MPC-10: x > -0.5 was off by
+    786432 units), mixed fixed-point and integer operands compare as values, and integer shares compare over the
+    modulus' bits on the ring."""
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    x = Sharetensor.enc(mpc, [0.5, 1.5, -2.0, 1.0], 0, modulus)
+    gt_one = (x > 1).reveal(mpc)
+    lt_one = (x < 1).reveal(mpc)
+    one_lt = (1 < x).reveal(mpc)
+    ge_float = (x > 0.75).reveal(mpc)
+    near = Sharetensor.enc(mpc, [-0.5001, -0.4999], 0, modulus)
+    gt_half = (near > -0.5).reveal(mpc)
+    lt_half = (near < -0.5).reveal(mpc)
+    fpx = Sharetensor.enc(mpc, [1.5, 0.5], 0, modulus)
+    inty = Sharetensor(mpc.comms.share_from_trusted_dealer([TP(1), TP(1)], modulus), modulus)
+    mixed = (fpx > inty).reveal(mpc)
+    # 2^90 on the ring (the sign test over the modulus' bits); 2^40 on the field, whose != squares the difference
+    # before its comparison (valid below about 2^95: beyond, the square leaves the field comparison's range)
+    big = TP(1) << TP(90 if modulus.popcnt() == 1 else 40)
+    ints = Sharetensor(mpc.comms.share_from_trusted_dealer([big, big.sub_mod(TP(1), modulus), big.neg_mod(modulus) % modulus], modulus), modulus)
+    pivot = Sharetensor(mpc.comms.share_from_trusted_dealer([big.sub_mod(TP(1), modulus), big, TP(5)], modulus), modulus)
+    ints_gt = (ints > pivot).reveal(mpc)
+    ints_eq = (ints == ints).reveal(mpc)
+    ints_ne = (ints != pivot).reveal(mpc)
+    # Scalars and matrices (the ring's != takes [d > 0] + [-d > 0] from one sign test of (d, -d) for each shape)
+    s = Sharetensor.enc(mpc, 0.25, 0, modulus)
+    s_gt = (s > 0.125).reveal(mpc)
+    s_ne = (s != 0.25).reveal(mpc)
+    s_eq = (s == s).reveal(mpc)
+    m = Sharetensor.enc(mpc, [[0.5, -1.0], [2.0, 0.0]], 0, modulus)
+    m2 = Sharetensor.enc(mpc, [[0.5, 1.0], [-2.0, 0.0]], 0, modulus)
+    m_gt = (m > m2).reveal(mpc)
+    m_ne = (m != m2).reveal(mpc)
+    m_eq = (m == m2).reveal(mpc)
+    # One raw unit (2^-F) apart: > sees it on both moduli; the ring's != too (the field's != squares the difference in
+    # fixed point, which truncates differences below about 2^(-F/2) to 0)
+    half = double_to_fp(0.5, modulus)
+    ulp_a = Sharetensor(mpc.comms.share_from_trusted_dealer([half, half.add_mod(TP(1), modulus)], modulus), modulus)
+    ulp_a.fp = True
+    ulp_b = Sharetensor(mpc.comms.share_from_trusted_dealer([half, half], modulus), modulus)
+    ulp_b.fp = True
+    ulp_gt = (ulp_a > ulp_b).reveal(mpc)
+    ulp_ne = (ulp_a != ulp_b).reveal(mpc)
+    # Integer shares against float constants: the shares are put in fixed point first
+    xi = Sharetensor.enc(mpc, [0, 1, 2, 3], 0, modulus)
+    xi_gt = (xi > 0.5).reveal(mpc)
+    xi_lt = (xi < 1.5).reveal(mpc)
+    c_gt_xi = (1.5 > xi).reveal(mpc)
+    xi_eq = (xi == 2.0).reveal(mpc)
+    xi_ne = (xi != 2.0).reveal(mpc)
+    # Negative int constants against integer shares, on either side (reduced mod the modulus: M-MPC-10)
+    yi = Sharetensor.enc(mpc, [-5, 0, 7], 0, modulus)
+    neg_gt = (-3 > yi).reveal(mpc)
+    neg_lt = (-3 < yi).reveal(mpc)
+    yi_gt = (yi > -3).reveal(mpc)
+    # Public operands count once: public vs public, vs a constant, vs a secret
+    xp = Sharetensor.enc(mpc, [1.0, -1.0, 0.25], 0, modulus).publish(mpc)
+    yp = Sharetensor.enc(mpc, [0.5, 0.5, 0.5], 0, modulus).publish(mpc)
+    ys = Sharetensor.enc(mpc, [0.5, 0.5, 0.5], 0, modulus)
+    pub_gt = (xp > yp).reveal(mpc)
+    pub_ne = (xp != yp).reveal(mpc)
+    pub_const = (xp > 0.5).reveal(mpc)
+    pub_sec = (xp > ys).reveal(mpc)
+    sec_pub = (ys > xp).reveal(mpc)
+    # Inside delayed_truncation() products keep scale 2^(2F): the ring's sign test widens to K + F + 1 bits
+    a6 = Sharetensor.enc(mpc, [2.0, -2.0, 0.5], 0, modulus)
+    b6 = Sharetensor.enc(mpc, [3.0, 3.0, -0.25], 0, modulus)
+    with mpc.delayed_truncation():
+        prod_pos = a6 * b6 > 0
+    prod_pos_r = prod_pos.reveal(mpc)
+    # Integer shares beyond the fixed-point range against fixed point, and constants beyond it
+    fp2 = Sharetensor.enc(mpc, [1.5, 0.5], 0, modulus)
+    int2 = Sharetensor(mpc.comms.share_from_trusted_dealer([TP(1) << TP(40), TP(0)], modulus), modulus)
+    mixed_big = (fp2 > int2).reveal(mpc)
+    huge_gt = (x > 1e12).reveal(mpc)
+    huge_neg_gt = (x > -1e12).reveal(mpc)
+    huge_int_lt = (x < 1099511627776).reveal(mpc)  # 2^40
+    huge_ne = (x != 1e12).reveal(mpc)
+    # Integer shares beyond the fixed-point range against a float constant beyond it: encoded exactly over the wide
+    # range
+    xi_big = Sharetensor.enc(mpc, [4294967296, 8589934592, 34359738368, 1099511627776, 5], 0, modulus)  # 2^32 .. 2^40
+    big_gt = (xi_big > 1e12).reveal(mpc)
+    big_lt = (xi_big < 1e12).reveal(mpc)
+    big_eq = (xi_big == 1e10).reveal(mpc)
+    # Inputs intact after the comparisons (a public tensor holds its value at every compute party: compare its shares)
+    x_after = x.reveal(mpc)
+    xi_after = xi.reveal(mpc)
+    m_after = m.reveal(mpc)
+    yi_after = yi.to_fp().reveal(mpc)  # integer shares; in fixed point so -5 reveals as -5.0
+    ys_after = ys.reveal(mpc)
+    xp_intact = xp.share == double_to_fp([1.0, -1.0, 0.25], modulus)
+    yp_intact = yp.share == double_to_fp([0.5, 0.5, 0.5], modulus)
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tfixed point > int constant 1 (H-10) on {alg_struct}", gt_one, array([0.0, 1.0, 0.0, 0.0]))
+        assert_eq(f"CP{mpc.pid}:\tfixed point < int constant 1 (H-10) on {alg_struct}", lt_one, array([1.0, 0.0, 1.0, 0.0]))
+        assert_eq(f"CP{mpc.pid}:\tint constant 1 < fixed point (H-10) on {alg_struct}", one_lt, array([0.0, 1.0, 0.0, 0.0]))
+        assert_eq(f"CP{mpc.pid}:\tfixed point > float constant 0.75 on {alg_struct}", ge_float, array([0.0, 1.0, 0.0, 1.0]))
+        assert_eq(f"CP{mpc.pid}:\tx > -0.5 for x = -0.5001, -0.4999 (no bias, M-MPC-10) on {alg_struct}", gt_half, array([0.0, 1.0]))
+        assert_eq(f"CP{mpc.pid}:\tx < -0.5 for x = -0.5001, -0.4999 (no bias, M-MPC-10) on {alg_struct}", lt_half, array([1.0, 0.0]))
+        assert_eq(f"CP{mpc.pid}:\tfixed point > integer shares (mixed operands, H-10) on {alg_struct}", mixed, array([1.0, 0.0]))
+        assert_eq(f"CP{mpc.pid}:\tlarge integers: > on {alg_struct}", ints_gt, array([1.0, 0.0, 0.0]))
+        assert_eq(f"CP{mpc.pid}:\tlarge integers: == on {alg_struct}", ints_eq, array([1.0, 1.0, 1.0]))
+        assert_eq(f"CP{mpc.pid}:\tlarge integers: != on {alg_struct}", ints_ne, array([1.0, 1.0, 1.0]))
+        assert_eq(f"CP{mpc.pid}:\tscalar > float constant on {alg_struct}", s_gt, 1.0)
+        assert_eq(f"CP{mpc.pid}:\tscalar != float constant on {alg_struct}", s_ne, 0.0)
+        assert_eq(f"CP{mpc.pid}:\tscalar == itself on {alg_struct}", s_eq, 1.0)
+        assert_eq(f"CP{mpc.pid}:\tmatrix > matrix on {alg_struct}", m_gt, array([[0.0, 0.0], [1.0, 0.0]]))
+        assert_eq(f"CP{mpc.pid}:\tmatrix != matrix on {alg_struct}", m_ne, array([[0.0, 1.0], [1.0, 0.0]]))
+        assert_eq(f"CP{mpc.pid}:\tmatrix == matrix on {alg_struct}", m_eq, array([[1.0, 0.0], [0.0, 1.0]]))
+        assert_eq(f"CP{mpc.pid}:\tone raw unit apart: > on {alg_struct}", ulp_gt, array([0.0, 1.0]))
+        if modulus.popcnt() == 1:
+            assert_eq(f"CP{mpc.pid}:\tone raw unit apart: != on {alg_struct}", ulp_ne, array([0.0, 1.0]))
+        assert_eq(f"CP{mpc.pid}:\tinteger shares > float constant 0.5 on {alg_struct}", xi_gt, array([0.0, 1.0, 1.0, 1.0]))
+        assert_eq(f"CP{mpc.pid}:\tinteger shares < float constant 1.5 on {alg_struct}", xi_lt, array([1.0, 1.0, 0.0, 0.0]))
+        assert_eq(f"CP{mpc.pid}:\tfloat constant 1.5 > integer shares on {alg_struct}", c_gt_xi, array([1.0, 1.0, 0.0, 0.0]))
+        assert_eq(f"CP{mpc.pid}:\tinteger shares == float constant 2.0 on {alg_struct}", xi_eq, array([0.0, 0.0, 1.0, 0.0]))
+        assert_eq(f"CP{mpc.pid}:\tinteger shares != float constant 2.0 on {alg_struct}", xi_ne, array([1.0, 1.0, 0.0, 1.0]))
+        assert_eq(f"CP{mpc.pid}:\tint constant -3 > integer shares on {alg_struct}", neg_gt, array([1.0, 0.0, 0.0]))
+        assert_eq(f"CP{mpc.pid}:\tint constant -3 < integer shares on {alg_struct}", neg_lt, array([0.0, 1.0, 1.0]))
+        assert_eq(f"CP{mpc.pid}:\tinteger shares > int constant -3 on {alg_struct}", yi_gt, array([0.0, 1.0, 1.0]))
+        assert_eq(f"CP{mpc.pid}:\tpublic > public on {alg_struct}", pub_gt, array([1.0, 0.0, 0.0]))
+        assert_eq(f"CP{mpc.pid}:\tpublic != public on {alg_struct}", pub_ne, array([1.0, 1.0, 1.0]))
+        assert_eq(f"CP{mpc.pid}:\tpublic > float constant on {alg_struct}", pub_const, array([1.0, 0.0, 0.0]))
+        assert_eq(f"CP{mpc.pid}:\tpublic > secret on {alg_struct}", pub_sec, array([1.0, 0.0, 0.0]))
+        assert_eq(f"CP{mpc.pid}:\tsecret > public on {alg_struct}", sec_pub, array([0.0, 1.0, 1.0]))
+        assert_eq(f"CP{mpc.pid}:\tproduct > 0 inside delayed_truncation() on {alg_struct}", prod_pos_r, array([1.0, 0.0, 0.0]))
+        assert_eq(f"CP{mpc.pid}:\tfixed point > integer shares of 2^40 on {alg_struct}", mixed_big, array([0.0, 1.0]))
+        assert_eq(f"CP{mpc.pid}:\tfixed point > 1e12 on {alg_struct}", huge_gt, array([0.0, 0.0, 0.0, 0.0]))
+        assert_eq(f"CP{mpc.pid}:\tfixed point > -1e12 on {alg_struct}", huge_neg_gt, array([1.0, 1.0, 1.0, 1.0]))
+        assert_eq(f"CP{mpc.pid}:\tfixed point < int constant 2^40 on {alg_struct}", huge_int_lt, array([1.0, 1.0, 1.0, 1.0]))
+        if modulus.popcnt() == 1:
+            # The field's != squares the difference, beyond its comparison's range here
+            assert_eq(f"CP{mpc.pid}:\tfixed point != 1e12 on {alg_struct}", huge_ne, array([1.0, 1.0, 1.0, 1.0]))
+        assert_eq_approx(f"CP{mpc.pid}:\tinputs intact after the comparisons (fixed point) on {alg_struct}", x_after, array([0.5, 1.5, -2.0, 1.0]), error=1e-9)
+        assert_eq(f"CP{mpc.pid}:\tinputs intact after the comparisons (integers) on {alg_struct}", xi_after, array([0.0, 1.0, 2.0, 3.0]))
+        assert_eq_approx(f"CP{mpc.pid}:\tinputs intact after the comparisons (matrix) on {alg_struct}", m_after, array([[0.5, -1.0], [2.0, 0.0]]), error=1e-9)
+        assert_eq(f"CP{mpc.pid}:\tintegers 2^32..2^40 > 1e12 on {alg_struct}", big_gt, array([0.0, 0.0, 0.0, 1.0, 0.0]))
+        assert_eq(f"CP{mpc.pid}:\tintegers 2^32..2^40 < 1e12 on {alg_struct}", big_lt, array([1.0, 1.0, 1.0, 0.0, 1.0]))
+        if modulus.popcnt() == 1:
+            # The field's == squares the difference, beyond its comparison's range here
+            assert_eq(f"CP{mpc.pid}:\tintegers 2^32..2^40 == 1e10 on {alg_struct}", big_eq, array([0.0, 0.0, 0.0, 0.0, 0.0]))
+        assert_eq_approx(f"CP{mpc.pid}:\tinputs intact after the comparisons (negative integers) on {alg_struct}", yi_after, array([-5.0, 0.0, 7.0]), error=1e-9)
+        assert_eq_approx(f"CP{mpc.pid}:\tinputs intact after the comparisons (secret against public) on {alg_struct}", ys_after, array([0.5, 0.5, 0.5]), error=1e-9)
+        assert_eq(f"CP{mpc.pid}:\tpublic operands intact after the comparisons on {alg_struct}", xp_intact and yp_intact, True)
+
+
 def test_rand[TP](mpc, modulus: TP):
     """Sharetensor.rand draws without a bias (M-MPC-06): "zeros" and "ones" give zeros and ones (they gave 1/1024 and
     1 + 1/1024), and "normal" samples have mean about 0 and standard deviation about 1. Under the shared seed the draws
@@ -251,7 +407,7 @@ def test_sharetensor[TP](mpc: MPCEnv[TP], modulus: TP):
     sv_vec.set_partitions(mpc.arithmetic.__beaver_partition(sv_vec.share, modulus))
     
     elem = 3.3
-    sv_elem = Sharetensor.enc(mpc, elem)
+    sv_elem = Sharetensor.enc(mpc, elem, 0, modulus)
     sv_elem.set_partitions(mpc.arithmetic.__beaver_partition(sv_elem.share, modulus))
     
     test_bitwise_operations(mpc, modulus)
@@ -260,6 +416,7 @@ def test_sharetensor[TP](mpc: MPCEnv[TP], modulus: TP):
     test_sqrt(mpc, sv_elem, elem)
     test_sqrt(mpc, sv_vec, a_vec * (mpc.comms.number_of_parties - 1))
     test_comparisons(mpc, sv_vec)
+    test_comparison_constants(mpc, modulus)
     test_rand(mpc, modulus)
     
     print(f'CP{mpc.pid}:\tShared tensor tests on {alg_struct} passed.\n')

@@ -1,0 +1,720 @@
+""" Bitwise (XOR) shared MPC, the ring sign test and normalizer, Decor division and public fixed-point operands. """
+
+import math
+import prg
+
+from sequre.attributes import sequre
+from sequre.constants import *
+from sequre.stdlib.numpy.create import array
+from sequre.types.sharetensor import Sharetensor
+from sequre.types.utils import double_to_fp, fp_to_double, num_to_bits_packed
+from sequre.utils.testing import assert_eq, assert_eq_approx as _assert_eq_approx
+from sequre.decor import ring_gt, decor_gt, decor_div, decor_mul_inv
+from sequre.stdlib.fp import fp_mul_inv
+
+
+# The checks compare in double precision: no tolerance goes below double precision (2^-50 of the expected value). It
+# matters at F = 64, where a unit of 2^-F is below it.
+def assert_eq_approx(name, result, expected, error: float = 0.018, silent_pass: bool = False, rel_error: float = 0.0):
+    _assert_eq_approx(name, result, expected, error, silent_pass, max(rel_error, 2.0 ** -50))
+
+
+WIDTHS = (MPC_NBIT_F + 1, MPC_NBIT_K + 1, MPC_MODULUS_BITS)  # 33, 65 and 174 bits in the default build
+
+
+def _name(modulus) -> str:
+    return "ring" if modulus.popcnt() == 1 else "field"
+
+
+def _pow2(bits: int) -> mpc_uint:
+    return mpc_uint(1) << mpc_uint(bits)
+
+
+def _rand_below_pow2(bits: int) -> mpc_uint:
+    return prg.getrandbits_intn(bits, TP=mpc_uint)
+
+
+def _unpack(rows: list[size_t]) -> mpc_uint:
+    # Inverse of num_to_bits_packed for one value (registers most significant first)
+    v = mpc_uint(0)
+    for reg in rows:
+        v = (v << mpc_uint(PACKING_SIZE)) | reg.ext_to(MPC_INT_SIZE)
+    return v
+
+
+def _fp_round(v: float, modulus: mpc_uint) -> float:
+    # The value a fixed-point encoding holds
+    return fp_to_double(double_to_fp(v, modulus), modulus)
+
+
+def _signed_raw(v: int, modulus: mpc_uint) -> mpc_uint:
+    # A raw (unscaled) signed integer mod modulus
+    return mpc_uint(v) if v >= 0 else modulus - mpc_uint(-v)
+
+
+def _signed_pow2(e: int, negative: bool, modulus: mpc_uint) -> mpc_uint:
+    return modulus - _pow2(e) if negative else _pow2(e)
+
+
+def test_primitives_local(mpc):
+    # Register-level primitives. Draws come from each party's own stream; every party checks.
+    n = 2000
+    top_size_t = size_t(1) << size_t(PACKING_SIZE - 1)
+    top_mpc = mpc_uint(1) << mpc_uint(MPC_INT_SIZE - 1)
+    draws = [size_t(0) for _ in range(n)].rand_full()
+    wide = [mpc_uint(0) for _ in range(n)].rand_full()
+    # Binomial(2000, 1/2): sd 0.011, so a fraction outside 0.45-0.55 has probability below 1e-5.
+    assert_eq_approx(f"CP{mpc.pid}:\trand_full sets the top bit of a size_t about half the time",
+                     float(sum(1 for d in draws if d >= top_size_t)) / float(n), 0.5, error=0.05)
+    assert_eq_approx(f"CP{mpc.pid}:\trand_full sets the top bit of an mpc_uint about half the time",
+                     float(sum(1 for d in wide if d >= top_mpc)) / float(n), 0.5, error=0.05)
+
+    assert_eq(f"CP{mpc.pid}:\tbit_replicate copies a bit into the positions below it",
+              (size_t(1) << size_t(8)).bit_replicate(size_t(4)), size_t(0b11110000))
+    assert_eq(f"CP{mpc.pid}:\tcttz counts trailing zeros (and the width for zero)",
+              [size_t(0b1000).cttz(), size_t(0).cttz()], [size_t(3), size_t(PACKING_SIZE)])
+    assert_eq(f"CP{mpc.pid}:\tcttz on mpc_uint", (mpc_uint(1) << mpc_uint(100)).cttz(), mpc_uint(100))
+    assert_eq(f"CP{mpc.pid}:\twrapping add, sub and mul wrap mod 2^N",
+              [size_t(-1).wrapping_add(size_t(2)), size_t(0).wrapping_sub(size_t(1)), (size_t(1) << size_t(PACKING_SIZE - 1)).wrapping_mul(size_t(2))],
+              [size_t(1), size_t(-1), size_t(0)])
+    _, overflow = size_t(-1).raw_mul_overflow(size_t(2))
+    assert_eq(f"CP{mpc.pid}:\traw_mul_overflow flags the overflow", int(overflow), 1)
+    assert_eq(f"CP{mpc.pid}:\t_shl_no_wrap saturates at the width", size_t(1)._shl_no_wrap(PACKING_SIZE), size_t(0))
+
+    zs = [size_t(5), size_t(7)].zeros()
+    assert_eq(f"CP{mpc.pid}:\tList.zeros keeps UInt elements", zs, [size_t(0), size_t(0)])
+    rb = [size_t(0) for _ in range(500)].rand_bits(10)
+    assert_eq(f"CP{mpc.pid}:\trand_bits keeps the element type and the bit count",
+              all(e < size_t(1 << 10) for e in rb), True)
+
+    for bits in WIDTHS:
+        vals = [_rand_below_pow2(bits) for _ in range(50)]
+        vals.append(_pow2(bits) - mpc_uint(1))
+        packed = num_to_bits_packed(vals, bitlen=MPC_MODULUS_BITS)
+        assert_eq(f"CP{mpc.pid}:\tnum_to_bits_packed round trip at {bits} bits",
+                  [_unpack(row) for row in packed], vals, silent_pass=bits != WIDTHS[0])
+
+    # double_to_fp: values below 2^-F encode as 0, negative and subnormal ones included, on both moduli (a shift by the
+    # register width or more used to leave garbage: 2^-240 decoded as 65536, -1.48e-71 as -1.7e6), and 2^-F as a unit
+    # (2^-270 and 2^-280 lie in the garbage bands of both the 192- and the 256-bit builds)
+    tiny = [2.0 ** -float(MPC_NBIT_F + 1), 2.0 ** -200.0, 2.0 ** -240.0, 2.0 ** -256.0, 2.0 ** -270.0, 2.0 ** -280.0, 1.48e-71,
+            2.06e-72, 1e-80, 1e-300, 5e-324]
+    unit = 2.0 ** -float(MPC_NBIT_F)
+    for modulus in (MPC_RING_SIZE, MPC_FIELD_SIZE):
+        encs = List[mpc_uint]()
+        for v in tiny:
+            encs.append(double_to_fp(v, modulus))
+            encs.append(double_to_fp(-v, modulus))
+        assert_eq(f"CP{mpc.pid}:\tdouble_to_fp of values below 2^-F is 0 on the {_name(modulus)}", encs,
+                  [mpc_uint(0) for _ in range(len(encs))])
+        assert_eq(f"CP{mpc.pid}:\tdouble_to_fp of +-2^-F is one unit on the {_name(modulus)}",
+                  [double_to_fp(unit, modulus), double_to_fp(-unit, modulus)], [mpc_uint(1), modulus - mpc_uint(1)])
+
+
+def test_xor_sharing(mpc):
+    # XOR sharing round trips, and full-width masks: every bit of the masks and of the openings varies (a narrower mask
+    # would leave its register's top bits fixed).
+    n = 300
+    with mpc.randomness.seed_switch(-1):
+        words = [prg.getrandbits_intn(PACKING_SIZE, TP=size_t) for _ in range(n)]
+        wide = [prg.getrandbits_intn(MPC_INT_SIZE, TP=mpc_uint) for _ in range(n)]
+        mat = [[prg.getrandbits_intn(PACKING_SIZE, TP=size_t) for _ in range(4)] for _ in range(5)]
+
+    for source in range(mpc.comms.number_of_parties):
+        sh = mpc.bitwise.share_from(words if mpc.pid == source else words.zeros(), source)
+        rv = mpc.bitwise.reveal(sh)
+        if mpc.pid:
+            assert_eq(f"CP{mpc.pid}:\tXOR share from CP{source} and reveal (size_t)", rv, words)
+    sh_wide = mpc.bitwise.share_from_trusted_dealer(wide)
+    sh_mat = mpc.bitwise.share_from_trusted_dealer(mat)
+    rv_wide = mpc.bitwise.reveal(sh_wide)
+    rv_mat = mpc.bitwise.reveal(sh_mat)
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tXOR share and reveal (mpc_uint)", rv_wide, wide)
+        assert_eq(f"CP{mpc.pid}:\tXOR share and reveal (matrix of size_t)", rv_mat, mat)
+
+    # Shares of zero are masks (or XORs of masks), and an opening value ^ r of a zero value is r itself: their top two
+    # bits must take every value. With masks drawn below 2^62 (the original's List.rand) they stay 0.
+    zero_sh = mpc.bitwise.share_from_trusted_dealer([size_t(0) for _ in range(n)])
+    opened, _ = mpc.bitwise._beaver_partition([size_t(0) for _ in range(n)])
+    # The dealer's other mask sites: random-bit shares, the ring word (arithmetic and XOR), the bit vectors of the
+    # B2A conversion, and the AND reconstruction.
+    _, packed = mpc.bitwise.share_random_bits_packed(n, MPC_RING_SIZE, bitlen=10)
+    word, word_xor = mpc.bitwise.share_random_ring_word(n)
+    rho, _ = mpc.bitwise.share_random_bit_vectors(n, 8, MPC_RING_SIZE)
+    rec = mpc.bitwise._beaver_reconstruct([size_t(0) for _ in range(n)])
+    if mpc.pid:
+        for name, xs in (("shares", zero_sh), ("openings", opened), ("random-bit shares", [row[0] for row in packed]),
+                         ("ring-word shares", word), ("ring-word XOR shares", word_xor),
+                         ("bit-vector XOR shares", rho), ("AND reconstruction shares", rec)):
+            tops = [int(e >> size_t(PACKING_SIZE - 2)) for e in xs]
+            assert_eq(f"CP{mpc.pid}:\tthe top two bits of XOR {name} take all four values",
+                      sorted(list(set(tops))), [0, 1, 2, 3])
+
+
+def test_bit_operations(mpc):
+    # land / lor / lor_public, carry out and prefix OR against plaintext, at widths 33, 65 and 174
+    n = 40
+    for bits in WIDTHS:
+        with mpc.randomness.seed_switch(-1):
+            a = [_rand_below_pow2(bits) for _ in range(n)]
+            b = [_rand_below_pow2(bits) for _ in range(n)]
+        # Edge rows: all ones, a carry chain across every register, zeros
+        a[0], b[0] = _pow2(bits) - mpc_uint(1), mpc_uint(1)
+        a[1], b[1] = _pow2(bits) - mpc_uint(1), _pow2(bits) - mpc_uint(1)
+        a[2], b[2] = mpc_uint(0), mpc_uint(0)
+        a_bits = num_to_bits_packed(a, bitlen=MPC_MODULUS_BITS)
+        b_bits = num_to_bits_packed(b, bitlen=MPC_MODULUS_BITS)
+        sa = mpc.bitwise.share_from_trusted_dealer(a_bits)
+        sb = mpc.bitwise.share_from_trusted_dealer(b_bits)
+
+        land = mpc.bitwise.reveal(mpc.bitwise.land(sa, sb))
+        lor = mpc.bitwise.reveal(mpc.bitwise.lor(sa, sb))
+        lor_pub = mpc.bitwise.reveal(mpc.bitwise.lor_public(sa, b_bits))
+        sa_after = [_unpack(r) for r in mpc.bitwise.reveal(sa)]
+        sb_after = [_unpack(r) for r in mpc.bitwise.reveal(sb)]
+
+        # Carry out of a + b over `bits` bits (rows: the registers of a bits-bit number, leading first)
+        regs = 1 + (bits - 1) // PACKING_SIZE
+        a_rows = num_to_bits_packed(a, bitlen=bits).transpose()
+        b_rows = num_to_bits_packed(b, bitlen=bits).transpose()
+        carry = mpc.bitwise.reveal(mpc.bitwise.carry_out_public(
+            a_rows, mpc.bitwise.share_from_trusted_dealer(b_rows), bits))
+
+        s_prefix = mpc.bitwise.share_from_trusted_dealer(a)
+        prefix = mpc.bitwise.reveal(mpc.bitwise.prefix_or(s_prefix, bitlen=MPC_MODULUS_BITS, dtype=mpc_uint))
+        prefix_in_after = mpc.bitwise.reveal(s_prefix)
+        if mpc.pid:
+            assert_eq(f"CP{mpc.pid}:\tland, lor and lor_public leave their operands intact at {bits} bits", [sa_after, sb_after], [a, b], silent_pass=True)
+            assert_eq(f"CP{mpc.pid}:\tprefix OR leaves its input intact at {bits} bits", prefix_in_after, a, silent_pass=True)
+            assert_eq(f"CP{mpc.pid}:\tland at {bits} bits", [_unpack(r) for r in land], [a[i] & b[i] for i in range(n)])
+            assert_eq(f"CP{mpc.pid}:\tlor at {bits} bits", [_unpack(r) for r in lor], [a[i] | b[i] for i in range(n)])
+            assert_eq(f"CP{mpc.pid}:\tlor_public at {bits} bits", [_unpack(r) for r in lor_pub],
+                      [a[i] | b[i] for i in range(n)])
+            assert_eq(f"CP{mpc.pid}:\tcarry out at {bits} bits ({regs} registers)", carry,
+                      [size_t(int(((a[i] + b[i]) >> mpc_uint(bits)) & mpc_uint(1))) for i in range(n)])
+            want_prefix = list[mpc_uint](n)
+            for v in a:
+                acc = mpc_uint(0)
+                run = mpc_uint(0)
+                for j in range(MPC_MODULUS_BITS - 1, -1, -1):
+                    run |= (v >> mpc_uint(j)) & mpc_uint(1)
+                    acc |= run << mpc_uint(j)
+                want_prefix.append(acc)
+            assert_eq(f"CP{mpc.pid}:\tprefix OR of {bits}-bit values in mpc_uint registers", prefix, want_prefix)
+
+    # Prefix OR over one size_t (the normalizer's case)
+    with mpc.randomness.seed_switch(-1):
+        w = [prg.getrandbits_intn(prg.randint(1, PACKING_SIZE), TP=size_t) for _ in range(n)]
+    w[0] = size_t(0)
+    pw = mpc.bitwise.reveal(mpc.bitwise.prefix_or(mpc.bitwise.share_from_trusted_dealer(w), bitlen=PACKING_SIZE, dtype=size_t))
+    if mpc.pid:
+        want = [size_t(0) if e == size_t(0) else (size_t(-1) >> size_t(PACKING_SIZE) - e.bitlen()) for e in w]
+        assert_eq(f"CP{mpc.pid}:\tprefix OR over one size_t", pw, want)
+
+
+def test_add_public(mpc):
+    # Bit addition with a public operand: full-width values, so carries cross every 64-bit boundary
+    n = 60
+    with mpc.randomness.seed_switch(-1):
+        x = [prg.getrandbits_intn(MPC_INT_SIZE, TP=mpc_uint) for _ in range(n)]
+        y = [prg.getrandbits_intn(MPC_INT_SIZE, TP=mpc_uint) for _ in range(n)]
+        xw = [prg.getrandbits_intn(PACKING_SIZE, TP=size_t) for _ in range(n)]
+        yw = [prg.getrandbits_intn(PACKING_SIZE, TP=size_t) for _ in range(n)]
+    x[0], y[0] = mpc_uint(-1), mpc_uint(1)  # carry through every bit
+    x[1], y[1] = (mpc_uint(1) << mpc_uint(128)) - mpc_uint(1), mpc_uint(1)  # carry into bit 128
+    xw[0], yw[0] = size_t(-1), size_t(1)
+    sx = mpc.bitwise.share_from_trusted_dealer(x)
+    s = mpc.bitwise.reveal(mpc.bitwise.add_public(sx, y))
+    sw = mpc.bitwise.reveal(mpc.bitwise.add_public(mpc.bitwise.share_from_trusted_dealer(xw), yw, bitlen=PACKING_SIZE, dtype=size_t))
+    x_after = mpc.bitwise.reveal(sx)
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tXOR addition input intact", x_after, x, silent_pass=True)
+        assert_eq(f"CP{mpc.pid}:\tXOR addition with a public operand (mpc_uint, full width)", s,
+                  [x[i].wrapping_add(y[i]) for i in range(n)])
+        assert_eq(f"CP{mpc.pid}:\tXOR addition with a public operand (size_t)", sw,
+                  [xw[i].wrapping_add(yw[i]) for i in range(n)])
+
+
+def _sign_case(mpc, raw: list[mpc_uint], bits: int, target: mpc_uint, ring: mpc_uint):
+    sh = mpc.comms.share_from_trusted_dealer(raw, ring)
+    res = _sign_of(mpc, sh, bits, target, ring)
+    after = mpc.comms.reveal(sh, ring)
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tsign test input intact", after, raw, silent_pass=True)
+    return res
+
+
+def _sign_of(mpc, sh: list[mpc_uint], bits: int, target: mpc_uint, ring: mpc_uint):
+    if bits == MPC_NBIT_F + 1:
+        return mpc.bitwise.sign_ring(sh, target, bits=MPC_NBIT_F + 1) if target == ring else \
+            mpc.bitwise.is_positive_ring([e & (_pow2(bits) - mpc_uint(1)) for e in sh], target, _pow2(bits), op_mod_bitlen=MPC_NBIT_F + 1)
+    if bits == MPC_NBIT_K + 1:
+        return mpc.bitwise.sign_ring(sh, target, bits=MPC_NBIT_K + 1) if target == ring else \
+            mpc.bitwise.is_positive_ring([e & (_pow2(bits) - mpc_uint(1)) for e in sh], target, _pow2(bits), op_mod_bitlen=MPC_NBIT_K + 1)
+    return mpc.bitwise.is_positive_ring(sh, target, ring, op_mod_bitlen=MPC_MODULUS_BITS)
+
+
+def test_sign(mpc):
+    # The ring sign test at F + 1, K + 1 and L bits: [v > 0] for |v| < 2^(bits - 1), strict like the field
+    # is_positive (0 gives 0); the result converts to the ring or the field.
+    ring = MPC_RING_SIZE
+    for bits in WIDTHS:
+        vals = [0, 1, -1]
+        raw = [mpc_uint(0), mpc_uint(1), ring - mpc_uint(1)]
+        for e, negative in ((bits - 2, False), (bits - 2, True)):
+            raw.append(_signed_pow2(e, negative, ring))
+            vals.append(-1 if negative else 1)
+        raw.append(_pow2(bits - 1) - mpc_uint(1)); vals.append(1)                  # largest positive
+        raw.append(ring - _pow2(bits - 1) + mpc_uint(1)); vals.append(-1)          # most negative in range
+        with mpc.randomness.seed_switch(-1):
+            for _ in range(40):
+                v = _rand_below_pow2(bits - 1)
+                negative = prg.random() < 0.5
+                raw.append(ring - v if negative and v else v)
+                vals.append(0 if not v else (-1 if negative else 1))
+        want = [mpc_uint(1) if v > 0 else mpc_uint(0) for v in vals]
+        for target in (ring, MPC_FIELD_SIZE):
+            res = _sign_case(mpc, raw, bits, target, ring)
+            rv = mpc.comms.reveal(res, target)
+            if mpc.pid:
+                assert_eq(f"CP{mpc.pid}:\tring sign test at {bits} bits, result on the {_name(target)}", rv, want)
+
+    # 2-D input
+    with mpc.randomness.seed_switch(-1):
+        mat = [[prg.random() * 8.0 - 4.0 for _ in range(5)] for _ in range(4)]
+    smat = Sharetensor.enc(mpc, mat, 0, ring)
+    rmat = mpc.comms.reveal(mpc.bitwise.sign_ring(smat.share, ring, bits=MPC_NBIT_K + 1), ring)
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tring sign test on a matrix", rmat,
+                  [[mpc_uint(1) if v > 0.0 else mpc_uint(0) for v in row] for row in mat])
+
+
+def test_ring_gt(mpc):
+    # Fixed-point comparisons through the sign test (ring) and the field comparison (field)
+    n = 50
+    with mpc.randomness.seed_switch(-1):
+        xs = [prg.random() * 2000.0 - 1000.0 for _ in range(n)]
+        ys = [prg.random() * 2000.0 - 1000.0 for _ in range(n)]
+        us = [prg.random() for _ in range(n)]
+        vs = [prg.random() for _ in range(n)]
+    ys[0] = xs[0]  # equality: not greater (strict, as the field comparison)
+    vs[0] = us[0]
+    for modulus in (MPC_RING_SIZE, MPC_FIELD_SIZE):
+        x = Sharetensor.enc(mpc, xs, 0, modulus)
+        y = Sharetensor.enc(mpc, ys, 0, modulus)
+        u = Sharetensor.enc(mpc, us, 0, modulus)
+        v = Sharetensor.enc(mpc, vs, 0, modulus)
+        gt = ring_gt(mpc, x, y, bits=MPC_NBIT_K + 1).reveal(mpc)
+        gt_pub = ring_gt(mpc, x, 12.5, bits=MPC_NBIT_K + 1).reveal(mpc)
+        gt_dec = decor_gt(mpc, u, v).reveal(mpc)
+        x_after = x.reveal(mpc)
+        others_after = [y.reveal(mpc).tolist(), u.reveal(mpc).tolist(), v.reveal(mpc).tolist()]
+        if mpc.pid:
+            name = _name(modulus)
+            assert_eq(f"CP{mpc.pid}:\tring_gt of two secrets on the {name}", gt,
+                      array([1.0 if xs[i] > ys[i] else 0.0 for i in range(n)]))
+            assert_eq(f"CP{mpc.pid}:\tring_gt with a public float on the {name}", gt_pub,
+                      array([1.0 if xs[i] > 12.5 else 0.0 for i in range(n)]))
+            assert_eq(f"CP{mpc.pid}:\tdecor_gt on [0, 1) operands on the {name}", gt_dec,
+                      array([1.0 if us[i] > vs[i] else 0.0 for i in range(n)]))
+            # Inputs are re-encoded exactly by reveal: tolerance one fixed-point unit
+            assert_eq_approx(f"CP{mpc.pid}:\tring_gt input intact on the {name}", x_after,
+                             array([_fp_round(e, modulus) for e in xs]), error=2.0 ** -MPC_NBIT_F, silent_pass=True)
+            assert_eq_approx(f"CP{mpc.pid}:\tring_gt's y and decor_gt's operands intact on the {name}", others_after,
+                             [[_fp_round(e, modulus) for e in ys], [_fp_round(e, modulus) for e in us], [_fp_round(e, modulus) for e in vs]],
+                             error=2.0 ** -MPC_NBIT_F, silent_pass=True)
+
+        # An integer x against a float y compares at the fixed-point scale
+        ints = [1, 5, 12, 13, 20, -3]
+        xi = Sharetensor(mpc.comms.share_from_trusted_dealer([_signed_raw(v, modulus) for v in ints], modulus), modulus)
+        gi = ring_gt(mpc, xi, 12.5, bits=MPC_NBIT_K + 1).reveal(mpc)
+        if mpc.pid:
+            assert_eq(f"CP{mpc.pid}:\tring_gt of an integer x and a float on the {_name(modulus)}", gi,
+                      array([0.0, 0.0, 0.0, 1.0, 1.0, 0.0]))
+
+
+def test_normalizer(mpc):
+    # s = 4^i, s_sqrt = 2^i with X * s in [2^(K - 2), 2^K) for X over [2^-(F - 12), 2^(K - F - 2)] (in value)
+    ring = MPC_RING_SIZE
+    n = 60
+    lo, hi = -(MPC_NBIT_F - 12), MPC_NBIT_K - MPC_NBIT_F - 2
+    with mpc.randomness.seed_switch(-1):
+        vals = [2.0 ** (float(lo) + float(hi - lo) * prg.random()) for _ in range(n)]
+    vals[0], vals[1], vals[2] = 2.0 ** lo, 2.0 ** hi, 1.0
+    raw = double_to_fp(vals, ring)
+    x = mpc.comms.share_from_trusted_dealer(raw, ring)
+    s, s_sqrt = mpc.bitwise.normalizer(x, ring)
+    rs = mpc.comms.reveal(s, ring)
+    rss = mpc.comms.reveal(s_sqrt, ring)
+    x_after = mpc.comms.reveal(x, ring)
+    zero_s, zero_ss = mpc.bitwise.normalizer(mpc.comms.share_from_trusted_dealer([mpc_uint(0)], ring), ring)
+    rz = mpc.comms.reveal(zero_s, ring)
+    rzs = mpc.comms.reveal(zero_ss, ring)
+    mat = [[raw[i * 3 + j] for j in range(3)] for i in range(4)]
+    ms, mss = mpc.bitwise.normalizer(mpc.comms.share_from_trusted_dealer(mat, ring), ring)
+    rms = mpc.comms.reveal(ms, ring)
+    if mpc.pid:
+        low, high = _pow2(MPC_NBIT_K - 2), _pow2(MPC_NBIT_K)
+        assert_eq(f"CP{mpc.pid}:\tnormalizer scales X into [2^(K-2), 2^K)",
+                  [low <= raw[i] * rs[i] < high for i in range(n)], [True for _ in range(n)])
+        assert_eq(f"CP{mpc.pid}:\tnormalizer s_sqrt^2 = s", [e * e for e in rss], rs)
+        assert_eq(f"CP{mpc.pid}:\tnormalizer input intact", x_after, raw, silent_pass=True)
+        assert_eq(f"CP{mpc.pid}:\tnormalizer of zero is zero", [rz[0], rzs[0]], [mpc_uint(0), mpc_uint(0)])
+        assert_eq(f"CP{mpc.pid}:\tnormalizer on a matrix", rms, [[rs[i * 3 + j] for j in range(3)] for i in range(4)])
+
+
+def _division_bound(a: float, b: float, q: float) -> float:
+    # The error model of Decor division, from 300 measured draws at F = 32: within
+    # 2.0 (Newton) and 2.6 (Goldschmidt) units of 2^-F relative to a / b for |b| <= 1, and within 1.0 and 1.7 times
+    # (|a| + 2) units absolute for |b| > 1; one iteration short of the default gives 72 and 20. Bounds: 6 units
+    # relative plus 4 units, and 3 (|a| + 2) units; a relative floor of 2^-50 covers the doubles at F = 64.
+    ulp = 2.0 ** -MPC_NBIT_F
+    floor = abs(q) * 2.0 ** -50
+    if abs(b) <= 1.0:
+        return 6.0 * ulp * abs(q) + 4.0 * ulp + floor
+    return 3.0 * (abs(a) + 2.0) * ulp + floor
+
+
+def _assert_division(mpc, name: str, got: list[float], num: list[float], den: list[float], modulus: mpc_uint):
+    if not mpc.pid:
+        return
+    worst, worst_i = 0.0, -1
+    for i in range(len(num)):
+        a, b = _fp_round(num[i], modulus), _fp_round(den[i], modulus)
+        q = a / b
+        ratio = abs(got[i] - q) / _division_bound(a, b, q)
+        if ratio > worst:
+            worst, worst_i = ratio, i
+    msg = f"{name} (worst error {worst:.2f} of its bound" + (f", at {num[worst_i]} / {den[worst_i]} -> {got[worst_i]})" if worst_i >= 0 else ")")
+    assert_eq(msg, worst <= 1.0, True)
+
+
+def test_division(mpc):
+    # Decor division against a / b of the fixed-point encodings, within the error model of _division_bound.
+    ring = MPC_RING_SIZE
+    n = 60
+    lo, hi = -(MPC_NBIT_F - 12), MPC_NBIT_K - MPC_NBIT_F - 2
+    with mpc.randomness.seed_switch(-1):
+        num = [prg.random() * 16.0 - 8.0 for _ in range(n)]
+        den = [(1.0 if prg.random() < 0.5 else -1.0) * 2.0 ** (float(lo) + float(hi - lo) * prg.random()) for _ in range(n)]
+    den[0], den[1], den[2], den[3] = 2.0 ** lo, -(2.0 ** hi), 1.0, -1.0
+    ones = [1.0 for _ in range(n)]
+    for modulus in (ring, MPC_FIELD_SIZE):
+        name = _name(modulus)
+        a = Sharetensor.enc(mpc, num, 0, modulus)
+        b = Sharetensor.enc(mpc, den, 0, modulus)
+        if modulus == ring:
+            q_newton = decor_div(mpc, a, b, method=DECOR_NEWTON_METHOD).reveal(mpc).tolist()
+            q_gold = decor_div(mpc, a, b, method=DECOR_GOLDSCHMIDT_METHOD).reveal(mpc).tolist()
+            _assert_division(mpc, f"CP{mpc.pid}:\tDecor division (Newton) on the ring", q_newton, num, den, modulus)
+            _assert_division(mpc, f"CP{mpc.pid}:\tDecor division (Goldschmidt) on the ring", q_gold, num, den, modulus)
+            # Divisors known to be positive skip the sign test
+            pos = [abs(e) for e in den]
+            pos_st = Sharetensor.enc(mpc, pos, 0, modulus)
+            inv = decor_mul_inv(mpc, pos_st, sign_check=False).reveal(mpc).tolist()
+            pos_after = pos_st.reveal(mpc).tolist()
+            _assert_division(mpc, f"CP{mpc.pid}:\tDecor inverse of positive divisors on the ring", inv, ones, pos, modulus)
+            if mpc.pid:
+                assert_eq_approx(f"CP{mpc.pid}:\tDecor inverse without the sign test leaves its input intact", pos_after,
+                                 [_fp_round(e, modulus) for e in pos], error=2.0 ** -MPC_NBIT_F, silent_pass=True)
+        else:
+            # The field path is Sequre's field division (fp_div / fp_mul_inv): a fixed allowance for its own precision
+            # (measured within 1e-5 here; test_nonlinear checks the same path to its model)
+            sub = [i for i in range(n) if 1.0 <= abs(den[i]) <= 1000.0]
+            a_sub = Sharetensor.enc(mpc, [num[i] for i in sub], 0, modulus)
+            b_sub = Sharetensor.enc(mpc, [den[i] for i in sub], 0, modulus)
+            q = decor_div(mpc, a_sub, b_sub).reveal(mpc).tolist()
+            q_inv = decor_mul_inv(mpc, b_sub).reveal(mpc).tolist()
+            if mpc.pid:
+                assert_eq_approx(f"CP{mpc.pid}:\tDecor division falls back to fp_div on the field", q,
+                                 [_fp_round(num[i], modulus) / _fp_round(den[i], modulus) for i in sub], error=1e-4, rel_error=1e-5)
+                assert_eq_approx(f"CP{mpc.pid}:\tDecor inverse falls back to fp_mul_inv on the field", q_inv,
+                                 [1.0 / _fp_round(den[i], modulus) for i in sub], error=1e-4, rel_error=1e-5)
+
+        # Scalar divisors: one local multiplication and one truncation
+        q_int = decor_div(mpc, a, 4).reveal(mpc).tolist()
+        q_float = decor_div(mpc, a, -0.5).reveal(mpc).tolist()
+        a_after = a.reveal(mpc).tolist()
+        b_after = b.reveal(mpc).tolist()
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tDecor division by an int on the {name}", q_int,
+                             [_fp_round(e, modulus) / 4.0 for e in num], error=4.0 * 2.0 ** -MPC_NBIT_F)
+            assert_eq_approx(f"CP{mpc.pid}:\tDecor division by a float on the {name}", q_float,
+                             [_fp_round(e, modulus) / -0.5 for e in num], error=4.0 * 2.0 ** -MPC_NBIT_F)
+            assert_eq_approx(f"CP{mpc.pid}:\tDecor division inputs intact on the {name}", a_after,
+                             [_fp_round(e, modulus) for e in num], error=2.0 ** -MPC_NBIT_F, silent_pass=True)
+            assert_eq_approx(f"CP{mpc.pid}:\tDecor division divisor intact on the {name}", b_after,
+                             [_fp_round(e, modulus) for e in den], error=2.0 ** -MPC_NBIT_F, rel_error=1e-12,
+                             silent_pass=True)
+
+        # A secret divisor refuses to run inside delayed_truncation (every party raises before any round)
+        raised = False
+        with mpc.delayed_truncation():
+            try:
+                decor_div(mpc, a, b)
+            except ValueError:
+                raised = True
+        assert_eq(f"CP{mpc.pid}:\tDecor division raises inside delayed_truncation on the {name}", raised, True)
+
+    # 2-D operands on the ring
+    rows, cols = 3, 4
+    na = [[num[i * cols + j] for j in range(cols)] for i in range(rows)]
+    nb = [[den[i * cols + j] for j in range(cols)] for i in range(rows)]
+    q2 = decor_div(mpc, Sharetensor.enc(mpc, na, 0, ring), Sharetensor.enc(mpc, nb, 0, ring)).reveal(mpc).tolist()
+    _assert_division(mpc, f"CP{mpc.pid}:\tDecor division of matrices on the ring", q2.flatten(), na.flatten(), nb.flatten(), ring)
+
+    # Empty operands: every party returns at once
+    empty = Sharetensor(list[mpc_uint](), ring)
+    empty.fp = True
+    q0 = decor_div(mpc, empty, empty)
+    s0, ss0 = mpc.bitwise.normalizer(list[mpc_uint](), ring)
+    g0 = mpc.bitwise.sign_ring(list[mpc_uint](), ring, bits=MPC_NBIT_K + 1)
+    assert_eq(f"CP{mpc.pid}:\tempty operands give empty results (division, normalizer, sign test)",
+              [len(q0.share), len(s0), len(ss0), len(g0)], [0, 0, 0, 0])
+
+    # fp_mul_inv runs on ring shares too (the ring normalizer replaced the modulus switch), within Decor
+    # division's bound
+    inv_den = [2.0, -0.25, 1000.0, -3.5]
+    inv_got = fp_mul_inv(mpc, Sharetensor.enc(mpc, inv_den, 0, ring)).reveal(mpc).tolist()
+    _assert_division(mpc, f"CP{mpc.pid}:\tfp_mul_inv on ring shares", inv_got, [1.0 for _ in inv_den], inv_den, ring)
+
+
+def test_square_and_switch_ring(mpc):
+    n = 30
+    with mpc.randomness.seed_switch(-1):
+        ints = [prg.randint(-1000, 1000) for _ in range(n)]
+    for modulus in (MPC_RING_SIZE, MPC_FIELD_SIZE):
+        raw = [_signed_raw(v, modulus) for v in ints]
+        sh = mpc.comms.share_from_trusted_dealer(raw, modulus)
+        sq = mpc.comms.reveal(mpc.arithmetic.square(sh, modulus), modulus)
+        sh_after = mpc.comms.reveal(sh, modulus)
+        if mpc.pid:
+            assert_eq(f"CP{mpc.pid}:\tsquare on the {_name(modulus)}", sq, [mpc_uint(v * v) for v in ints])
+            assert_eq(f"CP{mpc.pid}:\tsquare leaves its input intact on the {_name(modulus)}", sh_after, raw, silent_pass=True)
+
+    ring = MPC_RING_SIZE
+    x = Sharetensor(mpc.comms.share_from_trusted_dealer([_signed_raw(v, ring) for v in ints], ring), ring)
+    x.get_partitions(mpc)
+    small = x.switch_ring(MPC_NBIT_F + 1)
+    rv = mpc.comms.reveal(small.share, small.modulus)
+    x_r, r = small.get_partitions()
+    rp = mpc.comms.reveal((x_r if mpc.pid == 1 else x_r.zeros()).add_mod(r, small.modulus) if mpc.pid else r, small.modulus)
+    x_after = mpc.comms.reveal(x.share, ring)
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tswitch_ring leaves its source intact", x_after, [_signed_raw(v, ring) for v in ints], silent_pass=True)
+        want = [_signed_raw(v, ring) & (_pow2(MPC_NBIT_F + 1) - mpc_uint(1)) for v in ints]
+        assert_eq(f"CP{mpc.pid}:\tswitch_ring reduces the shares", rv, want)
+        assert_eq(f"CP{mpc.pid}:\tswitch_ring reduces the Beaver partitions", rp, want)
+        assert_eq(f"CP{mpc.pid}:\tswitch_ring sets the modulus", small.modulus, _pow2(MPC_NBIT_F + 1))
+
+
+@sequre
+def _product(mpc, x, y):
+    return x * y
+
+
+def test_truncation_control(mpc):
+    # delayed_truncation suspends truncation (nested scopes), the caller truncates once; weighted_sum truncates once
+    modulus = mpc.default_mpc_modulus
+    n = 20
+    with mpc.randomness.seed_switch(-1):
+        xs = [prg.random() * 4.0 - 2.0 for _ in range(n)]
+        ys = [prg.random() * 4.0 - 2.0 for _ in range(n)]
+    x = Sharetensor.enc(mpc, xs, 0, modulus)
+    y = Sharetensor.enc(mpc, ys, 0, modulus)
+    count = mpc.stats.truncations_count
+    with mpc.delayed_truncation():
+        with mpc.delayed_truncation():
+            z = _product(mpc, x, y)
+        inner_closed = mpc.fp.truncation_allowed()
+        w = _product(mpc, x, y)
+    after = mpc.fp.truncation_allowed()
+    untruncated_count = mpc.stats.truncations_count - count
+    z.itrunc(mpc)
+    w.itrunc(mpc)
+    rz = z.reveal(mpc).tolist()
+    rw = w.reveal(mpc).tolist()
+    # Products of fixed-point encodings: error at most 2 units of the last place
+    want = [_fp_round(xs[i], modulus) * _fp_round(ys[i], modulus) for i in range(n)]
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tdelayed_truncation scopes nest (truncation stays off after the inner exit, back on after the outer)",
+                  [inner_closed, after], [False, True])
+        assert_eq(f"CP{mpc.pid}:\tno truncation inside delayed_truncation", untruncated_count, 0)
+        assert_eq_approx(f"CP{mpc.pid}:\tproducts truncated once after delayed_truncation", rz, want, error=4.0 * 2.0 ** -MPC_NBIT_F)
+        assert_eq_approx(f"CP{mpc.pid}:\tproducts truncated once after nested scopes", rw, want, error=4.0 * 2.0 ** -MPC_NBIT_F)
+
+    # weighted_sum: 0.5 x - 1.25 y + w * x with per-element weights w
+    with mpc.randomness.seed_switch(-1):
+        ws = [prg.random() * 2.0 - 1.0 for _ in range(n)]
+    count = mpc.stats.truncations_count
+    s_scalar = mpc.fp.weighted_sum([x.share, y.share], [0.5, -1.25], modulus)
+    s_vector = mpc.fp.weighted_sum([x.share, y.share], [ws, ws], modulus)
+    used = mpc.stats.truncations_count - count
+    r1 = mpc.comms.print_fp(s_scalar, modulus)
+    r2 = mpc.comms.print_fp(s_vector, modulus)
+    xy_after = [x.reveal(mpc).tolist(), y.reveal(mpc).tolist()]
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tproducts and weighted sums leave their operands intact", xy_after,
+                         [[_fp_round(e, modulus) for e in xs], [_fp_round(e, modulus) for e in ys]], error=2.0 ** -MPC_NBIT_F, silent_pass=True)
+        assert_eq(f"CP{mpc.pid}:\tweighted_sum truncates once per sum", used, 2)
+        assert_eq_approx(f"CP{mpc.pid}:\tweighted_sum with scalar weights", r1,
+                         [0.5 * _fp_round(xs[i], modulus) - 1.25 * _fp_round(ys[i], modulus) for i in range(n)],
+                         error=4.0 * 2.0 ** -MPC_NBIT_F)
+        assert_eq_approx(f"CP{mpc.pid}:\tweighted_sum with per-element weights", r2,
+                         [_fp_round(ws[i], modulus) * (_fp_round(xs[i], modulus) + _fp_round(ys[i], modulus)) for i in range(n)],
+                         error=4.0 * 2.0 ** -MPC_NBIT_F)
+
+
+def test_detach_dealer(mpc):
+    # Nested blocks buffer CP0's sends until the outermost exit; a receive at CP0 inside a block raises.
+    modulus = mpc.default_mpc_modulus
+    data = [1.5, -2.25, 3.0]
+    with mpc.detach_dealer():
+        with mpc.detach_dealer():
+            x = Sharetensor.enc(mpc, data, 0, modulus)
+        still_detached = mpc.comms.detach_dealer
+        y = Sharetensor.enc(mpc, data, 0, modulus)
+    rx = x.reveal(mpc).tolist()
+    ry = y.reveal(mpc).tolist()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tdealer sends inside nested detach_dealer blocks arrive", rx, data, error=1e-9)
+        assert_eq_approx(f"CP{mpc.pid}:\tdealer sends after an inner detach_dealer exit arrive", ry, data, error=1e-9)
+    else:
+        assert_eq(f"CP{mpc.pid}:\tCP0 stays detached until the outermost block exits",
+                  [still_detached, mpc.comms.detach_dealer, mpc.comms.detach_depth == 0], [True, False, True])
+        raised = False
+        with mpc.detach_dealer():
+            try:
+                mpc.comms.receive_as_jar(1, T=int)
+            except ValueError:
+                raised = True
+        assert_eq(f"CP{mpc.pid}:\ta receive at CP0 inside detach_dealer raises", raised, True)
+
+
+@sequre
+def _public_ops(mpc, x_pub, y_sec, scale: float):
+    return x_pub * y_sec, x_pub * x_pub, x_pub * scale, x_pub / 4.0, y_sec * x_pub
+
+
+@sequre
+def _float_list_ops(mpc, x, ws, wm, m):
+    return x * ws, x + ws, x - ws, m * wm, m + wm
+
+
+@sequre
+def _public_float_list_ops(mpc, x_pub, ws):
+    return x_pub + ws, x_pub - ws, x_pub * ws
+
+
+@sequre
+def _public_public_ops(mpc, a, b):
+    return a + b, a - b
+
+
+@sequre
+def _public_scalar_ops(mpc, x_pub, c: float):
+    return x_pub + c, x_pub - c, c + x_pub, c - x_pub, x_pub + 2, 2 - x_pub
+
+
+def _local_value(sv, modulus):
+    # The value a public Sharetensor holds at a compute party (reveal would add the parties' copies)
+    return fp_to_double(sv.share, modulus)
+
+
+def test_public_operands(mpc):
+    # Public x secret fixed point truncates (M-MPC-08), public x public truncates locally with the sign, public
+    # x float and public / float shift signed values correctly; Sharetensor op List[float]
+    n = 12
+    with mpc.randomness.seed_switch(-1):
+        xs = [prg.random() * 8.0 - 4.0 for _ in range(n)]
+        ys = [prg.random() * 8.0 - 4.0 for _ in range(n)]
+        ws = [prg.random() * 4.0 - 2.0 for _ in range(n)]
+    xs[0] = -3.0  # a negative public value
+    for modulus in (MPC_RING_SIZE, MPC_FIELD_SIZE):
+        name = _name(modulus)
+        xr = [_fp_round(e, modulus) for e in xs]
+        yr = [_fp_round(e, modulus) for e in ys]
+        wr = [_fp_round(e, modulus) for e in ws]
+        x_pub = Sharetensor.enc(mpc, xs, 0, modulus).publish(mpc)
+        y = Sharetensor.enc(mpc, ys, 0, modulus)
+        p_sec, p_pub, p_float, p_div, p_rev = _public_ops(mpc, x_pub, y, -1.5)
+        r_sec = p_sec.reveal(mpc).tolist()
+        r_rev = p_rev.reveal(mpc).tolist()
+        y_after = y.reveal(mpc).tolist()
+        ulp = 2.0 ** -MPC_NBIT_F
+        if mpc.pid:
+            assert_eq(f"CP{mpc.pid}:\tpublic x public stays public on the {name}", [p_pub.public, p_float.public, p_div.public, p_sec.public],
+                      [True, True, True, False])
+            assert_eq_approx(f"CP{mpc.pid}:\tpublic x secret fixed point on the {name}", r_sec, [xr[i] * yr[i] for i in range(n)], error=4.0 * ulp)
+            assert_eq_approx(f"CP{mpc.pid}:\tsecret x public fixed point on the {name}", r_rev, [xr[i] * yr[i] for i in range(n)], error=4.0 * ulp)
+            assert_eq_approx(f"CP{mpc.pid}:\tpublic x public fixed point on the {name}", _local_value(p_pub, modulus),
+                             [xr[i] * xr[i] for i in range(n)], error=2.0 * ulp)
+            assert_eq_approx(f"CP{mpc.pid}:\tpublic x float on the {name}", _local_value(p_float, modulus),
+                             [xr[i] * -1.5 for i in range(n)], error=2.0 * ulp)
+            assert_eq_approx(f"CP{mpc.pid}:\tpublic / float on the {name}", _local_value(p_div, modulus),
+                             [xr[i] / 4.0 for i in range(n)], error=2.0 * ulp)
+            assert_eq_approx(f"CP{mpc.pid}:\tsecret operand intact after public products on the {name}", y_after, yr, error=ulp, silent_pass=True)
+
+        # A public tensor plus or minus a public scalar stays public, the constant at every party
+        ps = _public_scalar_ops(mpc, x_pub, 1.25)
+        if mpc.pid:
+            assert_eq(f"CP{mpc.pid}:\tpublic +- scalar stays public on the {name}", [ps[0].public, ps[1].public, ps[2].public, ps[3].public, ps[4].public, ps[5].public],
+                      [True, True, True, True, True, True])
+            assert_eq_approx(f"CP{mpc.pid}:\tpublic +- scalar on the {name}",
+                             [_local_value(ps[0], modulus), _local_value(ps[1], modulus), _local_value(ps[2], modulus),
+                              _local_value(ps[3], modulus), _local_value(ps[4], modulus), _local_value(ps[5], modulus)],
+                             [[xr[i] + 1.25 for i in range(n)], [xr[i] - 1.25 for i in range(n)], [1.25 + xr[i] for i in range(n)],
+                              [1.25 - xr[i] for i in range(n)], [xr[i] + 2.0 for i in range(n)], [2.0 - xr[i] for i in range(n)]],
+                             error=2.0 * ulp)
+
+        # Two public tensors: their sum and difference stay public, added at every party (not x + n_cp y)
+        w_pub = Sharetensor.enc(mpc, ws, 0, modulus).publish(mpc)
+        pp_add, pp_sub = _public_public_ops(mpc, x_pub, w_pub)
+        if mpc.pid:
+            assert_eq(f"CP{mpc.pid}:\tpublic +- public stays public on the {name}", [pp_add.public, pp_sub.public], [True, True])
+            assert_eq_approx(f"CP{mpc.pid}:\tpublic +- public on the {name}", [_local_value(pp_add, modulus), _local_value(pp_sub, modulus)],
+                             [[xr[i] + wr[i] for i in range(n)], [xr[i] - wr[i] for i in range(n)]], error=2.0 * ulp)
+
+        # A public tensor with public float vectors stays public, the same value at every party
+        pl_add, pl_sub, pl_mul = _public_float_list_ops(mpc, x_pub, ws)
+        if mpc.pid:
+            assert_eq(f"CP{mpc.pid}:\tpublic +- * List[float] stays public on the {name}", [pl_add.public, pl_sub.public, pl_mul.public],
+                      [True, True, True])
+            assert_eq_approx(f"CP{mpc.pid}:\tpublic + List[float] on the {name}", _local_value(pl_add, modulus),
+                             [xr[i] + wr[i] for i in range(n)], error=2.0 * ulp)
+            assert_eq_approx(f"CP{mpc.pid}:\tpublic - List[float] on the {name}", _local_value(pl_sub, modulus),
+                             [xr[i] - wr[i] for i in range(n)], error=2.0 * ulp)
+            assert_eq_approx(f"CP{mpc.pid}:\tpublic * List[float] on the {name}", _local_value(pl_mul, modulus),
+                             [xr[i] * wr[i] for i in range(n)], error=2.0 * ulp)
+
+        wm = [[ws[i * 4 + j] for j in range(4)] for i in range(3)]
+        m = Sharetensor.enc(mpc, [[ys[i * 4 + j] for j in range(4)] for i in range(3)], 0, modulus)
+        q_mul, q_add, q_sub, q_mmul, q_madd = _float_list_ops(mpc, y, ws, wm, m)
+        r_mul, r_add, r_sub = q_mul.reveal(mpc).tolist(), q_add.reveal(mpc).tolist(), q_sub.reveal(mpc).tolist()
+        r_mmul, r_madd = q_mmul.reveal(mpc).tolist(), q_madd.reveal(mpc).tolist()
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tSharetensor * List[float] on the {name}", r_mul, [yr[i] * wr[i] for i in range(n)], error=4.0 * ulp)
+            assert_eq_approx(f"CP{mpc.pid}:\tSharetensor + List[float] on the {name}", r_add, [yr[i] + wr[i] for i in range(n)], error=2.0 * ulp)
+            assert_eq_approx(f"CP{mpc.pid}:\tSharetensor - List[float] on the {name}", r_sub, [yr[i] - wr[i] for i in range(n)], error=2.0 * ulp)
+            assert_eq_approx(f"CP{mpc.pid}:\tSharetensor * List[List[float]] on the {name}", r_mmul,
+                             [[yr[i * 4 + j] * wr[i * 4 + j] for j in range(4)] for i in range(3)], error=4.0 * ulp)
+            assert_eq_approx(f"CP{mpc.pid}:\tSharetensor + List[List[float]] on the {name}", r_madd,
+                             [[yr[i * 4 + j] + wr[i * 4 + j] for j in range(4)] for i in range(3)], error=2.0 * ulp)
+
+
+def test_bitwise(mpc):
+    print(f"CP{mpc.pid}:\tTesting bitwise MPC, the ring sign test and normalizer, Decor division and public operands ...\n")
+    test_primitives_local(mpc)
+    test_xor_sharing(mpc)
+    test_bit_operations(mpc)
+    test_add_public(mpc)
+    test_sign(mpc)
+    test_ring_gt(mpc)
+    test_normalizer(mpc)
+    test_division(mpc)
+    test_square_and_switch_ring(mpc)
+    test_truncation_control(mpc)
+    test_detach_dealer(mpc)
+    test_public_operands(mpc)
+    print(f"CP{mpc.pid}:\tBitwise tests passed.\n")

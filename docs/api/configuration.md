@@ -66,6 +66,31 @@ _Defined in `stdlib/sequre/settings.codon` and `stdlib/sequre/constants.codon`_
 - **`MPC_NBIT_F`**: The fractional bit-width in fixed-point representation
 - **`MPC_NBIT_V`**: The statistical security padding for fixed-point representation (needed only in comparison protocols on finite fields)
 
+`MPC_INT_SIZE` sets the fixed-point precision: F = 32 fractional bits at 128 and 192 bits, F = 64 at 256 bits. Decor's
+nonlinear functions compute the function itself, so their error comes from the fixed-point encodings ($2^{-F}$) and,
+at F = 64, from the plaintext evaluations of their terms in double precision ($2^{-52}$ of their size), which then
+dominate: the 256-bit build gains about 4 to 6 decimal digits, and its default intervals are wider (see
+[Nonlinear Functions](../user-guide/nonlinear-functions.md#precision)).
+
+### Nonlinear functions
+
+| Constant | F = 32 | F = 64 | Description |
+|---|---|---|---|
+| `DECOR_INTERVAL_EXP` | (−8, 8) | (−20, 20) | Decor exp's default interval |
+| `DECOR_INTERVAL_SIGMOID` | (−10, 10) | (−15, 15) | Decor sigmoid's default interval |
+| `DECOR_INTERVAL_TANH` | (−5, 5) | (−8, 8) | Decor tanh's default interval |
+| `DECOR_INTERVAL_SINH` | (−5, 5) | (−8, 8) | Decor sinh's and cosh's default interval |
+| `DECOR_TOLERANCE` | $2^{-12}$ | $2^{-28}$ | Admissibility: the largest accepted error bound, relative to $\max(1, \max \lvert f \rvert)$ on the interval |
+| `DECOR_DIV_DEFAULT_NITER` | 4 | 5 | Goldschmidt iterations of Decor's division |
+| `DECOR_DIV_DEFAULT_METHOD` | `"goldschmidt"` | | Decor's inverse: `"goldschmidt"` (49 rounds at F = 32; a division x / y adds the product with x and its truncation: 51) or `"newton"` (55) |
+| `DECOR_SIGMOID_COMBINER` | `"select"` | | Decor's sigmoid and tanh: the addition theorem with one division (`"select"`), or exp and an inverse (`"exp"`) |
+| `CHEBYSHEV_DEGREE` | 20 | | Default degree of the Chebyshev method |
+| `NONLINEAR_FOURIER_DEGREE` | 16 | | Default degree of the Fourier method |
+| `NONLINEAR_TAYLOR_DEGREE` | 8 | | Default degree of the Taylor method |
+| `NONLINEAR_SOFTMAX_WIDTH` | 16 | | softmax evaluates $e^z$ on $(-W, 0]$ and saturates below ($e^{-16} \approx 1.1 \times 10^{-7}$) |
+| `LOSS_LOG_INTERVAL` | (1e-4, 1) | | The cross-entropies' log interval (`Sequential.compile(loss_interval=...)`) |
+| `PACKING_SIZE` | 64 | 128 | Bits per register in bitwise (XOR) sharing (= `MPC_NBIT_K`) |
+
 ### Lattiseq constants
 
 | Constant | Value | Description |

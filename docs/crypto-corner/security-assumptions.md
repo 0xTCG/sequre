@@ -49,6 +49,31 @@ $$x = x_1 + x_2 + \cdots + x_N \pmod{p}$$
 
 Shares and masks are drawn uniformly from the whole field with a cryptographically secure PRG, seeded pairwise between the parties over TLS. The shares seen by a coalition that misses at least one party (subject to the dealer caveat above) are therefore computationally indistinguishable from uniform: security rests on the PRG, not on perfect (information-theoretic) secrecy.
 
+## Decor and bitwise (XOR) sharing
+
+Sequre's nonlinear functions ([Nonlinear Functions](../user-guide/nonlinear-functions.md)) and its ring comparisons,
+division and square root add two kinds of messages to the MPC path. Neither needs a new assumption.
+
+**Decor's opening.** Each call scales its input to $t$ and partitions it like a Beaver multiplication: the compute
+parties open $t - r$ for a mask $r$ drawn uniformly over the whole modulus (field or ring) from the pairwise PRG
+streams. The opening is uniform and independent of the input. Every call draws a fresh mask: two openings against the
+same mask would reveal the difference of the two inputs.
+
+**The dealer's role.** CP0 knows $r$: it deals the shares of $h(r)$ that the decomposition combines, and an XOR sharing
+of $r$'s fractional bits for the carry. As with Beaver triples, CP0 together with any one compute party can recover $t$.
+Decor adds no trust beyond the existing [dealer assumption](#trusted-dealer-cp0).
+
+**Bitwise sharing.** The carry, the ring sign test and the ring normalizer XOR-share bits among the compute parties,
+packed into registers. Every mask is uniform over all bits of its register. What they open is masked uniformly over
+the opened width: the XOR-masked operands of AND gates, Beaver partitions, the sign test's $-a + r \bmod 2^{\text{bits}}$,
+the normalizer's $X - r \bmod 2^K$ and its masked one-hot bits, and each bit-to-arithmetic conversion's masked bit.
+
+**Public checks.** Before any communication, every party checks the function, interval, degree and tolerance
+(admissibility). The checks read public parameters only, so a refusal reveals nothing about the data.
+
+**Inputs outside the interval** give wrong results (for example, $f(x - kp)$ for Decor's bounded functions), not a leak.
+Only debug builds (`DEBUG = True`) open inputs, to warn about values outside the interval.
+
 ## Noise and masks in the MHE protocols
 
 What each protocol reveals to the party that combines the shares (the hub):

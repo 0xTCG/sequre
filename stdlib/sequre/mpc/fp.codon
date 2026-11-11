@@ -1,6 +1,6 @@
 from sequre.constants import mpc_uint, MPC_NBIT_K, MPC_NBIT_F, MPC_NBIT_V, MPC_MODULUS_BITS, MPC_SECOND_FIELD_SIZE
 from sequre.utils.primitives import mod_inv, mod_pow
-from sequre.types.utils import num_to_bits
+from sequre.types.utils import num_to_bits, double_to_fp
 
 from stats import MPCStats
 from randomness import MPCRandomness
@@ -21,7 +21,10 @@ class MPCFP[TP]:
     boolean: MPCBoolean[TP]
     invpow_cache: dict[int, TP]
     debug: bool
+    # trunc returns its input unchanged while default_truncation_allowed is False or a truncation scope is open
+    # (MPCEnv.delayed_truncation(); truncation_scopes counts the open ones, so scopes nest).
     default_truncation_allowed: bool
+    truncation_scopes: int
 
     def __init__(self, boolean: MPCBoolean[TP]):
         self.pid = boolean.pid
@@ -36,6 +39,7 @@ class MPCFP[TP]:
 
         self.debug = False
         self.default_truncation_allowed = True
+        self.truncation_scopes = 0
         self.reset_stats()
 
     def reset_stats(self):
@@ -44,7 +48,22 @@ class MPCFP[TP]:
     def print_stats(self, file_stream = None):
         self.stats.print_fp_stats(file_stream)
     
+    def truncation_allowed(self) -> bool:
+        return self.default_truncation_allowed and self.truncation_scopes == 0
+
+    def require_truncation(self, caller: str):
+        # Protocols with internal truncations (division, square root, Decor's nonlinear functions) cannot defer them:
+        # inside MPCEnv.delayed_truncation() they would return garbage, so they refuse to run. Every party raises at the
+        # same call, before any round.
+        if not self.truncation_allowed():
+            raise ValueError(
+                f"{caller}: cannot run inside MPCEnv.delayed_truncation(): its internal truncations cannot be deferred")
+
     def trunc(self, a, modulus, k = MPC_NBIT_K + MPC_NBIT_F, m = MPC_NBIT_F):
+        # Every party takes the same branch: the scope depth changes at the same calls everywhere.
+        if not self.truncation_allowed():
+            return a.copy()
+
         self.stats.truncations_count += 1
         assert (k + MPC_NBIT_V) < MPC_MODULUS_BITS, (
             f"Internal error: Truncation config too large for modulus. "
@@ -104,6 +123,25 @@ class MPCFP[TP]:
             a = a.mul_mod(self.invpow_cache[m], modulus)
         
         return a
+
+    def weighted_sum(self, shares, weights, modulus, k = MPC_NBIT_K + MPC_NBIT_F, m = MPC_NBIT_F):
+        """
+        Sum_i weights[i] * shares[i] with one truncation, for fixed-point shares and public weights.
+
+        Each weight is a float, or a list (matrix) of floats matching its share's shape, and is encoded in fixed point
+        (negative weights included). The products stay at scale 2^(2m) until the single truncation at the end, so
+        |Sum_i weights[i] * value_i| must stay below 2^(k - 2m) (2^32 with the default k = K + F, m = F); a
+        truncation per product would cost one opening each.
+        """
+        assert len(shares) == len(weights), "weighted_sum: one weight per share"
+        assert len(shares) > 0, "weighted_sum: nothing to sum"
+
+        acc = shares[0].zeros()
+        if self.pid > 0:
+            for i in range(len(shares)):
+                acc = acc.add_mod(shares[i].mul_mod(double_to_fp(weights[i], modulus), modulus), modulus)
+
+        return self.trunc(acc, modulus, k, m)
 
     def __nee_wrapper(self, a, modulus):
         if isinstance(a, mpc_uint):

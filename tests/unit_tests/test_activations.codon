@@ -1,0 +1,568 @@
+""" Neural-net activations: every activation's value and derivative in the clear (ndarray), on Sharetensors and on
+MPUs, for Decor and Chebyshev, on the run's modulus (the ring with --use-ring). Run with 3 and 4 parties.
+
+- In the clear: the method's result against its definition, computed independently: Decor (and the comparisons, asigmoid):
+  the function within 1e-9 and its derivative against a central finite difference; Chebyshev: the interpolant at the
+  default degree on the default interval (monomial form) and the derivative formula applied to it.
+- Sharetensor (every activation): value and derivative against the plaintext path within the fixed-point error model
+  (decor_error_bound, trig_error_bound, Clenshaw's bound; first-order propagation through the derivative formulas and
+  the composites); f_with_derivative against f and df; inputs intact.
+- MPU: partitions in the clear (each party evaluates its rows locally: the plaintext result) and encrypted (through MPC).
+- Clipped (what Dense calls): on both sides of each end of the default interval, the value is f at the clipped point and
+  the derivative f' there inside the interval, 0 beyond it (ndarray and Sharetensor; sin/cos, sinh/cosh through their
+  joint paths).
+- The module's default method is Chebyshev (no method given: the Chebyshev definition).
+"""
+
+import math
+
+from sequre.constants import *
+from sequre.stdlib.numpy.create import array
+from sequre.types.sharetensor import Sharetensor
+from sequre.types.multiparty_aggregate import MPA
+from sequre.types.multiparty_union import MPU
+from sequre.types.utils import double_to_fp, fp_to_double
+from sequre.utils.testing import assert_eq, assert_eq_approx as _assert_eq_approx
+from sequre.stdlib.chebyshev import chebyshev_coeffs, chebyshev_nodes
+from sequre.decor import linspace, cheb2poly, poly_eval, decor_error_bound, trig_error_bound
+from sequre.stdlib.learn.neural_net.activations import activate, activate_with_derivative, dactivate, softmax, sigmoid as act_sigmoid
+from sequre.stdlib.learn.neural_net.activations import (
+    dsigmoid as act_dsigmoid, dtanh as act_dtanh, dexp as act_dexp, dsin as act_dsin, dcos as act_dcos, dtan as act_dtan,
+    dcot as act_dcot, dsinh as act_dsinh, dcosh as act_dcosh, dgelu as act_dgelu, dsilu as act_dsilu, derf as act_derf)
+
+from multiparty_testing import unequal_ratios, own_rows, partition, encrypted_at
+
+
+# The checks compare in double precision: no tolerance goes below double precision (2^-50 of the expected value). It
+# matters at F = 64, where a unit of 2^-F is below it.
+def assert_eq_approx(name, result, expected, error: float = 0.018, silent_pass: bool = False, rel_error: float = 0.0):
+    _assert_eq_approx(name, result, expected, error, silent_pass, max(rel_error, 2.0 ** -50))
+
+
+ULP = 2.0 ** -MPC_NBIT_F
+FD_STEP = 1e-5
+# Every activation but softmax (which has no element-wise derivative: checked on its own)
+ACTIVATIONS = ["relu", "linear", "leaky_relu", "hardtanh", "relu6", "asigmoid", "sigmoid", "tanh", "exp", "sin", "cos",
+               "tan", "cot", "sinh", "cosh", "gelu", "silu", "erf"]
+PIECEWISE = ["relu", "linear", "leaky_relu", "hardtanh", "relu6"]
+
+
+def _name(modulus) -> str:
+    return "ring" if modulus.popcnt() == 1 else "field"
+
+
+def _sigmoid(v: float) -> float:
+    return 1.0 / (1.0 + math.exp(-v)) if v >= 0.0 else math.exp(v) / (1.0 + math.exp(v))
+
+
+def _gelu(v: float) -> float:
+    return 0.5 * v * (1.0 + math.tanh(GELU_ALPHA * (v + GELU_BETA * v * v * v)))
+
+
+def _plain(name: str, v: float) -> float:
+    # The activations' definitions in double precision
+    if name == "relu": return v if v > 0.0 else 0.0
+    if name == "linear": return v
+    if name == "leaky_relu": return v if v > 0.0 else LEAKY_RELU_SLOPE * v
+    if name == "hardtanh": return min(max(v, -1.0), 1.0)
+    if name == "relu6": return min(max(v, 0.0), 6.0)
+    if name == "asigmoid": return v / math.sqrt(v * v + 1.0)
+    if name == "sigmoid": return _sigmoid(v)
+    if name == "tanh": return math.tanh(v)
+    if name == "exp": return math.exp(v)
+    if name == "sin": return math.sin(v)
+    if name == "cos": return math.cos(v)
+    if name == "tan": return math.tan(v)
+    if name == "cot": return 1.0 / math.tan(v)
+    if name == "sinh": return math.sinh(v)
+    if name == "cosh": return math.cosh(v)
+    if name == "gelu": return _gelu(v)
+    if name == "silu": return v * _sigmoid(v)
+    return math.erf(v)
+
+
+def _points(name: str) -> List[float]:
+    # Inside every method's default interval (Chebyshev's tan (-1.2, 1.2), cot (0.4, 2.7); Decor's tanh (-5, 5) at
+    # F = 32 for gelu's inner argument), away from the kinks (0, +-1, 6) and the poles
+    if name == "tan": return linspace(-0.7, 0.7, 8)
+    if name == "cot": return linspace(0.8, 2.3, 8)
+    if name == "sinh" or name == "cosh" or name == "exp": return linspace(-1.8, 1.8, 8)
+    if name == "relu6": return linspace(-2.7, 6.9, 8)
+    if name == "gelu" or name == "tanh" or name == "erf": return linspace(-2.7, 2.7, 8)
+    if name == "sin" or name == "cos": return linspace(-3.0, 3.0, 8)  # inside Chebyshev's (-pi, pi)
+    return linspace(-3.3, 3.3, 8)
+
+
+def _fd(name: str, v: float) -> float:
+    return (_plain(name, v + FD_STEP) - _plain(name, v - FD_STEP)) / (2.0 * FD_STEP)
+
+
+def _scale(values: List[float]) -> float:
+    m = 1.0
+    for v in values:
+        m = max(m, abs(v))
+    return m
+
+
+def _abs_sum(values: List[float]) -> float:
+    s = 0.0
+    for v in values:
+        s += abs(v)
+    return s
+
+
+def _cheb_interval(func: str) -> Tuple[float, float]:
+    # nonlinear.default_interval for the polynomial methods (restated)
+    if func == "sin" or func == "cos": return (-math.pi, math.pi)
+    if func == "tan": return (-1.2, 1.2)
+    if func == "cot": return (0.4, 2.7)
+    if func == "exp": return (-8.0, 8.0)
+    if func == "sigmoid": return (-10.0, 10.0)
+    if func == "erf": return (-4.0, 4.0)
+    return (-5.0, 5.0)
+
+
+def _clenshaw_bound(func: str, interval: Tuple[float, float] = (0.0, 0.0)) -> float:
+    # Clenshaw truncates once per step: (4 + 2 degree) units per unit of sum |c_k| (as in test_nonlinear); interval
+    # (0, 0): the function's default
+    a, b = _cheb_interval(func) if interval[0] == 0.0 and interval[1] == 0.0 else interval
+    c = chebyshev_coeffs(lambda v: _plain(func, v), chebyshev_nodes(CHEBYSHEV_DEGREE + 1, (a, b)), (a, b))
+    # (F = 64: the double-precision terms, 64 2^-52 (1 + sum |c_k|), in place of 1e-9; the checks compare against the
+    # plaintext path, Clenshaw in double as well)
+    return (4.0 + 2.0 * float(CHEBYSHEV_DEGREE)) * ULP * (1.0 + _abs_sum(c)) + (1e-9 if MPC_NBIT_F <= 32 else 64.0 * 2.0 ** -52.0 * (1.0 + _abs_sum(c)))
+
+
+def _base_error(name: str, method: str, xs: List[float], values: List[float]) -> float:
+    # The error of the nonlinear building block each activation evaluates (the error models of test_nonlinear)
+    if name in PIECEWISE:
+        return 4.0 * ULP
+    if name == "asigmoid":
+        # Sequre's square root and division: a few units relative to the result (in [-1, 1])
+        return 64.0 * ULP
+    inner = "tanh" if name == "gelu" else ("sigmoid" if name == "silu" else name)
+    if name == "erf" or method == METHOD_CHEBYSHEV:
+        return _clenshaw_bound(inner)
+    if inner == "sin" or inner == "cos":
+        return trig_error_bound(_scale(xs))
+    if inner == "tan" or inner == "cot":
+        # sin / cos (or cos / sin): the division's few units, or the joint sin and cos error carried through the
+        # quotient (at most twice it times 1 + quotient^2 on these points), whichever is larger (the latter at F = 64,
+        # where double precision caps sin and cos)
+        return max(64.0 * ULP * _scale(values) * _scale(values), 2.0 * trig_error_bound(_scale(xs)) * (1.0 + _scale(values) * _scale(values)))
+    # decor_error_bound takes its function name at compile time
+    if inner == "sigmoid": return decor_error_bound("sigmoid")
+    if inner == "tanh": return decor_error_bound("tanh")
+    if inner == "exp": return decor_error_bound("exp")
+    if inner == "sinh": return decor_error_bound("sinh")
+    return decor_error_bound("cosh")
+
+
+def _tolerances(name: str, method: str, xs: List[float], values: List[float], slopes: List[float]) -> Tuple[float, float]:
+    # (value, derivative): the building block's error e, propagated to first order through the composite and the
+    # derivative formula. Derivatives are products of at most three factors no larger than (1 + max |x|) times the
+    # largest of value and slope; 16 units cover the truncations.
+    e = _base_error(name, method, xs, values)
+    growth = (1.0 + _scale(xs)) * _scale(values) * _scale(slopes)
+    value_tol = e * (1.0 + _scale(xs) if name == "gelu" or name == "silu" else 1.0) + 16.0 * ULP * _scale(values)
+    slope_tol = 8.0 * e * growth + 16.0 * ULP * growth
+    if name == "exp" or name == "sinh" or name == "cosh":
+        # exp' is the value itself; sinh' and cosh' are the joint output's other half, as accurate as the value
+        slope_tol = e + 16.0 * ULP * _scale(slopes)
+    if name == "erf":
+        # derf = 2 / sqrt(pi) e^(-x^2): Decor's (or Chebyshev's) exp on (-16, 0]
+        exp_error = decor_error_bound("exp", (-16.0, 0.0)) if method == METHOD_DECOR else _clenshaw_bound("exp", (-16.0, 0.0))
+        slope_tol = 2.0 * exp_error + 16.0 * ULP
+    return value_tol, slope_tol
+
+
+def _interpolant(func: str, interval: Tuple[float, float]) -> List[float]:
+    # The degree-CHEBYSHEV_DEGREE Chebyshev interpolant in monomial form (in the variable mapped to [-1, 1])
+    return cheb2poly(chebyshev_coeffs(lambda v: _plain(func, v), chebyshev_nodes(CHEBYSHEV_DEGREE + 1, interval), interval))
+
+
+def _interp(mono: List[float], interval: Tuple[float, float], v: float) -> float:
+    a, b = interval
+    return poly_eval(mono, (2.0 * v - a - b) / (b - a))
+
+
+def _cheb_definition(name: str, xs: List[float]) -> Tuple[List[float], List[float]]:
+    # The Chebyshev method's values and derivatives: the building blocks' interpolants (default intervals) and the
+    # activations' derivative formulas applied to them
+    if name == "sigmoid" or name == "silu":
+        m = _interpolant("sigmoid", _cheb_interval("sigmoid"))
+        s = [_interp(m, _cheb_interval("sigmoid"), v) for v in xs]
+        if name == "sigmoid":
+            return s, [e * (1.0 - e) for e in s]
+        return [xs[i] * s[i] for i in range(len(xs))], [s[i] * (1.0 + xs[i] * (1.0 - s[i])) for i in range(len(xs))]
+    if name == "tanh" or name == "gelu":
+        m = _interpolant("tanh", _cheb_interval("tanh"))
+        if name == "tanh":
+            t = [_interp(m, _cheb_interval("tanh"), v) for v in xs]
+            return t, [1.0 - e * e for e in t]
+        values = List[float]()
+        slopes = List[float]()
+        for v in xs:
+            inner = GELU_ALPHA * (v + GELU_BETA * v * v * v)
+            dinner = GELU_ALPHA * (1.0 + 3.0 * GELU_BETA * v * v)
+            t = _interp(m, _cheb_interval("tanh"), inner)
+            values.append(0.5 * v * (1.0 + t))
+            slopes.append(0.5 * (1.0 + t) + 0.5 * v * (1.0 - t * t) * dinner)
+        return values, slopes
+    if name == "exp":
+        m = _interpolant("exp", _cheb_interval("exp"))
+        e = [_interp(m, _cheb_interval("exp"), v) for v in xs]
+        return e, e.copy()
+    if name == "sin" or name == "cos":
+        ms = _interpolant("sin", _cheb_interval("sin"))
+        mc = _interpolant("cos", _cheb_interval("cos"))
+        sv = [_interp(ms, _cheb_interval("sin"), v) for v in xs]
+        cv = [_interp(mc, _cheb_interval("cos"), v) for v in xs]
+        if name == "sin":
+            return sv, cv
+        return cv, [-e for e in sv]
+    if name == "tan":
+        m = _interpolant("tan", _cheb_interval("tan"))
+        t = [_interp(m, _cheb_interval("tan"), v) for v in xs]
+        return t, [1.0 + e * e for e in t]
+    if name == "cot":
+        m = _interpolant("cot", _cheb_interval("cot"))
+        c = [_interp(m, _cheb_interval("cot"), v) for v in xs]
+        return c, [-(1.0 + e * e) for e in c]
+    if name == "sinh" or name == "cosh":
+        mh = _interpolant("sinh", _cheb_interval("sinh"))
+        mc = _interpolant("cosh", _cheb_interval("cosh"))
+        hv = [_interp(mh, _cheb_interval("sinh"), v) for v in xs]
+        cv = [_interp(mc, _cheb_interval("cosh"), v) for v in xs]
+        if name == "sinh":
+            return hv, cv
+        return cv, hv
+    # erf: the erf interpolant; the derivative's exp interpolated on (-16, 0] (clipped below)
+    m = _interpolant("erf", _cheb_interval("erf"))
+    me = _interpolant("exp", (-16.0, 0.0))
+    return [_interp(m, _cheb_interval("erf"), v) for v in xs], \
+        [1.1283791670955126 * _interp(me, (-16.0, 0.0), max(-v * v, -16.0)) for v in xs]
+
+
+def _each(mpc, modulus: mpc_uint, name: str, method: Static[str]):
+    label = f"{name}, {method}, on the {_name(modulus)}"
+    xs = _points(name)
+    xf = [fp_to_double(double_to_fp(v, modulus), modulus) for v in xs]
+    exact = [_plain(name, v) for v in xf]
+    exact_slope = [_fd(name, v) for v in xf]
+
+    # In the clear: the method's own result
+    plain_v, plain_d = activate_with_derivative(mpc, array(xf), name, method)
+    pv = plain_v.tolist()
+    pd = plain_d.tolist()
+
+    # Sharetensor: the value alone, the derivative alone, and both together
+    x = Sharetensor.enc(mpc, xs, 0, modulus)
+    sv = activate(mpc, x, name, method, clip=False).reveal(mpc).tolist()
+    swd_v, swd_d = activate_with_derivative(mpc, x, name, method)
+    s_v = swd_v.reveal(mpc).tolist()
+    s_d = swd_d.reveal(mpc).tolist()
+    after = x.reveal(mpc).tolist()
+
+    if mpc.pid:
+        # The definitions: the function and a central difference (Decor, the comparisons, asigmoid; erf's value is
+        # Chebyshev's under either method), or the Chebyshev interpolants and the derivative formulas
+        cheb_v, cheb_d = _cheb_definition(name, xf) if not (name in PIECEWISE or name == "asigmoid") else (exact, exact_slope)
+        exact_value = (method == METHOD_DECOR and name != "erf") or name in PIECEWISE or name == "asigmoid"
+        exact_slope_ok = method == METHOD_DECOR or name in PIECEWISE or name == "asigmoid"
+        want_v = exact if exact_value else cheb_v
+        want_d = exact_slope if exact_slope_ok else cheb_d
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: plaintext value (the method's definition)", pv, want_v, error=1e-9 * _scale(want_v), silent_pass=True)
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: plaintext derivative (central difference or the formula)", pd, want_d, error=(1e-5 if exact_slope_ok else 1e-9) * _scale(want_d), silent_pass=True)
+        value_tol, slope_tol = _tolerances(name, method, xf, pv, pd)
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: Sharetensor value", sv, pv, error=value_tol)
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: Sharetensor value with the derivative", s_v, pv, error=value_tol, silent_pass=True)
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: Sharetensor derivative", s_d, pd, error=slope_tol)
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: input intact", after, xf, error=ULP, silent_pass=True)
+
+
+def _mpu_check(mpc, modulus: mpc_uint, name: str, method: Static[str], encrypted: bool):
+    # A 2-D MPU in partition mode (each compute party's rows), its partitions in the clear or encrypted
+    n_cp = mpc.comms.number_of_parties - 1
+    ratios = unequal_ratios(n_cp)
+    rows = ratios.sum()
+    pts = _points(name)
+    grid = [[pts[(i * 3 + j) % len(pts)] for j in range(3)] for i in range(rows)]
+    matrix = array(grid)
+    start, stop = own_rows(mpc, ratios)
+    if encrypted:
+        mpp = encrypted_at(mpc, partition(mpc, matrix, ratios), [p for p in range(1, n_cp + 1)])
+        mpu = MPU[Tuple[int, int], float](_mpp=mpp, _mpa=MPA[Tuple[int, int], float](mpc))
+    else:
+        mpu = MPU(mpc, matrix[start:stop] if mpc.pid else matrix, "partition")
+    v, d = activate_with_derivative(mpc, mpu, name, method)
+    rv = v.reveal(mpc).tolist()
+    rd = d.reveal(mpc).tolist()
+    mpu_after = mpu.reveal(mpc).tolist()
+    plain_v, plain_d = activate_with_derivative(mpc, matrix, name, method)
+    pv = plain_v.tolist()
+    pd = plain_d.tolist()
+    if mpc.pid:
+        flat_x = [e for row in grid for e in row]
+        flat_v = [e for row in pv for e in row]
+        flat_d = [e for row in pd for e in row]
+        value_tol, slope_tol = _tolerances(name, method, flat_x, flat_v, flat_d)
+        # Encrypted: the HE noise, as test_nonlinear models it: Chebyshev's recurrence runs natively on the ciphertexts
+        # (2e-3: measured 2.9e-4 systematic, one 1.06e-3 outlier); Decor goes through the HE <-> MPC switches (1e-3, plus
+        # the input's switch noise, 1e-4, times the slope). Measured here: 2e-5 to 7e-5.
+        slope = _scale(flat_d)
+        noise = ((2e-3 if method == METHOD_CHEBYSHEV else 1e-3) + 1e-4 * slope) if encrypted else 1e-9
+        where = "encrypted" if encrypted else "in the clear"
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {name}, {method}, MPU {where} on the {_name(modulus)}: value", rv, pv, error=value_tol + noise)
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {name}, {method}, MPU {where} on the {_name(modulus)}: derivative", rd, pd, error=slope_tol + noise)
+        # (an encrypted input decrypts with CKKS's noise)
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {name}, {method}, MPU {where} on the {_name(modulus)}: input intact", mpu_after, grid,
+                         error=1e-4 if encrypted else 1e-9, silent_pass=True)
+
+
+def _softmax_check(mpc, modulus: mpc_uint, method: Static[str]):
+    rows = [[0.5, -1.25, 2.0, 0.0], [3.0, 3.0, -2.0, 1.5]]
+    x = Sharetensor.enc(mpc, rows, 0, modulus)
+    got = softmax(mpc, x, method).reveal(mpc).tolist()
+    plain = softmax(mpc, array(rows), method).tolist()
+    x_after = x.reveal(mpc).tolist()
+    # The definition: e^(x - row max) (Decor: the function; Chebyshev: its interpolant on (-16, 0], clipped below),
+    # normalized per row
+    me = _interpolant("exp", (-NONLINEAR_SOFTMAX_WIDTH, 0.0))
+    want = List[List[float]]()
+    for r in rows:
+        m = max(r)
+        e = [math.exp(v - m) if method == METHOD_DECOR else
+             _interp(me, (-NONLINEAR_SOFTMAX_WIDTH, 0.0), max(v - m, -NONLINEAR_SOFTMAX_WIDTH)) for v in r]
+        total = sum(e)
+        want.append([v / total for v in e])
+    if mpc.pid:
+        # (1 + cols) times the exp's error plus a few units (nonlinear.softmax)
+        exp_error = decor_error_bound("exp", (-NONLINEAR_SOFTMAX_WIDTH, 0.0)) if method == METHOD_DECOR else \
+            _clenshaw_bound("exp", (-NONLINEAR_SOFTMAX_WIDTH, 0.0))
+        tol = (1.0 + 4.0) * exp_error + 64.0 * ULP
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation softmax, {method}, plaintext (the definition) on the {_name(modulus)}", plain, want, error=1e-9)
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation softmax, {method}, Sharetensor on the {_name(modulus)}", got, plain, error=tol)
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation softmax, {method}, input intact on the {_name(modulus)}", x_after,
+                         [[fp_to_double(double_to_fp(v, modulus), modulus) for v in r] for r in rows], error=ULP, silent_pass=True)
+
+
+def _clip_interval(name: str, method: Static[str]) -> Tuple[float, float]:
+    # The default interval a clipped activation uses: Decor's DECOR_INTERVAL_* (erf: Chebyshev's) or Chebyshev's
+    if method == METHOD_DECOR and name != "erf":
+        if name == "sigmoid": return DECOR_INTERVAL_SIGMOID
+        if name == "tanh": return DECOR_INTERVAL_TANH
+        if name == "exp": return DECOR_INTERVAL_EXP
+        return DECOR_INTERVAL_SINH
+    return _cheb_interval(name)
+
+
+def _clip_check(mpc, modulus: mpc_uint, name: str, method: Static[str]):
+    # The clipped training forward (what Dense calls): f at the clipped point, and f' there inside the interval but 0
+    # beyond it (the clipped function is flat), on an ndarray and on a Sharetensor, at points on both sides of each end
+    lo, hi = _clip_interval(name, method)
+    w = hi - lo
+    xs = [lo - 0.4 * w, lo - 0.02 * w, lo + 0.3 * w, hi - 0.1 * w, hi + 0.02 * w, hi + 0.4 * w]
+    xf = [fp_to_double(double_to_fp(v, modulus), modulus) for v in xs]
+    xc = [min(max(v, lo), hi) for v in xf]
+    inside = [1.0 if lo <= v and v <= hi else 0.0 for v in xf]
+    ref_v, ref_d = activate_with_derivative(mpc, array(xc), name, method)
+    want_v = ref_v.tolist()
+    rd = ref_d.tolist()
+    want_d = [rd[i] * inside[i] for i in range(len(xf))]
+    plain_v, plain_d = activate_with_derivative(mpc, array(xf), name, method, clip=True)
+    plain_dd = dactivate(mpc, array(xf), name, method, clip=True)
+    x = Sharetensor.enc(mpc, xs, 0, modulus)
+    sv, sd = activate_with_derivative(mpc, x, name, method, clip=True)
+    s_v = sv.reveal(mpc).tolist()
+    s_d = sd.reveal(mpc).tolist()
+    s_dd = dactivate(mpc, x, name, method, clip=True).reveal(mpc).tolist()
+    after = x.reveal(mpc).tolist()
+    if mpc.pid:
+        label = f"{name}, {method}, clipped, on the {_name(modulus)}"
+        value_tol, slope_tol = _tolerances(name, method, xc, want_v, want_d)
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: plaintext value f(clip x)", plain_v.tolist(), want_v, error=1e-12 * _scale(want_v), silent_pass=True)
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: plaintext derivative f'(clip x) inside, 0 beyond", plain_d.tolist(), want_d, error=1e-12 * _scale(want_d), silent_pass=True)
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: Sharetensor value f(clip x)", s_v, want_v, error=value_tol, silent_pass=True)
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: Sharetensor derivative f'(clip x) inside, 0 beyond (got {s_d[0]:.2e}, {s_d[5]:.2e} at {xf[0]:.2f}, {xf[5]:.2f})", s_d, want_d, error=slope_tol)
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: dactivate, plaintext and Sharetensor, = the masked derivative",
+                         [plain_dd.tolist(), s_dd], [want_d, want_d], error=slope_tol, silent_pass=True)
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: input intact", after, xf, error=ULP, silent_pass=True)
+
+
+def _composite_clip_check(mpc, modulus: mpc_uint, name: str, method: Static[str]):
+    # gelu and silu clip their inner tanh's (argument u = sqrt(2/pi) (x + 0.044715 x^3)) or sigmoid's (argument x)
+    # argument: beyond it the inner function is fixed, so the slope is the clipped function's, 0.5 (1 + t) for gelu and
+    # s for silu. Against the definitions in double (the method's inner function at the clipped point, the inner term
+    # masked): every point on an ndarray, and on a Sharetensor the points beyond the band, where the unmasked slope is
+    # off by 1e-3 to 1e-2, against twice the inner function's error plus a few units
+    inner = "tanh" if name == "gelu" else "sigmoid"
+    lo, hi = _clip_interval(inner, method)
+    xs = [-8.0, -6.0, -1.0, 0.5, 2.0, 6.0, 8.0] if name == "gelu" else [-20.0, -14.0, -3.0, 1.0, 7.0, 14.0, 20.0]
+    xf = [fp_to_double(double_to_fp(v, modulus), modulus) for v in xs]
+    argcs = List[float]()
+    bands = List[float]()
+    for v in xf:
+        arg = GELU_ALPHA * (v + GELU_BETA * v * v * v) if name == "gelu" else v
+        argcs.append(min(max(arg, lo), hi))
+        bands.append(1.0 if lo <= arg and arg <= hi else 0.0)
+    # the method's inner function at the clipped arguments: the function itself (Decor), the plaintext path's
+    # interpolant, Clenshaw in double (Chebyshev)
+    f_ins = [_plain(inner, a) for a in argcs] if method == METHOD_DECOR else activate(mpc, array(argcs), inner, method).tolist()
+    want_v = List[float]()
+    want_d = List[float]()
+    beyond = List[int]()
+    for i in range(len(xf)):
+        v = xf[i]
+        band = bands[i]
+        if band == 0.0:
+            beyond.append(i)
+        f_in = f_ins[i]
+        if name == "gelu":
+            want_v.append(0.5 * v * (1.0 + f_in))
+            want_d.append(0.5 * (1.0 + f_in) + 0.5 * v * (1.0 - f_in * f_in) * GELU_ALPHA * (1.0 + 3.0 * GELU_BETA * v * v) * band)
+        else:
+            want_v.append(v * f_in)
+            want_d.append(f_in + v * f_in * (1.0 - f_in) * band)
+    plain_v, plain_d = activate_with_derivative(mpc, array(xf), name, method, clip=True)
+    x_st = Sharetensor.enc(mpc, xs, 0, modulus)
+    sv, sd = activate_with_derivative(mpc, x_st, name, method, clip=True)
+    s_d = sd.reveal(mpc).tolist()
+    s_v = sv.reveal(mpc).tolist()
+    x_after = x_st.reveal(mpc).tolist()
+    if mpc.pid:
+        label = f"{name}, {method}, clipped, on the {_name(modulus)}"
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: input intact", x_after, xf, error=ULP, silent_pass=True)
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: plaintext value and slope (the inner term masked beyond the band)",
+                         plain_v.tolist(), want_v, error=1e-12 * _scale(want_v), silent_pass=True)
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: plaintext slope (the inner term masked beyond the band)",
+                         plain_d.tolist(), want_d, error=1e-12 * _scale(want_d))
+        e_in = (decor_error_bound("tanh") if inner == "tanh" else decor_error_bound("sigmoid")) if method == METHOD_DECOR \
+            else _clenshaw_bound(inner)
+        tol_beyond = 2.0 * e_in + 64.0 * ULP
+        got_beyond = [s_d[i] for i in beyond]
+        want_beyond = [want_d[i] for i in beyond]
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: Sharetensor slope beyond the band = the clipped function's ({len(beyond)} points)",
+                         got_beyond, want_beyond, error=tol_beyond)
+        got_vb = [s_v[i] for i in beyond]
+        want_vb = [want_v[i] for i in beyond]
+        assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: Sharetensor value beyond the band",
+                         got_vb, want_vb, error=tol_beyond * _scale(xf) + 64.0 * ULP * _scale(want_vb), silent_pass=True)
+
+
+def _dstar(mpc, x, name: str, method: Static[str]):
+    # The static derivative function of an activation, clipped (what a direct caller uses)
+    if name == "sigmoid": return act_dsigmoid(mpc, x, method, clip=True)
+    elif name == "tanh": return act_dtanh(mpc, x, method, clip=True)
+    elif name == "exp": return act_dexp(mpc, x, method, clip=True)
+    elif name == "sin": return act_dsin(mpc, x, method, clip=True)
+    elif name == "cos": return act_dcos(mpc, x, method, clip=True)
+    elif name == "tan": return act_dtan(mpc, x, method, clip=True)
+    elif name == "cot": return act_dcot(mpc, x, method, clip=True)
+    elif name == "sinh": return act_dsinh(mpc, x, method, clip=True)
+    elif name == "cosh": return act_dcosh(mpc, x, method, clip=True)
+    elif name == "gelu": return act_dgelu(mpc, x, method, clip=True)
+    elif name == "silu": return act_dsilu(mpc, x, method, clip=True)
+    return act_derf(mpc, x, method, clip=True)
+
+
+def _dstar_check(mpc, modulus: mpc_uint, method: Static[str]):
+    # The static derivative functions with clip on a Sharetensor equal the masked training derivative of the ndarray
+    # path, at a point inside the interval and one beyond each end (0 there; gelu and silu: the clipped function's
+    # slope). Decor's sin, cos, tan and cot take any x (no clip).
+    names = ["sigmoid", "tanh", "exp", "sinh", "cosh", "gelu", "silu", "erf"]
+    if method != METHOD_DECOR:
+        names.extend(["sin", "cos", "tan", "cot"])
+    for name in names:
+        lo, hi = _clip_interval("tanh" if name == "gelu" else ("sigmoid" if name == "silu" else name), method)
+        w = hi - lo
+        xs = [lo - 0.4 * w, lo + 0.3 * w, hi + 0.4 * w]
+        xf = [fp_to_double(double_to_fp(v, modulus), modulus) for v in xs]
+        x = Sharetensor.enc(mpc, xs, 0, modulus)
+        got = _dstar(mpc, x, name, method).reveal(mpc).tolist()
+        want_v, want_d = activate_with_derivative(mpc, array(xf), name, method, clip=True)
+        if mpc.pid:
+            _, slope_tol = _tolerances(name, method, xf, want_v.tolist(), want_d.tolist())
+            assert_eq_approx(f"CP{mpc.pid}:\tactivation d{name} ({method}, clip) on a Sharetensor = the masked derivative on the {_name(modulus)}",
+                             got, want_d.tolist(), error=slope_tol)
+
+
+def _values(mpc, sv, modulus: mpc_uint) -> List[float]:
+    # A secure result's values at the compute parties: a public Sharetensor holds them, a shared one is revealed
+    if sv.public:
+        return fp_to_double(sv.share, modulus)
+    return sv.reveal(mpc).tolist()
+
+
+def _public_clip_check(mpc, modulus: mpc_uint):
+    # A public Sharetensor (each party holds the whole value, as after publish) through the clipped training forward:
+    # clipped as a sharing held by CP1, so f and f' are those of x (not n_cp x), as the ndarray path gives them
+    xs = [-14.0, -3.0, 0.5, 2.0, 14.0]
+    xf = [fp_to_double(double_to_fp(v, modulus), modulus) for v in xs]
+    for name, method in (("sigmoid", METHOD_DECOR), ("sigmoid", METHOD_CHEBYSHEV), ("gelu", METHOD_CHEBYSHEV), ("silu", METHOD_DECOR)):
+        xp = Sharetensor.enc(mpc, xs, 0, modulus).publish(mpc)
+        pv, pd = activate_with_derivative(mpc, xp, name, method, clip=True)
+        rv, rd = _values(mpc, pv, modulus), _values(mpc, pd, modulus)
+        rdd = _values(mpc, dactivate(mpc, xp, name, method, clip=True), modulus)
+        want_v, want_d = activate_with_derivative(mpc, array(xf), name, method, clip=True)
+        if mpc.pid:
+            value_tol, slope_tol = _tolerances(name, method, xf, want_v.tolist(), want_d.tolist())
+            label = f"{name}, {method}, clipped, a public Sharetensor on the {_name(modulus)}"
+            assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: value = the ndarray path", rv, want_v.tolist(), error=value_tol)
+            assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: derivative and dactivate = the ndarray path", [rd, rdd],
+                             [want_d.tolist(), want_d.tolist()], error=slope_tol)
+            assert_eq_approx(f"CP{mpc.pid}:\tactivation {label}: input intact", fp_to_double(xp.share, modulus), xf, error=ULP, silent_pass=True)
+
+
+def _default_method_check(mpc, modulus: mpc_uint):
+    # The activations module defaults to Chebyshev, as Dense and LogReg do: no method given gives the Chebyshev
+    # definition (in the clear: no round)
+    xf = [fp_to_double(double_to_fp(v, modulus), modulus) for v in _points("sigmoid")]
+    v, d = activate_with_derivative(mpc, array(xf), "sigmoid")
+    direct = act_sigmoid(mpc, array(xf))
+    cv, cd = _cheb_definition("sigmoid", xf)
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tactivations default to Chebyshev on the {_name(modulus)}: activate_with_derivative's value", v.tolist(), cv, error=1e-9)
+        assert_eq_approx(f"CP{mpc.pid}:\tactivations default to Chebyshev on the {_name(modulus)}: activate_with_derivative's derivative", d.tolist(), cd, error=1e-9)
+        assert_eq_approx(f"CP{mpc.pid}:\tactivations default to Chebyshev on the {_name(modulus)}: sigmoid", direct.tolist(), cv, error=1e-9)
+
+
+def _refusals(mpc, modulus: mpc_uint):
+    raised = False
+    try:
+        activate_with_derivative(mpc, Sharetensor.enc(mpc, [0.5], 0, modulus), "relu", "fourier")
+    except AssertionError:
+        raised = True
+    assert_eq(f"CP{mpc.pid}:\tactivation with a method other than decor or chebyshev refused on the {_name(modulus)}", raised, True)
+
+
+def test_activations(mpc, modulus: mpc_uint):
+    print(f"CP{mpc.pid}:\tTesting the neural-net activations on the {_name(modulus)} ... \n")
+    for name in ACTIVATIONS:
+        _each(mpc, modulus, name, METHOD_DECOR)
+        if name not in PIECEWISE and name != "asigmoid":
+            _each(mpc, modulus, name, METHOD_CHEBYSHEV)
+    _softmax_check(mpc, modulus, METHOD_DECOR)
+    _softmax_check(mpc, modulus, METHOD_CHEBYSHEV)
+    for name in ["relu", "sigmoid", "tanh", "sin", "gelu"]:
+        _mpu_check(mpc, modulus, name, METHOD_DECOR, False)
+    _mpu_check(mpc, modulus, "sigmoid", METHOD_CHEBYSHEV, False)
+    _mpu_check(mpc, modulus, "sigmoid", METHOD_DECOR, True)
+    _mpu_check(mpc, modulus, "tanh", METHOD_CHEBYSHEV, True)
+    _clip_check(mpc, modulus, "sigmoid", METHOD_DECOR)
+    _clip_check(mpc, modulus, "sigmoid", METHOD_CHEBYSHEV)
+    _clip_check(mpc, modulus, "exp", METHOD_DECOR)
+    _clip_check(mpc, modulus, "sin", METHOD_CHEBYSHEV)
+    _clip_check(mpc, modulus, "cos", METHOD_CHEBYSHEV)
+    _clip_check(mpc, modulus, "tan", METHOD_CHEBYSHEV)
+    _clip_check(mpc, modulus, "sinh", METHOD_DECOR)
+    _clip_check(mpc, modulus, "cosh", METHOD_CHEBYSHEV)
+    _clip_check(mpc, modulus, "erf", METHOD_DECOR)
+    for name in ["gelu", "silu"]:
+        _composite_clip_check(mpc, modulus, name, METHOD_DECOR)
+        _composite_clip_check(mpc, modulus, name, METHOD_CHEBYSHEV)
+    _dstar_check(mpc, modulus, METHOD_DECOR)
+    _dstar_check(mpc, modulus, METHOD_CHEBYSHEV)
+    _public_clip_check(mpc, modulus)
+    _default_method_check(mpc, modulus)
+    _refusals(mpc, modulus)
+    print(f"CP{mpc.pid}:\tNeural-net activations on the {_name(modulus)} passed.\n")

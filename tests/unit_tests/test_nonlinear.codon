@@ -1,0 +1,687 @@
+""" sequre.stdlib.nonlinear: every (function, method) pair on plaintext and on Sharetensors (field and ring), the same
+results across types, the multiparty types (MPP in the clear, encrypted and mixed; MPA; MPU), softmax, polynomial and
+approx. Run with 3 and 4 parties (SEQURE_CP_COUNT). """
+
+import math
+
+from sequre.constants import *
+from sequre.stdlib.numpy.create import array
+from sequre.lattiseq.ckks import Ciphertext
+from sequre.types.sharetensor import Sharetensor
+from sequre.types.ciphertensor import Ciphertensor
+from sequre.types.multiparty_aggregate import MPA
+from sequre.types.multiparty_union import MPU
+from sequre.types.utils import double_to_fp, fp_to_double
+from sequre.utils.testing import assert_eq, assert_eq_approx as _assert_eq_approx
+from sequre.stdlib.chebyshev import chebyshev_coeffs, chebyshev_nodes, via_chebyshev
+from sequre.decor import (
+    linspace, cheb2poly, poly_eval, taylor_coeffs, fourier_coeffs, decor_error_bound, trig_error_bound, via_decor,
+    via_taylor, via_fourier, ring_gt, decor_gt, decor_mul_inv)
+import sequre.stdlib.nonlinear as nl
+
+from multiparty_testing import unequal_ratios, own_rows, partition, encrypted_at, assert_parties_in_step
+
+
+# The checks compare in double precision: no tolerance goes below double precision (2^-50 of the expected value). It
+# matters at F = 64, where a unit of 2^-F is below it.
+def assert_eq_approx(name, result, expected, error: float = 0.018, silent_pass: bool = False, rel_error: float = 0.0):
+    _assert_eq_approx(name, result, expected, error, silent_pass, max(rel_error, 2.0 ** -50))
+
+
+ULP = 2.0 ** -MPC_NBIT_F
+DOUBLE_EPS = 2.0 ** -52.0
+FUNCS = ["exp", "sigmoid", "tanh", "sin", "cos", "tan", "cot", "sinh", "cosh", "log", "inv", "erf"]
+DECOR_FUNCS = ["exp", "sigmoid", "tanh", "sin", "cos", "tan", "cot", "sinh", "cosh", "inv"]
+
+
+def _name(modulus) -> str:
+    return "ring" if modulus.popcnt() == 1 else "field"
+
+
+def _fpr(v: float, modulus: mpc_uint) -> float:
+    return fp_to_double(double_to_fp(v, modulus), modulus)
+
+
+def _sigmoid(v: float) -> float:
+    return 1.0 / (1.0 + math.exp(-v)) if v >= 0.0 else math.exp(v) / (1.0 + math.exp(v))
+
+
+def _value(func: str, v: float) -> float:
+    if func == "exp": return math.exp(v)
+    if func == "sigmoid": return _sigmoid(v)
+    if func == "tanh": return math.tanh(v)
+    if func == "sin": return math.sin(v)
+    if func == "cos": return math.cos(v)
+    if func == "tan": return math.tan(v)
+    if func == "cot": return 1.0 / math.tan(v)
+    if func == "sinh": return math.sinh(v)
+    if func == "cosh": return math.cosh(v)
+    if func == "log": return math.log(v)
+    if func == "inv": return 1.0 / v
+    return math.erf(v)
+
+
+def _points(func: str) -> List[float]:
+    # Inside the polynomial methods' default interval (and Decor's), away from poles
+    if func == "tan": return linspace(-1.1, 1.1, 9)
+    if func == "cot": return linspace(0.5, 2.6, 9)
+    if func == "log" or func == "inv": return linspace(0.6, 7.0, 9)
+    if func == "sigmoid": return linspace(-6.0, 6.0, 9)
+    return linspace(-3.0, 3.0, 9)
+
+
+def _call(mpc, x, func: str, method: Static[str]):
+    # nl.<func>(x, method), for a func the method supports (the caller guards Decor's log and erf, and auto's two);
+    # Taylor on the polynomial methods' interval (it takes no default)
+    if method == METHOD_AUTO:
+        if func == "sigmoid": return nl.sigmoid(mpc, x, method=method)
+        return nl.tanh(mpc, x, method=method)
+    else:
+        iv = _poly_interval(func) if method == METHOD_TAYLOR else (0.0, 0.0)
+        if func == "exp": return nl.exp(mpc, x, method=method, interval=iv)
+        if func == "sigmoid": return nl.sigmoid(mpc, x, method=method, interval=iv)
+        if func == "tanh": return nl.tanh(mpc, x, method=method, interval=iv)
+        if func == "sin": return nl.sin(mpc, x, method=method, interval=iv)
+        if func == "cos": return nl.cos(mpc, x, method=method, interval=iv)
+        if func == "tan": return nl.tan(mpc, x, method=method, interval=iv)
+        if func == "cot": return nl.cot(mpc, x, method=method, interval=iv)
+        if func == "sinh": return nl.sinh(mpc, x, method=method, interval=iv)
+        if func == "cosh": return nl.cosh(mpc, x, method=method, interval=iv)
+        if func == "inv": return nl.inv(mpc, x, method=method, interval=iv)
+        if method != METHOD_DECOR:
+            if func == "log": return nl.log(mpc, x, method=method, interval=iv)
+            return nl.erf(mpc, x, method=method, interval=iv)
+        raise ValueError(f"no Decor decomposition for {func}")
+
+
+def _supported(func: str, method: str) -> bool:
+    if method == METHOD_AUTO:
+        return func == "sigmoid" or func == "tanh"
+    return method != METHOD_DECOR or func in DECOR_FUNCS
+
+
+def _poly_interval(func: str) -> Tuple[float, float]:
+    # The polynomial methods' default intervals (the spec in nonlinear.default_interval, restated)
+    if func == "sin" or func == "cos": return (-math.pi, math.pi)
+    if func == "tan": return (-1.2, 1.2)
+    if func == "cot": return (0.4, 2.7)
+    if func == "exp": return (-8.0, 8.0)
+    if func == "sigmoid": return (-10.0, 10.0)
+    if func == "log" or func == "inv": return (0.5, 8.0)
+    if func == "erf": return (-4.0, 4.0)
+    return (-5.0, 5.0)
+
+
+def _taylor(func: str, pivot: float) -> List[float]:
+    if func == "exp": return taylor_coeffs("exp", pivot, NONLINEAR_TAYLOR_DEGREE)
+    if func == "sigmoid": return taylor_coeffs("sigmoid", pivot, NONLINEAR_TAYLOR_DEGREE)
+    if func == "tanh": return taylor_coeffs("tanh", pivot, NONLINEAR_TAYLOR_DEGREE)
+    if func == "sin": return taylor_coeffs("sin", pivot, NONLINEAR_TAYLOR_DEGREE)
+    if func == "cos": return taylor_coeffs("cos", pivot, NONLINEAR_TAYLOR_DEGREE)
+    if func == "tan": return taylor_coeffs("tan", pivot, NONLINEAR_TAYLOR_DEGREE)
+    if func == "cot": return taylor_coeffs("cot", pivot, NONLINEAR_TAYLOR_DEGREE)
+    if func == "sinh": return taylor_coeffs("sinh", pivot, NONLINEAR_TAYLOR_DEGREE)
+    if func == "cosh": return taylor_coeffs("cosh", pivot, NONLINEAR_TAYLOR_DEGREE)
+    if func == "log": return taylor_coeffs("log", pivot, NONLINEAR_TAYLOR_DEGREE)
+    if func == "inv": return taylor_coeffs("inv", pivot, NONLINEAR_TAYLOR_DEGREE)
+    return taylor_coeffs("erf", pivot, NONLINEAR_TAYLOR_DEGREE)
+
+
+def _definition(func: str, method: str, xs: List[float]) -> List[float]:
+    # Each method's result, computed independently of nonlinear's plaintext path: the function, the Chebyshev
+    # interpolant (monomial form), the Fourier series, the Taylor polynomial, on the default interval and degree (auto:
+    # the function, which it approximates within Decor's bound on either modulus)
+    if method == METHOD_DECOR or method == METHOD_AUTO:
+        return [_value(func, v) for v in xs]
+    a, b = _poly_interval(func)
+    if method == METHOD_CHEBYSHEV:
+        iv = (a, b)
+        mono = cheb2poly(chebyshev_coeffs(lambda v: _value(func, v), chebyshev_nodes(CHEBYSHEV_DEGREE + 1, iv), iv))
+        return [poly_eval(mono, (2.0 * v - a - b) / (b - a)) for v in xs]
+    if method == METHOD_FOURIER:
+        series = fourier_coeffs(lambda v: _value(func, v), (a, b), NONLINEAR_FOURIER_DEGREE)
+        return [series(v) for v in xs]
+    coeffs = _taylor(func, (a + b) / 2.0)
+    return [poly_eval(coeffs, v - (a + b) / 2.0) for v in xs]
+
+
+def _scale(values: List[float]) -> float:
+    m = 1.0
+    for v in values:
+        m = max(m, abs(v))
+    return m
+
+
+def _abs_sum(values: List[float]) -> float:
+    s = 0.0
+    for v in values:
+        s += abs(v)
+    return s
+
+
+def _fourier_phase(series) -> float:
+    # sum_k k (|a_k| + |b_k|): how the phase's error grows over the harmonics
+    s = 0.0
+    for k in range(series.degree()):
+        s += float(k + 1) * (abs(series.a[k]) + abs(series.b[k]))
+    return s
+
+
+def _secure_tolerance(func: str, method: str, want: List[float]) -> float:
+    # The documented error models (as in test_decor), plus the double-precision references' rounding:
+    # - Decor: trig_error_bound (sin, cos), decor_error_bound on the default interval, a few units of the division
+    #   relative to the quotient (tan, cot, inv);
+    # - Chebyshev: Clenshaw truncates once per step, (4 + 2 degree) units per unit of sum |c_k|;
+    # - Fourier: 8 units per unit of sum |a_k| + |b_k|, times the phase's growth with the harmonic;
+    # - Taylor: Decor's polynomial bound on the centred interval;
+    # - auto: _auto_tolerance on the default interval.
+    floor = 64.0 * 2.0 ** -52.0 * _scale(want)
+    if method == METHOD_AUTO:
+        return _auto_tolerance(func, (0.0, 0.0)) + floor
+    if method == METHOD_DECOR:
+        if func == "sin" or func == "cos":
+            return trig_error_bound(3.0)
+        if func == "tan" or func == "cot" or func == "inv":
+            # the division's few units relative to the quotient, the operands' errors over the divisor (>= 0.45 here)
+            return (64.0 * ULP + 64.0 * DOUBLE_EPS) * _scale(want) * _scale(want)
+        if func == "exp": return decor_error_bound("exp")
+        if func == "sigmoid": return decor_error_bound("sigmoid")
+        if func == "tanh": return decor_error_bound("tanh")
+        if func == "sinh": return decor_error_bound("sinh")
+        return decor_error_bound("cosh")
+    a, b = _poly_interval(func)
+    if method == METHOD_CHEBYSHEV:
+        c = chebyshev_coeffs(lambda v: _value(func, v), chebyshev_nodes(CHEBYSHEV_DEGREE + 1, (a, b)), (a, b))
+        # (F = 64: Horner's rounding of the monomial reference, 2 (degree + 1) 2^-52 sum |m_k|, in place of 1e-9)
+        reference = 1e-9 if MPC_NBIT_F <= 32 else 2.0 * float(CHEBYSHEV_DEGREE + 1) * DOUBLE_EPS * (1.0 + _abs_sum(cheb2poly(c)))
+        return (4.0 + 2.0 * float(CHEBYSHEV_DEGREE)) * ULP * (1.0 + _abs_sum(c)) + reference + floor
+    if method == METHOD_FOURIER:
+        series = fourier_coeffs(lambda v: _value(func, v), (a, b), NONLINEAR_FOURIER_DEGREE)
+        weight = abs(series.a0) + _abs_sum(series.a) + _abs_sum(series.b)
+        # (F = 64: the phase's double-precision term, twice, and the reference's rounding, in place of 1e-9)
+        reference = 1e-9 if MPC_NBIT_F <= 32 else 4.0 * math.pi * _fourier_phase(series) * DOUBLE_EPS + 8.0 * DOUBLE_EPS * (1.0 + weight)
+        return 8.0 * ULP * weight * (1.0 + 2.0 * math.pi * float(NONLINEAR_FOURIER_DEGREE)) + reference + floor
+    pivot = (a + b) / 2.0
+    return decor_error_bound("polynomial", (a - pivot, b - pivot), _taylor(func, pivot)) + floor
+
+
+def _each_method(mpc, modulus: mpc_uint, func: str, method: Static[str]):
+    if not _supported(func, method):
+        return
+    name = _name(modulus)
+    xs = _points(func)
+    xf = [_fpr(v, modulus) for v in xs]
+    want = _definition(func, method, xf)
+    plain = _call(mpc, xf, func, method)
+    plain_nd = _call(mpc, array(xf), func, method).tolist()
+    x = Sharetensor.enc(mpc, xs, 0, modulus)
+    got = _call(mpc, x, func, method).reveal(mpc).tolist()
+    after = x.reveal(mpc).tolist()
+    if mpc.pid:
+        # the plaintext paths compute the method's definition; the protocol computes the same thing
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear {func}, {method}, plaintext list = the method's definition", plain, want, error=1e-9 * _scale(want), silent_pass=True)
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear {func}, {method}, ndarray = the method's definition", plain_nd, want, error=1e-9 * _scale(want), silent_pass=True)
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear {func}, {method}, Sharetensor on the {name}", got, want, error=_secure_tolerance(func, method, want))
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear {func}, {method}: input intact on the {name}", after, xf, error=ULP, silent_pass=True)
+
+
+def _refuses(mpc, label: str, op):
+    # The call raises ValueError at every party, CP0 included, before any round and before sending anything
+    r0, b0 = mpc.stats.rounds, mpc.stats.bytes_sent
+    raised = False
+    try:
+        op()
+    except ValueError:
+        raised = True
+    assert_eq(f"CP{mpc.pid}:\t{label} raises before any round", raised and mpc.stats.rounds == r0 and mpc.stats.bytes_sent == b0, True)
+
+
+def test_methods(mpc, modulus: mpc_uint):
+    # Every function with every method it supports; Decor's log and erf do not compile (no decomposition)
+    for func in FUNCS:
+        _each_method(mpc, modulus, func, METHOD_DECOR)
+        _each_method(mpc, modulus, func, METHOD_AUTO)
+        _each_method(mpc, modulus, func, METHOD_CHEBYSHEV)
+        _each_method(mpc, modulus, func, METHOD_FOURIER)
+        _each_method(mpc, modulus, func, METHOD_TAYLOR)
+
+    # The defaults: Decor where it applies, Chebyshev for log and erf (degree 20 on (0.5, 8) and (-4, 4): interpolation
+    # errors about 1e-4, hence the loose checks against the functions themselves)
+    name = _name(modulus)
+    x = Sharetensor.enc(mpc, [0.5, 1.5, 2.5], 0, modulus)
+    d_exp = nl.exp(mpc, x).reveal(mpc).tolist()
+    d_log = nl.log(mpc, x).reveal(mpc).tolist()
+    d_erf = nl.erf(mpc, x).reveal(mpc).tolist()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear exp, default method (Decor) on the {name}", d_exp, [math.exp(v) for v in [0.5, 1.5, 2.5]], error=decor_error_bound("exp"))
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear log, default method (Chebyshev) on the {name}", d_log, [math.log(v) for v in [0.5, 1.5, 2.5]], error=1e-3)
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear erf, default method (Chebyshev) on the {name}", d_erf, [math.erf(v) for v in [0.5, 1.5, 2.5]], error=1e-3)
+
+    # An explicit interval and degree, clip, and the refusals: an interval with a >= b, clip for Decor's sin
+    xi = Sharetensor.enc(mpc, [-0.4, 0.1, 0.9, 1.7], 0, modulus)
+    c = nl.sigmoid(mpc, xi, method=METHOD_CHEBYSHEV, interval=(-1.0, 1.0), degree=12, clip=True).reveal(mpc).tolist()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear sigmoid, Chebyshev degree 12 on (-1, 1), clipped, on the {name}", c,
+                         [_sigmoid(min(max(v, -1.0), 1.0)) for v in [-0.4, 0.1, 0.9, 1.7]], error=1e-6)
+    _refuses(mpc, f"nonlinear exp with a degenerate interval on the {name}", lambda: nl.exp(mpc, xi, method=METHOD_CHEBYSHEV, interval=(1.0, 1.0)))
+    _refuses(mpc, f"nonlinear Decor sin with clip (no interval) on the {name}", lambda: nl.sin(mpc, xi, clip=True))
+    _refuses(mpc, f"nonlinear Decor sin with an interval on the {name}", lambda: nl.sin(mpc, xi, interval=(-1.0, 1.0)))
+    _refuses(mpc, f"nonlinear Decor exp with a degree on the {name}", lambda: nl.exp(mpc, xi, degree=5))
+    _refuses(mpc, f"nonlinear Chebyshev exp with a negative degree on the {name}", lambda: nl.exp(mpc, xi, method=METHOD_CHEBYSHEV, degree=-3))
+    # Clenshaw's intermediates beyond the fixed-point range (exp on (-25, 25), degree 40: coefficients up to 1e10, past
+    # 2^31 at F = 32; at F = 64 the range is 2^63, which (-50, 50) passes) and Decor's refusals hold for every type,
+    # plaintext included, before any round
+    cheb_b = 25.0 if MPC_NBIT_F <= 32 else 50.0
+    _refuses(mpc, f"nonlinear Chebyshev exp on (-{cheb_b:.0f}, {cheb_b:.0f}), degree 40, on the {name}",
+             lambda: nl.exp(mpc, xi, method=METHOD_CHEBYSHEV, interval=(-cheb_b, cheb_b), degree=40))
+    _refuses(mpc, f"nonlinear Chebyshev exp on (-{cheb_b:.0f}, {cheb_b:.0f}), degree 40, in plaintext",
+             lambda: nl.exp(mpc, [0.5], method=METHOD_CHEBYSHEV, interval=(-cheb_b, cheb_b), degree=40))
+    _refuses(mpc, f"nonlinear Decor sigmoid on (-30, 30) in plaintext", lambda: nl.sigmoid(mpc, [0.5], method=METHOD_DECOR, interval=(-30.0, 30.0)))
+    # Taylor takes no default interval (its polynomial is accurate near the centre only)
+    _refuses(mpc, f"nonlinear Taylor exp without an interval on the {name}", lambda: nl.exp(mpc, xi, method=METHOD_TAYLOR))
+    _refuses(mpc, f"nonlinear Taylor sigmoid without an interval in plaintext", lambda: nl.sigmoid(mpc, [0.5], method=METHOD_TAYLOR))
+    # The tolerance reaches Taylor's admissibility check, both ways (a tolerance below the bound: 1e-12 at F = 32, 1e-20
+    # at F = 64, whose bounds are smaller)
+    taylor_tol = 1e-12 if MPC_NBIT_F <= 32 else 1e-20
+    _refuses(mpc, f"nonlinear Taylor exp at tolerance {taylor_tol:.0e} on the {name}", lambda: nl.exp(mpc, xi, method=METHOD_TAYLOR, interval=(-8.0, 8.0), tolerance=taylor_tol))
+    xt = [-2.0, 0.5, 3.0]
+    t13 = nl.exp(mpc, Sharetensor.enc(mpc, xt, 0, modulus), method=METHOD_TAYLOR, interval=(-5.0, 5.0), degree=13, tolerance=1.0).reveal(mpc).tolist()
+    if mpc.pid:
+        coeffs = taylor_coeffs("exp", 0.0, 13)
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear Taylor exp, degree 13 on (-5, 5), tolerance 1, on the {name}", t13,
+                         [poly_eval(coeffs, _fpr(v, modulus)) for v in xt], error=decor_error_bound("polynomial", (-5.0, 5.0), coeffs))
+
+    # Empty inputs, 1-D and 2-D, every method: empty results, every party in step
+    e1 = Sharetensor(List[mpc_uint](), modulus)
+    e1.fp = True
+    e2 = Sharetensor(List[List[mpc_uint]](), modulus)
+    e2.fp = True
+    n_out = len(nl.log(mpc, e1).share) + len(nl.log(mpc, e2).share)
+    n_out += len(nl.inv(mpc, e1).share) + len(nl.inv(mpc, e2).share)
+    n_out += len(nl.exp(mpc, e2, method=METHOD_TAYLOR, interval=(-1.0, 1.0)).share) + len(nl.sin(mpc, e2, method=METHOD_FOURIER).share)
+    n_out += len(nl.sigmoid(mpc, e2, method=METHOD_CHEBYSHEV, clip=True).share) + len(nl.sigmoid(mpc, e2).share)
+    n_out += len(nl.approx(mpc, e2, math.exp, (-1.0, 1.0)).share) + len(nl.approx(mpc, e1, math.exp, (-1.0, 1.0), method=METHOD_FOURIER).share)
+    assert_eq(f"CP{mpc.pid}:\tnonlinear of empty inputs is empty on the {name}", n_out, 0)
+    assert_parties_in_step(mpc, f"nonlinear of empty inputs on the {name}")
+
+
+def _cohort(mpc, positive: bool):
+    # A 2-D cohort matrix every party knows (halves in [-3.5, 3.5], or shifted to [1, 8]) and its unequal partitions
+    n_cp = mpc.comms.number_of_parties - 1
+    ratios = unequal_ratios(n_cp)
+    with mpc.randomness.seed_switch(-1):
+        ints = array([[float((7 * i + 3 * j) % 8) for j in range(4)] for i in range(ratios.sum())])
+    matrix = ints - 3.5 if not positive else ints + 1.0
+    return matrix, ratios
+
+
+def _mp_case(mpc, label: str, func: str, method: Static[str], positive: bool):
+    # One function and method on every multiparty type: MPP in the clear (local), encrypted and mixed (via MPC), MPA,
+    # MPU (partitions and additive), each against the plaintext result of the same method, with the parties in step.
+    # Tolerance: the method's error model plus the HE noise: 1e-3 for the HE <-> MPC switches (as the MPP tests); 2e-3
+    # where Chebyshev's recurrence runs natively on ciphertexts (degree 20, each step a homomorphic product and rescale,
+    # with collective refreshes): measured 2.9e-4 at every element for log on this cohort with two and three compute
+    # parties (16 runs each), and once 1.06e-3 at one element (cause not found)
+    matrix, ratios = _cohort(mpc, positive)
+    want = _call(mpc, matrix, func, method)
+    # The switches' noise on the input (about 1e-5 at 192 bits, up to 4.3e-5 seen at 256 bits) is also amplified by the
+    # function's slope: exp's reaches 33 on this cohort (e^3.5), the others' stay below 1.2
+    slope = _scale(want.flatten().tolist()) if func == "exp" else 1.2
+    he_noise = (2e-3 if method == METHOD_CHEBYSHEV else 1e-3) + 1e-4 * slope
+    tolerance = _secure_tolerance(func, method, want.flatten().tolist()) + he_noise
+    local = partition(mpc, matrix, ratios)
+    encrypted = encrypted_at(mpc, local, [q + 1 for q in range(len(ratios))])
+    mixed = encrypted_at(mpc, local, [1])
+    start, stop = own_rows(mpc, ratios)
+    mpa = MPA(mpc, matrix if mpc.pid == 1 else matrix.zeros())
+    mpu_p = MPU(mpc, matrix[start:stop] if mpc.pid else matrix, "partition")
+    mpu_a = MPU(mpc, matrix if mpc.pid == 1 else matrix.zeros(), "additive")
+    # In the clear: the plaintext definition computed locally after the agreement (a collect, which mpc.stats does not
+    # count as a round; Chebyshev: natively, on the partitions' own local arithmetic), equal to the plaintext result in
+    # double precision; via MPC would spend dozens of rounds
+    r0 = mpc.stats.rounds
+    got_local = _call(mpc, local, func, method)
+    local_rounds = mpc.stats.rounds - r0
+    got = got_local.reveal(mpc)
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tnonlinear {label}, MPP in the clear: no MPC round", local_rounds, 0)
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear {label}, MPP in the clear", got, want, error=1e-9 * _scale(want.flatten().tolist()))
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear {label}, MPP in the clear: input intact", local.reveal(mpc), matrix, error=1e-12, silent_pass=True)
+    assert_parties_in_step(mpc, f"nonlinear {label}, MPP in the clear")
+    for kind, x in (("MPP encrypted", encrypted), ("MPP mixed", mixed)):
+        got = _call(mpc, x, func, method).reveal(mpc)
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tnonlinear {label}, {kind}", got, want, error=tolerance)
+            assert_eq_approx(f"CP{mpc.pid}:\tnonlinear {label}, {kind}: input intact", x.reveal(mpc), matrix, error=1e-3, silent_pass=True)
+        assert_parties_in_step(mpc, f"nonlinear {label}, {kind}")
+    got = _call(mpc, mpa, func, method).reveal(mpc)
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear {label}, MPA", got, want, error=tolerance)
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear {label}, MPA: input intact", mpa.reveal(mpc), matrix, error=1e-3, silent_pass=True)
+    assert_parties_in_step(mpc, f"nonlinear {label}, MPA")
+    for kind, x in (("MPU of partitions", mpu_p), ("MPU additive", mpu_a)):
+        got = _call(mpc, x, func, method).reveal(mpc)
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tnonlinear {label}, {kind}", got, want, error=tolerance)
+            assert_eq_approx(f"CP{mpc.pid}:\tnonlinear {label}, {kind}: input intact", x.reveal(mpc), matrix, error=1e-3, silent_pass=True)
+        assert_parties_in_step(mpc, f"nonlinear {label}, {kind}")
+
+
+def test_ciphertensor(mpc):
+    # A Ciphertensor every party encrypts (CP0's is the placeholder the conversions take their shape from): via MPC (each
+    # compute party's own ciphertexts), decrypted to that party alone
+    matrix, _ = _cohort(mpc, False)
+    ct = Ciphertensor[Ciphertext].enc(mpc, matrix)
+    got = nl.sin(mpc, ct).reveal(mpc)
+    after = ct.reveal(mpc)
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear sin (Decor) of a Ciphertensor", got, _call(mpc, matrix, "sin", METHOD_DECOR), error=1e-3)
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear sin of a Ciphertensor: input intact", after, matrix, error=1e-3, silent_pass=True)
+    assert_parties_in_step(mpc, "nonlinear sin of a Ciphertensor")
+    vec = array([0.5, -1.0, 2.0, 0.25])
+    ct1 = Ciphertensor[Ciphertext].enc(mpc, vec)
+    got1 = nl.sin(mpc, ct1).reveal(mpc).flatten().tolist()
+    after1 = ct1.reveal(mpc).flatten().tolist()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear sin (Decor) of a 1-D Ciphertensor", got1[:4], [math.sin(v) for v in [0.5, -1.0, 2.0, 0.25]], error=1e-3)
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear sin of a 1-D Ciphertensor: input intact", after1[:4], [0.5, -1.0, 2.0, 0.25], error=1e-3, silent_pass=True)
+    assert_parties_in_step(mpc, "nonlinear sin of a 1-D Ciphertensor")
+
+
+def test_multiparty(mpc):
+    # Every type, one function per method
+    _mp_case(mpc, "sigmoid (Decor)", "sigmoid", METHOD_DECOR, False)
+    _mp_case(mpc, "sigmoid (auto)", "sigmoid", METHOD_AUTO, False)
+    _mp_case(mpc, "sin (Decor)", "sin", METHOD_DECOR, False)
+    _mp_case(mpc, "log (Chebyshev, native on every type)", "log", METHOD_CHEBYSHEV, True)
+    _mp_case(mpc, "exp (Taylor)", "exp", METHOD_TAYLOR, False)
+    _mp_case(mpc, "erf (Fourier)", "erf", METHOD_FOURIER, False)
+    _mp_case(mpc, "inv (Decor division)", "inv", METHOD_DECOR, True)
+
+
+def test_softmax(mpc, modulus: mpc_uint):
+    # Row-wise softmax: max shift and fixed shift; 2-D and 1-D; against the plaintext softmax. The exponents' error
+    # (decor_error_bound of exp on (-16, 0]) and one inverse per row (a few units relative) bound the result's error.
+    name = _name(modulus)
+    # the last row's entries 23 and 43 below its maximum reach the clip at -16 (they come out as e^-16 = 1.1e-7 over the
+    # row sum instead of about 0, inside the tolerance)
+    m = [[0.5, -1.0, 2.0, 0.0, 1.5], [-3.0, 4.0, 0.25, -0.5, 1.0], [2.0, 2.0, 2.0, 2.0, 2.0], [0.0, -20.0, -40.0, 3.0, 1.0]]
+    want = [_softmax_row(row) for row in m]
+    # each exponent errs by at most eps (Decor exp's bound on (-16, 0]); a row sum S by cols eps; e_i / S then by
+    # (1 + cols) eps / S, plus the inverse's and the product's few units, and S >= 1 with the max shift. The clip at
+    # -16 errs like an exponent, by up to e^-16 (independent of F: at F = 64 it exceeds Decor's eps)
+    eps = decor_error_bound("exp", (-16.0, 0.0)) + math.exp(-NONLINEAR_SOFTMAX_WIDTH)
+    tol = (1.0 + 5.0) * eps + 8.0 * ULP + 8.0 * DOUBLE_EPS
+    # the fixed shift's row sums can fall below 1, which divides the exponents' absolute error by them
+    s_min = 1.0
+    for row in m:
+        total = 0.0
+        for e in row:
+            total += math.exp(e - 5.0)
+        s_min = min(s_min, total)
+    tol_fixed = tol / s_min
+    x = Sharetensor.enc(mpc, m, 0, modulus)
+    got_max = nl.softmax(mpc, x).reveal(mpc).tolist()
+    got_fixed = nl.softmax(mpc, x, shift="fixed", offset=5.0).reveal(mpc).tolist()
+    v = Sharetensor.enc(mpc, m[1], 0, modulus)
+    got_vec = nl.softmax(mpc, v).reveal(mpc).tolist()
+    after = x.reveal(mpc).tolist()
+    after_v = v.reveal(mpc).tolist()
+    plain = nl.softmax(mpc, m)
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear softmax (max shift) of a matrix on the {name}", got_max, want, error=tol)
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear softmax (fixed shift 5) of a matrix on the {name}", got_fixed, want, error=tol_fixed)
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear softmax of a vector on the {name}", got_vec, want[1], error=tol)
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear softmax, plaintext", plain, want, error=1e-12)
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear softmax: input intact on the {name}", after, [[_fpr(e, modulus) for e in row] for row in m], error=ULP, silent_pass=True)
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear softmax of a vector: input intact on the {name}", after_v, [_fpr(e, modulus) for e in m[1]], error=ULP, silent_pass=True)
+
+    # The fixed shift on a row far below its offset: the error grows as 1 / S (here S = e^-7 + e^-8 + e^-9 = 1.4e-3)
+    far = [[-7.0, -8.0, -9.0]]
+    s_far = math.exp(-7.0) + math.exp(-8.0) + math.exp(-9.0)
+    far_st = Sharetensor.enc(mpc, far, 0, modulus)
+    got_far = nl.softmax(mpc, far_st, shift="fixed", offset=0.0).reveal(mpc).tolist()
+    after_far = far_st.reveal(mpc).tolist()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear softmax (fixed shift 0) of a row 7 below it on the {name}", got_far,
+                         [_softmax_row(far[0])], error=((1.0 + 3.0) * eps + 8.0 * ULP) / s_far)
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear softmax (fixed shift): input intact on the {name}", after_far, far, error=ULP, silent_pass=True)
+    _refuses(mpc, f"nonlinear softmax with an offset and the max shift on the {name}", lambda: nl.softmax(mpc, far_st, offset=5.0))
+    _refuses(mpc, f"nonlinear softmax with width 60 on the {name}", lambda: nl.softmax(mpc, far_st, width=60.0))
+
+
+def _softmax_row(row: List[float]) -> List[float]:
+    m = row[0]
+    for v in row:
+        m = max(m, v)
+    exps = [math.exp(v - m) for v in row]
+    total = 0.0
+    for e in exps:
+        total += e
+    return [e / total for e in exps]
+
+
+def test_softmax_multiparty(mpc):
+    # Partitions in the clear: each party's rows locally; encrypted: via MPC. A 1-D MPP (split by elements) always
+    # goes through MPC: its softmax spans the partitions
+    n_cp = mpc.comms.number_of_parties - 1
+    ratios1 = unequal_ratios(n_cp)
+    vector = array([0.5 * float(i % 7) - 1.5 for i in range(ratios1.sum())])
+    want1 = nl.softmax(mpc, vector)
+    local1 = partition(mpc, vector, ratios1)
+    encrypted1 = encrypted_at(mpc, local1, [q + 1 for q in range(len(ratios1))])
+    for kind, x in (("1-D MPP in the clear", local1), ("1-D MPP encrypted", encrypted1)):
+        got = nl.softmax(mpc, x).reveal(mpc)
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tnonlinear softmax, {kind}", got, want1, error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\tnonlinear softmax, {kind}: input intact", x.reveal(mpc), vector, error=1e-3, silent_pass=True)
+        assert_parties_in_step(mpc, f"nonlinear softmax, {kind}")
+    matrix, ratios = _cohort(mpc, False)
+    want = nl.softmax(mpc, matrix)
+    local = partition(mpc, matrix, ratios)
+    encrypted = encrypted_at(mpc, local, [q + 1 for q in range(len(ratios))])
+    for kind, x in (("MPP in the clear", local), ("MPP encrypted", encrypted)):
+        got = nl.softmax(mpc, x).reveal(mpc)
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tnonlinear softmax, {kind}", got, want, error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\tnonlinear softmax, {kind}: input intact", x.reveal(mpc), matrix, error=1e-3, silent_pass=True)
+        assert_parties_in_step(mpc, f"nonlinear softmax, {kind}")
+
+
+def test_polynomial_approx(mpc, modulus: mpc_uint):
+    # polynomial (Decor) and approx (Chebyshev, Fourier) of an arbitrary plaintext function, on a Sharetensor and in
+    # plaintext
+    name = _name(modulus)
+    coeffs = [1.0, -2.0, 0.5, 0.25]
+    xs = [-2.5, -1.0, 0.0, 0.75, 2.0]
+    x = Sharetensor.enc(mpc, xs, 0, modulus)
+    p = nl.polynomial(mpc, x, coeffs, (-3.0, 3.0)).reveal(mpc).tolist()
+    op = lambda v: math.exp(-v * v)
+    ac = nl.approx(mpc, x, op, (-3.0, 3.0)).reveal(mpc).tolist()
+    af = nl.approx(mpc, x, op, (-3.0, 3.0), method=METHOD_FOURIER, degree=12).reveal(mpc).tolist()
+    pc = nl.approx(mpc, [_fpr(v, modulus) for v in xs], op, (-3.0, 3.0))
+    pf = nl.approx(mpc, [_fpr(v, modulus) for v in xs], op, (-3.0, 3.0), method=METHOD_FOURIER, degree=12)
+    after = x.reveal(mpc).tolist()
+    if mpc.pid:
+        xf = [_fpr(v, modulus) for v in xs]
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear polynomial (Decor) on the {name}", p, [poly_eval(coeffs, v) for v in xf], error=decor_error_bound("polynomial", (-3.0, 3.0), coeffs))
+        cc = chebyshev_coeffs(op, chebyshev_nodes(CHEBYSHEV_DEGREE + 1, (-3.0, 3.0)), (-3.0, 3.0))
+        tol_c = (4.0 + 2.0 * float(CHEBYSHEV_DEGREE)) * ULP * (1.0 + _abs_sum(cc)) + 64.0 * DOUBLE_EPS
+        fs = fourier_coeffs(op, (-3.0, 3.0), 12)
+        tol_f = 8.0 * ULP * (abs(fs.a0) + _abs_sum(fs.a) + _abs_sum(fs.b)) * (1.0 + 2.0 * math.pi * 12.0) + 64.0 * DOUBLE_EPS
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear approx (Chebyshev) = its plaintext on the {name}", ac, pc, error=tol_c)
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear approx (Fourier) = its plaintext on the {name}", af, pf, error=tol_f)
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear approx (Chebyshev, degree 20) approximates exp(-x^2) on the {name}", ac, [op(v) for v in xf], error=1e-4)
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear polynomial/approx: input intact on the {name}", after, [_fpr(v, modulus) for v in xs], error=ULP, silent_pass=True)
+
+
+def _local_value(sv, modulus):
+    # The value a public Sharetensor holds at a compute party (reveal would add the parties' copies)
+    return fp_to_double(sv.share, modulus)
+
+
+def test_public(mpc, modulus: mpc_uint):
+    # A public Sharetensor (each party holds the whole value, as after publish): the API evaluates it in the clear and
+    # the result stays public, as the plaintext input gives it; Decor's own entry points take it as a sharing (the
+    # protocol counts it once: f(x), not f(n_cp x))
+    name = _name(modulus)
+    xs = [0.5, -1.0, 2.0]
+    pos = [0.75, 1.5, 4.0]
+    xp = Sharetensor.enc(mpc, xs, 0, modulus).publish(mpc)
+    pp = Sharetensor.enc(mpc, pos, 0, modulus).publish(mpc)
+    xf = [_fpr(v, modulus) for v in xs]
+    pf = [_fpr(v, modulus) for v in pos]
+    cubic = [1.0, -2.0, 0.5, 0.25]
+    outs = [nl.sigmoid(mpc, xp), nl.sigmoid(mpc, xp, method=METHOD_CHEBYSHEV), nl.exp(mpc, xp), nl.sin(mpc, xp),
+            nl.inv(mpc, pp), nl.log(mpc, pp), nl.polynomial(mpc, xp, cubic, (-3.0, 3.0)), nl.approx(mpc, xp, math.exp, (-3.0, 3.0)),
+            nl.softmax(mpc, xp)]
+    wants = [nl.sigmoid(mpc, xf), nl.sigmoid(mpc, xf, method=METHOD_CHEBYSHEV), nl.exp(mpc, xf), nl.sin(mpc, xf),
+             nl.inv(mpc, pf), nl.log(mpc, pf), nl.polynomial(mpc, xf, cubic, (-3.0, 3.0)), nl.approx(mpc, xf, math.exp, (-3.0, 3.0)),
+             nl.softmax(mpc, array(xf)).tolist()]
+    labels = ["sigmoid (auto: the function)", "sigmoid (Chebyshev)", "exp (Decor)", "sin (Decor)", "inv (Decor)", "log (Chebyshev)",
+              "polynomial", "approx (Chebyshev)", "softmax"]
+    direct = via_decor(mpc, xp, func="sigmoid").reveal(mpc).tolist()
+    direct_exp = via_decor(mpc, xp, func="exp", interval=(-3.0, 3.0)).reveal(mpc).tolist()
+    if mpc.pid:
+        for i in range(len(outs)):
+            assert_eq(f"CP{mpc.pid}:\tnonlinear {labels[i]} of a public Sharetensor stays public on the {name}", outs[i].public, True, silent_pass=True)
+            assert_eq_approx(f"CP{mpc.pid}:\tnonlinear {labels[i]} of a public Sharetensor = the plaintext path on the {name}",
+                             _local_value(outs[i], modulus), wants[i], error=2.0 * ULP)
+        assert_eq_approx(f"CP{mpc.pid}:\tvia_decor sigmoid of a public Sharetensor (as a sharing) on the {name}", direct,
+                         [_sigmoid(v) for v in xf], error=decor_error_bound("sigmoid"))
+        assert_eq_approx(f"CP{mpc.pid}:\tvia_decor exp of a public Sharetensor (as a sharing) on the {name}", direct_exp,
+                         [math.exp(v) for v in xf], error=decor_error_bound("exp", (-3.0, 3.0)))
+        assert_eq_approx(f"CP{mpc.pid}:\tpublic input intact on the {name}", _local_value(xp, modulus), xf, error=ULP, silent_pass=True)
+
+    # Below the API: every entry point takes a public input as a sharing held by CP1
+    sig_coeffs = chebyshev_coeffs(_sigmoid, chebyshev_nodes(11, (-8.0, 8.0)), (-8.0, 8.0))
+    sig_mono = cheb2poly(sig_coeffs)
+    cl = via_chebyshev(mpc, xp, _sigmoid, (-8.0, 8.0), 10).reveal(mpc).tolist()
+    yp = Sharetensor.enc(mpc, [0.25, 0.75, 1.5], 0, modulus).publish(mpc)
+    gt = ring_gt(mpc, xp, yp, bits=MPC_NBIT_K + 1).reveal(mpc).tolist()
+    up = Sharetensor.enc(mpc, [0.1, 0.9, 0.45], 0, modulus).publish(mpc)
+    dgt = decor_gt(mpc, up, 0.5).reveal(mpc).tolist()
+    inv = decor_mul_inv(mpc, pp, sign_check=False).reveal(mpc).tolist()
+    tay = via_taylor(mpc, xp, func="exp", interval=(-3.0, 3.0), degree=8).reveal(mpc).tolist()
+    tay_n = via_taylor(mpc, xp, func="exp", interval=(-3.0, 3.0), degree=8, evaluation="naive").reveal(mpc).tolist()
+    s1 = fourier_coeffs(math.sin, (-math.pi, math.pi), 2)
+    fou = via_fourier(mpc, xp, math.sin, (-math.pi, math.pi), 2).reveal(mpc).tolist()
+    if mpc.pid:
+        # Clenshaw: (4 + 2 degree) units per unit of sum |c_k|, and the monomial reference's rounding
+        cl_tol = (4.0 + 20.0) * ULP * (1.0 + _abs_sum(sig_coeffs)) + (1e-9 if MPC_NBIT_F <= 32 else 22.0 * DOUBLE_EPS * (1.0 + _abs_sum(sig_mono)))
+        assert_eq_approx(f"CP{mpc.pid}:\tvia_chebyshev (Clenshaw) of a public Sharetensor on the {name}", cl,
+                         [poly_eval(sig_mono, v / 8.0) for v in xf], error=cl_tol)
+        assert_eq(f"CP{mpc.pid}:\tring_gt of two public Sharetensors on the {name}", gt, [1.0, 0.0, 1.0])
+        assert_eq(f"CP{mpc.pid}:\tdecor_gt of a public Sharetensor and 0.5 on the {name}", dgt, [0.0, 1.0, 0.0])
+        inv_want = [1.0 / v for v in pf]
+        assert_eq_approx(f"CP{mpc.pid}:\tdecor_mul_inv of a public Sharetensor on the {name}", inv, inv_want,
+                         error=(64.0 * ULP + 64.0 * DOUBLE_EPS) * _scale(inv_want) * _scale(inv_want))
+        exp8 = taylor_coeffs("exp", 0.0, 8)
+        tay_want = [poly_eval(exp8, v) for v in xf]
+        floor = 4.0 * DOUBLE_EPS * (1.0 + _abs_sum([abs(exp8[k]) * 3.0 ** float(k) for k in range(len(exp8))]))
+        assert_eq_approx(f"CP{mpc.pid}:\tvia_taylor (Decor) of a public Sharetensor on the {name}", tay, tay_want,
+                         error=decor_error_bound("polynomial", (-3.0, 3.0), exp8) + floor)
+        # the naive check's estimate, 2^-F (2 + sum_k r^k + 2 sum_k |c_k| sum_{j < k - 1} r^j), r = 3
+        naive_est = 2.0
+        for k in range(len(exp8)):
+            naive_est += 3.0 ** float(k) + 2.0 * abs(exp8[k]) * sum([3.0 ** float(j) for j in range(k - 1)])
+        assert_eq_approx(f"CP{mpc.pid}:\tvia_taylor (naive) of a public Sharetensor on the {name}", tay_n, tay_want,
+                         error=naive_est * ULP + floor)
+        weight = abs(s1.a0) + _abs_sum(s1.a) + _abs_sum(s1.b)
+        fou_tol = 8.0 * ULP * weight * (1.0 + 4.0 * math.pi) + (1e-9 if MPC_NBIT_F <= 32 else 4.0 * math.pi * _fourier_phase(s1) * DOUBLE_EPS + 8.0 * DOUBLE_EPS * (1.0 + weight))
+        assert_eq_approx(f"CP{mpc.pid}:\tvia_fourier of a public Sharetensor on the {name}", fou, [s1(v) for v in xf], error=fou_tol)
+
+
+def _auto_tolerance(func: str, interval) -> float:
+    # auto's error model on either modulus: Decor's bound (at least NONLINEAR_AUTO_FLOOR) covers Decor on the ring and
+    # twice the interpolant's truncation on the field; Clenshaw's rounding adds (4 + 2 degree) units per unit of
+    # 1 + sum |c_k| (the interpolant's coefficients, recomputed)
+    bound = decor_error_bound("sigmoid", interval) if func == "sigmoid" else decor_error_bound("tanh", interval)
+    degree = nl.auto_degree("sigmoid", interval) if func == "sigmoid" else nl.auto_degree("tanh", interval)
+    iv = interval if interval != (0.0, 0.0) else (DECOR_INTERVAL_SIGMOID if func == "sigmoid" else DECOR_INTERVAL_TANH)
+    c = _cos_coeffs(func, 2 * degree + 2, iv)
+    weight = 1.0
+    for k in range(degree + 1):
+        weight += abs(c[k])
+    return max(bound, NONLINEAR_AUTO_FLOOR) + (4.0 + 2.0 * float(degree)) * ULP * weight
+
+
+def _cos_coeffs(func: str, n: int, iv) -> List[float]:
+    # The degree-n Chebyshev interpolant's coefficients by the cosine sum, independently of the module
+    a, b = iv
+    m = n + 1
+    c = List[float]()
+    for k in range(m):
+        s = 0.0
+        for i in range(m):
+            t = (float(i) + 0.5) * math.pi / float(m)
+            s += _value(func, 0.5 * (a + b) + 0.5 * (b - a) * math.cos(t)) * math.cos(float(k) * t)
+        c.append(s * (1.0 if k == 0 else 2.0) / float(m))
+    return c
+
+
+def test_auto(mpc, modulus: mpc_uint):
+    # sigmoid's and tanh's default: Decor on ring shares (method decor's rounds), on field shares the Chebyshev
+    # interpolant of auto_degree (method chebyshev's rounds at that degree), within _auto_tolerance either way. The degree
+    # is the smallest whose Chebyshev tail (coefficients above double-precision noise) stays within half of
+    # max(Decor's bound, NONLINEAR_AUTO_FLOOR) (recomputed here from a degree-512 interpolant). auto refuses a degree and
+    # Decor's inadmissible intervals, on every modulus and before any round.
+    name = _name(modulus)
+    ring = modulus.popcnt() == 1
+    xs = [-4.5, -2.5, 0.0, 1.5, 4.5]
+    xf = [_fpr(v, modulus) for v in xs]
+    for func in ["sigmoid", "tanh"]:
+        iv = DECOR_INTERVAL_SIGMOID if func == "sigmoid" else DECOR_INTERVAL_TANH
+        bound = decor_error_bound("sigmoid") if func == "sigmoid" else decor_error_bound("tanh")
+        degree = nl.auto_degree("sigmoid") if func == "sigmoid" else nl.auto_degree("tanh")
+        x = Sharetensor.enc(mpc, xs, 0, modulus)
+        r0 = mpc.stats.rounds
+        y = nl.sigmoid(mpc, x) if func == "sigmoid" else nl.tanh(mpc, x)
+        auto_rounds = mpc.stats.rounds - r0
+        r1 = mpc.stats.rounds
+        if ring:
+            ref = nl.sigmoid(mpc, x, method=METHOD_DECOR) if func == "sigmoid" else nl.tanh(mpc, x, method=METHOD_DECOR)
+        else:
+            ref = nl.sigmoid(mpc, x, method=METHOD_CHEBYSHEV, interval=iv, degree=degree) if func == "sigmoid" else \
+                nl.tanh(mpc, x, method=METHOD_CHEBYSHEV, interval=iv, degree=degree)
+        ref_rounds = mpc.stats.rounds - r1
+        got = y.reveal(mpc).tolist()
+        c = _cos_coeffs(func, 512, iv)
+        noise = 2.0 ** -52 * (16.0 + 64.0)
+        target = 0.5 * max(bound, NONLINEAR_AUTO_FLOOR)
+        tail = 0.0
+        for k in range(degree + 1, 513):
+            if abs(c[k]) > noise:
+                tail += abs(c[k])
+        if mpc.pid:
+            want = [_value(func, v) for v in xf]
+            method_name = "Decor" if ring else f"Chebyshev degree {degree}"
+            assert_eq_approx(f"CP{mpc.pid}:\tnonlinear {func}, default (auto) on the {name}: within Decor's bound and Clenshaw's rounding", got, want, error=_auto_tolerance(func, (0.0, 0.0)) + 64.0 * DOUBLE_EPS)
+            assert_eq(f"CP{mpc.pid}:\tnonlinear {func}, default (auto) on the {name}: {method_name}'s rounds ({auto_rounds} = {ref_rounds})", auto_rounds == ref_rounds and auto_rounds > 0, True)
+            assert_eq(f"CP{mpc.pid}:\tnonlinear {func}, auto_degree {degree}: the smallest degree whose tail ({tail:.2e}) stays within half of max(Decor's bound, the floor) ({target:.2e})",
+                      tail <= target and abs(c[degree]) > noise and tail + abs(c[degree]) > target, True)
+    # A narrower interval, clipped: auto's interpolant for that interval (or Decor's clip on the ring)
+    xc = Sharetensor.enc(mpc, [-3.0, -0.5, 0.75, 2.5], 0, modulus)
+    clipped = nl.sigmoid(mpc, xc, interval=(-2.0, 2.0), clip=True).reveal(mpc).tolist()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tnonlinear sigmoid, auto on (-2, 2), clipped, on the {name}", clipped,
+                         [_sigmoid(min(max(_fpr(v, modulus), -2.0), 2.0)) for v in [-3.0, -0.5, 0.75, 2.5]],
+                         error=_auto_tolerance("sigmoid", (-2.0, 2.0)) + 64.0 * DOUBLE_EPS)
+    xi = Sharetensor.enc(mpc, [0.5], 0, modulus)
+    _refuses(mpc, f"nonlinear sigmoid (auto) with a degree on the {name}", lambda: nl.sigmoid(mpc, xi, degree=12))
+    _refuses(mpc, f"nonlinear sigmoid (auto) on (-30, 30), beyond Decor's admissible interval, on the {name}", lambda: nl.sigmoid(mpc, xi, interval=(-30.0, 30.0)))
+    _refuses(mpc, f"nonlinear sigmoid (auto) on (-30, 30) in plaintext", lambda: nl.sigmoid(mpc, [0.5], interval=(-30.0, 30.0)))
+
+
+def test_nonlinear(mpc):
+    print(f"CP{mpc.pid}:\tTesting sequre.stdlib.nonlinear ...\n")
+    for modulus in (MPC_RING_SIZE, MPC_FIELD_SIZE):
+        test_methods(mpc, modulus)
+        test_auto(mpc, modulus)
+        test_softmax(mpc, modulus)
+        test_polynomial_approx(mpc, modulus)
+        test_public(mpc, modulus)
+    test_multiparty(mpc)
+    test_softmax_multiparty(mpc)
+    test_ciphertensor(mpc)
+    print(f"CP{mpc.pid}:\tsequre.stdlib.nonlinear tests passed.\n")
