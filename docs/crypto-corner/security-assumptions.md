@@ -20,6 +20,12 @@ Party 0 (CP0) acts as a **trusted dealer** during the offline phase:
 
 In production deployments, the trusted dealer can be replaced by an MPC preprocessing protocol or a hardware enclave.
 
+### Authenticated channels
+
+In distributed mode, every pair of parties talks over its own mutual-TLS connection. Each party holds a certificate from the deployment's CA that names that party (`SEQURE_PARTY_CERT_NAME`, default `cp<pid>`), and both ends of a connection check that the other's certificate comes from the CA and names the party expected there. So no party, and no one else the CA certified, can take another party's place or sit in the middle of a connection and read or change what it carries: the pairwise and global PRG seeds, shares, masks and opened values. This rests on the CA issuing each party's name to that party only. A failed check stops the run; aborts are outside the semi-honest model.
+
+Local mode runs all parties on one machine over UNIX sockets, without TLS. The data-sharing socket, where data owners (not parties) send their inputs, accepts any certificate from the CA.
+
 ## Hardness assumptions
 
 ### Ring Learning with Errors (RLWE)

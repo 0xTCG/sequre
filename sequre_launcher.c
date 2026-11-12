@@ -532,9 +532,12 @@ static void print_help(const char *codon) {
   printf("  CODON_BIN              Path to the codon executable\n");
   printf("  CODON_PYTHON           Path to libpython, for @python interop (auto-detected via python3)\n");
   printf("  SEQURE_GMP_PATH        Override auto-detected libgmp path\n");
-  printf("  SEQURE_CP_IPS          Comma-separated party IP addresses\n");
+  printf("  SEQURE_CP_IPS          Comma-separated party IPv4 addresses\n");
   printf("  SEQURE_CERT_DIR        TLS certificate directory (default: certs)\n");
   printf("  SEQURE_CA_CERT_FILE    CA certificate file (default: ca.pem)\n");
+  printf("  SEQURE_PARTY_CERT_FILE Party certificate file pattern (default: cp{pid}.pem)\n");
+  printf("  SEQURE_PARTY_KEY_FILE  Party private key file pattern (default: cp{pid}-key.pem)\n");
+  printf("  SEQURE_PARTY_CERT_NAME Name each party's certificate must carry (default: cp{pid})\n");
   printf("  SEQURE_USE_TLS         Set to 0 to disable TLS (insecure)\n");
   printf("  SEQURE_OPENSSL_PATH    Override auto-detected libssl path\n");
   printf("  SEQURE_LIBCRYPTO_PATH  Override auto-detected libcrypto path\n");

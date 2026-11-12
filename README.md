@@ -128,7 +128,7 @@ The [MPC instance](https://0xtcg.github.io/sequre/api/mpc-instance/) provides ac
 
 > **Note:** When working with many local runs, the socket files (`sock.*`) — needed for local communication — may collide between runs and cause connection issues. Delete stale files with `rm sock.*`.
 
-Distributed mode requires mutual TLS certificates. Sequre handles MHE/MPC key management automatically, but **does not handle TLS certificate creation/maintenance**. For testing, generate test certificates with `scripts/generate_certs.sh`. For production, use a secure CA — see [TLS configuration](https://0xTCG.github.io/sequre/user-guide/running-distributed/#tls-configuration).
+Distributed mode requires mutual TLS certificates: one per party, from a CA all parties trust, naming its party (`cp<pid>` by default). Sequre handles MHE/MPC key management automatically, but **does not handle TLS certificate creation/maintenance**. For testing, generate test certificates with `scripts/generate_certs.sh`. For production, use a secure CA — see [TLS configuration](https://0xTCG.github.io/sequre/user-guide/running-distributed/#tls-configuration).
 
 Sequre also provides lower-level `@local` and `@online` decorators for hard-coding the execution mode --- see the [documentation](https://0xTCG.github.io/sequre/api/decorators/) --- but `@main` covers both use-cases.
 

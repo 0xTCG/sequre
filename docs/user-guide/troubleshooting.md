@@ -131,6 +131,29 @@ export SEQURE_CA_CERT_FILE=my-ca.pem
 
 See [TLS configuration](running-distributed.md#tls-configuration) for the full list of environment variables.
 
+### Peer certificate rejected
+
+Every connection between two parties checks that the peer's certificate comes from the CA and names the party it connects as (see [TLS configuration](running-distributed.md#tls-configuration)). If it does not, the handshake fails, the party stops, and its error names the connection, the party it expected and OpenSSL's reason:
+
+```
+ValueError: TLS handshake with CP1 at CP0 (server side, 0.0.0.0:9001, connection from 10.0.0.12:53418) failed:
+CP1's certificate was rejected: hostname mismatch; expected a certificate from the CA in certs/ca.pem that names
+"cp1" (SEQURE_PARTY_CERT_NAME sets the names the parties expect) [TLS protocol error; OpenSSL: error:0A000086:SSL
+routines::certificate verify failed]
+```
+
+The reason after "was rejected:" is OpenSSL's verification result:
+
+| Reason | Cause | Fix |
+|---|---|---|
+| `hostname mismatch` | The certificate names another party, or not in the form the parties expect | Check its names with `openssl x509 -in certs/cp1.pem -noout -text \| grep -E "Subject:\|DNS:"`: it must carry the name `SEQURE_PARTY_CERT_NAME` gives that party (default `cp1`), as a subjectAltName DNS entry or, if it has none, as the CN. Run every party with the same `SEQURE_PARTY_CERT_NAME`. |
+| `unable to get local issuer certificate`, `authority and subject key identifier mismatch`, `certificate signature failure` | The certificate is not signed by the CA in `SEQURE_CA_CERT_FILE` | Give every party the same `ca.pem`, and certificates that CA signed (one run of `generate_certs.sh` for all parties) |
+| `certificate has expired`, `certificate is not yet valid` | Outside its validity period | Issue a new one; check the clocks |
+
+When the other side rejected this party, the error says so instead: "`CP0 did not confirm the handshake, so it rejected this party`" or "`CP1 rejected the handshake (with an alert ...)`", followed by the alert OpenSSL received, such as `sslv3 alert bad certificate` or `tlsv1 alert unknown ca`. The reason is then in the other party's error.
+
+The connection's address helps tell a misconfigured party from a stranger: the server side reports where the connection came from.
+
 ### Expired or invalid certificates
 
 If connections fail with TLS handshake errors, check certificate validity:
@@ -156,7 +179,7 @@ export SEQURE_USE_TLS=0
 
 ### Parties cannot connect
 
-- Verify all parties use the same `SEQURE_CP_IPS` with IPs in the same order
+- Verify all parties use the same `SEQURE_CP_IPS` with IPs in the same order. The entries must be IPv4 addresses: a host name stops every party at startup with "`... is not an IPv4 address`"
 - Check that ports `9000+` and `9999` are open between machines (see [network configuration](running-distributed.md#network-configuration))
 - Ensure all parties start within a reasonable time window — the connection has a retry mechanism, but it will eventually time out
 

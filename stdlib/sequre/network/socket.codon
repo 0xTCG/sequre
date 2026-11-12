@@ -1,18 +1,39 @@
-from sequre.constants import AF_UNIX, AF_INET, SOCK_STREAM
+from sequre.constants import AF_UNIX, AF_INET, SOCK_STREAM, USE_TLS, ENV_USE_TLS, ENV_CP_IPS
 
-from C import socket(int, int, int) -> int
-from C import bind(int, cobj, int) -> int
-from C import connect(int, cobj, int) -> int
+# C declarations at the C types' real widths (see common.codon): int is i32, socklen_t is u32
+from C import socket(i32, i32, i32) -> i32
+from C import bind(i32, cobj, u32) -> i32
+from C import connect(i32, cobj, u32) -> i32
+from C import setsockopt(i32, i32, i32, cobj, u32) -> i32
 from C import perror(cobj)
 from C import memcpy(cobj, cobj, int)
-from C import memset(cobj, int, int) -> cobj
+from C import memset(cobj, i32, int) -> cobj
 from C import htons(u16) -> u16
 from C import inet_addr(cobj) -> u32
-from C import unlink(str) -> int
+from C import unlink(cobj) -> i32
 
 from common import (
-    listen_socket, accept_socket, close_socket, ignore_sigpipe,
-    create_ssl_context, ssl_wrap_accept, ssl_wrap_connect)
+    listen_socket, accept_socket, close_socket, ignore_sigpipe, peer_address,
+    create_ssl_context, tls_handshake, party_cert_name, SSL_CTX_free)
+
+# setsockopt levels and options (SOL_SOCKET and SO_REUSEADDR differ between Linux and macOS)
+_SOL_SOCKET = i32(0xffff) if __apple__ else i32(1)
+_SO_REUSEADDR = i32(4) if __apple__ else i32(2)
+_IPPROTO_TCP = i32(6)
+_TCP_NODELAY = i32(1)
+# What inet_addr returns for a string that is not an IPv4 address
+_INADDR_NONE = u32(0xffffffff)
+
+
+def check_ipv4_address(ip_address: str) -> u32:
+    # The IPv4 address in dotted form ip_address, in network byte order. Host names are not resolved: inet_addr would
+    # turn one into 255.255.255.255, and every connection attempt would fail, so it raises instead.
+    addr = inet_addr(ip_address.c_str())
+    if addr == _INADDR_NONE:
+        raise ValueError(
+            f'"{ip_address}" is not an IPv4 address: {ENV_CP_IPS} takes IPv4 addresses in dotted form, '
+            f'not host names')
+    return addr
 
 
 class CSocket:
@@ -27,23 +48,27 @@ class CSocket:
     is_macos: bool
     ssl: cobj      # SSL* handle (NULL for UNIX sockets)
     ssl_ctx: cobj  # SSL_CTX* handle (NULL for UNIX sockets)
+    pid: int       # the party this socket belongs to, set by init_ssl_ctx (-1 before)
+    peer_pid: int  # the party the TLS handshake requires at the other end (-1: any certificate from the CA)
 
     def __init__(self: CSocket, unix_file_address: str = '', ip_address: str = '', port: str = ''):
         ignore_sigpipe()  # so that a send to a closed peer raises instead of killing the process
         self.sock_fd = -1
         self.ssl = cobj()
         self.ssl_ctx = cobj()
+        self.pid = -1
+        self.peer_pid = -1
         self.inet_serveraddr = Ptr[byte](0)
         self.inet_serveraddr_len = 0
         self.unix_serveraddr = Ptr[byte](0)
         self.unix_serveraddr_len = 0
         self.is_macos = __apple__  # Codon compile-time platform flag (matches the build target)
-        
+
         self.is_inet = ip_address != '' and port != ''
         self.is_unix = unix_file_address != ''
- 
+
         assert self.is_inet ^ self.is_unix, "Invalid CSocket address config. Set either INET IP address and port or UNIX file address."
-        
+
         if self.is_inet:
             self.socket_address = f'{ip_address}:{port}'
             self.inet_serveraddr, self.inet_serveraddr_len = self._set_inet_serveraddr(ip_address, port)
@@ -52,61 +77,121 @@ class CSocket:
             self.unix_serveraddr, self.unix_serveraddr_len = self._set_unix_serveraddr(unix_file_address)
 
     def close(self: CSocket):
-        # Safe to call more than once (freeing the TLS session twice would crash).
+        # Safe to call more than once (freeing the TLS session or context twice would crash).
         close_socket(self.sock_fd, self.ssl)
         self.sock_fd = -1
         self.ssl = cobj()
+        if self.ssl_ctx:
+            SSL_CTX_free(self.ssl_ctx)
+            self.ssl_ctx = cobj()
 
-    def init_ssl_ctx(self: CSocket, pid: int, is_server: bool):
+    def init_ssl_ctx(self: CSocket, pid: int, is_server: bool, peer_pid: int = -1):
+        # The TLS context of an INET socket at party pid (its certificate and key, and the CA). With peer_pid >= 0 the
+        # handshake also requires the peer's certificate to name party peer_pid (party_cert_name: SEQURE_PARTY_CERT_NAME,
+        # default "cp{pid}"), on both ends of the channel. With -1 any certificate from the CA passes: the
+        # data-sharing socket, whose clients are data owners, not parties.
         if self.is_inet:
+            if peer_pid >= 0:
+                party_cert_name(peer_pid)  # raises now if SEQURE_PARTY_CERT_NAME cannot name the parties apart
+            if self.ssl_ctx:
+                SSL_CTX_free(self.ssl_ctx)
+                self.ssl_ctx = cobj()
             self.ssl_ctx = create_ssl_context(pid, is_server)
-        
+            self.pid = pid
+            self.peer_pid = peer_pid
+
     def socket(self: CSocket):
         close_socket(self.sock_fd)
-        self.sock_fd = socket(AF_INET if self.is_inet else AF_UNIX, SOCK_STREAM, 0)
-        if self.sock_fd == -1:
+        self.sock_fd = int(socket(i32(AF_INET if self.is_inet else AF_UNIX), i32(SOCK_STREAM), i32(0)))
+        if self.sock_fd < 0:
+            self.sock_fd = -1
             perror(f'Socket not instantiated'.c_str())
             raise ValueError(f'Socket not instantiated')
 
     def connect(self: CSocket) -> bool:
         if self.is_inet:
-            connection = connect(self.sock_fd, self.inet_serveraddr, self.inet_serveraddr_len)
+            connection = int(connect(i32(self.sock_fd), self.inet_serveraddr, u32(self.inet_serveraddr_len)))
         else:
-            connection = connect(self.sock_fd, self.unix_serveraddr, self.unix_serveraddr_len)
+            connection = int(connect(i32(self.sock_fd), self.unix_serveraddr, u32(self.unix_serveraddr_len)))
 
         if connection != 0:
             perror(f'{self.socket_address}:\tCould not connect'.c_str())
+            return False
 
-        return connection == 0
+        if self.is_inet:
+            self._set_option(_IPPROTO_TCP, _TCP_NODELAY, 'TCP_NODELAY')
+        return True
 
     def ssl_handshake_connect(self: CSocket):
-        if self.is_inet and self.ssl_ctx:
-            self.ssl = ssl_wrap_connect(self.ssl_ctx, self.sock_fd)
-            print(f'{self.socket_address}:\tTLS handshake complete (client).')
+        if self._needs_tls():
+            context = f'TLS handshake with {self._peer_label()} at CP{self.pid} (client side, {self.socket_address})'
+            self.ssl = tls_handshake(
+                self.ssl_ctx, self.sock_fd, False, self._peer_name(), self._peer_label(), context)
+            print(f'{self.socket_address}:\tTLS handshake complete (client): {self._verified()}.')
 
     def ssl_handshake_accept(self: CSocket):
-        if self.is_inet and self.ssl_ctx:
-            self.ssl = ssl_wrap_accept(self.ssl_ctx, self.sock_fd)
-            print(f'{self.socket_address}:\tTLS handshake complete (server).')
+        if self._needs_tls():
+            context = (f'TLS handshake with {self._peer_label()} at CP{self.pid} (server side, '
+                       f'{self.socket_address}, connection from {peer_address(self.sock_fd)})')
+            self.ssl = tls_handshake(
+                self.ssl_ctx, self.sock_fd, True, self._peer_name(), self._peer_label(), context)
+            print(f'{self.socket_address}:\tTLS handshake complete (server): {self._verified()}.')
 
     def bind(self: CSocket):
         if self.is_inet:
-            rc = bind(self.sock_fd, self.inet_serveraddr, self.inet_serveraddr_len)
+            rc = int(bind(i32(self.sock_fd), self.inet_serveraddr, u32(self.inet_serveraddr_len)))
         else:
-            rc = bind(self.sock_fd, self.unix_serveraddr, self.unix_serveraddr_len)
+            rc = int(bind(i32(self.sock_fd), self.unix_serveraddr, u32(self.unix_serveraddr_len)))
 
-        if rc < 0:
+        if rc != 0:
             perror(f'Server not binded at {self.socket_address} and fd {self.sock_fd}'.c_str())
             raise ValueError(f'Server not binded at {self.socket_address} and fd {self.sock_fd}')
 
     def open_channel(self: CSocket):
-        unlink(self.socket_address)
+        if self.is_unix:
+            unlink(self.socket_address.c_str())  # a socket file left behind by an earlier run would fail the bind
         self.socket()
+        if self.is_inet:
+            # Lets a run bind its port while connections of the previous run there are still in TIME_WAIT (~60 s)
+            self._set_option(_SOL_SOCKET, _SO_REUSEADDR, 'SO_REUSEADDR')
         self.bind()
         listen_socket(self.sock_fd)
         print(f"{self.socket_address}:\tChannel open: awaiting connection ...")
         self.sock_fd = accept_socket(self.sock_fd)
+        if self.is_inet:
+            self._set_option(_IPPROTO_TCP, _TCP_NODELAY, 'TCP_NODELAY')
         self.ssl_handshake_accept()
+
+    def _needs_tls(self: CSocket) -> bool:
+        # With TLS on, every INET channel runs a handshake: one without a TLS context fails here instead of carrying
+        # its data in the clear
+        if not self.is_inet:
+            return False
+        if not self.ssl_ctx:
+            if USE_TLS:
+                raise ValueError(
+                    f'{self.socket_address}: TLS is on ({ENV_USE_TLS}) but this channel has no TLS context '
+                    f'(CSocket.init_ssl_ctx was not called)')
+            return False
+        return True
+
+    def _peer_name(self: CSocket) -> str:
+        return party_cert_name(self.peer_pid) if self.peer_pid >= 0 else ''
+
+    def _peer_label(self: CSocket) -> str:
+        return f'CP{self.peer_pid}' if self.peer_pid >= 0 else 'the peer'
+
+    def _verified(self: CSocket) -> str:
+        if self.peer_pid >= 0:
+            return f'CP{self.peer_pid} verified as "{self._peer_name()}"'
+        return 'peer certificate from the CA (no party name required)'
+
+    def _set_option(self: CSocket, level: i32, option: i32, name: str):
+        # Sets an int socket option to 1. A failure costs speed only (TCP_NODELAY) or a rerun's bind within TIME_WAIT
+        # (SO_REUSEADDR), so it is reported and the run goes on.
+        one = i32(1)
+        if int(setsockopt(i32(self.sock_fd), level, option, __ptr__(one).as_byte(), u32(4))) != 0:
+            perror(f'{self.socket_address}:\tsetsockopt {name} failed'.c_str())
 
     def _set_unix_serveraddr(self: CSocket, socket_address: str) -> Tuple[Ptr[byte], int]:
         # Linux:   sockaddr_un = {sa_family_t(2), sun_path[108]}
@@ -116,7 +201,7 @@ class CSocket:
         addr_len = path_len + 2
 
         serveraddr = Ptr[byte](max_path_len + 2)
-        memset(serveraddr, 0, max_path_len + 2)
+        memset(serveraddr, i32(0), max_path_len + 2)
 
         if self.is_macos:
             serveraddr[0] = byte(addr_len)
@@ -127,12 +212,12 @@ class CSocket:
 
         memcpy(serveraddr + 2, socket_address.c_str(), path_len)
         return serveraddr, addr_len
-    
+
     def _set_inet_serveraddr(self: CSocket, ip_address: str, port: str) -> Tuple[Ptr[byte], int]:
         # Linux: sockaddr_in starts with {sin_family: u16, sin_port: u16, sin_addr: u32}
         # macOS: sockaddr_in starts with {sin_len: u8, sin_family: u8, sin_port: u16, sin_addr: u32}
         serveraddr = Ptr[byte](16)
-        memset(serveraddr, 0, 16)
+        memset(serveraddr, i32(0), 16)
 
         if self.is_macos:
             serveraddr[0] = byte(16)
@@ -142,7 +227,7 @@ class CSocket:
             memcpy(serveraddr, __ptr__(family).as_byte(), 2)
 
         net_port = htons(u16(port))
-        addr = inet_addr(ip_address.c_str())
+        addr = check_ipv4_address(ip_address)
         memcpy(serveraddr + 2, __ptr__(net_port).as_byte(), 2)
         memcpy(serveraddr + 4, __ptr__(addr).as_byte(), 4)
 

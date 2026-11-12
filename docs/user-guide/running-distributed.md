@@ -214,13 +214,22 @@ Set the `SEQURE_CP_IPS` environment variable to configure party IP addresses:
 export SEQURE_CP_IPS="192.168.1.10,192.168.1.11,192.168.1.12"
 ```
 
+The entries are IPv4 addresses in dotted form, in party order; host names are not resolved (every party checks every entry at startup and stops on one that is not an address).
+
 ---
 
 ## TLS configuration
 
 _Defined in `stdlib/sequre/network/common.codon`_
 
-Sequre uses **mutual TLS** for all INET (TCP/IP) connections. Both parties in a connection authenticate each other via X.509 certificates signed by a shared CA.
+Sequre uses **mutual TLS** for all INET (TCP/IP) connections between parties. In each connection, both parties present an X.509 certificate, and each accepts the other's only if:
+
+- it is signed by the shared CA (`SEQURE_CA_CERT_FILE`), and
+- it names the party at the other end of the connection: the name `SEQURE_PARTY_CERT_NAME` gives that party (default `cp<pid>`: `cp0`, `cp1`, ...).
+
+A certificate names a party in a subjectAltName DNS entry, or, if it has no DNS entries, in its subject CN (wildcards are not accepted). Certificates that carry the name only in the CN, as `scripts/generate_certs.sh` made them before, keep working. Since each party checks its peer's name, a party (or anyone else the CA certified) cannot take another party's place, for example by connecting first to the port where CP0 waits for CP1, or sit in the middle of a connection.
+
+A handshake that fails stops the run at both ends. The error names the party expected at the other end and OpenSSL's reason, for example `hostname mismatch` for a certificate that names another party (see [Troubleshooting](troubleshooting.md#peer-certificate-rejected)).
 
 ### Certificate environment variables
 
@@ -230,6 +239,13 @@ Sequre uses **mutual TLS** for all INET (TCP/IP) connections. Both parties in a 
 | `SEQURE_CA_CERT_FILE` | `"ca.pem"` | CA certificate filename |
 | `SEQURE_PARTY_CERT_FILE` | `"cp{pid}.pem"` | Per-party certificate filename pattern |
 | `SEQURE_PARTY_KEY_FILE` | `"cp{pid}-key.pem"` | Per-party private key filename pattern |
+| `SEQURE_PARTY_CERT_NAME` | `"cp{pid}"` | The name each party's certificate must carry, `{pid}` replaced by the party ID. Set it to the same value at every party, for example `party{pid}.example.org` if your CA issues DNS names. It must contain `{pid}`. |
+
+In the patterns, `{pid}` is replaced by a party ID: the party's own for its certificate and key files, the peer's for the name a connection expects.
+
+### Data-sharing socket
+
+A party started with data sharing on also listens on `DATA_SHARING_PORT + pid` for data owners. Data owners are not parties, so this socket accepts any certificate signed by the CA, without a name check.
 
 ### Generating certificates
 
@@ -241,7 +257,7 @@ Sequre uses **mutual TLS** for all INET (TCP/IP) connections. Both parties in a 
 Use the provided script to generate a CA and per-party certificates:
 
 ```bash
-bash scripts/generate_certs.sh
+bash scripts/generate_certs.sh [num_parties] [output_dir]   # defaults: 3, ./certs
 ```
 
 This creates:
@@ -250,6 +266,10 @@ This creates:
 - `certs/cp0.pem`, `certs/cp0-key.pem` — Party 0 cert and key
 - `certs/cp1.pem`, `certs/cp1-key.pem` — Party 1 cert and key
 - `certs/cp2.pem`, `certs/cp2-key.pem` — Party 2 cert and key
+
+Each party certificate names its party as a subjectAltName DNS entry and as the subject CN (`cp<pid>`, or the names `SEQURE_PARTY_CERT_NAME` gives when set, which the parties must then also be run with). The private keys are readable by their owner only. The CA's private key is deleted once it has signed the party certificates: to add or replace a party, generate a new set for all parties. Give each party `ca.pem` and only its own certificate and key.
+
+To try a distributed setup on one machine, `tests/network/test_tls.sh` runs the parties as separate processes on 127.0.0.1 with fresh certificates, including runs with wrong certificates that must be rejected.
 
 ### Disabling TLS
 
@@ -280,9 +300,11 @@ sock = CSocket(unix_file_address="/tmp/sequre_cp0_cp1.sock")
 | `bind()` | Bind to the configured address |
 | `connect()` | Connect to the remote party |
 | `open_channel()` | Bind, listen, accept, and TLS handshake (server side) |
-| `init_ssl_ctx(pid, is_server)` | Initialize TLS context with certificates |
+| `init_ssl_ctx(pid, is_server, peer_pid=-1)` | Initialize the TLS context with party `pid`'s certificate and the CA. With `peer_pid`, the handshake also requires the peer's certificate to name party `peer_pid`; with -1, any certificate from the CA passes (the data-sharing socket) |
 | `ssl_handshake_connect()` | Perform TLS handshake as client |
 | `ssl_handshake_accept()` | Perform TLS handshake as server |
+
+With TLS on, a handshake runs on every INET socket: one without a TLS context raises instead of carrying data in the clear.
 
 ### Connection retry
 

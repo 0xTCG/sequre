@@ -8,7 +8,7 @@ from sequre.constants import (
     NETWORK_DELAY_TIME, NETWORK_DELAY_THRESHOLD,
     USE_TLS)
 from sequre.types.utils import fp_to_double
-from sequre.network.socket import CSocket
+from sequre.network.socket import CSocket, check_ipv4_address
 from sequre.network.connect import connect
 from sequre.network.common import snd_jar, receive_jar, generate_random_bytes
 
@@ -17,6 +17,12 @@ from randomness import MPCRandomness
 
 from C import usleep(int) -> int
 from C import memcpy(cobj, cobj, int)
+
+# The largest message (size field and payload, in bytes) send_as_jar sends in one write over UNIX sockets: round trips
+# of larger ones measured faster with the size sent first (2 KB to 4 MB: 4 to 13% in local mode), smaller ones slower
+# (up to 26% at 1 KB). Over TCP one write was as fast or faster at every size measured (72 bytes to 16 MB, with TLS
+# and without), so every message goes in one there.
+LOCAL_MERGED_WRITE_LIMIT = 2048
 
 
 class MPCComms[TP]:
@@ -64,6 +70,8 @@ class MPCComms[TP]:
     def receive[T](self, from_pid: int) -> T:
         return self.receive_as_jar(from_pid, T=T)
     
+    # send_jar_size and receive_jar_size send and receive a message's size field alone. send_as_jar and receive_as_jar
+    # do not use them; a caller that frames its own messages with them counts one request per message, as those do.
     def send_jar_size(self, data, to_pid: int):
         self.stats.send_requests += 1
         self.stats.bytes_sent += sizeof(int)
@@ -77,26 +85,43 @@ class MPCComms[TP]:
         return unpickle(receive_jar(self.sockets[from_pid].sock_fd, sizeof(int), self.sockets[from_pid].ssl), False, int)
     
     def send_as_jar(self, data, to_pid: int):
-        self.stats.send_requests += 1
-        self.send_jar_size(data, to_pid)
+        # A message is its pickled size (an int) followed by the pickled data. Over TCP it goes in one write (so a small
+        # message is one segment and one TLS record): a separate size write costs another segment and TLS record, and
+        # without TCP_NODELAY it would wait for the receiver's delayed ACK (Nagle), about 40 ms per message. Over UNIX
+        # sockets (local mode) only a message of up to LOCAL_MERGED_WRITE_LIMIT bytes goes in one write: a larger one
+        # sends its size first, so that the receiver allocates its buffer while this side pickles the data, which
+        # measured faster there.
         pickle_size = data._pickle_size()
+        msg_len = sizeof(int) + pickle_size
+        self.stats.send_requests += 1
+        self.stats.bytes_sent += msg_len
 
         if NETWORK_DELAY_TIME > 0:
-            self.delay_buffer_size += pickle_size + sizeof(int)
+            self.delay_buffer_size += msg_len
             if self.delay_buffer_size >= NETWORK_DELAY_THRESHOLD:
                 usleep(NETWORK_DELAY_TIME * (self.delay_buffer_size // NETWORK_DELAY_THRESHOLD))
                 self.delay_buffer_size %= NETWORK_DELAY_THRESHOLD
 
-        self.stats.bytes_sent += pickle_size
-        jar = ptr[byte](pickle_size)
-        pickle(data, jar, pasteurized=False)
-
-        self.flush(to_pid, jar, pickle_size)
+        if not self.local or msg_len <= LOCAL_MERGED_WRITE_LIMIT:
+            jar = ptr[byte](msg_len)
+            pickle(pickle_size, jar, pasteurized=False)
+            pickle(data, jar + sizeof(int), pasteurized=False)
+            self.flush(to_pid, jar, msg_len)
+        else:
+            size_jar = ptr[byte](sizeof(int))
+            pickle(pickle_size, size_jar, pasteurized=False)
+            self.flush(to_pid, size_jar, sizeof(int))
+            jar = ptr[byte](pickle_size)
+            pickle(data, jar, pasteurized=False)
+            self.flush(to_pid, jar, pickle_size)
 
     def receive_as_jar[T](self, from_pid: int) -> T:
+        # One message (send_as_jar): its size, then the data; counted as one receive request, as the send is one
+        self._check_not_detached(from_pid)
         self.stats.receive_requests += 1
-        msg_len = self.receive_jar_size(from_pid)
-        received_jar = receive_jar(self.sockets[from_pid].sock_fd, msg_len, self.sockets[from_pid].ssl)
+        socket = self.sockets[from_pid]
+        msg_len = unpickle(receive_jar(socket.sock_fd, sizeof(int), socket.ssl), False, int)
+        received_jar = receive_jar(socket.sock_fd, msg_len, socket.ssl)
         return unpickle(received_jar, False, T)
     
     def flush(self, to_pid: int, jar, pickle_size):
@@ -346,6 +371,11 @@ class MPCComms[TP]:
 
     def __setup_channels(self, expect_data_sharing):
         assert self.local or len(CP_IPS) == NUMBER_OF_PARTIES, f"CP_IPS are invalid: len({CP_IPS}) != NUMBER_OF_PARTIES ({NUMBER_OF_PARTIES})"
+        if not self.local:
+            # Every party checks every address before opening a socket, so that a bad entry stops all of them (the
+            # parties that only listen would otherwise wait for a connection that never comes)
+            for ip_address in CP_IPS:
+                check_ipv4_address(ip_address)
         
         # Sockets are spawned per corresponding party
         for pid in range(self.number_of_parties):
@@ -363,9 +393,9 @@ class MPCComms[TP]:
             else:
                 ip_address = '0.0.0.0' if self.pid < pid else CP_IPS[pid]
                 self.sockets[pid] = CSocket(ip_address=ip_address, port=str(port))
-                # Initialize TLS context for INET sockets when enabled.
+                # With TLS on, each end requires the other's certificate to come from the CA and name its party.
                 if USE_TLS:
-                    self.sockets[pid].init_ssl_ctx(self.pid, is_server=(self.pid < pid))
+                    self.sockets[pid].init_ssl_ctx(self.pid, is_server=(self.pid < pid), peer_pid=pid)
 
             if self.pid < pid:
                 self.sockets[pid].open_channel()
@@ -375,7 +405,8 @@ class MPCComms[TP]:
 
         if expect_data_sharing:
             assert not self.local, "Local data sharing not supported yet"
-            # Data sharing host socket is at self.sockets[self.pid]
+            # Data sharing host socket is at self.sockets[self.pid]. Its clients are data owners, not parties: any
+            # certificate from the CA passes.
             self.sockets[self.pid] = CSocket(ip_address='0.0.0.0', port=str(DATA_SHARING_PORT + self.pid))
             if USE_TLS:
                 self.sockets[self.pid].init_ssl_ctx(self.pid, is_server=True)
