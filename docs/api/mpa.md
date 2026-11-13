@@ -84,8 +84,8 @@ mpa = MPA(mpc, my_ciphertensor)
 
 | Method | Description |
 |---|---|
-| `.sum(axis)` | Sum along axis |
-| `.dot(axis)` | Dot product along axis |
+| `.sum(axis)` | Sum along axis of each share as held (in the clear, encrypted, or the aggregate) |
+| `.dot(axis)` | `(x * x).sum(axis)` |
 
 ## Shape manipulation
 

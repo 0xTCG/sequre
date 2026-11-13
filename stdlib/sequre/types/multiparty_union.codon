@@ -9,9 +9,9 @@ from sequre.attributes import sequre
 from sequre.mpc.env import MPCEnv
 from sequre.lattiseq.ckks import Ciphertext
 from sequre.types.ciphertensor import Ciphertensor
-from sequre.types.multiparty_partition import MPP, ALIGN_ENCRYPT, _agree_on_partitions
+from sequre.types.multiparty_partition import MPP, ALIGN_ENCRYPT, _agree_on_partitions, D_KIND, MPP_UNIFIED, MPP_SEMI
 from sequre.types.multiparty_aggregate import MPA
-from sequre.constants import HE_ENC_COST_ESTIMATE
+from sequre.constants import HE_ENC_COST_ESTIMATE, ENC_ROW
 
 
 # Multiparty union
@@ -652,38 +652,39 @@ class MPU[S, dtype]:
         return max(mpa._mpc.comms.collect(cost + HE_ENC_COST_ESTIMATE * Ciphertensor._count_ciphers(mpa.shape, slots), True)[1:])
 
     def _sum_mpp(self, axis: int) -> MPU[Tuple[int], dtype]:
+        # Within the partitions (a 2-dim MPP's rows as held: X.sum(1), X.T.sum(0); a held row) the MPP's own sum, with
+        # the axis as given (MPP.sum flips it for a transposed MPP: flipping it here too summed the other axis, H-32).
+        # Across them (X.sum(0), X.T.sum(1); a column) an MPA whose shares are the parties' partial sums, after
+        # MPP._sum_partitions' round and refresh parity: in the clear if every partition is (an empty one's zeros), else
+        # encrypted at every party (those in the clear encrypt theirs, an empty one holds encrypted zeros), so that no
+        # MPA comes out in the clear at some parties and encrypted at others (M-MP-23, M-MP-24).
         assert self.is_mpp(), "MPU: cannot sum empty MPP"
         mpp = self._mpp
         mpc = mpp._mpc
 
         assert 0 <= axis < mpp.ndim, "MPU: axis out of range for sum"
-        if mpp._transposed:
-            axis ^= 1
-        
-        if axis == 1:
+        if not mpp._sums_across(axis):
             return MPU[Tuple[int], dtype](
                 _mpp=mpp.sum(axis),
                 _mpa=MPA[Tuple[int], dtype](mpc))
-        
+
+        held = mpp._held_axis(axis)
         if mpc.pid == 0:
             return MPU[Tuple[int], dtype](
                 _mpp=MPP[Tuple[int], dtype](mpc),
-                _mpa=MPA[Tuple[int], dtype](mpc, mpp._local_data.sum_axis(axis)))
+                _mpa=MPA[Tuple[int], dtype](mpc, mpp._local_data.sum_axis(held)))
 
-        _local_data = ndarray[Tuple[int], dtype]()
-        _encryption_unified = Ciphertensor[Ciphertext]()
-        
-        if mpp.is_local():
-            _local_data = mpp._local_data.sum_axis(axis)
+        # length: the sums' length (the partitions' width, or 1 for a column), which an empty partition's zeros take
+        _local_data, _encryption_unified, descriptors, length = mpp._sum_partitions(held, True)
+        if any(d[D_KIND] == MPP_UNIFIED or d[D_KIND] == MPP_SEMI for d in descriptors):
+            if not _local_data.is_empty():
+                _encryption_unified = Ciphertensor[Ciphertext].enc(mpc, _local_data, encoding=ENC_ROW)
+            elif not _encryption_unified:
+                _encryption_unified = Ciphertensor[Ciphertext].zeros(mpc, [length])
+            mpa = MPA[Tuple[int], dtype](mpc, _encryption_unified)
         else:
-            mpp.unify_encryption()
-            _encryption_unified = mpp._encryption_unified.sum(mpc, axis)
-        
-        if _encryption_unified:
-            mpa = MPA[Tuple[int], dtype](mpp._mpc, _encryption_unified)
-        else:
-            mpa = MPA[Tuple[int], dtype](mpp._mpc, _local_data)
-        
+            mpa = MPA[Tuple[int], dtype](mpc, _local_data if not _local_data.is_empty() else zeros((length,), dtype=dtype))
+
         return MPU[Tuple[int], dtype](
                 _mpp=MPP[Tuple[int], dtype](mpc),
                 _mpa=mpa)

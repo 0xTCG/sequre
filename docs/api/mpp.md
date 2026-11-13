@@ -32,7 +32,27 @@ mpp = MPP(mpc, local_ciphertensor)
 
 The compute parties' partitions may differ in size, and a party may hold no rows at all (a ratio of 0). Call every operation at every party, the trusted dealer and parties with empty partitions included: the parties take the same sequence of collective steps whatever their partitions hold.
 
-The compute parties may also hold their partitions differently: some in the clear and others encrypted (a *mixed cohort*, for example after `encrypt()` at some of them only), or some semi-encrypted with different blocks (the result of `A @ B.T` in the clear). Element-wise operations, powers and matrix products handle any mix. All of them but the products of two secret MPPs keep each party's own representation: a partition in the clear gives a result in the clear, an encrypted one an encrypted result. Products of two secret MPPs (`A.T @ B`, `A @ B.T`) encrypt the partitions in the clear of a mixed factor for the product, by public-key encryption; their results are encrypted. A product refreshes its encrypted operands, and each refresh is a council among the compute parties, so operations that may refresh (multiplications, powers, products) first agree on how every party holds its partition, in one round among the compute parties; a party that holds no encryption then runs the others' HE steps on placeholders. Sums and differences of partitions of equal size need no round.
+The compute parties may also hold their partitions differently: some in the clear and others encrypted (a *mixed cohort*, for example after `encrypt()` at some of them only), or some semi-encrypted with different blocks (the result of `A @ B.T` in the clear). Element-wise operations, powers, matrix products and sums handle any mix. Element-wise operations, powers, products with a plaintext matrix and sums within the partitions keep each party's own representation: a partition in the clear gives a result in the clear, an encrypted one an encrypted result. Sums across the partitions give a row the hub holds encrypted (see below). Products of two secret MPPs (`A.T @ B`, `A @ B.T`) encrypt the partitions in the clear of a mixed factor for the product, by public-key encryption; their results are encrypted. A product refreshes its encrypted operands, and each refresh is a council among the compute parties, so operations that may refresh (multiplications, powers, products) first agree on how every party holds its partition, in one round among the compute parties; a party that holds no encryption then runs the others' HE steps on placeholders. Element-wise sums and differences (`+`, `-`) of partitions of equal size need no round.
+
+## One-dimensional MPPs and sums
+
+A 1-dim MPP is one of two things, told apart by its lazy transpose:
+
+- **Not transposed: a row held by one compute party** (the holder). Its ratios are one-hot at the holder, whose partition is the row; the other compute parties hold nothing, and CP0 a placeholder of the row's length. `X[i]` gives one.
+- **Transposed: a column split over the compute parties.** Its ratios are each party's length (0 for an empty partition), and CP0 holds a placeholder of the total length. `X.T[j]` gives one.
+
+A vector of length 1 held by one party with one-hot ratios reads the same either way. `MPP(mpc, vector)`, which takes each party's vector, builds an untransposed 1-dim MPP whose ratios are the lengths: sums read it as a column, as `Sharetensor.to_mpp` reads ratios that sum to more than 1.
+
+Sums follow from where they add up. Of a 2-dim MPP `X` (its partitions are rows of the matrix as held):
+
+| Sum | Adds up | Result |
+|---|---|---|
+| `X.sum(1)`, `X.T.sum(0)` | within each partition (each row as held) | a column split with `X`'s ratios: each party's sums of its own rows, in its own representation (in the clear, or encrypted; a semi-encrypted partition's sums encrypted) |
+| `X.sum(0)`, `X.T.sum(1)` | across the partitions (each column as held) | a row held by the hub (CP1), encrypted: each party's partial sums, encrypted, go to the hub alone, which adds them |
+
+A held row's sum stays with its holder (a length-1 row there, in the holder's representation); a column's sum is a column of length 1 at the hub, encrypted, which `broadcast` spreads over a column encrypted at every compute party with more than one element in each partition, and whose partitions' lengths are all multiples of the slots or none (`v - v.sum(0)`). `dot(axis)` is `(x * x).sum(axis)`.
+
+The compute parties agree on how they hold their partitions in one round, and each sums its own as it holds it; a sum along the ciphertext rows of an encryption refreshes once per row, so a party whose sum takes fewer refreshes (in the clear, an empty partition, fewer rows) makes the rest on placeholders, and every compute party takes the same collective steps. A sum that some compute party cannot compute raises `NotImplementedError` at every compute party; CP0 has returned its placeholder by then, so a caller that catches the error must not fall back to a step that involves CP0. These are: along the rows of a diagonal storage; a skinny diagonal storage whose rows span several ciphertexts that it cannot fold; a semi-encrypted partition whose blocks are not column-wise, summed across the partitions; as many storage rows to reduce as there are slots.
 
 ## Factory methods
 
@@ -93,7 +113,7 @@ The compute parties may also hold their partitions differently: some in the clea
 | `.reveal()` | Reveal with secure aggregation to all parties |
 | `.reveal_local()` | This compute party's own partition, decrypted to it alone: no other party learns it. Call it at every compute party, since each takes part in the decryption whatever it holds (in the clear, encrypted, empty). A semi-encrypted partition's blocks (from `A @ B.T`) are its holder's. CP0 gets its placeholder |
 | `.level()` | Minimum encryption level |
-| `.unify_encryption()` | Consolidate left/right encryptions to unified |
+| `.unify_encryption(transposed=-1)` | Cache this party's partition as one encryption: a semi-encrypted partition's blocks and block in the clear concatenated, in the blocks' layout; a 2-dim partition in the clear row-wise as held, or column-wise for `transposed=1` (a layout the caller agreed on with the other parties) |
 
 ## Distributed operations
 
@@ -103,13 +123,13 @@ The compute parties may also hold their partitions differently: some in the clea
 | `.collect_and_execute_at(target_pid, op)` | Collective operation executed at target party |
 | `.aggregate()` | Aggregate to aligned uniform partition |
 | `.aggregate_at(target_pid)` | Aggregate all shares at specific party |
-| `.join()` | Join encrypted partitions into unified encryption |
+| `.join()` | The whole cohort as one encryption, at every compute party: for a 2-dim MPP the parties agree on their partitions in one round, and partitions held in the clear are encrypted in the layout of the encrypted ones (row-wise as held if none is encrypted), so that a transposed MPP encrypted column-wise at some parties joins with the others. Encrypted layouts that differ, and diagonal storages, raise at every compute party (CP0 has returned by then). A vector's parts join with their transposed flags cleared |
 | `.join_at(target_pid)` | Join at specific target party |
 | `.broadcast_from(source_pid)` | Broadcast partition from source party |
-| `.broadcast(target)` | Broadcast single-row MPP to match target ratios |
+| `.broadcast(target)` | Spread a transposed vector of length 1, encrypted (such as a column's sum), over a transposed MPP encrypted at every compute party whose partitions all hold more than one element, their lengths all multiples of the slots or none. An element-wise operand whose ratios sum to 1 goes here; one it cannot take (a held row, such as a column sum; a non-transposed target, a partition of fewer than two elements, lengths that are multiples of the slots at some partitions only; either of them held in the clear at some party) raises `NotImplementedError` at every party (the state takes one round with every party, CP0 included), and an element-wise operation between a 2-dim and a 1-dim MPP does not compile |
 | `.align_ratios(ratios, force)` | Realign partition ratios |
-| `.sum(axis)` | Sum along axis with cross-party reduction |
-| `.dot(axis)` | Dot product along axis |
+| `.sum(axis)` | Sum along axis: a column split within the partitions, a row at the hub across them (see [One-dimensional MPPs and sums](#one-dimensional-mpps-and-sums)). Call it at every party |
+| `.dot(axis)` | `(x * x).sum(axis)` |
 
 ## Shape manipulation
 

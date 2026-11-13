@@ -9,7 +9,7 @@ from sequre.types.ciphertensor import (
     Ciphertensor, MATMUL_VIA_MPC, MATMUL_V1, MATMUL_V2, MATMUL_V3, MATMUL_BSGS, MATMUL_TNT, MATMUL_V2_T, MATMUL_TN,
     MATMUL_V3_11)
 from sequre.utils.stats import precision_stats
-from sequre.utils.testing import assert_eq, assert_neq
+from sequre.utils.testing import assert_eq, assert_neq, assert_eq_approx
 from sequre.utils.utils import zeros, random_floats
 from sequre.constants import ENC_DIAG, ENC_ROW, ENC_COL
 
@@ -1083,6 +1083,74 @@ def test_ciphertensor_arithmetics(mpc):
     test_ciphertensor_matmul_via_mpc(mpc)
 
 
+def test_ciphertensor_concat_offsets(mpc):
+    """H-18: 1-dim concatenations at offsets without a rotation key of their own (100 + 10, 1000 + 30, 70 + 5: a direct
+    rotation by slots - offset had none), and pad_with_value on 100 columns (a rotation by 100 per row); M-MHE-01:
+    second operands whose length is a multiple of the slots (their last ciphertext was dropped)."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    for n1, n2 in ((100, 10), (1000, 30), (70, 5), (100, slots), (slots + 100, slots), (100, 2 * slots)):
+        with mpc.randomness.global_stream():
+            first = random_floats((n1,))
+            other = random_floats((n2,))
+        if mpc.pid > 0:
+            joined = Ciphertensor[ckks.Ciphertext].enc(mpc, first).concat(mpc, Ciphertensor[ckks.Ciphertext].enc(mpc, other), axis=0)
+            expected = first.copy()
+            expected.extend(other)
+            assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor concat {n1} + {n2}: ciphertexts", len(joined._data), (n1 + n2 + slots - 1) // slots)
+            stats = precision_stats(mpc=mpc, result=joined.reveal(mpc, T=float).flatten().tolist(), expected=expected)
+            assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor concat {n1} + {n2}", stats.min_precision.l2 > 10, True)
+
+    # Appendices that encode row-wise (a tall one is encoded column-wise and cannot be concatenated: H-16)
+    for rows, size in ((1, 1), (2, 2)):
+        with mpc.randomness.global_stream():
+            values = random_floats((rows, 100))
+        if mpc.pid > 0:
+            padded = Ciphertensor[ckks.Ciphertext].enc(mpc, values).pad_with_value(1.0, size, 1, mpc)
+            expected = list[list[float]]()
+            for row in values:
+                expected_row = row.copy()
+                expected_row.extend([1.0 for _ in range(size)])
+                expected.append(expected_row)
+            stats = precision_stats(mpc=mpc, result=padded.reveal(mpc, T=float).tolist(), expected=expected)
+            assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor pad_with_value {rows} x 100 + {size} columns", stats.min_precision.l2 > 10, True)
+
+
+def test_ciphertensor_extend_chunks(mpc):
+    """M-MHE-04: an extend of column-wise (transposed) tensors of 8000 and 500 rows, across a ciphertext boundary: each
+    row of the storage then takes two ciphertexts, which _chunk_size must count (a stale count addressed the storage's
+    rows wrongly), and a copy received from another party, which recomputes it, must agree."""
+    with mpc.randomness.global_stream():
+        first = random_floats((2, 8000))
+        other = random_floats((2, 500))
+    if mpc.pid > 0:
+        extended = Ciphertensor[ckks.Ciphertext].enc(mpc, first, encoding=ENC_ROW)
+        extended._transposed = True
+        second = Ciphertensor[ckks.Ciphertext].enc(mpc, other, encoding=ENC_ROW)
+        second._transposed = True
+        extended.extend(mpc, second)
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor extend 8000 + 500 transposed: ciphertexts per row", extended._chunk_size, 2)
+        expected = first[1].copy()
+        expected.extend(other[1])
+        stats = precision_stats(mpc=mpc, result=extended._get_rows_raw(1).reveal(mpc, T=float).flatten().tolist(), expected=expected)
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor extend 8000 + 500 transposed: a row of the storage", stats.min_precision.l2 > 10, True)
+        copies = mpc.comms.collect(extended)
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor extend 8000 + 500 transposed: every party's copy agrees", all(c._chunk_size == extended._chunk_size for c in copies), True)
+
+
+def test_ciphertensor_sum_slots(mpc):
+    """H-19: 1-dim sums (reduce_add without keep_dims) of 8192 and 16384 values, multiples of the slots: the masked last
+    ciphertext was missing and the mask's product asserted."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    for n in (slots, 2 * slots):
+        with mpc.randomness.global_stream():
+            values = random_floats((n,))
+        if mpc.pid > 0:
+            summed = Ciphertensor[ckks.Ciphertext].enc(mpc, values).sum(mpc, 0)
+            assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor sum of {n}: shape", summed.shape, [1])
+            # The noise of n slots' sum (values below 7: the sum about 3.5 n) is absolute: a tolerance, not 10 bits
+            assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor sum of {n}", summed.reveal(mpc, T=float).flatten().tolist(), [values.sum()], error=0.05)
+
+
 def test_ciphertensor(mpc):
     print(f'CP{mpc.pid}:\tTesting Sequre MHE Ciphertensor ... \n')
     test_ciphertensor_send_receive(mpc)
@@ -1101,4 +1169,7 @@ def test_ciphertensor(mpc):
     test_ciphertensor_lazy_rescaling(mpc, 4 ,32)
     test_ciphertensor_lazy_rescaling(mpc, 7 ,7)
     test_ciphertensor_arithmetics(mpc)
+    test_ciphertensor_concat_offsets(mpc)
+    test_ciphertensor_extend_chunks(mpc)
+    test_ciphertensor_sum_slots(mpc)
     print(f'CP{mpc.pid}:\tSequre MHE Ciphertensor tests passed.\n')

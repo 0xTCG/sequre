@@ -58,7 +58,7 @@ The actual type conversions are implemented in `stdlib/sequre/types/internal.cod
 | `Sharetensor.to_ciphertensor(mpc)` | MPC → MHE | Re-encrypt via S2E into a collective ciphertext |
 | `MPP.to_sharetensor(mpc)` | MHE → MPC | Convert partitioned encryption to shares |
 | `Sharetensor.to_mpp(mpc, ratios)` | MPC → MHE | Convert shares to partitioned encryption |
-| `MPA.to_sharetensor(mpc)` | MHE → MPC | Convert aggregated encryption to shares |
+| `MPA.to_sharetensor(mpc)` | MHE → MPC | Convert to shares: shares every compute party holds in the clear directly (each party shares its own); otherwise the aggregate, which every party first forms (a share held in the clear encrypted for it), so an MPA held in the clear at some parties and encrypted at others converts too |
 | `Sharetensor.to_mpa(mpc)` | MPC → MHE | Convert shares to aggregated encryption |
 
 The shares that `MPP.to_sharetensor` and `MPA.to_sharetensor` return are fixed point whatever the dtype: partitions switched from MHE come out fixed point, and integer partitions held in the clear are scaled to match, so that every party (the trusted dealer included) takes the same fixed-point steps. Integer values must therefore fit the fixed-point range, $|x| < 2^{k-f-1}$ (2^31 by default).

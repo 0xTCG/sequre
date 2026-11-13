@@ -75,8 +75,8 @@ All standard arithmetic and comparison operators are supported. They dispatch to
 | `.reveal_local()` | This compute party's own data: its partition (partition mode, as `MPP.reveal_local`) or its share (additive mode, as `MPA.reveal_local`), decrypted to it alone; call it at every compute party |
 | `.encrypt()` | Encrypt plaintext data |
 | `.level()` | Current HE noise-growth level |
-| `.sum(axis)` | Distributed sum reduction |
-| `.dot(axis)` | Distributed dot product |
+| `.sum(axis)` | Additive mode: each share summed (`MPA.sum`). Partition mode: within the partitions (`X.sum(1)`, `X.T.sum(0)`, a held row) the MPP's sum, a column split with the operand's ratios (a held row's sum stays with its holder); across them (`X.sum(0)`, `X.T.sum(1)`, a column) an additive-mode MPU whose shares are the compute parties' partial sums: in the clear if every partition is in the clear (an empty partition's share is zeros), otherwise encrypted at every party, so its shares are never in the clear at some parties and encrypted at others. One agreement round among the compute parties; call it at every party |
+| `.dot(axis)` | Additive mode: `MPA.dot`. Partition mode: `MPP.dot`, `(x * x)` summed as `MPP.sum` sums (across the partitions a row held by the hub, not additive shares) |
 | `.via_mpc(fn, *args)` | Execute via [MPC layer](../user-guide/switching.md) |
 | `.sign(*args)` | Secure sign function |
 | `.expand_dims(axis=0)` | Insert dimension |

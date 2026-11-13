@@ -1,18 +1,22 @@
 import secure_operator
 
-from sequre.stdlib.numpy.create import array, ones
+from sequre.stdlib.numpy.create import array, ones, zeros
 
+from sequre.constants import ENC_DIAG
+from sequre.lattiseq.ckks import Ciphertext
 from sequre.mpc.env import MPCEnv
+from sequre.types.ciphertensor import Ciphertensor
+from sequre.types.multiparty_aggregate import MPA
 from sequre.types.multiparty_partition import MPP
 from sequre.types.multiparty_union import MPU
 from sequre.types.sharetensor import Sharetensor
 from sequre.utils.testing import assert_eq, assert_eq_approx
 from sequre.utils.io import write_ndarray, read_ndarray
-from sequre.utils.utils import random_ints
+from sequre.utils.utils import random_ints, one_hot_vector
 
 from multiparty_testing import (
     unequal_ratios, ratios_with_empty, own_rows, cohort_matrix, partition, column, assert_parties_in_step, encrypted_at,
-    holders)
+    holders, sum_ratios)
 
 
 def test_mpp_getitem(mpp_a, raw_a):
@@ -562,6 +566,267 @@ def test_mpp_mixed_products(mpc):
         assert_eq_approx(f"CP{mpc.pid}:\tMPP mixed @ mixed.T, {label}", revealed_mixed_b, expected, error=0.01)
 
 
+def check_sum(mpc, label: str, s, want, within: bool, ratios: List[int], error: float, next_op: int):
+    # A sum's metadata at every party, CP0 included (within the partitions a column split with the operand's ratios,
+    # across them a row at CP1), its values, and then one next operation: an element-wise one with a compatible MPP (0),
+    # the switch to MPC (1), or an MPU around it (2). The element-wise one follows the reveal, which caches an encryption
+    # beside a vector held in the clear (M-MP-26: the aligner then left the padding of unequal vectors uncut).
+    n_cp = mpc.comms.number_of_parties - 1
+    want_ratios = ratios.copy() if within else one_hot_vector(idx=0, size=n_cp, TP=int)
+    assert_eq(f"CP{mpc.pid}:\t{label}: ratios", s._ratios, want_ratios)
+    assert_eq(f"CP{mpc.pid}:\t{label}: transposed", s._transposed, within)
+    assert_eq(f"CP{mpc.pid}:\t{label}: cohort shape", s.cohort_shape[0], len(want))
+    revealed = s.reveal()
+    if next_op == 0:
+        revealed_next = (s + s).reveal()
+        want_next = want * 2.0
+    elif next_op == 1:
+        revealed_next = array(s.to_sharetensor().reveal(mpc))
+        want_next = want
+    else:
+        wrapped = MPU[Tuple[int], float](_mpp=s, _mpa=MPA[Tuple[int], float](mpc))
+        assert_eq(f"CP{mpc.pid}:\t{label}: MPU shape", wrapped.shape[0], len(want))
+        revealed_next = wrapped.reveal()
+        want_next = want
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\t{label}", revealed, want, error=error)
+        names = ["s + s", "to_sharetensor", "MPU"]
+        assert_eq_approx(f"CP{mpc.pid}:\t{label}: {names[next_op]}", revealed_next, want_next, error=2.0 * error)
+
+
+def test_mpp_sums(mpc):
+    """M-MP-23, H-30, M-MP-13: MPP.sum of cohorts in the clear, encrypted (row-wise, and column-wise: X.T.encrypt()),
+    mixed (the first holder encrypted; with two compute parties and an empty partition the only holder is that one), and
+    semi-encrypted (K = A @ B.T in the clear); equal, unequal and empty partitions; transposed or not; both axes. Within
+    the partitions the sums used to be a held row's metadata, encrypted partitions came back empty when any party held
+    its own in the clear, and encrypted ones crashed in the aligner's revert at unequal ratios; across them a transposed
+    operand's came back as a column. Each sum runs on a fresh copy (a sum across the partitions unifies a semi-encrypted
+    one, which later sums would then take whole): its metadata at every party, its values, one next operation; every
+    party in step after each kind. Then row sums held differently at a party in element-wise operations."""
+    n_cp = mpc.comms.number_of_parties - 1
+    cols = 4
+    next_op = 0
+    for ratios in sum_ratios(n_cp):
+        rows = ratios.sum()
+        a = cohort_matrix(mpc, rows, cols)
+        b = cohort_matrix(mpc, rows, cols)
+        local = partition(mpc, a, ratios)
+        parties = holders(ratios)
+        encrypted = encrypted_at(mpc, local, parties)
+        column_wise = local.T
+        column_wise.encrypt()
+        mixed = encrypted_at(mpc, local, parties[:1])
+        k = local @ partition(mpc, b, ratios).T
+        ab = a @ b.T
+        cases = [("in the clear", local, a), ("encrypted", encrypted, a), ("encrypted column-wise", column_wise.T, a),
+                 ("mixed", mixed, a), ("A @ B.T", k, ab)]
+        for kind, mpp, m in cases:
+            for transposed in (False, True):
+                for axis in (0, 1):
+                    x = mpp.T if transposed else mpp.copy()
+                    within = (axis ^ int(transposed)) == 1
+                    label = f"MPP {kind}{'.T' if transposed else ''}.sum({axis}), ratios {ratios}"
+                    error = 0.05 if kind == "A @ B.T" else 0.01
+                    check_sum(mpc, label, x.sum(axis), m.sum(axis=1) if within else m.sum(axis=0), within, ratios, error, next_op % 3)
+                    next_op += 1
+            assert_parties_in_step(mpc, f"MPP {kind} sums, ratios {ratios}")
+
+        # Row sums that a party holds differently (the mixed cohort's against those in the clear, or encrypted) meet at one
+        # length in an element-wise operation: padded each to the longest of its own kind, they crashed or refreshed at
+        # one party only at unequal ratios
+        mixed_rows = mixed.copy().sum(1)
+        clear_rows = local.copy().sum(1)
+        encrypted_rows = encrypted.copy().sum(1)
+        row_sums = a.sum(axis=1)
+        pairs = ["mixed + in the clear", "in the clear + mixed", "mixed * in the clear", "mixed + encrypted"]
+        wants = [row_sums * 2.0, row_sums * 2.0, row_sums * row_sums, row_sums * 2.0]
+        results = List[MPP[Tuple[int], float]]()
+        for i in range(len(pairs)):
+            if i == 0: results.append(mixed_rows + clear_rows)
+            elif i == 1: results.append(clear_rows + mixed_rows)
+            elif i == 2: results.append(mixed_rows * clear_rows)
+            else: results.append(mixed_rows + encrypted_rows)
+            assert_parties_in_step(mpc, f"MPP row sums {pairs[i]}, ratios {ratios}")
+        revealed_pairs = [result.reveal() for result in results]
+        if mpc.pid:
+            for i in range(len(pairs)):
+                assert_eq_approx(f"CP{mpc.pid}:\tMPP row sums {pairs[i]}, ratios {ratios}", revealed_pairs[i], wants[i], error=0.05)
+
+
+def test_mpp_sum_vectors(mpc):
+    """H-30: a held row's sum stays with its holder (CP1 or another), a column's sum is a column of length 1 at CP1;
+    in the clear, encrypted, and (a column) mixed; equal, unequal and empty partitions. A column minus its sum still
+    broadcasts the sum (MPP.broadcast) where the column is encrypted with more than one element in each partition. L-103:
+    otherwise, and for a row minus a column sum held elsewhere, every party raises the same error, CP0 included (an
+    assertion at the compute parties only)."""
+    n_cp = mpc.comms.number_of_parties - 1
+    cols = 5
+    for ratios in sum_ratios(n_cp):
+        rows = ratios.sum()
+        a = cohort_matrix(mpc, rows, cols)
+        local = partition(mpc, a, ratios)
+        parties = holders(ratios)
+        encrypted = encrypted_at(mpc, local, parties)
+        start, stop = own_rows(mpc, ratios)
+        for kind, x in (("in the clear", local), ("encrypted", encrypted)):
+            for r in (0, rows - 1):
+                holder = 0
+                while r >= ratios[:holder + 1].sum():
+                    holder += 1
+                label = f"MPP held row {r} (CP{holder + 1}) {kind}.sum(0), ratios {ratios}"
+                s = x[r].sum(0)
+                assert_eq(f"CP{mpc.pid}:\t{label}: ratios", s._ratios, one_hot_vector(idx=holder, size=n_cp, TP=int))
+                assert_eq(f"CP{mpc.pid}:\t{label}: not transposed", s._transposed, False)
+                assert_eq(f"CP{mpc.pid}:\t{label}: cohort shape", s.cohort_shape[0], 1)
+                revealed_mpc = array(s.to_sharetensor().reveal(mpc))
+                revealed = s.reveal()
+                want = array([a[r].sum()])
+                if mpc.pid:
+                    assert_eq_approx(f"CP{mpc.pid}:\t{label}", revealed, want, error=0.01)
+                    assert_eq_approx(f"CP{mpc.pid}:\t{label}: to_sharetensor", revealed_mpc, want, error=0.01)
+            expected = column(a, 1)
+            vector = MPP[Tuple[int], float](
+                _mpc=mpc,
+                _ratios=ratios,
+                _local_data=expected.zeros() if mpc.pid == 0 else expected[start:stop].copy(),
+                _transposed=True)
+            if kind == "encrypted":
+                vector.encrypt()
+            s = vector.sum(0)
+            label = f"MPP column {kind}.sum(0), ratios {ratios}"
+            assert_eq(f"CP{mpc.pid}:\t{label}: ratios", s._ratios, one_hot_vector(idx=0, size=n_cp, TP=int))
+            assert_eq(f"CP{mpc.pid}:\t{label}: transposed", s._transposed, True)
+            assert_eq(f"CP{mpc.pid}:\t{label}: cohort shape", s.cohort_shape[0], 1)
+            revealed = s.reveal()
+            if mpc.pid:
+                assert_eq_approx(f"CP{mpc.pid}:\t{label}", revealed, array([expected.sum()]), error=0.01)
+            # A column minus its sum: MPP.broadcast spreads the sum over a column encrypted at every compute party with
+            # more than one element in each partition; otherwise (in the clear, a partition of one element or none) every
+            # party raises alike (L-103: an assertion at the compute parties only, while CP0 went on)
+            if kind == "encrypted" and ratios.same():
+                centered = (vector - vector.sum(0)).reveal()
+                if mpc.pid:
+                    assert_eq_approx(f"CP{mpc.pid}:\tMPP encrypted column minus its sum, ratios {ratios}", centered, expected - expected.sum(), error=0.01)
+            else:
+                raised = False
+                try:
+                    vector - vector.sum(0)
+                except NotImplementedError:
+                    raised = True
+                assert_eq(f"CP{mpc.pid}:\tMPP column {kind} minus its sum raises at every party, ratios {ratios}", raised, True)
+            assert_parties_in_step(mpc, f"MPP 1-dim sums {kind}, ratios {ratios}")
+
+        mixed_vector = MPP[Tuple[int], float](
+            _mpc=mpc,
+            _ratios=ratios,
+            _local_data=column(a, 2).zeros() if mpc.pid == 0 else column(a, 2)[start:stop].copy(),
+            _transposed=True)
+        if mpc.pid == parties[0]:
+            mixed_vector.encrypt()
+        revealed = mixed_vector.sum(0).reveal()
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tMPP column mixed.sum(0), ratios {ratios}", revealed, array([column(a, 2).sum()]), error=0.01)
+        assert_parties_in_step(mpc, f"MPP mixed column sum, ratios {ratios}")
+
+        raised = False
+        try:
+            local[rows - 1] - local.sum(0)
+        except NotImplementedError:
+            raised = True
+        assert_eq(f"CP{mpc.pid}:\tMPP a held row minus a column sum held by another party raises at every party, ratios {ratios}", raised, True)
+        assert_parties_in_step(mpc, f"MPP row minus column sum, ratios {ratios}")
+
+    # A column whose first partition's length is a multiple of the slots and the others' not, minus its sum: broadcast's
+    # replication would refresh once at the first party and twice at the others (a desync); every party raises
+    slots = mpc.mhe.crypto_params.params.slots()
+    ratios = [2 for _ in range(n_cp)]
+    ratios[0] = slots
+    start, stop = own_rows(mpc, ratios)
+    expected = column(cohort_matrix(mpc, ratios.sum(), 1), 0)
+    vector = MPP[Tuple[int], float](
+        _mpc=mpc,
+        _ratios=ratios,
+        _local_data=expected.zeros() if mpc.pid == 0 else expected[start:stop].copy(),
+        _transposed=True)
+    vector.encrypt()
+    raised = False
+    try:
+        vector - vector.sum(0)
+    except NotImplementedError:
+        raised = True
+    assert_eq(f"CP{mpc.pid}:\tMPP encrypted column with a partition of {slots} elements minus its sum raises at every party", raised, True)
+    assert_parties_in_step(mpc, "MPP column with a partition of slots elements minus its sum")
+
+    # A cohort without rows sums to nothing, at every party alike (the hub raised alone)
+    empty = MPP[Tuple[int, int], float](_mpc=mpc, _ratios=[0 for _ in range(n_cp)], _local_data=zeros((0, 3), dtype=float))
+    empty_sums = empty.sum(0)
+    assert_eq(f"CP{mpc.pid}:\tMPP without rows .sum(0): ratios", empty_sums._ratios, one_hot_vector(idx=0, size=n_cp, TP=int))
+    assert_parties_in_step(mpc, "MPP without rows .sum(0)")
+
+
+def diagonal_partition(mpc, matrix, ratios: List[int]) -> MPP[Tuple[int, int], float]:
+    # Each compute party's rows encrypted diagonal-wise, as the switch from MPC leaves them under
+    # default_encoding(ENC_DIAG) (CP0 keeps a placeholder)
+    start, stop = own_rows(mpc, ratios)
+    if mpc.pid == 0:
+        return MPP[Tuple[int, int], float](_mpc=mpc, _ratios=ratios, _local_data=matrix.zeros())
+    encryption = Ciphertensor[Ciphertext].enc(mpc, matrix[start:stop], encoding=ENC_DIAG)
+    return MPP[Tuple[int, int], float](_mpc=mpc, _ratios=ratios, _encryption_unified=encryption)
+
+
+def test_mpp_sum_encodings(mpc):
+    """Sums of diagonal-encoded partitions (what MPC switches return under default_encoding(ENC_DIAG)): column sums of
+    wide and skinny storages (a skinny one folds its diagonals with masked products), also at unequal ratios with both
+    kinds at once, where the other parties make up the folds' refreshes; row sums of them, and their join, raise at every
+    compute party (a diagonal storage cannot be summed along its rows, nor stacked; CP0 returns its placeholder). Partial sums of partitions in the
+    clear under default_encoding(ENC_DIAG) are encrypted row-wise (a vector in the ambient encoding asserted). Every party
+    in step after each."""
+    n_cp = mpc.comms.number_of_parties - 1
+    mixed_shapes = [2 * (q + 1) for q in range(n_cp)]  # 2 x 2 (not skinny), 4 x 2, 6 x 2, ... (skinny)
+    for label, ratios, cols in (("wide", [2 for _ in range(n_cp)], 4), ("skinny", [4 for _ in range(n_cp)], 2), ("square and skinny", mixed_shapes, 2)):
+        a = cohort_matrix(mpc, ratios.sum(), cols)
+        x = diagonal_partition(mpc, a, ratios)
+        column_sums = x.sum(0).reveal()
+        assert_parties_in_step(mpc, f"MPP {label} diagonal partitions .sum(0), ratios {ratios}")
+        mpu_sums = MPU[Tuple[int, int], float](_mpp=x, _mpa=MPA[Tuple[int, int], float](mpc)).sum(0).reveal()
+        assert_parties_in_step(mpc, f"MPU {label} diagonal partitions .sum(0), ratios {ratios}")
+        raised = False
+        try:
+            x.sum(1)
+        except NotImplementedError:
+            raised = True
+        assert_parties_in_step(mpc, f"MPP {label} diagonal partitions .sum(1), ratios {ratios}")
+        assert_eq(f"CP{mpc.pid}:\tMPP {label} diagonal partitions .sum(1) raises at every compute party, ratios {ratios}", raised, mpc.pid > 0)
+        # Their join (MPU * MPA takes it) neither: Ciphertensor.extend does not stack diagonal storages (it gave a wrong
+        # tensor; with a partition in the clear beside them, a wrong shape or an assertion at one party)
+        raised = False
+        try:
+            x.join()
+        except NotImplementedError:
+            raised = True
+        assert_parties_in_step(mpc, f"MPP {label} diagonal partitions joined, ratios {ratios}")
+        assert_eq(f"CP{mpc.pid}:\tMPP {label} diagonal partitions' join raises at every compute party, ratios {ratios}", raised, mpc.pid > 0)
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tMPP {label} diagonal partitions .sum(0), ratios {ratios}", column_sums, a.sum(axis=0), error=0.01)
+            assert_eq_approx(f"CP{mpc.pid}:\tMPU {label} diagonal partitions .sum(0), ratios {ratios}", mpu_sums, a.sum(axis=0), error=0.01)
+
+    ratios = [q + 1 for q in range(n_cp)]
+    a = cohort_matrix(mpc, ratios.sum(), 4)
+    local = partition(mpc, a, ratios)
+    mixed = encrypted_at(mpc, local, [1])
+    with mpc.default_encoding(ENC_DIAG):
+        clear_sums = local.sum(0).reveal()
+        assert_parties_in_step(mpc, "MPP in the clear .sum(0) under ENC_DIAG")
+        mixed_sums = mixed.sum(0).reveal()
+        assert_parties_in_step(mpc, "MPP mixed .sum(0) under ENC_DIAG")
+        mpu_sums = MPU[Tuple[int, int], float](_mpp=mixed, _mpa=MPA[Tuple[int, int], float](mpc)).sum(0).reveal()
+        assert_parties_in_step(mpc, "MPU mixed .sum(0) under ENC_DIAG")
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPP in the clear .sum(0) under ENC_DIAG, ratios {ratios}", clear_sums, a.sum(axis=0), error=0.01)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPP mixed .sum(0) under ENC_DIAG, ratios {ratios}", mixed_sums, a.sum(axis=0), error=0.01)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPU mixed .sum(0) under ENC_DIAG, ratios {ratios}", mpu_sums, a.sum(axis=0), error=0.01)
+
+
 def test_mpp[TP](mpc: MPCEnv[TP], modulus: TP):
     mpc.comms.sync_parties()
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
@@ -611,5 +876,8 @@ def test_mpp[TP](mpc: MPCEnv[TP], modulus: TP):
     test_mpp_cohort_products(mpc)
     test_mpp_mixed_cohorts(mpc)
     test_mpp_mixed_products(mpc)
+    test_mpp_sums(mpc)
+    test_mpp_sum_vectors(mpc)
+    test_mpp_sum_encodings(mpc)
 
     print(f'CP{mpc.pid}:\tSequre MHE MPP tests on {alg_struct} passed.\n')
