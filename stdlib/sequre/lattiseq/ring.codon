@@ -1744,6 +1744,10 @@ class BasisExtender:
     params_p_to_q: list[ModupParams]
     _mm_mod_down_params_p_to_q: list[list[u64xN]]
     mod_down_params_q_to_p: list[list[u64]]
+    # (P - 1) / 2 modulo each prime of P and of Q, for P the product of the first level_p + 1 primes of P: the shift
+    # that makes the mod-down's division by P a rounding (see _mm_mod_down_qp_to_q)
+    _mm_half_p_mod_p: list[list[u64xN]]
+    _mm_half_p_mod_q: list[list[u64xN]]
 
     buff_q: Poly
     buff_p: Poly
@@ -1755,6 +1759,8 @@ class BasisExtender:
         self.params_p_to_q = []
         self._mm_mod_down_params_p_to_q = []
         self.mod_down_params_q_to_p = []
+        self._mm_half_p_mod_p = []
+        self._mm_half_p_mod_q = []
         self.buff_q = Poly()
         self.buff_p = Poly()
 
@@ -1806,6 +1812,32 @@ class BasisExtender:
                 for j in range(n_dst):
                     dst[j][x] = _mm_mul_sum(v, y, dst_mod[j], dst_mred[j], vtimesqmodp[j], qoverqimodp[j])
                 
+    def _mm_shift_by_half_p(self, level_p: int, src: Poly, dst: Poly):
+        # dst = src + (P - 1) / 2 on every coefficient of the P basis (coefficient domain). Unreduced: the basis extension
+        # reduces its inputs (Montgomery), and src may be lazy (below 2 * p_j).
+        half = self._mm_half_p_mod_p[level_p]
+        for j in range(level_p + 1):
+            h = half[j]
+            s_row = src._mm_coeffs[j]
+            d_row = dst._mm_coeffs[j]
+            for x in range(len(s_row)):
+                d_row[x] = s_row[x] + h
+
+    def _mm_unshift_by_half_p(self, level_p: int, level_q: int, pol_q: Poly):
+        # pol_q - (P - 1) / 2 on every coefficient of the Q basis (coefficient domain), reduced to [0, q_i): the basis
+        # extension leaves its outputs below 3 * q_i
+        half = self._mm_half_p_mod_q[level_p]
+        @par(num_threads=lattiseq_threads())
+        for i in range(level_q + 1):
+            q = self.ring_q._mm_modulus[i]
+            two_q = q << u64xN(u64(1))
+            q_minus_h = q - half[i]
+            row = pol_q._mm_coeffs[i]
+            for x in range(len(row)):
+                t = row[x] + q_minus_h
+                t = t.sub_if(two_q, t.__ge__(two_q))
+                row[x] = t.sub_if(q, t.__ge__(q))
+
     # ModDownQPtoQNTT reduces the basis of a polynomial.
     # Given a polynomial with coefficients in basis {Q0,Q1....Qi} and {P0,P1...Pj},
     # it reduces its basis from {Q0,Q1....Qi} and {P0,P1...Pj} to {Q0,Q1....Qi}
@@ -1820,9 +1852,12 @@ class BasisExtender:
 
         # First we get the P basis part of p1 out of the NTT domain
         ring_p._mm_inv_ntt_lazy_lvl(level_p, p1_p, buff_p)
+        # Rounding: the residue the division removes must be centered (see _mm_mod_down_qp_to_q)
+        self._mm_shift_by_half_p(level_p, buff_p, buff_p)
         # Then we target this P basis of p1 and convert it to a q basis (at the "level" of p1) and copy it on the buffer.
         # The buffer is now the representation of the P basis of p1 but in basis q (at the "level" of p1)
         self._mm_mod_up_p_to_q(level_p, level_q, buff_p, buff_q)
+        self._mm_unshift_by_half_p(level_p, level_q, buff_q)
         # First, we switch back the buffer CRT array back to the NTT domain
         ring_q._mm_ntt_lazy_lvl(level_q, buff_q, buff_q)
         
@@ -1846,9 +1881,16 @@ class BasisExtender:
         mod_down_params = self._mm_mod_down_params_p_to_q
         buff = self.buff_q
 
+        # p2 = (p1 - r) / P exactly, for r the residue of p1 modulo P. The basis extension gives r in [0, P), which makes
+        # the division a floor: an error in (-1, 0] per coefficient, of mean -1/2. A ciphertext's two components both
+        # carry it, so its decryption carries e0 + e1 * s with E[e1] = -1/2 on every coefficient: a fixed pattern per
+        # secret key, up to about 4e-5 in the first slots at the default scale. The residue of p1 + (P - 1) / 2, less
+        # (P - 1) / 2, is the centered one (in [-(P - 1) / 2, (P + 1) / 2)): the division then rounds.
+        self._mm_shift_by_half_p(level_p, p1_p, self.buff_p)
         # Then we target this P basis of p1 and convert it to a q basis (at the "level" of p1) and copy it on buff
         # buff is now the representation of the P basis of p1 but in basis q (at the "level" of p1)
-        self._mm_mod_up_p_to_q(level_p, level_q, p1_p, buff)
+        self._mm_mod_up_p_to_q(level_p, level_q, self.buff_p, buff)
+        self._mm_unshift_by_half_p(level_p, level_q, buff)
 
         # Finally, for each level of p1 (and buff since they now share the same basis) we compute p2 = (P^-1) * (p1 - buff) mod q
         @par(num_threads=lattiseq_threads())
@@ -2191,6 +2233,24 @@ def gen_mod_down_params(ring_q, ring_p):
     return params
 
 
+def gen_half_p_params(ring_q, ring_p) -> Tuple[list[list[u64xN]], list[list[u64xN]]]:
+    # (P - 1) / 2 modulo p_j and q_i, for each P = p_0 * ... * p_level_p. Modulo a prime p_j of P it is (p_j - 1) / 2
+    # (P is 0 there, so (P - 1) / 2 = -1/2); modulo q_i it is (P mod q_i - 1) * 2^-1.
+    half_p = list[list[u64xN]](len(ring_p.modulus))
+    half_q = list[list[u64xN]](len(ring_p.modulus))
+    for level_p in range(len(ring_p.modulus)):
+        half_p.append([u64xN((ring_p.modulus[j] - u64(1)) >> u64(1)) for j in range(level_p + 1)])
+        row = list[u64xN](len(ring_q.modulus))
+        for qi in ring_q.modulus:
+            p_mod = u64(1)
+            for j in range(level_p + 1):
+                p_mod = u64((u128(p_mod) * u128(ring_p.modulus[j] % qi)) % u128(qi))
+            inv2 = (qi + u64(1)) >> u64(1)
+            row.append(u64xN(u64((u128((p_mod + qi - u64(1)) % qi) * u128(inv2)) % u128(qi))))
+        half_q.append(row)
+    return half_p, half_q
+
+
 def new_basis_extender(ring_q, ring_p):
     new_params = BasisExtender()
 
@@ -2208,6 +2268,7 @@ def new_basis_extender(ring_q, ring_p):
     mod_down_params_p_to_q = gen_mod_down_params(ring_q, ring_p)
     new_params._mm_mod_down_params_p_to_q = [[u64xN(e) for e in row] for row in mod_down_params_p_to_q]
     new_params.mod_down_params_q_to_p = gen_mod_down_params(ring_p, ring_q)
+    new_params._mm_half_p_mod_p, new_params._mm_half_p_mod_q = gen_half_p_params(ring_q, ring_p)
 
     new_params.buff_q = ring_q.new_poly()
     new_params.buff_p = ring_p.new_poly()

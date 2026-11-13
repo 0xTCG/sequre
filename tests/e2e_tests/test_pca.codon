@@ -9,6 +9,32 @@ from sequre.mpc.env import MPCEnv
 from sequre.stdlib.learn.pca import random_pca_with_norm, random_pca_without_projection
 
 
+def _genotypes_with_variance(rows: int, cols: int) -> List[List[int]]:
+    # rows x cols random 0/1/2 genotypes; a column without variance is drawn again. A real pipeline drops monomorphic
+    # SNPs before PCA, and the standardization divides by each column's spread (an all-0 or all-2 column made the
+    # reference's std_inv infinite: L-242). Call it inside randomness.global_stream(), at every party.
+    data = random_ints((rows, cols), upper_limit=2)
+    for j in range(cols):
+        while all(data[i][j] == data[0][j] for i in range(rows)):
+            column = random_ints((rows,), upper_limit=2)
+            for i in range(rows):
+                data[i][j] = column[i]
+    return data
+
+
+def _rows_up_to_sign(result, expected, rows: int):
+    # The first rows rows of result, each taken with the sign that fits the same row of expected best: a component (an
+    # eigenvector, a Householder direction) is defined up to its sign, and the paths pick the sign at pivots near zero,
+    # where the plaintext and the fixed point can fall on either side
+    out = [[float(result[i, j]) for j in range(result.shape[1])] for i in range(rows)]
+    for i in range(rows):
+        plus = max(abs(out[i][j] - float(expected[i, j])) for j in range(result.shape[1]))
+        minus = max(abs(out[i][j] + float(expected[i, j])) for j in range(result.shape[1]))
+        if minus < plus:
+            out[i] = [-v for v in out[i]]
+    return array(out)
+
+
 def test_pca[TP](mpc: MPCEnv[TP], modulus: TP):
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
     print(f'CP{mpc.pid}:\tTesting Sequre PCA on {alg_struct} ... \n')
@@ -16,7 +42,7 @@ def test_pca[TP](mpc: MPCEnv[TP], modulus: TP):
     rows_per_party = 4  # 128
     cols_per_party = 4  # 32768
     with mpc.randomness.global_stream():
-        raw_data = array(random_ints(((mpc.comms.number_of_parties - 1) * rows_per_party, cols_per_party), upper_limit=2))
+        raw_data = array(_genotypes_with_variance((mpc.comms.number_of_parties - 1) * rows_per_party, cols_per_party))
 
     raw_data_mean = raw_data.sum(axis=0) / len(raw_data) / 2
     raw_data_std_inv = 1 / (raw_data_mean * (1 - raw_data_mean)).sqrt()
@@ -50,8 +76,16 @@ def test_pca[TP](mpc: MPCEnv[TP], modulus: TP):
         assert_eq(f"CP{mpc.pid}:\tSafe-checking std PCA U result shape (MPC) on {alg_struct}", mpc_pca_u.shape, list(classic_pca_u.shape))
         assert_eq(f"CP{mpc.pid}:\tSafe-checking std PCA Z result shape (MPC) on {alg_struct}", mpc_pca_z.shape, list(classic_pca_z.shape))
     else:
-        assert_eq_approx(f"CP{mpc.pid}:\tSequre std PCA U (MPC) on {alg_struct}", mpc_pca_u.reveal(mpc), classic_pca_u)
-        assert_eq_approx(f"CP{mpc.pid}:\tSequre std PCA Z (MPC) on {alg_struct}", mpc_pca_z.reveal(mpc), classic_pca_z)
+        # What the PCA defines: Z's top rows (the data projected on the first directions of the sketch; the rows below
+        # them are the oversampled directions, which the sketch leaves arbitrary) and the top components' scores U @ Z
+        # (what psa_with_norm uses: independent of the basis Z is expressed in), each row up to its sign
+        mpc_u = mpc_pca_u.reveal(mpc)
+        mpc_z = mpc_pca_z.reveal(mpc)
+        top = min(top_components_count, classic_pca_z.shape[0])
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre std PCA top components U @ Z (MPC) on {alg_struct}",
+                         _rows_up_to_sign(mpc_u @ mpc_z, classic_pca_u @ classic_pca_z, classic_pca_u.shape[0]), classic_pca_u @ classic_pca_z)
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre std PCA Z top rows (MPC) on {alg_struct}",
+                         _rows_up_to_sign(mpc_z, classic_pca_z, top), classic_pca_z[:top])
     
     # TODO: Check why PCA is unstable:
     #   - Different runs produce different results (set DEBUG to False to randomize seed)
@@ -78,7 +112,8 @@ def test_pca[TP](mpc: MPCEnv[TP], modulus: TP):
     if mpc.pid == 0:
         assert_eq(f"CP{mpc.pid}:\tSafe-checking non-std PCA result shape (MPU) on {alg_struct}", mpu_pca_non_std.shape, classic_pca_non_std.shape)
     else:
-        assert_eq_approx(f"CP{mpc.pid}:\tSequre non-std PCA (MPU) on {alg_struct}", mpu_pca_non_std.reveal(mpc), classic_pca_non_std, error=0.01)
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre non-std PCA (MPU) on {alg_struct}",
+                         _rows_up_to_sign(mpu_pca_non_std.reveal(mpc), classic_pca_non_std, classic_pca_non_std.shape[0]), classic_pca_non_std, error=0.01)
 
     print(f'CP{mpc.pid}:\tSequre PCA on {"ring" if modulus.popcnt() == 1 else "field"} tests passed.\n')
     

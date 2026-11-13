@@ -4,6 +4,7 @@ import sequre.lattiseq.ckks as ckks
 import sequre.lattiseq.rlwe as rlwe
 import sequre.lattiseq.dckks as dckks
 import sequre.lattiseq.params as ckks_params
+import sequre.lattiseq.ring as ring
 
 from sequre.lattiseq.exact_encoder import new_exact_encoder
 from sequre.lattiseq.stats import plot_precision_stats
@@ -566,6 +567,79 @@ def test_public_key_generation():
                   max_decryption_error(params, encoder, zero_sk, ct, values) > 1.0, True)
 
 
+def test_mod_down_rounding():
+    """The mod-down after a key switch or a public-key encryption (division by the special modulus P, both variants)
+    rounds: x * P + r goes to x for r below P / 2 and to x + 1 above it. It used to floor (x for every r below P), which
+    left every pk encryption and key switch with e0 + e1 * s, E[e1] = -1/2 on every coefficient: a fixed error pattern
+    per secret key, up to about 4e-5 in the first slots at the default scale. Every level of P (the public-key encryption
+    uses level 0, the key switches the top one) and two levels of Q. The offsets stay P / 1000 away from P / 2 and from
+    P: the basis extension counts its overflow in floating point, so residues within about 2^-53 * P of the boundary may
+    come out either way (a tie, to 1e-16)."""
+    params = ckks.new_parameters_from_literal(ckks_params.PN14QP438)
+    ring_q, ring_p = params.ring_q, params.ring_p
+    extender = ring.new_basis_extender(ring_q, ring_p)
+    n = params.n()
+    for level_p in range(params.p_count()):
+        big_p = u128(1)
+        for j in range(level_p + 1): big_p *= u128(ring_p.modulus[j])
+        half = (big_p - u128(1)) >> u128(1)
+        away = big_p // u128(1000)
+        offsets = [u128(0), u128(1), half - away, half + away, big_p - away]
+        carries = [0, 0, 0, 1, 1]  # round(r / P); a floor gives 0 for all
+        for level_q in (params.max_level(), 0):
+            for ntt in (False, True):
+                p1_q = ring_q.new_poly_lvl(level_q)
+                p1_p = ring_p.new_poly_lvl(level_p)
+                out = ring_q.new_poly_lvl(level_q)
+                for x in range(n):
+                    quotient = u128(x % 5)
+                    r = offsets[x % len(offsets)]
+                    for i in range(level_q + 1):
+                        qi = u128(ring_q.modulus[i])
+                        p1_q._buf_coeffs[i][x] = u64((quotient * (big_p % qi) + r % qi) % qi)
+                    for j in range(level_p + 1):
+                        p1_p._buf_coeffs[j][x] = u64(r % u128(ring_p.modulus[j]))
+                if ntt:
+                    ring_q._mm_ntt_lvl(level_q, p1_q, p1_q)
+                    ring_p._mm_ntt_lvl(level_p, p1_p, p1_p)
+                    extender._mm_mod_down_qp_to_q_ntt(level_q, level_p, p1_q, p1_p, out)
+                    ring_q._mm_inv_ntt_lvl(level_q, out, out)
+                else:
+                    extender._mm_mod_down_qp_to_q(level_q, level_p, p1_q, p1_p, out)
+                wrong = 0
+                for x in range(n):
+                    want = u64(x % 5 + carries[x % len(offsets)])
+                    for i in range(level_q + 1):
+                        if out._buf_coeffs[i][x] != want: wrong += 1
+                variant = "NTT" if ntt else "coefficient"
+                assert_eq(f"Lattiseq mod-down ({variant} domain, P level {level_p}, Q level {level_q}) rounds x * P + r to the nearest integer ({wrong} wrong residues)", wrong, 0)
+
+def test_pk_encryption_bias():
+    """Public-key encryptions of zero, 40 per key for three keys: in each of the first three slots the mean error is
+    within 7 standard errors of zero (a t statistic; one encryption's slot error is 0.5e-7 to 4e-7 here, depending on
+    the key and the slot, measured). A mod-down that floors leaves E[e1] * s (see test_mod_down_rounding): 1e-6 to 4e-5
+    in slot 0 for four keys measured, 30 standard errors or more."""
+    params = ckks.new_parameters_from_literal(ckks_params.PN14QP438)
+    encoder = ckks.new_encoder_complex(params)
+    pt = ckks.new_plaintext(params, params.max_level(), params.default_scale)
+    encoder.encode([complex(0.0, 0.0) for _ in range(params.slots())], pt, params.log_slots)
+    count, slots = 40, 3
+    worst = 0.0
+    for _ in range(3):
+        kgen = ckks.new_key_generator(params)
+        sk = kgen.gen_secret_key()
+        encryptor = ckks.new_encryptor(params, kgen.gen_public_key(sk))
+        decryptor = ckks.new_decryptor(params, sk)
+        errors = [[complex(0.0, 0.0) for _ in range(count)] for _ in range(slots)]
+        for t in range(count):
+            decoded = encoder.decode(decryptor.decrypt_new(encryptor.encrypt_new(pt)), params.log_slots)
+            for k in range(slots): errors[k][t] = decoded[k]
+        for k in range(slots):
+            mean = sum(errors[k]) / float(count)
+            spread = math.sqrt(sum(abs(e - mean) ** 2 for e in errors[k]) / float(count - 1))
+            worst = max(worst, abs(mean) / (spread / math.sqrt(float(count))))
+    assert_eq(f"Lattiseq pk encryptions carry no per-key bias in the first slots (largest mean error {worst:.1f} standard errors)", worst < 7.0, True)
+
 def test_he():
     print('Testing HE ... \n')
 
@@ -574,5 +648,7 @@ def test_he():
     test_exact_encoder()
     test_multi_modulus_rescale()
     test_public_key_generation()
+    test_mod_down_rounding()
+    test_pk_encryption_bias()
 
     print('HE tests passed.\n')

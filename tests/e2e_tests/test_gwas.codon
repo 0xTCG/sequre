@@ -7,12 +7,39 @@ from sequre.types.sharetensor import Sharetensor
 from sequre.types.multiparty_union import MPU
 from sequre.utils.testing import assert_eq, assert_eq_approx
 from sequre.utils.utils import random_ints, random_floats
-from sequre.utils.stats import precision_stats
+from sequre.stdlib.lin_alg import orthonormalize
 
 from .. import \
     cochran_armitage, \
     gwas_protocol, \
-    gwas_without_norm
+    gwas_without_norm, \
+    MAF_LB, MAF_UB
+
+
+def _qc_genotypes(inds: int, snps: int) -> List[List[int]]:
+    # inds x snps random 0/1/2 genotypes that pass the QC the GWAS pipeline applies before association: a SNP outside
+    # hwe_filter's allele-frequency bounds (MAF_LB < maf < MAF_UB; by default a monomorphic one) is drawn again, and so
+    # is one without variance (all heterozygous), whose statistic is 0 / 0 too. Call it inside
+    # randomness.global_stream(), at every party.
+    genotypes = random_ints((inds, snps), upper_limit=2)
+    for s in range(snps):
+        while True:
+            column = [genotypes[i][s] for i in range(inds)]
+            maf = float(sum(column)) / float(2 * inds)
+            if MAF_LB < maf < MAF_UB and any(g != column[0] for g in column):
+                break
+            redrawn = random_ints((inds,), upper_limit=2)
+            for i in range(inds):
+                genotypes[i][s] = redrawn[i]
+    return genotypes
+
+
+def _binary_phenotypes(inds: int) -> List[int]:
+    # 0/1 phenotypes with cases and controls both present (a cohort of one class has no association to test)
+    pheno = random_ints((inds,), upper_limit=1)
+    while not (any(p == 0 for p in pheno) and any(p == 1 for p in pheno)):
+        pheno = random_ints((inds,), upper_limit=1)
+    return pheno
 
 
 def test_cochran_armitage(mpc, modulus):
@@ -24,11 +51,17 @@ def test_cochran_armitage(mpc, modulus):
     snps_count = 32
     pca_components_count = 4
     
+    # The data cochran_armitage gets in the pipeline (gwas_protocol, gwas_without_norm): components with orthonormal
+    # rows (both PCA steps end in orthonormalize) and SNPs that passed QC. Components drawn uniformly, not
+    # orthonormal, gave 10 to 18 of the 32 SNPs a negative denominator (NaN in the reference) and statistics up to
+    # |25|, some with a positive denominator close to 0 that the fixed point cannot divide by: the MPU check failed on
+    # about 12.5% of draws. Orthonormal components keep every denominator positive and every |statistic| below 1.
     with mpc.randomness.global_stream():
         raw_pca_components = array(random_floats((pca_components_count, inds_count), scale=1))
-        raw_pheno = array(random_ints((inds_count,), upper_limit=1), dtype=float)
-        raw_dosage = array(random_ints((inds_count, snps_count), upper_limit=2), dtype=float)
+        raw_pheno = array(_binary_phenotypes(inds_count), dtype=float)
+        raw_dosage = array(_qc_genotypes(inds_count, snps_count), dtype=float)
         raw_dosage -= raw_dosage.mean(axis=0)
+    raw_pca_components = orthonormalize(mpc, raw_pca_components)
     
     mpc_pca_components = Sharetensor.enc(mpc, raw_pca_components, 1, modulus)
     mpc_pheno = Sharetensor.enc(mpc, raw_pheno, 1, modulus)
@@ -66,25 +99,27 @@ def test_cochran_armitage(mpc, modulus):
         assert_eq_approx(f"CP{mpc.pid}:\tSafe-checking Cochran-Armitage data loading (MPC) on {alg_struct}: geno", mpc_dosage.reveal(mpc).tolist(), raw_dosage.tolist())
         assert_eq_approx(f"CP{mpc.pid}:\tSafe-checking Cochran-Armitage data loading (MPU) on {alg_struct}: geno", mpu_dosage.reveal(mpc).tolist(), raw_dosage.tolist())
 
-    raw_assoc = cochran_armitage(mpc, raw_pca_components, raw_pheno, raw_dosage).nan_to_num()
+    # Every statistic is defined on these data, so the checks compare them directly (the reference used to be NaN for the
+    # SNPs whose denominators came out negative, and the checks weighted each SNP by the reference to skip them)
+    raw_assoc = cochran_armitage(mpc, raw_pca_components, raw_pheno, raw_dosage)
     mpc_assoc = cochran_armitage(mpc, mpc_pca_components, mpc_pheno, mpc_dosage)
 
     if mpc.pid == 0:
         assert_eq(f"CP{mpc.pid}:\tSafe-checking Cochran-Armitage result shape (MPC) on {alg_struct}", mpc_assoc.shape, list(raw_assoc.shape))
     else:
-        assert_eq_approx(f"CP{mpc.pid}:\tSequre Cochran-Armitage (MPC) on {alg_struct}", (mpc_assoc.reveal(mpc) * raw_assoc).tolist(), (raw_assoc * raw_assoc).tolist())
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre Cochran-Armitage (MPC) on {alg_struct}", mpc_assoc.reveal(mpc).tolist(), raw_assoc.tolist())
     
     mpu_assoc = cochran_armitage(mpc, mpu_pca_components, mpu_pheno, mpu_dosage)
 
     if mpc.pid == 0:
         assert_eq(f"CP{mpc.pid}:\tSafe-checking Cochran-Armitage result shape (MPU) on {alg_struct}", mpu_assoc.shape, raw_assoc.shape)
     else:
-        stats = precision_stats(
-            mpc=mpc,
-            result=(mpu_assoc.reveal(mpc) * raw_assoc).flatten().tolist(),
-            expected=(raw_assoc * raw_assoc).flatten().tolist())
-        
-        assert_eq(f"CP{mpc.pid}:\tSequre Cochran-Armitage (MPU) on {alg_struct}", stats.mean_precision.l2 > 1, True)
+        # The MPU path (HE partitions, switched to shares for the divisions) on these statistics (|statistic| < 1),
+        # the largest error of each draw over its 32 SNPs, 3 parties, measured: field 3.2e-5 to 1.16e-4 (median 5.5e-5,
+        # 200 draws), ring 3.3e-5 to 1.35e-4 (median 5.7e-5, 75 draws). 3e-4 is 1.15 bits above the worst; the median
+        # times 8 (a loss of 3 bits) fails it. (The old check asked for a mean precision above 1 bit of the statistics
+        # weighted by the reference.)
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre Cochran-Armitage (MPU) on {alg_struct}", mpu_assoc.reveal(mpc).tolist(), raw_assoc.tolist(), error=3e-4)
     
     print(f'CP{mpc.pid}:\tSequre Cochran-Armitage on {"ring" if modulus.popcnt() == 1 else "field"} tests passed.\n')
 

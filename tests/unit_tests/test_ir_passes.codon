@@ -224,14 +224,48 @@ def test_mhe_mpp_opt(mpc, modulus):
         assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization IR pass on MPPs on {alg_struct}: multiplications count', mul_count, 1)
         assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization IR pass on MPPs on {alg_struct}: additions count', add_count, 2)
 
+    # The matmul reorder pass on a @ b.T @ c, in two cases: these 4 x 32 partitions, and 6 x 32 ones (below), for
+    # which the pass takes the other order with two compute parties
+    with mpc.randomness.global_stream():
+        a6 = array(random_ints((6, cols), upper_limit=99))
+        b6 = array(random_ints((6, cols), upper_limit=99))
+        c6 = array(random_ints((6, cols), upper_limit=99))
+    reorders = _check_matmul_reorder(mpc, alg_struct, rows, cols, mpp_a, mpp_b, mpp_c, raw_a, raw_b, raw_c)
+    reorders_6 = _check_matmul_reorder(
+        mpc, alg_struct, 6, cols, MPP(mpc, a6), MPP(mpc, b6), MPP(mpc, c6),
+        [a6 for _ in range(mpc.comms.number_of_parties - 1)].unfence(),
+        [b6 for _ in range(mpc.comms.number_of_parties - 1)].unfence(),
+        [c6 for _ in range(mpc.comms.number_of_parties - 1)].unfence())
+    # A case evaluated left to right, (a @ b.T) @ c, or whose two orders count the same, would pass without the pass:
+    # at least one case must reorder visibly
+    if mpc.pid:
+        assert_eq(f'CP{mpc.pid}:\tMHE matmul reorder optimization IR pass on MPPs on {alg_struct}: a case reorders', reorders or reorders_6, True)
+
+
+def _check_matmul_reorder(mpc, alg_struct, rows_per_party, cols, mpp_a, mpp_b, mpp_c, raw_a, raw_b, raw_c) -> bool:
+    # The pass evaluates a @ b.T @ c greedily (evaluate_and_reorder): the adjacent pair with the lower get_matmul_cost
+    # first, a @ b.T on a tie. secure_matmul_complexity adds rows x inner x columns of each product's cohort shapes:
+    # with R = rows_per_party * (compute parties) and C = cols, (a @ b.T) @ c counts R C R + R R C = 2 R^2 C and
+    # a @ (b.T @ c) counts C R C + R C C = 2 R C^2. With the HE cost constants and 4 x 32 partitions, the model takes
+    # a @ b.T first with two compute parties (cost 0.369 against 0.495 for b.T @ c: 4096) and b.T @ c with three or four
+    # (0.495 against 0.737 and 0.911: 24576 and 32768); with 6 x 32 partitions it takes b.T @ c first already with two
+    # (0.593 against 0.679: 24576 against 9216 left to right). The int MPPs reveal rounded: in the order (a @ b.T) @ c
+    # the product of the other parties' blocks of a @ b.T goes through CKKS, and its error on the 4 x 32 case's values
+    # (up to 6.7e7) stays below 0.2 (0.04 rms), measured with two compute parties; a @ (b.T @ c) goes through MPC and
+    # comes out exact, which the 6 x 32 case's correctness relies on (its larger values would round off in the CKKS
+    # order). Returns whether the pass reorders visibly: b.T @ c first, and the two orders count differently (R != C).
+    first_ab = mpp_a.get_matmul_cost(mpp_b.T) <= mpp_b.T.get_matmul_cost(mpp_c)
+    cohort_rows = rows_per_party * (mpc.comms.number_of_parties - 1)
+    expected_complexity = 2 * cohort_rows * cohort_rows * cols if first_ab else 2 * cohort_rows * cols * cols
+    order = "(a @ b.T) @ c" if first_ab else "a @ (b.T @ c)"
     matmul_complexity = mpc.stats.secure_matmul_complexity
     sequre_result = matmul_foo(mpc, mpp_a, mpp_b, mpp_c)
 
     if mpc.pid:
         matmul_complexity = mpc.stats.secure_matmul_complexity - matmul_complexity
-        assert_eq_approx(f'CP{mpc.pid}:\tMHE matmul reorder optimization IR pass on MPPs on {alg_struct}: correctness', sequre_result.reveal(mpc), raw_a @ raw_b.T @ raw_c)
-        assert_eq_approx(f'CP{mpc.pid}:\tMHE matmul reorder optimization IR pass on MPPs on {alg_struct}: multiplications complexity', matmul_complexity, 8192. * (mpc.comms.number_of_parties - 1))
-
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE matmul reorder optimization IR pass on MPPs on {alg_struct}: correctness ({rows_per_party} rows per party)', sequre_result.reveal(mpc), raw_a @ raw_b.T @ raw_c)
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE matmul reorder optimization IR pass on MPPs on {alg_struct}: multiplications complexity ({order}, {rows_per_party} rows per party)', matmul_complexity, float(expected_complexity))
+    return not first_ab and cohort_rows != cols
 
 def test_mhe_encoding_opt(mpc):
     print(f'CP{mpc.pid}:\tTesting MHE encoding optimization pass on Ciphertensors ... \n')

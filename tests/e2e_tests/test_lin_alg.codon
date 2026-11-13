@@ -1,4 +1,4 @@
-from sequre.stdlib.numpy.create import array, zeros_like
+from sequre.stdlib.numpy.create import array, zeros, zeros_like
 
 from sequre.stdlib.lin_alg import householder, qr_fact_square, tridiag, eigen_decomp, orthonormalize
 from sequre.types.multiparty_union import MPU
@@ -80,6 +80,8 @@ def test_lin_alg(mpc, modulus):
         assert_eq_approx(f'CP{mpc.pid}:\tSequre tridiagonalize Q on {alg_struct}', mpc_q.reveal(mpc), raw_q)
         assert_eq_approx(f'CP{mpc.pid}:\tInput intact post tridiagonalization on {alg_struct}', mpc_mat.reveal(mpc), raw_mat, silent_pass=True)
     
+    test_lin_alg_edge_cases(mpc, modulus)
+
     # TODO: #262 Check why the sign of the eigen decomposition result is flipped for some inputs
     # raw_eigen_mat, raw_eigen_val = eigen_decomp(mpc, raw_mat)
     # mpc_eigen_mat, mpc_eigen_val = eigen_decomp(mpc, mpc_mat)
@@ -87,3 +89,115 @@ def test_lin_alg(mpc, modulus):
     #     assert_eq_approx(f'CP{mpc.pid}:\tSequre eigen decomposition eigen matrix on {alg_struct}', mpc_eigen_mat.reveal(mpc), raw_eigen_mat)
     #     assert_eq_approx(f'CP{mpc.pid}:\tSequre eigen decomposition eigen values on {alg_struct}', mpc_eigen_val.reveal(mpc), raw_eigen_val, error=0.15)
     #     assert_eq_approx(f'CP{mpc.pid}:\tInput intact post eigen decomposition {alg_struct}', mpc_mat.reveal(mpc), raw_mat, silent_pass=True)
+
+
+def _gram_error(q) -> float:
+    # The largest entry of q @ q.T - I: 0 for orthonormal rows
+    worst = 0.0
+    for i in range(q.shape[0]):
+        for j in range(q.shape[0]):
+            dot = sum(float(q[i, k]) * float(q[j, k]) for k in range(q.shape[1]))
+            worst = max(worst, abs(dot - (1.0 if i == j else 0.0)))
+    return worst if worst == worst else 1e300
+
+
+def _outer_error(a, b) -> float:
+    # The largest entry of a^T a - b^T b for row vectors a and b: two Householder vectors give the same reflection
+    # I - 2 v^T v when it is 0, whatever their signs
+    worst = 0.0
+    for i in range(len(a)):
+        for j in range(len(a)):
+            worst = max(worst, abs(float(a[i]) * float(a[j]) - float(b[i]) * float(b[j])))
+    return worst if worst == worst else 1e300
+
+
+def _row_sign_error(a, b) -> float:
+    # The largest entry of a - b with each row of a taken with the sign that fits b best
+    worst = 0.0
+    for i in range(a.shape[0]):
+        plus = max(abs(float(a[i, j]) - float(b[i, j])) for j in range(a.shape[1]))
+        minus = max(abs(float(a[i, j]) + float(b[i, j])) for j in range(a.shape[1]))
+        worst = max(worst, min(plus, minus))
+    return worst if worst == worst else 1e300
+
+
+def test_lin_alg_edge_cases(mpc, modulus):
+    """
+    The decompositions on the sizes and inputs a PCA sketch can produce (L-010, L-242): householder of the zero vector
+    (a reflection, not 0 / 0), orthonormalize with a zero row, qr_fact_square and tridiag of a 1 x 1 matrix, tridiag
+    and eigen_decomp of a 2 x 2 one (already tridiagonal), in the clear and on Sharetensors, and the empty matrix in the
+    clear. Fixed inputs. Tolerances: 1e-9 in double; on shares 1e-4, four times the largest error in 60 repetitions on
+    either modulus (2.5e-5, orthonormalize with a zero row: the square root of householder's eps is 2^-14 in a format of
+    resolution 2^-32, a relative 2^-18 per rounding; measured).
+    """
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    raw_zero = array([0.0, 0.0, 0.0, 0.0])
+    raw_v = householder(mpc, raw_zero)
+    mpc_v = householder(mpc, Sharetensor.enc(mpc, raw_zero, 0, modulus)).reveal(mpc)
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\thouseholder of the zero vector is a unit vector (|v|^2 = {float((raw_v * raw_v).sum()):.6f}) on {alg_struct}",
+                  abs(float((raw_v * raw_v).sum()) - 1.0) < 1e-9, True)
+        assert_eq(f"CP{mpc.pid}:\thouseholder of the zero vector on shares: the same reflection on {alg_struct}",
+                  _outer_error(mpc_v, raw_v) < 1e-4, True)
+
+    raw_a = array([[1.0, 2.0, 0.0, 1.0], [0.0, 0.0, 0.0, 0.0], [2.0, 1.0, 1.0, 0.0]])
+    raw_q = orthonormalize(mpc, raw_a)
+    mpc_q = orthonormalize(mpc, Sharetensor.enc(mpc, raw_a, 0, modulus)).reveal(mpc)
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\torthonormalize with a zero row: orthonormal rows (error {_gram_error(raw_q):.1e}) on {alg_struct}",
+                  _gram_error(raw_q) < 1e-9, True)
+        assert_eq(f"CP{mpc.pid}:\torthonormalize with a zero row on shares ({_row_sign_error(mpc_q, raw_q):.1e}) on {alg_struct}",
+                  _row_sign_error(mpc_q, raw_q) < 1e-4, True)
+
+    raw_one = array([[3.0]])
+    mpc_one = Sharetensor.enc(mpc, raw_one, 0, modulus)
+    raw_q1, raw_r1 = qr_fact_square(mpc, raw_one)
+    mpc_q1, mpc_r1 = qr_fact_square(mpc, mpc_one)
+    raw_t1, raw_tq1 = tridiag(mpc, raw_one)
+    mpc_t1, mpc_tq1 = tridiag(mpc, mpc_one)
+    raw_v1, raw_l1 = eigen_decomp(mpc, raw_one)
+    mpc_v1, mpc_l1 = eigen_decomp(mpc, mpc_one)
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tqr_fact_square of a 1 x 1 matrix: Q on {alg_struct}", raw_q1, array([[1.0]]), error=1e-9)
+        assert_eq_approx(f"CP{mpc.pid}:\tqr_fact_square of a 1 x 1 matrix: R on {alg_struct}", raw_r1, raw_one, error=1e-9)
+        assert_eq_approx(f"CP{mpc.pid}:\tqr_fact_square of a 1 x 1 matrix on shares: Q on {alg_struct}", mpc_q1.reveal(mpc), array([[1.0]]), error=1e-4)
+        assert_eq_approx(f"CP{mpc.pid}:\tqr_fact_square of a 1 x 1 matrix on shares: R on {alg_struct}", mpc_r1.reveal(mpc), raw_one, error=1e-4)
+        assert_eq_approx(f"CP{mpc.pid}:\ttridiag of a 1 x 1 matrix: T and Q on {alg_struct}", array([[float(raw_t1[0, 0]), float(raw_tq1[0, 0])]]), array([[3.0, 1.0]]), error=1e-9)
+        assert_eq_approx(f"CP{mpc.pid}:\ttridiag of a 1 x 1 matrix on shares: T on {alg_struct}", mpc_t1.reveal(mpc), raw_one, error=1e-4)
+        assert_eq_approx(f"CP{mpc.pid}:\teigen_decomp of a 1 x 1 matrix: eigenvalue on {alg_struct}", float(raw_l1[0]), 3.0, error=1e-9)
+        assert_eq_approx(f"CP{mpc.pid}:\teigen_decomp of a 1 x 1 matrix on shares: eigenvalue on {alg_struct}", float(mpc_l1.reveal(mpc)[0]), 3.0, error=1e-4)
+
+    raw_empty = zeros((0, 0))
+    empty_q, empty_r = qr_fact_square(mpc, raw_empty)
+    empty_t, empty_tq = tridiag(mpc, raw_empty)
+    empty_v, empty_l = eigen_decomp(mpc, raw_empty)
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tqr_fact_square, tridiag and eigen_decomp of the empty matrix: empty factors on {alg_struct}",
+                  empty_q.size + empty_r.size + empty_t.size + empty_tq.size + empty_v.size + empty_l.size, 0)
+
+    raw_two = array([[2.0, 1.0], [1.0, 3.0]])
+    mpc_two = Sharetensor.enc(mpc, raw_two, 0, modulus)
+    raw_t2, raw_tq2 = tridiag(mpc, raw_two)
+    mpc_t2, mpc_tq2 = tridiag(mpc, mpc_two)
+    raw_v2, raw_l2 = eigen_decomp(mpc, raw_two)
+    mpc_v2, mpc_l2 = eigen_decomp(mpc, mpc_two)
+    # The eigenvalues of [[2, 1], [1, 3]] are (5 -+ sqrt(5)) / 2; V's rows are the eigenvectors, up to sign
+    low, high = (5.0 - 5.0 ** 0.5) / 2.0, (5.0 + 5.0 ** 0.5) / 2.0
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\ttridiag of a 2 x 2 matrix: T on {alg_struct}", raw_t2, raw_two, error=1e-9)
+        assert_eq_approx(f"CP{mpc.pid}:\ttridiag of a 2 x 2 matrix: Q on {alg_struct}", raw_tq2, array([[1.0, 0.0], [0.0, 1.0]]), error=1e-9)
+        assert_eq_approx(f"CP{mpc.pid}:\ttridiag of a 2 x 2 matrix on shares: T on {alg_struct}", mpc_t2.reveal(mpc), raw_two, error=1e-4)
+        assert_eq_approx(f"CP{mpc.pid}:\ttridiag of a 2 x 2 matrix on shares: Q on {alg_struct}", mpc_tq2.reveal(mpc), array([[1.0, 0.0], [0.0, 1.0]]), error=1e-4)
+        values = sorted([float(raw_l2[0]), float(raw_l2[1])])
+        mpc_values = sorted([float(e) for e in mpc_l2.reveal(mpc).tolist()])
+        assert_eq_approx(f"CP{mpc.pid}:\teigen_decomp of a 2 x 2 matrix: eigenvalues on {alg_struct}", values, [low, high], error=1e-9)
+        assert_eq_approx(f"CP{mpc.pid}:\teigen_decomp of a 2 x 2 matrix on shares: eigenvalues on {alg_struct}", mpc_values, [low, high], error=1e-4)
+        # A v = lambda v for each row v of V and its eigenvalue
+        residual = 0.0
+        for i in range(2):
+            for j in range(2):
+                av = float(raw_two[j, 0]) * float(raw_v2[i, 0]) + float(raw_two[j, 1]) * float(raw_v2[i, 1])
+                residual = max(residual, abs(av - float(raw_l2[i]) * float(raw_v2[i, j])))
+        assert_eq(f"CP{mpc.pid}:\teigen_decomp of a 2 x 2 matrix: A v = lambda v ({residual:.1e}) on {alg_struct}", residual < 1e-9, True)
+        assert_eq(f"CP{mpc.pid}:\teigen_decomp of a 2 x 2 matrix on shares: eigenvectors ({_row_sign_error(mpc_v2.reveal(mpc), raw_v2):.1e}) on {alg_struct}",
+                  _row_sign_error(mpc_v2.reveal(mpc), raw_v2) < 1e-4, True)
