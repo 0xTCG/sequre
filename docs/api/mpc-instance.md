@@ -94,7 +94,7 @@ Beaver-triple based secure arithmetic over secret-shared values.
 
 | Method | Signature | Description |
 |---|---|---|
-| `add_public` | `(x, a, modulus)` | Add a public value `a` to secret-shared `x` (only at party 1) |
+| `add_public` | `(x, a, modulus)` | Add a public value `a` to secret-shared `x` (only at party 1; the other parties return `x` itself) |
 | `multiply` | `(a, b, modulus)` | Beaver-triple secure element-wise multiplication |
 | `multiply_matmul` | `(a, b, modulus)` | Beaver-triple secure matrix multiplication |
 | `inner_prod` | `(a, modulus)` | Secure inner product of secret-shared vectors |
@@ -125,7 +125,8 @@ Boolean circuits and comparison protocols over secret-shared values. Implements 
 | `fan_in_and` | `(a, modulus)` | Compute AND reduction (via De Morgan + `fan_in_or`) |
 | `prefix_and` | `(a, modulus)` | Compute prefix-AND (via De Morgan + `prefix_or`) |
 | `flip_bit` | `(a, modulus)` | Negate shared bits: $1 - a$ |
-| `is_positive` | `(a, modulus)` | $[a > 0]$ as a shared bit. On the ring: the sign test over the modulus' bits (`mpc.bitwise.sign_ring`); on the field: the field protocol |
+| `is_positive` | `(a, modulus, nbits=MPC_MODULUS_BITS)` | $[a > 0]$ as a shared bit. On the ring: the sign test over the modulus' bits (`mpc.bitwise.sign_ring`), exact for every $\lvert a \rvert < 2^{L-1}$ (`nbits` is ignored). On the field: the parity of $2a$, masked by a uniform field element and opened, whose overflow is found by comparing the low `nbits` bits of the mask and the opening: exact for every $\lvert a \rvert \le (p-1)/2$ with the default (all $L$ bits), wrong with probability about $2\lvert a \rvert / 2^{\text{nbits}}$ with fewer (Sharetensor comparisons pass $K + F$ for differences of two fixed-point values) |
+| `is_nonzero` | `(a, modulus, nbits=MPC_MODULUS_BITS)` | $[a \ne 0]$ as a shared bit, field only: $a + r$ is opened for a uniform field element $r$, and an OR over the XOR of the low `nbits` bits of $r$ and the opening decides. Exact (not just with high probability) for every $\lvert a \rvert < 2^{\text{nbits}} - c$, where $p = 2^L - c$ ($c$ = 1, 3 and 9 with 128-, 192- and 256-bit shares): with the default, every value. About a quarter of `is_positive`'s cost at the same width. Sharetensor `==` and `!=` use it on the field |
 | `less_than_bits_public` | `(a, b_pub, modulus)` | Bitwise comparison $a < b$ where `b` is public |
 | `less_than_bits` | `(a, b, modulus)` | Bitwise comparison $a < b$ where both are secret-shared |
 | `less_than_public` | `(a, bpub, modulus)` | Comparison $a < b$ where `b` is public. Works on scalars, 1D, and 2D inputs |
@@ -136,6 +137,10 @@ Boolean circuits and comparison protocols over secret-shared values. Implements 
 | `greater_than` | `(a, b, modulus)` | Comparison $a > b$ on secret-shared values |
 | `not_greater_than` | `(a, b, modulus)` | Comparison $a \leq b$ on secret-shared values |
 | `not_greater_than_public` | `(a, bpub, modulus)` | Comparison $a \leq b$ where `b` is public |
+
+The comparison methods from `less_than_public` on take `is_positive`'s default width: exact on both moduli whenever the
+difference of their operands lies in the signed range ($\lvert a - b \rvert \le (p-1)/2$ on the field, $< 2^{L-1}$ on the ring;
+on the field all $L$ bits), negative public operands included.
 
 ---
 

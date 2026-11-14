@@ -334,13 +334,36 @@ class MPCBoolean[TP]:
             for i in range(len(a)): a[i] = a[i].add_mod(1, modulus)
         a_mask = a_mask.neg_mod(modulus)
     
-    def is_positive(self, a, modulus):
+    def is_positive(self, a, modulus, nbits: int = MPC_MODULUS_BITS):
         # [a > 0] (strict). Ring: the ring sign test over the modulus' L bits (raw shares carry no fixed-point flag:
-        # any |a| < 2^(L - 1)); field: the field protocol
+        # any |a| < 2^(L - 1)). Field: the parity of 2a, masked by a uniform field element r and opened; the overflow
+        # of 2a + r is r's comparison with the opening over their low nbits bits. With nbits = L (the default) that is
+        # exact for every |a| <= (p - 1) / 2; with fewer bits it is wrong with probability about 2|a| / 2^nbits (InternalMPC
+        # passes K + F for differences of two fixed-point values, |a| < 2^K: below 2^(1 - F); M-MPC-17). nbits is
+        # ignored on the ring.
         if modulus.popcnt() == 1:
             return self.bitwise.sign_ring(a, modulus, bits=MPC_MODULUS_BITS)
-        return self.__is_positive(a, modulus)
+        return self.__is_positive(a, modulus, nbits)
     
+    def is_nonzero(self, a, modulus, nbits: int = MPC_MODULUS_BITS):
+        # [a != 0] on the field. The compute parties open a + r for a uniform field element r whose low nbits bits the
+        # dealer shares; a = 0 exactly when the opening equals r, so an OR over the XOR of their low nbits bits decides.
+        # Exact for every |a| < 2^nbits - c, where p = 2^L - c (c = MPC_MERSENNE_OFFSET: 1, 3 and 9 with 128-, 192- and
+        # 256-bit shares), not just with high probability: below that bound a nonzero a never leaves the low bits of the
+        # opening equal to r's, with or without a wrap mod p. With the default (the field's L bits) that is every value;
+        # with K + F bits, any difference of two fixed-point values (|a| < 2^K). One opening, two fan-in ORs (blocks of
+        # small-field-size - 1 bits, then the blocks) and one table lookup: about a quarter of is_positive's cost at the
+        # same width. The ring compares with its sign test instead.
+        assert modulus.popcnt() != 1, "is_nonzero: field shares only (the ring uses its sign test)"
+        if isinstance(a, mpc_uint):
+            return self.__is_nonzero_aux([a], modulus, nbits)[0]
+        elif isinstance(a, list[mpc_uint]):
+            return self.__is_nonzero_aux(a, modulus, nbits)
+        elif isinstance(a, list[list[mpc_uint]]):
+            return self.__is_nonzero_aux(a.flatten(), modulus, nbits).reshape(a.shape)
+        else:
+            compile_error(f'Invalid type of {a}')
+
     def less_than_public(self, a, bpub, modulus):
         if isinstance(a, mpc_uint):
             return self.__less_than_public([a], bpub, modulus)[0]
@@ -421,21 +444,22 @@ class MPCBoolean[TP]:
         else:
             compile_error(f'Invalid type of {a}')
 
-    def __is_positive(self, a, modulus):
+    def __is_positive(self, a, modulus, nbits: int):
         if isinstance(a, mpc_uint):
-            return self.__is_positive_aux([a], modulus)[0]
+            return self.__is_positive_aux([a], modulus, nbits)[0]
         elif isinstance(a, list[mpc_uint]):
-            return self.__is_positive_aux(a, modulus)
+            return self.__is_positive_aux(a, modulus, nbits)
         elif isinstance(a, list[list[mpc_uint]]):
-            return self.__is_positive_aux(a.flatten(), modulus).reshape(a.shape)
+            return self.__is_positive_aux(a.flatten(), modulus, nbits).reshape(a.shape)
         else:
             compile_error(f'Invalid type of {a}')
-    
-    def __is_positive_aux(self, a, modulus):
+
+    def __is_positive_aux(self, a, modulus, nbits: int):
         n = len(a)
         assert n > 0, "is_positive should not be called on top of an empty array for safety reasons"
-        # TODO: #189 Use perfect secrecy or safer statistical security in is_positive
-        nbits = MPC_NBIT_K + MPC_NBIT_F
+        assert 0 < nbits <= MPC_MODULUS_BITS, f"is_positive: invalid comparison width {nbits}"
+        # The low nbits bits of r and of the opening c = 2a + r decide whether 2a + r wrapped: all of the field's bits
+        # make it exact (TODO #189 was this statistical shortcut: see is_positive)
         small_modulus = MPC_THIRD_FIELD_SIZE
         r = [TP(0) for _ in range(n)]
         r_bits = [[type(small_modulus)(0) for _ in range(nbits)] for _ in range(n)]
@@ -498,6 +522,68 @@ class MPCBoolean[TP]:
 
         return b_mat[0]
 
+    def __is_nonzero_aux(self, a, modulus, nbits: int):
+        n = len(a)
+        assert n > 0, "is_nonzero should not be called on top of an empty array"
+        assert 0 < nbits <= MPC_MODULUS_BITS, f"is_nonzero: invalid comparison width {nbits}"
+        small_modulus = MPC_THIRD_FIELD_SIZE
+        # The dealer's mask r (uniform over the field) and its low nbits bits, shared as in is_positive
+        r = [TP(0) for _ in range(n)]
+        r_bits = [[type(small_modulus)(0) for _ in range(nbits)] for _ in range(n)]
+        if self.pid == 0:
+            with self.randomness.private():
+                r = a.rand(modulus, "uniform")
+            r_bits = num_to_bits(r, nbits)
+
+            r_mask = r.zeros()
+            r_bits_mask = r_bits.zeros()
+            for p in range(2, self.comms.number_of_parties):
+                with self.randomness.seed_switch(p):
+                    r_mask = r_mask.add_mod(r.rand(modulus, "uniform"), modulus)
+                    r_bits_mask = r_bits_mask.add_mod(r_bits.rand(small_modulus, "uniform"), small_modulus)
+
+            self.comms.send(r.sub_mod(r_mask, modulus), 1)
+            self.comms.send(r_bits.sub_mod(r_bits_mask, small_modulus), 1)
+        elif self.pid == 1:
+            r = self.comms.receive(0, T=type(r))
+            r_bits = self.comms.receive(0, T=type(r_bits))
+        else:
+            with self.randomness.seed_switch(0):
+                r = r.rand(modulus, "uniform")
+                r_bits = r_bits.rand(small_modulus, "uniform")
+
+        c = a.add_mod(r, modulus) if self.pid != 0 else [TP(0) for _ in range(n)]
+        c = self.comms.reveal(c, modulus=modulus)
+        c_bits = num_to_bits(c, nbits) if self.pid != 0 else [[type(small_modulus)(0) for _ in range(nbits)] for _ in range(n)]
+
+        # c XOR r bit by bit (c is public): r's share where c's bit is 0, 1 - r where it is 1 (CP1 adds the 1). A fan-in
+        # OR of d bits evaluates its polynomial at 1 + (the count of ones), so d + 1 must stay within the small field:
+        # blocks of small_modulus - 1 bits (16 with 192- and 256-bit shares, 12 with 128-bit ones), zero-padded, then
+        # one more OR over the blocks
+        block = small_modulus - 1
+        nblocks = (nbits + block - 1) // block
+        assert nblocks + 1 <= small_modulus, f"is_nonzero: {nbits} bits need more than two levels of fan-in ORs"
+        xor_blocks = list[list[type(small_modulus)]](n * nblocks)
+        for i in range(n):
+            for b in range(nblocks):
+                row = list[type(small_modulus)](block)
+                for j in range(b * block, (b + 1) * block):
+                    v = type(small_modulus)(0)
+                    if j < nbits and self.pid > 0:
+                        if c_bits[i][j] == 0:
+                            v = r_bits[i][j]
+                        else:
+                            v = (type(small_modulus)(1 if self.pid == 1 else 0) - r_bits[i][j]) % small_modulus
+                    row.append(v)
+                xor_blocks.append(row)
+
+        block_or = self.fan_in_or(xor_blocks, small_modulus)
+        any_bit = self.fan_in_or([[block_or[i * nblocks + b] for b in range(nblocks)] for i in range(n)], small_modulus)
+
+        # To the large modulus: table 0 maps 1 to 1 and 2 to 0, so look up 2 - [a != 0] (CP1 adds the 2)
+        lifted = [TP(((2 if self.pid == 1 else 0) - any_bit[i]) % small_modulus) if self.pid > 0 else TP(0) for i in range(n)]
+        return self.polynomial.table_lookup(lifted, 0, modulus)[0]
+
     def __less_than_public(self, a, bpub, modulus):
         b_a = self.arithmetic.add_public(a.neg_mod(modulus), bpub, modulus) if self.pid != 0 else a.zeros()
 
@@ -521,7 +607,9 @@ class MPCBoolean[TP]:
         return c
 
     def __greater_than_public(self, a, bpub, modulus):
-        a_b = self.arithmetic.add_public(a, -bpub, modulus) if self.pid != 0 else a.zeros()
+        # a - b: the public b negated mod the modulus (its N-bit two's complement, -bpub, was off by 2^N mod p on the field
+        # for a share below b: a negative constant almost always; M-MPC-10)
+        a_b = self.arithmetic.add_public(a, bpub.neg_mod(modulus), modulus) if self.pid != 0 else a.zeros()
 
         return self.is_positive(a_b, modulus)
     

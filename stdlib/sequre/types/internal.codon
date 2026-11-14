@@ -616,7 +616,10 @@ class InternalMPC:
     def __positive_share(mpc, d, wide: bool):
         # Shares of [d > 0] (strict: 0 gives 0). Ring: the ring sign test over K + 1 bits for a fixed-point d (any
         # difference of two fixed-point values), K + F + 1 inside MPCEnv.delayed_truncation() (products keep scale
-        # 2^(2F) there), the modulus' L bits for integers and wide differences. Field: is_positive.
+        # 2^(2F) there), the modulus' L bits for integers and wide differences: exact. Field: is_positive, exact over the
+        # field's L bits for integers, wide differences and inside delayed_truncation(); for a difference of two
+        # fixed-point values over K + F bits, wrong with probability about 2|d| / 2^(K + F) in raw units (below
+        # 2^(1 - F) in the fixed-point range: M-MPC-17).
         modulus = d.modulus
         if modulus.popcnt() == 1:
             if wide or not d.is_fp():
@@ -625,7 +628,9 @@ class InternalMPC:
                 return mpc.bitwise.sign_ring(d.share, modulus, bits=MPC_NBIT_K + 1)
             else:
                 return mpc.bitwise.sign_ring(d.share, modulus, bits=MPC_NBIT_K + MPC_NBIT_F + 1)
-        return mpc.boolean.is_positive(d.share, modulus)
+        if wide or not d.is_fp() or not mpc.fp.truncation_allowed():
+            return mpc.boolean.is_positive(d.share, modulus)
+        return mpc.boolean.is_positive(d.share, modulus, nbits=MPC_NBIT_K + MPC_NBIT_F)
 
     def __ne_ring(mpc, flat, fp: bool, wide: bool, modulus):
         # [d != 0] for a list of ring shares of d: [d > 0] + [-d > 0] from one sign test of the concatenation
@@ -652,10 +657,14 @@ class InternalMPC:
         return InternalMPC.sub(mpc, 1, InternalMPC.ne(mpc, x, y))
 
     def ne(mpc, x, y):
+        # [x != y] for the difference d = x - y (__difference: public operands count once, mixed fixed point and
+        # constants as in gt). Exact on both moduli, with no product and no truncation (H-54: the field squared d and
+        # compared it with 0, wrong for |d| >= about 2^47.5 raw units and for fixed-point differences below about
+        # 2^(-F/2), which squared to 0).
         d, wide = InternalMPC.__difference(mpc, x, y)
         modulus = d.modulus
         if modulus.popcnt() == 1:
-            # [d > 0] + [-d > 0] from one sign test of (d, -d)
+            # Ring: [d > 0] + [-d > 0] from one sign test of (d, -d)
             if isinstance(d.share, TP):
                 res = InternalMPC.__ne_ring(mpc, [d.share], d.fp, wide, modulus)
                 return Sharetensor(res[0], modulus)
@@ -665,9 +674,12 @@ class InternalMPC:
             else:
                 return Sharetensor(InternalMPC.__ne_ring(mpc, d.share, d.fp, wide, modulus), modulus)
 
-        # Field: the squared difference against 0 (unchanged: wrong when d^2 leaves the field comparison's range,
-        # |d| >= about 2^47.5 raw units, and for fixed-point differences below about 2^(-F/2), which square to 0)
-        return InternalMPC.gt(mpc, InternalMPC.mul(mpc, d, d), 0)
+        # Field: an equality test (is_nonzero), exact for |d| < 2^nbits - c (p = 2^L - c): over the field's L bits for
+        # integers, wide differences and inside delayed_truncation(), over K + F bits for a difference of two fixed-point
+        # values (|d| < 2^K), as gt's widths (__positive_share)
+        if wide or not d.is_fp() or not mpc.fp.truncation_allowed():
+            return Sharetensor(mpc.boolean.is_nonzero(d.share, modulus), modulus)
+        return Sharetensor(mpc.boolean.is_nonzero(d.share, modulus, nbits=MPC_NBIT_K + MPC_NBIT_F), modulus)
 
     def sqrt_inv(mpc, x, y):
         # TODO: #26 Currently does not work for complex algebraic structures.
@@ -715,20 +727,22 @@ class InternalMPC:
         return InternalMPC.dot(mpc, x, x, axis)
 
     def matmul(mpc, x, y):
+        # A public ndarray times shares: each party multiplies its own shares, reduced mod the modulus (H-08: the raw
+        # List.matmul wrapped mod 2^N, and the truncation then overflowed on unreduced cells: H-57)
         if isinstance(x, ndarray):
             modulus = y.modulus
-            c = x.to_int_t(modulus) @ y.share
+            c = x.to_int_t(modulus).small_matmul_mod(y.share, modulus)
 
             if y.is_fp() and isinstance(type(x.data[0]), float):
                 c = mpc.fp.trunc(c, modulus)
-            
+
             sv = Sharetensor(c, modulus)
             sv.fp = y.is_fp() or isinstance(type(x.data[0]), float)
             return sv
-        
+
         if isinstance(y, ndarray):
             modulus = x.modulus
-            c = x.share @ y.to_int_t(modulus)
+            c = x.share.matmul_small_mod(y.to_int_t(modulus), modulus)
 
             if x.is_fp() and isinstance(type(y.data[0]), float):
                 c = mpc.fp.trunc(c, modulus)
@@ -825,31 +839,44 @@ class InternalMPC:
         sv.public = True
         return sv
 
+    def __unaliased_add_public(mpc, share, x_public, modulus):
+        # add_public adds at the hub only and returns its input at the other parties: there the result is copied, so it
+        # shares no list with the operand
+        s = mpc.arithmetic.add_public(share, x_public, modulus)
+        if isinstance(s, ByVal):
+            return s
+        return s.copy() if s is share else s
+
     def __add_public(mpc, x_public, y, diagonal):
+        # y + a public value (added once, at the hub). The result shares no list with y at any party (H-11): the
+        # diagonal path writes into a copy of y's shares, and where add_public adds nothing (every party but the hub)
+        # the shares are copied, so a later in-place write to the sum leaves y alone. Beaver partitions: x_r moves by
+        # the public value (it is public), r stays (copied).
         share = y.share
         modulus = y.modulus
 
         if isinstance(share, list[list]) and isinstance(x_public, list[list]):
             if diagonal:
+                share = share.copy()
                 for i in range(len(share)):
                     share[i][i] = mpc.arithmetic.add_public(share[i][i], x_public[i][i], modulus)
-            else: share = mpc.arithmetic.add_public(share, x_public, modulus)
-        else: share = mpc.arithmetic.add_public(share, x_public, modulus)
-        
+            else: share = InternalMPC.__unaliased_add_public(mpc, share, x_public, modulus)
+        else: share = InternalMPC.__unaliased_add_public(mpc, share, x_public, modulus)
+
         sv = Sharetensor(share, modulus)
         sv.fp = y.fp
 
         if y.sqrt:
             sv.sqrt = type(share)(0)
             sv.sqrt_inv = type(share)(0)
-        
+
         if not y.is_partitioned():
             return sv
-        
-        sv.x_r = y.x_r.add_mod(x_public, modulus)
-        sv.r = y.r
 
-        return sv        
+        sv.x_r = y.x_r.add_mod(x_public, modulus) if mpc.pid else y.x_r.copy()  # CP0's x_r stays zeros
+        sv.r = y.r.copy()
+
+        return sv
 
 
 class InternalMHE:

@@ -166,6 +166,11 @@ CASES = [
     ("nl.tanh_auto_ring_vec_1e3", "", "nonlinear.tanh's default (auto) on its default interval ((-5, 5) at F = 32), inputs in (-5, 5): Decor on ring shares, ring, 1e3"),
     ("nl.tanh_auto_field_vec_1e3", "", "nonlinear.tanh's default (auto) on its default interval ((-5, 5) at F = 32), inputs in (-5, 5): on field shares the Chebyshev interpolant of auto_degree (degree in params), field, 1e3"),
     ("prim.rand.seed_switch_global_1e4", "", "10k seed_switch(-1) enter/exit pairs from the private stream, one draw each, at every party: a switch between two streams"),
+    # Run after every earlier section (bench_late_mpc): their shared draws move no other case's data
+    ("mpc.cmp.ne_vec_1e3", "", "x != y, both secret, on field shares (every 4th pair equal), 1e3"),
+    ("mpc.bcast.sub_scalar_sq_vec_1e4", "", "(x - m) * (x - m): an fp vector with cached Beaver partitions minus a secret scalar (broadcast_add), then the square, 1e4"),
+    ("mpc.ndarray.rmatmul_float_128", "", "fp Sharetensor @ float ndarray 128x128"),
+    ("mpc.public.add_identity_mat_256", "", "A + I for a 256x256 fp Sharetensor and a public identity (the diagonal public add)"),
 ]
 
 handle_list_flag("mpc", CASES)
@@ -1534,6 +1539,81 @@ def bench_streams(mpc, b: Bench):
         b.report(f"n={n};check=draws_ok", t, 1.0 if acc != mpc_uint(0) else 0.0)
 
 
+def bench_late_mpc(mpc, b: Bench):
+    # Cases added after bench_streams: their draws from the shared stream move no other case's data
+    if b.want(mpc, "mpc.cmp.ne_vec_1e3"):
+        field = MPC_FIELD_SIZE
+        n = 1000
+        xs = shared_floats(mpc, n, -4.0, 4.0)
+        ys = shared_floats(mpc, n, -4.0, 4.0)
+        for i in range(0, n, 4):
+            ys[i] = xs[i]  # equal pairs
+        x = Sharetensor.enc(mpc, xs, 0, field)
+        y = Sharetensor.enc(mpc, ys, 0, field)
+        r = x
+        t = Timer(b.reps(7))
+        while t.next():
+            t.begin(mpc)
+            r = sq.secure_ne(mpc, fresh(x), fresh(y))
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n}", t, mismatches(rv, [1.0 if xs[i] != ys[i] else 0.0 for i in range(n)]) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.bcast.sub_scalar_sq_vec_1e4"):
+        # x has cached Beaver partitions (as after an earlier product); m has none. The difference's square must not
+        # reuse x's partitions (the value would come out as x^2).
+        n = 10000
+        xs, x = fp_vec(mpc, n, -4.0, 4.0)
+        m = Sharetensor.enc(mpc, [0.75])[0]
+        r = x
+        t = Timer(b.reps(9), batch=3)
+        while t.next():
+            xp = fresh(x)
+            xp.get_partitions(mpc, force=False)
+            t.begin(mpc)
+            for _ in range(t.batch):
+                d = secure_operator.sub(mpc, xp, m)
+                r = secure_operator.mul(mpc, d, d)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        b.report(f"n={n}", t, max_abs_err_1d(rv, [(v - 0.75) * (v - 0.75) for v in xs]) if mpc.pid else 0.0)
+
+    if b.want(mpc, "mpc.ndarray.rmatmul_float_128"):
+        size = 128
+        ps = shared_float_matrix(mpc, size, size, -1.0, 1.0)
+        xs, x = fp_mat(mpc, size, size, -1.0, 1.0)
+        nd = array(ps)
+        r = x
+        t = Timer(b.reps(9), batch=2)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                r = secure_operator.matmul(mpc, x, nd)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        err = 0.0
+        if mpc.pid:
+            err = max_abs_err_2d(rv, array(xs) @ nd)
+        b.report(f"{size}x{size}", t, err)
+
+    if b.want(mpc, "mpc.public.add_identity_mat_256"):
+        size = 256
+        ms, a = fp_mat(mpc, size, size, -4.0, 4.0)
+        ident = a.I
+        r = a
+        t = Timer(b.reps(9), batch=4)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                r = secure_operator.add(mpc, a, ident)
+            t.end(mpc)
+        rv = r.reveal(mpc)
+        err = 0.0
+        if mpc.pid:
+            err = max_abs_err_2d(rv, [[ms[i][j] + (1.0 if i == j else 0.0) for j in range(size)] for i in range(size)])
+        b.report(f"{size}x{size}", t, err)
+
+
 @main
 def bench_mpc_main(mpc):
     b = Bench("mpc", mpc.pid, CASES)
@@ -1556,6 +1636,7 @@ def bench_mpc_main(mpc):
     bench_apps(mpc, b)
     bench_twins(mpc, b)
     bench_streams(mpc, b)
+    bench_late_mpc(mpc, b)
     b.finish(mpc)
 
 

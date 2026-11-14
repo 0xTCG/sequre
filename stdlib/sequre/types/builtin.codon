@@ -784,6 +784,74 @@ class Int:
         return self
 
 
+# A public matrix of small signed entries times shares, exact mod the field in one reduction per cell (H-08: the raw
+# N-bit products of List.matmul wrap mod 2^N, not mod p). A public entry v, read as signed (above p / 2: negative), with
+# -2^(K - 1) <= v < 2^(K - 1) (double_to_fp clamps fixed-point values below 2^(K - 1); 64-bit ints fit) is shifted to
+# v + 2^(K - 1), a K-bit unsigned value. Its products with shares (below 2^L) stay below 2^(K + L), so a
+# SMALL_MATMUL_WIDE-bit accumulator adds 2^SMALL_MATMUL_CHUNK_BITS of them before a reduction, and 2^(K - 1) times the
+# shares' sum over the inner dimension comes off again.
+SMALL_MATMUL_BITS: Static[int] = MPC_NBIT_K
+SMALL_MATMUL_WIDE: Static[int] = 256 if MPC_INT_SIZE < 256 else 512
+SMALL_MATMUL_CHUNK_BITS: Static[int] = 20 if SMALL_MATMUL_WIDE - MPC_NBIT_K - MPC_MODULUS_BITS - 1 > 20 else SMALL_MATMUL_WIDE - MPC_NBIT_K - MPC_MODULUS_BITS - 1
+
+
+def _wide_mod_field(x: UInt[SMALL_MATMUL_WIDE]) -> mpc_uint:
+    # x mod p for the field p = 2^L - s (s = MPC_MERSENNE_OFFSET): 2^L = s mod p, so the bits above L fold back in
+    # times s until none are left
+    bits = UInt[SMALL_MATMUL_WIDE](MPC_MODULUS_BITS)
+    mask = (UInt[SMALL_MATMUL_WIDE](1) << bits) - UInt[SMALL_MATMUL_WIDE](1)
+    while x >> bits:
+        x = (x & mask) + (x >> bits) * UInt[SMALL_MATMUL_WIDE](MPC_MERSENNE_OFFSET)
+    v = x.trunc_to(MPC_INT_SIZE)
+    return v - MPC_FIELD_SIZE if v >= MPC_FIELD_SIZE else v
+
+
+def _small_shifted(m, modulus: mpc_uint) -> Tuple[List[List[UInt[SMALL_MATMUL_BITS]]], bool]:
+    # (each entry of the matrix m, read as signed, plus 2^(K - 1), True) when every entry lies in [-2^(K - 1), 2^(K - 1));
+    # (empty, False) otherwise
+    half = mpc_uint(1) << mpc_uint(SMALL_MATMUL_BITS - 1)
+    top = modulus >> mpc_uint(1)
+    out = List[List[UInt[SMALL_MATMUL_BITS]]](len(m))
+    for row in m:
+        shifted = List[UInt[SMALL_MATMUL_BITS]](len(row))
+        for v in row:
+            if v > top:
+                magnitude = modulus - v
+                if magnitude > half:
+                    return List[List[UInt[SMALL_MATMUL_BITS]]](), False
+                shifted.append((half - magnitude).trunc_to(SMALL_MATMUL_BITS))
+            else:
+                if v >= half:
+                    return List[List[UInt[SMALL_MATMUL_BITS]]](), False
+                shifted.append((half + v).trunc_to(SMALL_MATMUL_BITS))
+        out.append(shifted)
+    return out, True
+
+
+def _small_dot_field(w: List[UInt[SMALL_MATMUL_BITS]], y: List[mpc_uint]) -> mpc_uint:
+    # sum_k w[k] y[k] mod p for K-bit w and shares y, in wide accumulators of 2^SMALL_MATMUL_CHUNK_BITS terms
+    n = len(w)
+    chunk = 1 << SMALL_MATMUL_CHUNK_BITS
+    total = mpc_uint(0)
+    start = 0
+    while start < n:
+        stop = start + chunk if start + chunk < n else n
+        acc = UInt[SMALL_MATMUL_WIDE](0)
+        for k in range(start, stop):
+            acc += w[k].ext_to(SMALL_MATMUL_WIDE) * y[k].ext_to(SMALL_MATMUL_WIDE)
+        total = total.add_mod(_wide_mod_field(acc), MPC_FIELD_SIZE)
+        start = stop
+    return total
+
+
+def _small_correction(y: List[mpc_uint]) -> mpc_uint:
+    # 2^(K - 1) sum_k y[k] mod p: what the shift adds to a row of products with y
+    s = mpc_uint(0)
+    for e in y:
+        s = s.add_mod(e, MPC_FIELD_SIZE)
+    return s.lsh_mod(SMALL_MATMUL_BITS - 1, MPC_FIELD_SIZE)
+
+
 @extend
 class List:
     def __getitem__(self: list[T], i: u64) -> T:
@@ -1533,6 +1601,81 @@ class List:
                 new_row.append(cell_value)
             new_mat.append(new_row)
 
+        return new_mat
+
+    def small_matmul_mod(self: list[T], other: list[T], modulus) -> list[T]:
+        """
+        self @ other mod modulus, exact, for a public self of small signed entries: read as signed (above modulus / 2:
+        negative), each in [-2^(K - 1), 2^(K - 1)), as fixed-point floats (double_to_fp clamps below 2^(K - 1)) and
+        64-bit ints are. The public operand of `ndarray @ Sharetensor`. On the field: one wide accumulation and one
+        reduction per cell (_small_dot_field), as fast as the raw matmul, whose N-bit products wrap mod 2^N, not mod p;
+        on a power-of-two ring the raw products are exact and masked to it. Entries out of range, or another modulus:
+        matmul_mod.
+        """
+        assert self.shape[1] == other.shape[0], f"Not aligned shapes {self.shape} and {other.shape} for matmul"
+        if modulus.popcnt() == 1:
+            return self.matmul(other) & (modulus - type(modulus)(1))
+        if modulus != MPC_FIELD_SIZE:
+            return self.matmul_mod(other, modulus)
+        w, small = _small_shifted(self, modulus)
+        if not small:
+            return self.matmul_mod(other, modulus)
+
+        other_t = other.transpose()
+        corrections = [_small_correction(column) for column in other_t]
+        n = len(other)
+        one_chunk = n <= (1 << SMALL_MATMUL_CHUNK_BITS)
+        new_mat = list[T](len(self))
+        for i in range(len(self)):
+            wi = w[i]
+            new_row = list[type(modulus)](len(other_t))
+            for j in range(len(other_t)):
+                yj = other_t[j]
+                if one_chunk:
+                    # inline (a call per cell costs about a third more)
+                    acc = UInt[SMALL_MATMUL_WIDE](0)
+                    for k in range(n):
+                        acc += wi[k].ext_to(SMALL_MATMUL_WIDE) * yj[k].ext_to(SMALL_MATMUL_WIDE)
+                    cell = _wide_mod_field(acc)
+                else:
+                    cell = _small_dot_field(wi, yj)
+                new_row.append(cell.sub_mod(corrections[j], modulus))
+            new_mat.append(new_row)
+        return new_mat
+
+    def matmul_small_mod(self: list[T], other: list[T], modulus) -> list[T]:
+        """
+        self @ other mod modulus, exact, for a public other of small signed entries (as in small_matmul_mod): the
+        public operand of `Sharetensor @ ndarray`.
+        """
+        assert self.shape[1] == other.shape[0], f"Not aligned shapes {self.shape} and {other.shape} for matmul"
+        if modulus.popcnt() == 1:
+            return self.matmul(other) & (modulus - type(modulus)(1))
+        if modulus != MPC_FIELD_SIZE:
+            return self.matmul_mod(other, modulus)
+        w, small = _small_shifted(other, modulus)
+        if not small:
+            return self.matmul_mod(other, modulus)
+
+        w_t = w.transpose()
+        n = len(other)
+        one_chunk = n <= (1 << SMALL_MATMUL_CHUNK_BITS)
+        new_mat = list[T](len(self))
+        for i in range(len(self)):
+            yi = self[i]
+            correction = _small_correction(yi)
+            new_row = list[type(modulus)](len(w_t))
+            for j in range(len(w_t)):
+                wj = w_t[j]
+                if one_chunk:
+                    acc = UInt[SMALL_MATMUL_WIDE](0)
+                    for k in range(n):
+                        acc += wj[k].ext_to(SMALL_MATMUL_WIDE) * yi[k].ext_to(SMALL_MATMUL_WIDE)
+                    cell = _wide_mod_field(acc)
+                else:
+                    cell = _small_dot_field(wj, yi)
+                new_row.append(cell.sub_mod(correction, modulus))
+            new_mat.append(new_row)
         return new_mat
 
     @property

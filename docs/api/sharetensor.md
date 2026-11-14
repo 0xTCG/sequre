@@ -92,13 +92,31 @@ All standard operators are supported and are automatically rewritten by the `@se
 | Addition | `a + b` | Local (no communication) |
 | Subtraction | `a - b` | Local |
 | Multiplication | `a * b` | Beaver triple protocol |
-| Matrix multiply | `a @ b` | Beaver triple |
+| Matrix multiply | `a @ b` | Beaver triple; with a public `ndarray` operand, each party multiplies its own shares (exactly mod the modulus), plus a truncation for a float `ndarray` times fixed-point shares |
 | Division | `a / b` | Fixed-point iterative protocol |
 | Power | `a ** n` | Repeated multiplication |
-| Comparison | `a == b`, `a > b`, `a < b` | Bit decomposition protocol |
+| Comparison | `a > b`, `a < b`, `a == b`, `a != b` | Sign test; equality test on the field (see [Comparisons](#comparisons)) |
 | Dot product | `a.dot(mpc, b, axis=0)` | Beaver inner product |
 
 In-place variants (`+=`, `-=`, `*=`, `**=`) are also supported.
+
+A sum of two secret tensors keeps cached Beaver partitions only when both have them (their sum); otherwise it has none,
+and the next product partitions it. A public sum keeps the secret operand's partitions, moved by the public value.
+No arithmetic writes into an operand's shares or partitions (products may cache partitions in an operand, and `sqrt`
+its roots): `A + A.I` and other public sums leave `A` as it was, and the result shares no list with the operand at any
+party.
+
+### Comparisons
+
+`a > b`, `a < b`, `a == b` and `a != b` return 0/1 integer shares. Either operand may be a public int, float or
+`mpc_uint` constant, or a public Sharetensor (counted once). Fixed point on either side puts both in fixed point. What
+they compute is the difference $d = a - b$ (in raw units: scaled by $2^F$ in fixed point) and its sign or whether it is
+zero:
+
+| Modulus | `>`, `<` | `==`, `!=` |
+|---|---|---|
+| Ring ($2^L$) | Exact. The ring's sign test over $K + 1$ bits for a difference of two fixed-point values ($\lvert d \rvert < 2^K$), $K + F + 1$ inside `mpc.delayed_truncation()`, all $L$ bits for integers and wide differences (an integer operand put in fixed point, a constant beyond the fixed-point range) | Exact: $[d > 0] + [-d > 0]$ from one sign test of $(d, -d)$ |
+| Field ($p = 2^L - c$) | Integers, wide differences and inside `mpc.delayed_truncation()`: exact (`mpc.boolean.is_positive` over all $L$ bits). A difference of two fixed-point values: over $K + F$ bits, wrong with probability about $2\lvert d \rvert / 2^{K+F}$, which stays below $2^{1-F}$ in the fixed-point range ($2^{-31}$ with 192-bit shares, $2^{-63}$ with 256-bit ones) and is about $2^{-63}$ for values near 1 with 192-bit shares | Exact for every difference: an equality test (`mpc.boolean.is_nonzero`), about a quarter of a sign test's cost |
 
 ## Fixed-point support
 
