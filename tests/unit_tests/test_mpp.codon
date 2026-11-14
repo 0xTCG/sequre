@@ -14,9 +14,12 @@ from sequre.utils.testing import assert_eq, assert_eq_approx
 from sequre.utils.io import write_ndarray, read_ndarray
 from sequre.utils.utils import random_ints, one_hot_vector
 
+import math
+import sequre.stdlib.nonlinear as nl
+
 from multiparty_testing import (
     unequal_ratios, ratios_with_empty, own_rows, cohort_matrix, partition, column, assert_parties_in_step, encrypted_at,
-    holders, sum_ratios)
+    holders, sum_ratios, with_columns)
 
 
 def test_mpp_getitem(mpp_a, raw_a):
@@ -282,8 +285,8 @@ def test_mpp_partitioned_vectors(mpc):
     for ratios in ([4 for _ in range(n_cp)], unequal_ratios(n_cp)):
         matrix = cohort_matrix(mpc, ratios.sum(), 3)
         expected = column(matrix, 1)
-        # What a column of a transposed MPP is (mpp.T[1]), each party's slice copied: that getitem returns a strided view
-        # of the partition, which pickling reads as if it were contiguous (H-14)
+        # What a column of a transposed MPP is (mpp.T[1]), built from each party's slice copied (test_mpp_columns takes
+        # mpp.T[j] itself, a strided view of each partition)
         start, stop = own_rows(mpc, ratios)
         vector = MPP[Tuple[int], float](
             _mpc=mpc,
@@ -827,6 +830,140 @@ def test_mpp_sum_encodings(mpc):
         assert_eq_approx(f"CP{mpc.pid}:\tMPU mixed .sum(0) under ENC_DIAG, ratios {ratios}", mpu_sums, a.sum(axis=0), error=0.01)
 
 
+def test_mpp_pad_with_value(mpc):
+    """H-16: pad_with_value (LinReg's and LogReg's bias column) on MPPs whose partitions are in the clear (padded with
+    ones whatever the value), encrypted and mixed (the appendix came out column-wise and concat asserted), and
+    semi-encrypted (A @ A.T: the left block was dropped, and the block in the clear and the right block both padded);
+    equal, unequal and empty partitions; a transposed MPP along axis 0. Every party pads its own rows with the value,
+    and the operand stays as it was."""
+    n_cp = mpc.comms.number_of_parties - 1
+    for ratios in ([2 for _ in range(n_cp)], unequal_ratios(n_cp), ratios_with_empty(n_cp)):
+        matrix = cohort_matrix(mpc, ratios.sum(), 3)
+        expected = with_columns(matrix, 2, 7.5)
+        clear = partition(mpc, matrix, ratios)
+        padded = clear.pad_with_value(7.5, 2, 1)
+        encrypted = encrypted_at(mpc, clear, holders(ratios))
+        padded_encrypted = encrypted.pad_with_value(7.5, 2, 1)
+        padded_encrypted_transposed = encrypted.T.pad_with_value(-1.0, 1, 0)
+        padded_mixed = encrypted_at(mpc, clear, [1]).pad_with_value(7.5, 2, 1)
+        semi = clear @ clear.T
+        padded_semi = semi.pad_with_value(1.0, 1, 1)
+        padded_transposed = clear.T.pad_with_value(-1.0, 1, 0)
+        assert_parties_in_step(mpc, f"MPP pad_with_value, ratios {ratios}")
+
+        revealed = padded.reveal()
+        revealed_encrypted = padded_encrypted.reveal()
+        revealed_mixed = padded_mixed.reveal()
+        revealed_semi = padded_semi.reveal()
+        revealed_transposed = padded_transposed.reveal()
+        revealed_encrypted_transposed = padded_encrypted_transposed.reveal()
+        revealed_operand = clear.reveal()
+        revealed_encrypted_operand = encrypted.reveal()
+        if mpc.pid:
+            label = f"MPP pad_with_value, ratios {ratios}"
+            assert_eq(f"CP{mpc.pid}:\t{label}: in the clear", revealed, expected)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: encrypted", revealed_encrypted, expected, error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: mixed", revealed_mixed, expected, error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: semi-encrypted (A @ A.T)", revealed_semi, with_columns(matrix @ matrix.T, 1, 1.0), error=0.05)
+            assert_eq(f"CP{mpc.pid}:\t{label}: transposed, along axis 0", revealed_transposed, with_columns(matrix, 1, -1.0).T)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: encrypted and transposed, along axis 0", revealed_encrypted_transposed, with_columns(matrix, 1, -1.0).T, error=1e-3)
+            assert_eq(f"CP{mpc.pid}:\t{label}: operand kept", revealed_operand, matrix)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: encrypted operand kept", revealed_encrypted_operand, matrix, error=1e-3)
+        assert_parties_in_step(mpc, f"MPP pad_with_value, ratios {ratios}: reveals")
+
+
+def test_mpp_pad_with_value_copies(mpc):
+    """H-16 (review c17-cr1-1, -2): a partition can hold its rows in the clear and a unified encryption of them as a copy,
+    which join(), a product's transposed operand and a mixed cohort's reveal leave; pad_with_value pads both (padding
+    only the copy lost the column, or left the parties disagreeing on the shape). Rows that end one slot short of a
+    ciphertext boundary, padded across it, at unequal ratios: the padding must not rotate or multiply, which could start
+    refresh councils at only the parties holding encryptions."""
+    n_cp = mpc.comms.number_of_parties - 1
+    ratios = unequal_ratios(n_cp)
+    matrix = cohort_matrix(mpc, ratios.sum(), 3)
+    expected = with_columns(matrix, 1, 1.0)
+
+    joined = partition(mpc, matrix, ratios)
+    joined.join()
+    padded_joined = joined.pad_with_value(1.0, 1, 1)
+    operand = partition(mpc, matrix, ratios)
+    transposed = operand.T
+    product = operand @ transposed
+    padded_operand = transposed.pad_with_value(1.0, 1, 0)
+    mixed = encrypted_at(mpc, partition(mpc, matrix, ratios), [1])
+    revealed_before = mixed.reveal()
+    padded_mixed = mixed.pad_with_value(1.0, 1, 1)
+    semi = partition(mpc, matrix, ratios) @ partition(mpc, matrix, ratios).T
+    revealed_semi_before = semi.reveal()  # leaves a unified copy beside the blocks
+    padded_semi = semi.pad_with_value(1.0, 1, 1)
+    assert_parties_in_step(mpc, f"MPP pad_with_value of partitions with copies, ratios {ratios}")
+
+    revealed_joined = padded_joined.reveal()
+    revealed_operand = padded_operand.reveal()
+    revealed_mixed = padded_mixed.reveal()
+    revealed_semi = padded_semi.reveal()
+    revealed_semi_operand = semi.reveal()
+    if mpc.pid:
+        label = f"MPP pad_with_value, ratios {ratios}"
+        assert_eq(f"CP{mpc.pid}:\t{label}: after join()", revealed_joined, expected)
+        assert_eq(f"CP{mpc.pid}:\t{label}: a product's transposed operand, along axis 0", revealed_operand, expected.T)
+        assert_eq_approx(f"CP{mpc.pid}:\t{label}: a mixed cohort after its reveal", revealed_mixed, expected, error=1e-3)
+        assert_eq(f"CP{mpc.pid}:\t{label}: a mixed cohort after its reveal, the cohort's shape", padded_mixed.cohort_shape, (ratios.sum(), 4))
+        rows = ratios.sum()
+        assert_eq_approx(f"CP{mpc.pid}:\t{label}: semi-encrypted (A @ A.T) after its reveal", revealed_semi, with_columns(matrix @ matrix.T, 1, 1.0), error=0.05)
+        assert_eq(f"CP{mpc.pid}:\t{label}: semi-encrypted after its reveal, the cohort's shape", padded_semi.cohort_shape, (rows, rows + 1))
+        assert_eq_approx(f"CP{mpc.pid}:\t{label}: semi-encrypted operand kept", revealed_semi_operand, matrix @ matrix.T, error=0.05)
+    assert_parties_in_step(mpc, f"MPP pad_with_value of partitions with copies, ratios {ratios}: reveals")
+
+    slots = mpc.mhe.crypto_params.params.slots()
+    wide = cohort_matrix(mpc, ratios.sum(), slots - 1)
+    encrypted = encrypted_at(mpc, partition(mpc, wide, ratios), holders(ratios))
+    padded_wide = encrypted.pad_with_value(1.0, 2, 1)
+    assert_parties_in_step(mpc, f"MPP pad_with_value across a ciphertext boundary, ratios {ratios}")
+    revealed_wide = padded_wide.reveal()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPP pad_with_value across a ciphertext boundary ({slots - 1} + 2 columns), ratios {ratios}", revealed_wide, with_columns(wide, 2, 1.0), error=1e-3)
+    assert_parties_in_step(mpc, f"MPP pad_with_value across a ciphertext boundary, ratios {ratios}: reveal")
+
+def test_mpp_columns(mpc):
+    """H-14: a column of a transposed MPP (mpp.T[j]) holds a strided view of each partition, which its reveal and
+    nonlinear functions in the clear read as if it were contiguous (the start of the partition's first row). Equal and
+    unequal partitions; the column added to itself, encrypted, and through exp in the clear (against the same column
+    built from contiguous copies)."""
+    n_cp = mpc.comms.number_of_parties - 1
+    for ratios in ([3 for _ in range(n_cp)], unequal_ratios(n_cp)):
+        matrix = cohort_matrix(mpc, ratios.sum(), 4)
+        expected = column(matrix, 2)
+        start, stop = own_rows(mpc, ratios)
+        mpp = partition(mpc, matrix, ratios)
+        col = mpp.T[2]
+        copied = MPP[Tuple[int], float](
+            _mpc=mpc,
+            _ratios=ratios,
+            _local_data=expected.zeros() if mpc.pid == 0 else expected[start:stop].copy(),
+            _transposed=True)
+        doubled = col + col
+        encrypted = col.copy()
+        encrypted.encrypt()
+        exp_col = nl.exp(mpc, col)
+        exp_copied = nl.exp(mpc, copied)
+        assert_parties_in_step(mpc, f"MPP column, ratios {ratios}")
+
+        revealed = col.reveal()
+        revealed_doubled = doubled.reveal()
+        revealed_encrypted = encrypted.reveal()
+        revealed_exp = exp_col.reveal()
+        revealed_exp_copied = exp_copied.reveal()
+        if mpc.pid:
+            label = f"MPP column of a transposed MPP, ratios {ratios}"
+            assert_eq(f"CP{mpc.pid}:\t{label}", revealed, expected)
+            assert_eq(f"CP{mpc.pid}:\t{label}: c + c", revealed_doubled, expected * 2.0)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: encrypted", revealed_encrypted, expected, error=1e-3)
+            assert_eq(f"CP{mpc.pid}:\t{label}: exp in the clear, as of contiguous copies", revealed_exp, revealed_exp_copied)
+            exact = array([math.exp(v) for v in expected.tolist()])
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: exp in the clear", revealed_exp, exact, error=0.0, rel_error=0.02)
+        assert_parties_in_step(mpc, f"MPP column, ratios {ratios}: reveals")
+
 def test_mpp[TP](mpc: MPCEnv[TP], modulus: TP):
     mpc.comms.sync_parties()
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
@@ -879,5 +1016,8 @@ def test_mpp[TP](mpc: MPCEnv[TP], modulus: TP):
     test_mpp_sums(mpc)
     test_mpp_sum_vectors(mpc)
     test_mpp_sum_encodings(mpc)
+    test_mpp_pad_with_value(mpc)
+    test_mpp_pad_with_value_copies(mpc)
+    test_mpp_columns(mpc)
 
     print(f'CP{mpc.pid}:\tSequre MHE MPP tests on {alg_struct} passed.\n')

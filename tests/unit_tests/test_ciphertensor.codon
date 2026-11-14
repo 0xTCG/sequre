@@ -9,7 +9,7 @@ from sequre.types.ciphertensor import (
     Ciphertensor, MATMUL_VIA_MPC, MATMUL_V1, MATMUL_V2, MATMUL_V3, MATMUL_BSGS, MATMUL_TNT, MATMUL_V2_T, MATMUL_TN,
     MATMUL_V3_11)
 from sequre.utils.stats import precision_stats
-from sequre.utils.testing import assert_eq, assert_neq, assert_eq_approx
+from sequre.utils.testing import assert_eq, assert_neq, assert_eq_approx, same_at_every_party
 from sequre.utils.utils import zeros, random_floats
 from sequre.constants import ENC_DIAG, ENC_ROW, ENC_COL
 
@@ -1085,8 +1085,8 @@ def test_ciphertensor_arithmetics(mpc):
 
 def test_ciphertensor_concat_offsets(mpc):
     """H-18: 1-dim concatenations at offsets without a rotation key of their own (100 + 10, 1000 + 30, 70 + 5: a direct
-    rotation by slots - offset had none), and pad_with_value on 100 columns (a rotation by 100 per row); M-MHE-01:
-    second operands whose length is a multiple of the slots (their last ciphertext was dropped)."""
+    rotation by slots - offset had none), and pad_with_value on 100 columns; M-MHE-01: second operands whose length is a
+    multiple of the slots (their last ciphertext was dropped)."""
     slots = mpc.mhe.crypto_params.params.slots()
     for n1, n2 in ((100, 10), (1000, 30), (70, 5), (100, slots), (slots + 100, slots), (100, 2 * slots)):
         with mpc.randomness.global_stream():
@@ -1100,7 +1100,7 @@ def test_ciphertensor_concat_offsets(mpc):
             stats = precision_stats(mpc=mpc, result=joined.reveal(mpc, T=float).flatten().tolist(), expected=expected)
             assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor concat {n1} + {n2}", stats.min_precision.l2 > 10, True)
 
-    # Appendices that encode row-wise (a tall one is encoded column-wise and cannot be concatenated: H-16)
+    # Row-wise tensors of 100 columns padded by 1 and 2 (the values go into each row's free slots)
     for rows, size in ((1, 1), (2, 2)):
         with mpc.randomness.global_stream():
             values = random_floats((rows, 100))
@@ -1114,6 +1114,54 @@ def test_ciphertensor_concat_offsets(mpc):
             stats = precision_stats(mpc=mpc, result=padded.reveal(mpc, T=float).tolist(), expected=expected)
             assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor pad_with_value {rows} x 100 + {size} columns", stats.min_precision.l2 > 10, True)
 
+
+def test_ciphertensor_pad_with_value(mpc):
+    """H-16: pad_with_value along both axes of a wide (row-wise) and a tall (column-wise) tensor. Axis 0 built the
+    axis-1 appendix (a missing else), the appendix took the stored shape rather than the logical one, and it was
+    encoded by its own shape, so concat asserted on every tall tensor or appendix. Each result keeps its tensor's
+    layout; padding by nothing is a copy."""
+    wide = array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    tall = array([[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]])
+    for values in (wide, tall):
+        rows, cols = values.shape
+        if mpc.pid > 0:
+            ct = Ciphertensor[ckks.Ciphertext].enc(mpc, values)
+            name = f"Sequre MHE ciphertensor pad_with_value, {rows} x {cols} ({'column' if ct._transposed else 'row'}-wise)"
+            with_rows = ct.pad_with_value(2.5, 2, 0, mpc)
+            with_cols = ct.pad_with_value(-1.0, 1, 1, mpc)
+            unpadded = ct.pad_with_value(9.0, 0, 1, mpc)
+            expected_rows = array([[values[i, j] if i < rows else 2.5 for j in range(cols)] for i in range(rows + 2)])
+            expected_cols = array([[values[i, j] if j < cols else -1.0 for j in range(cols + 1)] for i in range(rows)])
+            assert_eq(f"CP{mpc.pid}:\t{name}: layouts kept", (with_rows._transposed, with_cols._transposed, unpadded._transposed), (ct._transposed, ct._transposed, ct._transposed))
+            assert_eq_approx(f"CP{mpc.pid}:\t{name}: 2 rows of 2.5", with_rows.reveal(mpc, T=float), expected_rows, error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{name}: a column of -1", with_cols.reveal(mpc, T=float), expected_cols, error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{name}: by nothing", unpadded.reveal(mpc, T=float), values, error=1e-3)
+
+    # Rows that end in the middle of a ciphertext, padded within it and across its end (once one slot short of it), and
+    # a tensor every party holds alike, which must stay so
+    slots = mpc.mhe.crypto_params.params.slots()
+    for cols, size in ((slots + 5, 3), (slots - 1, 2), (slots - 3, slots + 4), (slots, 1), (slots - 2, 2)):
+        with mpc.randomness.global_stream():
+            values = array(random_floats((2, cols)))
+        if mpc.pid > 0:
+            name = f"Sequre MHE ciphertensor pad_with_value, 2 x {cols} + {size} columns"
+            padded = Ciphertensor[ckks.Ciphertext].enc(mpc, values, encoding=ENC_ROW).pad_with_value(0.5, size, 1, mpc)
+            expected = array([[values[i, j] if j < cols else 0.5 for j in range(cols + size)] for i in range(2)])
+            assert_eq(f"CP{mpc.pid}:\t{name}: ciphertexts", len(padded._data), 2 * ((cols + size + slots - 1) // slots))
+            assert_eq_approx(f"CP{mpc.pid}:\t{name}", padded.reveal(mpc, T=float), expected, error=1e-3)
+            common = Ciphertensor[ckks.Ciphertext].enc_public(mpc, values, encoding=ENC_ROW).pad_with_value(0.5, size, 1, mpc)
+            assert_eq(f"CP{mpc.pid}:\t{name}: a common tensor stays the same at every party", same_at_every_party(mpc, common._data), True)
+
+    # A tensor whose ciphertexts sit below the top level (the padding is encoded at each row's level and scale)
+    with mpc.randomness.global_stream():
+        low_values = array(random_floats((2, 20)))
+    if mpc.pid > 0:
+        low = Ciphertensor[ckks.Ciphertext].enc(mpc, low_values, encoding=ENC_ROW)
+        low._data = mpc.mhe.drop_level(low._data, mpc.mhe.bootstrap_min_level)
+        padded_low = low.pad_with_value(0.5, 3, 1, mpc)
+        expected_low = array([[low_values[i, j] if j < 20 else 0.5 for j in range(23)] for i in range(2)])
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor pad_with_value at level {mpc.mhe.bootstrap_min_level}: level kept", padded_low._data[0].level(), mpc.mhe.bootstrap_min_level)
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor pad_with_value at level {mpc.mhe.bootstrap_min_level}", padded_low.reveal(mpc, T=float), expected_low, error=1e-3)
 
 def test_ciphertensor_extend_chunks(mpc):
     """M-MHE-04: an extend of column-wise (transposed) tensors of 8000 and 500 rows, across a ciphertext boundary: each
@@ -1170,6 +1218,7 @@ def test_ciphertensor(mpc):
     test_ciphertensor_lazy_rescaling(mpc, 7 ,7)
     test_ciphertensor_arithmetics(mpc)
     test_ciphertensor_concat_offsets(mpc)
+    test_ciphertensor_pad_with_value(mpc)
     test_ciphertensor_extend_chunks(mpc)
     test_ciphertensor_sum_slots(mpc)
     print(f'CP{mpc.pid}:\tSequre MHE Ciphertensor tests passed.\n')

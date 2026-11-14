@@ -137,7 +137,7 @@ The compute parties agree on how they hold their partitions in one round, and ea
 |---|---|
 | `.expand_dims(axis=0)` | Insert dimension |
 | `.extend(other)` | Concatenate partitions |
-| `.pad_with_value(val, size, axis, ...)` | Pad axis with value |
+| `.pad_with_value(val, size, axis, ...)` | Append `size` columns of `val` to every party's rows (axis 1, or axis 0 of a transposed MPP), in each partition's representation |
 | `.erase_element(index)` | Remove element by index |
 | `.filter(mask)` | Boolean mask filtering |
 | `.cohort_filter(mask)` | Filter across cohort with adjusted ratios |

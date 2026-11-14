@@ -161,7 +161,7 @@ The `@mhe_enc_opt` compiler pass selects the optimal encoding strategy per matri
 |---|---|
 | `.expand_dims(axis=0)` | Insert a dimension of size 1 |
 | `.pad(mpc, new_size)` | Pad 1-D tensor with zeros |
-| `.pad_with_value(val, size, axis, mpc)` | Pad with a specific value |
+| `.pad_with_value(val, size, axis, mpc)` | Append `size` rows (axis 0) or columns (axis 1) of `val`, in the tensor's own layout (2-D, not diagonal-encoded) |
 | `.resize(mpc, shape)` | Resize 1-D tensor to new shape |
 | `.concat(mpc, other, axis)` | Concatenate along axis (returns new tensor) |
 | `.iconcat(mpc, other, axis)` | In-place concatenation |

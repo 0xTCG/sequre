@@ -81,7 +81,7 @@ All standard arithmetic and comparison operators are supported. They dispatch to
 | `.sign(*args)` | Secure sign function |
 | `.expand_dims(axis=0)` | Insert dimension |
 | `.extend(other)` | Concatenate with compatible MPU |
-| `.pad_with_value(val, size, axis)` | Pad with repeated value |
+| `.pad_with_value(val, size, axis)` | Append `size` columns of `val`, as the MPP or MPA beneath does |
 | `.erase_element(index)` | Remove element at index |
 | `.filter(mask)` | Boolean mask filtering |
 | `.hstack(other)` | Horizontal concatenation |

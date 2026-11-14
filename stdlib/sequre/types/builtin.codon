@@ -1787,16 +1787,19 @@ class List:
             return new_mat
     
     def expand_dims(self, axis: int = 0) -> List[List[T]]:
-        assert 0 <= axis < self.ndim, "List: axis out of range for expand dim"
+        assert 0 <= axis <= self.ndim, "List: axis out of range for expand dim"  # the new axis may come last
         assert axis <= 1, "Not implemented yet: expanding list dimension over arbitrary axis"
 
         if axis == 0:
             return [self]
         else:  # axis == 1
             return [[e] for e in self]
-    
+
     def erase_element(self, index: int) -> List[T]:
         assert self.ndim == 1, "Not implemented yet: List erase_element for arbitrary dimension"
+        if index < 0:
+            index += len(self)  # -1 is the last element
+        assert 0 <= index < len(self), f"List: erase_element index {index} out of range for length {len(self)}"
 
         new_arr = [T(0) for _ in range(len(self) - 1)]
 
@@ -2165,7 +2168,7 @@ class List:
         assert n == q, "List: shapes missmatch for vstack"
 
         new_arr = self.copy()
-        new_arr.extend(other)
+        new_arr.extend(other.copy())  # rows of their own, as self's are
 
         return new_arr
     
@@ -2214,10 +2217,13 @@ class List:
 
 @extend
 class ndarray:
+    # The methods below read an array's elements in C order through the fork's _contiguous(): the buffer itself when
+    # the array is C-contiguous, else a C-ordered copy gathered through its strides. A view (x[:, j], a slice with a
+    # step, a transposed MPP's column) is not contiguous, and its buffer starts at its first element only.
     def __pickle__(self, jar: Jar, pasteurized: bool):
         pickle(self.nbytes, jar, pasteurized)
         if not pasteurized: jar += self.nbytes._pickle_size()
-        _write_raw(jar, self._data.as_byte(), self.nbytes, pasteurized)
+        _write_raw(jar, self._contiguous().as_byte(), self.nbytes, pasteurized)
         if not pasteurized:
             jar += self.nbytes
             pickle_tuple_unpasteurized(self.shape, jar)
@@ -2259,14 +2265,24 @@ class ndarray:
     def nan_to_num(self, copy: bool = True, nan=0) -> ndarray[S, T]:
         new_arr = self.copy() if copy else self
 
-        for i in range(self.size):
-            if math.isnan(new_arr._data[i]):
-                new_arr._data[i] = T(nan)
-        
+        if new_arr.flags.c_contiguous:
+            for i in range(new_arr.size):
+                if math.isnan(new_arr._data[i]):
+                    new_arr._data[i] = T(nan)
+        else:
+            # In place on a view: through its strides
+            for idx in ndarray._multirange(new_arr.shape):
+                p = new_arr._ptr_for_index(idx, check=False)
+                if math.isnan(p[0]):
+                    p[0] = T(nan)
+
         return new_arr
-    
+
     def erase_element(self, index: int) -> ndarray[S, T]:
         assert self.ndim == 1, "not implemented yet: ndarray erase_element for arbitrary dimension"
+        if index < 0:
+            index += len(self)  # -1 is the last element, as in a list
+        assert 0 <= index < len(self), f"ndarray: erase_element index {index} out of range for length {len(self)}"
 
         new_arr = zeros((len(self) - 1,), dtype=T)
 
@@ -2304,38 +2320,51 @@ class ndarray:
             compile_error("ndarray: incomatible shapes for broadcast")
 
     def expand_dims(self, axis: int = 0):
+        # The same elements (the buffer is shared) with a new axis of length 1 first (axis 0) or last; a view keeps its
+        # strides, and the new axis's stride is never stepped over
         if static.len(S) == 1:
             new_shape = (1, self.shape[0]) if axis == 0 else (self.shape[0], 1)
-            return ndarray[Tuple[int, int], T]._new_contig(new_shape, self._data)
+            if self.flags.c_contiguous:
+                return ndarray[Tuple[int, int], T]._new_contig(new_shape, self._data)
+            s = self.strides[0]
+            new_strides = (s * self.shape[0], s) if axis == 0 else (s, s)
+            return ndarray[Tuple[int, int], T]._new(new_shape, new_strides, self._data, self.flags._unown())
         elif static.len(S) == 2:
             new_shape = (1, *self.shape) if axis == 0 else (*self.shape, 1)
-            return ndarray[Tuple[int, int, int], T]._new_contig(new_shape, self._data)
+            if self.flags.c_contiguous:
+                return ndarray[Tuple[int, int, int], T]._new_contig(new_shape, self._data)
+            s0, s1 = self.strides
+            new_strides = (s0 * self.shape[0], s0, s1) if axis == 0 else (s0, s1, s1)
+            return ndarray[Tuple[int, int, int], T]._new(new_shape, new_strides, self._data, self.flags._unown())
         else:
             compile_error("Invalid ndarray shape (not supported yet for expand_dims)")
-    
+
     def extend(self, other: ndarray[S, T], axis: int = 0) -> ndarray[S, T]:
+        # In place: self becomes a C-contiguous array of its rows and then other's (either may be a view)
         assert axis == 0, "ndarray: Only axis=0 supported for extension at the moment"
         assert self.shape[1:] == other.shape[1:], f"ndarray: Shapes mismatch while extending over 0 axis: {self.shape} vs {other.shape}"
-        
-        new_data = ptr[byte](self.nbytes + other.nbytes)
-        str.memcpy(new_data, self._data.as_byte(), self.nbytes)
-        str.memcpy(new_data + self.nbytes, other._data.as_byte(), other.nbytes)
 
-        first_lane = self.shape[0] + other.shape[0]
-        self._shape = (first_lane, *self.shape[1:])
-        self._data = ptr[T](new_data)
+        new_data = ptr[byte](self.nbytes + other.nbytes)
+        str.memcpy(new_data, self._contiguous().as_byte(), self.nbytes)
+        str.memcpy(new_data + self.nbytes, other._contiguous().as_byte(), other.nbytes)
+
+        extended = ndarray[S, T]._new_contig((self.shape[0] + other.shape[0], *self.shape[1:]), ptr[T](new_data))
+        self._shape = extended._shape
+        self._strides = extended._strides
+        self._data = extended._data
+        self._flags = extended._flags
 
         return self
 
     def resize(self, shape: S) -> ndarray[S, T]:
         if self.shape == shape:
             return self
-        
+
         new_array = zeros(shape, dtype=T)
-        
+
         if static.len(S) == 1:
             for i in range(min(self.shape[-1], shape[-1])):
-                new_array._data[i] = self._data[i]
+                new_array._data[i] = self[i]
         elif static.len(S) == 2:
             new_rows, new_cols = shape
             old_rows, old_cols = self.shape
@@ -2352,22 +2381,24 @@ class ndarray:
         if static.len(S) <= axis:
             compile_error("ndarray: axis does not exist (too large)")
 
+        assert padding >= 0, f"ndarray: cannot pad by {padding}"
         if padding == 0:
             return self.copy()
-        
-        _chunk_size = self.size if axis == 0 else self.strides[axis - 1] // self.itemsize
+
+        # Zeros after the last index along axis. In C order each of the prod(shape[:axis]) outer blocks is contiguous in
+        # both arrays (one block in all along axis 0), so it is one copy per block.
         new_shape = (*self.shape[:axis], self.shape[axis] + padding, *self.shape[axis + 1:])
-
         new_arr = zeros(new_shape, dtype=T)
-        idx = 0
+        if self.size == 0:
+            return new_arr
 
-        for e in self.flatten():
-            if idx == 0 or idx % _chunk_size:
-                new_arr._data[idx] = e
-                idx += 1
-            else:
-                idx += self.strides[axis] * padding
-        
+        outer = 1 if axis == 0 else ndarray._count(self.shape[:axis])
+        block = self.size // outer
+        new_block = new_arr.size // outer
+        data = self._contiguous()
+        for o in range(outer):
+            str.memcpy((new_arr._data + o * new_block).as_byte(), (data + o * block).as_byte(), block * self.itemsize)
+
         return new_arr
     
     def pad_left(self, padding: int) -> ndarray[S, T]:
@@ -2377,29 +2408,48 @@ class ndarray:
         return self.copy().extend(zeros((padding, *self.shape[1:]), dtype=T))
 
     def pad_with_value(self, val, size: int, axis: int, *args) -> ndarray[S, T]:
+        # A copy with size more rows (axis 0) or columns (axis 1), each entry T(val)
+        if static.len(S) != 2:
+            compile_error("ndarray: pad_with_value pads 2-dim arrays only")
         assert -1 < axis < 2, "ndarray: pad_with_value axis missmatch"
+        assert size >= 0, f"ndarray: cannot pad by {size}"
 
-        if axis == 0:
-            return self.vstack(ndarray[S, T].ones((size, len(self[0]))))
-        
-        # axis == 1
-        return self.hstack(ndarray[S, T].ones((len(self), size)))
+        rows, cols = self.shape
+        new_rows = rows + size if axis == 0 else rows
+        new_cols = cols if axis == 0 else cols + size
+        new_arr = zeros((new_rows, new_cols), dtype=T)
+        value = T(val)
+        data = self._contiguous()
+
+        for i in range(new_rows):
+            row = new_arr._data + i * new_cols
+            start = 0
+            if i < rows:
+                str.memcpy(row.as_byte(), (data + i * cols).as_byte(), cols * self.itemsize)
+                start = cols
+            for j in range(start, new_cols):
+                row[j] = value
+
+        return new_arr
 
     def abs(self) -> ndarray[S, T]:
         new_array = self.zeros()
-        
+        data = self._contiguous()
+
         for i in range(self.size):
-            new_array._data[i] = abs(self._data[i])
-        
+            new_array._data[i] = abs(data[i])
+
         return new_array
-    
+
     def copy(self) -> ndarray[S, T]:
-        new_array = self.zeros()
-        
-        for i in range(self.size):
-            new_array._data[i] = self._data[i]
-        
-        return new_array
+        # A C-contiguous copy in a buffer of its own
+        if not self.flags.c_contiguous:
+            return ndarray[S, T]._new_contig(self.shape, self._contiguous())  # a fresh buffer already
+
+        n = self.size
+        data = Ptr[T](n)
+        str.memcpy(data.as_byte(), self._data.as_byte(), n * self.itemsize)
+        return ndarray[S, T]._new_contig(self.shape, data)
     
     def replicate(self, new_size: int) -> ndarray[S, T]:
         return array(self.tolist().replicate(new_size))
@@ -2409,19 +2459,23 @@ class ndarray:
         return self.replicate(new_size)
     
     def to_list(self) -> List:
+        # Lists over the array's own buffer, so that writes through either show in both, when it is C-contiguous; over
+        # a copy of a view's elements otherwise (a list cannot step over strides)
         assert static.len(self.shape) <= 2, "Bitcast to_list is supported only for ndarrays of dimension less than 3 at the moment."
+        data = self._contiguous()
         if static.len(self.shape) == 0:
             return List[T]()
         elif static.len(self.shape) == 1:
-            return List(arr=Array(ptr=self._data, sz=self.shape[0]), len=self.shape[0])
+            return List(arr=Array(ptr=data, sz=self.shape[0]), len=self.shape[0])
         else:
-            return [List(arr=Array(ptr=self._data + i * self.shape[1], sz=self.shape[1]), len=self.shape[1]) for i in range(self.shape[0])]
-    
+            return [List(arr=Array(ptr=data + i * self.shape[1], sz=self.shape[1]), len=self.shape[1]) for i in range(self.shape[0])]
+
     def count(self, elem: T) -> int:
         counter = 0
-        
+        data = self._contiguous()
+
         for i in range(self.size):
-            if elem == self._data[i]:
+            if elem == data[i]:
                 counter += 1
         
         return counter
@@ -2508,8 +2562,9 @@ class ndarray:
     def _propagate_call(self, _call):
         # TODO: Write an IR pass that will call this automatically to enable bar.foo(ndarray) for any byVal-arg foo in bar
         new_arr = self.zeros()
+        data = self._contiguous()
         for i in range(self.size):
-            new_arr._data[i] = _call(self._data[i])
+            new_arr._data[i] = _call(data[i])
         return new_arr
     
     def getitemdup(self, i: int, new_size: int) -> ndarray[S, T]:
@@ -2543,9 +2598,10 @@ class ndarray:
     
     def sign(self, *args) -> ndarray[S, T]:
         new_arr = self.zeros()
+        data = self._contiguous()
 
         for i in range(self.size):
-            new_arr._data[i] = T(-1) if self._data[i] < 0 else T(1) if self._data[0] > 0 else T(0)
+            new_arr._data[i] = T(-1) if data[i] < 0 else T(1) if data[i] > 0 else T(0)
 
         return new_arr
 
@@ -2646,38 +2702,37 @@ class ndarray:
         return self.tolist().__repr__()
     
     def transpose(self) -> ndarray[S, T]:
+        # A C-ordered copy, not the fork's strided view. array() of an empty list has no shape to read.
+        if self.is_empty():
+            return zeros(self.shape[::-1], dtype=T)
         return array(self.tolist().transpose(), dtype=T)
-    
+
     def __getitem__(self, s: Tuple[slice, slice]) -> ndarray[S, T]:
+        # A copy of the rows and columns the slices pick, steps included
         if not static.len(S) == 2:
             compile_error("ndarray: can only do sliced 2-dim getitem on 2-dim arrays")
-        
+
         rs, cs = s
-        r_start, r_stop, _, _ = rs.adjust_indices(self.shape[0])
-        c_start, c_stop, _, _ = cs.adjust_indices(self.shape[1])
-        
-        new_array = zeros((r_stop - r_start, c_stop - c_start), dtype=T)
-        
-        r_idx = 0
-        for i in range(r_start, r_stop):
-            c_idx = 0
-            for j in range(c_start, c_stop):
-                new_array[r_idx][c_idx] = self[i][j]
-                c_idx += 1
-            r_idx += 1
-        
+        r_start, _, r_step, r_len = rs.adjust_indices(self.shape[0])
+        c_start, _, c_step, c_len = cs.adjust_indices(self.shape[1])
+
+        new_array = zeros((r_len, c_len), dtype=T)
+
+        for r_idx in range(r_len):
+            i = r_start + r_idx * r_step
+            for c_idx in range(c_len):
+                new_array[r_idx][c_idx] = self[i][c_start + c_idx * c_step]
+
         return new_array
-    
+
     def __setitem__(self, s: Tuple[slice, slice], other: ndarray[S, T]):
         if not static.len(S) == 2:
             compile_error("ndarray: can only do sliced 2-dim setitem on 2-dim arrays")
-        
+
         rs, cs = s
-        start, stop, _, _ = rs.adjust_indices(self.shape[0])
-        o_idx = 0
-        for i in range(start, stop):
-            self[i][cs] = other[o_idx][:]
-            o_idx += 1
+        start, _, step, length = rs.adjust_indices(self.shape[0])
+        for o_idx in range(length):
+            self[start + o_idx * step][cs] = other[o_idx][:]
 
     def __mul__[dtype](self: ndarray[S, dtype], other: ndarray[S, bool]) -> ndarray[S, dtype]:
         return self * other.astype(dtype)
@@ -2719,6 +2774,8 @@ class ndarray:
         if i_pos != cp_1_size:
             new_arr[:i_pos] = self[0][cp_1_size - i_pos:cp_1_size]
             new_arr[i_pos:cp_1_size] = self[0][:cp_1_size - i_pos]
-            
+        else:
+            new_arr[:cp_1_size] = self[0][:cp_1_size]  # a full rotation leaves the first cp_1_size elements in place
+
         new_arr[cp_1_size:] = self[0][cp_1_size:]
         return new_arr.expand_dims()

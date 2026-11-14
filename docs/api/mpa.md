@@ -92,7 +92,7 @@ mpa = MPA(mpc, my_ciphertensor)
 | Method | Description |
 |---|---|
 | `.expand_dims(axis=0)` | Insert dimension (1-D only) |
-| `.pad_with_value(val, size, axis, ...)` | Pad with value |
+| `.pad_with_value(val, size, axis, ...)` | Append `size` columns (axis 1) whose entries add up to `val`: the hub's share and its encryption hold `val` and the other parties' 0; an aggregate takes `val` and stays one |
 | `.erase_element(index)` | Remove element by index |
 | `.filter(mask)` | Boolean mask filtering |
 | `.hstack(other)` | Horizontal concatenation |

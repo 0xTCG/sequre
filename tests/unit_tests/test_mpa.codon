@@ -15,7 +15,7 @@ from internal.gc import sizeof
 from sequre.types.utils import double_to_fp, fp_to_double
 from sequre.constants import MPC_MODULUS_BITS, mpc_uint, ENC_ROW, ENC_DIAG
 
-from multiparty_testing import cohort_matrix, assert_parties_in_step, column
+from multiparty_testing import cohort_matrix, assert_parties_in_step, column, with_columns
 
 
 def test_mpa_getitem(mpa_a, raw_a):
@@ -410,6 +410,58 @@ def test_mpa_mixed_to_sharetensor(mpc):
         assert_eq_approx(f"CP{mpc.pid}:\tMPA vector held in the clear at CP1 and encrypted elsewhere, to MPC under ENC_DIAG", array(revealed_vector), vector * float(n_cp), error=0.01)
 
 
+def test_mpa_pad_with_value(mpc):
+    """H-16: pad_with_value (LinReg's and LogReg's bias column) on MPAs, whose compute parties hold additive shares, so
+    the new entries must add up to the value: shares in the clear (each party padded with ones: the column added up to
+    the number of compute parties), encrypted shares and the aggregate (concat asserted on the stored shape, and the
+    aggregate came back as each party's encryption), and shares with their aggregate at once (both kept). A padded
+    aggregate stays the same ciphertexts at every party."""
+    n_cp = mpc.comms.number_of_parties - 1
+    for rows, cols in ((4, 3), (2, 5)):  # encoded column-wise and row-wise
+        with mpc.randomness.global_stream():
+            shares = [array(random_floats((rows, cols))) for _ in range(n_cp)]
+        total = shares[0].copy()
+        for q in range(1, n_cp):
+            total = total + shares[q]
+        expected = with_columns(total, 1, 1.0)
+        share = shares[mpc.pid - 1] if mpc.pid else zeros((rows, cols))
+
+        plain = MPA(mpc, share)
+        encrypted = MPA(mpc, Ciphertensor[ckks.Ciphertext].enc(mpc, share)) if mpc.pid else MPA(mpc, zeros((rows, cols)))
+        both = MPA(mpc, share)
+        both.aggregate()
+        aggregate_only = MPA[Tuple[int, int], float]._from_parts(
+            mpc, zeros((rows, cols)) if mpc.pid == 0 else ndarray[Tuple[int, int], float](), Ciphertensor[ckks.Ciphertext](),
+            both._aggregate.copy() if mpc.pid else Ciphertensor[ckks.Ciphertext]())
+
+        padded_plain = plain.pad_with_value(1.0, 1, 1)
+        padded_encrypted = encrypted.pad_with_value(1.0, 1, 1)
+        padded_both = both.pad_with_value(1.0, 1, 1)
+        padded_aggregate = aggregate_only.pad_with_value(1.0, 1, 1)
+        if mpc.pid:
+            label = f"MPA pad_with_value, {rows} x {cols}"
+            assert_eq(f"CP{mpc.pid}:\t{label}: representations kept", (padded_plain.is_plain(), padded_encrypted.is_distributed(), padded_both.has_plain() and padded_both.has_aggregate(), padded_aggregate.is_aggregate()), (True, True, True, True))
+            assert_eq(f"CP{mpc.pid}:\t{label}: the padded aggregate is the same at every party", same_at_every_party(mpc, padded_aggregate._aggregate._data), True)
+            assert_eq(f"CP{mpc.pid}:\t{label}: shares and aggregate, the aggregate the same at every party", same_at_every_party(mpc, padded_both._aggregate._data), True)
+        assert_parties_in_step(mpc, f"MPA pad_with_value, {rows} x {cols}")
+
+        revealed_plain = padded_plain.reveal()
+        revealed_encrypted = padded_encrypted.reveal()
+        revealed_both = padded_both.reveal()
+        revealed_both_plain = MPA[Tuple[int, int], float]._from_parts(mpc, padded_both._plain, Ciphertensor[ckks.Ciphertext](), Ciphertensor[ckks.Ciphertext]()).reveal()
+        revealed_aggregate = padded_aggregate.reveal()
+        revealed_operand = plain.reveal()
+        if mpc.pid:
+            label = f"MPA pad_with_value, {rows} x {cols}"
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: shares in the clear", revealed_plain, expected, error=1e-9)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: encrypted shares", revealed_encrypted, expected, error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: shares and their aggregate", revealed_both, expected, error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: shares and their aggregate, the shares", revealed_both_plain, expected, error=1e-9)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: aggregate", revealed_aggregate, expected, error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: operand kept", revealed_operand, total, error=1e-9)
+        assert_parties_in_step(mpc, f"MPA pad_with_value, {rows} x {cols}: reveals")
+
+
 def test_mpa[TP](mpc: MPCEnv[TP], modulus: TP):
     mpc.comms.sync_parties()
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
@@ -447,5 +499,6 @@ def test_mpa[TP](mpc: MPCEnv[TP], modulus: TP):
     test_mpa_public_product_via_mpc(mpc)
     test_mpa_reveal_sums_only(mpc)
     test_mpa_mixed_to_sharetensor(mpc)
+    test_mpa_pad_with_value(mpc)
 
     print(f'CP{mpc.pid}:\tSequre MHE MPA tests on {alg_struct} passed.\n')

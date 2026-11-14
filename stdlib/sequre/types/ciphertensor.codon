@@ -9,7 +9,7 @@ from sequre.stdlib.numpy.create import array, zeros, identity
 from pickler import pickle, unpickle
 from patch import argmin
 
-from sequre.lattiseq.ckks import Ciphertext, Plaintext
+from sequre.lattiseq.ckks import Ciphertext, Plaintext, new_plaintext
 from sequre.utils.utils import one_hot_vector
 from sequre.constants import (
     HE_MUL_COST_ESTIMATE, HE_ROT_COST_ESTIMATE,
@@ -639,14 +639,89 @@ class Ciphertensor[ctype]:
         self.shape[0] -= 1
 
     def pad_with_value(self, val, size: int, axis: int, mpc):
+        # size more rows (axis 0) or columns (axis 1) of val, in the tensor's own layout. Every new ciphertext is a
+        # trivial encryption (the same at every party) and nothing is rotated or multiplied, so no refresh council can
+        # start at only the parties that hold the tensor, and an aggregate stays the same at every party.
+        if isinstance(ctype, Plaintext):
+            compile_error("Ciphertensor: pad_with_value pads encrypted tensors only")
         assert -1 < axis < 2, "Ciphertensor: pad_with_value axis does not match the dimension"
+        assert self.ndim == 2, "Ciphertensor: pad_with_value pads 2-dim ciphertensors only"
+        assert not self._diagonal_contiguous, "Not implemented yet: padding a diagonal-encoded ciphertensor"
+        assert size >= 0, f"Ciphertensor: cannot pad by {size}"
 
-        if axis == 0:
-            appendix = Ciphertensor[ctype].enc_public(mpc, zeros((size, self.shape[1])) + val)
-        # axis == 1
-        appendix = Ciphertensor[ctype].enc_public(mpc, zeros((self.shape[0], size)) + val)
-        
-        return self.concat(mpc, appendix, axis)
+        if size == 0:
+            return self.copy()
+
+        if (axis == 0) ^ self._transposed:
+            # Whole stored rows of val: an appendix of the tensor's logical shape in its layout, which concat appends
+            shape = self.actual_shape
+            rows, cols = shape[0], shape[1]
+            appendix_shape = (size, cols) if axis == 0 else (rows, size)
+            appendix = Ciphertensor[ctype].enc_public(
+                mpc, zeros(appendix_shape) + float(val), encoding=(ENC_COL if self._transposed else ENC_ROW))
+            return self.concat(mpc, appendix, axis)
+
+        # Each stored row grows by size values: they go into the free slots of the row's last ciphertext (a trivial
+        # encryption of val in those slots, at that ciphertext's level and scale, added to it) and into new trivial
+        # ciphertexts. As in concat, the slots past a row's last value must hold zeros. The three patterns (the free
+        # slots, a full ciphertext, the last partial one) are encoded once per level and scale: rows share them.
+        slots = self.slots
+        width = self.shape[1]
+        offset = width % slots
+        fill = float(val)
+        head_taken = min(size, slots - offset) if offset else 0
+        full_count = (size - head_taken) // slots
+        tail_taken = (size - head_taken) % slots
+        params = mpc.mhe.crypto_params.params
+        level, scale = -1, 0.0
+        head = mpc.mhe.zero_cipher()
+        full = mpc.mhe.zero_cipher()
+        tail = mpc.mhe.zero_cipher()
+
+        per_row = Ciphertensor._count_ciphers([width], slots)
+        _data = List[ctype](self.shape[0] * Ciphertensor._count_ciphers([width + size], slots))
+        for r in range(self.shape[0]):
+            row = self._data[r * per_row:(r + 1) * per_row]
+            last_real = len(row) > 0 and not row[-1]._nil_ideal
+            row_level = row[-1].level() if last_real else params.max_level()
+            row_scale = row[-1].scale if last_real else params.default_scale
+            if row_level != level or row_scale != scale:
+                level, scale = row_level, row_scale
+                if head_taken:
+                    head = Ciphertensor._trivial_at(mpc, [fill if offset <= s < offset + head_taken else 0.0 for s in range(slots)], level, scale)
+                if full_count:
+                    full = Ciphertensor._trivial_at(mpc, [fill for _ in range(slots)], level, scale)
+                if tail_taken:
+                    tail = Ciphertensor._trivial_at(mpc, [fill if s < tail_taken else 0.0 for s in range(slots)], level, scale)
+
+            for ct in row:
+                _data.append(ct.copy())
+            if head_taken:
+                mpc.mhe.iadd([_data[-1]], [head])  # head is only read
+            for _ in range(full_count):
+                _data.append(full.copy())
+            if tail_taken:
+                _data.append(tail.copy())
+
+        padded = Ciphertensor[ctype](
+            _data=_data,
+            shape=[self.shape[0], width + size],
+            slots=slots,
+            _transposed=self._transposed,
+            _diagonal_contiguous=False,
+            _skinny=self._skinny,
+            _is_broadcast=self._is_broadcast)
+        padded._reset_chunk_size()
+        return padded
+
+    @staticmethod
+    def _trivial_at(mpc, values: List[float], level: int, scale: float) -> Ciphertext:
+        # The trivial encryption of one ciphertext's slots of public values, encoded at the level and scale of the
+        # ciphertext it is added to or stands beside (adding it then adds the values exactly); the same at every party
+        params = mpc.mhe.crypto_params.params
+        plaintext = new_plaintext(params, level, scale)
+        mpc.mhe.crypto_params.encoder.encode(values.to_complex(), plaintext, params.log_slots)
+        return mpc.mhe.trivial_cipher(plaintext)
     
     def extend(self, mpc, other: Ciphertensor[ctype]) -> Ciphertensor[ctype]:
         assert not (self._diagonal_contiguous ^ other._diagonal_contiguous), "Not implemented yet: extending diagonal-contiguous by non-diagonal-contiguous ciphertensors is not implemented yet"
