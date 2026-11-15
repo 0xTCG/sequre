@@ -1199,6 +1199,388 @@ def test_ciphertensor_sum_slots(mpc):
             assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor sum of {n}", summed.reveal(mpc, T=float).flatten().tolist(), [values.sum()], error=0.05)
 
 
+def _rotated_list(values: list[float], step: int) -> list[float]:
+    n = len(values)
+    s = ((step % n) + n) % n
+    out = values[s:]
+    out.extend(values[:s])
+    return out
+
+
+def _spliced_list(values: list[float], start: int, stop: int, inserted: list[float]) -> list[float]:
+    out = values[:start]
+    out.extend(inserted)
+    out.extend(values[stop:])
+    return out
+
+
+def _test_values(n: int, shift: float) -> list[float]:
+    return [float((i * 37 + 11) % 101) * 0.05 - 2.0 + shift for i in range(n)]
+
+
+def test_ciphertensor_slices(mpc):
+    """H-20: slices ending on a ciphertext boundary (their mask was empty: zeros), slices across ciphertexts (a 1-dim
+    one raised "Bugfix required"), aligned and not, the last element, negative ints (M-MHE-19: x[-1] gave zeros, and an
+    empty tensor on a matrix), empty and whole ranges, a column-wise tensor's row; an aligned whole ciphertext is copied
+    (it keeps its level)."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    for n in (32, slots, slots + slots // 2, 2 * slots + 100):
+        with mpc.randomness.global_stream():
+            values = random_floats((n,))
+        ranges = [(0, n), (1, n), (n - 1, n), (0, 1), (5, 5), (n // 3, n - n // 4)]
+        if n > slots:
+            ranges.extend([(0, slots), (100, slots + 808), (slots - 5, n), (slots, n)])
+        if n > 2 * slots:
+            ranges.extend([(slots - 5, 2 * slots + 5), (50, 2 * slots + 50)])
+        if mpc.pid > 0:
+            ct = Ciphertensor[ckks.Ciphertext].enc(mpc, values)
+            for start, stop in ranges:
+                got = ct._getitem(mpc, slice(start=start, stop=stop, step=1))
+                name = f"CP{mpc.pid}:\tSequre MHE ciphertensor 1-dim slice [{start}:{stop}] of {n}"
+                if stop == start:
+                    assert_eq(f"{name}: empty", (got.shape, len(got._data)), (list[int](), 0))
+                    continue
+                assert_eq(f"{name}: shape and ciphertexts", (got.shape, len(got._data)), ([stop - start], (stop - start + slots - 1) // slots))
+                stats = precision_stats(mpc=mpc, result=got.reveal(mpc, T=float).flatten().tolist(), expected=values[start:stop])
+                assert_eq(name, stats.min_precision.l2 > 10, True)
+            assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor 1-dim x[-1] of {n}", ct._getitem(mpc, -1).reveal(mpc, T=float).flatten().tolist(), [values[n - 1]], error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor 1-dim x[-3:] of {n}", ct._getitem(mpc, slice(start=-3, stop=None, step=1)).reveal(mpc, T=float).flatten().tolist(), values[n - 3:], error=1e-3)
+            if n > slots:
+                # A whole, full ciphertext is copied; a partly filled last one is masked, as before
+                aligned = ct._getitem(mpc, slice(start=0, stop=slots, step=1))
+                assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor 1-dim slice [0:{slots}] of {n}: a full ciphertext copied (level and scale kept)", (aligned._data[0].level(), aligned._data[0].scale), (ct._data[0].level(), ct._data[0].scale))
+
+    # 2-dim: a column range ending on the boundary, the last column, a range across ciphertexts of a wide matrix, a
+    # negative row, and rows of a column-wise tensor (columns of its storage)
+    with mpc.randomness.global_stream():
+        m = random_floats((2, slots))
+        w = random_floats((3, slots + slots // 2))
+        tall = random_floats((6, 3))
+    if mpc.pid > 0:
+        cm = Ciphertensor[ckks.Ciphertext].enc(mpc, m, encoding=ENC_ROW)
+        got = cm._getitem(mpc, (slice(start=None, stop=None, step=1), slice(start=1, stop=None, step=1)))
+        stats = precision_stats(mpc=mpc, result=got.reveal(mpc, T=float).tolist(), expected=[row[1:] for row in m])
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor 2-dim x[:, 1:] of 2 x {slots}", stats.min_precision.l2 > 10, True)
+        got = cm._getitem(mpc, (slice(start=None, stop=None, step=1), slots - 1))
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor 2-dim x[:, {slots - 1}] of 2 x {slots}", got.reveal(mpc, T=float).flatten().tolist(), [m[0][slots - 1], m[1][slots - 1]], error=1e-3)
+        cw = Ciphertensor[ckks.Ciphertext].enc(mpc, w, encoding=ENC_ROW)
+        got = cw._getitem(mpc, (slice(start=1, stop=None, step=1), slice(start=5, stop=9000, step=1)))
+        stats = precision_stats(mpc=mpc, result=got.reveal(mpc, T=float).tolist(), expected=[row[5:9000] for row in w[1:]])
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor 2-dim x[1:, 5:9000] of 3 x {slots + slots // 2}", stats.min_precision.l2 > 10, True)
+        got = cw._getitem(mpc, -1)
+        stats = precision_stats(mpc=mpc, result=got.reveal(mpc, T=float).flatten().tolist(), expected=w[2])
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor 2-dim x[-1] of 3 x {slots + slots // 2}", (got.shape, stats.min_precision.l2 > 10), ([slots + slots // 2], True))
+        ct_tall = Ciphertensor[ckks.Ciphertext].enc(mpc, tall)
+        got = ct_tall._getitem(mpc, 3)
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor column-wise 6 x 3: stored column-wise", ct_tall._transposed, True)
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor column-wise 6 x 3: x[3]", got.reveal(mpc, T=float).flatten().tolist(), tall[3], error=1e-3)
+        got = ct_tall._getitem(mpc, (slice(start=1, stop=4, step=1), -1))
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor column-wise 6 x 3: x[1:4, -1]", got.reveal(mpc, T=float).flatten().tolist(), [tall[1][2], tall[2][2], tall[3][2]], error=1e-3)
+
+
+def test_ciphertensor_setitem_ranges(mpc):
+    """H-20 and M-MHE-03: slice assignments ending on a ciphertext boundary (the complement mask kept every slot and the
+    value was added), across ciphertexts (the wrong ciphertext, an impossible assert, an interior ciphertext dropped), at
+    the last element and x[-1], empty; 2-dim assignments of a column range ending on the boundary and across
+    ciphertexts; a whole assignment does not share the value's list."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    for n in (32, slots, slots + slots // 2, 2 * slots + 100):
+        with mpc.randomness.global_stream():
+            values = random_floats((n,))
+        ranges = [(1, n), (n - 1, n), (0, 1), (5, 5), (n // 3, n - n // 4)]
+        if n > slots:
+            ranges.extend([(100, slots), (slots - 5, n), (0, slots), (slots, n)])
+        if n > 2 * slots:
+            ranges.extend([(50, 2 * slots + 50), (slots - 5, 2 * slots + 5)])
+        if mpc.pid > 0:
+            for start, stop in ranges:
+                inserted = _test_values(stop - start, 3.0)
+                # An empty value is an empty tensor (array() cannot shape an empty list)
+                value = Ciphertensor[ckks.Ciphertext].enc(mpc, inserted) if inserted else Ciphertensor[ckks.Ciphertext](slots=slots)
+                target = Ciphertensor[ckks.Ciphertext].enc(mpc, values)
+                target._setitem(mpc, slice(start=start, stop=stop, step=1), value)
+                name = f"CP{mpc.pid}:\tSequre MHE ciphertensor 1-dim x[{start}:{stop}] = w on {n}"
+                assert_eq(f"{name}: shape and ciphertexts", (target.shape, len(target._data)), ([n], (n + slots - 1) // slots))
+                stats = precision_stats(mpc=mpc, result=target.reveal(mpc, T=float).flatten().tolist(), expected=_spliced_list(values, start, stop, inserted))
+                assert_eq(name, stats.min_precision.l2 > 10, True)
+            target = Ciphertensor[ckks.Ciphertext].enc(mpc, values)
+            target._setitem(mpc, -1, Ciphertensor[ckks.Ciphertext].enc(mpc, [9.0]))
+            stats = precision_stats(mpc=mpc, result=target.reveal(mpc, T=float).flatten().tolist(), expected=_spliced_list(values, n - 1, n, [9.0]))
+            assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor 1-dim x[-1] = 9 on {n}", stats.min_precision.l2 > 10, True)
+
+    with mpc.randomness.global_stream():
+        m = random_floats((2, slots))
+        w = random_floats((3, slots + slots // 2))
+    if mpc.pid > 0:
+        target = Ciphertensor[ckks.Ciphertext].enc(mpc, m, encoding=ENC_ROW)
+        inserted_m = [_test_values(slots - 5, 4.0), _test_values(slots - 5, 5.0)]
+        target._setitem(mpc, (slice(start=None, stop=None, step=1), slice(start=5, stop=None, step=1)), Ciphertensor[ckks.Ciphertext].enc(mpc, inserted_m, encoding=ENC_ROW))
+        stats = precision_stats(mpc=mpc, result=target.reveal(mpc, T=float).tolist(), expected=[_spliced_list(m[i], 5, slots, inserted_m[i]) for i in range(2)])
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor 2-dim x[:, 5:] = w on 2 x {slots}", stats.min_precision.l2 > 10, True)
+        target = Ciphertensor[ckks.Ciphertext].enc(mpc, w, encoding=ENC_ROW)
+        inserted_w = [_test_values(8900, 1.0), _test_values(8900, 2.0)]
+        target._setitem(mpc, (slice(start=0, stop=2, step=1), slice(start=100, stop=9000, step=1)), Ciphertensor[ckks.Ciphertext].enc(mpc, inserted_w, encoding=ENC_ROW))
+        expected_w = [_spliced_list(w[0], 100, 9000, inserted_w[0]), _spliced_list(w[1], 100, 9000, inserted_w[1]), w[2]]
+        stats = precision_stats(mpc=mpc, result=target.reveal(mpc, T=float).tolist(), expected=expected_w)
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor 2-dim x[0:2, 100:9000] = w on 3 x {slots + slots // 2}", stats.min_precision.l2 > 10, True)
+
+        vector = Ciphertensor[ckks.Ciphertext].enc(mpc, m[0])
+        replacement = Ciphertensor[ckks.Ciphertext].enc(mpc, m[1])
+        vector._setitem(mpc, slice(start=None, stop=None, step=1), replacement)
+        replacement._data.append(replacement._data[0].copy())
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor 1-dim x[:] = y does not share y's list", len(vector._data), 1)
+
+
+def test_ciphertensor_rotations(mpc):
+    """H-21: 1-dim rotations by a step of at least the slots and by negative steps (the list rotation took
+    ceil(step / slots), a partial last ciphertext broke it, a step of the slots did nothing); a row-wise matrix rotated
+    by the slots (its rows' list permutations never reached it); a column-wise matrix; diagonal-encoded matrices, square
+    and wide (L-083: the branch raised)."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    for n in (21, slots, slots + slots // 2, 2 * slots):
+        with mpc.randomness.global_stream():
+            values = random_floats((n,))
+        if mpc.pid > 0:
+            ct = Ciphertensor[ckks.Ciphertext].enc(mpc, values)
+            for step in (0, 1, 131, slots - 1, slots, slots + 5, n - 1, -1, -131, -(slots + 5)):
+                stats = precision_stats(mpc=mpc, result=ct.rotate(mpc, step).reveal(mpc, T=float).flatten().tolist(), expected=_rotated_list(values, step))
+                assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor rotation of {n} by {step}", stats.min_precision.l2 > 10, True)
+
+    # Whole ciphertexts permuted (lengths multiples of the slots): three ciphertexts, where a left and a right list
+    # rotation differ
+    with mpc.randomness.global_stream():
+        three = random_floats((3 * slots,))
+    if mpc.pid > 0:
+        ct_three = Ciphertensor[ckks.Ciphertext].enc(mpc, three)
+        for step in (slots, -slots, 2 * slots):
+            stats = precision_stats(mpc=mpc, result=ct_three.rotate(mpc, step).reveal(mpc, T=float).flatten().tolist(), expected=_rotated_list(three, step))
+            assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor rotation of {3 * slots} by {step} (whole ciphertexts)", stats.min_precision.l2 > 10, True)
+
+    with mpc.randomness.global_stream():
+        m = random_floats((2, 2 * slots))
+        tall = random_floats((6, 3))
+    if mpc.pid > 0:
+        cm = Ciphertensor[ckks.Ciphertext].enc(mpc, m, encoding=ENC_ROW)
+        for step in (slots, 7):
+            stats = precision_stats(mpc=mpc, result=cm.rotate(mpc, step).reveal(mpc, T=float).tolist(), expected=[_rotated_list(row, step) for row in m])
+            assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor rotation of 2 x {2 * slots} by {step}", stats.min_precision.l2 > 10, True)
+        ct_tall = Ciphertensor[ckks.Ciphertext].enc(mpc, tall)
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor rotation of a column-wise 6 x 3 by 1", ct_tall.rotate(mpc, 1).reveal(mpc, T=float), array([_rotated_list(row, 1) for row in tall]), error=1e-3)
+
+    for rows, cols, steps in ((4, 4, (1, 3)), (3, 4, (1, 2)), (2, 6, (4, -1))):
+        with mpc.randomness.global_stream():
+            matrix = random_floats((rows, cols))
+        if mpc.pid > 0:
+            diagonal = Ciphertensor[ckks.Ciphertext].enc(mpc, matrix, encoding=ENC_DIAG)
+            for step in steps:
+                assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor rotation of a diagonal-encoded {rows} x {cols} by {step}", diagonal.rotate(mpc, step).reveal(mpc, T=float), array([_rotated_list(row, step) for row in matrix]), error=1e-3)
+
+
+def test_ciphertensor_council_shapes(mpc):
+    """M-MHE-15 (its row-count part): a getitem or setitem refreshes what it masks in one council per call, where every
+    masked row took one, so parties holding different numbers of rows, or vectors of different lengths, stay in step
+    when they take the same kind of range; a party that masks nothing (whole rows, an empty range, an empty tensor, a
+    full-width range of a row-wise or column-wise matrix) holds none, as before, so it may skip the call. An aggregate
+    (the same ciphertexts at every party) low on levels stays the same at every party when sliced and assigned (its
+    refresh runs in the broadcast mode)."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    if mpc.pid > 0:
+        n = 32 * mpc.pid
+        values = _test_values(n, 0.0)
+        ct = Ciphertensor[ckks.Ciphertext].enc(mpc, values)
+        for start, stop in ((5, n), (0, 0), (1, 30)):
+            got = ct._getitem(mpc, slice(start=start, stop=stop, step=1))
+            mpc.comms.sync_parties(include_trusted_dealer=False)
+            if stop > start:
+                assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor x[{start}:{stop}] at lengths 32, 64, ...: in step", got.reveal(mpc, T=float).flatten().tolist(), values[start:stop], error=1e-3)
+        got = ct._getitem(mpc, -1)
+        mpc.comms.sync_parties(include_trusted_dealer=False)
+        target = ct.copy()
+        target._setitem(mpc, slice(start=1, stop=30, step=1), Ciphertensor[ckks.Ciphertext].enc(mpc, _test_values(29, 2.0)))
+        mpc.comms.sync_parties(include_trusted_dealer=False)
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor x[1:30] = w at lengths 32, 64, ...: in step", target.reveal(mpc, T=float).flatten().tolist(), _spliced_list(values, 1, 30, _test_values(29, 2.0)), error=1e-3)
+
+        matrix = [_test_values(40, float(r)) for r in range(mpc.pid)]
+        cm = Ciphertensor[ckks.Ciphertext].enc(mpc, matrix, encoding=ENC_ROW)
+        got = cm._getitem(mpc, (slice(start=None, stop=None, step=1), slice(start=0, stop=3, step=1)))
+        mpc.comms.sync_parties(include_trusted_dealer=False)
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor x[:, 0:3] at 1, 2, ... rows: in step", got.reveal(mpc, T=float), array([row[0:3] for row in matrix]), error=1e-3)
+        cm._setitem(mpc, (slice(start=None, stop=None, step=1), slice(start=1, stop=4, step=1)), Ciphertensor[ckks.Ciphertext].enc(mpc, [[7.0, 8.0, 9.0] for _ in range(mpc.pid)], encoding=ENC_ROW))
+        mpc.comms.sync_parties(include_trusted_dealer=False)
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor x[:, 1:4] = w at 1, 2, ... rows: in step", cm.reveal(mpc, T=float), array([_spliced_list(row, 1, 4, [7.0, 8.0, 9.0]) for row in matrix]), error=1e-3)
+
+        # Ranges that mask nothing hold no council, so a party may skip them, as the MP layer's empty partitions do: every
+        # column of a row-wise matrix, every stored column of a column-wise one, and anything at an empty tensor
+        column_wise = Ciphertensor[ckks.Ciphertext].enc(mpc, [[float(i + j) for j in range(3)] for i in range(mpc.pid)], encoding=ENC_COL)
+        whole_rows = Ciphertensor[ckks.Ciphertext](slots=slots)
+        own_rows = Ciphertensor[ckks.Ciphertext](slots=slots)
+        if mpc.pid != 1:
+            whole_rows = cm._getitem(mpc, (slice(start=None, stop=None, step=1), slice(start=0, stop=40, step=1)))
+            own_rows = column_wise._getitem(mpc, slice(start=0, stop=mpc.pid, step=1))
+        mpc.comms.sync_parties(include_trusted_dealer=False)
+        own_revealed = own_rows.reveal(mpc, T=float)  # a collective decryption: every compute party, CP1 with nothing
+        if mpc.pid != 1:
+            assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor x[:, 0:40] of {mpc.pid} x 40: whole rows", (whole_rows.shape, len(whole_rows._data)), ([mpc.pid, 40], mpc.pid))
+            assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor column-wise x[0:{mpc.pid}]: every stored column", own_revealed, array([[float(i + j) for j in range(3)] for i in range(mpc.pid)]), error=1e-3)
+        held = Ciphertensor[ckks.Ciphertext](slots=slots) if mpc.pid == 1 else cm
+        got = held._getitem(mpc, (slice(start=None, stop=None, step=1), slice(start=0, stop=40, step=1)))
+        mpc.comms.sync_parties(include_trusted_dealer=False)
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor x[:, 0:40] with an empty tensor at CP1: in step", len(got._data), 0 if mpc.pid == 1 else mpc.pid)
+
+        # The last, partly filled ciphertext of a row is masked, and its council held, as before: CP1 slices exactly
+        # that ciphertext, the others a partial range of shorter vectors
+        long_n = slots + 100 if mpc.pid == 1 else 200
+        long_values = _test_values(long_n, 0.5)
+        long_ct = Ciphertensor[ckks.Ciphertext].enc(mpc, long_values)
+        lo, hi = (slots, slots + 100) if mpc.pid == 1 else (0, 50)
+        got = long_ct._getitem(mpc, slice(start=lo, stop=hi, step=1))
+        mpc.comms.sync_parties(include_trusted_dealer=False)
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor x[{lo}:{hi}] of {long_n}: in step", got.reveal(mpc, T=float).flatten().tolist(), long_values[lo:hi], error=1e-3)
+
+        # Placeholders (nil-ideal ciphertexts, which the MP aligners give the parties without the data) add nothing and
+        # take the council: every party slices, assigns into and rotates a placeholder
+        placeholder = Ciphertensor[ckks.Ciphertext].placeholder([100], slots)
+        got = placeholder._getitem(mpc, 5)
+        placeholder._setitem(mpc, slice(start=3, stop=9, step=1), Ciphertensor[ckks.Ciphertext].placeholder([6], slots))
+        rotated = placeholder.rotate(mpc, 7)
+        mpc.comms.sync_parties(include_trusted_dealer=False)
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor placeholder: sliced, assigned and rotated, still placeholders", (got._data[0]._nil_ideal, placeholder._data[0]._nil_ideal, rotated._data[0]._nil_ideal), (True, True, True))
+
+        # An aggregate at the lowest level: its slices and assignments refresh in the broadcast mode (the assignment's
+        # target is copied first, so that it is still low when it is assigned into)
+        common = Ciphertensor[ckks.Ciphertext].enc(mpc, _test_values(slots + 10, 0.0)).aggregate(mpc)
+        common._data = mpc.mhe.drop_level(common._data, mpc.mhe.bootstrap_min_level)
+        assigned = common.copy()
+        sliced = common._getitem(mpc, slice(start=3, stop=slots + 5, step=1))
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor slice of an aggregate: the same at every party", (sliced._is_broadcast, same_at_every_party(mpc, sliced._data)), (True, True))
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor assignment into an aggregate: its target at the lowest level", assigned._data[0].level(), mpc.mhe.bootstrap_min_level)
+        assigned._setitem(mpc, slice(start=3, stop=slots + 5, step=1), sliced)
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor assignment into an aggregate: the same at every party", (assigned._is_broadcast, same_at_every_party(mpc, assigned._data)), (True, True))
+        expected_common = [float(mpc.comms.number_of_parties - 1) * v for v in _test_values(slots + 10, 0.0)]
+        stats = precision_stats(mpc=mpc, result=sliced.reveal(mpc, source_pid=-1, T=float).flatten().tolist(), expected=expected_common[3:slots + 5])
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor slice of an aggregate", stats.min_precision.l2 > 10, True)
+        # A per-party row assigned into an aggregate's whole row: the result is no longer the same at every party
+        common_matrix = Ciphertensor[ckks.Ciphertext].enc(mpc, [_test_values(8, 0.0), _test_values(8, 1.0)], encoding=ENC_ROW).aggregate(mpc)
+        common_matrix._setitem(mpc, 0, Ciphertensor[ckks.Ciphertext].enc(mpc, _test_values(8, float(mpc.pid))))
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor a party's row assigned into an aggregate: no longer broadcast", common_matrix._is_broadcast, False)
+
+
+def test_ciphertensor_index_errors(mpc):
+    """A step other than 1 raises NotImplementedError (it was ignored), an int out of range IndexError (it read the free
+    slots), a getitem on a diagonal-encoded tensor, a setitem of a diagonal-encoded value and rotating a tall one
+    NotImplementedError (the diagonals came back as rows, or went in as rows; the rotation raised from a getitem without
+    the IR pass). None of them holds a council first, so
+    every party raises alike and stays in step."""
+    if mpc.pid > 0:
+        ct = Ciphertensor[ckks.Ciphertext].enc(mpc, _test_values(32, 0.0))
+        raised = False
+        try:
+            ct._getitem(mpc, slice(start=0, stop=10, step=2))
+        except NotImplementedError:
+            raised = True
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor x[0:10:2] raises", raised, True)
+        raised = False
+        try:
+            ct._getitem(mpc, 40)
+        except IndexError:
+            raised = True
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor x[40] of 32 raises", raised, True)
+        raised = False
+        try:
+            ct._getitem(mpc, -33)
+        except IndexError:
+            raised = True
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor x[-33] of 32 raises", raised, True)
+        diagonal = Ciphertensor[ckks.Ciphertext].enc(mpc, [_test_values(4, float(i)) for i in range(4)], encoding=ENC_DIAG)
+        raised = False
+        try:
+            diagonal._getitem(mpc, 0)
+        except NotImplementedError:
+            raised = True
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor getitem on a diagonal-encoded tensor raises", raised, True)
+        raised = False
+        rows = Ciphertensor[ckks.Ciphertext].enc(mpc, [_test_values(4, 0.0), _test_values(4, 1.0)], encoding=ENC_ROW)
+        try:
+            rows._setitem(mpc, (slice(start=None, stop=None, step=1), slice(start=0, stop=2, step=1)), Ciphertensor[ckks.Ciphertext].enc(mpc, [_test_values(2, 2.0), _test_values(2, 3.0)], encoding=ENC_DIAG))
+        except NotImplementedError:
+            raised = True
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor setitem of a diagonal-encoded value raises", raised, True)
+        tall = Ciphertensor[ckks.Ciphertext].enc(mpc, [_test_values(3, float(i)) for i in range(6)], encoding=ENC_DIAG)
+        raised = False
+        try:
+            tall.rotate(mpc, 1)
+        except NotImplementedError:
+            raised = True
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor rotating a tall diagonal-encoded tensor raises", raised, True)
+        mpc.comms.sync_parties(include_trusted_dealer=False)
+
+
+def test_ciphertensor_mixed_scales(mpc):
+    """c18-cr1-3: pieces of different scales meeting in one ciphertext are brought to one scale before they are added
+    (Lattiseq's add corrects integer scale ratios only, so a ratio of 1.00008 was 8e-5 relative off): a lazily rescaled
+    product rotated by the slots (a copied whole ciphertext beside a refreshed, masked one), and a product's values
+    assigned into a fresh vector (the refreshed value beside the target's kept slots)."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    n = slots + slots // 2
+    with mpc.randomness.global_stream():
+        a = random_floats((n,))
+        b = random_floats((n,))
+        w1 = random_floats((20,))
+        w2 = random_floats((20,))
+    if mpc.pid > 0:
+        product = Ciphertensor[ckks.Ciphertext].enc(mpc, a).mul(mpc, Ciphertensor[ckks.Ciphertext].enc(mpc, b))
+        expected = _rotated_list([a[i] * b[i] for i in range(n)], slots)
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor a product of {n} rotated by {slots}", product.rotate(mpc, slots).reveal(mpc, T=float).flatten().tolist(), expected, error=1e-3)
+        target = Ciphertensor[ckks.Ciphertext].enc(mpc, a)
+        target._setitem(mpc, slice(start=slots - 5, stop=slots + 15, step=1), Ciphertensor[ckks.Ciphertext].enc(mpc, w1).mul(mpc, Ciphertensor[ckks.Ciphertext].enc(mpc, w2)))
+        expected = _spliced_list(a, slots - 5, slots + 15, [w1[i] * w2[i] for i in range(20)])
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor a product assigned into x[{slots - 5}:{slots + 15}]", target.reveal(mpc, T=float).flatten().tolist(), expected, error=1e-3)
+
+
+def test_ciphertensor_shared_rows(mpc):
+    """Assigned whole rows are the value's ciphertexts, except that a broadcast value's are copied into a per-party target:
+    the target's per-party refreshes left the value different at each party, and a later slice of the value, refreshed
+    in the broadcast mode, wrote garbage into it (review c18-cr6-1). A one-row diagonal-encoded tensor is stored as its
+    row, and is read and assigned as such (c18-cr6-2)."""
+    n_cp = mpc.comms.number_of_parties - 1
+    if mpc.pid > 0:
+        common = Ciphertensor[ckks.Ciphertext].enc(mpc, [_test_values(16, 0.0), _test_values(16, 1.0)], encoding=ENC_ROW).aggregate(mpc)
+        common._data = mpc.mhe.drop_level(common._data, mpc.mhe.bootstrap_min_level)
+        target = Ciphertensor[ckks.Ciphertext].enc(mpc, [_test_values(16, 2.0), _test_values(16, 3.0)], encoding=ENC_ROW)
+        target._setitem(mpc, slice(start=0, stop=2, step=1), common)
+        product = Ciphertensor[ckks.Ciphertext].enc(mpc, [_test_values(16, 4.0), _test_values(16, 5.0)], encoding=ENC_ROW).mul(mpc, target)
+        assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor an aggregate assigned into a party's rows, the target refreshed: the aggregate the same at every party", same_at_every_party(mpc, common._data), True)
+        sliced = common._getitem(mpc, (slice(start=None, stop=None, step=1), slice(start=0, stop=5, step=1)))
+        expected = [[float(n_cp) * v for v in _test_values(16, shift)[0:5]] for shift in (0.0, 1.0)]
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor that aggregate sliced afterwards", sliced.reveal(mpc, source_pid=-1, T=float), array(expected), error=1e-3)
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor the product with the assigned rows", product.reveal(mpc, T=float), array([[_test_values(16, 4.0)[j] * float(n_cp) * _test_values(16, 0.0)[j] for j in range(16)], [_test_values(16, 5.0)[j] * float(n_cp) * _test_values(16, 1.0)[j] for j in range(16)]]), error=1e-2)
+
+        one_row = Ciphertensor[ckks.Ciphertext].enc(mpc, [[0.0, 1.0, 2.0, 3.0]], encoding=ENC_DIAG)
+        got = one_row._getitem(mpc, (slice(start=0, stop=1, step=1), slice(start=1, stop=3, step=1)))
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor a one-row diagonal-encoded tensor sliced", got.reveal(mpc, T=float).flatten().tolist(), [1.0, 2.0], error=1e-3)
+        row = Ciphertensor[ckks.Ciphertext].enc(mpc, [[0.0, 1.0, 2.0, 3.0]], encoding=ENC_ROW)
+        row._setitem(mpc, (slice(start=0, stop=1, step=1), slice(start=1, stop=3, step=1)), Ciphertensor[ckks.Ciphertext].enc(mpc, [[10.0, 11.0]], encoding=ENC_DIAG))
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor a one-row diagonal-encoded value assigned", row.reveal(mpc, T=float).flatten().tolist(), [0.0, 10.0, 11.0, 3.0], error=1e-3)
+
+
+def test_ciphertensor_pad(mpc):
+    """M-MHE-05: pad of a full ciphertext (its mask zeroed every value) and of a vector of several ciphertexts (one
+    padding ciphertext too many: the reveal asserted); the input is left as it was."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    for n, new_size in ((slots, slots + 100), (slots + 100, 3 * slots), (100, 300)):
+        with mpc.randomness.global_stream():
+            values = random_floats((n,))
+        if mpc.pid > 0:
+            ct = Ciphertensor[ckks.Ciphertext].enc(mpc, values)
+            level, scale = ct._data[-1].level(), ct._data[-1].scale
+            padded = ct.pad(mpc, new_size)
+            expected = values.copy()
+            expected.extend([0.0 for _ in range(new_size - n)])
+            assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor pad {n} -> {new_size}: ciphertexts, the input kept", (len(padded._data), ct._data[-1].level(), ct._data[-1].scale), ((new_size + slots - 1) // slots, level, scale))
+            stats = precision_stats(mpc=mpc, result=padded.reveal(mpc, T=float).flatten().tolist(), expected=expected)
+            assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor pad {n} -> {new_size}", stats.min_precision.l2 > 10, True)
+
+
 def test_ciphertensor(mpc):
     print(f'CP{mpc.pid}:\tTesting Sequre MHE Ciphertensor ... \n')
     test_ciphertensor_send_receive(mpc)
@@ -1221,4 +1603,12 @@ def test_ciphertensor(mpc):
     test_ciphertensor_pad_with_value(mpc)
     test_ciphertensor_extend_chunks(mpc)
     test_ciphertensor_sum_slots(mpc)
+    test_ciphertensor_slices(mpc)
+    test_ciphertensor_setitem_ranges(mpc)
+    test_ciphertensor_rotations(mpc)
+    test_ciphertensor_council_shapes(mpc)
+    test_ciphertensor_index_errors(mpc)
+    test_ciphertensor_mixed_scales(mpc)
+    test_ciphertensor_shared_rows(mpc)
+    test_ciphertensor_pad(mpc)
     print(f'CP{mpc.pid}:\tSequre MHE Ciphertensor tests passed.\n')

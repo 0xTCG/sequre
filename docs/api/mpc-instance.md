@@ -331,7 +331,7 @@ Multiparty homomorphic encryption based on the CKKS scheme. Provides collective 
 | `iadd_const` | `(x, constant)` | Add a scalar constant in-place |
 | `isub_const` | `(x, constant)` | Subtract a scalar constant in-place |
 | `imul_const` | `(x, constant)` | Multiply by a scalar constant in-place |
-| `irotate` | `(x, k)` | Rotate ciphertext slots by `k` positions in-place |
+| `irotate` | `(x, k)` | Rotate ciphertext slots left by `k` positions in-place, for any `k` (modulo the slots, either sign) |
 | `irotate_butterfly` | `(x, k)` | Butterfly-decomposed rotation for large `k` |
 
 #### Ciphertext arithmetic (out-of-place)
@@ -371,8 +371,8 @@ Multiparty homomorphic encryption based on the CKKS scheme. Provides collective 
 
 | Method | Signature | Description |
 |---|---|---|
-| `mask_one[T]` | `(x, idx, complement=False)` | Mask a single slot (or its complement) in a ciphertext or ciphervector |
-| `mask_range[T]` | `(x, start, stop, complement=False)` | Mask a range of slots in a ciphertext |
+| `mask_one[T]` | `(x, idx, complement=False)` | Keep a single slot (or every other one) of a ciphertext or ciphervector (a public plaintext mask) |
+| `mask_range[T]` | `(x, start, stop, complement=False)` | Keep slots `[start, stop)`, `0 <= start <= stop <= slots`, of a ciphertext (or every other one; a public plaintext mask) |
 
 #### Utilities
 

@@ -8,7 +8,7 @@ from sequre.types.ciphertensor import Ciphertensor
 from sequre.types.multiparty_aggregate import MPA
 from sequre.types.multiparty_partition import MPP
 from sequre.types.multiparty_union import MPU
-from sequre.utils.testing import assert_eq, assert_eq_approx
+from sequre.utils.testing import assert_eq, assert_eq_approx, same_at_every_party
 from sequre.utils.utils import random_floats
 
 import math
@@ -534,6 +534,65 @@ def test_mpu_pad_with_value(mpc):
             assert_eq_approx(f"CP{mpc.pid}:\tMPU pad_with_value, additive shares", revealed_additive, with_columns(matrix, 1, 1.0), error=1e-9)
         assert_parties_in_step(mpc, f"MPU pad_with_value, ratios {ratios}: reveals")
 
+def test_mpu_t_matmul_wide_mpa(mpc):
+    """X.T @ M with X encrypted at every compute party and M an additive MPU wide enough for a row-wise aggregate: each
+    party multiplies by its own rows of M's aggregate, which differ per party, so they must not be flagged as the same at
+    every party (a version of the Ciphertensor slice rework kept the aggregate's broadcast flag on them: the product hung
+    at unequal ratios and, with the aggregate at the bootstrap level, came out garbage at equal ones). Unequal ratios,
+    an empty partition, and equal ratios with M's aggregate at the lowest level."""
+    n_cp = mpc.comms.number_of_parties - 1
+    for ratios, low in ((unequal_ratios(n_cp), False), (ratios_with_empty(n_cp), False), ([4 for _ in range(n_cp)], True), (unequal_ratios(n_cp), True)):
+        total = ratios.sum()
+        a = cohort_matrix(mpc, total, 4)
+        w = cohort_matrix(mpc, total, total + 2) * 0.5
+        start, stop = own_rows(mpc, ratios)
+        x = MPU(mpc, a[start:stop].copy() if mpc.pid else a, "partition")
+        x.encrypt()
+        m = MPU(mpc, w if mpc.pid == 1 else w.zeros(), "additive")
+        if low and mpc.pid:
+            m._mpa.aggregate()
+            m._mpa._aggregate._data = mpc.mhe.drop_level(m._mpa._aggregate._data, mpc.mhe.bootstrap_min_level)
+        product = x.T @ m
+        label = f"MPU X.T @ M, ratios {ratios}{', aggregate at the lowest level' if low else ''}"
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}", product.reveal(), a.T @ w, error=1e-2)
+        assert_parties_in_step(mpc, label)
+        # M's aggregate is still the same at every party (the product refreshes copies of each party's rows, not the
+        # aggregate's own ciphertexts), so a slice of M afterwards, which refreshes it in the broadcast mode, is right
+        if mpc.pid and m._mpa.has_aggregate():
+            assert_eq(f"CP{mpc.pid}:\t{label}: M's aggregate the same at every party after it", same_at_every_party(mpc, m._mpa._aggregate._data), True)
+        block = m[:, 0:2]
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: M[:, 0:2] after it", block.reveal(), w[:, 0:2], error=1e-2)
+        assert_parties_in_step(mpc, f"{label}: M[:, 0:2] after it")
+
+    # A tall M (a column-wise aggregate) with X encrypted column-wise (the V1 product) and every row at one party: that
+    # party's rows of the aggregate are every stored column, a view, which must be copied as well
+    ratios = [0 for _ in range(n_cp)]
+    ratios[1] = 5
+    a = cohort_matrix(mpc, 5, 4)
+    w = cohort_matrix(mpc, 5, 3) * 0.5
+    start, stop = own_rows(mpc, ratios)
+    xmpp = MPP(mpc, a[start:stop].copy() if mpc.pid else a)
+    xt = xmpp.T
+    xt.encrypt()
+    x = MPU[Tuple[int, int], float](_mpp=xt.T, _mpa=MPA[Tuple[int, int], float](mpc))
+    m = MPU(mpc, w if mpc.pid == 1 else w.zeros(), "additive")
+    if mpc.pid:
+        m._mpa.aggregate()
+        m._mpa._aggregate._data = mpc.mhe.drop_level(m._mpa._aggregate._data, mpc.mhe.bootstrap_min_level)
+    product = x.T @ m
+    label = f"MPU X.T @ M, a tall M, X encrypted column-wise, ratios {ratios}, aggregate at the lowest level"
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\t{label}", product.reveal(), a.T @ w, error=1e-2)
+        assert_eq(f"CP{mpc.pid}:\t{label}: M's aggregate the same at every party after it", same_at_every_party(mpc, m._mpa._aggregate._data), True)
+    assert_parties_in_step(mpc, label)
+    rows = m[0:2]
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\t{label}: M[0:2] after it", rows.reveal(), w[0:2], error=1e-2)
+    assert_parties_in_step(mpc, f"{label}: M[0:2] after it")
+
+
 def test_mpu[TP](mpc: MPCEnv[TP], modulus: TP):
     mpc.comms.sync_parties()
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
@@ -573,5 +632,6 @@ def test_mpu[TP](mpc: MPCEnv[TP], modulus: TP):
     test_mpu_reveal_local(mpc)
     test_mpu_sums(mpc)
     test_mpu_pad_with_value(mpc)
+    test_mpu_t_matmul_wide_mpa(mpc)
 
     print(f'CP{mpc.pid}:\tSequre MHE MPU tests on {alg_struct} passed.\n')

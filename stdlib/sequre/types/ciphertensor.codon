@@ -884,67 +884,71 @@ class Ciphertensor[ctype]:
         return self
     
     def irotate(self, mpc, step: int) -> Ciphertensor[ctype]:
-        if mpc.pid == 0: return self
-        shape = self.actual_shape
-        step = (shape[-1] + step) % shape[-1]
-
+        # Rotates left along the last logical axis, in place: out[..., i] = in[..., (i + step) % n] for any step, either
+        # sign. CP0 holds placeholders and does no HE.
+        if mpc.pid == 0 or not self._data:
+            return self
+        n = self.actual_shape[-1]
+        step = ((step % n) + n) % n
         if step == 0:
             return self
 
-        # Diagonal-contiguous rotation is cheaper than rotating the c-continguous matrix
         if self._diagonal_contiguous:
-            assert self.ndim == 2, "Ciphertensor: cannot rotate --- diagonal-contiguous ciphertensor needs to be 2-dimensional"
-            _data = []
-            for i in range(self.shape[0]):
-                _data.extend(self[(step + i) % self.shape[0]].irotate(mpc, step + i)._data)
-
-            self._data = _data
-        # Case c-contiguous 2-dimensional or higher tensor. Rotate only largest axis.
-        elif self.ndim > 1:
-            if self._transposed:
-                self._irotate_raw(step)
-            else:
-                for row in self:
-                    row.irotate(mpc, step)
-        # Best case scenario. Rotating by multiplicative of slots requires no homomorphic rotation.
-        elif step % self.slots == 0 and self.shape[-1] % self.slots == 0:
-            self._data.irotate(step // self.slots)
-        # Second-best case scenario. If cipher fits in the number of slots, only one homomorphic rotation is needed.
-        elif self.shape[-1] == self.slots:
-            mpc.mhe.irotate(self._data, step % self.slots)
-        # Worst case scenario. Either the rotation is done over multiple ciphertexts or encoded data size is less than the number of slots
+            self._irotate_diagonal(mpc, step)
+        elif self.ndim > 1 and self._transposed:
+            # The logical rows run along the stored rows: a permutation of whole stored rows
+            self._irotate_raw(step)
         else:
-            # TODO: Check why this is buggy. Reproduce by using irotate in reduce_add_tiled diagonal encoding case.
-            step_offset = step % self.slots % self.shape[-1]
-            mpc.mhe.irotate(self._data, step_offset)
-
-            mask = [(0 if (i < self.slots - step_offset) else 1) for i in range(self.slots)]
-            cipher_mask = mpc.mhe.enc_vector(mask, T=Plaintext)[0]
-            cipher_mask_inv = mpc.mhe.enc_vector(mask ^ 1, T=Plaintext)[0]
-            mask_enc = [cipher_mask for _ in range(len(self._data))]
-            mask_inv_enc = [cipher_mask_inv for _ in range(len(self._data))]
-            
-            offset_tensor_data = mpc.mhe.mul(self._data, mask_enc).irotate(1)
-            
-            data_offset = self.shape[-1] % self.slots
-            if data_offset:
-                mpc.mhe.irotate([offset_tensor_data[-1]], self.slots - data_offset)
-            
-            if data_offset and data_offset < step_offset:
-                corr_mask = [(0 if (i < self.slots - step_offset + data_offset) else 1) for i in range(self.slots)]
-                corr_cipher_mask = mpc.mhe.enc_vector(corr_mask, T=Plaintext)
-                corr_cipher_mask_inv = mpc.mhe.enc_vector(corr_mask ^ 1, T=Plaintext)
-                correction_cipher = mpc.mhe.mul([offset_tensor_data[-1]], corr_cipher_mask)
-                mpc.mhe.imul([offset_tensor_data[-1]], corr_cipher_mask_inv)
-                mpc.mhe.iadd([offset_tensor_data[-2]], correction_cipher)
-
-            mpc.mhe.imul(self._data, mask_inv_enc)
-            mpc.mhe.iadd(self._data, offset_tensor_data)
-
-            if self.slots < step < self.shape[-1]:
-                self._data.irotate((step + self.slots - 1) // self.slots)
-
+            # The vector, or every stored row of a row-wise matrix, rotated in the tensor's own list (a row view's list
+            # permutation never reached the parent)
+            self._irotate_rows(mpc, step)
         return self
+
+    def _irotate_rows(self, mpc, step: int):
+        # Every stored row of n = shape[-1] values rotated left by 0 < step < n
+        if isinstance(ctype, Plaintext):
+            compile_error("Not implemented yet: rotating a plaintext tensor")
+
+        slots = self.slots
+        n = self.shape[-1]
+        chunk = (n + slots - 1) // slots
+        rows = len(self._data) // chunk
+
+        if n == slots:
+            # One full ciphertext per row: one rotation each
+            Ciphertensor._rotate_slots(mpc, self._data, step)
+        elif n % slots == 0 and step % slots == 0:
+            # Whole ciphertexts by a multiple of the slots: each row's list permuted, no HE
+            _data = List[ctype](len(self._data))
+            for r in range(rows):
+                row = self._data[r * chunk:(r + 1) * chunk]
+                row.irotate(step // slots)
+                _data.extend(row)
+            self._data = _data
+        else:
+            # Positions [step, n) to 0 and [0, step) to n - step (any length, any step), one refresh council for all
+            # the rows
+            moves = [(0, step, n, 0), (0, 0, step, n - step)]
+            sources = [[self._data[r * chunk:(r + 1) * chunk]] for r in range(rows)]
+            self._data = Ciphertensor._flatten(Ciphertensor._move_rows(mpc, sources, n, moves, chunk, self._is_broadcast))
+
+    def _irotate_diagonal(self, mpc, step: int):
+        # A wide (or square) matrix M is stored by its diagonals d_k[t] = M[(t + k) % rows][t % cols], t < cols (rows <=
+        # cols). Rotating every row of M left by step makes d_k[t] = M[(t + k) % rows][(t + step) % cols]: positions
+        # [step, cols) of d_((k - step) % rows) for t < cols - step, then positions [0, step) of
+        # d_((k - step + cols) % rows) (the same diagonal when rows divides cols). A tall matrix's storage maps indices
+        # differently.
+        if isinstance(ctype, Plaintext):
+            compile_error("Not implemented yet: rotating a plaintext tensor")
+        if self._skinny or self._transposed or self.ndim != 2:
+            raise NotImplementedError("Ciphertensor: rotating a tall or transposed diagonal-encoded tensor is not implemented")
+
+        rows, cols = self.shape[0], self.shape[1]
+        chunk = self._chunk_size
+        stored = [self._data[k * chunk:(k + 1) * chunk] for k in range(rows)]
+        sources = [[stored[(((k - step) % rows) + rows) % rows], stored[(((k - step + cols) % rows) + rows) % rows]] for k in range(rows)]
+        moves = [(0, step, cols, 0), (1, 0, step, cols - step)]
+        self._data = Ciphertensor._flatten(Ciphertensor._move_rows(mpc, sources, cols, moves, chunk, self._is_broadcast))
 
     def neg(self, mpc):
         if isinstance(ctype, Plaintext):
@@ -1089,20 +1093,27 @@ class Ciphertensor[ctype]:
             # TODO: Read dtype (T) from self (add dtype static to Ciphertensor class)
             return Ciphertensor[Plaintext].enc(mpc, self.decode(mpc, T=float).pad(new_size))
         
+        assert self.ndim == 1, "Ciphertensor: only 1-dimensional ciphertensors can be padded"
+        assert new_size >= self.shape[0], f"Ciphertensor: cannot pad {self.shape[0]} values to {new_size}"
         _data = self._data.copy()
 
-        # TODO: There should be no need for masking here
-        mask = mpc.mhe.enc_vector([(1.0 if i < self.shape[-1] % self.slots else 0.0) for i in range(self.slots)], T=Plaintext)
-        mpc.mhe.imul([_data[-1]], mask)
+        # The free slots of a partial last ciphertext zeroed (replicate's reduce_add reads them). A full last ciphertext
+        # has none: its mask, built from size % slots, zeroed every value.
+        offset = self.shape[0] % self.slots
+        if offset and _data:
+            mask = mpc.mhe.enc_vector([(1.0 if i < offset else 0.0) for i in range(self.slots)], T=Plaintext)
+            mpc.mhe.imul([_data[-1]], mask)
 
+        # Zero ciphertexts up to ceil(new_size / slots) in all (the count ignored the ciphertexts already there)
         zero_cipher = mpc.mhe.zero_cipher()
-        _padding = [zero_cipher.copy() for _ in range((new_size - 1) // self.slots)]
-        _data.extend(_padding)
-        
+        for _ in range((new_size + self.slots - 1) // self.slots - len(_data)):
+            _data.append(zero_cipher.copy())
+
         return Ciphertensor[ctype](
             _data=_data,
             shape=[new_size],
-            slots=self.slots)
+            slots=self.slots,
+            _transposed=self._transposed)
     
     def reduce_add(self, mpc, keep_dims: bool = True) -> Ciphertensor[ctype]:
         assert mpc.pid, "Not implemented yet: reduce_add at CP0"
@@ -2531,7 +2542,284 @@ class Ciphertensor[ctype]:
         
         self._data = _data
     
+    # Slices, slice assignments and rotations move ranges of slot positions between ciphertext lists (a vector, or one
+    # stored row). A move (source, a, b, d) takes positions [a, b) of a source row to position d of a fresh row. A
+    # destination ciphertext that is one whole, full source ciphertext and nothing else is a copy of it and keeps its
+    # level. Any other destination ciphertext
+    # takes at most two source ciphertexts per move, each multiplied by a public 0/1 plaintext mask that keeps exactly the
+    # piece's slots (a ct x pt product: no relinearization), the products summed and rotated once (_rotate_slots: every
+    # step has keys); each mask is encoded at the common scale divided by its source's, so the addends meet at one scale
+    # (Lattiseq's add corrects integer scale ratios only).
+    #
+    # Councils: the ciphertexts an operation masks are refreshed together, in one council per call, held when there is
+    # something to mask: the same decision as before (a whole range, an empty one, aligned whole full ciphertexts or a
+    # party holding no rows masks nothing; placeholders count as data), but one council per call where every masked row
+    # took one before. So parties holding different numbers of rows stay in step; parties must still take the same kind
+    # of range (whole, empty or partial). A slice of a broadcast tensor stays broadcast, which holds when every party
+    # takes the same slice, and its refresh is collective (a bootstrap per ciphertext, with every party), so the copies
+    # must be identical: a caller that takes a different slice at each party copies it (whole rows are views of the
+    # tensor's ciphertexts) and clears the flag. Assigned whole rows are the value's ciphertexts, except that a broadcast
+    # value's are copied into a per-party target.
+
+    @staticmethod
+    def _flatten(rows: List[List[Ciphertext]]) -> List[Ciphertext]:
+        out = List[Ciphertext]()
+        for row in rows:
+            out.extend(row)
+        return out
+
+    @staticmethod
+    def _whole_slice(index) -> bool:
+        # `:` (no start, no stop, step 1)
+        if isinstance(index, slice):
+            step: int = index.step if index.step is not None else 1
+            return index.start is None and index.stop is None and step == 1
+        return False
+
+    def _diagonal_layout(self) -> bool:
+        # Diagonal-encoded storage other than a single row: a 1 x n matrix stores its one diagonal, its row, row-wise
+        return self._diagonal_contiguous and not (self.ndim == 2 and self.shape[0] == 1 and not self._skinny)
+
+    def _whole_rows(self, cs, c_start: int, c_stop: int) -> bool:
+        # Whole stored rows: the stored-column index `:`, or a range over every stored column
+        return Ciphertensor._whole_slice(cs) or (c_start == 0 and c_stop == self.shape[1])
+
+    @staticmethod
+    def _range_of(index, n: int) -> Tuple[int, int]:
+        # [start, stop) of an int (negative ones count from the end) or a step-1 slice along an axis of n positions
+        if isinstance(index, int):
+            i = index + n if index < 0 else index
+            if not (0 <= i < n):
+                raise IndexError(f"Ciphertensor: index {index} is out of range for an axis of {n}")
+            return i, i + 1
+        elif isinstance(index, slice):
+            start, _, step, length = index.adjust_indices(n)
+            if step != 1:
+                raise NotImplementedError(f"Ciphertensor: slices with a step other than 1 (here {step}) are not supported")
+            return start, start + length
+        else:
+            compile_error("Ciphertensor: invalid index")
+
+    @staticmethod
+    def _move_groups(slots: int, n_src: int, moves: List[Tuple[int, int, int, int]], dst_len: int) -> List[List[Tuple[int, List[Tuple[int, int, int, int]]]]]:
+        # For each destination ciphertext, its groups: (left rotation, pieces), a piece being (source, source
+        # ciphertext, first slot, stop slot), the slots it keeps. A move's pieces that land in one destination ciphertext
+        # share its rotation, (a - d) mod slots, and form one group with any other move's pieces there of that rotation.
+        by_t = [List[Tuple[int, List[Tuple[int, int, int, int]]]]() for _ in range(dst_len)]
+        for move in moves:
+            src, a, b, d = move
+            rot = (((a - d) % slots) + slots) % slots
+            p = a
+            while p < b:
+                u = p // slots
+                t = (p + d - a) // slots
+                q = min(min(b, (u + 1) * slots), (t + 1) * slots + a - d)
+                piece = (src, u, p - u * slots, q - u * slots)
+                merged = False
+                for g in by_t[t]:
+                    if g[0] == rot:
+                        g[1].append(piece)
+                        merged = True
+                        break
+                if not merged:
+                    by_t[t].append((rot, [piece]))
+                p = q
+        return by_t
+
+    @staticmethod
+    def _dest_masked(slots: int, n_src: int, by_t: List[List[Tuple[int, List[Tuple[int, int, int, int]]]]], force: List[bool]) -> List[bool]:
+        # Whether each destination ciphertext is masked: all of it unless it is one piece that is a whole, full source
+        # ciphertext (a copy), and always where force says so (an addend of setitem's target goes there). A partly filled
+        # last ciphertext is masked, as before (its council, too)
+        out = List[bool](len(by_t))
+        for t in range(len(by_t)):
+            groups = by_t[t]
+            copy = len(groups) == 1 and len(groups[0][1]) == 1
+            if copy:
+                _, _, lo, hi = groups[0][1][0]
+                copy = lo == 0 and hi == slots
+            out.append(not copy or (t < len(force) and force[t]))
+        return out
+
+    @staticmethod
+    def _slot_mask(mpc, lo: int, hi: int, complement: bool, scale: float, level: int, masks: Dict[Tuple[int, int, bool, float, int], Plaintext]) -> Plaintext:
+        # The public plaintext mask keeping slots [lo, hi) (all the others with complement), at the level and scale given,
+        # encoded once per operation
+        key = (lo, hi, complement, scale, level)
+        if key not in masks:
+            params = mpc.mhe.crypto_params.params
+            slots = params.slots()
+            keep = 0.0 if complement else 1.0
+            values = [(keep if lo <= i < hi else 1.0 - keep) for i in range(slots)]
+            plaintext = new_plaintext(params, level, scale)
+            mpc.mhe.crypto_params.encoder.encode(values.to_complex(), plaintext, params.log_slots)
+            masks[key] = plaintext
+        return masks[key]
+
+    @staticmethod
+    def _shifted_mask(mpc, lo: int, hi: int, r_pre: int, scale: float, level: int, masks: Dict[Tuple[int, int, bool, float, int], Plaintext]) -> Plaintext:
+        # The mask keeping source slots [lo, hi) after the source was rotated left by r_pre: the range may wrap past the
+        # last slot, and is then the complement of the slots between its two ends
+        slots = mpc.mhe.crypto_params.params.slots()
+        a = (((lo - r_pre) % slots) + slots) % slots
+        b = a + hi - lo
+        if b <= slots:
+            return Ciphertensor._slot_mask(mpc, a, b, False, scale, level, masks)
+        return Ciphertensor._slot_mask(mpc, b - slots, a, True, scale, level, masks)
+
+    @staticmethod
+    def _refresh_masked(mpc, x: List[Ciphertext], is_broadcast: bool):
+        # Refreshes the ciphertexts an operation is about to mask, in one council (none when there is nothing to mask). A
+        # broadcast tensor (the same ciphertexts at every party) refreshes in the broadcast mode, which keeps its copies
+        # identical and needs no council.
+        if mpc.pid == 0 or not x:
+            return
+        mpc.mhe.rescale(x, mpc.mhe.crypto_params.params.default_scale)
+        mpc.mhe.bootstrap(x, is_broadcast)
+
+    @staticmethod
+    def _masked_sources(sources: List[List[List[Ciphertext]]], by_t: List[List[Tuple[int, List[Tuple[int, int, int, int]]]]], masked: List[bool]) -> List[Ciphertext]:
+        # The source ciphertexts the masked destinations multiply, each once
+        seen = Set[int]()
+        out = List[Ciphertext]()
+        for row_sources in sources:
+            for t in range(len(by_t)):
+                if not masked[t]:
+                    continue
+                for g in by_t[t]:
+                    for piece in g[1]:
+                        c = row_sources[piece[0]][piece[1]]
+                        if id(c) not in seen:
+                            seen.add(id(c))
+                            out.append(c)
+        return out
+
+    @staticmethod
+    def _pre_rotation(slots: int, row_sources: List[List[Ciphertext]], by_t: List[List[Tuple[int, List[Tuple[int, int, int, int]]]]]) -> int:
+        # The rotation to apply to the source ciphertexts before masking, by key-switch count: none (each group rotates
+        # by its own step after masking), or one group's step (each source ciphertext once, then the other groups by the
+        # difference). A 1-dim rotation of n < slots values by s costs s and slots - n this way where masking first cost
+        # s and slots - n + s (n = 1024, s = 7: 2 key switches instead of 9).
+        sources = Set[int]()
+        steps = List[int]()
+        best_cost = 0
+        for groups in by_t:
+            for g in groups:
+                best_cost += Ciphertensor._rot_key_switches(g[0], slots)
+                if g[0] not in steps:
+                    steps.append(g[0])
+                for piece in g[1]:
+                    sources.add(id(row_sources[piece[0]][piece[1]]))
+        best = 0
+        for r in steps:
+            if r == 0:
+                continue
+            cost = len(sources) * Ciphertensor._rot_key_switches(r, slots)
+            for groups in by_t:
+                for g in groups:
+                    cost += Ciphertensor._rot_key_switches((((g[0] - r) % slots) + slots) % slots, slots)
+            if cost < best_cost:
+                best, best_cost = r, cost
+        return best
+
+    @staticmethod
+    def _move_run(mpc, row_sources: List[List[Ciphertext]], n_src: int, by_t: List[List[Tuple[int, List[Tuple[int, int, int, int]]]]], masked: List[bool], masks: Dict[Tuple[int, int, bool, float, int], Plaintext], r_pre: int) -> List[Ciphertext]:
+        # One destination row (the masked sources refreshed already). With r_pre, every source ciphertext used is first
+        # rotated left by r_pre (once), the masks follow it, and each group rotates by what is left of its step.
+        slots = mpc.mhe.crypto_params.params.slots()
+        evaluator = mpc.mhe.crypto_params.evaluator
+        default_scale = mpc.mhe.crypto_params.params.default_scale
+        # A placeholder (nil-ideal) source, as the MP aligners give the parties without the data, adds nothing: it takes
+        # no mask (its level and scale are not a ciphertext's) and no rotation, and a destination of placeholders only is
+        # a fresh placeholder (never the shared one, which adding into would turn into a real ciphertext)
+        pre = Dict[int, Ciphertext]()
+        if r_pre:
+            for groups in by_t:
+                for g in groups:
+                    for piece in g[1]:
+                        c = row_sources[piece[0]][piece[1]]
+                        if id(c) not in pre and not c._nil_ideal:
+                            rotated = c.copy()
+                            Ciphertensor._rotate_slots(mpc, [rotated], r_pre)
+                            pre[id(c)] = rotated
+
+        dst = List[Ciphertext](len(by_t))
+        for t in range(len(by_t)):
+            groups = by_t[t]
+            if not masked[t]:
+                rot, pieces = groups[0]
+                c = row_sources[pieces[0][0]][pieces[0][1]]
+                if c._nil_ideal:
+                    dst.append(c.copy())
+                    continue
+                copied = pre[id(c)].copy() if r_pre else c.copy()
+                residual = (((rot - r_pre) % slots) + slots) % slots
+                if residual:
+                    Ciphertensor._rotate_slots(mpc, [copied], residual)
+                dst.append(copied)
+                continue
+
+            # One scale for every addend: the largest source scale times the default one, each mask at that over its
+            # source's scale
+            common = 0.0
+            placeholder = Ciphertext.nil_ideal()
+            for g in groups:
+                for piece in g[1]:
+                    c = row_sources[piece[0]][piece[1]]
+                    if c._nil_ideal:
+                        placeholder = c
+                    else:
+                        common = max(common, c.scale)
+            if common == 0.0:
+                dst.append(placeholder.copy())
+                continue
+            common *= default_scale
+
+            sums = List[Ciphertext](len(groups))
+            for g in groups:
+                rot, pieces = g
+                terms = List[Ciphertext](len(pieces))
+                for piece in pieces:
+                    c = row_sources[piece[0]][piece[1]]
+                    if c._nil_ideal:
+                        continue
+                    source = pre[id(c)] if r_pre else c
+                    mask = Ciphertensor._shifted_mask(mpc, piece[2], piece[3], r_pre, common / source.scale, source.level(), masks)
+                    terms.append(evaluator.mul_relin_new(source, mask))
+                if not terms:
+                    continue
+                group_sum = terms[0]
+                for k in range(1, len(terms)):
+                    evaluator.add(group_sum, terms[k], group_sum)
+                residual = (((rot - r_pre) % slots) + slots) % slots
+                if residual:
+                    Ciphertensor._rotate_slots(mpc, [group_sum], residual)
+                sums.append(group_sum)
+            total = sums[0]
+            for k in range(1, len(sums)):
+                evaluator.add(total, sums[k], total)
+            dst.append(total)
+        return dst
+
+    @staticmethod
+    def _move_rows(mpc, sources: List[List[List[Ciphertext]]], n_src: int, moves: List[Tuple[int, int, int, int]], dst_len: int, is_broadcast: bool) -> List[List[Ciphertext]]:
+        # The same moves for every destination row (sources[r]: its source rows of n_src values each), one refresh
+        # council for all of them when anything is masked
+        slots = mpc.mhe.crypto_params.params.slots()
+        by_t = Ciphertensor._move_groups(slots, n_src, moves, dst_len)
+        if mpc.pid == 0:
+            return [[Ciphertext.nil_ideal().copy() for _ in range(dst_len)] for _ in range(len(sources))]
+
+        masked = Ciphertensor._dest_masked(slots, n_src, by_t, List[bool]())
+        Ciphertensor._refresh_masked(mpc, Ciphertensor._masked_sources(sources, by_t, masked), is_broadcast)
+
+        r_pre = Ciphertensor._pre_rotation(slots, sources[0], by_t) if len(moves) > 1 and sources else 0
+        masks = Dict[Tuple[int, int, bool, float, int], Plaintext]()
+        return [Ciphertensor._move_run(mpc, row_sources, n_src, by_t, masked, masks, r_pre) for row_sources in sources]
+
     def _getitem(self, mpc, indices) -> Ciphertensor[ctype]:
+        if self._diagonal_layout():
+            raise NotImplementedError("Ciphertensor: getitem on a diagonal-encoded ciphertensor is not implemented")
         if isinstance(indices, tuple) or self.ndim > 1:
             tuple_indices, _ = self._coerce_tuple_indices(indices)
             
@@ -2546,46 +2834,33 @@ class Ciphertensor[ctype]:
             
             return self._get_slices_raw(mpc, tuple_indices, pack_dim)
         
-        assert self.ndim == 1, f"Ciphertensor: invalid indices for 1-dimensional getitem: {indices}"
         return self._getitem_1_dim(mpc, indices)
     
     def _getitem_1_dim(self, mpc, indices) -> Ciphertensor[ctype]:
-        assert self.ndim == 1, "Ciphertensor: should be 1-dimensional in 1-dim getitem"
-        assert not self._diagonal_contiguous, "Not implemented yet: getitem on diagonal-contiguous ciphertensor"
-        start, stop = self._adjust_col_indices(indices)
-        
-        if stop - start == 0:
-            return Ciphertensor[ctype](slots=self.slots, _transposed=self._transposed)
-        if start == 0 and stop == self.shape[-1]:
+        # Positions [start, stop) of a vector; the whole range is the tensor itself, as before
+        if isinstance(ctype, Plaintext):
+            compile_error("Not implemented yet: slicing a plaintext tensor")
+        if self._diagonal_layout():
+            raise NotImplementedError("Ciphertensor: getitem on a diagonal-encoded ciphertensor is not implemented")
+        if Ciphertensor._whole_slice(indices):
             return self
-        
-        # TODO: Bugfix required: mask_range below requires bootstrap check.
-        # Some parties may not reach it because of the checks above. This causes deadlock.
-        # Use mask_range_noboot instead and then change methods upstream to use manual bootstraps and no MPP aligners.
+        if not self._data:
+            return Ciphertensor[ctype](slots=self.slots, _transposed=self._transposed)
 
-        start_cipher_idx = start // self.slots
-        stop_cipher_idx = (stop - 1) // self.slots
-
-        start_cipher = self._data[start_cipher_idx]
-        upper_limit = stop % self.slots if start_cipher_idx == stop_cipher_idx else self.slots
-        masked_start_cipher = mpc.mhe.mask_range(start_cipher, start % self.slots, upper_limit)
-        _data = [masked_start_cipher]
-        
-        if start_cipher_idx != stop_cipher_idx:
-            # stop_cipher = self._data[stop_cipher_idx]
-            # masked_stop_cipher = mpc.mhe.mask_range(stop_cipher, 0, stop % self.slots)
-            # inbetween_ciphers = self._data[start_cipher_idx + 1:stop_cipher_idx - 1].copy()
-            # _data.extend(inbetween_ciphers)
-            # _data.append(masked_stop_cipher)
-            raise NotImplementedError("Bugfix required: getting from 1-dimensonal multicipher ciphertensor")
-
-        if start % self.slots: mpc.mhe.irotate(_data, start % self.slots)
-        
+        start, stop = self._adjust_col_indices(indices)
+        if start == 0 and stop == self.shape[0]:
+            return self
+        if stop == start:
+            return Ciphertensor[ctype](slots=self.slots, _transposed=self._transposed)
+        _data = Ciphertensor._move_rows(mpc, [[self._data]], self.shape[0], [(0, start, stop, 0)], (stop - start + self.slots - 1) // self.slots, self._is_broadcast)[0]
         return Ciphertensor[ctype](
             _data=_data,
             shape=[stop - start],
             slots=self.slots,
-            _transposed=self._transposed)
+            _transposed=self._transposed,
+            _diagonal_contiguous=False,
+            _skinny=False,
+            _is_broadcast=self._is_broadcast)
     
     def _get_rows_raw(self, indices) -> Ciphertensor[ctype]:
         assert self.ndim > 1, "Ciphertensor: cannot get rows from one-dimensional ciphertensor"
@@ -2619,71 +2894,138 @@ class Ciphertensor[ctype]:
             _transposed=self._transposed)
     
     def _get_slices_raw(self, mpc, indices: Tuple[slice, slice], pack_dim: bool = False) -> Ciphertensor[ctype]:
+        # Stored rows rs, stored columns cs. Whole stored rows are views of the tensor's ciphertexts, as before; any
+        # other column range is moved out of every selected row, the masks refreshed in one council.
+        if isinstance(ctype, Plaintext):
+            compile_error("Not implemented yet: slicing a plaintext tensor")
         rs, cs = indices
-        c_start, c_stop, _, _ = cs.adjust_indices(self.shape[-1])
-        
-        row_sliced_ctensor = self._get_rows_raw(rs)
+        if not self._data:
+            return Ciphertensor[ctype](slots=self.slots, _transposed=self._transposed)
+        assert self.ndim == 2, f"Ciphertensor: 2-dimensional getitem on a {self.ndim}-dimensional ciphertensor"
 
-        new_ciphertensor = Ciphertensor[ctype](
-            shape=[0, c_stop - c_start],
-            slots=self.slots)
-        
-        for row in row_sliced_ctensor._raw_iter():
-            new_ciphertensor.append(row._getitem_1_dim(mpc, cs))
-        
-        if new_ciphertensor.ndim > 1 and new_ciphertensor.shape[0] == 1 and pack_dim:
-            new_ciphertensor.shape = new_ciphertensor.shape[1:]
-        
-        new_ciphertensor._transposed = self._transposed
-        return new_ciphertensor
+        r_start, r_stop = Ciphertensor._range_of(rs, self.shape[0])
+        c_start, c_stop = Ciphertensor._range_of(cs, self.shape[1])
+        if self._whole_rows(cs, c_start, c_stop):
+            _data = self._data[r_start * self._chunk_size:r_stop * self._chunk_size]
+        else:
+            sources = [[self._data[r * self._chunk_size:(r + 1) * self._chunk_size]] for r in range(r_start, r_stop)]
+            _data = Ciphertensor._flatten(Ciphertensor._move_rows(
+                mpc, sources, self.shape[1], [(0, c_start, c_stop, 0)], (c_stop - c_start + self.slots - 1) // self.slots, self._is_broadcast))
+
+        shape = [r_stop - r_start, c_stop - c_start]
+        if shape[0] == 1 and pack_dim:
+            shape = shape[1:]
+        return Ciphertensor[ctype](
+            _data=_data,
+            shape=shape,
+            slots=self.slots,
+            _transposed=self._transposed,
+            _diagonal_contiguous=False,
+            _skinny=False,
+            _is_broadcast=self._is_broadcast)
 
     def _setitem(self, mpc, indices, value: Ciphertensor[ctype]):
+        if self._diagonal_layout() or value._diagonal_layout():
+            raise NotImplementedError("Ciphertensor: setitem on or of a diagonal-encoded ciphertensor is not implemented")
         if isinstance(indices, tuple) or self.ndim > 1:
             tuple_indices, adjusted_value = self._coerce_tuple_indices(indices, value)
             return self._set_slices_raw(mpc, tuple_indices, adjusted_value)
         
-        assert self.ndim == 1, f"Ciphertensor: invalid indices for 1-dimensional setitem: {indices}"
         return self._setitem_1_dim(mpc, indices, value)
     
     def _setitem_1_dim(self, mpc, indices, value: Ciphertensor[ctype]):
-        assert self.ndim == value.ndim == 1, "Ciphertensor: operands should be 1-dimensional in 1-dim setitem"
-        
+        # Positions [start, stop) of a vector set to value; the whole range takes copies of the value's ciphertexts
+        if isinstance(ctype, Plaintext):
+            compile_error("Not implemented yet: setting a slice of a plaintext tensor")
+        if Ciphertensor._whole_slice(indices):
+            assert value.shape == self.shape, f"Ciphertensor: cannot set shape {value.shape} into shape {self.shape}"
+            self._data = value._data.copy()
+            self._is_broadcast = value._is_broadcast
+            return
+        if not self._data:
+            return
+
+        assert self.ndim == 1 and value.ndim <= 1, "Ciphertensor: operands should be 1-dimensional in 1-dim setitem"
         start, stop = self._adjust_col_indices(indices)
-        assert value.shape == [stop - start], "Ciphertensor: 1-dim setitem value should have a single element"
-
-        if stop - start == 0:
+        assert value.shape == [stop - start] or (stop == start and not value._data), f"Ciphertensor: cannot set shape {value.shape} into {stop - start} positions"
+        if start == 0 and stop == self.shape[0]:
+            self._data = value._data.copy()
+            self._is_broadcast = value._is_broadcast
             return
-        if start == 0 and stop == self.shape[-1]:
-            self._data = value._data
+        self._set_ranges(mpc, [0], [value._data], self.shape[0], start, stop, value._is_broadcast)
+
+    def _set_ranges(self, mpc, rows: List[int], values: List[List[Ciphertext]], n: int, start: int, stop: int, value_is_broadcast: bool):
+        # Positions [start, stop) of the stored rows `rows` (n values each) set to values[k] (stop - start values each).
+        # A target ciphertext the range covers wholly takes the moved value; one it covers partly has the range masked
+        # out and the moved value added, the two at one scale. One refresh council for the masked ciphertexts of the
+        # target and of the value, when there are any; each operand refreshes in its own mode, so a broadcast one stays
+        # the same at every party.
+        if mpc.pid == 0:
             return
-        
-        start_offset = start % self.slots
-        addend_data = value._data.copy()
-        
-        if start_offset:
-            if start_offset + value.shape[0] > self.slots:
-                addend_data = mpc.mhe.shift(addend_data, self.slots - start_offset)
-            else:
-                mpc.mhe.irotate(addend_data, self.slots - start_offset)
+        m = stop - start
+        if m <= 0 or not rows:
+            return
+        slots = self.slots
+        chunk = self._chunk_size if self.ndim > 1 else len(self._data)
+        t0 = start // slots
+        off = start - t0 * slots
+        dst_len = (off + m + slots - 1) // slots
+        by_t = Ciphertensor._move_groups(slots, m, [(0, 0, m, off)], dst_len)
 
-        start_cipher_idx = start // self.slots
-        stop_cipher_idx = (stop - 1) // self.slots
+        # The target ciphertexts the range covers partly (anything but all slots of a full ciphertext; a partly filled
+        # last one is partial, as before): (index in the moved row, first slot, stop slot). The moved value is masked
+        # there too, so that it meets the kept part at one scale.
+        partial = List[Tuple[int, int, int]]()
+        force = [False for _ in range(dst_len)]
+        for k in range(dst_len):
+            j = t0 + k
+            lo = max(start, j * slots) - j * slots
+            hi = min(stop, (j + 1) * slots) - j * slots
+            if not (lo == 0 and hi == slots):
+                partial.append((k, lo, hi))
+                force[k] = True
+        masked = Ciphertensor._dest_masked(slots, m, by_t, force)
 
-        start_cipher = self._data[start_cipher_idx]
-        upper_limit = stop % self.slots if start_cipher_idx == stop_cipher_idx else self.slots
-        masked_start_cipher = mpc.mhe.mask_range(start_cipher, start % self.slots, upper_limit, complement=True)
-        
-        mpc.mhe.iadd([masked_start_cipher], addend_data[:1])
-        self._data[start_cipher_idx] = masked_start_cipher
+        target_refresh = List[Ciphertext]()
+        for r in rows:
+            for p in partial:
+                target_refresh.append(self._data[r * chunk + t0 + p[0]])
+        value_refresh = Ciphertensor._masked_sources([[value_row] for value_row in values], by_t, masked)
 
-        if start_cipher_idx != stop_cipher_idx:
-            stop_cipher = self._data[stop_cipher_idx]
-            masked_stop_cipher = mpc.mhe.mask_range(stop_cipher, 0, stop % self.slots, complement=True)
-            mpc.mhe.iadd([masked_stop_cipher], addend_data[-1:])
-            self._data[stop_cipher_idx] = masked_start_cipher
-            
-            assert stop_cipher_idx - start_cipher_idx == len(addend_data), f"Ciphertensor: Cannot set {len(addend_data)} ciphers into {stop_cipher_idx - start_cipher_idx} slots"
-            self._data[start_cipher_idx + 1:stop_cipher_idx - 1] = addend_data[1:-1]
+        both_broadcast = self._is_broadcast and value_is_broadcast
+        if both_broadcast:
+            target_refresh.extend(value_refresh)
+            Ciphertensor._refresh_masked(mpc, target_refresh, True)
+        elif self._is_broadcast:
+            Ciphertensor._refresh_masked(mpc, value_refresh, False)
+            Ciphertensor._refresh_masked(mpc, target_refresh, True)
+        elif value_is_broadcast:
+            Ciphertensor._refresh_masked(mpc, target_refresh, False)
+            Ciphertensor._refresh_masked(mpc, value_refresh, True)
+        else:
+            target_refresh.extend(value_refresh)
+            Ciphertensor._refresh_masked(mpc, target_refresh, False)
+
+        evaluator = mpc.mhe.crypto_params.evaluator
+        default_scale = mpc.mhe.crypto_params.params.default_scale
+        masks = Dict[Tuple[int, int, bool, float, int], Plaintext]()
+        for k in range(len(rows)):
+            moved = Ciphertensor._move_run(mpc, [values[k]], m, by_t, masked, masks, 0)
+            base = rows[k] * chunk + t0
+            for p in partial:
+                # A placeholder target keeps nothing (the moved value stands); a placeholder value adds nothing
+                target = self._data[base + p[0]]
+                if target._nil_ideal:
+                    continue
+                value_part = moved[p[0]]
+                scale = default_scale if value_part._nil_ideal else value_part.scale / target.scale
+                kept = evaluator.mul_relin_new(target, Ciphertensor._slot_mask(mpc, p[1], p[2], True, scale, target.level(), masks))
+                if not value_part._nil_ideal:
+                    evaluator.add(kept, value_part, kept)
+                moved[p[0]] = kept
+            for i in range(dst_len):
+                self._data[base + i] = moved[i]
+        self._is_broadcast = both_broadcast
 
     def _set_rows_raw(self, indices, value: Ciphertensor[ctype]):
         assert self.ndim > 1, "Ciphertensor: cannot set rows to one-dimensional ciphertensor"
@@ -2702,45 +3044,54 @@ class Ciphertensor[ctype]:
         self._data[start * self._chunk_size:stop * self._chunk_size] = value._data
 
     def _set_slices_raw(self, mpc, indices: Tuple[slice, slice], value: Ciphertensor[ctype]):
-        assert value.ndim > 1, "Ciphertensor: invalid set-value dimension --- needs to be multidimensional to set int into sliced ciphertensor"
-        
+        # Stored rows rs, stored columns cs. Whole stored rows take the value's ciphertexts, as before; any other column
+        # range goes through _set_ranges.
+        if isinstance(ctype, Plaintext):
+            compile_error("Not implemented yet: setting a slice of a plaintext tensor")
         rs, cs = indices
-        r_start, r_stop, _, _ = rs.adjust_indices(self.shape[0])
-        c_start, c_stop, _, _ = cs.adjust_indices(self.shape[1])
-
-        if c_start == 0 and c_stop == self.shape[1]:
-            self._set_rows_raw(rs, value)
+        if not self._data:
             return
+        assert self.ndim == 2, f"Ciphertensor: 2-dimensional setitem on a {self.ndim}-dimensional ciphertensor"
 
-        value_idx = 0
-        for i in range(r_start, r_stop):
-            row = self._get_rows_raw(i)
-            row._setitem_1_dim(mpc, cs, value._get_rows_raw(value_idx))
-            self._set_rows_raw(i, row)
-            value_idx += 1
+        r_start, r_stop = Ciphertensor._range_of(rs, self.shape[0])
+        c_start, c_stop = Ciphertensor._range_of(cs, self.shape[1])
+        if self._whole_rows(cs, c_start, c_stop):
+            # The target takes the value's ciphertexts, as before; a broadcast value's are copied into a per-party target,
+            # whose refreshes run per party in place and would leave the value different at each party
+            self._set_rows_raw(rs, value.copy() if value._is_broadcast and not self._is_broadcast else value)
+            self._is_broadcast = self._is_broadcast and value._is_broadcast
+            return
+        assert value.ndim > 1 or not value._data, "Ciphertensor: invalid set-value dimension --- needs to be multidimensional to set int into sliced ciphertensor"
+        assert value.shape == [r_stop - r_start, c_stop - c_start] or ((r_stop == r_start or c_stop == c_start) and not value._data), f"Ciphertensor: cannot set shape {value.shape} into [{r_stop - r_start}, {c_stop - c_start}]"
+        value_chunk = (c_stop - c_start + self.slots - 1) // self.slots
+        value_rows = [value._data[k * value_chunk:(k + 1) * value_chunk] for k in range(r_stop - r_start)] if value._data else [List[Ciphertext]() for _ in range(r_stop - r_start)]
+        self._set_ranges(mpc, list(range(r_start, r_stop)), value_rows, self.shape[1], c_start, c_stop, value._is_broadcast)
     
     def _coerce_tuple_indices(self, indices, ctensor=None):
+        # Logical (row, column) indices as slices in storage order, ints counted from the end when negative and checked
+        # against the logical shape (an empty tensor takes them as they are)
         whole_slice = slice(start=None, stop=None, step=1)
+        logical = self.actual_shape if self.ndim >= 2 else List[int]()
         if isinstance(indices, int):
-            one_slice = slice(start=indices, stop=indices+1, step=1)
-            tuple_indices = (one_slice, whole_slice)
+            i = Ciphertensor._norm_index(indices, logical, 0)
+            tuple_indices = (slice(start=i, stop=i + 1, step=1), whole_slice)
         elif isinstance(indices, slice):
             tuple_indices = (indices, whole_slice)
         elif isinstance(indices, Tuple[slice, slice]):
             tuple_indices = indices
         elif isinstance(indices, Tuple[int, slice]):
             rs, cs = indices
-            one_slice = slice(start=rs, stop=rs + 1, step=1)
-            tuple_indices = (one_slice, cs)
+            i = Ciphertensor._norm_index(rs, logical, 0)
+            tuple_indices = (slice(start=i, stop=i + 1, step=1), cs)
         elif isinstance(indices, Tuple[slice, int]):
             rs, cs = indices
-            one_slice = slice(start=cs, stop=cs + 1, step=1)
-            tuple_indices = (rs, one_slice)
+            j = Ciphertensor._norm_index(cs, logical, 1)
+            tuple_indices = (rs, slice(start=j, stop=j + 1, step=1))
         elif isinstance(indices, Tuple[int, int]):
             rs, cs = indices
-            one_rs_slice = slice(start=rs, stop=rs + 1, step=1)
-            one_cs_slice = slice(start=cs, stop=cs + 1, step=1)
-            tuple_indices = (one_rs_slice, one_cs_slice)
+            i = Ciphertensor._norm_index(rs, logical, 0)
+            j = Ciphertensor._norm_index(cs, logical, 1)
+            tuple_indices = (slice(start=i, stop=i + 1, step=1), slice(start=j, stop=j + 1, step=1))
         else:
             compile_error("Ciphertensor: invalid indices")
 
@@ -2758,16 +3109,25 @@ class Ciphertensor[ctype]:
                 return tuple_indices, ctensor_cp
         
         return tuple_indices, ctensor
+
+    @staticmethod
+    def _norm_index(i: int, logical: List[int], axis: int) -> int:
+        if not logical:
+            return i
+        n = logical[axis]
+        j = i + n if i < 0 else i
+        if not (0 <= j < n):
+            raise IndexError(f"Ciphertensor: index {i} is out of range for an axis of {n}")
+        return j
     
     def _adjust_row_indices(self, indices):
         assert self.ndim > 1, "Ciphertensor: cannot adjust row-indices of 1-dim ciphertensor"
         
         if isinstance(indices, int):
-            start = indices
-            stop = indices + 1
+            start, stop = Ciphertensor._range_of(indices, self.shape[0])
             shape = self.shape[1:].copy()
         elif isinstance(indices, slice):
-            start, stop, _, _ = indices.adjust_indices(self.shape[0])
+            start, stop = Ciphertensor._range_of(indices, self.shape[0])
             shape = []
             if stop - start:
                 shape = self.shape.copy()
@@ -2779,16 +3139,7 @@ class Ciphertensor[ctype]:
     
     def _adjust_col_indices(self, indices):
         assert self.ndim == 1, "Ciphertensor: can adjust row-indices of 1-dim ciphertensor only"
-        
-        if isinstance(indices, int):
-            start = indices
-            stop = indices + 1
-        elif isinstance(indices, slice):
-            start, stop, _, _ = indices.adjust_indices(self.shape[0])
-        else:
-            compile_error("Ciphertensor: invalid indices for col-wise adjustment")
-        
-        return start, stop
+        return Ciphertensor._range_of(indices, self.shape[0])
 
 
 @extend

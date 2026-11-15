@@ -110,7 +110,7 @@ These methods take `mpc` as the first argument and return a new ciphertensor:
 | `.imul(mpc, other, no_refresh=False)` | In-place multiplication (optional refresh suppression) |
 | `.ipow(mpc, p)` | In-place exponentiation |
 | `.ineg(mpc)` | In-place negation |
-| `.irotate(mpc, step)` | In-place homomorphic rotation |
+| `.irotate(mpc, step)` | In-place rotation along the last logical axis, `out[i] = in[(i + step) % n]`, for any step (negative, or beyond the slots); a tall or lazily transposed diagonal-encoded tensor raises `NotImplementedError` |
 
 ## Matrix and vector operations
 
@@ -160,7 +160,7 @@ The `@mhe_enc_opt` compiler pass selects the optimal encoding strategy per matri
 | Method | Description |
 |---|---|
 | `.expand_dims(axis=0)` | Insert a dimension of size 1 |
-| `.pad(mpc, new_size)` | Pad 1-D tensor with zeros |
+| `.pad(mpc, new_size)` | Pad a 1-D tensor with zeros up to `new_size` values |
 | `.pad_with_value(val, size, axis, mpc)` | Append `size` rows (axis 0) or columns (axis 1) of `val`, in the tensor's own layout (2-D, not diagonal-encoded) |
 | `.resize(mpc, shape)` | Resize 1-D tensor to new shape |
 | `.concat(mpc, other, axis)` | Concatenate along axis (returns new tensor) |
@@ -176,7 +176,7 @@ The `@mhe_enc_opt` compiler pass selects the optimal encoding strategy per matri
 
 | Method | Description |
 |---|---|
-| `.rotate(mpc, step)` | Homomorphic rotation (returns new tensor) |
+| `.rotate(mpc, step)` | Rotation along the last logical axis (returns new tensor; see `.irotate`) |
 | `.shift(mpc, step)` | Shift 1-D tensor with zero fill and shape expansion |
 | `.diagonal(idx)` | Extract diagonal from diagonal-contiguous 2-D tensor |
 | `.diagonal_contig(mpc)` | Convert to diagonal-contiguous encoding |
@@ -203,8 +203,8 @@ The `@mhe_enc_opt` compiler pass selects the optimal encoding strategy per matri
 
 | Method | Description |
 |---|---|
-| `ct[i]` | Index / slice (requires compiler IR pass) |
-| `ct[i] = v` | Set element (requires compiler IR pass) |
+| `ct[i]` | Index / slice (requires compiler IR pass): ints (negative ones count from the end), step-1 slices and `(row, column)` pairs of them; not on diagonal-encoded tensors (except a single row, stored as a row). Whole stored rows are views. A slice that masks (anything but whole stored rows, the whole vector, an empty range or whole full ciphertexts) refreshes what it masks in one refresh council per call (none for a broadcast tensor), whatever the number of rows: the parties holding a tensor's parts must take the same kind of range. A slice of a broadcast tensor stays broadcast, so every party must take the same slice (copy per-party slices, since whole rows are views, and clear their `_is_broadcast`) |
+| `ct[i] = v` | Set an element, slice or block (requires compiler IR pass; the same indices and council as `ct[i]`, and `v` not diagonal-encoded either). Assigned whole rows are `v`'s ciphertexts, except that a broadcast `v`'s are copied into a per-party target |
 | `for row in ct` | Iterate over rows (asserts not transposed, ndim > 1) |
 | `bool(ct)` | `True` if the tensor contains data |
 

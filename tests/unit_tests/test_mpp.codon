@@ -1,6 +1,7 @@
 import secure_operator
 
 from sequre.stdlib.numpy.create import array, ones, zeros
+from sequre.stdlib.numpy.ndarray import ndarray
 
 from sequre.constants import ENC_DIAG
 from sequre.lattiseq.ckks import Ciphertext
@@ -964,6 +965,82 @@ def test_mpp_columns(mpc):
             assert_eq_approx(f"CP{mpc.pid}:\t{label}: exp in the clear", revealed_exp, exact, error=0.0, rel_error=0.02)
         assert_parties_in_step(mpc, f"MPP column, ratios {ratios}: reveals")
 
+def test_mpp_column_wise_row_slices(mpc):
+    """Row slices of column-wise encrypted partitions at partition boundaries: the parties that hold the rows take every
+    stored column of their partitions and the others take nothing, so no party masks and none holds a refresh council
+    (a first version of the Ciphertensor slice rework held one at the holders only, and they hung)."""
+    n_cp = mpc.comms.number_of_parties - 1
+    ratios = [2 for _ in range(n_cp)]
+    a = cohort_matrix(mpc, ratios.sum(), 3)
+    local = partition(mpc, a, ratios)
+    column_wise = local.T
+    column_wise.encrypt()
+    column_wise = column_wise.T
+    rows = column_wise[0:2]
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPP encrypted column-wise: rows [0:2] (CP1's)", rows.reveal(), a[0:2], error=1e-3)
+    assert_parties_in_step(mpc, "MPP encrypted column-wise: rows [0:2]")
+    transposed = local.T
+    transposed.encrypt()
+    columns = transposed[:, 0:2]
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPP encrypted transpose: columns [:, 0:2] (CP1's rows)", columns.reveal(), a[0:2].T, error=1e-3)
+    assert_parties_in_step(mpc, "MPP encrypted transpose: columns [:, 0:2]")
+
+
+def test_mpp_encrypted_indexing(mpc):
+    """Encrypted MPPs indexed through the aligners, whose parties without the data work on placeholders (nil-ideal
+    ciphertexts): an element of an encrypted partitioned vector read and assigned (the parties that do not hold it slice
+    a placeholder of the holder's size), and a column block of an encrypted cohort at unequal ratios and with an empty
+    partition read and assigned (the aligner pads the shorter partitions with placeholder rows). A placeholder must
+    add nothing and still take the refresh council the others take (a version of the Ciphertensor slice rework masked
+    them and crashed or hung)."""
+    n_cp = mpc.comms.number_of_parties - 1
+    ratios = [3 for _ in range(n_cp)]
+    total = ratios.sum()
+    values = [float(i) * 0.5 - 1.0 for i in range(total)]
+    start = ratios[:mpc.pid - 1].sum() if mpc.pid else 0
+    stop = start + ratios[mpc.pid - 1] if mpc.pid else total
+    vector = MPP[Tuple[int], float](
+        _mpc=mpc, _ratios=ratios, _local_data=array(values) if mpc.pid == 0 else array(values[start:stop]), _transposed=True)
+    vector.encrypt()
+    item = vector[1]
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPP encrypted partitioned vector: v[1]", item.reveal(), array([values[1]]), error=1e-3)
+    assert_parties_in_step(mpc, "MPP encrypted partitioned vector: v[1]")
+    w = MPP[Tuple[int], float](
+        _mpc=mpc, _ratios=[1 if q == 0 else 0 for q in range(n_cp)],
+        _local_data=array([9.0]) if mpc.pid <= 1 else ndarray[Tuple[int], float](), _transposed=True)
+    if mpc.pid == 1:
+        w.encrypt()
+    vector[1] = w
+    if mpc.pid:
+        expected = values.copy()
+        expected[1] = 9.0
+        assert_eq_approx(f"CP{mpc.pid}:\tMPP encrypted partitioned vector: v[1] = w", vector.reveal(), array(expected), error=1e-3)
+    assert_parties_in_step(mpc, "MPP encrypted partitioned vector: v[1] = w")
+
+    for cohort_ratios in (unequal_ratios(n_cp), ratios_with_empty(n_cp)):
+        a = cohort_matrix(mpc, cohort_ratios.sum(), 4)
+        b = cohort_matrix(mpc, cohort_ratios.sum(), 4) * 0.5
+        x = partition(mpc, a, cohort_ratios)
+        x.encrypt()
+        block = x[:, 0:2]
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tMPP encrypted, ratios {cohort_ratios}: X[:, 0:2]", block.reveal(), a[:, 0:2], error=1e-3)
+        assert_parties_in_step(mpc, f"MPP encrypted, ratios {cohort_ratios}: X[:, 0:2]")
+        y = partition(mpc, b, cohort_ratios)
+        y.encrypt()
+        x[:, 0:2] = y[:, 0:2]
+        if mpc.pid:
+            expected_x = a.copy()
+            for i in range(cohort_ratios.sum()):
+                for j in range(2):
+                    expected_x[i, j] = b[i, j]
+            assert_eq_approx(f"CP{mpc.pid}:\tMPP encrypted, ratios {cohort_ratios}: X[:, 0:2] = Y[:, 0:2]", x.reveal(), expected_x, error=1e-3)
+        assert_parties_in_step(mpc, f"MPP encrypted, ratios {cohort_ratios}: X[:, 0:2] = Y[:, 0:2]")
+
+
 def test_mpp[TP](mpc: MPCEnv[TP], modulus: TP):
     mpc.comms.sync_parties()
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
@@ -1019,5 +1096,7 @@ def test_mpp[TP](mpc: MPCEnv[TP], modulus: TP):
     test_mpp_pad_with_value(mpc)
     test_mpp_pad_with_value_copies(mpc)
     test_mpp_columns(mpc)
+    test_mpp_column_wise_row_slices(mpc)
+    test_mpp_encrypted_indexing(mpc)
 
     print(f'CP{mpc.pid}:\tSequre MHE MPP tests on {alg_struct} passed.\n')
