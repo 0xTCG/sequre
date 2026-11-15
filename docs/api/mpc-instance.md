@@ -354,8 +354,9 @@ Multiparty homomorphic encryption based on the CKKS scheme. Provides collective 
 |---|---|---|
 | `rescale` | `(x, target_scale)` | Rescale ciphertexts to `target_scale` |
 | `requires_bootstrap` | `(x, min_level_distance=0)` | Check which ciphertexts need bootstrapping (returns `list[bool]`) |
-| `bootstrap` | `(x, is_broadcast=False, min_level_distance=0)` | Collectively bootstrap ciphertexts that need it |
+| `bootstrap` | `(x, is_broadcast=False, min_level_distance=0)` | Collectively bootstrap ciphertexts that need it. With `is_broadcast` (ciphertexts that are the same at every party, such as an aggregate) one bootstrap serves every party: each takes the hub's copy and gets its refresh, so the copies come out the same, also where they had come apart. Otherwise one council decides, and each party's ciphertexts are bootstrapped in rounds of their own |
 | `refresh` | `(x, is_broadcast=False, min_level_distance=0)` | Rescale then bootstrap as needed (recommended before heavy computation) |
+| `refresh_council` | `(x, status=0)` | One refresh council among the compute parties that also carries a status from each: rescale `x`, then one collect gives every party's status and which of its ciphertexts need a collective bootstrap. Returns every compute party's status (the same list at each), so that the caller can raise at every party alike when one is nonzero; every bootstrap any party needs runs first, whatever the statuses. `x` may be empty: the parties need only hold the same number of councils |
 | `drop_level` | `(a, out_level)` | Drop ciphertext level (works on `list[Ciphertext]` and `list[list[Ciphertext]]`) |
 | `flatten_levels` | `(x)` | Drop all ciphertexts in a matrix to the minimum level. Returns `(matrix, min_level)` |
 

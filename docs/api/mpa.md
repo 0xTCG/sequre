@@ -66,7 +66,7 @@ mpa = MPA(mpc, my_ciphertensor)
 | `-a` | Negation |
 | `a > b` | Secure greater-than (uses [MPC switching](../user-guide/switching.md) internally) |
 | `a < b` | Secure less-than (uses [MPC switching](../user-guide/switching.md) internally) |
-| `a[i]`, `a[i] = v` | Indexing and slicing |
+| `a[i]`, `a[i] = v` | Indexing and slicing, at every party with the same index; negative ints count from the end (an int out of range raises `IndexError`) |
 | `bool(a)` | Boolean conversion |
 | `len(a)` | Length of first dimension |
 

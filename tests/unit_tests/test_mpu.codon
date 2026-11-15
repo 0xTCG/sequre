@@ -185,9 +185,9 @@ def test_mpu_comparisons(mpc):
 def test_mpu_mixed_cohorts(mpc):
     """M-MP-21: the MPU per-partition products with an MPP that some compute parties hold encrypted and the others in the
     clear (unequal and empty partitions): the mixed MPP is encrypted at every party for the product. MPA + MPP and
-    MPA - MPP: an MPA that holds its shares encrypted takes a mixed MPP, and one that holds them in the clear, which
-    MPA's setitem cannot take an encrypted partition into yet (H-23), raises the same error at every compute party. Every
-    party in step after each operation."""
+    MPA - MPP: an MPA that holds its shares encrypted takes a mixed MPP, and so does one that holds them in the clear,
+    whose shares are then encrypted at every party (H-23; it raised the same error at every compute party before
+    the fix). Every party in step after each operation."""
     n_cp = mpc.comms.number_of_parties - 1
     for ratios in (unequal_ratios(n_cp), ratios_with_empty(n_cp)):
         rows = ratios.sum()
@@ -233,23 +233,17 @@ def test_mpu_mixed_cohorts(mpc):
         summed = MPU[Tuple[int, int], float](_mpp=MPP[Tuple[int, int], float](mpc), _mpa=encrypted_mpa) + mixed
         assert_parties_in_step(mpc, f"MPU encrypted MPA + mixed, {label}")
 
-        # An MPA with its shares in the clear (a fresh one: mixed * mpa_a above encrypted mpa_a's shares in place): the
-        # parties that hold rows each place theirs, and one of those holds its partition encrypted. With a single holder
-        # the sum takes no setitem and works; the difference always places rows.
+        # An MPA with its shares in the clear (a fresh one: mixed * mpa_a above encrypted mpa_a's shares in place) plus and
+        # minus the mixed cohort: every share encrypted, each party adding its partition into its own (H-23, the user's
+        # choice of 2026-11-15; before the fix both raised NotImplementedError at every compute party, the sum except
+        # with a single holder)
         plain_mpa = MPU(mpc, a if mpc.pid == 1 else a.zeros(), "additive")
-        raised_add, raised_sub = False, False
-        try:
-            plain_mpa + mixed
-        except NotImplementedError:
-            raised_add = True
+        plain_sum = plain_mpa + mixed
         assert_parties_in_step(mpc, f"MPU plain MPA + mixed, {label}")
-        try:
-            plain_mpa - mixed
-        except NotImplementedError:
-            raised_sub = True
+        plain_diff = plain_mpa - mixed
         assert_parties_in_step(mpc, f"MPU plain MPA - mixed, {label}")
 
-        revealed = [product.reveal(), product_t.reveal(), product_mpa.reveal(), product_mpp.reveal(), elem_wise.reveal(), summed.reveal()]
+        revealed = [product.reveal(), product_t.reveal(), product_mpa.reveal(), product_mpp.reveal(), elem_wise.reveal(), summed.reveal(), plain_sum.reveal(), plain_diff.reveal()]
         if mpc.pid:
             assert_eq_approx(f"CP{mpc.pid}:\tMPU mixed @ MPA, {label}", revealed[0], a @ w, error=0.01)
             assert_eq_approx(f"CP{mpc.pid}:\tMPU mixed.T @ MPA, {label}", revealed[1], a.T @ bs, error=0.01)
@@ -257,9 +251,8 @@ def test_mpu_mixed_cohorts(mpc):
             assert_eq_approx(f"CP{mpc.pid}:\tMPU mixed.T @ MPP, {label}", revealed[3], a.T @ b, error=0.01)
             assert_eq_approx(f"CP{mpc.pid}:\tMPU mixed * MPA, {label}", revealed[4], a * a, error=0.01)
             assert_eq_approx(f"CP{mpc.pid}:\tMPU encrypted MPA + mixed, {label}", revealed[5], a + a, error=0.01)
-            several = len(parties) > 1
-            assert_eq(f"CP{mpc.pid}:\tMPU plain MPA + mixed raises at every compute party, {label}", raised_add, several)
-            assert_eq(f"CP{mpc.pid}:\tMPU plain MPA - mixed raises at every compute party, {label}", raised_sub, True)
+            assert_eq_approx(f"CP{mpc.pid}:\tMPU plain MPA + mixed, {label}", revealed[6], a + a, error=0.01)
+            assert_eq_approx(f"CP{mpc.pid}:\tMPU plain MPA - mixed, {label}", revealed[7], a - a, error=0.01)
 
 
 def test_mpu_reveal_local(mpc):
@@ -593,6 +586,342 @@ def test_mpu_t_matmul_wide_mpa(mpc):
     assert_parties_in_step(mpc, f"{label}: M[0:2] after it")
 
 
+MPA_STATES = ["shares in the clear", "shares in the clear beside their encryption", "shares only encrypted",
+              "shares in the clear beside their aggregate", "only an aggregate"]
+PARTITION_KINDS = ["in the clear", "encrypted", "mixed (CP1 encrypted)"]
+
+
+def additive_as(mpc, value, state: int) -> MPU:
+    # An additive MPU of value (CP1's share the value, the others' zeros) in one of MPA_STATES: as MPA.encrypt() and
+    # aggregate() (which reveal() and the MPU products call on their operands) leave it
+    share = value if mpc.pid <= 1 else value.zeros()
+    if state == 2 and mpc.pid:
+        return MPU(_mpp=MPP[Tuple[int, int], float](mpc), _mpa=MPA[Tuple[int, int], float](mpc, Ciphertensor[Ciphertext].enc(mpc, share, encoding=ENC_ROW)))
+    m = MPU(mpc, share, "additive")
+    if state == 1:
+        m._mpa.encrypt()
+    elif state >= 3:
+        m._mpa.aggregate()
+        if state == 4 and mpc.pid:
+            m._mpa._plain = ndarray[Tuple[int, int], float]()
+    return m
+
+
+def additive_vector(mpc, values: List[float], state: int) -> MPU:
+    # A 1-dim additive MPU of values (CP1's share the values, the others' zeros), its shares in the clear (state 0) or held
+    # only encrypted (state 2)
+    share = array(values) if mpc.pid <= 1 else array([0.0 for _ in values])
+    if state == 2 and mpc.pid:
+        return MPU(_mpp=MPP[Tuple[int], float](mpc), _mpa=MPA[Tuple[int], float](mpc, Ciphertensor[Ciphertext].enc(mpc, share, encoding=ENC_ROW)))
+    return MPU(mpc, share, "additive")
+
+
+def partitioned_as(mpc, matrix, ratios: List[int], kind: int) -> MPU:
+    start, stop = own_rows(mpc, ratios)
+    x = MPU(mpc, matrix[start:stop] if mpc.pid else matrix, "partition")
+    if kind == 1 or (kind == 2 and mpc.pid == 1):
+        x._mpp.encrypt()
+    return x
+
+
+def test_mpu_add_mpa_mpp(mpc):
+    """H-23, M-MP-31, M-MP-02 on MPA ± MPP, M-MP-09, M-MP-10: an additive MPU plus and minus a partitioned MPU for every
+    MPA state (MPA_STATES) and partition kind (in the clear, encrypted, mixed), at equal and unequal ratios, against
+    plaintext and in step, the operands unchanged. As the user chose: an MPA that is only an aggregate gets the joined
+    MPP (still only an aggregate); otherwise each party adds its partition into its own share, every share encrypted
+    unless all of it is in the clear; a representation the addition did not update is dropped. Before the fix the
+    encrypted partitions and the aggregate-only MPA raised NotImplementedError, and an MPA carrying an aggregate or an
+    encryption beside its shares came back with it stale (M + X revealed M's value)."""
+    n_cp = mpc.comms.number_of_parties - 1
+    for ratios in ([2 for _ in range(n_cp)], unequal_ratios(n_cp)):
+        total = ratios.sum()
+        a = cohort_matrix(mpc, total, 4)
+        b = cohort_matrix(mpc, total, 4) * 0.5
+        for state in range(5):
+            for kind in range(3):
+                label = f"MPU additive ({MPA_STATES[state]}) ± partition ({PARTITION_KINDS[kind]}), ratios {ratios}"
+                m = additive_as(mpc, a, state)
+                x = partitioned_as(mpc, b, ratios, kind)
+                plus = m + x
+                minus = m - x
+                left = x - m
+                assert_parties_in_step(mpc, label)
+                if mpc.pid:
+                    # The result holds only the representation the addition updated (the user's choice): an aggregate
+                    # for an aggregate-only MPA, else the shares, in the clear or encrypted, nothing stale beside them
+                    held = int(plus._mpa.has_plain()) + int(plus._mpa.has_encryption()) + int(plus._mpa.has_aggregate())
+                    assert_eq(f"CP{mpc.pid}:\t{label}: M + X holds one representation", held, 1)
+                    assert_eq(f"CP{mpc.pid}:\t{label}: M + X only an aggregate as M", plus._mpa.is_aggregate(), state == 4)
+                revealed_plus = plus.reveal()
+                revealed_minus = minus.reveal()
+                revealed_left = left.reveal()
+                revealed_m = m.reveal()
+                revealed_x = x.reveal()
+                if mpc.pid:
+                    assert_eq_approx(f"CP{mpc.pid}:\t{label}: M + X", revealed_plus, a + b, error=1e-3)
+                    assert_eq_approx(f"CP{mpc.pid}:\t{label}: M - X", revealed_minus, a - b, error=1e-3)
+                    assert_eq_approx(f"CP{mpc.pid}:\t{label}: X - M", revealed_left, b - a, error=1e-3)
+                    assert_eq_approx(f"CP{mpc.pid}:\t{label}: M unchanged", revealed_m, a, error=1e-3)
+                    assert_eq_approx(f"CP{mpc.pid}:\t{label}: X unchanged", revealed_x, b, error=1e-3)
+                assert_parties_in_step(mpc, f"{label}: reveals")
+
+
+def test_mpu_add_mpa_mpp_shapes(mpc):
+    """H-23 and M-MP-09: MPA + MPP where the partitions are semi-encrypted (an A @ B.T result; it added only the block in
+    the clear before the fix, a shape error at every party), transposed (the MPA added along the partitions' rows,
+    returned in its own orientation), held by one party (it left the MPA in the clear at the holder and encrypted
+    elsewhere), and 1-dim (a column's segments), with the MPA's shares in the clear and only encrypted (row-wise, so that
+    the A @ B.T result's column-wise blocks and the transposed MPP's partitions are converted to the shares' layout as
+    they are added)."""
+    n_cp = mpc.comms.number_of_parties - 1
+    ratios = [2 for _ in range(n_cp)]
+    total = ratios.sum()
+    a = cohort_matrix(mpc, total, total)
+    b = cohort_matrix(mpc, total, 4) * 0.5
+    c = cohort_matrix(mpc, total, 4) * 0.25
+    start, stop = own_rows(mpc, ratios)
+    for state in (0, 2):
+        label = f"MPU additive ({MPA_STATES[state]})"
+        m = additive_as(mpc, a, state)
+        semi = MPU(_mpp=partitioned_as(mpc, b, ratios, 0)._mpp @ partitioned_as(mpc, c, ratios, 0)._mpp.T, _mpa=MPA[Tuple[int, int], float](mpc))
+        mt = additive_as(mpc, b.T.copy(), state)
+        xt = partitioned_as(mpc, b, ratios, 1).T
+        single = [total if q == 0 else 0 for q in range(n_cp)]
+        mb = additive_as(mpc, b, state)
+        with_single = mb + partitioned_as(mpc, c, single, 0)
+        with_semi = m + semi
+        with_transposed = mt + xt
+        assert_parties_in_step(mpc, f"{label}: shapes")
+        revealed_semi = with_semi.reveal()
+        revealed_transposed = with_transposed.reveal()
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\t{label} + A @ B.T (semi-encrypted)", revealed_semi, a + b @ c.T, error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label} + an encrypted MPP transposed", revealed_transposed, b.T + b.T, error=1e-3)
+        revealed_single = with_single.reveal()
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\t{label} + an MPP held by CP1", revealed_single, b + c, error=1e-3)
+        assert_parties_in_step(mpc, f"{label}: shapes: reveals")
+        # 1-dim MPAs plus vectors stored as 2-dim tensors (review c19-cr1-1, -2): a row of column-wise partitions (X[1],
+        # held by CP1, a row stored as a column), a row of an A @ B.T result (K[1]) and a column of row-wise encrypted
+        # partitions (X.T[1], each partition's a one-column tensor)
+        xcw = partitioned_as(mpc, b, ratios, 0)._mpp.T
+        xcw.encrypt()
+        xcw = xcw.T
+        xrw = partitioned_as(mpc, b, ratios, 1)._mpp
+        kk = partitioned_as(mpc, b, ratios, 0)._mpp @ partitioned_as(mpc, c, ratios, 0)._mpp.T
+        k_full = b @ c.T
+        b_row = [b[1, j] for j in range(4)]
+        k_row = [k_full[1, j] for j in range(total)]
+        b_col = [b[i, 1] for i in range(total)]
+        with_cw_row = additive_vector(mpc, [0.25 for _ in range(4)], state) + MPU(_mpp=xcw[1], _mpa=MPA[Tuple[int], float](mpc))
+        with_k_row = additive_vector(mpc, [0.25 for _ in range(total)], state) - MPU(_mpp=kk[1], _mpa=MPA[Tuple[int], float](mpc))
+        with_rw_col = additive_vector(mpc, [0.25 for _ in range(total)], state) + MPU(_mpp=xrw.T[1], _mpa=MPA[Tuple[int], float](mpc))
+        assert_parties_in_step(mpc, f"{label} 1-dim + vectors stored as 2-dim tensors")
+        revealed_vectors = [with_cw_row.reveal(), with_k_row.reveal(), with_rw_col.reveal()]
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\t{label} 1-dim + a row of column-wise partitions", revealed_vectors[0], array(b_row) + 0.25, error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label} 1-dim - a row of A @ B.T", revealed_vectors[1], array([0.25 - v for v in k_row]), error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label} 1-dim + a column of row-wise encrypted partitions", revealed_vectors[2], array(b_col) + 0.25, error=1e-3)
+        assert_parties_in_step(mpc, f"{label} 1-dim + vectors stored as 2-dim tensors: reveals")
+        values = [float(i) * 0.5 - 1.0 for i in range(total)]
+        mv = MPU(mpc, array(values) if mpc.pid <= 1 else array([0.0 for _ in range(total)]), "additive")
+        if state == 2 and mpc.pid:
+            mv._mpa._encryption = Ciphertensor[Ciphertext].enc(mpc, mv._mpa._plain, encoding=ENC_ROW)
+            mv._mpa._plain = ndarray[Tuple[int], float]()
+        col = MPU(_mpp=MPP[Tuple[int], float](_mpc=mpc, _ratios=ratios, _local_data=array(values) if mpc.pid == 0 else array(values[start:stop]), _transposed=True), _mpa=MPA[Tuple[int], float](mpc))
+        with_col = mv + col
+        assert_parties_in_step(mpc, f"{label} 1-dim + a column")
+        revealed_col = with_col.reveal()
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\t{label} 1-dim + a column (segments)", revealed_col, array(values) * 2.0, error=1e-3)
+        assert_parties_in_step(mpc, f"{label} 1-dim + a column: reveal")
+
+
+def encrypted_shares_at(mpc, value, level: int, column_wise: bool) -> MPU:
+    # An additive MPU of value (CP1's share the value, the others' zeros) whose shares are held only encrypted, row-wise
+    # or column-wise, resting at the given level with the default scale (a state a refresh leaves ciphertexts in); a
+    # negative level leaves them fresh
+    share = value if mpc.pid <= 1 else value.zeros()
+    if mpc.pid == 0:
+        return MPU(mpc, share, "additive")
+    if column_wise:
+        enc = Ciphertensor[Ciphertext].enc(mpc, share.T.copy(), encoding=ENC_ROW)
+        enc._transposed = True
+    else:
+        enc = Ciphertensor[Ciphertext].enc(mpc, share, encoding=ENC_ROW)
+    if level >= 0:
+        enc._data = mpc.mhe.drop_level(enc._data, level)
+    return MPU(_mpp=MPP[Tuple[int, int], float](mpc), _mpa=MPA[Tuple[int, int], float](mpc, enc))
+
+
+def test_mpu_add_mpa_mpp_low_level(mpc):
+    """MPA ± MPP near the bootstrap level, in states Sequre leaves ciphertexts in (reviews c19-cr2-2, c19-cr3-1,
+    c19-cr4-1, c19-cr4-4): shares held only encrypted one level above the bootstrap level (where a refresh can leave
+    them), or as a product (the scale squared, as every product rests until its next refresh), plus column-wise
+    partitions one level above the bootstrap level (shifts into column-wise shares, conversions into row-wise ones) and
+    A @ B.T partitions (conversions); an aggregate-only MPA there plus an A @ B.T result. Each sum is revealed, summed
+    over its rows, added to a product and scaled, each of which refreshes: a moved value rests as a product does (its
+    source's level, the scale squared), so the sums stay above the bootstrap level. Two cases use values of a few
+    hundred, where a scale bias between the moved values and the rest would show: shares at the default scale (review
+    c19-cr4-2) and column-wise shares held as a product, which reach the default scale only through the refresh of the
+    ciphertexts the moved values land in (review c19-cr5-3). The aggregate stays the same at every party."""
+    n_cp = mpc.comms.number_of_parties - 1
+    ratios = unequal_ratios(n_cp)
+    total = ratios.sum()
+    level = mpc.mhe.bootstrap_min_level + 1
+    b = cohort_matrix(mpc, total, 4) * 0.5
+    c = cohort_matrix(mpc, total, 4) * 0.25
+    x = partitioned_as(mpc, b, ratios, 0)._mpp.T
+    x.encrypt()
+    x = x.T
+    if mpc.pid:
+        x._encryption_unified._data = mpc.mhe.drop_level(x._encryption_unified._data, level)
+    kk = partitioned_as(mpc, b, ratios, 0)._mpp @ partitioned_as(mpc, c, ratios, 0)._mpp.T
+    k_full = b @ c.T
+    for case in ("column-wise shares + column-wise MPP", "row-wise shares + column-wise MPP", "row-wise shares + A @ B.T", "row-wise shares x 200 + column-wise MPP", "column-wise product shares x 200 + column-wise MPP"):
+        big = "x 200" in case
+        width = total if case.endswith("A @ B.T") else 4
+        a = cohort_matrix(mpc, total, width) * (200.0 if big else 1.0)
+        if case.startswith("column-wise product shares"):
+            m = encrypted_shares_at(mpc, a * 2.0, -1, True) * 0.5
+        else:
+            m = encrypted_shares_at(mpc, a, level, case.startswith("column-wise"))
+        if case.endswith("A @ B.T"):
+            addend = MPU(_mpp=kk, _mpa=MPA[Tuple[int, int], float](mpc))
+            added = k_full
+        else:
+            addend = MPU(_mpp=x, _mpa=MPA[Tuple[int, int], float](mpc))
+            added = b
+        expected = a + added
+        # A product of fresh shares in the shares' layout: an aggregate at the scale squared
+        p = encrypted_shares_at(mpc, a * 0.5, -1, case.startswith("column-wise"))
+        s = m + addend
+        revealed = s.reveal()
+        rows_summed = (s.sum(0) * 2.5).reveal()
+        with_product = ((s + p * p) * 2.5).reveal()
+        difference = (m - addend).reveal()
+        assert_parties_in_step(mpc, f"MPU {case}, near the bootstrap level")
+        if mpc.pid:
+            label = f"MPU {case}, near the bootstrap level"
+            rel = 1e-5 if big else 0.0
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: M + X", revealed, expected, error=1e-2, rel_error=rel)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: (M + X).sum(0) * 2.5", rows_summed, expected.sum(axis=0) * 2.5, error=5e-2, rel_error=rel)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: (M + X + P * P) * 2.5", with_product, (expected + (a * 0.5) * (a * 0.5)) * 2.5, error=5e-2, rel_error=1e-4 if big else 0.0)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: M - X", difference, a - added, error=1e-2, rel_error=rel)
+        assert_parties_in_step(mpc, f"MPU {case}, near the bootstrap level: reveals")
+
+    a2 = cohort_matrix(mpc, total, total)
+    m2 = additive_as(mpc, a2, 4)
+    if mpc.pid:
+        m2._mpa._aggregate._data = mpc.mhe.drop_level(m2._mpa._aggregate._data, level)
+    s2 = m2 + MPU(_mpp=kk, _mpa=MPA[Tuple[int, int], float](mpc))
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tMPU aggregate near the bootstrap level + A @ B.T: the aggregate the same at every party", same_at_every_party(mpc, s2._mpa._aggregate._data), True)
+    scaled2 = (s2 * 2.5).reveal()
+    assert_parties_in_step(mpc, "MPU aggregate near the bootstrap level + A @ B.T, then * 2.5")
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPU (aggregate near the bootstrap level + A @ B.T) * 2.5", scaled2, (a2 + k_full) * 2.5, error=1e-2)
+    assert_parties_in_step(mpc, "MPU aggregate near the bootstrap level: reveal")
+
+
+def test_mpu_add_mpa_mpp_aggregate_refresh(mpc):
+    """MPA ± MPP on an MPA that is only an aggregate (a tall one, stored column-wise), plus row-wise encrypted partitions.
+    After products by a public float that bootstrap it on the way (from one level above the bootstrap level, six
+    products by 1.5), the aggregate is still the same at every party, and so is M + X, which is right: a product by a
+    constant refreshed an aggregate party by party, so that its copies differed, and the sum's refresh, which takes
+    every copy as the same, decrypted to garbage (review c19-cr5-1). And a fresh aggregate plus fresh partitions: the
+    aggregate's ciphertexts are refreshed once for all partitions, so none of them is rescaled (review c19-cr5-2)."""
+    n_cp = mpc.comms.number_of_parties - 1
+    ratios = unequal_ratios(n_cp)
+    total = ratios.sum()
+    level = mpc.mhe.bootstrap_min_level + 1
+    a = cohort_matrix(mpc, total, 4)
+    b = cohort_matrix(mpc, total, 4) * 0.5
+    x = partitioned_as(mpc, b, ratios, 1)
+    m = additive_as(mpc, a, 4)
+    if mpc.pid:
+        m._mpa._aggregate._data = mpc.mhe.drop_level(m._mpa._aggregate._data, level)
+    for _ in range(6):
+        m = m * 1.5
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tMPU aggregate one level above the bootstrap level, times 1.5 six times: the same at every party", same_at_every_party(mpc, m._mpa._aggregate._data), True)
+    s = m + x
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tMPU aggregate times 1.5 six times, + X: the same at every party", same_at_every_party(mpc, s._mpa._aggregate._data), True)
+    revealed = s.reveal()
+    assert_parties_in_step(mpc, "MPU aggregate times 1.5 six times, + X")
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPU aggregate times 1.5 six times, + X", revealed, a * 11.390625 + b, error=1e-2, rel_error=1e-5)
+
+    fresh = additive_as(mpc, a, 4)
+    levels_before = [c.level() for c in fresh._mpa._aggregate._data] if mpc.pid else List[int]()
+    s2 = fresh + x
+    if mpc.pid:
+        levels_after = [c.level() for c in s2._mpa._aggregate._data]
+        assert_eq(f"CP{mpc.pid}:\tMPU fresh aggregate + fresh X: no level spent on the aggregate", levels_after, levels_before)
+    revealed2 = s2.reveal()
+    assert_parties_in_step(mpc, "MPU fresh aggregate + fresh X")
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPU fresh aggregate + fresh X", revealed2, a + b, error=1e-2)
+
+
+def test_mpu_aggregate_drift(mpc):
+    """Aggregates whose copies came apart, then a bootstrap in the broadcast mode (review c19-cr6-1). A sum's mask product
+    and an MPA * MPP product refresh the aggregate, or the joined MPP, at each party in a round of its own (H-59), which
+    leaves every party's copy valid but different. The next broadcast-mode bootstrap takes the hub's copy and writes its
+    refresh into every party's copy: right, and the same at every party. Before, every party refreshed its own copy
+    collectively, which combined shares of different ciphertexts: garbage. That bootstrap comes from a product by a
+    constant (after a sum: six products by 1.5, the fifth bootstraps; after an MPA * MPP product: the same) or from a power
+    (after a sum: four products by 1.5, then a square, which bootstraps; review c19-cr7-1). Each starts one level above
+    the bootstrap level as a product (five products by 1.5 from fresh), where the sum's or the product's refresh
+    bootstraps."""
+    n_cp = mpc.comms.number_of_parties - 1
+    ratios = unequal_ratios(n_cp)
+    total = ratios.sum()
+    a = cohort_matrix(mpc, total, 4)
+    b = cohort_matrix(mpc, total, 4) * 0.5
+    values = [a[i, 0] for i in range(total)]
+    share = array(values) if mpc.pid <= 1 else array([0.0 for _ in range(total)])
+    total_value = sum(values)
+
+    for then_square in (False, True):
+        v = MPU(mpc, share, "additive")
+        v._mpa.aggregate()
+        if mpc.pid:
+            v._mpa._plain = ndarray[Tuple[int], float]()
+        for _ in range(5):
+            v = v * 1.5
+        s = v.sum(0)
+        for _ in range(4 if then_square else 6):
+            s = s * 1.5
+        if then_square:
+            s = s ** 2
+        label = "MPU aggregate summed after five products, then " + ("times 1.5 four times and squared" if then_square else "times 1.5 six times")
+        if mpc.pid:
+            assert_eq(f"CP{mpc.pid}:\t{label}: the same at every party", same_at_every_party(mpc, s._mpa._aggregate._data), True)
+        revealed = s.reveal()
+        assert_parties_in_step(mpc, label)
+        if mpc.pid:
+            expected = total_value * 38.443359375 if then_square else total_value * 86.49755859375  # 1.5 ** 9, 1.5 ** 11
+            if then_square:
+                expected = expected * expected
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}", revealed, array([expected]), error=1e-1, rel_error=1e-4)
+
+    m = additive_as(mpc, a, 4)
+    x = partitioned_as(mpc, b, ratios, 1)
+    for _ in range(5):
+        x = x * 1.5
+    p = m * x
+    for _ in range(6):
+        p = p * 1.5
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tMPU aggregate times partitions after five products, then times 1.5 six times: the same at every party", same_at_every_party(mpc, p._mpa._aggregate._data), True)
+    revealed_product = p.reveal()
+    assert_parties_in_step(mpc, "MPU aggregate times partitions, then products by a constant")
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPU aggregate times partitions after five products, then times 1.5 six times", revealed_product, a * b * 86.49755859375, error=1e-2, rel_error=1e-4)
+
+
 def test_mpu[TP](mpc: MPCEnv[TP], modulus: TP):
     mpc.comms.sync_parties()
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
@@ -633,5 +962,10 @@ def test_mpu[TP](mpc: MPCEnv[TP], modulus: TP):
     test_mpu_sums(mpc)
     test_mpu_pad_with_value(mpc)
     test_mpu_t_matmul_wide_mpa(mpc)
+    test_mpu_add_mpa_mpp(mpc)
+    test_mpu_add_mpa_mpp_shapes(mpc)
+    test_mpu_add_mpa_mpp_low_level(mpc)
+    test_mpu_add_mpa_mpp_aggregate_refresh(mpc)
+    test_mpu_aggregate_drift(mpc)
 
     print(f'CP{mpc.pid}:\tSequre MHE MPU tests on {alg_struct} passed.\n')

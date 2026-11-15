@@ -124,6 +124,15 @@ CASES = [
     ("mp.mpa.matmul_public_via_mpc", "", "aggregate MPA 16x64 @ ndarray 64x3 under allow_mpc_switch(): one conversion via MPC and back, every party joins"),
     ("mp.mpa.reveal_plain", "", "MPA.reveal of additive 16x64 shares every compute party holds in the clear (the sum to every party)"),
     ("mp.mpu.add_local", "", "MPU(partition) + MPU(partition) on local plaintext partitions, 2x8x64"),
+    ("mp.mpu.add_mpa_mpp", "", "MPU(additive) + MPU(partition): each party adds its partition into its MPA share in the clear, 2x8x64"),
+    ("mp.mpu.add_mpa_enc_mpp", "", "MPU(additive, shares only encrypted) + MPU(partition) in the clear: each party adds its partition into its encrypted share, 2x8x64"),
+    ("mp.mpp.getitem_row_enc", "", "encrypted MPP X[3]: one row of CP1's row-wise partition (a view), 2x8x64"),
+    ("mp.mpp.getitem_rows_enc", "", "encrypted MPP X[4:12]: rows across a partition boundary (views), 2x8x64"),
+    ("mp.mpp.getitem_cols_enc", "", "encrypted MPP X[:, 0:16]: a column block of row-wise partitions (masked), 2x8x64"),
+    ("mp.mpp.column_enc", "", "encrypted MPP X.T[5]: a column of each row-wise partition (masked and rotated), 2x8x64"),
+    ("mp.mpp.setitem_rows_enc", "", "encrypted MPP X[4:12] = Y[4:12]: whole rows of row-wise partitions, 2x8x64"),
+    ("mp.mpp.setitem_cols_enc", "", "encrypted MPP X[:, 0:16] = Y[:, 0:16]: a column block of row-wise partitions (masked), 2x8x64"),
+    ("mp.mpp.getitem_vec_enc", "", "encrypted partitioned vector (a column, 8 values per party) v[3], 2x8"),
     ("mp.mpu.matmul_ntt", "", "MPU(partition) A @ B.T, 2x8x64 partitions"),
     ("mp.mpu.matmul_mpp_mpa", "", "MPU(partition) 16x64 @ MPU(additive) 64x1"),
     ("mp.mpu.sum_axis0_local", "", "MPU(partition).sum(0) on local plaintext partitions: each party's column sums become its MPA share, 2x8x64"),
@@ -1283,6 +1292,138 @@ def bench_mp(mpc, b: Bench):
         rv = out.reveal(mpc)
         if mpc.pid:
             b.report(f"{n_cp}x{per}x{cols}", t, max_abs_err_2d(rv, A + B))
+
+    if b.want(mpc, "mp.mpu.add_mpa_mpp") or b.want(mpc, "mp.mpu.add_mpa_enc_mpp"):
+        # Additive shares as in mp.mpa (CP1 A - R, CP2 R) plus a partition of B, in the clear
+        R2 = array(shared_float_matrix(mpc, rows, cols, -1.0, 1.0))
+        share2 = zeros_like(A) if mpc.pid == 0 else (A - R2 if mpc.pid == 1 else R2)
+        ux = MPU(mpc, pB, "partition")
+        if b.want(mpc, "mp.mpu.add_mpa_mpp"):
+            um = MPU(mpc, share2, "additive")
+            sum_out = um + ux
+            t = Timer(b.reps(9), batch=100)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    sum_out = um + ux
+                t.end(mpc)
+            rv = sum_out.reveal(mpc)
+            if mpc.pid:
+                b.report(f"{n_cp}x{per}x{cols}", t, max_abs_err_2d(rv, A + B))
+        if b.want(mpc, "mp.mpu.add_mpa_enc_mpp"):
+            # Shares held only encrypted (MPA.encrypt() keeps the shares in the clear beside their encryption, and the
+            # sum of the two kinds is another case)
+            if mpc.pid:
+                em = MPA[Tuple[int, int], float](mpc, Ciphertensor[Ciphertext].enc(mpc, share2, encoding=ENC_ROW))
+            else:
+                em = MPA[Tuple[int, int], float](mpc, share2)
+            ue = MPU[Tuple[int, int], float](_mpp=MPP[Tuple[int, int], float](mpc), _mpa=em)
+            enc_sum = ue + ux
+            t = Timer(b.reps(9), batch=5)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    enc_sum = ue + ux
+                t.end(mpc)
+            rv = enc_sum.reveal(mpc)
+            if mpc.pid:
+                b.report(f"{n_cp}x{per}x{cols}", t, max_abs_err_2d(rv, A + B))
+
+    if b.want(mpc, "mp.mpp.getitem_row_enc"):
+        row_out = encA[3]
+        t = Timer(b.reps(9), batch=100)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                row_out = encA[3]
+            t.end(mpc)
+        rv = row_out.reveal()
+        if mpc.pid:
+            b.report(f"{n_cp}x{per}x{cols};row=3", t, max_abs_err_1d(rv, A[3]))
+
+    if b.want(mpc, "mp.mpp.getitem_rows_enc"):
+        rows_out = encA[4:12]
+        t = Timer(b.reps(9), batch=100)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                rows_out = encA[4:12]
+            t.end(mpc)
+        rv = rows_out.reveal()
+        if mpc.pid:
+            b.report(f"{n_cp}x{per}x{cols};rows=4:12", t, max_abs_err_2d(rv, A[4:12]))
+
+    if b.want(mpc, "mp.mpp.getitem_cols_enc"):
+        cols_out = encA[:, 0:16]
+        t = Timer(b.reps(7))
+        while t.next():
+            t.begin(mpc)
+            cols_out = encA[:, 0:16]
+            t.end(mpc)
+        rv = cols_out.reveal()
+        if mpc.pid:
+            b.report(f"{n_cp}x{per}x{cols};cols=0:16", t, max_abs_err_2d(rv, A[:, 0:16]))
+
+    if b.want(mpc, "mp.mpp.column_enc"):
+        col_out = encA.T[5]
+        t = Timer(b.reps(7))
+        while t.next():
+            t.begin(mpc)
+            col_out = encA.T[5]
+            t.end(mpc)
+        rv = col_out.reveal()
+        if mpc.pid:
+            b.report(f"{n_cp}x{per}x{cols};col=5", t, max_abs_err_1d(rv, array([A[i, 5] for i in range(rows)])))
+
+    if b.want(mpc, "mp.mpp.setitem_rows_enc"):
+        set_rows = encA.copy()
+        rows_value = encB[4:12]
+        t = Timer(b.reps(9), batch=100)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                set_rows[4:12] = rows_value
+            t.end(mpc)
+        rv = set_rows.reveal()
+        if mpc.pid:
+            want_rows = A.copy()
+            for i in range(4, 12):
+                for j in range(cols):
+                    want_rows[i, j] = B[i, j]
+            b.report(f"{n_cp}x{per}x{cols};rows=4:12", t, max_abs_err_2d(rv, want_rows))
+
+    if b.want(mpc, "mp.mpp.setitem_cols_enc"):
+        set_cols = encA.copy()
+        cols_value = encB[:, 0:16]
+        t = Timer(b.reps(7))
+        while t.next():
+            t.begin(mpc)
+            set_cols[:, 0:16] = cols_value
+            t.end(mpc)
+        rv = set_cols.reveal()
+        if mpc.pid:
+            want_cols = A.copy()
+            for i in range(rows):
+                for j in range(16):
+                    want_cols[i, j] = B[i, j]
+            b.report(f"{n_cp}x{per}x{cols};cols=0:16", t, max_abs_err_2d(rv, want_cols))
+
+    if b.want(mpc, "mp.mpp.getitem_vec_enc"):
+        column0 = [A[i, 0] for i in range(rows)]
+        start0 = 0 if mpc.pid == 0 else (mpc.pid - 1) * per
+        vec_mpp = MPP[Tuple[int], float](
+            _mpc=mpc, _ratios=[per for _ in range(n_cp)],
+            _local_data=array(column0) if mpc.pid == 0 else array(column0[start0:start0 + per]), _transposed=True)
+        vec_mpp.encrypt()
+        elem_out = vec_mpp[3]
+        t = Timer(b.reps(7))
+        while t.next():
+            t.begin(mpc)
+            elem_out = vec_mpp[3]
+            t.end(mpc)
+        rv = elem_out.reveal()
+        if mpc.pid:
+            b.report(f"{n_cp}x{per};index=3", t, max_abs_err_1d(rv, array([column0[3]])))
 
     if b.want(mpc, "mp.mpu.matmul_ntt"):
         ua = MPU(mpc, pA, "partition")

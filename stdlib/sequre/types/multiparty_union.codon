@@ -9,7 +9,9 @@ from sequre.attributes import sequre
 from sequre.mpc.env import MPCEnv
 from sequre.lattiseq.ckks import Ciphertext
 from sequre.types.ciphertensor import Ciphertensor
-from sequre.types.multiparty_partition import MPP, ALIGN_ENCRYPT, _agree_on_partitions, D_KIND, MPP_UNIFIED, MPP_SEMI
+from sequre.types.multiparty_partition import (
+    MPP, ALIGN_ENCRYPT, _agree_on_partitions, _partition_descriptor, _encrypted_layout, _encrypt_like, _plan_indexing,
+    _indexing_council, D_KIND, D_SIZE, D_UNIFIED, D_LEFT, D_RIGHT, MPP_EMPTY, MPP_CLEAR, MPP_UNIFIED, MPP_SEMI)
 from sequre.types.multiparty_aggregate import MPA
 from sequre.constants import HE_ENC_COST_ESTIMATE, ENC_ROW
 
@@ -846,89 +848,176 @@ class MPU[S, dtype]:
             _mpp=self._mpp @ other,
             _mpa=MPA[S, dtype](self._mpp._mpc))
     
-    def _add_mpa_mpp(mpa: MPA[S, dtype], mpp: MPP[S, dtype]) -> MPA[S, dtype]:
+    def _add_mpa_mpp(mpa: MPA[S, dtype], mpp: MPP[S, dtype], subtract: bool = False) -> MPA[S, dtype]:
+        # mpa + mpp (mpa - mpp with subtract), as the user chose on 2026-11-15 (H-23, M-MP-31):
+        # - an MPA that is only an aggregate: every partition's encryption goes to every party (one round) and each is
+        #   added into the aggregate at its rows, at every party alike; the result is still only an aggregate;
+        # - otherwise each compute party adds its partition into its own share: in the clear if every share is in the
+        #   clear and every partition in the clear (or empty); else every share encrypted, at every party, in one layout
+        #   (_shares_layout), those in the clear encrypting theirs (as MPA's own + does with an encrypted operand), and
+        #   each partition added encrypted (a semi-encrypted one unified), through one indexing council at every
+        #   compute party (the masks the additions take, and any party's error);
+        # - the result carries only the representation the addition updated: an aggregate, or an encryption beside
+        #   shares in the clear, would be stale (M + X revealed M's value, M-MP-31, M-MP-02), and aggregate() rebuilds
+        #   the aggregate from the shares when an operation needs it.
+        # One round among the compute parties agrees on every party's partition and share; the single holder takes the
+        # same path as the others (M-MP-09, M-MP-28). The MPA is copied, never viewed (M-MP-10). A partition in another
+        # layout than the shares or the aggregate is converted as it is added (Ciphertensor._add_rows: one masked move
+        # per value), where that layout is fixed; diagonal storage raises NotImplementedError at every compute party.
         mpc = mpa._mpc
         if mpc.pid == 0:
             return mpa.copy()
-        
-        transposed = mpp._transposed
-        new_mpa = mpa.T if transposed else mpa.copy()
-        
-        # One round among the compute parties: whether one of them holds the whole MPP, and whether one of them would
-        # place an encrypted partition into an MPA share that holds no encryption (_mpa_lacks_encryption)
-        agreed = mpc.comms.collect([int(mpa.shape == mpp.shape), int(MPU[S, dtype]._mpa_lacks_encryption(mpa, mpp))])
-        
-        # Case where MPP partition is present only at a single party
-        if any(bool(d[0]) for d in agreed):
-            is_non_empty = mpa.shape == mpp.shape
-            if mpp.has_local_data():
-                new_mpa += MPA[S, dtype](mpc, mpp._local_data if is_non_empty else zeros(mpa.shape, dtype=dtype))
-            else:
-                mpp.unify_encryption()
-                new_mpa += MPA[S, dtype](mpc, mpp._encryption_unified if is_non_empty else Ciphertensor.zeros(mpc, list(mpa.shape)))
-            return new_mpa
+        transposed = static.len(S) == 2 and mpp._transposed
+        work = mpa.copy().T if transposed else mpa.copy()
 
-        if mpa.ndim == 1 and not transposed:
-            assert mpp.ndim == 1, f"MPA: cannot add MPs of different dimensionality: MPA dim {mpa.ndim} != MPP dim {mpp.ndim}"
-            if mpp.has_local_data():
-                new_mpa += MPA[S, dtype](mpc, mpp._local_data)
-            elif not mpp.is_empty():
-                mpp.unify_encryption()
-                new_mpa += MPA[S, dtype](mpc, mpp._encryption_unified)
-            return new_mpa
+        mine = _partition_descriptor(mpp)
+        mine.extend([int(work.has_plain()), int(work.has_encryption()), int(work.has_aggregate()), MPU[S, dtype]._layout_code(work._encryption), mpp._held_width()])
+        agreed = mpc.comms.collect(mine)
+        descriptors = [d[:D_SIZE] for d in agreed]
+        states = [d[D_SIZE:] for d in agreed]
+        MPU[S, dtype]._check_addend_shapes(work, mpp, descriptors, states)
 
-        MPU[S, dtype]._check_mpa_takes_partitions(agreed)
-        start, end = mpp.get_relative_indices()
-        if end - start:
-            if mpp.has_local_data():
-                new_mpa[start:end] += MPA[S, dtype](mpc, mpp._local_data)
-            else:
-                mpp.unify_encryption()
-                new_mpa[start:end] += MPA[S, dtype](mpc, mpp._encryption_unified)
-        
-        return new_mpa.T if transposed else new_mpa
-    
+        aggregate_only = [bool(st[2]) and not st[0] and not st[1] for st in states]
+        if any(aggregate_only):
+            if not all(aggregate_only):
+                raise ValueError("MPU: the MPA is only an aggregate at some compute parties and not at others")
+            result = MPA[S, dtype](mpc, MPU[S, dtype]._aggregate_plus_mpp(mpc, work._aggregate, mpp, descriptors, subtract), aggregate=True)
+            return result.T if transposed else result
+
+        start, end = MPU[S, dtype]._addend_range(mpp)
+        if all(bool(st[0]) for st in states) and all(d[D_KIND] == MPP_EMPTY or d[D_KIND] == MPP_CLEAR for d in descriptors):
+            plain = work._plain
+            if end > start:
+                if subtract:
+                    plain[start:end] -= mpp._local_data
+                else:
+                    plain[start:end] += mpp._local_data
+            result = MPA[S, dtype]._from_plain(mpc, plain)
+            return result.T if transposed else result
+
+        if any(not st[0] and not st[1] for st in states):
+            raise ValueError("MPU: cannot add an MPP to an MPA that holds no share at some compute party")
+        if any(d[D_UNIFIED + 3] or d[D_LEFT + 3] or d[D_RIGHT + 3] for d in descriptors):
+            raise NotImplementedError("MPU: adding a diagonal-encoded MPP to an MPA is not implemented yet")
+        layout = MPU[S, dtype]._shares_layout(descriptors, states)
+        if work.has_encryption() and MPU[S, dtype]._layout_code(work._encryption) == layout:
+            share = work._encryption
+        else:
+            share = _encrypt_like(mpc, work._plain, layout == 2)
+        share._is_broadcast = False
+        take = end > start
+        addend = MPU[S, dtype]._partition_encryption(mpc, mpp, layout == 2) if take else Ciphertensor[Ciphertext]()
+        # Every compute party holds one council: the masks its addition takes (none where it adds whole stored rows or
+        # nothing), and its status, so that a party that cannot add raises at every compute party alike
+        masked, status, message = _plan_indexing(lambda: share._add_rows_masked(start, addend) if take else List[Ciphertext]())
+        _indexing_council(mpc, masked, status, message)
+        if take:
+            share._add_rows(mpc, start, addend, subtract, refresh=False)
+        result = MPA[S, dtype](mpc, share)
+        return result.T if transposed else result
+
     @staticmethod
-    def _mpa_lacks_encryption(mpa: MPA[S, dtype], mpp: MPP[S, dtype]) -> bool:
-        # Whether this compute party would add its partition (encrypted, or any if the MPA is only an aggregate) into rows
-        # of an MPA share that holds no encryption, which MPA's setitem cannot do yet (H-23)
-        start, end = mpp.get_relative_indices()
-        return end > start and not mpa.has_encryption() and (not mpp.has_local_data() or not mpa.has_plain())
+    def _check_addend_shapes(work: MPA[S, dtype], mpp: MPP[S, dtype], descriptors: List[List[int]], states: List[List[int]]):
+        # The MPP's rows and every partition's width against the MPA's shape (as the partitions hold their rows), from
+        # the agreed round: a mismatch raises ValueError at every compute party alike, also where a party holds nothing
+        shape = work.shape
+        n = shape[1] if static.len(S) == 2 else shape[0]
+        whole_vectors = static.len(S) == 1 and not mpp._transposed
+        for q in range(len(descriptors)):
+            # A column's partitions are its segments: only their total is checked
+            if (static.len(S) == 2 or whole_vectors) and descriptors[q][D_KIND] != MPP_EMPTY and states[q][4] != n:
+                raise ValueError(f"MPU: cannot add an MPP whose partition at CP{q + 1} holds {states[q][4]} columns (or values) to an MPA of {n}")
+        if not whole_vectors and mpp._ratios.sum() != shape[0]:
+            raise ValueError(f"MPU: cannot add an MPP of {mpp._ratios.sum()} rows (or values) to an MPA of {shape[0]}")
 
     @staticmethod
-    def _check_mpa_takes_partitions(agreed: List[List[int]]):
-        # Raises at every compute party alike if one of them would hit MPA's setitem assertion: the others would go on
-        # and wait for it (M-MP-21)
-        if any(bool(d[-1]) for d in agreed):
-            raise NotImplementedError("MPU: adding an MPP to an MPA where some compute party holds its partition encrypted and its MPA share not encrypted (or the MPA only as an aggregate) is not implemented yet")
-    
+    def _layout_code(enc: Ciphertensor[Ciphertext]) -> int:
+        # An encryption's layout as _add_mpa_mpp agrees on it: 0 none, 1 row-wise (a vector's only layout), 2 column-wise,
+        # 3 diagonal
+        if not enc:
+            return 0
+        if enc._diagonal_contiguous:
+            return 3
+        return 2 if enc.ndim == 2 and enc._transposed else 1
+
+    @staticmethod
+    def _shares_layout(descriptors: List[List[int]], states: List[List[int]]) -> int:
+        # The layout every compute party holds its share encrypted in, as the partitions hold their rows (1 row-wise, 2
+        # column-wise): that of the shares held only encrypted (fixed: partitions in the other layout are converted as
+        # they are added), else that of the encrypted partitions where they agree (column-wise ones and A @ B.T blocks
+        # then shift into place, where row-wise shares would take one masked move per value), else row-wise, which
+        # takes row-wise and clear partitions without masking. Raises at every party alike (the agreed round's content)
+        # where the shares' layouts differ or one is diagonal.
+        if static.len(S) == 1:
+            return 1
+        share_layouts = [st[3] for st in states if st[1] and not st[0]]
+        if any(l == 3 for l in share_layouts):
+            raise NotImplementedError("MPU: adding an MPP to an MPA whose shares are diagonal-encoded is not implemented yet")
+        if share_layouts:
+            if not all(l == share_layouts[0] for l in share_layouts):
+                raise NotImplementedError("MPU: the compute parties hold their MPA shares encrypted in different layouts")
+            return share_layouts[0]
+        if any(d[D_KIND] == MPP_UNIFIED or d[D_KIND] == MPP_SEMI for d in descriptors):
+            transposed, _, agreed = _encrypted_layout(descriptors)
+            if agreed:
+                return 2 if transposed else 1
+        return 1
+
+    @staticmethod
+    def _partition_encryption(mpc, mpp: MPP[S, dtype], transposed: bool) -> Ciphertensor[Ciphertext]:
+        # This compute party's partition, as held, as one encryption: data in the clear encrypted in the given layout, an
+        # encryption as it is (a copy), a semi-encrypted partition unified (in its blocks' layout). A 1-dim encryption's
+        # flag is cleared (a vector has one layout); a 2-dim one's (a row stored as a column) is its layout and stays.
+        if mpp.is_local():
+            return _encrypt_like(mpc, mpp._local_data, transposed)
+        part = mpp.copy()
+        part.unify_encryption()
+        out = part._encryption_unified
+        if static.len(S) == 1 and out.ndim == 1:
+            out._transposed = False
+        return out
+
+    @staticmethod
+    def _addend_range(mpp: MPP[S, dtype]) -> Tuple[int, int]:
+        # This compute party's rows of the MPA (as the partitions hold them) its partition adds into: its rows of the
+        # cohort, a column's segment; a 1-dim MPP that is not transposed adds its whole vector (a held row, as before)
+        if mpp.is_empty():
+            return 0, 0
+        if static.len(S) == 1 and not mpp._transposed:
+            return 0, mpp._held_width()
+        return mpp.get_relative_indices()
+
+    @staticmethod
+    def _aggregate_plus_mpp(mpc, aggregate: Ciphertensor[Ciphertext], mpp: MPP[S, dtype], descriptors: List[List[int]], subtract: bool) -> Ciphertensor[Ciphertext]:
+        # An aggregate (the same ciphertexts at every party) ± every compute party's partition: each partition's
+        # encryption to every party (one round), then each added at its rows, at every party alike (broadcast refreshes,
+        # no council), so that the sum stays the same at every party. What every part masks, and the aggregate's
+        # ciphertexts that take its placements, are refreshed together once, before any part is added: an aggregate
+        # ciphertext that takes placements from several partitions is refreshed once, not once per partition.
+        if aggregate._diagonal_contiguous or any(d[D_UNIFIED + 3] or d[D_LEFT + 3] or d[D_RIGHT + 3] for d in descriptors):
+            raise NotImplementedError("MPU: adding an MPP to an aggregate where either is diagonal-encoded is not implemented yet")
+        own = MPU[S, dtype]._partition_encryption(mpc, mpp, static.len(S) == 2 and aggregate._transposed) if not mpp.is_empty() else Ciphertensor[Ciphertext]()
+        parts = mpc.comms.collect(own)
+        out = aggregate.copy()
+        out._is_broadcast = True
+        starts = List[int]()
+        masked = List[Ciphertext]()
+        offset = 0
+        for q in range(len(parts)):
+            start = 0 if static.len(S) == 1 and not mpp._transposed else offset
+            starts.append(start)
+            if parts[q]:
+                parts[q]._is_broadcast = True
+                masked.extend(out._add_rows_masked(start, parts[q]))
+            offset += mpp._ratios[q]
+        Ciphertensor._refresh_masked(mpc, masked, True)
+        for q in range(len(parts)):
+            if parts[q]:
+                out._add_rows(mpc, starts[q], parts[q], subtract, refresh=False)
+        return out
+
     def _sub_mpa_mpp(mpa: MPA[S, dtype], mpp: MPP[S, dtype]) -> MPA[S, dtype]:
-        mpc = mpa._mpc
-        if mpc.pid == 0:
-            return mpa.copy()
-        
-        transposed = mpp._transposed
-        new_mpa = mpa.T if transposed else mpa.copy()
-
-        if mpa.ndim == 1 and not transposed:
-            assert mpp.ndim == 1, f"MPA: cannot add MPs of different dimensionality: MPA dim {mpa.ndim} != MPP dim {mpp.ndim}"
-            if mpp.has_local_data():
-                new_mpa -= MPA[S, dtype](mpc, mpp._local_data)
-            elif not mpp.is_empty():
-                mpp.unify_encryption()
-                new_mpa -= MPA[S, dtype](mpc, mpp._encryption_unified)
-            return new_mpa
-
-        MPU[S, dtype]._check_mpa_takes_partitions(mpc.comms.collect([int(MPU[S, dtype]._mpa_lacks_encryption(mpa, mpp))]))
-        start, end = mpp.get_relative_indices()
-        if end - start:
-            if mpp.has_local_data():
-                new_mpa[start:end] -= MPA[S, dtype](mpc, mpp._local_data)
-            else:
-                mpp.unify_encryption()
-                new_mpa[start:end] -= MPA[S, dtype](mpc, mpp._encryption_unified)
-        
-        return new_mpa.T if transposed else new_mpa
+        return MPU[S, dtype]._add_mpa_mpp(mpa, mpp, subtract=True)
     
     def _mul_mpa_mpp(mpa: MPA[S, dtype], mpp: MPP[S, dtype]) -> MPA[S, dtype]:
         if mpa._mpc.pid == 0:

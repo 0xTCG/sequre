@@ -101,7 +101,7 @@ The compute parties agree on how they hold their partitions in one round, and ea
 | `-a` | Negation |
 | `a > b` | Greater-than a public value: local at each compute party if all of them hold their partitions in the clear, otherwise the secure comparison through [MPC switching](../user-guide/switching.md#comparisons) |
 | `a < b` | Less-than a public value, likewise |
-| `a[i]`, `a[i] = v` | Indexing and slicing |
+| `a[i]`, `a[i] = v` | Indexing and slicing, called at every party with the same index: rows (`a[i]`, `a[i:j]`), cells and column ranges (`a[i, j]`, `a[rows, cols]`), a column of a transposed MPP (`a.T[j]`), and an element of a 1-dim MPP (a held row or a column). Negative ints count from the end; an int out of range raises `IndexError` and a step other than 1 `NotImplementedError`, at every party. Each compute party takes its own rows of the range, whatever it holds (in the clear, encrypted row-wise or column-wise, semi-encrypted, nothing), and every compute party holds one refresh council per call. A setitem value is partitioned as the target's rows are (`ValueError` otherwise); a value in the clear is encrypted in the target's layout where the target is encrypted. These raise `NotImplementedError` at every compute party: diagonal-encoded partitions; a value encrypted in another layout than the target's; into a semi-encrypted target, a cell or a column range (it takes whole rows) or an encrypted value, and an encrypted element into its block in the clear; a semi-encrypted value into a target that is not semi-encrypted or has other blocks. On a transposed MPP only `a.T[j]` and `a.T[rows, cols]` are implemented (row slices, other index pairs and setitems raise) |
 | `bool(a)` | Non-empty check |
 | `len(a)` | Length of first dimension |
 

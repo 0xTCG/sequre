@@ -57,7 +57,7 @@ All standard arithmetic and comparison operators are supported. They dispatch to
 
 | Operator | Description |
 |---|---|
-| `a + b` | Addition (MPU, scalar, or ndarray). An additive-mode MPU plus a partition-mode one whose partitions some compute party holds encrypted needs the additive one's shares encrypted: with shares in the clear, or an aggregate only, it raises `NotImplementedError` at every compute party (unless one party holds every row) |
+| `a + b` | Addition (MPU, scalar, or ndarray). An additive-mode MPU plus a partition-mode one: each compute party adds its partition into its own share, in the clear if every share and every partition is in the clear, otherwise with every share encrypted, in one layout: that of shares held only encrypted, else that of the encrypted partitions. An additive MPU that holds only its aggregate gets every partition added to the aggregate (still only an aggregate: every party adds the same partitions to its copy). A partition in another layout than such fixed shares or the aggregate is converted as it is added, at one masked move per value; diagonal-encoded storage raises `NotImplementedError` at every compute party. The result holds only what the addition updated: an aggregate, or an encryption kept beside shares in the clear, is not carried over (`aggregate()` rebuilds it when needed) |
 | `a - b` | Subtraction (likewise for additive minus partition-mode) |
 | `a * b` | Element-wise multiplication |
 | `a @ b` | Matrix multiplication |
@@ -65,7 +65,7 @@ All standard arithmetic and comparison operators are supported. They dispatch to
 | `a ** n` | Integer exponentiation |
 | `-a` | Negation |
 | `a > b`, `a < b` | Comparisons (vs. scalars): local at each owner for a partition-mode MPU every compute party holds in the clear, otherwise the secure comparison in MPC (see [switching](../user-guide/switching.md#comparisons)) |
-| `a[i]`, `a[i] = v` | Indexing and slicing |
+| `a[i]`, `a[i] = v` | Indexing and slicing (as for [MPP](mpp.md) or [MPA](mpa.md)) |
 
 ## Methods
 

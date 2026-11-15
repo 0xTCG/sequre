@@ -1041,6 +1041,441 @@ def test_mpp_encrypted_indexing(mpc):
         assert_parties_in_step(mpc, f"MPP encrypted, ratios {cohort_ratios}: X[:, 0:2] = Y[:, 0:2]")
 
 
+KIND_NAMES = ["in the clear", "encrypted row-wise", "encrypted column-wise", "mixed (CP1 encrypted)"]
+
+
+def held_as(mpc, matrix, ratios: List[int], kind: int) -> MPP:
+    # matrix partitioned with ratios, held in the clear (0), encrypted row-wise (1) or column-wise (2: stored transposed),
+    # or as a mixed cohort (3: CP1 encrypted row-wise, the others in the clear). A copy: partition() holds views of the
+    # matrix, which setitem in the clear would write into
+    x = partition(mpc, matrix.copy(), ratios)
+    if kind == 1 or (kind == 3 and mpc.pid == 1):
+        x.encrypt()
+    elif kind == 2:
+        cw = x.T
+        cw.encrypt()
+        x = cw.T
+    return x
+
+
+def rows_copy(matrix, r0: int, r1: int, c0: int, c1: int):
+    # A copy of matrix[r0:r1, c0:c1]
+    return array([[matrix[i, j] for j in range(c0, c1)] for i in range(r0, r1)])
+
+
+def row_copy(matrix, i: int, c0: int, c1: int):
+    return array([matrix[i, j] for j in range(c0, c1)])
+
+
+def raised_alike(mpc, name: str, raised: bool, compute_parties_only: bool = True):
+    # The call raised at every compute party (and at CP0 too unless compute_parties_only), then the parties are in step
+    if mpc.pid or not compute_parties_only:
+        assert_eq(f"CP{mpc.pid}:\t{name}: raised", raised, True)
+    assert_parties_in_step(mpc, name)
+
+
+def test_mpp_indexing_kinds(mpc):
+    """H-34 and M-MHE-15 through the MP layer: getitem on partitions in the clear, encrypted row-wise and column-wise,
+    and a mixed cohort, at equal and unequal ratios and with an empty partition. Every compute party holds one refresh
+    council per call whatever it holds and whatever its share of the range: a row at its holder only, rows whole at
+    one party and partial at another, column blocks, a column of the transposed MPP, negative indices. Before the
+    fix a party without the row, an empty or clear partition, and a party taking whole stored rows skipped councils the
+    others held (desyncs and crashes)."""
+    n_cp = mpc.comms.number_of_parties - 1
+    for ratios in ([3 for _ in range(n_cp)], unequal_ratios(n_cp), ratios_with_empty(n_cp)):
+        total = ratios.sum()
+        a = cohort_matrix(mpc, total, 4)
+        r1 = ratios[0]
+        for kind in range(4):
+            x = held_as(mpc, a, ratios, kind)
+            label = f"MPP {KIND_NAMES[kind]}, ratios {ratios}"
+            first = x[0]
+            last = x[-1]
+            across = x[0:r1 + 1]
+            cols = x[:, 1:3]
+            row_cols = x[total - 1, 1:3]
+            col_block = x[1:total, 2]
+            cell = x[-1, -1]
+            col = x.T[1]
+            neg_col = x.T[-1]
+            assert_parties_in_step(mpc, f"{label}: getitems")
+            revealed_first = first.reveal()
+            revealed_last = last.reveal()
+            revealed_across = across.reveal()
+            revealed_cols = cols.reveal()
+            revealed_row_cols = row_cols.reveal()
+            revealed_col_block = col_block.reveal()
+            revealed_cell = cell.reveal()
+            revealed_col = col.reveal()
+            revealed_neg_col = neg_col.reveal()
+            if mpc.pid:
+                assert_eq_approx(f"CP{mpc.pid}:\t{label}: X[0]", revealed_first, row_copy(a, 0, 0, 4), error=1e-3)
+                assert_eq_approx(f"CP{mpc.pid}:\t{label}: X[-1]", revealed_last, row_copy(a, total - 1, 0, 4), error=1e-3)
+                assert_eq_approx(f"CP{mpc.pid}:\t{label}: X[0:{r1 + 1}]", revealed_across, rows_copy(a, 0, r1 + 1, 0, 4), error=1e-3)
+                assert_eq_approx(f"CP{mpc.pid}:\t{label}: X[:, 1:3]", revealed_cols, rows_copy(a, 0, total, 1, 3), error=1e-3)
+                assert_eq_approx(f"CP{mpc.pid}:\t{label}: X[{total - 1}, 1:3]", revealed_row_cols, row_copy(a, total - 1, 1, 3), error=1e-3)
+                assert_eq_approx(f"CP{mpc.pid}:\t{label}: X[1:{total}, 2]", revealed_col_block, rows_copy(a, 1, total, 2, 3), error=1e-3)
+                assert_eq_approx(f"CP{mpc.pid}:\t{label}: X[-1, -1]", revealed_cell, row_copy(a, total - 1, 3, 4), error=1e-3)
+                assert_eq_approx(f"CP{mpc.pid}:\t{label}: X.T[1]", revealed_col, column(a, 1), error=1e-3)
+                assert_eq_approx(f"CP{mpc.pid}:\t{label}: X.T[-1]", revealed_neg_col, column(a, 3), error=1e-3)
+            assert_parties_in_step(mpc, f"{label}: reveals")
+
+
+def test_mpp_semi_indexing(mpc):
+    """H-31, M-MP-29 and M-MP-03's indexing part: indexing an A @ B.T result, whose partitions are semi-encrypted (each
+    party's own block in the clear between encrypted blocks; CP1 holds no left block, the last party no right block):
+    the first and last party's rows, rows across a boundary, column blocks inside a party's block and across two, columns
+    of the transposed result in each block, an element of a row. Before the fix the party without the block crashed
+    (signal 11, IndexError), and the others waited."""
+    n_cp = mpc.comms.number_of_parties - 1
+    for ratios in ([2 for _ in range(n_cp)], unequal_ratios(n_cp)):
+        total = ratios.sum()
+        r1 = ratios[0]
+        a = cohort_matrix(mpc, total, 4)
+        b = cohort_matrix(mpc, total, 4) * 0.5
+        k = a @ b.T
+        kk = partition(mpc, a, ratios) @ partition(mpc, b, ratios).T
+        label = f"MPP A @ B.T (semi-encrypted), ratios {ratios}"
+        first = kk[0]
+        last = kk[total - 1]
+        across = kk[r1 - 1:r1 + 1]
+        inside = kk[:, 0:r1]
+        two_blocks = kk[:, r1 - 1:r1 + 1]
+        col_first = kk.T[0]
+        col_last = kk.T[total - 1]
+        row_of_last = kk[total - 1]
+        elem = row_of_last[0]
+        assert_parties_in_step(mpc, f"{label}: getitems")
+        revealed = [first.reveal(), last.reveal(), elem.reveal(), col_first.reveal(), col_last.reveal()]
+        revealed_across = across.reveal()
+        revealed_inside = inside.reveal()
+        revealed_two = two_blocks.reveal()
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: K[0] (CP1, no left block)", revealed[0], row_copy(k, 0, 0, total), error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: K[{total - 1}] (last party, no right block)", revealed[1], row_copy(k, total - 1, 0, total), error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: K[{total - 1}][0]", revealed[2], row_copy(k, total - 1, 0, 1), error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: K.T[0]", revealed[3], column(k, 0), error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: K.T[{total - 1}]", revealed[4], column(k, total - 1), error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: K[{r1 - 1}:{r1 + 1}]", revealed_across, rows_copy(k, r1 - 1, r1 + 1, 0, total), error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: K[:, 0:{r1}]", revealed_inside, rows_copy(k, 0, total, 0, r1), error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: K[:, {r1 - 1}:{r1 + 1}]", revealed_two, rows_copy(k, 0, total, r1 - 1, r1 + 1), error=1e-3)
+        assert_parties_in_step(mpc, f"{label}: reveals")
+
+        # Setitems into the semi-encrypted partitions: an element of a row's encrypted block after a reveal cached the
+        # row's unified encryption, which must not stay stale (review c19-cr2-1); whole rows from values in the clear
+        # (each partition's blocks take the value's columns, encrypted in their layout)
+        row = kk[total - 1]
+        cached = row.reveal()
+        row[0] = 0.5
+        v_row = [float(j) * 0.25 - 1.0 for j in range(total)]
+        kk[0] = MPP[Tuple[int], float](
+            _mpc=mpc, _ratios=[1 if q == 0 else 0 for q in range(n_cp)],
+            _local_data=array(v_row) if mpc.pid <= 1 else ndarray[Tuple[int], float]())
+        vmat = cohort_matrix(mpc, 2, total) * 0.25
+        kk[r1 - 1:r1 + 1] = partition(mpc, vmat, range_ratios(ratios, r1 - 1, r1 + 1))
+        assert_parties_in_step(mpc, f"{label}: setitems")
+        revealed_row = row.reveal()
+        revealed_kk = kk.reveal()
+        if mpc.pid:
+            expected_row = row_copy(k, total - 1, 0, total)
+            expected_row[0] = 0.5
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: K[{total - 1}] before its setitem", cached, row_copy(k, total - 1, 0, total), error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: K[{total - 1}][0] = 0.5 after a reveal", revealed_row, expected_row, error=1e-3)
+            expected_k = k.copy()
+            for j in range(total):
+                expected_k[0, j] = v_row[j]
+                expected_k[r1 - 1, j] = vmat[0, j]
+                expected_k[r1, j] = vmat[1, j]
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: K[0] = v, K[{r1 - 1}:{r1 + 1}] = V (in the clear)", revealed_kk, expected_k, error=1e-3)
+        assert_parties_in_step(mpc, f"{label}: setitems: reveals")
+
+
+def test_mpp_setitem_boundaries(mpc):
+    """H-26: row-slice assignments that end on a partition boundary (the next party takes no rows; it asserted there
+    before the fix while the others went on) and that cross one, in the clear and encrypted; a value partitioned
+    otherwise than the target's rows raises ValueError at every party."""
+    n_cp = mpc.comms.number_of_parties - 1
+    ratios = [2 for _ in range(n_cp)]
+    total = ratios.sum()
+    a = cohort_matrix(mpc, total, 4)
+    b = cohort_matrix(mpc, total, 4) * 0.5
+    for encrypted in (False, True):
+        label = f"MPP {'encrypted' if encrypted else 'in the clear'}, ratios {ratios}"
+        for r0, r1 in ((0, 2), (1, 3)):
+            x = partition(mpc, a.copy(), ratios)
+            v = partition(mpc, rows_copy(b, r0, r1, 0, 4), range_ratios(ratios, r0, r1))
+            if encrypted:
+                x.encrypt()
+                v.encrypt()
+            x[r0:r1] = v
+            assert_parties_in_step(mpc, f"{label}: X[{r0}:{r1}] = V")
+            revealed = x.reveal()
+            if mpc.pid:
+                expected = a.copy()
+                for i in range(r0, r1):
+                    for j in range(4):
+                        expected[i, j] = b[i, j]
+                assert_eq_approx(f"CP{mpc.pid}:\t{label}: X[{r0}:{r1}] = V", revealed, expected, error=1e-3)
+            assert_parties_in_step(mpc, f"{label}: X[{r0}:{r1}] = V: reveal")
+    x = partition(mpc, a.copy(), ratios)
+    wrong = partition(mpc, rows_copy(b, 0, 2, 0, 4), [2 if q == n_cp - 1 else 0 for q in range(n_cp)])
+    raised = False
+    try:
+        x[0:2] = wrong
+    except ValueError:
+        raised = True
+    raised_alike(mpc, "MPP X[0:2] = V with V partitioned otherwise", raised, compute_parties_only=False)
+
+
+def range_ratios(ratios: List[int], start: int, stop: int) -> List[int]:
+    # Every compute party's row count of the cohort's rows [start, stop)
+    out = List[int]()
+    off = 0
+    for q in range(len(ratios)):
+        lo = min(max(start - off, 0), ratios[q])
+        hi = max(min(stop - off, ratios[q]), lo)
+        out.append(hi - lo)
+        off += ratios[q]
+    return out
+
+
+def test_mpp_setitem_kinds(mpc):
+    """H-34 and M-MP-25: X[i] = v at the row's holder on partitions in the clear, encrypted row-wise and column-wise
+    (the value in the clear, encrypted in the target's layout there), X[i] = X[j] within one party, a column block of a
+    mixed cohort at equal ratios, X[i, j] = 0.5 on each (it wrote into the empty data of an encrypted partition before the
+    fix); a value encrypted in the other layout raises NotImplementedError at every compute party."""
+    n_cp = mpc.comms.number_of_parties - 1
+    ratios = [3 for _ in range(n_cp)]
+    total = ratios.sum()
+    a = cohort_matrix(mpc, total, 4)
+    w = [9.0, -9.0, 4.5, 0.25]
+    for kind in range(4):
+        label = f"MPP {KIND_NAMES[kind]}, ratios {ratios}"
+        x = held_as(mpc, a, ratios, kind)
+        v = MPP[Tuple[int], float](
+            _mpc=mpc, _ratios=[1 if q == n_cp - 1 else 0 for q in range(n_cp)],
+            _local_data=array(w) if mpc.pid == 0 or mpc.pid == n_cp else ndarray[Tuple[int], float]())
+        x[total - 1] = v
+        x[1] = x[2]
+        x[0, 3] = 0.5
+        y = held_as(mpc, a * 0.5, ratios, kind)
+        x[:, 0:2] = y[:, 0:2]
+        assert_parties_in_step(mpc, f"{label}: setitems")
+        revealed = x.reveal()
+        if mpc.pid:
+            expected = a.copy()
+            for j in range(4):
+                expected[total - 1, j] = w[j]
+                expected[1, j] = a[2, j]
+            expected[0, 3] = 0.5
+            for i in range(total):
+                for j in range(2):
+                    expected[i, j] = a[i, j] * 0.5
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: X[-1] = v, X[1] = X[2], X[0, 3] = 0.5, X[:, 0:2] = Y[:, 0:2]", revealed, expected, error=1e-3)
+        assert_parties_in_step(mpc, f"{label}: setitems: reveal")
+    x = held_as(mpc, a, ratios, 2)
+    row = held_as(mpc, a, ratios, 1)[1]
+    raised = False
+    try:
+        x[0] = row
+    except NotImplementedError:
+        raised = True
+    raised_alike(mpc, "MPP column-wise X[0] = a row encrypted row-wise", raised)
+
+
+def test_mpp_vector_elements(mpc):
+    """M-MHE-19 and L-094: elements of a partitioned vector (a column) and of a held row: v[-1] (it read an empty slice
+    before the fix), v[i] = w in the clear and encrypted each way, v[i] = 0.5 on an encrypted column (it asserted at
+    the parties without the element), and an element of a row."""
+    n_cp = mpc.comms.number_of_parties - 1
+    ratios = [3 for _ in range(n_cp)]
+    total = ratios.sum()
+    values = [float(i) * 0.5 - 1.0 for i in range(total)]
+    start, stop = own_rows(mpc, ratios)
+    for encrypted in (False, True):
+        label = f"MPP {'encrypted' if encrypted else 'in the clear'} partitioned vector"
+        vec = MPP[Tuple[int], float](_mpc=mpc, _ratios=ratios, _local_data=array(values) if mpc.pid == 0 else array(values[start:stop]), _transposed=True)
+        if encrypted:
+            vec.encrypt()
+        last = vec[-1]
+        for w_encrypted in (False, True):
+            w = MPP[Tuple[int], float](
+                _mpc=mpc, _ratios=[1 if q == n_cp - 1 else 0 for q in range(n_cp)],
+                _local_data=array([7.0]) if mpc.pid == 0 or mpc.pid == n_cp else ndarray[Tuple[int], float](), _transposed=True)
+            if w_encrypted and mpc.pid == n_cp:
+                w.encrypt()
+            vec[total - 2] = w
+        vec[1] = 0.5
+        assert_parties_in_step(mpc, f"{label}: elements")
+        revealed_last = last.reveal()
+        revealed = vec.reveal()
+        if mpc.pid:
+            expected = values.copy()
+            expected[total - 2] = 7.0
+            expected[1] = 0.5
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: v[-1]", revealed_last, array([values[total - 1]]), error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: v[{total - 2}] = w (in the clear, then encrypted), v[1] = 0.5", revealed, array(expected), error=1e-3)
+        assert_parties_in_step(mpc, f"{label}: reveals")
+    a = cohort_matrix(mpc, total, 4)
+    for kind in range(3):
+        x = held_as(mpc, a, ratios, kind)
+        row = x[total - 1]
+        elem = row[-2]
+        row[0] = 0.5
+        assert_parties_in_step(mpc, f"MPP {KIND_NAMES[kind]}: an element of a row")
+        revealed_elem = elem.reveal()
+        revealed_row = row.reveal()
+        if mpc.pid:
+            expected_row = row_copy(a, total - 1, 0, 4)
+            expected_row[0] = 0.5
+            assert_eq_approx(f"CP{mpc.pid}:\tMPP {KIND_NAMES[kind]}: X[-1][-2]", revealed_elem, row_copy(a, total - 1, 2, 3), error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\tMPP {KIND_NAMES[kind]}: X[-1][0] = 0.5", revealed_row, expected_row, error=1e-3)
+        assert_parties_in_step(mpc, f"MPP {KIND_NAMES[kind]}: an element of a row: reveals")
+
+
+def test_mpp_index_errors(mpc):
+    """Index errors raise at every party alike before any HE work: ints out of range (IndexError), a step other than 1
+    (NotImplementedError; M-MP-12: the compute parties ignored it while CP0 applied it)."""
+    n_cp = mpc.comms.number_of_parties - 1
+    ratios = [2 for _ in range(n_cp)]
+    total = ratios.sum()
+    a = cohort_matrix(mpc, total, 4)
+    x = partition(mpc, a, ratios)
+    x.encrypt()
+    raised = False
+    try:
+        x[total]
+    except IndexError:
+        raised = True
+    raised_alike(mpc, f"MPP X[{total}] of {total} rows", raised, compute_parties_only=False)
+    raised = False
+    try:
+        x[0:total:2]
+    except NotImplementedError:
+        raised = True
+    raised_alike(mpc, "MPP X[0:n:2]", raised, compute_parties_only=False)
+    raised = False
+    try:
+        x.T[4]
+    except IndexError:
+        raised = True
+    raised_alike(mpc, "MPP X.T[4] of 4 columns", raised)
+
+
+def test_mpp_column_elements(mpc):
+    """Elements of a column of a transposed MPP (X.T[j]: each partition's column j), read and set, from partitions in the
+    clear, encrypted row-wise (each partition's column a one-column tensor) and column-wise (a vector), at unequal
+    ratios: a segment's first, second and last elements and the last party's (review c19-cr1-2: on row-wise
+    encryptions only a segment's first element could be read)."""
+    n_cp = mpc.comms.number_of_parties - 1
+    ratios = unequal_ratios(n_cp)
+    total = ratios.sum()
+    a = cohort_matrix(mpc, total, 4)
+    ks = [0, 1, ratios[0] - 1, ratios[0], total - 1]
+    for kind in range(3):
+        label = f"MPP {KIND_NAMES[kind]}, ratios {ratios}"
+        x = held_as(mpc, a, ratios, kind)
+        col = x.T[1]
+        elems = [col[k] for k in ks]
+        # Revealed before the assignments: in the clear an element is a view of the column, as numpy's slices are
+        revealed = [e.reveal() for e in elems]
+        col[1] = 0.5
+        q = 0
+        acc = 0
+        for p in range(n_cp):
+            acc += ratios[p]
+            if total - 2 < acc:
+                q = p
+                break
+        w = MPP[Tuple[int], float](
+            _mpc=mpc, _ratios=[1 if p == q else 0 for p in range(n_cp)],
+            _local_data=array([7.0]) if mpc.pid == 0 or mpc.pid == q + 1 else ndarray[Tuple[int], float](), _transposed=True)
+        col[total - 2] = w
+        # An encrypted element flagged transposed (a column's, as w.encrypt() leaves it): one element has no layout, and
+        # goes into any column (review c19-cr2-3)
+        q2 = 1 if n_cp > 1 else 0
+        w_enc = MPP[Tuple[int], float](
+            _mpc=mpc, _ratios=[1 if p == q2 else 0 for p in range(n_cp)],
+            _local_data=array([-6.5]) if mpc.pid == 0 or mpc.pid == q2 + 1 else ndarray[Tuple[int], float](), _transposed=True)
+        if mpc.pid == q2 + 1:
+            w_enc.encrypt()
+        col[ratios[0]] = w_enc
+        assert_parties_in_step(mpc, f"{label}: X.T[1][k]")
+        revealed_col = col.reveal()
+        if mpc.pid:
+            for i in range(len(ks)):
+                assert_eq_approx(f"CP{mpc.pid}:\t{label}: X.T[1][{ks[i]}]", revealed[i], array([a[ks[i], 1]]), error=1e-3)
+            expected = [a[i, 1] for i in range(total)]
+            expected[1] = 0.5
+            expected[total - 2] = 7.0
+            expected[ratios[0]] = -6.5
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: X.T[1][1] = 0.5, X.T[1][{total - 2}] = w, X.T[1][{ratios[0]}] = encrypted w", revealed_col, array(expected), error=1e-3)
+        assert_parties_in_step(mpc, f"{label}: X.T[1][k]: reveals")
+
+
+def test_mpp_setitem_low_level(mpc):
+    """Moves near the bootstrap level, in states Sequre leaves ciphertexts in (reviews c19-cr3-1, c19-cr4-1, c19-cr4-4):
+    row-wise encrypted partitions one level above the bootstrap level (where a refresh can leave them); a column block
+    taken from them plus a product (the scale squared, as every product rests until its next refresh), and an
+    assignment into one row followed by a product added and by a sum, each then scaled (which refreshes). A move's
+    output rests as a product does (its source's level, the scale squared), so these sums stay above the bootstrap
+    level; an output rescaled to the default scale would sit at the bootstrap level, where the product's scale would
+    take the sum below it at the next refresh. Also a row set from an encrypted column (its encryption a vector flagged
+    transposed, as encrypt() leaves it), held by the row's holder (review c19-cr3-3)."""
+    n_cp = mpc.comms.number_of_parties - 1
+    ratios = unequal_ratios(n_cp)
+    total = ratios.sum()
+    a = cohort_matrix(mpc, total, 4)
+    b = cohort_matrix(mpc, total, 4) * 0.5
+    b2 = rows_copy(b, 0, total, 1, 3)
+    level = mpc.mhe.bootstrap_min_level + 1
+    x = partition(mpc, a.copy(), ratios)
+    x.encrypt()
+    y = partition(mpc, b.copy(), ratios)
+    y.encrypt()
+    y2 = partition(mpc, b2.copy(), ratios)
+    y2.encrypt()
+    if mpc.pid:
+        x._encryption_unified._data = mpc.mhe.drop_level(x._encryption_unified._data, level)
+    # Each product is formed where it is added: a getitem's council would refresh a product it masks
+    block = (x[:, 1:3] + y2 * y2) * 2.5
+    revealed_block = block.reveal()
+    x[0:1, 0:2] = y[0:1, 0:2]
+    plus_product = ((x + y * y) * 2.5).reveal()
+    summed = (x.sum(0) * 2.5).reveal()
+    revealed = x.reveal()
+    assert_parties_in_step(mpc, "MPP moves near the bootstrap level")
+    expected = a.copy()
+    for j in range(2):
+        expected[0, j] = b[0, j]
+    if mpc.pid:
+        label = "MPP row-wise partitions one level above the bootstrap level"
+        assert_eq_approx(f"CP{mpc.pid}:\t{label}: (X[:, 1:3] + Y2 * Y2) * 2.5", revealed_block, (rows_copy(a, 0, total, 1, 3) + b2 * b2) * 2.5, error=5e-2)
+        assert_eq_approx(f"CP{mpc.pid}:\t{label}: X[0:1, 0:2] = Y[0:1, 0:2]", revealed, expected, error=1e-2)
+        assert_eq_approx(f"CP{mpc.pid}:\t{label}: then (X + Y * Y) * 2.5", plus_product, (expected + b * b) * 2.5, error=5e-2)
+        assert_eq_approx(f"CP{mpc.pid}:\t{label}: then sum(0) * 2.5", summed, expected.sum(axis=0) * 2.5, error=5e-2)
+    assert_parties_in_step(mpc, "MPP moves near the bootstrap level: reveals")
+
+    q = n_cp - 1
+    values = [0.5, -1.5, 2.25, 3.0]
+    c = MPP[Tuple[int], float](
+        _mpc=mpc, _ratios=[1 if p == q else 0 for p in range(n_cp)],
+        _local_data=array(values) if mpc.pid == 0 or mpc.pid == q + 1 else ndarray[Tuple[int], float](), _transposed=True)
+    if mpc.pid == q + 1:
+        c.encrypt()
+    z = partition(mpc, a.copy(), ratios)
+    z.encrypt()
+    z[total - 1] = c
+    revealed_z = z.reveal()
+    assert_parties_in_step(mpc, "MPP X[-1] = an encrypted column")
+    if mpc.pid:
+        expected_z = a.copy()
+        for j in range(4):
+            expected_z[total - 1, j] = values[j]
+        assert_eq_approx(f"CP{mpc.pid}:\tMPP X[{total - 1}] = an encrypted column (flagged transposed)", revealed_z, expected_z, error=1e-3)
+    assert_parties_in_step(mpc, "MPP X[-1] = an encrypted column: reveal")
+
+
 def test_mpp[TP](mpc: MPCEnv[TP], modulus: TP):
     mpc.comms.sync_parties()
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
@@ -1098,5 +1533,13 @@ def test_mpp[TP](mpc: MPCEnv[TP], modulus: TP):
     test_mpp_columns(mpc)
     test_mpp_column_wise_row_slices(mpc)
     test_mpp_encrypted_indexing(mpc)
+    test_mpp_indexing_kinds(mpc)
+    test_mpp_semi_indexing(mpc)
+    test_mpp_setitem_boundaries(mpc)
+    test_mpp_setitem_kinds(mpc)
+    test_mpp_vector_elements(mpc)
+    test_mpp_index_errors(mpc)
+    test_mpp_column_elements(mpc)
+    test_mpp_setitem_low_level(mpc)
 
     print(f'CP{mpc.pid}:\tSequre MHE MPP tests on {alg_struct} passed.\n')

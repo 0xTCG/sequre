@@ -153,6 +153,181 @@ def _first_holder(descriptors: List[List[int]], field: int) -> int:
     return -1
 
 
+# Indexing (MPP getitem and setitem). The statuses of an indexing council: what a compute party's part of a call raised
+# while it was planned, so that every compute party raises it alike (_indexing_council)
+IDX_OK = 0
+IDX_INDEX_ERROR = 1
+IDX_NOT_IMPLEMENTED = 2
+IDX_VALUE_ERROR = 3
+
+
+def _plan_indexing(f) -> Tuple[List[Ciphertext], int, str]:
+    # Runs a compute party's indexing plan f(), which lists the ciphertexts its part masks, and turns what it raises into
+    # a status for _indexing_council
+    try:
+        return f(), IDX_OK, ""
+    except IndexError as e:
+        return List[Ciphertext](), IDX_INDEX_ERROR, e.message
+    except NotImplementedError as e:
+        return List[Ciphertext](), IDX_NOT_IMPLEMENTED, e.message
+    except ValueError as e:
+        return List[Ciphertext](), IDX_VALUE_ERROR, e.message
+    except AssertionError as e:
+        return List[Ciphertext](), IDX_VALUE_ERROR, e.message
+
+
+def _indexing_council(mpc, masked: List[Ciphertext], status: int, message: str):
+    # The one council of an MP getitem or setitem call at every compute party (CP0 takes no part): the ciphertexts this
+    # party's part masks, refreshed (none: it takes part all the same), and its status. A nonzero status at any party
+    # raises at every compute party alike, before the call's own HE work (the council's refreshes run first): that
+    # party's own message there, a pointer elsewhere.
+    statuses = mpc.mhe.refresh_council(masked, status)
+    for q in range(len(statuses)):
+        if statuses[q] != IDX_OK:
+            text = message if q == mpc.pid - 1 else f"MPP: indexing failed at CP{q + 1} (its error is raised there)"
+            if statuses[q] == IDX_INDEX_ERROR:
+                raise IndexError(text)
+            if statuses[q] == IDX_NOT_IMPLEMENTED:
+                raise NotImplementedError(text)
+            raise ValueError(text)
+
+
+def _normalized_index(idx: int, n: int, what: str) -> int:
+    # An int index along n positions, counted from the end when negative; IndexError out of range
+    j = idx + n if idx < 0 else idx
+    if not (0 <= j < n):
+        raise IndexError(f"MPP: index {idx} is out of range for {n} {what}")
+    return j
+
+
+def _step_one_range(s: slice, n: int) -> Tuple[int, int]:
+    # [start, stop) of a slice along n positions. A step other than 1 raises NotImplementedError: the compute parties
+    # ignored it while CP0 applied it (M-MP-12)
+    start, _, step, length = s.adjust_indices(n)
+    if step != 1:
+        raise NotImplementedError(f"MPP: slices with a step other than 1 (here {step}) are not supported")
+    return start, start + length
+
+
+def _index_range[T](index: T, n: int, what: str) -> Tuple[int, int]:
+    # [start, stop) of an int or a step-1 slice along n positions
+    if isinstance(T, int):
+        j = _normalized_index(index, n, what)
+        return j, j + 1
+    elif isinstance(T, slice):
+        return _step_one_range(index, n)
+    else:
+        compile_error("MPP: invalid index --- should be either slice or int")
+
+
+def _local_rows(ratios: List[int], q: int, start: int, stop: int) -> Tuple[int, int]:
+    # Compute party q's (0-based) rows of the cohort's rows [start, stop), numbered within its partition (lo == hi: none)
+    off = ratios[:q].sum()
+    lo = min(max(start - off, 0), ratios[q])
+    hi = max(min(stop - off, ratios[q]), lo)
+    return lo, hi
+
+
+def _sliced_ratios(ratios: List[int], start: int, stop: int) -> List[int]:
+    # Every compute party's row count of the cohort's rows [start, stop)
+    out = List[int](len(ratios))
+    for q in range(len(ratios)):
+        lo, hi = _local_rows(ratios, q, start, stop)
+        out.append(hi - lo)
+    return out
+
+
+def _holder_of(ratios: List[int], i: int) -> int:
+    # The compute party (0-based) that holds the cohort's row i
+    acc = 0
+    for q in range(len(ratios)):
+        acc += ratios[q]
+        if i < acc:
+            return q
+    return len(ratios) - 1
+
+
+def _block_ranges(c_start: int, c_stop: int, wl: int, wc: int, wr: int) -> List[Tuple[int, int]]:
+    # Columns [c_start, c_stop) of a semi-encrypted partition, split over its left block, its block in the clear and its
+    # right block (logical widths wl, wc, wr): each block's range in its own numbering (lo == hi: none)
+    out = List[Tuple[int, int]](3)
+    off = 0
+    for w in (wl, wc, wr):
+        lo = min(max(c_start - off, 0), w)
+        hi = max(min(c_stop - off, w), lo)
+        out.append((lo, hi))
+        off += w
+    return out
+
+
+def _vector_length(enc: Ciphertensor[Ciphertext]) -> int:
+    # The values of a 1-dim MPP's encryption: a vector, or a 2-dim one-row or one-column tensor, as rows and columns of
+    # 2-dim storage come out (a row of column-wise storage: logical [1, n], stored [n, 1]; a column of row-wise storage:
+    # logical [r, 1])
+    if not enc:
+        return 0
+    if enc.ndim == 2:
+        a, b = enc.actual_shape
+        return a * b
+    return enc.shape[0]
+
+
+def _vector_index(enc: Ciphertensor[Ciphertext], k: int) -> Tuple[int, int]:
+    # Element k of a 2-dim vector encryption, by its logical shape: (0, k) of a one-row tensor, (k, 0) of a one-column one
+    return (0, k) if enc.actual_shape[0] == 1 else (k, 0)
+
+
+def _vector_masked(mpc, enc: Ciphertensor[Ciphertext], k: int) -> List[Ciphertext]:
+    # The ciphertexts element k of a 1-dim MPP's encryption masks (a vector, or a 2-dim vector: _vector_length)
+    if enc.ndim == 2:
+        return enc._getitem_masked(mpc, _vector_index(enc, k))
+    return enc._getitem_masked(mpc, k)
+
+
+def _vector_element(mpc, enc: Ciphertensor[Ciphertext], k: int) -> Ciphertensor[Ciphertext]:
+    if enc.ndim == 2:
+        return enc._getitem(mpc, _vector_index(enc, k), refresh=False)
+    return enc._getitem(mpc, k, refresh=False)
+
+
+def _vector_set_masked(mpc, enc: Ciphertensor[Ciphertext], k: int, item: Ciphertensor[Ciphertext]) -> List[Ciphertext]:
+    if enc.ndim == 2:
+        return enc._setitem_masked(mpc, _vector_index(enc, k), item)
+    return enc._setitem_masked(mpc, k, item)
+
+
+def _vector_set(mpc, enc: Ciphertensor[Ciphertext], k: int, item: Ciphertensor[Ciphertext]):
+    if enc.ndim == 2:
+        enc._setitem(mpc, _vector_index(enc, k), item, refresh=False)
+    else:
+        enc._setitem(mpc, k, item, refresh=False)
+
+
+def _as_vector_item(enc: Ciphertensor[Ciphertext]) -> Ciphertensor[Ciphertext]:
+    # One element as a 1-dim encryption without a layout flag: a [1, 1] tensor (an element of a row stored as a column)
+    # or a one-value vector flagged transposed (an element of a column's encryption) is the same single ciphertext, and
+    # a single element has no layout (a flagged one was refused for 2-dim vector targets)
+    if (enc.ndim == 2 and enc.shape == [1, 1]) or (enc.ndim == 1 and enc.shape == [1] and enc._transposed):
+        return Ciphertensor[Ciphertext](_data=enc._data.copy(), shape=[1], slots=enc.slots)
+    return enc
+
+
+def _encrypt_like[SV, T](mpc, data: ndarray[SV, T], transposed: bool) -> Ciphertensor[Ciphertext]:
+    # Data in the clear encrypted in a target's layout: row-wise, or column-wise (stored transposed, flagged) for a
+    # target stored column-wise. A row (1-dim) into column-wise storage becomes a column of one stored value per row.
+    if not transposed:
+        return Ciphertensor[Ciphertext].enc(mpc, data, encoding=ENC_ROW)
+    if static.len(SV) == 1:
+        column = zeros((data.shape[0], 1), dtype=T)
+        for t in range(data.shape[0]):
+            column[t, 0] = data[t]
+        enc = Ciphertensor[Ciphertext].enc(mpc, column, encoding=ENC_ROW)
+    else:
+        enc = Ciphertensor[Ciphertext].enc(mpc, data.T, encoding=ENC_ROW)
+    enc._transposed = True
+    return enc
+
+
 # Multiparty partition
 class MPP[S, dtype]:
     """
@@ -782,9 +957,16 @@ class MPP[S, dtype]:
                 is_d_contig = self._encryption_right._diagonal_contiguous
             
             local_data = local_data.T if is_transposed else local_data
-
-        self._encryption_unified = Ciphertensor[Ciphertext].enc(mpc, local_data, encoding=ENC_DIAG if is_d_contig else ENC_ROW)
-        self._encryption_unified._transposed = is_transposed
+            self._encryption_unified = Ciphertensor[Ciphertext].enc(mpc, local_data, encoding=ENC_DIAG if is_d_contig else ENC_ROW)
+            self._encryption_unified._transposed = is_transposed
+        elif any(bool(blk) and blk.ndim == 2 and blk._transposed for blk in (self._encryption_left, self._encryption_right)):
+            # A row of a semi-encrypted partition whose blocks are stored as columns ([n, 1], flagged transposed: a row of
+            # column-wise storage comes out so, as the blocks of an A @ B.T result are): its block in the clear is
+            # encrypted the same way, so that the three join along the row
+            self._encryption_unified = _encrypt_like(mpc, local_data, True)
+        else:
+            self._encryption_unified = Ciphertensor[Ciphertext].enc(mpc, local_data, encoding=ENC_ROW)
+            self._encryption_unified._transposed = is_transposed
         if self._encryption_left:
             self._encryption_unified = self._encryption_left.concat(mpc, self._encryption_unified, axis=1)
         if self._encryption_right:
@@ -2369,562 +2551,659 @@ class MPP[S, dtype]:
             _encryption_unified=_encryption_unified,
             _transposed=self._transposed)
 
+    # Indexing. A getitem or setitem is called at every party with the same arguments, and its index arithmetic (the
+    # ratios, the index) is public: CP0 answers from it with placeholders and does no HE, and every party raises the
+    # index errors it finds there. Each compute party then plans its own part without HE work: the ciphertexts it will
+    # mask (none if it holds nothing encrypted, takes nothing, or takes whole stored rows) and whether its part is valid
+    # at its partition. Every compute party holds one council (_indexing_council), which refreshes those ciphertexts and
+    # raises any party's error at every compute party alike, and then does its part with the Ciphertensor calls' own
+    # refreshes off. So the parties hold the same number of refresh councils whatever each holds (in the clear,
+    # encrypted in any layout, semi-encrypted, nothing) and whatever its share of the range (H-34). The aligner, which
+    # gave empty partitions placeholders for this, is not used here: it could not cover mixed kinds at equal ratios, nor
+    # parties whose ranges differ in kind (a whole range at one, a partial one at another).
+
+    def _empty_part[S1](self, ratios: List[int], transposed: bool) -> MPP[S1, dtype]:
+        return MPP[S1, dtype](
+            _mpc=self._mpc,
+            _ratios=ratios,
+            _local_data=ndarray[S1, dtype](),
+            _encryption_left=Ciphertensor[Ciphertext](),
+            _encryption_right=Ciphertensor[Ciphertext](),
+            _encryption_unified=Ciphertensor[Ciphertext](),
+            _transposed=transposed)
+
+    def _block_widths(self) -> Tuple[int, int, int]:
+        # A semi-encrypted partition's blocks' logical widths (columns as held; a 1-dim one's lengths), 0 for an absent
+        # block (CP1 holds no left block of an A @ B.T result, the last party no right block)
+        wc = self._local_data.shape[-1] if self.has_local_data() else 0
+        if static.len(S) == 1:
+            return _vector_length(self._encryption_left), wc, _vector_length(self._encryption_right)
+        wl = self._encryption_left.actual_shape[-1] if self._encryption_left else 0
+        wr = self._encryption_right.actual_shape[-1] if self._encryption_right else 0
+        return wl, wc, wr
+
+    def _held_width(self) -> int:
+        # The columns of this compute party's partition as held (a 1-dim one's length); 0 if it is empty
+        if self.is_empty():
+            return 0
+        if self.is_local():
+            return self._local_data.shape[-1]
+        if self.is_semi_encrypted():
+            wl, wc, wr = self._block_widths()
+            return wl + wc + wr
+        if static.len(S) == 1:
+            return _vector_length(self._encryption_unified)
+        return self._encryption_unified.actual_shape[-1]
+
+    def _element_masked(self, k: int) -> List[Ciphertext]:
+        # The ciphertexts _element(k) masks: element k of this party's 1-dim partition (its blocks in order)
+        mpc = self._mpc
+        if self.is_local():
+            return List[Ciphertext]()
+        if not self.is_semi_encrypted():
+            return _vector_masked(mpc, self._encryption_unified, k)
+        wl, wc, _ = self._block_widths()
+        if k < wl:
+            return _vector_masked(mpc, self._encryption_left, k)
+        if k < wl + wc:
+            return List[Ciphertext]()
+        return _vector_masked(mpc, self._encryption_right, k - wl - wc)
+
+    def _element(self, k: int, ratios: List[int]) -> MPP[S, dtype]:
+        # Element k of this party's 1-dim partition, in the representation of the block that holds it (the ciphertexts
+        # _element_masked lists were refreshed in the indexing council)
+        mpc = self._mpc
+        if self.is_local():
+            return MPP[S, dtype](_mpc=mpc, _ratios=ratios, _local_data=self._local_data[k:k + 1], _transposed=self._transposed)
+        if not self.is_semi_encrypted():
+            return MPP[S, dtype](_mpc=mpc, _ratios=ratios, _encryption_unified=_vector_element(mpc, self._encryption_unified, k), _transposed=self._transposed)
+        wl, wc, _ = self._block_widths()
+        if k < wl:
+            return MPP[S, dtype](_mpc=mpc, _ratios=ratios, _encryption_unified=_vector_element(mpc, self._encryption_left, k), _transposed=self._transposed)
+        if k < wl + wc:
+            return MPP[S, dtype](_mpc=mpc, _ratios=ratios, _local_data=self._local_data[k - wl:k - wl + 1], _transposed=self._transposed)
+        return MPP[S, dtype](_mpc=mpc, _ratios=ratios, _encryption_unified=_vector_element(mpc, self._encryption_right, k - wl - wc), _transposed=self._transposed)
+
     def _getitem_1_dim(self, indices) -> MPP[S, dtype]:
         if isinstance(indices, slice):
             compile_error("Not implemented yet: slicing 1-dim MPP")
-        
         if isinstance(indices, tuple):
             compile_error("MPP: cannot slice 1-dim MPP --- too many indices")
-        
-        idx = indices
-        mpc = self._mpc
         if static.len(S) != 1: compile_error("MPP: cannot do 1-dim getitem from non-1-dim MPP")
-        if self._ratios.sum() != 1:
-            assert self._transposed, "MPP: 1-dimensional MPP should be either present at one party only or transposed"
-
-        _local_data = ndarray[S, dtype]()
-        _encryption_unified = Ciphertensor[Ciphertext]()
-
-        _ratio_idx = self._find_idx_in_ratios(idx)
         if self._transposed:
-            _ratios = one_hot_vector(idx=_ratio_idx, size=len(self._ratios), TP=int)
-        else:
-            _ratios = self._ratios.copy()
-        
+            return self._get_column_element(indices)
+        return self._get_row_element(indices)
+
+    def _get_column_element(self, index: int) -> MPP[S, dtype]:
+        # Element index of a column split over the parties (a transposed 1-dim MPP): its holder's, with one-hot ratios
+        mpc = self._mpc
+        i = _normalized_index(index, self._ratios.sum(), "elements")
+        q = _holder_of(self._ratios, i)
+        _ratios = one_hot_vector(idx=q, size=len(self._ratios), TP=int)
         if mpc.pid == 0:
-            return MPP[S, dtype](
-                _mpc=self._mpc,
-                _ratios=_ratios,
-                _local_data=self._local_data[idx:idx+1],
-                _transposed=self._transposed)
-        
-        if self._transposed:
-            assert not self.is_semi_encrypted(), "MPP: 1-dimensional transposed MPP should not be partially encrypted"
-            
-            adjusted_idx = idx - self._ratios[:_ratio_idx].sum()
-            is_local = mpc.council(self.is_local())[_ratio_idx]
-            
-            if mpc.pid == _ratio_idx + 1:
-                if is_local:
-                    return MPP[S, dtype](
-                        _mpc=self._mpc,
-                        _ratios=_ratios,
-                        _local_data=self._local_data[adjusted_idx:adjusted_idx+1],
-                        _transposed=self._transposed)
-                else:
-                    assert self.has_unified_encryption(), "MPP: 1-dimensional transposed MPP should have either local or full-encrypted partition"
-                    mpc.comms.send_to_all_from(self._encryption_unified.shape[0], mpc.pid)
-                    _encryption_unified = self._encryption_unified._getitem_1_dim(mpc, adjusted_idx)
-            elif not is_local: # Manual aligner to support bootstrapping
-                slots = mpc.mhe.crypto_params.params.slots()
-                size = mpc.comms.receive_as_jar(_ratio_idx + 1, T=int)
-                Ciphertensor[Ciphertext].placeholder([size], slots)._getitem_1_dim(mpc, adjusted_idx)
-            
-            return MPP[S, dtype](
-                _mpc=self._mpc,
-                _ratios=_ratios,
-                _local_data=_local_data,
-                _encryption_left=Ciphertensor[Ciphertext](),
-                _encryption_right=Ciphertensor[Ciphertext](),
-                _encryption_unified=_encryption_unified,
-                _transposed=self._transposed)
+            return MPP[S, dtype](_mpc=mpc, _ratios=_ratios, _local_data=self._local_data[i:i + 1], _transposed=True)
+        holder = mpc.pid == q + 1
+        k = i - self._ratios[:q].sum()
+        masked, status, message = _plan_indexing(lambda: self._element_masked(k) if holder else List[Ciphertext]())
+        _indexing_council(mpc, masked, status, message)
+        if not holder:
+            return self._empty_part(_ratios, True, S1=S)
+        return self._element(k, _ratios)
 
-        with self.partition_aligner() as aligner:
-            if not self.is_empty():
-                if self.is_local():
-                    _local_data = self._local_data[idx:idx+1]
-                elif self.is_semi_encrypted():
-                    idx_up_bound = 0
-                    if self._encryption_left:
-                        assert self._encryption_left.ndim == 1, "MPP: invalid dimension of ciphertensor"
-                        idx_up_bound += self._encryption_left.shape[-1]
-                        if idx < idx_up_bound:
-                            _encryption_unified = self._encryption_left._getitem_1_dim(mpc, idx)
+    def _get_row_element(self, index: int) -> MPP[S, dtype]:
+        # Element index of a row held by one compute party (a 1-dim MPP, not transposed, with one-hot ratios): its
+        # holder's. The holder knows the row's length, so an index out of range raises through the council.
+        mpc = self._mpc
+        if self._ratios.sum() != 1:
+            raise NotImplementedError(f"MPP: an element of a 1-dimensional MPP comes from a row held by one party or from a column (transposed); ratios {self._ratios} are neither")
+        _ratios = self._ratios.copy()
+        if mpc.pid == 0:
+            i = _normalized_index(index, self._local_data.shape[0], "elements")
+            return MPP[S, dtype](_mpc=mpc, _ratios=_ratios, _local_data=self._local_data[i:i + 1])
+        holder = mpc.pid == argmax(self._ratios) + 1
+        k = 0
+        masked = List[Ciphertext]()
+        status = IDX_OK
+        message = ""
+        if holder:
+            try:
+                k = _normalized_index(index, self._held_width(), "elements")
+            except IndexError as e:
+                status = IDX_INDEX_ERROR
+                message = e.message
+            if status == IDX_OK:
+                masked, status, message = _plan_indexing(lambda: self._element_masked(k))
+        _indexing_council(mpc, masked, status, message)
+        if not holder:
+            return self._empty_part(_ratios, False, S1=S)
+        return self._element(k, _ratios)
 
-                            return MPP[S, dtype](
-                                _mpc=self._mpc,
-                                _ratios=self._ratios.copy(),
-                                _encryption_unified=_encryption_unified)
-                    
-                    idx_low_bound = idx_up_bound
-                    idx_up_bound += self._local_data.shape[-1]
-                    if idx < idx_up_bound:
-                        _local_data = self._local_data[idx - idx_low_bound:idx - idx_low_bound + 1]
+    def _part_masked[TR](self, ri: TR, c_lo: int, c_hi: int) -> List[Ciphertext]:
+        # The ciphertexts _part_get(ri, c_lo, c_hi) masks: rows ri (an int or a slice) and columns [c_lo, c_hi) of this
+        # party's 2-dim partition as held
+        mpc = self._mpc
+        if self.is_empty() or self.is_local():
+            return List[Ciphertext]()
+        if not self.is_semi_encrypted():
+            return self._encryption_unified._getitem_masked(mpc, (ri, slice(start=c_lo, stop=c_hi, step=1)))
+        wl, wc, wr = self._block_widths()
+        ranges = _block_ranges(c_lo, c_hi, wl, wc, wr)
+        out = List[Ciphertext]()
+        if ranges[0][1] > ranges[0][0]:
+            out.extend(self._encryption_left._getitem_masked(mpc, (ri, slice(start=ranges[0][0], stop=ranges[0][1], step=1))))
+        if ranges[2][1] > ranges[2][0]:
+            out.extend(self._encryption_right._getitem_masked(mpc, (ri, slice(start=ranges[2][0], stop=ranges[2][1], step=1))))
+        return out
 
-                        return MPP[S, dtype](
-                            _mpc=self._mpc,
-                            _ratios=self._ratios.copy(),
-                            _local_data=_local_data)
-                    
-                    idx_low_bound = idx_up_bound
-                    if self._encryption_right:
-                        assert self._encryption_right.ndim == 1, "MPP: invalid dimension of ciphertensor"
-                        idx_up_bound += self._encryption_right.shape[-1]
-                        if idx < idx_up_bound:
-                            _encryption_unified = self._encryption_right._getitem_1_dim(mpc, idx - idx_low_bound)
-
-                            return MPP[S, dtype](
-                                _mpc=self._mpc,
-                                _ratios=self._ratios.copy(),
-                                _encryption_unified=_encryption_unified)
-                    
-                    raise ValueError("MPP: index out of bound")
-                else:
-                    assert self.has_unified_encryption(), "MPP: must have unified encryption if not local and semi encrypted"
-                    _encryption_unified = self._encryption_unified._getitem_1_dim(mpc, idx)
-        
-            return aligner.new_mpp(
-                _local_data=_local_data,
-                _encryption_unified=_encryption_unified)
-    
-    @sequre
-    def _get_column(mpc, mpp: MPP[Tuple[int, int], dtype], idx: int) -> MPP[Tuple[int], dtype]:
-        _local_data = ndarray[Tuple[int], dtype]()
-        _encryption_unified = Ciphertensor[Ciphertext]()
-
-        if not mpp.is_empty():
-            if mpp.is_local():
-                _local_data = mpp._local_data[:, idx]
-            elif mpp.is_semi_encrypted():
-                if idx < mpp._encryption_left.shape[-1]:
-                    _encryption_unified = mpp._encryption_left[:, idx]
-                elif idx < mpp._encryption_left.shape[-1] + mpp._local_data.shape[-1]:
-                    _local_data = mpp._local_data[:, idx - mpp._encryption_left.shape[-1]]
-                else:
-                    _encryption_unified = mpp._encryption_right[:, idx - mpp._encryption_left.shape[-1] - mpp._local_data.shape[-1]]
-            else:
-                assert mpp.has_unified_encryption(), "MPP: must have unified encryption if not local and semi encrypted"
-                _encryption_unified = mpp._encryption_unified[:, idx]
-        
-        return MPP[Tuple[int], dtype](
-            _mpc=mpc,
-            _ratios=mpp._ratios,
-            _local_data=_local_data,
-            _encryption_left=Ciphertensor[Ciphertext](),
-            _encryption_right=Ciphertensor[Ciphertext](),
-            _encryption_unified=_encryption_unified,
-            _transposed=mpp._transposed)
-    
-    @sequre
-    def _getitem_core[S1](mpc, mpp: MPP[S, dtype], adjusted_idx, ratios: List[int]) -> MPP[S1, dtype]:
-        assert not mpp.is_empty(), "MPP: _getitem_core should be called on top of a non-empty partition"
-
-        _local_data = ndarray[S1, dtype]()
-        _encryption_left = Ciphertensor[Ciphertext]()
-        _encryption_right = Ciphertensor[Ciphertext]()
-        _encryption_unified = Ciphertensor[Ciphertext]()
-        
-        if mpp.is_local():
-            _local_data = mpp._local_data[adjusted_idx]
-        elif mpp.is_semi_encrypted():
-            assert not static.len(S) == 1 and not isinstance(adjusted_idx, tuple), "Not implemented yet: slicing along 1-axis semi-encrypted MPP via _getitem_core"
-            _local_data = mpp._local_data[adjusted_idx]
-            _encryption_left = mpp._encryption_left[adjusted_idx]
-            _encryption_right = mpp._encryption_right[adjusted_idx]
-        else:
-            assert mpp.has_unified_encryption(), "MPP: must have unified encryption if not local and semi encrypted"
-            _encryption_unified = mpp._encryption_unified[adjusted_idx]
-        
+    def _part_get[S1, TR](self, ri: TR, c_lo: int, c_hi: int, ratios: List[int]) -> MPP[S1, dtype]:
+        # Rows ri and columns [c_lo, c_hi) of this party's 2-dim partition as held (the ciphertexts _part_masked lists were
+        # refreshed in the indexing council). A semi-encrypted partition keeps its blocks' parts of the range; a range
+        # that misses its block in the clear lies in one encrypted block, which becomes the unified encryption.
+        mpc = self._mpc
+        if self.is_local():
+            return MPP[S1, dtype](_mpc=mpc, _ratios=ratios, _local_data=self._local_data[ri, c_lo:c_hi])
+        if not self.is_semi_encrypted():
+            return MPP[S1, dtype](
+                _mpc=mpc, _ratios=ratios,
+                _encryption_unified=self._encryption_unified._getitem(mpc, (ri, slice(start=c_lo, stop=c_hi, step=1)), refresh=False))
+        wl, wc, wr = self._block_widths()
+        ranges = _block_ranges(c_lo, c_hi, wl, wc, wr)
+        left = Ciphertensor[Ciphertext]()
+        right = Ciphertensor[Ciphertext]()
+        if ranges[0][1] > ranges[0][0]:
+            left = self._encryption_left._getitem(mpc, (ri, slice(start=ranges[0][0], stop=ranges[0][1], step=1)), refresh=False)
+        if ranges[2][1] > ranges[2][0]:
+            right = self._encryption_right._getitem(mpc, (ri, slice(start=ranges[2][0], stop=ranges[2][1], step=1)), refresh=False)
+        if ranges[1][1] == ranges[1][0]:
+            return MPP[S1, dtype](_mpc=mpc, _ratios=ratios, _encryption_unified=left if left else right)
         return MPP[S1, dtype](
             _mpc=mpc,
             _ratios=ratios,
-            _local_data=_local_data,
-            _encryption_left=_encryption_left,
-            _encryption_right=_encryption_right,
-            _encryption_unified=_encryption_unified,
+            _local_data=self._local_data[ri, ranges[1][0]:ranges[1][1]],
+            _encryption_left=left,
+            _encryption_right=right,
+            _encryption_unified=Ciphertensor[Ciphertext](),
             _transposed=False)
 
+    def _get_block[S1, T1, T2](self, rs: T1, cs: T2) -> MPP[S1, dtype]:
+        # X[rs, cs] of an MPP as held (rows rs: an int or a slice; columns cs: an int or a slice), in one council: each
+        # compute party takes its rows of the range and the columns of its partition
+        mpc = self._mpc
+        start, stop = _index_range(rs, self._ratios.sum(), "rows")
+        if isinstance(T1, int):
+            _ratios = one_hot_vector(idx=_holder_of(self._ratios, start), size=len(self._ratios), TP=int)
+        else:
+            _ratios = _sliced_ratios(self._ratios, start, stop)
+        if mpc.pid == 0:
+            c_lo, c_hi = _index_range(cs, self._local_data.shape[1], "columns")
+            if isinstance(T1, int):
+                return MPP[S1, dtype](_mpc=mpc, _ratios=_ratios, _local_data=self._local_data[start, c_lo:c_hi])
+            else:
+                return MPP[S1, dtype](_mpc=mpc, _ratios=_ratios, _local_data=self._local_data[start:stop, c_lo:c_hi])
+
+        lo, hi = _local_rows(self._ratios, mpc.pid - 1, start, stop)
+        take = hi > lo
+        c_lo, c_hi = 0, 0
+        masked = List[Ciphertext]()
+        status = IDX_OK
+        message = ""
+        # Every party that holds a partition checks the columns (as CP0 does), whether or not it takes rows of the range
+        if not self.is_empty():
+            try:
+                c_lo, c_hi = _index_range(cs, self._held_width(), "columns")
+            except IndexError as e:
+                status = IDX_INDEX_ERROR
+                message = e.message
+            except NotImplementedError as e:
+                status = IDX_NOT_IMPLEMENTED
+                message = e.message
+            except ValueError as e:
+                status = IDX_VALUE_ERROR
+                message = e.message
+            except AssertionError as e:
+                status = IDX_VALUE_ERROR
+                message = e.message
+            if status == IDX_OK and take:
+                if isinstance(T1, int):
+                    masked, status, message = _plan_indexing(lambda: self._part_masked(lo, c_lo, c_hi))
+                else:
+                    masked, status, message = _plan_indexing(lambda: self._part_masked(slice(start=lo, stop=hi, step=1), c_lo, c_hi))
+        _indexing_council(mpc, masked, status, message)
+        if not take:
+            return self._empty_part(_ratios, False, S1=S1)
+        if isinstance(T1, int):
+            return self._part_get(lo, c_lo, c_hi, _ratios, S1=S1)
+        else:
+            return self._part_get(slice(start=lo, stop=hi, step=1), c_lo, c_hi, _ratios, S1=S1)
+
+    def _column_masked(self, j: int) -> List[Ciphertext]:
+        # The ciphertexts _column(j) masks
+        mpc = self._mpc
+        whole = slice(start=None, stop=None, step=1)
+        if self.is_local():
+            return List[Ciphertext]()
+        if not self.is_semi_encrypted():
+            return self._encryption_unified._getitem_masked(mpc, (whole, j))
+        wl, wc, _ = self._block_widths()
+        if j < wl:
+            return self._encryption_left._getitem_masked(mpc, (whole, j))
+        if j < wl + wc:
+            return List[Ciphertext]()
+        return self._encryption_right._getitem_masked(mpc, (whole, j - wl - wc))
+
+    def _column(self, j: int) -> MPP[Tuple[int], dtype]:
+        # Column j of this party's 2-dim partition as held, in the representation of the block that holds it
+        mpc = self._mpc
+        whole = slice(start=None, stop=None, step=1)
+        ratios = self._ratios.copy()
+        enc = Ciphertensor[Ciphertext]()
+        if self.is_local():
+            return MPP[Tuple[int], dtype](_mpc=mpc, _ratios=ratios, _local_data=self._local_data[:, j], _transposed=True)
+        if not self.is_semi_encrypted():
+            enc = self._encryption_unified._getitem(mpc, (whole, j), refresh=False)
+        else:
+            wl, wc, _ = self._block_widths()
+            if j < wl:
+                enc = self._encryption_left._getitem(mpc, (whole, j), refresh=False)
+            elif j < wl + wc:
+                return MPP[Tuple[int], dtype](_mpc=mpc, _ratios=ratios, _local_data=self._local_data[:, j - wl], _transposed=True)
+            else:
+                enc = self._encryption_right._getitem(mpc, (whole, j - wl - wc), refresh=False)
+        return MPP[Tuple[int], dtype](_mpc=mpc, _ratios=ratios, _encryption_unified=enc, _transposed=True)
+
+    def _get_column(self, idx: int) -> MPP[Tuple[int], dtype]:
+        # Row idx of a transposed MPP: column idx of each partition as held, a column split over the parties with the
+        # operand's ratios
+        mpc = self._mpc
+        if mpc.pid == 0:
+            j = _normalized_index(idx, self._local_data.shape[1], "columns")
+            return MPP[Tuple[int], dtype](_mpc=mpc, _ratios=self._ratios.copy(), _local_data=self._local_data[:, j], _transposed=True)
+        take = not self.is_empty()
+        j = 0
+        masked = List[Ciphertext]()
+        status = IDX_OK
+        message = ""
+        if take:
+            try:
+                j = _normalized_index(idx, self._held_width(), "columns")
+            except IndexError as e:
+                status = IDX_INDEX_ERROR
+                message = e.message
+            if status == IDX_OK:
+                masked, status, message = _plan_indexing(lambda: self._column_masked(j))
+        _indexing_council(mpc, masked, status, message)
+        if not take:
+            return self._empty_part(self._ratios.copy(), True, S1=Tuple[int])
+        return self._column(j)
+
     def _getitem_2_dim(self, idx: int) -> MPP[Tuple[int], dtype]:
-        mpc = self._mpc
         assert self.ndim == 2, "MPP: cannot do 2-dim-getitem from non-2-dimensional MPP"
-
         if self._transposed:
-            return MPP[S, dtype]._get_column(mpc, self, idx)
+            return self._get_column(idx)
+        return self._get_block(idx, slice(start=None, stop=None, step=1), S1=Tuple[int])
 
-        assert 0 <= idx < self._ratios.sum(), f"MPP: getitem - index out of bound --- {idx} not in [0, {self._ratios.sum()})"
-
-        _ratio_idx = self._find_idx_in_ratios(idx)
-        _ratios = one_hot_vector(idx=_ratio_idx, size=len(self._ratios), TP=int)
-
-        if mpc.pid == 0:
-            return MPP[Tuple[int], dtype](
-                _mpc=self._mpc,
-                _ratios=_ratios,
-                _local_data=self._local_data[idx])
-
-        if mpc.pid == _ratio_idx + 1:
-            adjusted_idx = idx - self._ratios[:_ratio_idx].sum()
-            return MPP._getitem_core(mpc, self, adjusted_idx, _ratios, S1=Tuple[int])
-            
-        return MPP[Tuple[int], dtype](
-            _mpc=self._mpc,
-            _ratios=_ratios)
-    
     def _getitem_2_dim(self, s: slice) -> MPP[S, dtype]:
-        mpc = self._mpc
         assert self.ndim == 2, "MPP: cannot do 2-dim-getitem from non-2-dimensional MPP"
-        assert not self._transposed, "Not implemented yet: getitem from transposed MPP"
+        if self._transposed:
+            raise NotImplementedError("MPP: row slices of a transposed MPP are not implemented yet")
+        return self._get_block(s, slice(start=None, stop=None, step=1), S1=S)
 
-        start, stop, _, _ = s.adjust_indices(self.cohort_shape[0])
-        
-        _start_ratio_idx = self._find_idx_in_ratios(start)
-        _stop_ratio_idx = self._find_idx_in_ratios(stop)
-        _ratios = self._get_sliced_ratios(_start_ratio_idx, _stop_ratio_idx, start, stop)
-
-        if mpc.pid == 0:
-            return MPP[S, dtype](
-                _mpc=self._mpc,
-                _ratios=_ratios,
-                _local_data=self._local_data[s])
-
-        reference_pid = mpc.pid - 1
-        if _ratios[reference_pid]:
-            adjusted_slice = self._adjust_row_slice(start, stop)
-            return MPP._getitem_core(mpc, self, adjusted_slice, _ratios, S1=S)
-            
-        return MPP[S, dtype](
-            _mpc=self._mpc,
-            _ratios=_ratios)
-    
-    def _getitem_2_dim_tuple[T1](self, slices: Tuple[T1, slice]) -> MPP:
-        mpc = self._mpc
-        rs = slices[0]
-        row_sliced_self = self._getitem_2_dim(rs)
-        _ratios = row_sliced_self._ratios
-        
-        if mpc.pid == 0:
-            return MPP[row_sliced_self.S, dtype](
-                _mpc=self._mpc,
-                _ratios=_ratios,
-                _local_data=self._local_data[slices])
-
-        with row_sliced_self.partition_aligner() as aligner:
-            if not row_sliced_self.is_empty():
-                adjusted_idx = MPP._adjust_col_slice_tuple(slices[1], T1=T1)
-                col_sliced_self = MPP._getitem_core(mpc, row_sliced_self, adjusted_idx, _ratios, S1=row_sliced_self.S)
-
-                return aligner.new_mpp(
-                    _local_data=col_sliced_self._local_data,
-                    _encryption_left=col_sliced_self._encryption_left,
-                    _encryption_right=col_sliced_self._encryption_right,
-                    _encryption_unified=col_sliced_self._encryption_unified)
-
-        return MPP[row_sliced_self.S, dtype](
-            _mpc=self._mpc,
-            _ratios=_ratios)
-    
     def _getitem_2_dim(self, slices: Tuple[slice, slice]) -> MPP[S, dtype]:
         assert self.ndim == 2, "MPP: cannot do 2-dim-getitem from non-2-dimensional MPP"
-        if self._transposed:
-            slices = slices[::-1]
-            self._transposed = False
-            r = self._getitem_2_dim_tuple(slices)
-            r._transposed = True
+        if not self._transposed:
+            return self._get_block(slices[0], slices[1], S1=S)
+        # X.T[rs, cs] is X[cs, rs], transposed
+        self._transposed = False
+        try:
+            r = self._get_block(slices[1], slices[0], S1=S)
+        finally:
             self._transposed = True
-            return r
-        
-        return self._getitem_2_dim_tuple(slices)
-    
+        r._transposed = True
+        return r
+
     def _getitem_2_dim(self, slices: Tuple[slice, int]) -> MPP[S, dtype]:
         assert self.ndim == 2, "MPP: cannot do 2-dim-getitem from non-2-dimensional MPP"
-        assert not self._transposed, "Not implemented yet: getitem from transposed MPP"
+        if self._transposed:
+            raise NotImplementedError("MPP: getitem (rows, column) from a transposed MPP is not implemented yet")
+        return self._get_block(slices[0], slices[1], S1=S)
 
-        rs, c_idx = slices
-        cs = slice(start=c_idx, stop=c_idx + 1, step=1)
-        return self._getitem_2_dim_tuple((rs, cs))
-    
     def _getitem_2_dim(self, slices: Tuple[int, slice]) -> MPP[Tuple[int], dtype]:
         assert self.ndim == 2, "MPP: cannot do 2-dim-getitem from non-2-dimensional MPP"
-        assert not self._transposed, "Not implemented yet: getitem from transposed MPP"
-        return self._getitem_2_dim_tuple(slices)
-    
+        if self._transposed:
+            raise NotImplementedError("MPP: getitem (row, columns) from a transposed MPP is not implemented yet")
+        return self._get_block(slices[0], slices[1], S1=Tuple[int])
+
     def _getitem_2_dim(self, slices: Tuple[int, int]) -> MPP[Tuple[int], dtype]:
         assert self.ndim == 2, "MPP: cannot do 2-dim-getitem from non-2-dimensional MPP"
-        assert not self._transposed, "Not implemented yet: getitem from transposed MPP"
+        if self._transposed:
+            raise NotImplementedError("MPP: getitem (row, column) from a transposed MPP is not implemented yet")
+        return self._get_block(slices[0], slices[1], S1=Tuple[int])
 
-        r_idx, c_idx = slices
-        cs = slice(start=c_idx, stop=c_idx + 1, step=1)
-        return self._getitem_2_dim_tuple((r_idx, cs))
-    
     def _setitem_1_dim(self, indices, value: MPP):
         if isinstance(indices, slice):
             compile_error("MPP: slicing 1-dim MPP is not implemented yet")
-        
         if isinstance(indices, tuple):
             compile_error("MPP: cannot slice 1-dim MPP --- too many indices")
-
-        idx = indices
+        if static.len(S) != 1 or static.len(value.S) != 1:
+            compile_error("MPP: 1-dim setitem expects 1-dim operands")
         mpc = self._mpc
-        assert static.len(S) == static.len(value.S) == 1, "MPP: 1-dim setitem expects 1-dim operands"
-        
-        if mpc.pid == 0:
-            self._local_data[idx] = value._local_data[0]
-            return
-        
+        i = 0
         if self._transposed:
-            assert not self.is_semi_encrypted(), "MPP: 1-dimensional transposed MPP should not be partially encrypted"
-            
-            _ratio_idx = self._find_idx_in_ratios(idx)
-            adjusted_idx = idx - self._ratios[:_ratio_idx].sum()
-            is_local = mpc.council(self.is_local())[_ratio_idx]
-            
-            if mpc.pid == _ratio_idx + 1:
-                if is_local:
-                    self._local_data[adjusted_idx] = value._local_data[0]
-                else:
-                    assert self.has_unified_encryption(), "MPP: 1-dimensional transposed MPP should have either local or full-encrypted partition"
-                    mpc.comms.send_to_all_from(self._encryption_unified.shape[0], mpc.pid)
-                    mpc.comms.send_to_all_from(value._encryption_unified.shape[0], mpc.pid)
-                    self._encryption_unified._setitem(mpc, adjusted_idx, value._encryption_unified)
-            elif not is_local: # Manual aligner to support bootstrapping
-                slots = mpc.mhe.crypto_params.params.slots()
-                self_size = mpc.comms.receive_as_jar(_ratio_idx + 1, T=int)
-                value_size = mpc.comms.receive_as_jar(_ratio_idx + 1, T=int)
-                self_placeholder = Ciphertensor[Ciphertext].placeholder([self_size], slots)
-                value_placeholder = Ciphertensor[Ciphertext].placeholder([value_size], slots)
-                self_placeholder._setitem(mpc, adjusted_idx, value_placeholder)
-
+            i = _normalized_index(indices, self._ratios.sum(), "elements")
+            q = _holder_of(self._ratios, i)
+        else:
+            if self._ratios.sum() != 1:
+                raise NotImplementedError(f"MPP: an element of a 1-dimensional MPP is set in a row held by one party or in a column (transposed); ratios {self._ratios} are neither")
+            q = argmax(self._ratios)
+        if value._ratios.sum() != 1 or argmax(value._ratios) != q:
+            raise ValueError(f"MPP: a 1-dim setitem takes one element held by the party that holds the target element (CP{q + 1}), not one partitioned as {value._ratios}")
+        if mpc.pid == 0:
+            j = i if self._transposed else _normalized_index(indices, self._local_data.shape[0], "elements")
+            self._local_data[j] = value._local_data[0]
             return
-            
-        assert self._ratios == value._ratios, f"MPP: partitioning missmatch in 1-dim setitem: {self._ratios} != {value._ratios}"
-        assert self._ratios.sum() == value._ratios.sum(), "MPP: invalid partition ratios for 1-dim setitem"
 
-        with self.partition_aligner(), value.partition_aligner():
-            if not self.is_empty():
-                assert value.shape == (1,), "MPP: 1-dim setitem operand should contain a single value"
-                assert not value.is_semi_encrypted(), "MPP: single-element setitem value should not be semi-encrypted"
-
-                if self.is_full_encrypted() or value.is_full_encrypted():
-                    self.unify_encryption()
-                    _value_cp = value.copy()
-                    _value_cp.unify_encryption()
-                    self._encryption_unified._setitem(mpc, idx, _value_cp._encryption_unified)
+        holder = mpc.pid == q + 1
+        k = i - self._ratios[:q].sum() if self._transposed else 0
+        masked = List[Ciphertext]()
+        status = IDX_OK
+        message = ""
+        # At the holder: in_clear writes data in the clear (the partition's, or a semi-encrypted one's block in the
+        # clear at offset `shift`); otherwise target (its encryption, or the block that holds the element, at kb) takes
+        # item, and becomes the partition's unified encryption if the partition was in the clear (to_unified)
+        in_clear = False
+        shift = 0
+        kb = 0
+        to_unified = False
+        target = Ciphertensor[Ciphertext]()
+        item = Ciphertensor[Ciphertext]()
+        if holder:
+            try:
+                if not self._transposed:
+                    k = _normalized_index(indices, self._held_width(), "elements")
+                if value._held_width() != 1:
+                    raise ValueError(f"MPP: a 1-dim setitem takes one element, not {value._held_width()}")
+                kb = k
+                if self.is_semi_encrypted():
+                    wl, wc, _ = self._block_widths()
+                    if k < wl:
+                        target = self._encryption_left
+                    elif k < wl + wc:
+                        if not value.is_local():
+                            raise NotImplementedError("MPP: setting an encrypted element into the block in the clear of a semi-encrypted partition is not implemented yet")
+                        in_clear = True
+                        shift = wl
+                    else:
+                        target = self._encryption_right
+                        kb = k - wl - wc
+                elif self.is_local() and value.is_local():
+                    in_clear = True
+                elif self.is_local():
+                    target = Ciphertensor[Ciphertext].enc(mpc, self._local_data, encoding=ENC_ROW)
+                    target._transposed = self._transposed
+                    to_unified = True
                 else:
-                    assert self.is_local() or self.is_semi_encrypted(), "MPP: ivalid self operand in 1-dim setitem"
-                    assert value.is_local(), "MPP: ivalid value operand in 1-dim setitem"
-                    
-                    border = 0
-                    if self._encryption_left:
-                        border = self._encryption_left.shape[-1]
-                        if idx < border:
-                            _value_cp = value.copy()
-                            _value_cp.unify_encryption()
-                            self._encryption_left._setitem(mpc, idx, _value_cp._encryption_unified)
-                            return
-                    
-                    if idx < border + self._local_data.shape[-1]:
-                        self._local_data[idx - border] = value._local_data[0]
-                        return
-                    border += self._local_data.shape[-1]
+                    target = self._encryption_unified
+                if not in_clear:
+                    if value.is_local():
+                        item = Ciphertensor[Ciphertext].enc(mpc, value._local_data, encoding=ENC_ROW)
+                    else:
+                        value_copy = value.copy()
+                        value_copy.unify_encryption()
+                        item = _as_vector_item(value_copy._encryption_unified)
+            except IndexError as e:
+                status = IDX_INDEX_ERROR
+                message = e.message
+            except NotImplementedError as e:
+                status = IDX_NOT_IMPLEMENTED
+                message = e.message
+            except ValueError as e:
+                status = IDX_VALUE_ERROR
+                message = e.message
+            except AssertionError as e:
+                status = IDX_VALUE_ERROR
+                message = e.message
+            if status == IDX_OK and not in_clear:
+                masked, status, message = _plan_indexing(lambda: _vector_set_masked(mpc, target, kb, item))
+        _indexing_council(mpc, masked, status, message)
+        if not holder:
+            return
+        if in_clear:
+            # A unified encryption cached beside the data in the clear would be stale (M-MP-02): dropped
+            self._local_data[k - shift] = value._local_data[0]
+            self._encryption_unified = Ciphertensor[Ciphertext]()
+            return
+        _vector_set(mpc, target, kb, item)
+        if to_unified:
+            self._encryption_unified = target
+            self._local_data = ndarray[S, dtype]()
+        elif self.is_semi_encrypted():
+            # The element went into a block: a unified encryption cached beside the blocks would be stale
+            self._encryption_unified = Ciphertensor[Ciphertext]()
 
-                    assert bool(self._encryption_right) and idx < border + self._encryption_right.shape[-1], "MPP: 1-dim setitem index out of bound"
-                    _value_cp = value.copy()
-                    _value_cp.unify_encryption()
-                    self._encryption_right._setitem(mpc, idx - border, _value_cp._encryption_unified)
-    
     def _setitem_1_dim(self, indices, value: float):
-        assert self.is_local(), "MPP: Cannot set public value into an encrypted MPP."
-        assert static.len(S) == 1, "MPP: 1-dim setitem expects 1-dim operands"
-        
+        # An element set to a public value: the value held by the element's holder (encrypted there if the partition is)
         if isinstance(indices, slice):
             compile_error("MPP: slicing 1-dim MPP is not implemented yet")
-        
         if isinstance(indices, tuple):
             compile_error("MPP: cannot slice 1-dim MPP --- too many indices")
-
-        idx = indices
+        if static.len(S) != 1:
+            compile_error("MPP: 1-dim setitem expects 1-dim operands")
         mpc = self._mpc
-        
-        if mpc.pid == 0:
-            return
-        
         if self._transposed:
-            _ratio_idx = self._find_idx_in_ratios(idx)
-            adjusted_idx = idx - self._ratios[:_ratio_idx].sum()
-            
-            if mpc.pid == _ratio_idx + 1:
-                self._local_data[adjusted_idx] = value._local_data[0]
-        elif self.has_local_data():
-            self._local_data[idx] = value
-
-    @sequre
-    def _setitem_core(mpc, mpp: MPP[S, dtype], adjusted_idx, value: MPP):
-        assert not mpp.is_empty() and not value.is_empty(), "MPP: _setitem_core should be called on top of non-empty partitions"
-        
-        if mpp.is_full_encrypted() or value.is_full_encrypted():
-            _value_cp = value.copy()
-            mpp.unify_encryption()
-            _value_cp.unify_encryption()
-            mpp._encryption_unified[adjusted_idx] = _value_cp._encryption_unified
-            mpp._local_data = ndarray[S, dtype]()
-        elif mpp.is_local() and value.is_local():
-            mpp._local_data[adjusted_idx] = value._local_data
+            q = _holder_of(self._ratios, _normalized_index(indices, self._ratios.sum(), "elements"))
         else:
-            assert not static.len(S) == 1 and not isinstance(adjusted_idx, tuple), "Not implemented yet: slicing along 1-axis semi-encrypted MPP within _setitem_core"
-            value_enc_left, value_local, value_enc_right = mpp._align_semi_encryptions(value)
-            if mpp._encryption_left: mpp._encryption_left[adjusted_idx] = value_enc_left
-            mpp._local_data[adjusted_idx] = value_local
-            if mpp._encryption_right: mpp._encryption_right[adjusted_idx] = value_enc_right
+            if self._ratios.sum() != 1:
+                raise NotImplementedError(f"MPP: an element of a 1-dimensional MPP is set in a row held by one party or in a column (transposed); ratios {self._ratios} are neither")
+            q = argmax(self._ratios)
+        has = mpc.pid == 0 or mpc.pid == q + 1
+        item = MPP[S, dtype](
+            _mpc=mpc,
+            _ratios=one_hot_vector(idx=q, size=len(self._ratios), TP=int),
+            _local_data=array([dtype(value)]) if has else ndarray[S, dtype](),
+            _transposed=self._transposed)
+        self._setitem_1_dim(indices, item)
+
+    def _set_part_prepare[TR, SV](self, ri: TR, c_lo: int, c_hi: int, value: MPP[SV, dtype]) -> Tuple[bool, Ciphertensor[Ciphertext], Ciphertensor[Ciphertext], Ciphertensor[Ciphertext], Ciphertensor[Ciphertext], ndarray[SV, dtype], bool]:
+        # How this party sets rows ri, columns [c_lo, c_hi) of its 2-dim partition from its partition of value, decided
+        # without HE work beyond public-key encryptions: (in_clear, target, item, left_item, right_item, local_item,
+        # to_unified). in_clear: both in the clear. A semi-encrypted partition takes whole rows only: its blocks take
+        # left_item and right_item (value's blocks of the same widths, or value's columns encrypted in the blocks'
+        # layouts), its block in the clear local_item. Otherwise target (the partition's encryption; a fresh one of its
+        # data in the value's layout if it was in the clear, to_unified) takes item (value's encryption, or value's
+        # data encrypted in the target's layout). Raises ValueError and NotImplementedError for what it cannot set.
+        mpc = self._mpc
+        empty = Ciphertensor[Ciphertext]()
+        width = c_hi - c_lo
+        if value.is_empty() or value._held_width() != width:
+            raise ValueError(f"MPP: the setitem value's partition here holds {value._held_width()} columns for {width} (or nothing)")
+        if self.is_local() and value.is_local():
+            return True, empty, empty, empty, empty, ndarray[SV, dtype](), False
+        if self.is_semi_encrypted():
+            wl, wc, wr = self._block_widths()
+            if not (c_lo == 0 and c_hi == wl + wc + wr):
+                raise NotImplementedError("MPP: setting a column range of a semi-encrypted partition is not implemented yet")
+            if value.is_semi_encrypted():
+                vl, vc, vr = value._block_widths()
+                if (vl, vc, vr) != (wl, wc, wr):
+                    raise NotImplementedError(f"MPP: setting a semi-encrypted value of blocks {(vl, vc, vr)} into a semi-encrypted partition of blocks {(wl, wc, wr)} is not implemented yet")
+                return False, empty, empty, value._encryption_left.copy(), value._encryption_right.copy(), value._local_data, False
+            if not value.is_local():
+                raise NotImplementedError("MPP: setting an encrypted value into a semi-encrypted partition is not implemented yet")
+            data = value._local_data
+            left_item = empty
+            right_item = empty
+            local_item = ndarray[SV, dtype]()
+            if static.len(SV) == 2:
+                if wl:
+                    left_item = _encrypt_like(mpc, data._slice_cols(0, wl), self._encryption_left._transposed)
+                if wr:
+                    right_item = _encrypt_like(mpc, data._slice_cols(wl + wc, wl + wc + wr), self._encryption_right._transposed)
+                local_item = data._slice_cols(wl, wl + wc)
+            else:
+                if wl:
+                    left_item = _encrypt_like(mpc, data[0:wl], self._encryption_left._transposed)
+                if wr:
+                    right_item = _encrypt_like(mpc, data[wl + wc:wl + wc + wr], self._encryption_right._transposed)
+                local_item = data[wl:wl + wc]
+            return False, empty, empty, left_item, right_item, local_item, False
+        if value.is_semi_encrypted():
+            raise NotImplementedError("MPP: setting a semi-encrypted value into a partition that is not semi-encrypted is not implemented yet")
+        to_unified = False
+        if self.is_local():
+            # The partition becomes encrypted, in the layout of the value's encryption
+            transposed = value._encryption_unified._transposed if value._encryption_unified.ndim == 2 else False
+            target = _encrypt_like(mpc, self._local_data, transposed)
+            to_unified = True
+        else:
+            target = self._encryption_unified
+        if value.is_local():
+            item = _encrypt_like(mpc, value._local_data, target._transposed and target.ndim == 2)
+        else:
+            item = value._encryption_unified.copy()
+            if static.len(SV) == 1 and width == 1:
+                # A cell: one element, which has no layout
+                item = _as_vector_item(item)
+            elif static.len(SV) == 1 and item.ndim == 1 and not (target.ndim == 2 and target._transposed):
+                # A vector's flag (a column's, as encrypt() leaves it) is no layout: a row-wise target takes it as a row
+                item._transposed = False
+        return False, target, item, empty, empty, ndarray[SV, dtype](), to_unified
+
+    def _set_block[T1, T2](self, rs: T1, cs: T2, value: MPP):
+        # X[rs, cs] = value on an MPP as held (rows rs: an int or a slice; columns cs: an int or a slice), in one council:
+        # each compute party sets its rows of the range from its partition of value, which must hold exactly those rows
+        # (the value partitioned as the range is)
+        mpc = self._mpc
+        start, stop = _index_range(rs, self._ratios.sum(), "rows")
+        want = _sliced_ratios(self._ratios, start, stop)
+        if value._ratios != want:
+            raise ValueError(f"MPP: the setitem value is partitioned as {value._ratios}, rows {start}:{stop} of the target as {want}")
+        if mpc.pid == 0:
+            # CP0 checks the columns as the compute parties do and keeps its placeholder
+            _index_range(cs, self._local_data.shape[1], "columns")
+            return
+
+        lo, hi = _local_rows(self._ratios, mpc.pid - 1, start, stop)
+        take = hi > lo
+        c_lo, c_hi = 0, 0
+        masked = List[Ciphertext]()
+        status = IDX_OK
+        message = ""
+        empty = Ciphertensor[Ciphertext]()
+        in_clear, target, item, left_item, right_item, local_item, to_unified = False, empty, empty, empty, empty, ndarray[value.S, dtype](), False
+        if not self.is_empty():
+            try:
+                # Every party that holds a partition checks the columns (as CP0 does), whether or not it takes rows
+                c_lo, c_hi = _index_range(cs, self._held_width(), "columns")
+                if not take:
+                    pass
+                elif isinstance(T1, int):
+                    in_clear, target, item, left_item, right_item, local_item, to_unified = self._set_part_prepare(lo, c_lo, c_hi, value)
+                else:
+                    if value.shape[0] != hi - lo:
+                        raise ValueError(f"MPP: the setitem value's partition here holds {value.shape[0]} rows for {hi - lo}")
+                    in_clear, target, item, left_item, right_item, local_item, to_unified = self._set_part_prepare(slice(start=lo, stop=hi, step=1), c_lo, c_hi, value)
+            except IndexError as e:
+                status = IDX_INDEX_ERROR
+                message = e.message
+            except NotImplementedError as e:
+                status = IDX_NOT_IMPLEMENTED
+                message = e.message
+            except ValueError as e:
+                status = IDX_VALUE_ERROR
+                message = e.message
+            except AssertionError as e:
+                status = IDX_VALUE_ERROR
+                message = e.message
+            if status == IDX_OK and take and not in_clear:
+                if isinstance(T1, int):
+                    masked, status, message = _plan_indexing(lambda: self._set_part_masked(lo, c_lo, c_hi, target, item, left_item, right_item))
+                else:
+                    masked, status, message = _plan_indexing(lambda: self._set_part_masked(slice(start=lo, stop=hi, step=1), c_lo, c_hi, target, item, left_item, right_item))
+        _indexing_council(mpc, masked, status, message)
+        if not take:
+            return
+        if isinstance(T1, int):
+            self._set_part_apply(lo, c_lo, c_hi, value, in_clear, target, item, left_item, right_item, local_item, to_unified)
+        else:
+            self._set_part_apply(slice(start=lo, stop=hi, step=1), c_lo, c_hi, value, in_clear, target, item, left_item, right_item, local_item, to_unified)
+
+    def _set_part_masked[TR](self, ri: TR, c_lo: int, c_hi: int, target: Ciphertensor[Ciphertext], item: Ciphertensor[Ciphertext], left_item: Ciphertensor[Ciphertext], right_item: Ciphertensor[Ciphertext]) -> List[Ciphertext]:
+        # The ciphertexts _set_part_apply masks
+        mpc = self._mpc
+        if self.is_semi_encrypted():
+            out = List[Ciphertext]()
+            if self._encryption_left:
+                out.extend(self._encryption_left._setitem_masked(mpc, ri, left_item))
+            if self._encryption_right:
+                out.extend(self._encryption_right._setitem_masked(mpc, ri, right_item))
+            return out
+        return target._setitem_masked(mpc, (ri, slice(start=c_lo, stop=c_hi, step=1)), item)
+
+    def _set_part_apply[TR, SV](self, ri: TR, c_lo: int, c_hi: int, value: MPP[SV, dtype], in_clear: bool, target: Ciphertensor[Ciphertext], item: Ciphertensor[Ciphertext], left_item: Ciphertensor[Ciphertext], right_item: Ciphertensor[Ciphertext], local_item: ndarray[SV, dtype], to_unified: bool):
+        # This party's part of a setitem, as _set_part_prepare decided (the ciphertexts _set_part_masked lists were
+        # refreshed in the indexing council)
+        mpc = self._mpc
+        if in_clear:
+            # A unified encryption cached beside the data in the clear would be stale (M-MP-02): dropped
+            self._local_data[ri, c_lo:c_hi] = value._local_data
+            self._encryption_unified = Ciphertensor[Ciphertext]()
+            return
+        if self.is_semi_encrypted():
+            if self._encryption_left:
+                self._encryption_left._setitem(mpc, ri, left_item, refresh=False)
+            if self._encryption_right:
+                self._encryption_right._setitem(mpc, ri, right_item, refresh=False)
+            self._local_data[ri] = local_item
+            self._encryption_unified = Ciphertensor[Ciphertext]()
+            return
+        target._setitem(mpc, (ri, slice(start=c_lo, stop=c_hi, step=1)), item, refresh=False)
+        if to_unified:
+            self._encryption_unified = target
+            self._local_data = ndarray[S, dtype]()
 
     def _setitem_2_dim(self, idx: int, value: MPP[Tuple[int], dtype]):
-        mpc = self._mpc
         if static.len(S) != 2 or static.len(value.S) != 1:
             compile_error("MPP: invalid shapes for setitem")
+        if self._transposed:
+            raise NotImplementedError("MPP: setitem on a transposed MPP is not implemented yet")
+        self._set_block(idx, slice(start=None, stop=None, step=1), value)
 
-        assert not self._transposed, "Not implemented yet: setitem for transposed MPP"
-        assert value._ratios.sum() == max(value._ratios) == 1, "Not implemented yet: setitem value should be at one partition/party for now"
-        
-        reference_pid = mpc.pid - 1  # Skip CP0
-        
-        if reference_pid == argmax(value._ratios):
-            adjusted_idx = idx - self._ratios[:reference_pid].sum()
-            assert 0 <= adjusted_idx < self._ratios[reference_pid], "MPP: setitem index out of bound"
-            MPP._setitem_core(mpc, self, adjusted_idx, value)
-    
     def _setitem_2_dim(self, s: slice, value: MPP[S, dtype]):
-        mpc = self._mpc
         if static.len(S) != 2 or static.len(value.S) != 2:
             compile_error("MPP: invalid shapes for setitem")
+        if self._transposed:
+            raise NotImplementedError("MPP: setitem on a transposed MPP is not implemented yet")
+        self._set_block(s, slice(start=None, stop=None, step=1), value)
 
-        assert not self._transposed, "Not implemented yet: setitem for transposed MPP"
-
-        start, stop, _, _ = s.adjust_indices(self.cohort_shape[0])
-        assert value._ratios.sum() == stop - start, f"MPP: setitem value does not match the slice size {value._ratios.sum()} != {stop - start}"
-        
-        _start_ratio_idx = self._find_idx_in_ratios(start)
-        _stop_ratio_idx = self._find_idx_in_ratios(stop)
-        reference_pid = mpc.pid - 1
-        
-        if not self._ratios[reference_pid]:
-            return
-        
-        if _start_ratio_idx <= reference_pid <= _stop_ratio_idx:
-            adjusted_slice = self._adjust_row_slice(start, stop)
-            assert value._ratios[reference_pid] == adjusted_slice.stop - adjusted_slice.start, f"MPP: setitem value does not match the adjusted slice size: {value._ratios[reference_pid]} != {adjusted_slice.stop} - {adjusted_slice.start}"
-            MPP._setitem_core(mpc, self, adjusted_slice, value)
-    
-    def _setitem_2_dim_tuple[T1, T2](self, s: Tuple[T1, T2], value: MPP):
-        mpc = self._mpc
-        
-        if mpc.pid == 0:
-            return
-        
-        rs = s[0]
-        rows_to_set = self._getitem_2_dim(rs)
-
-        with rows_to_set.partition_aligner(), value.partition_aligner():
-            if rows_to_set.is_empty():
-                assert value.is_empty(), "MPP: alligner error while setting item"
-            if not rows_to_set.is_empty():
-                adjusted_idx = MPP._adjust_col_slice_tuple(s[1], T1=T1)
-                MPP._setitem_core(mpc, rows_to_set, adjusted_idx, value)
-
-        self._setitem_2_dim(rs, rows_to_set)
-    
     def _setitem_2_dim[T1, T2](self, s: Tuple[T1, T2], value: MPP):
         if static.len(S) != 2:
             compile_error("MPP: invalid shapes for setitem")
-        
-        rs, cs = s
-        cohort_shape = self.cohort_shape
-        
         if isinstance(T1, slice):
             if static.len(value.S) != 2:
                 compile_error("MPP: invalid shapes for setitem")
-
-            start, stop, _, _ = s[0].adjust_indices(cohort_shape[0])
-            assert not self._transposed, "Not implemented yet: setitem for transposed MPP"
-            assert value._ratios.sum() == stop - start, f"MPP: setitem value does not match the slice size {value._ratios.sum()} != {stop - start}"
-            adjusted_cs = cs
         elif isinstance(T1, int):
-            _rows_count = cohort_shape[0]
-            assert rs < _rows_count, "MPP: invalid setitem indices"
-            rs = (rs + _rows_count) % _rows_count
-            
             if static.len(value.S) != 1:
                 compile_error("MPP: invalid shapes for setitem")
-
-            assert not self._transposed, "Not implemented yet: setitem for transposed MPP"
-            assert value._ratios.sum() == max(value._ratios) == 1, "Not implemented yet: setitem operands should be at the same partition/party for now"
-
-            if isinstance(T2, int):
-                _cols_count = cohort_shape[1]
-                assert cs < _cols_count, "MPP: invalid setitem indices"
-                cs = (cs + _cols_count) % _cols_count
-                adjusted_cs = slice(start=cs, stop=cs + 1, step=1)
-            else:
-                adjusted_cs = cs
         else:
             compile_error("MPP: invalid index --- should be either slice or int")
+        if self._transposed:
+            raise NotImplementedError("MPP: setitem on a transposed MPP is not implemented yet")
+        self._set_block(s[0], s[1], value)
 
-        self._setitem_2_dim_tuple((rs, adjusted_cs), value)
-    
     def _setitem_2_dim(self, s: Tuple[int, int], value: float):
-        assert not self._transposed, "Not implemented yet: setitem for transposed MPP"
+        # A cell set to a public value: the value held by the row's holder (encrypted there if the partition is, M-MP-25)
         if static.len(S) != 2:
             compile_error("MPP: invalid shapes for setitem")
-        
+        if self._transposed:
+            raise NotImplementedError("MPP: setitem on a transposed MPP is not implemented yet")
         mpc = self._mpc
-        if mpc.pid == 0:
-            return
-
-        rs, cs = s
-        cohort_shape = self.cohort_shape
-        
-        _rows_count = cohort_shape[0]
-        assert rs < _rows_count, "MPP: invalid setitem indices"
-        rs = (rs + _rows_count) % _rows_count
-
-        _cols_count = cohort_shape[1]
-        assert cs < _cols_count, "MPP: invalid setitem indices"
-        cs = (cs + _cols_count) % _cols_count
-
-        _ratio_idx = self._find_idx_in_ratios(rs)
-        adjusted_idx = rs - self._ratios[:_ratio_idx].sum()
-
-        if mpc.pid == _ratio_idx + 1:
-            self._local_data[adjusted_idx, cs] = value
-
-    def _align_semi_encryptions(self, other: MPP) -> Tuple[Ciphertensor[Ciphertext], ndarray, Ciphertensor[Ciphertext]]:
-        mpc = self._mpc
-        assert self.is_semi_encrypted() or other.is_semi_encrypted(), "MPP: at least on of the MPPs needs to be semi-encrypted to align the semi ancryptions"
-
-        if self.is_semi_encrypted() and other.is_semi_encrypted():
-            if self._encryption_left:
-                assert bool(other._encryption_left) and self._encryption_left.shape[-1] == other._encryption_left.shape[-1], "MPP: left semi encryption shape missmatch"
-            if self._encryption_right:
-                assert bool(other._encryption_right) and self._encryption_right.shape[-1] == other._encryption_right.shape[-1], "MPP: right semi encryption shape missmatch"
-            
-            assert self.has_local_data() and other.has_local_data(), "MPP: semi-encrypted MPP should have local data"
-            return other._encryption_left, other._local_data, other._encryption_right
-        
-        elif self.is_local():
-            if other._encryption_left:
-                left_border = other._encryption_left.shape[-1]
-                self._encryption_left = Ciphertensor[Ciphertext].enc(mpc, self._local_data._slice_cols(0, left_border))
-                self._local_data = self._local_data._slice_cols(left_border, self._local_data.shape[-1])
-            if other._encryption_right:
-                right_border = -other._encryption_right.shape[-1]
-                self._encryption_right = Ciphertensor[Ciphertext].enc(mpc, self._local_data._slice_cols(right_border, self._local_data.shape[-1]))
-                self._local_data = self._local_data._slice_cols(0, right_border)
-            
-            return other._encryption_left, other._local_data, other._encryption_right
-        
-        else:  # other is local
-            _encryption_left = Ciphertensor[Ciphertext]()
-            _local_data = other._local_data
-            _encryption_right = Ciphertensor[Ciphertext]()
-
-            if self._encryption_left:
-                left_border = self._encryption_left.shape[-1]
-                _encryption_left = Ciphertensor[Ciphertext].enc(mpc, other._local_data._slice_cols(0, left_border))
-                _local_data = _local_data._slice_cols(left_border, _local_data.shape[-1])
-            if self._encryption_right:
-                right_border = -self._encryption_right.shape[-1]
-                _encryption_right = Ciphertensor[Ciphertext].enc(mpc, _local_data._slice_cols(right_border, _local_data.shape[-1]))
-                _local_data = _local_data._slice_cols(0, right_border)
-            
-            return _encryption_left, _local_data, _encryption_right
+        q = _holder_of(self._ratios, _normalized_index(s[0], self._ratios.sum(), "rows"))
+        has = mpc.pid == 0 or mpc.pid == q + 1
+        item = MPP[Tuple[int], dtype](
+            _mpc=mpc,
+            _ratios=one_hot_vector(idx=q, size=len(self._ratios), TP=int),
+            _local_data=array([dtype(value)]) if has else ndarray[Tuple[int], dtype]())
+        self._set_block(s[0], s[1], item)
 
     def _rows_count(self) -> int:
         if self._mpc.pid == 0: return self._ratios.sum()
@@ -2940,49 +3219,6 @@ class MPP[S, dtype]:
             else: break
         return _ratio_idx
 
-    def _adjust_row_slice(self, start, stop):
-        reference_pid = self._mpc.pid - 1
-        ratios_sum = self._ratios[:reference_pid].sum()
-        adjusted_start = max(start - ratios_sum, 0)
-        adjusted_stop = min(stop - ratios_sum, self._ratios[reference_pid])
-
-        assert 0 <= adjusted_start < self._ratios[reference_pid], f"MPP: index out of bound --- {adjusted_start} not in [0, {self._ratios[reference_pid]})"
-        assert 0 <= adjusted_stop <= self._ratios[reference_pid], f"MPP: index out of bound --- {adjusted_start} not in [0, {self._ratios[reference_pid]}]"
-        
-        return slice(start=adjusted_start, stop=adjusted_stop, step=1)
-    
-    @staticmethod
-    def _adjust_col_slice_tuple[T1](cs):
-        whole_slice = slice(start=None, stop=None, step=1)
-                
-        if isinstance(T1, slice):
-            return (whole_slice, cs)
-        elif isinstance(T1, int):
-            return cs
-        else:
-            compile_error("MPP: invalid index --- should be either slice or int")
-    
-    def _get_sliced_ratios(self, _start_ratio_idx: int, _stop_ratio_idx: int, start: int, stop: int) -> List[int]:
-        _ratios = []
-        _ratios_start_sum = 0
-        _ratios_stop_sum = 0
-        
-        for i, ratio in enumerate(self._ratios):
-            _ratios_start_sum += ratio
-            if i < _start_ratio_idx or i > _stop_ratio_idx:
-                _ratios.append(0)
-            elif i == _start_ratio_idx == _stop_ratio_idx:
-                _ratios.append(stop - start)
-            elif i == _start_ratio_idx:
-                _ratios.append(_ratios_start_sum - start)
-            elif i == _stop_ratio_idx:
-                _ratios.append(stop - _ratios_stop_sum)
-            else:
-                _ratios.append(self._ratios[i])
-            _ratios_stop_sum += ratio
-        
-        return _ratios
-    
     # Internal typechecker hack
     @property
     def _internal_type(self) -> dtype:

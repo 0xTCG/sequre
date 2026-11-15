@@ -447,11 +447,34 @@ class MPCMHE[TP]:
     def refresh(self, x: list[Ciphertext], is_broadcast: bool = False, min_level_distance: int = 0) -> list[Ciphertext]:
         if not len(x):
             return x
-        
+
         self.rescale(x, self.crypto_params.params.default_scale)
         self.bootstrap(x, is_broadcast, min_level_distance)
-        
+
         return x
+
+    def refresh_council(self, x: list[Ciphertext], status: int = 0) -> List[int]:
+        # One refresh council among the compute parties (per-party ciphertexts, as bootstrap without is_broadcast) that
+        # also carries a status from each party: x is rescaled to the default scale, then one collect gives every
+        # party's status and which of its ciphertexts need a collective bootstrap. Returns every compute party's status,
+        # the same list at each (CP0 takes no part: empty), so that the caller can raise at every party alike when one
+        # is nonzero. Every bootstrap any party needs runs, as in bootstrap(), whatever the statuses: the rescale above
+        # changed x in place, and a ciphertext it left at the bootstrap level must not stay there when the caller
+        # raises. x may be empty: the parties need only hold the same number of councils.
+        if self.pid == 0:
+            return List[int]()
+        self.rescale(x, self.crypto_params.params.default_scale)
+        mine = [status]
+        for flag in self.requires_bootstrap(x):
+            mine.append(int(flag))
+        council = self.comms.collect(mine)
+        statuses = [entry[0] for entry in council]
+        for pid, entry in enumerate(council):
+            for i in range(1, len(entry)):
+                if entry[i]:
+                    cipher = x[i - 1] if i - 1 < len(x) else Ciphertext.nil_ideal()
+                    self._collective_bootstrap(cipher, pid + 1)
+        return statuses
     
     def ineg(self, x: list) -> list:
         for i in range(len(x)):
@@ -486,11 +509,13 @@ class MPCMHE[TP]:
         
         return x
     
-    def imul_const(self, x: list[Ciphertext], constant) -> list[Ciphertext]:
+    def imul_const(self, x: list[Ciphertext], constant, is_broadcast: bool = False) -> list[Ciphertext]:
+        # is_broadcast: x is an aggregate (the same ciphertexts at every party), refreshed in the broadcast mode: one
+        # bootstrap serves every party and leaves every party's copy the same
         if not len(x):
             return x
         
-        self.refresh(x)
+        self.refresh(x, is_broadcast)
         for i in range(len(x)):
             self.crypto_params.evaluator.mul_const(x[i], constant, x[i])
         
@@ -608,10 +633,10 @@ class MPCMHE[TP]:
     def sub_const(self, x: list, constant) -> list:
         return self.isub_const(x.copy(), constant)
     
-    def mul_const(self, x: list[Ciphertext], constant) -> list[Ciphertext]:
+    def mul_const(self, x: list[Ciphertext], constant, is_broadcast: bool = False) -> list[Ciphertext]:
         # Check if first operand should be refreshed before copying it downstream
-        self.refresh(x)
-        return self.imul_const(x.copy(), constant)
+        self.refresh(x, is_broadcast)
+        return self.imul_const(x.copy(), constant, is_broadcast)
     
     def add(self, x: list, y: list) -> list:
         return self.iadd(x.copy(), y)
@@ -1277,13 +1302,22 @@ class MPCMHE[TP]:
             self._collective_bootstrap(ct, hub_pid)
     
     def _collective_bootstrap(self, ct: Ciphertext, hub_pid: int):
+        # hub_pid >= 1: ct is that party's own ciphertext, sent to the others, and only that party keeps the refresh.
+        # hub_pid -1: ct is the same at every party (an aggregate). Every party takes the hub's copy and writes its
+        # refresh into its own copy, so that one bootstrap serves every party and the copies come out the same, also
+        # where they had come apart (an earlier refresh of each party's copy in its own round leaves each valid but
+        # different, and refreshing each party's own copy collectively would combine shares of different ciphertexts).
         self.stats.secure_bootstrap_count += 1
         
         if self.pid == 0:
             return
 
+        out = ct
         if hub_pid > -1:  # If ct is not already broadcast to all parties
             ct = self.comms.broadcast_from(ct, hub_pid)
+            out = ct
+        else:
+            ct = self.comms.broadcast_from(ct, self.comms.hub_pid)
 
         parameters = self.crypto_params.params
         level_start = ct.level()
@@ -1307,7 +1341,7 @@ class MPCMHE[TP]:
             ref_share)
 
         ref_agg = self._aggregate_refresh_share(ref_protocol, ref_share)
-        ref_protocol.finalize(ct, parameters.log_slots, crp, ref_agg, ct)
+        ref_protocol.finalize(ct, parameters.log_slots, crp, ref_agg, out)
     
     def _collective_decrypt(self, ct: Ciphertext, hub_pid: int) -> Plaintext:
         if self.pid == 0:
