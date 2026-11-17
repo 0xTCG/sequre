@@ -154,22 +154,30 @@ class Sharetensor:
 @extend
 class Ciphertensor:
     def to_sharetensor[S, dtype=float](
-            self, mpc, modulus: mpc_uint, source_pid: int) -> Sharetensor:
+            self, mpc, modulus: mpc_uint, source_pid: int, copies_identical: bool = False) -> Sharetensor:
+        # source_pid and copies_identical as in MPCMHE.ciphervector_to_additive_share_vector: -1 switches the hub's copy
+        # of a tensor every compute party holds (an aggregate), unless the caller vouches that the copies are the same
         if not isinstance(dtype, float):
             # Might be possible to support integers, too, in other FHE schemes
             # CKKS is the only supported scheme for now, so we can assume that all ciphertexts are fixed-point
             compile_error("Ciphertensor: only fixed-point tensors can be converted to Sharetensor for now")
-        
+
         padded_cipher_shape = self.cipher_shape
         padded_cipher_shape[-1] *= self.slots
-        
+
         share: list[mpc_uint] = mpc.mhe.ciphervector_to_additive_share_vector(
-            self._data, len(self._data) * self.slots, modulus, source_pid=source_pid)
+            self._data, len(self._data) * self.slots, modulus, source_pid=source_pid, copies_identical=copies_identical)
         
         if static.len(S) == 0:
             stensor = Sharetensor(share[0], modulus)
         elif static.len(S) == 1:
-            stensor = Sharetensor(share.resize(self.shape), modulus)
+            if self.ndim == 2:
+                # A vector kept in 2-dim storage (a row of column-wise storage, [n, 1] flagged transposed, as getitem
+                # gives it; a column of row-wise storage): every stored row's values in order. Resizing the flat shares
+                # to the stored shape kept the first slots of the first ciphertext, one value
+                stensor = Sharetensor(share.reshape(padded_cipher_shape).resize(self.shape).flatten(), modulus)
+            else:
+                stensor = Sharetensor(share.resize(self.shape), modulus)
         elif static.len(S) == 2:
             stensor = Sharetensor(share.reshape(padded_cipher_shape).resize(self.shape), modulus)
             
@@ -188,6 +196,11 @@ class Ciphertensor:
         return stensor
     
     def to_mpp[S, dtype](self, mpc, ratios: list[int], source_pid: int) -> MPP[S, dtype]:
+        # The source party's row-wise tensor split by its rows among the compute parties, by ratios (scaled to its rows),
+        # each party's rows sent to it (whole stored rows: no HE); the result's _transposed is False, for the caller to
+        # set. Call it at every compute party with the same ratios and source_pid; the other parties' tensors are ignored.
+        # A column-wise tensor's stored rows are its columns, which this split gave as rows (H-25): MPP.align_ratios moves
+        # such partitions itself (_realign_moved).
         if mpc.pid and mpc.pid != source_pid:
             return MPP[S, dtype](
                 _mpc=mpc,
@@ -199,7 +212,8 @@ class Ciphertensor:
         elif static.len(S) == 1:
             shape = (self.shape[0],)
         elif static.len(S) == 2:
-            shape = (self.shape[0], self.shape[1])
+            m, n = self.actual_shape
+            shape = (m, n)
         else:
             compile_error("MPP supports only 0-dim, 1-dim and 2-dim arrays at the momemt")
         
@@ -209,21 +223,20 @@ class Ciphertensor:
                 _ratios=ratios,
                 _local_data=zeros(shape, dtype=dtype))
         
+        assert static.len(S) == 2 and not self._transposed and not self._diagonal_contiguous, "Ciphertensor.to_mpp: splits row-wise matrices only"
         new_ratios = MPP.apply_ratios(ratios, shape[0])
         
         for p in range(1, mpc.comms.number_of_parties):
-            reference_pid = p - 1
-            start = new_ratios[:reference_pid].sum()
-            end = start + new_ratios[reference_pid]
-
+            start, end = MPP.get_relative_indices(p, new_ratios)
+            rows = self._get_rows_raw(slice(start=start, stop=end, step=1))
             if p == source_pid:
                 _mpp = MPP[S, dtype](
                     _mpc=mpc,
                     _ratios=new_ratios,
-                    _encryption_unified=self._get_rows_raw(slice(start=start, stop=end, step=1)))
+                    _encryption_unified=rows)
             else:
                 mpc.comms.send_as_jar(new_ratios, p)
-                mpc.comms.send_as_jar(self._get_rows_raw(slice(start=start, stop=end, step=1)), p)
+                mpc.comms.send_as_jar(rows, p)
         
         return _mpp
 
@@ -254,7 +267,8 @@ class MPP:
         for p in range(1, mpc.comms.number_of_parties):
             descriptor = descriptors[p - 1]
             if descriptor:
-                pieces.append(descriptor.to_sharetensor(mpc, modulus, source_pid=-1, S=S, dtype=float))
+                # Collected from its holder: the same ciphertexts at every compute party
+                pieces.append(descriptor.to_sharetensor(mpc, modulus, source_pid=-1, S=S, dtype=float, copies_identical=True))
             elif descriptor.shape:
                 if p == mpc.pid:
                     data = self._local_data
@@ -287,11 +301,19 @@ class MPA:
         # one council on how they hold their shares: all in the clear, each shares its own; any encrypted, every party
         # aggregates (aggregate() encrypts a share held in the clear), so an MPA held in the clear at some parties and
         # encrypted at others goes the encrypted way (M-MP-24: only the parties in the clear entered the council)
-        if not self.has_aggregate() and mpc.council(self.is_plain()).all():
-            stensors = [Sharetensor.enc(mpc, self._plain.astype(dtype), p, self.modulus) for p in range(1, mpc.comms.number_of_parties)]
-            return stensors.sum().to_fp()
+        # The same round also gives the layout each party's share enters the aggregate in: an aggregate summed here from
+        # shares in one layout is the same ciphertexts at every party (each sums the same collected shares in the same
+        # order), so its switch needs no copy from the hub. One held already, or summed from shares in different layouts
+        # (the sum converts them, party by party), may have copies that came apart: the switch takes the hub's (H-59).
+        identical = False
+        if not self.has_aggregate():
+            agreed = mpc.comms.collect([int(self.is_plain()), self._aggregate_layout()])
+            if all(bool(d[0]) for d in agreed):
+                stensors = [Sharetensor.enc(mpc, self._plain.astype(dtype), p, self.modulus) for p in range(1, mpc.comms.number_of_parties)]
+                return stensors.sum().to_fp()
+            identical = all(d[1] == agreed[0][1] for d in agreed)
         self.aggregate()
-        return self._aggregate.to_sharetensor(mpc, self.modulus, source_pid=-1, S=S, dtype=float)
+        return self._aggregate.to_sharetensor(mpc, self.modulus, source_pid=-1, S=S, dtype=float, copies_identical=identical)
 
 
 @extend

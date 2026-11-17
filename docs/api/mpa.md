@@ -62,11 +62,11 @@ mpa = MPA(mpc, my_ciphertensor)
 | `a * b` | Multiplication with lazy aggregation |
 | `a @ b` | Matrix multiplication |
 | `a / b` | Division by scalar |
-| `a ** n` | Integer exponentiation |
+| `a ** n` | The value (the sum of the shares) to the power `n`, as `n - 1` products `a * a` give it: an MPA that is only an aggregate gives the aggregate's power (every party alike); one that holds shares gives each compute party's encrypted share times the aggregate's power `n - 1` (encrypted shares; `a` keeps the encryption and aggregate it built, as `a * a` does). `a ** 0` is ones (as `.ones()`), `a ** 1` a copy, a negative `n` raises `ValueError` at every party |
 | `-a` | Negation |
 | `a > b` | Secure greater-than (uses [MPC switching](../user-guide/switching.md) internally) |
 | `a < b` | Secure less-than (uses [MPC switching](../user-guide/switching.md) internally) |
-| `a[i]`, `a[i] = v` | Indexing and slicing, at every party with the same index; negative ints count from the end (an int out of range raises `IndexError`) |
+| `a[i]`, `a[i] = v` | Indexing and slicing, at every party with the same index; negative ints count from the end (an int out of range raises `IndexError`). A float `v` sets the selected entries of the value: the hub's share takes `v` and the other compute parties' shares 0, in the clear or encrypted (trivial ciphertexts of the public value, in the share's layout), and an aggregate takes `v` in every copy alike; an encryption or aggregate kept beside shares in the clear is dropped (`encrypt()`, `aggregate()` rebuild it). What it writes is copied first, so an MPA sharing storage with this one (a view's parent, the operand of `m + c`) is left as it was: a float setitem on a view does not write through. The compute parties are expected to hold the MPA alike (all in the clear or all encrypted) |
 | `bool(a)` | Boolean conversion |
 | `len(a)` | Length of first dimension |
 
@@ -115,6 +115,6 @@ mpa = MPA(mpc, my_ciphertensor)
 | `.to_fp()` | Convert to floating point |
 | `.copy()` | Deep copy all components |
 | `.zeros(shape)` / `.zeros()` | Zero tensor |
-| `.ones(...)` | Ones tensor |
+| `.ones(...)` | An MPA whose value is ones, in the clear: the hub's share ones, the other compute parties' zeros |
 | `.rand(distribution, ...)` | Random values |
 | `.get_matmul_cost(other)` | Estimate matmul cost |

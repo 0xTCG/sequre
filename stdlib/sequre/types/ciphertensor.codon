@@ -554,17 +554,19 @@ class Ciphertensor[ctype]:
         
         return 1024  # Until mpc instance is added to self. Then return mpc.mhe.crypto_params.params.max_level().
     
-    def decrypt(self, mpc, source_pid: int = -2) -> Ciphertensor[Plaintext]:
+    def decrypt(self, mpc, source_pid: int = -2, copies_identical: bool = False) -> Ciphertensor[Plaintext]:
         """
         If source_pid is (see MPCMHE.decrypt):
             - -2 (the default): every compute party gets its own tensor decrypted, and no party learns another's; every
               compute party must call it, an empty tensor included
             - a compute party's PID (1, 2, ...): that party's tensor is decrypted for every compute party
-            - -1: the tensor is the same at every compute party (an aggregate); every compute party gets it
+            - -1: the tensor holds the same values at every compute party (an aggregate); every compute party gets it.
+              The hub's copy is decrypted, so copies that came apart still decrypt right; copies_identical skips sending
+              it where the caller vouches that every party holds the same ciphertexts (collected ones)
         """
         assert isinstance(ctype, Ciphertext), "Ciphertensor: data already decrypted"
         return Ciphertensor[Plaintext](
-            _data=mpc.mhe.decrypt(self._data, source_pid),
+            _data=mpc.mhe.decrypt(self._data, source_pid, copies_identical),
             shape=self.shape.copy(),
             slots=self.slots,
             _transposed=self._transposed,
@@ -596,13 +598,13 @@ class Ciphertensor[ctype]:
         
         return arr.T if self._transposed else arr
     
-    def reveal[T=float](self, mpc, source_pid: int = -2) -> ndarray[Tuple[int, int], T]:
+    def reveal[T=float](self, mpc, source_pid: int = -2, copies_identical: bool = False) -> ndarray[Tuple[int, int], T]:
         if not bool(self):
             if isinstance(ctype, Ciphertext) and source_pid == -2:
                 mpc.mhe.decrypt(List[Ciphertext](), -2)  # every compute party takes part, an empty tensor included
             return ndarray[Tuple[int, int], T]()
-        
-        plain = self.decrypt(mpc, source_pid) if isinstance(ctype, Ciphertext) else self
+
+        plain = self.decrypt(mpc, source_pid, copies_identical) if isinstance(ctype, Ciphertext) else self
         return plain.decode(mpc, T=T)
     
     def filter(self, mask) -> Ciphertensor[ctype]:
@@ -1399,10 +1401,10 @@ class Ciphertensor[ctype]:
         if isinstance(ctype, Plaintext):
             # TODO: Read dtype from self (add dtype static to Ciphertensor class)
             return Ciphertensor[Plaintext].enc(mpc, self.decode(mpc, T=float))
-    
-        if self._diagonal_contiguous and self._transposed:
-            return self.diagonal_transpose(mpc)
-        
+
+        # The same values, row-wise: through MPC, as iget_actual converts in place. A diagonal-encoded tensor flagged
+        # transposed went to diagonal_transpose, which gives its transpose (self.T), still diagonal-encoded: the
+        # element-wise coercion then combined the wrong entries (H-55: W - X.T @ D with X.T @ D's shares so stored)
         return self.via_mpc(mpc, lambda stensor: stensor, S=Tuple[int, int])
     
     def actual_transpose(self, mpc) -> Ciphertensor[ctype]:
@@ -1478,9 +1480,10 @@ class Ciphertensor[ctype]:
         for i in range(mpc.comms.number_of_parties - 1):
             if i in exclude_parties or (mpc.pid and not ctensors[i]):
                 continue
-            
+
             ctensor = ctensors[i] if mpc.pid else self
-            stensor = ctensor.to_sharetensor(mpc, modulus=mpc.default_mpc_modulus, source_pid=-1, S=S, dtype=float)
+            # Collected from its holder: the same ciphertexts at every compute party
+            stensor = ctensor.to_sharetensor(mpc, modulus=mpc.default_mpc_modulus, source_pid=-1, S=S, dtype=float, copies_identical=True)
             stensor = foo(stensor, *args)
             processed_ctensors[i + 1] = stensor.to_ciphertensor(mpc)
         
@@ -1537,7 +1540,11 @@ class Ciphertensor[ctype]:
 
     @staticmethod
     def requires_collective[C1, C2](first: Ciphertensor[C1], other: Ciphertensor[C2]) -> bool:
-        return first._transposed ^ other._transposed
+        # Whether an element-wise operation of the two converts a layout first (_check_other_operand_elem_wise: through
+        # MPC or with refreshed masks, a protocol among the compute parties), so that a party must not run it alone (as
+        # MPA's hub adds its share to an aggregate): the storages differ, row-wise or column-wise, diagonal or not (a
+        # diagonal one alone went to the hub's one-party add, which ran the conversion's protocol at the hub only)
+        return (first._transposed ^ other._transposed) or (first._diagonal_contiguous ^ other._diagonal_contiguous)
 
     @staticmethod
     def _get_matmul_public_cost(first, other):
@@ -2464,7 +2471,15 @@ class Ciphertensor[ctype]:
             pt = other
             if self._diagonal_contiguous ^ other._diagonal_contiguous:
                 if other._diagonal_contiguous:
-                    pt = other.get_actual(mpc)
+                    if isinstance(other, Ciphertensor[Plaintext]):
+                        pt = other.get_actual(mpc)
+                    elif self._transposed and other.ndim == 2:
+                        # Straight into self's column-wise storage: one conversion through MPC (get_actual's to row-wise
+                        # storage and then actual_transpose's took two)
+                        pt = other.via_mpc(mpc, lambda stensor: stensor.T, S=Tuple[int, int])
+                        pt._transposed = True
+                    else:
+                        pt = other.get_actual(mpc)
                 else:
                     self.iget_actual(mpc)
 
@@ -2472,7 +2487,17 @@ class Ciphertensor[ctype]:
             # Check for a better way.
             # It can be improved at lease for the case where both ciphers are cyclic diagonal.
             if self._transposed ^ pt._transposed:
-                pt = pt.get_actual(mpc) if pt._transposed else pt.actual_transpose(mpc)
+                if pt._transposed and pt._diagonal_contiguous:
+                    # Both diagonal-encoded (else pt is converted above): the same values in diagonal storage without the
+                    # flag, a ciphertext's by rotating the stored matrix's diagonals into its transpose's, a plaintext's
+                    # encoded anew (get_actual converts to row-wise storage, which self's diagonal ciphertexts would then
+                    # meet)
+                    if isinstance(pt, Ciphertensor[Plaintext]):
+                        pt = Ciphertensor[Plaintext].enc(mpc, pt.decode(mpc, T=float), encoding=ENC_DIAG)
+                    else:
+                        pt = pt.T.diagonal_transpose(mpc)
+                else:
+                    pt = pt.get_actual(mpc) if pt._transposed else pt.actual_transpose(mpc)
                 pt._transposed = self._transposed
             
             pt = pt.local_broadcast(mpc, self.shape)

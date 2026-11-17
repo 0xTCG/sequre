@@ -1110,18 +1110,153 @@ class MPP[S, dtype]:
         return self.collect_and_execute_at(target_pid, List.unfence)
     
     def align_ratios(self, ratios: List[int], force: bool) -> MPP[S, dtype]:
+        # The MPP's rows (a column's values) redistributed among the compute parties by ratios (scaled to the rows with
+        # force), encrypted: the compute parties agree on one layout first (one round; partitions in the clear are
+        # encrypted in that of the encrypted ones, row-wise if none is) and every partition goes to the party holding the
+        # most rows. Row-wise partitions are joined and split there by whole stored rows, without HE; column-wise ones
+        # and a column's segments are moved into each party's new rows directly (_realign_moved: masked moves refreshed
+        # in one council at every compute party). Each party gets its own. Every party, CP0 included, ends with the same
+        # ratios and the MPP's _transposed. A column-wise join used to be split by its stored rows (its columns), which
+        # gave the compute parties other ratios than CP0 and wrong partitions (H-25), and the compute parties dropped
+        # _transposed (M-MP-14). Layouts that differ, and diagonal storage, raise at every compute party alike.
         if self._ratios == ratios:
             return self
-        
-        assert force or self._ratios.sum() == ratios.sum(), f"MPP: cannot align partitions {self._ratios} to {ratios}"
 
-        if self._mpc.pid == 0:
+        assert force or self._ratios.sum() == ratios.sum(), f"MPP: cannot align partitions {self._ratios} to {ratios}"
+        mpc = self._mpc
+        new_ratios = MPP.apply_ratios(ratios, self._ratios.sum())
+
+        if mpc.pid == 0:
             self_cp = self.copy()
-            self_cp._ratios = ratios.copy()
+            self_cp._ratios = new_ratios
             return self_cp
-        
+
+        if static.len(S) == 1:
+            # A vector's transposed flag is no layout (as join() treats it): no round, and the flag is cleared below
+            transposed, diagonal, agreed = False, False, True
+        else:
+            transposed, diagonal, agreed = _encrypted_layout(mpc.comms.collect(_partition_descriptor(self)))
+        if not agreed:
+            raise ValueError("MPP: the compute parties hold their partitions encrypted in different layouts")
+        if diagonal:
+            raise NotImplementedError("MPP: aligning diagonal-encoded partitions to other ratios is not implemented yet")
         source_pid = argmax(self._ratios) + 1
-        return self.join_at(source_pid).to_mpp(self._mpc, ratios, source_pid=source_pid, S=S, dtype=dtype)
+        # unify_encryption caches an encryption beside a partition in the clear: it does so on a shallow copy, so that
+        # the operand keeps what it holds; the encryption sent gets a list of its own (not copies of its ciphertexts)
+        part = MPP[S, dtype](
+            _mpc=mpc,
+            _ratios=self._ratios.copy(),
+            _local_data=self._local_data,
+            _encryption_left=self._encryption_left,
+            _encryption_right=self._encryption_right,
+            _encryption_unified=self._encryption_unified,
+            _transposed=self._transposed)
+        part.unify_encryption(int(transposed))
+        own = part._encryption_unified.copy(shallow=True)
+        own._data = own._data[:]
+        if static.len(S) == 1:
+            own._transposed = False  # a vector's flag is no layout (as join() clears it)
+        partitions = mpc.comms.collect_at(own, source_pid)
+        if static.len(S) == 2 and not transposed:
+            joined = partitions.unfence(mpc) if mpc.pid == source_pid else Ciphertensor[Ciphertext]()
+            out = joined.to_mpp(mpc, new_ratios, source_pid=source_pid, S=S, dtype=dtype)
+        else:
+            out = MPP._realign_moved(mpc, partitions, self._ratios, new_ratios, source_pid, static.len(S) == 2, S=S, dtype=dtype)
+        out._transposed = self._transposed
+        return out
+
+    @staticmethod
+    def _realign_moved[S, dtype](mpc, partitions: List[Ciphertensor[Ciphertext]], old_ratios: List[int], new_ratios: List[int], source_pid: int, column_wise: bool) -> MPP[S, dtype]:
+        # Column-wise partitions (a column's segments, for a 1-dim MPP) moved to new ratios by the source, which holds
+        # them all (collected in party order): each compute party's new rows (values) are taken from the partitions they
+        # span with masked moves, without joining them. A join shifts values across ciphertexts wherever a partition's
+        # length is not a multiple of the slots, and its products refresh in councils the source would hold alone (a hang
+        # or crash above 8192 rows). The masked ciphertexts are refreshed first, in one indexing council at every compute
+        # party (the others take part with nothing), which also raises an error found while planning at every compute
+        # party alike; then the source sends each party its part. The new rows rest as a product's do.
+        if mpc.pid != source_pid:
+            _indexing_council(mpc, List[Ciphertext](), IDX_OK, "")
+            return MPP[S, dtype](
+                _mpc=mpc,
+                _ratios=new_ratios,
+                _encryption_unified=mpc.comms.receive_as_jar(source_pid, Ciphertensor[Ciphertext]))
+
+        slots = mpc.mhe.crypto_params.params.slots()
+        n_cp = len(new_ratios)
+        # Per compute party: the stored rows' sources (each stored row's segment in every partition it spans), the moves
+        # (source, first slot, stop slot, destination slot), the destination's ciphertexts per stored row, its length
+        jobs = List[Tuple[List[List[List[Ciphertext]]], List[Tuple[int, int, int, int]], int, int]](n_cp)
+        stored = [1]
+
+        def plan() -> List[Ciphertext]:
+            for q in range(n_cp):
+                t = partitions[q]
+                if not t:
+                    continue
+                if column_wise:
+                    if t.ndim != 2 or not t._transposed:
+                        raise NotImplementedError("MPP: aligning partitions encrypted otherwise than column-wise is not implemented")
+                    stored[0] = t.shape[0]
+                elif t.ndim != 1:
+                    raise NotImplementedError("MPP: aligning a vector whose segments are encrypted as 2-dim tensors is not implemented")
+            for q in range(n_cp):
+                if partitions[q] and (column_wise and partitions[q].shape[0] != stored[0]):
+                    raise ValueError(f"MPP: the partitions have {partitions[q].shape[0]} and {stored[0]} columns")
+            seen = Set[int]()
+            out = List[Ciphertext]()
+            for p in range(n_cp):
+                s_p, e_p = MPP.get_relative_indices(p + 1, new_ratios)
+                moves = List[Tuple[int, int, int, int]]()
+                spanned = List[int]()
+                for q in range(n_cp):
+                    g_q, g_end = MPP.get_relative_indices(q + 1, old_ratios)
+                    lo = max(s_p, g_q)
+                    hi = min(e_p, g_end)
+                    if hi > lo and partitions[q]:
+                        moves.append((len(spanned), lo - g_q, hi - g_q, lo - s_p))
+                        spanned.append(q)
+                length = e_p - s_p
+                dst_len = (length + slots - 1) // slots
+                sources = List[List[List[Ciphertext]]](stored[0])
+                for c in range(stored[0]):
+                    row_sources = List[List[Ciphertext]](len(spanned))
+                    for q in spanned:
+                        t = partitions[q]
+                        chunk = t._chunk_size if column_wise else len(t._data)
+                        row_sources.append(t._data[c * chunk:(c + 1) * chunk])
+                    sources.append(row_sources)
+                jobs.append((sources, moves, dst_len, length))
+                if moves:
+                    for ct in Ciphertensor._move_masked(slots, sources, 0, moves, dst_len):
+                        if id(ct) not in seen:
+                            seen.add(id(ct))
+                            out.append(ct)
+            return out
+
+        masked, status, message = _plan_indexing(plan)
+        _indexing_council(mpc, masked, status, message)
+
+        own = Ciphertensor[Ciphertext]()
+        for p in range(n_cp):
+            sources, moves, dst_len, length = jobs[p]
+            if moves:
+                rows = Ciphertensor._move_rows(mpc, sources, 0, moves, dst_len, False, refresh=False)
+                part = Ciphertensor[Ciphertext](
+                    _data=Ciphertensor._flatten(rows),
+                    shape=[stored[0], length] if column_wise else [length],
+                    slots=slots,
+                    _transposed=column_wise)
+            else:
+                part = Ciphertensor[Ciphertext](slots=slots)
+            if p + 1 == source_pid:
+                own = part
+            else:
+                mpc.comms.send_as_jar(part, p + 1)
+
+        return MPP[S, dtype](
+            _mpc=mpc,
+            _ratios=new_ratios,
+            _encryption_unified=own)
     
     def broadcast_from(self, source_pid: int):
         mpc = self._mpc
@@ -1162,7 +1297,8 @@ class MPP[S, dtype]:
                 f"aggregation since all parties have plaintext data")
             arr = mpc.comms.collect(self._local_data.copy()).unfence()
         else:
-            reveals = [enc.reveal(mpc, source_pid=-1, T=dtype) for enc in self.collect()]
+            # Every partition collected from its holder: the same ciphertexts at every compute party
+            reveals = [enc.reveal(mpc, source_pid=-1, copies_identical=True, T=dtype) for enc in self.collect()]
             non_empty_reveals = [e for e in reveals if not e.is_empty()]
 
             if static.len(S) == 1:
@@ -1584,17 +1720,25 @@ class MPP[S, dtype]:
             _ratios=adjusted_ratios,
             _local_data=zeros(adjusted_shape, dtype=dtype))
     
+    def _held_shape(self) -> S:
+        # This party's partition's shape as held (rows of the matrix as held: the logical shape reversed for a transposed
+        # MPP), which zeros(), ones() and rand() build their data in, keeping the flag (L-092: they built it in the logical
+        # shape and dropped the flag)
+        return self.shape[::-1] if self._transposed else self.shape
+
     def zeros(self) -> MPP[S, dtype]:
         return MPP[S, dtype](
             _mpc=self._mpc,
             _ratios=self._ratios.copy(),
-            _local_data=zeros(self.shape, dtype=dtype))
+            _local_data=zeros(self._held_shape(), dtype=dtype),
+            _transposed=self._transposed)
     
     def ones(self, *args) -> MPP[S, dtype]:
         return MPP[S, dtype](
             _mpc=self._mpc,
             _ratios=self._ratios.copy(),
-            _local_data=ones(self.shape, dtype=dtype))
+            _local_data=ones(self._held_shape(), dtype=dtype),
+            _transposed=self._transposed)
     
     @staticmethod
     def rand(shape: S, distribution: str, mpc) -> MPP[S, dtype]:
@@ -1620,14 +1764,15 @@ class MPP[S, dtype]:
             _local_data=random_local_data)
     
     def rand(self, distribution: str, *args) -> MPP[S, dtype]:
+        held = self._held_shape()
         if distribution == "uniform":
-            random_local_data = rand_uniform(self.shape)
+            random_local_data = rand_uniform(held)
         elif distribution == "normal":
-            random_local_data = rand_normal(self.shape)
+            random_local_data = rand_normal(held)
         elif distribution == "zeros":
-            random_local_data = ndarray[S, dtype].zeros(self.shape)
+            random_local_data = ndarray[S, dtype].zeros(held)
         elif distribution == "ones":
-            random_local_data = ndarray[S, dtype].zeros(self.shape)
+            random_local_data = ndarray[S, dtype].zeros(held)
             for i in range(random_local_data.size):
                 random_local_data._data[i] = dtype(1)
         else:
@@ -1636,7 +1781,8 @@ class MPP[S, dtype]:
         return MPP[S, dtype](
             _mpc=self._mpc,
             _ratios=self._ratios.copy(),
-            _local_data=random_local_data)
+            _local_data=random_local_data,
+            _transposed=self._transposed)
 
     def hstack(self, other:  MPP[S, dtype]) ->  MPP[S, dtype]:
         if self.is_local() and other.is_local():
@@ -2045,13 +2191,16 @@ class MPP[S, dtype]:
                 mpc.default_allow_mpc_switch = allow_mpc_switch
 
         # Every compute party ran the same product on partitions of the same shape, so the results' layouts agree
-        # without a council. A result that is not row-wise (diagonal, or column-wise: the kernels' layout for an
-        # encrypted factor) is redistributed through MPC, which splits it by its rows; splitting its physical rows
-        # instead returned the wrong layout (H-25). TODO: Temporary solution. Inefficient.
+        # without a council. A result that is not row-wise (diagonal; or column-wise: a column or a tall product in the
+        # clear, as Ciphertensor.enc encodes them, or the kernels' layout for an encrypted factor) is redistributed
+        # through MPC, which splits it by its rows and returns row-wise partitions; splitting its physical rows instead
+        # returned the wrong layout (H-25). Splitting a column-wise sum by its rows in HE (masked moves, as align_ratios
+        # moves column-wise partitions) is faster, but it leaves column-wise partitions, which the next product at
+        # unequal ratios cuts back wrongly (H-60) and LinReg converts every epoch: the detour stays until those change.
         if enc._diagonal_contiguous or enc._transposed:
             joined_sum = mpc.comms.collect(enc).sum(mpc)
             return joined_sum.to_sharetensor(
-                mpc, modulus=mpc.default_mpc_modulus, source_pid=-1, S=S, dtype=float).to_mpp(
+                mpc, modulus=mpc.default_mpc_modulus, source_pid=-1, S=S, dtype=float, copies_identical=True).to_mpp(
                     mpc, ratios=first._ratios, dtype=dtype)
         
         return mpc.comms.collect_at(enc, mpc.comms.hub_pid).sum(mpc).to_mpp(mpc, first._ratios, source_pid=mpc.comms.hub_pid, S=S, dtype=dtype)
@@ -3630,8 +3779,19 @@ class MPPAligner[S, dtype]:
         slots = mpc.mhe.crypto_params.params.slots()
         _encryption_placeholder = Ciphertensor[Ciphertext].placeholder([cols, rows] if _transposed else [rows, cols], slots)
         _encryption_placeholder._transposed = _transposed
-        for i, cipher in enumerate(encryption._data):
-            _encryption_placeholder._data[i] = cipher
+        if _transposed and encryption:
+            # Stored transposed, the padded rows lengthen every stored row (a logical column), which can then take more
+            # ciphertexts than this party's own: stored row r's k-th ciphertext goes to r * new_chunk + k (copied in
+            # flat order, the stored rows' ciphertexts landed out of place above the slots, and the revert failed at
+            # this party alone)
+            new_chunk = _encryption_placeholder._chunk_size
+            old_chunk = encryption._chunk_size
+            for r in range(encryption.shape[0]):
+                for k in range(old_chunk):
+                    _encryption_placeholder._data[r * new_chunk + k] = encryption._data[r * old_chunk + k]
+        else:
+            for i, cipher in enumerate(encryption._data):
+                _encryption_placeholder._data[i] = cipher
 
         return _encryption_placeholder
     
@@ -3660,11 +3820,19 @@ class MPPAligner[S, dtype]:
             return Ciphertensor[Ciphertext].like(encryption)
 
         if encryption._transposed:
-            # Assume that slice of the result that was produced by nil-ideals is all zeros
-            
-            _data = [cipher for cipher in encryption._data if not cipher._nil_ideal]
-            encryption.shape[-1] = ratios[mpc.pid - 1]
+            # Stored transposed, every stored row (a logical column) keeps the ciphertexts this party's rows take, its
+            # first ones; the padded ones are dropped whatever the operation left in them (a placeholder, or what the
+            # other operand had there). The slots past this party's rows in the last one kept are the padding's zeros.
+            own_rows = ratios[mpc.pid - 1]
+            old_chunk = (own_rows + encryption.slots - 1) // encryption.slots
+            new_chunk = encryption._chunk_size
+            _data = List[Ciphertext](encryption.shape[0] * old_chunk)
+            for r in range(encryption.shape[0]):
+                for k in range(old_chunk):
+                    _data.append(encryption._data[r * new_chunk + k])
+            encryption.shape[-1] = own_rows
             encryption._data = _data
+            encryption._reset_chunk_size()
             encryption.validate()
             return encryption
         

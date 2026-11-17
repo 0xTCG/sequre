@@ -140,6 +140,18 @@ CASES = [
     ("e2e.king.mpp_16x1024", "", "KING + reveal on MPP partitions, 2x8 individuals x 1024 SNPs"),
     ("e2e.linreg.mpu_16x15", "", "LinReg BGD fit (2 epochs) on MPU partitions with MPA weights + reveal, 16x15"),
     ("e2e.linreg.mpu_predict_16x15", "", "LinReg predict with noise on MPU partitions with MPA weights (the MI imputation step), 16x15"),
+    ("mhe.decrypt.aggregate_1ct", "", "collective decryption of one ciphertext every compute party holds alike (source -1, an aggregate's)"),
+    ("mhe.switch.mhe_to_mpc_aggregate_8ct", "", "Ciphertensor.to_sharetensor of 8x8192 values every compute party holds alike (source -1)"),
+    ("mp.mpa.to_sharetensor_aggregate", "", "MPA.to_sharetensor of an MPA that is only an aggregate (the switch with source -1), 16x64"),
+    ("mp.mpa.pow2_shares", "", "MPA ** 2 of additive 16x64 shares in the clear, split over the compute parties"),
+    ("mp.mpu.matmul_tt", "", "MPU(partition) A.T @ B.T, A 2x8x16 and B 2x8x16 partitions"),
+    ("mp.mpp.align_ratios_enc", "", "MPP.align_ratios of row-wise encrypted 2x8x64 partitions to other ratios (4 rows move)"),
+    ("mp.mpp.align_ratios_cw_enc", "", "MPP.align_ratios of column-wise encrypted 2x8x64 partitions to other ratios (4 rows move by masked moves, one council)"),
+    ("mp.mpu.sub_diag_t", "", "MPU(additive) W - X.T @ D, 8x6: X.T @ D's shares diagonal-encoded and transposed, converted through MPC to W's column-wise encryption (Sequential's first-layer update)"),
+    ("mp.mpp.matmul_tnt_col", "", "MPP A.T @ y in the clear, 2x8x64 and 2x8x1 partitions: a column-wise product, its sum redistributed by rows through MPC"),
+    ("mp.mpp.matmul_tnt_col_enc", "", "MPP A.T @ y, both encrypted, 2x8x64 and 2x8x1 partitions: a column-wise product, its sum redistributed by rows through MPC"),
+    ("mp.mpp.matmul_tnt_cw_enc", "", "MPP A.T @ B, both encrypted, 2x8x64 and 2x8x3 partitions: the M2 kernel's column-wise product, its sum redistributed by rows through MPC"),
+    ("e2e.linreg.mpp_16x15", "", "LinReg BGD fit (2 epochs) on MPP partitions with MPP weights + reveal, 16x15 (X.T @ y column-wise)"),
 ]
 
 handle_list_flag("mhe", CASES)
@@ -1579,6 +1591,237 @@ def bench_e2e(mpc, b: Bench):
             b.report(f"{rows}x{cols};noise={noise_scale}", t, max_abs_err_2d(pv, ref))
 
 
+########################## MP arithmetic and the aggregate's switch (last: their shared draws shift no other case's data) ##########################
+
+def bench_mp_arith(mpc, b: Bench):
+    n_cp = mpc.comms.number_of_parties - 1
+    slots = mpc.mhe.crypto_params.params.slots()
+    modulus = MPC_FIELD_SIZE
+    per, cols = 8, 64
+    rows = per * n_cp
+
+    if b.want(mpc, "mhe.decrypt.aggregate_1ct"):
+        vs = shared_floats(mpc, slots, -1.0, 1.0)
+        # Every compute party holds CP1's ciphertext: the same ciphertexts, as an aggregate's
+        cv = mpc.comms.broadcast_from(mpc.mhe.enc_vector(vs, T=Ciphertext), 1)
+        pts = List[Plaintext]()
+        t = Timer(b.reps(9))
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                pts = mpc.mhe.decrypt(cv, -1)
+            t.end(mpc)
+        if mpc.pid:
+            b.report(f"source=-1;level={cv[0].level()}", t, max_abs_err_1d(mpc.mhe.decode(pts, dtype=float), vs))
+
+    if b.want(mpc, "mhe.switch.mhe_to_mpc_aggregate_8ct"):
+        n = 8 * slots
+        xs = shared_floats(mpc, n, -1.0, 1.0)
+        ct = mpc.comms.broadcast_from(Ciphertensor[Ciphertext].enc(mpc, xs), 1) if mpc.pid else Ciphertensor[Ciphertext].enc(mpc, xs)
+        ct._is_broadcast = True
+        st = ct.to_sharetensor(mpc, modulus, -1, S=Tuple[int])
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            st = ct.to_sharetensor(mpc, modulus, -1, S=Tuple[int])
+            t.end(mpc)
+        rv = st.reveal(mpc)
+        if mpc.pid:
+            b.report(f"n={n};source=-1", t, max_abs_err_1d(rv, xs))
+
+    if b.any_selected("mp.mpa.to_sharetensor_aggregate") or b.any_selected("mp.mpa.pow2_shares"):
+        A = array(shared_float_matrix(mpc, rows, cols, -1.0, 1.0))
+        # Additive shares of A: CP1 holds three quarters, the other compute parties the rest in equal parts
+        weight = 0.75 if mpc.pid == 1 else 0.25 / float(n_cp - 1)
+        share = zeros_like(A) if mpc.pid == 0 else A * weight
+
+        if b.want(mpc, "mp.mpa.to_sharetensor_aggregate"):
+            aggregated = MPA(mpc, share)
+            aggregated.aggregate()
+            m = MPA[Tuple[int, int], float]._from_parts(
+                mpc, zeros_like(A) if mpc.pid == 0 else ndarray[Tuple[int, int], float](), Ciphertensor[Ciphertext](),
+                aggregated._aggregate if mpc.pid else Ciphertensor[Ciphertext]())
+            st = m.to_sharetensor()
+            t = Timer(b.reps(5))
+            while t.next():
+                t.begin(mpc)
+                st = m.to_sharetensor()
+                t.end(mpc)
+            rv = st.reveal(mpc)
+            if mpc.pid:
+                b.report(f"{rows}x{cols}", t, max_abs_err_2d(rv, A))
+
+        if b.want(mpc, "mp.mpa.pow2_shares"):
+            out = MPA(mpc, share)
+            t = Timer(b.reps(5))
+            while t.next():
+                m = MPA(mpc, share)
+                t.begin(mpc)
+                out = m ** 2
+                t.end(mpc)
+            rv = out.reveal()
+            if mpc.pid:
+                b.report(f"{rows}x{cols}", t, max_abs_err_2d(rv, A * A))
+
+    if b.want(mpc, "mp.mpu.matmul_tt"):
+        # A.T @ B.T = (B @ A).T for A (rows x 16) and B (rows x rows), 8 rows of each per party
+        tcols = 16
+        TA = array(shared_float_matrix(mpc, rows, tcols, -1.0, 1.0))
+        TB = array(shared_float_matrix(mpc, rows, rows, -1.0, 1.0))
+        ua = MPU(mpc, partition_of(mpc, TA, per), "partition")
+        ub = MPU(mpc, partition_of(mpc, TB, per), "partition")
+        out = ua.T @ ub.T
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            out = ua.T @ ub.T
+            t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"({rows}x{tcols}).T@({rows}x{rows}).T", t, max_abs_err_2d(rv, TA.T @ TB.T))
+
+    if b.want(mpc, "mp.mpp.align_ratios_enc"):
+        M = array(shared_float_matrix(mpc, rows, cols, -1.0, 1.0))
+        enc = MPP(mpc, partition_of(mpc, M, per))
+        enc.encrypt()
+        target = [per for _ in range(n_cp)]
+        target[0] -= 4
+        target[1] += 4
+        out = enc.align_ratios(target, False)
+        t = Timer(b.reps(7))
+        while t.next():
+            t.begin(mpc)
+            out = enc.align_ratios(target, False)
+            t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"{n_cp}x{per}x{cols};to={target}", t, max_abs_err_2d(rv, M))
+
+    if b.want(mpc, "mp.mpp.align_ratios_cw_enc"):
+        M = array(shared_float_matrix(mpc, rows, cols, -1.0, 1.0))
+        # Partitions encrypted column-wise (stored transposed): rows move between the parties by masked moves
+        cw = MPP(mpc, partition_of(mpc, M, per)).T
+        cw.encrypt()
+        enc = cw.T
+        target = [per for _ in range(n_cp)]
+        target[0] -= 4
+        target[1] += 4
+        out = enc.align_ratios(target, False)
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            out = enc.align_ratios(target, False)
+            t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"{n_cp}x{per}x{cols};to={target};column-wise", t, max_abs_err_2d(rv, M))
+
+    if b.want(mpc, "mp.mpu.sub_diag_t"):
+        # The first layer's update in Sequential on MPUs: W - X.T @ D, with W's shares in the clear (encrypted
+        # column-wise, as a tall MPA is) and X.T @ D's shares diagonal-encoded and flagged transposed (X in the clear, D
+        # encrypted): the product's shares go to W's layout through MPC
+        X = array(shared_float_matrix(mpc, rows, 8, -1.0, 1.0))
+        D = array(shared_float_matrix(mpc, rows, 6, -1.0, 1.0))
+        W0 = array(shared_float_matrix(mpc, 8, 6, -1.0, 1.0))
+        ux = MPU(mpc, partition_of(mpc, X, per), "partition")
+        ud = MPU(mpc, partition_of(mpc, D, per), "partition")
+        ud._mpp.encrypt()
+        dw = ux.T @ ud
+        layout = ""
+        if mpc.pid:
+            e = dw._mpa._encryption
+            layout = f"diagonal={int(e._diagonal_contiguous)};transposed={int(e._transposed)}"
+        out = MPU(mpc, W0 if mpc.pid == 1 else zeros_like(W0), "additive") - dw
+        t = Timer(b.reps(5))
+        while t.next():
+            uw = MPU(mpc, W0 if mpc.pid == 1 else zeros_like(W0), "additive")
+            t.begin(mpc)
+            out = uw - dw
+            t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"(8x6)-({rows}x8).T@({rows}x6);{layout}", t, max_abs_err_2d(rv, W0 - X.T @ D))
+
+    if b.any_selected("mp.mpp.matmul_tnt_col") or b.any_selected("mp.mpp.matmul_tnt_cw_enc"):
+        # A.T @ B whose per-party products come out column-wise: a column (B = y, as LinReg's X.T @ y; a column encrypts
+        # as one transposed row even from data in the clear) and B with 3 columns (encrypted factors: the M2 kernel's
+        # transposed result). The products' sum is redistributed by rows among the compute parties, through MPC.
+        TA = array(shared_float_matrix(mpc, rows, cols, -1.0, 1.0))
+        Ty = array(shared_float_matrix(mpc, rows, 1, -1.0, 1.0))
+        TB3 = array(shared_float_matrix(mpc, rows, 3, -1.0, 1.0))
+        ma = MPP(mpc, partition_of(mpc, TA, per))
+        my = MPP(mpc, partition_of(mpc, Ty, per))
+
+        if b.want(mpc, "mp.mpp.matmul_tnt_col"):
+            out = ma.T @ my
+            t = Timer(b.reps(5))
+            while t.next():
+                t.begin(mpc)
+                out = ma.T @ my
+                t.end(mpc)
+            rv = out.reveal()
+            if mpc.pid:
+                b.report(f"({rows}x{cols}).T@({rows}x1)", t, max_abs_err_2d(rv, TA.T @ Ty))
+
+        if b.want(mpc, "mp.mpp.matmul_tnt_col_enc"):
+            ea = ma.copy()
+            ea.encrypt()
+            ey = my.copy()
+            ey.encrypt()
+            out = ea.T @ ey
+            t = Timer(b.reps(5))
+            while t.next():
+                t.begin(mpc)
+                out = ea.T @ ey
+                t.end(mpc)
+            rv = out.reveal()
+            if mpc.pid:
+                b.report(f"({rows}x{cols}).T@({rows}x1);encrypted", t, max_abs_err_2d(rv, TA.T @ Ty))
+
+        if b.want(mpc, "mp.mpp.matmul_tnt_cw_enc"):
+            ea = ma.copy()
+            ea.encrypt()
+            eb = MPP(mpc, partition_of(mpc, TB3, per))
+            eb.encrypt()
+            out = ea.T @ eb
+            t = Timer(b.reps(5))
+            while t.next():
+                t.begin(mpc)
+                out = ea.T @ eb
+                t.end(mpc)
+            rv = out.reveal()
+            if mpc.pid:
+                b.report(f"({rows}x{cols}).T@({rows}x3);encrypted", t, max_abs_err_2d(rv, TA.T @ TB3))
+
+    if b.want(mpc, "e2e.linreg.mpp_16x15"):
+        # LinReg on MPPs: X, y and the initial weights partitioned in the clear (X.T @ y is a column-wise product)
+        lcols = 15
+        X = array(shared_float_matrix(mpc, rows, lcols, 0.0, 1.0))
+        target_w = array(shared_float_matrix(mpc, lcols, 1, 0.0, 1.0))
+        y = X @ target_w + 1.0
+        raw_w0 = ones((lcols + 1, 1))
+        # The weights' rows split as evenly as possible, the remainder to the last compute party
+        per_w = (lcols + 1) // n_cp
+        w_stop = lcols + 1 if mpc.pid == n_cp else mpc.pid * per_w
+        step, epochs = 0.001, 2
+        px = partition_of(mpc, X, per)
+        py = partition_of(mpc, y, per)
+        pw = zeros_like(raw_w0) if mpc.pid == 0 else raw_w0[(mpc.pid - 1) * per_w:w_stop]
+        wv = array([[0.0]])
+        t = Timer(b.reps(2), warmup=0)
+        while t.next():
+            t.begin(mpc)
+            mx = MPP(mpc, px)
+            my = MPP(mpc, py)
+            mw = MPP(mpc, pw)
+            model = LinReg(mw).fit(mpc, X=mx, y=my, step=step, epochs=epochs)
+            wv = model.coef_.reveal()
+            t.end(mpc)
+        if mpc.pid:
+            ref = LinReg(raw_w0).fit(mpc, X=X, y=y, step=step, epochs=epochs).coef_
+            b.report(f"{rows}x{lcols};epochs={epochs}", t, max_abs_err_2d(wv, ref))
+
+
 @main
 def bench_mhe_main(mpc):
     b = Bench("mhe", mpc.pid, CASES)
@@ -1599,6 +1842,7 @@ def bench_mhe_main(mpc):
     bench_ct_matmul(mpc, b)
     bench_mp(mpc, b)
     bench_e2e(mpc, b)
+    bench_mp_arith(mpc, b)
     b.finish(mpc)
 
 

@@ -55,6 +55,32 @@ def _train_pair(mpc, modulus, X, y, layers_plain, layers_mpc, loss: str, epochs:
     return raw_init, raw_model.layers[1].weights.tolist(), mpc_model.layers[1].weights.reveal(mpc).tolist()
 
 
+# The HE <-> MPC switches' noise in a value, which an activation or a product on MPUs carries (test_activations' model
+# of encrypted MPUs: 1e-4 for the input's switch)
+MPU_SWITCH_NOISE = 1e-4
+
+
+def _train_pair_mpu(mpc, X, y, layers_plain, layers_mpu, loss: str, epochs: int, step: float):
+    # The same model in the clear and on MPUs (X and y partitioned, rows_per_party rows each; the weights additive, as
+    # Dense draws them) from the same initial weights (the shared seed); returns the first Dense layer's initial and
+    # trained weights, in the clear and revealed
+    n_cp = mpc.comms.number_of_parties - 1
+    rows_per_party = X.shape[0] // n_cp
+    start = (mpc.pid - 1) * rows_per_party
+    mpu_X = MPU(mpc, X[start:start + rows_per_party] if mpc.pid else X, "partition")
+    mpu_y = MPU(mpc, y[start:start + rows_per_party] if mpc.pid else y, "partition")
+    mpc.randomness.reset_global_seed()
+    with mpc.randomness.global_stream():
+        raw_model = Sequential(layers_plain).compile(mpc, loss=loss, optimizer="bgd")
+    raw_init = raw_model.layers[1].weights.tolist()
+    raw_model.fit(mpc, X=X, y=y, step=step, epochs=epochs, momentum=0.9)
+    mpc.randomness.reset_global_seed()
+    with mpc.randomness.global_stream():
+        mpu_model = Sequential(layers_mpu).compile(mpc, loss=loss, optimizer="bgd")
+    mpu_model.fit(mpc, X=mpu_X, y=mpu_y, step=step, epochs=epochs, momentum=0.9)
+    return raw_init, raw_model.layers[1].weights.tolist(), mpu_model.layers[1].weights.reveal(mpc).tolist()
+
+
 def test_neural_net_activations[TP](mpc: MPCEnv[TP], modulus: TP):
     """
     Models with the new activations, trained in the clear and on Sharetensors from the same initial weights:
@@ -138,8 +164,19 @@ def test_neural_net_activations[TP](mpc: MPCEnv[TP], modulus: TP):
     default_method = Dense[type(X)]("sigmoid", 1, "normal", "zeros").method
     assert_eq(f"CP{mpc.pid}:\tDense defaults to the Chebyshev method ({default_method})", default_method == "chebyshev", True)
 
-    # MPUs: not here. Training on MPUs computes wrong first-layer updates for every activation (an open defect of
-    # Sequential on MPUs, relu included); the activations themselves are checked on MPUs in test_activations.
+    # On MPUs (X and y partitioned, the weights additive): relu + linear with the hinge loss, from the same weights. The
+    # first layer's gradient X.T @ dhidden comes back as each party's encryption in diagonal-encoded, transposed storage,
+    # and the update subtracted it from a column-wise encryption through Ciphertensor.get_actual, which gave its
+    # transpose (H-55: the first layer's weights 0.2 off). Its error model: the HE <-> MPC switches' noise (1e-4 a
+    # value, as test_activations models it) in each activation and product, carried as tol_for carries an activation's
+    # error.
+    raw_init, raw_w, mpu_w = _train_pair_mpu(
+        mpc, X, y_pm,
+        (Input[type(X)](8), Dense[type(X)]("relu", 6, "normal", "zeros"), Dense[type(X)]("linear", 1, "normal", "zeros")),
+        (Input[MPU[Tuple[int, int], float]](8), Dense[MPU[Tuple[int, int], float]]("relu", 6, "normal", "zeros"),
+         Dense[MPU[Tuple[int, int], float]]("linear", 1, "normal", "zeros")),
+        "hinge", epochs, step)
+    checks.append(("relu + linear, hinge, on MPUs", _max_abs_diff(raw_w, mpu_w), _max_abs_diff(raw_w, raw_init), tol_for(MPU_SWITCH_NOISE)))
 
     if mpc.pid:
         for name, diff, moved, limit in checks:
@@ -362,10 +399,17 @@ def test_neural_net[TP](mpc: MPCEnv[TP], modulus: TP):
     mpu_model.fit(mpc, X=mpu_X, y=mpu_y, step=step_size, epochs=epochs, momentum=momentum)
     mpu_w = mpu_model.layers[1].weights
 
+    # Against the clear model within the error model of test_neural_net_activations' MPU check (the default tolerance,
+    # 0.018, was loose). A regression bound only: this model's first layer (16 x 32) never reaches the diagonal-encoded
+    # product whose update went wrong (H-55: the same agreement, 9e-6, before and after the fix); the MPU check in
+    # test_neural_net_activations (8 x 6) is the one that fails on that defect.
+    mpu_tol = 8.0 * float(epochs) * step_size * float(rows) * 1.0 * MPU_SWITCH_NOISE + 1e-7
+    mpu_revealed = mpu_w.reveal(mpc)
     if mpc.pid == 0:
         assert_eq(f"CP{mpc.pid}:\tSafe-checking neural net result shape (MPU) on {alg_struct}", mpu_w.shape, raw_w.shape)
     else:
-        assert_eq_approx(f"CP{mpc.pid}:\tSequre neural net (MPU) on {alg_struct}", mpu_w.reveal(mpc), raw_w)
+        mpu_diff = _max_abs_diff(mpu_revealed.tolist(), raw_w.tolist())
+        assert_eq(f"CP{mpc.pid}:\tSequre neural net (MPU) on {alg_struct}: weights agree with the clear model (max diff {mpu_diff:.2e} < {mpu_tol:.1e})", mpu_diff < mpu_tol, True)
 
     # Verbose training prints the loss summed over the records and reveals nothing per record (M-ML-02): beyond the
     # loss's own computation, verbose sends less than a single reveal of the per-record losses (it revealed them every
