@@ -19,6 +19,7 @@ _Defined in `stdlib/sequre/mpc/env.codon`_
 | `default_mpc_modulus` | `TP` | Default modulus for MPC arithmetic |
 | `default_ciphertensor_encoding` | `str` | Default encoding for ciphertensors |
 | `default_allow_mpc_switch` | `bool` | Whether automatic MPC ↔ MHE switching is enabled |
+| `default_allow_diagonal_results` | `bool` | Whether a matrix product may take a kernel whose result is diagonal-encoded (TNT, for a column-wise first factor); `True` by default. MPP and MPU operations clear it around their per-partition products by a plaintext operand, which they cut back to each party's rows (a diagonal storage cannot be cut by rows): such a product then takes M2 on the transposes. A product of two ciphertext operands sets it, whatever it was, and takes TNT where its first factor is column-wise and its second is not stored transposed; TNT's diagonal-encoded result is converted once through MPC, to row-wise partitions or, where each party's product has fewer columns than rows, column-wise ones, and cut to each party's rows on the shares where a party holds rows but fewer than the most |
 | `stats` | `MPCStats` | Operation counters and byte-transfer tracking |
 | `randomness` | `MPCRandomness` | PRG streams and seed management |
 | `comms` | `MPCComms[TP]` | Network I/O (send, receive, reveal, broadcast) |
@@ -306,7 +307,7 @@ Multiparty homomorphic encryption based on the CKKS scheme. Provides collective 
 |---|---|---|
 | `enc_vector[T]` | `(values)` | Encode and encrypt a list of values into a list of `Ciphertext` or `Plaintext` (type selected by `T`) |
 | `enc_public_vector` | `(values)` | Trivial encryptions of public values (the same at every party), laid out as `enc_vector` lays them out: identical at every party, noiseless, no public-key encryption |
-| `decrypt` | `(x, source_pid=-2, copies_identical=False)` | Collectively decrypt ciphertexts. `-2` (default): every compute party gets the plaintexts of its own ciphertexts and no other party learns them; each sends the others only the `c1` of its ciphertexts and gets back their decryption shares, so every compute party must call it, with an empty list if it holds none. A compute party's PID: that party's ciphertexts, decrypted for every compute party. `-1`: ciphertexts that hold the same values at every compute party (an aggregate), decrypted for every compute party: the hub's copy is sent to the others and decrypted (as for source 1), so copies that came apart (each a valid encryption of the values, but not the same ciphertexts, as a refresh of each party's copy in a round of its own leaves them) decrypt right; `copies_identical=True` (only for copies the same by construction, such as ones collected from their holder) decrypts each party's own copy and sends nothing first. CP0 takes no part (`source_pid=0` is an error). See [Security assumptions](../crypto-corner/security-assumptions.md#what-each-reveal-discloses) |
+| `decrypt` | `(x, source_pid=-2)` | Collectively decrypt ciphertexts. `-2` (default): every compute party gets the plaintexts of its own ciphertexts and no other party learns them; each sends the others only the `c1` of its ciphertexts and gets back their decryption shares, so every compute party must call it, with an empty list if it holds none. A compute party's PID: that party's ciphertexts, decrypted for every compute party. `-1`: ciphertexts that are the same at every compute party (an aggregate, whose every operation keeps its copies the same, or ones collected from their holder), decrypted for every compute party, each decrypting its own copy (debug builds first check that the copies are the same, and raise at every compute party if not). CP0 takes no part (`source_pid=0` is an error). See [Security assumptions](../crypto-corner/security-assumptions.md#what-each-reveal-discloses) |
 | `decode[dtype]` | `(enc)` | Decode a list of `Plaintext` into `list[dtype]` (`int`, `float`, or `complex`) |
 | `reveal[dtype]` | `(x, source_pid=-2)` | Decrypt then decode (convenience wrapper; same `source_pid` modes) |
 
@@ -317,7 +318,7 @@ Multiparty homomorphic encryption based on the CKKS scheme. Provides collective 
 | `cipher_to_additive_plaintext` | `(ct, hub_pid)` | E2S: convert a `Ciphertext` to an `AdditiveShareBigint` |
 | `additive_plaintext_to_cipher` | `(secret_share, hub_pid)` | S2E: convert an `AdditiveShareBigint` back to a `Ciphertext` |
 | `additive_share_vector_to_ciphervector` | `(shared_tensor, modulus, is_fp, target_pid=-1)` | MPC→MHE: convert MPC secret shares to a ciphervector |
-| `ciphervector_to_additive_share_vector` | `(ciphervector, number_of_elements, modulus, source_pid, copies_identical=False)` | MHE→MPC: convert a ciphervector to MPC secret shares. A compute party's PID: that party's ciphertexts (the others' are ignored). `-1`: ciphertexts that hold the same values at every compute party (an aggregate): the hub's copy is switched (sent to the others first, as for source 1), so copies that came apart give the right shares; `copies_identical=True` switches each party's own copy, for copies the same by construction. Every party's copy of an aggregate is rescaled in place and otherwise left as it is; a single holder's ciphertexts, and copies vouched for, are rescaled and, below the switch's level, bootstrapped in place. Placeholders (nil-ideal ciphertexts, the padding of unequal partitions) switch as zeros |
+| `ciphervector_to_additive_share_vector` | `(ciphervector, number_of_elements, modulus, source_pid)` | MHE→MPC: convert a ciphervector to MPC secret shares. A compute party's PID: that party's ciphertexts (the others' are ignored). `-1`: ciphertexts that are the same at every compute party (an aggregate, or ones collected from their holder): each party switches its own copy (debug builds check the copies first, as `decrypt` does). The ciphertexts are rescaled and, below the switch's level, bootstrapped in place (an aggregate's copies in the broadcast mode, alike). Placeholders (nil-ideal ciphertexts, the padding of unequal partitions) switch as zeros |
 
 #### Ciphertext arithmetic (in-place)
 
@@ -341,7 +342,7 @@ Multiparty homomorphic encryption based on the CKKS scheme. Provides collective 
 | `neg` | `(x)` | Return negated copy |
 | `add` | `(x, y)` | Return sum of ciphervectors |
 | `sub` | `(x, y)` | Return difference of ciphervectors |
-| `mul` | `(x, y)` | Return product of ciphervectors |
+| `mul` | `(x, y, x_is_broadcast=False, y_is_broadcast=False)` | Return product of ciphervectors; as in `imul`, an operand flagged broadcast (the same ciphertexts at every party) is refreshed in the broadcast mode, one bootstrap for every party |
 | `mul_noboot` | `(x, y)` | Return product without bootstrapping |
 | `add_const` | `(x, constant)` | Return ciphervector + constant |
 | `sub_const` | `(x, constant)` | Return ciphervector − constant |
@@ -354,7 +355,7 @@ Multiparty homomorphic encryption based on the CKKS scheme. Provides collective 
 |---|---|---|
 | `rescale` | `(x, target_scale)` | Rescale ciphertexts to `target_scale` |
 | `requires_bootstrap` | `(x, min_level_distance=0)` | Check which ciphertexts need bootstrapping (returns `list[bool]`) |
-| `bootstrap` | `(x, is_broadcast=False, min_level_distance=0)` | Collectively bootstrap ciphertexts that need it. With `is_broadcast` (ciphertexts that are the same at every party, such as an aggregate) one bootstrap serves every party: each takes the hub's copy and gets its refresh, so the copies come out the same, also where they had come apart. Otherwise one council decides, and each party's ciphertexts are bootstrapped in rounds of their own |
+| `bootstrap` | `(x, is_broadcast=False, min_level_distance=0, copies_identical=False)` | Collectively bootstrap ciphertexts that need it. With `is_broadcast` (ciphertexts that are the same at every party, such as an aggregate) one bootstrap serves every party: each takes the hub's copy and gets its refresh, so the copies come out the same, also where they had come apart (debug builds check them first, as `decrypt` does); `copies_identical=True` (the switch to MPC, on ciphertexts it just received from one party or an aggregate's copies) bootstraps each party's own copy without the hub's sent first. Otherwise one council decides, and each party's ciphertexts are bootstrapped in rounds of their own |
 | `refresh` | `(x, is_broadcast=False, min_level_distance=0)` | Rescale then bootstrap as needed (recommended before heavy computation) |
 | `refresh_council` | `(x, status=0)` | One refresh council among the compute parties that also carries a status from each: rescale `x`, then one collect gives every party's status and which of its ciphertexts need a collective bootstrap. Returns every compute party's status (the same list at each), so that the caller can raise at every party alike when one is nonzero; every bootstrap any party needs runs first, whatever the statuses. `x` may be empty: the parties need only hold the same number of councils |
 | `drop_level` | `(a, out_level)` | Drop ciphertext level (works on `list[Ciphertext]` and `list[list[Ciphertext]]`) |
@@ -364,9 +365,9 @@ Multiparty homomorphic encryption based on the CKKS scheme. Provides collective 
 
 | Method | Signature | Description |
 |---|---|---|
-| `shift` | `(x, step)` | Shift ciphervector by `step` slots (inter-ciphertext, with masking) |
+| `shift` | `(x, step, is_broadcast=False)` | Shift ciphervector by `step` slots (inter-ciphertext, with masking); with `is_broadcast` the masked products of a broadcast `x` refresh in the broadcast mode |
 | `shift_noboot` | `(x, step)` | Shift without bootstrapping |
-| `reduce_add` | `(x, size, keep_dims=True)` | Sum-reduce a ciphervector along the slot axis |
+| `reduce_add` | `(x, size, keep_dims=True, is_broadcast=False)` | Sum-reduce a ciphervector along the slot axis; with `is_broadcast` the mask product of a broadcast `x` refreshes in the broadcast mode |
 
 #### Masking
 

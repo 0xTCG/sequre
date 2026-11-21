@@ -315,6 +315,40 @@ def test_mpa_public_product_via_mpc(mpc):
             assert_eq_approx(f"CP{mpc.pid}:\tMPA encrypt with shares in the clear and an aggregate: CP{p}'s encryption holds its own share", revealed_own, all_shares[p - 1], error=1e-3)
 
 
+def test_mpa_via_mpc_default_mode(mpc):
+    """L-274 (the user's choice, 2026-11-18): Ciphertensor.via_mpc in its default mode on an aggregate (the same
+    ciphertexts at every compute party) switched every party's copy apart, each party keeping a fresh encryption of its
+    own, which a decryption with source -1 cannot combine (it raised in debug builds; garbage in release builds). The hub
+    now tells every party, CP0 included, that the tensor is broadcast (one round), and it is switched once, as mirrored:
+    as many ciphertexts switched as it holds, a result the same at every party and flagged broadcast, its decryption with
+    source -1 right. A party's own tensor in the default mode still comes back as that party's own result."""
+    rows, cols = 4, 8
+    public = cohort_matrix(mpc, cols, 3) * 0.25
+    share = array(random_floats((rows, cols), scale=1.0))
+    raw = mpc.comms.collect(share).sum() if mpc.pid else zeros_like(share)
+    aggregated = MPA(mpc, share)
+    aggregated.aggregate()
+    ciphers = aggregated._aggregate if mpc.pid else Ciphertensor[ckks.Ciphertext].zeros(mpc, [rows, cols])
+    label = "Ciphertensor via MPC, default mode, an aggregate"
+    before = mpc.mhe.stats.secure_mhe_mpc_switch_count
+    out = ciphers.via_mpc(mpc, lambda stensor: secure_operator.matmul(mpc, stensor, public), S=Tuple[int, int])
+    switched = mpc.mhe.stats.secure_mhe_mpc_switch_count - before
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\t{label}: switched once ({switched} ciphertexts for {len(ciphers._data)})", switched, len(ciphers._data))
+        assert_eq(f"CP{mpc.pid}:\t{label}: the result the same at every party, flagged broadcast", out._is_broadcast and same_at_every_party(mpc, out._data), True)
+        assert_eq_approx(f"CP{mpc.pid}:\t{label}: decrypted with source -1", out.reveal(mpc, source_pid=-1), raw @ public, error=0.01)
+    assert_parties_in_step(mpc, label)
+
+    # Each party's own share, encrypted: every party's switched in turn, and each party gets its own result back
+    own = Ciphertensor[ckks.Ciphertext].enc(mpc, share) if mpc.pid else Ciphertensor[ckks.Ciphertext].zeros(mpc, [rows, cols])
+    label = "Ciphertensor via MPC, default mode, each party's own tensor"
+    per_party = own.via_mpc(mpc, lambda stensor: secure_operator.matmul(mpc, stensor, public), S=Tuple[int, int])
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\t{label}: not flagged broadcast", per_party._is_broadcast, False)
+        assert_eq_approx(f"CP{mpc.pid}:\t{label}", per_party.reveal(mpc), share @ public, error=0.01)
+    assert_parties_in_step(mpc, label)
+
+
 def test_mpa_reveal_sums_only(mpc):
     """MPA.reveal of shares the compute parties hold in the clear reveals their sum and nothing else (M-MP-15): each
     party sends the others its share under pairwise masks that cancel in the sum, so a vector a party receives differs
@@ -720,6 +754,78 @@ def test_mpa_ones_and_float_setitem(mpc):
         assert_parties_in_step(mpc, f"{label}: setitems into shared storage")
 
 
+def aggregate_only(mpc, value, level: int) -> MPA[Tuple[int, int], float]:
+    # An MPA that holds only an aggregate of value (CP1's share), at level: the same ciphertexts at every compute party
+    m = MPA(mpc, value if mpc.pid == 1 else value.zeros())
+    m.aggregate()
+    if mpc.pid:
+        m._plain = ndarray[Tuple[int, int], float]()
+        m._aggregate._data = mpc.mhe.drop_level(m._aggregate._data, level)
+    return m
+
+
+def test_mpa_aggregate_operations_stay_identical(mpc):
+    """M-MHE-26 through MPA: operations on an MPA that holds only an aggregate, at the bootstrap level and one level
+    above it: sums over either axis, a dot product, a product with a public matrix and a product of two aggregates. A sum
+    refreshed the aggregate's mask product at every party in a round of its own (one bootstrap per party per
+    ciphertext), and the copies came apart; now the copies stay the same at every compute party, with at most one
+    bootstrap per ciphertext refreshed."""
+    lb = mpc.mhe.bootstrap_min_level
+    m35 = cohort_matrix(mpc, 3, 5) * 0.5
+    m53 = cohort_matrix(mpc, 5, 3) * 0.5
+    for level in (lb, lb + 1):
+        cases = [("sum(0)", 0), ("sum(1)", 1), ("dot(1)", 2), ("@ public 5x3", 3), ("@ an aggregate's transpose", 4)]
+        for name, op in cases:
+            a = aggregate_only(mpc, m35, level)
+            before = mpc.mhe.stats.secure_bootstrap_count
+            if op == 0:
+                r = a.sum(0)
+                want = array([[sum(m35[i, j] for i in range(3)) for j in range(5)]])
+                most = 1
+            elif op == 1:
+                r = a.sum(1)
+                want = array([[sum(m35[i, j] for j in range(5)) for i in range(3)]])
+                most = 3
+            elif op == 2:
+                r = a.dot(1)
+                want = array([[sum(m35[i, j] * m35[i, j] for j in range(5)) for i in range(3)]])
+                most = 6
+            elif op == 3:
+                r2 = a @ m53
+                bootstraps = mpc.mhe.stats.secure_bootstrap_count - before
+                label = f"MPA (an aggregate at level {level}) {name}"
+                if mpc.pid:
+                    assert_eq(f"CP{mpc.pid}:\t{label}: the copies the same at every compute party", same_at_every_party(mpc, r2._aggregate._data), True)
+                    assert_eq(f"CP{mpc.pid}:\t{label}: at most 3 bootstraps (got {bootstraps})", bootstraps <= 3, True)
+                revealed2 = r2.reveal()
+                if mpc.pid:
+                    assert_eq_approx(f"CP{mpc.pid}:\t{label}", revealed2, m35 @ m53, error=2e-2)
+                assert_parties_in_step(mpc, label)
+                continue
+            else:
+                b = aggregate_only(mpc, m35, level)
+                r2 = a @ b.T
+                bootstraps = mpc.mhe.stats.secure_bootstrap_count - before
+                label = f"MPA (an aggregate at level {level}) {name}"
+                if mpc.pid:
+                    assert_eq(f"CP{mpc.pid}:\t{label}: the copies the same at every compute party", same_at_every_party(mpc, r2._aggregate._data), True)
+                    assert_eq(f"CP{mpc.pid}:\t{label}: at most 12 bootstraps (got {bootstraps})", bootstraps <= 12, True)
+                revealed2 = r2.reveal()
+                if mpc.pid:
+                    assert_eq_approx(f"CP{mpc.pid}:\t{label}", revealed2, m35 @ m35.T, error=2e-2)
+                assert_parties_in_step(mpc, label)
+                continue
+            bootstraps = mpc.mhe.stats.secure_bootstrap_count - before
+            label = f"MPA (an aggregate at level {level}).{name}"
+            if mpc.pid:
+                assert_eq(f"CP{mpc.pid}:\t{label}: the copies the same at every compute party", same_at_every_party(mpc, r._aggregate._data), True)
+                assert_eq(f"CP{mpc.pid}:\t{label}: at most {most} bootstraps (got {bootstraps})", bootstraps <= most, True)
+            revealed = r.reveal()
+            if mpc.pid:
+                assert_eq_approx(f"CP{mpc.pid}:\t{label}", revealed, want[0], error=2e-2)
+            assert_parties_in_step(mpc, label)
+
+
 def test_mpa[TP](mpc: MPCEnv[TP], modulus: TP):
     mpc.comms.sync_parties()
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
@@ -755,11 +861,13 @@ def test_mpa[TP](mpc: MPCEnv[TP], modulus: TP):
     test_mpa_matmul_cost_agreement(mpa_a, raw_a)
     test_mpa_int_to_sharetensor(mpc)
     test_mpa_public_product_via_mpc(mpc)
+    test_mpa_via_mpc_default_mode(mpc)
     test_mpa_reveal_sums_only(mpc)
     test_mpa_mixed_to_sharetensor(mpc)
     test_mpa_pad_with_value(mpc)
     test_mpa_negative_indices(mpc)
     test_mpa_powers(mpc)
     test_mpa_ones_and_float_setitem(mpc)
+    test_mpa_aggregate_operations_stay_identical(mpc)
 
     print(f'CP{mpc.pid}:\tSequre MHE MPA tests on {alg_struct} passed.\n')

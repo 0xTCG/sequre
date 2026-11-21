@@ -320,19 +320,17 @@ class MPCMHE[TP]:
         
         return ct_rec
     
-    def decrypt(self, x: list[Ciphertext], source_pid: int = -2, copies_identical: bool = False) -> list[Plaintext]:
+    def decrypt(self, x: list[Ciphertext], source_pid: int = -2) -> list[Plaintext]:
         """
         Collective decryption. If source_pid is:
             - -2 (the default): every compute party gets the plaintexts of its own ciphertexts, and no party learns
               another's (_decrypt_to_holders). Every compute party must call it, with an empty list if it holds none.
             - a compute party's PID (1, 2, ...): that party's ciphertexts are decrypted for every compute party (all of
               them learn the plaintexts); the other parties' x is ignored
-            - -1: x holds the same values at every compute party (an aggregate); every compute party gets them. The hub's
-              copy is decrypted (sent to the others, as for source_pid 1): copies that came apart (each a valid
-              encryption of the values, but not the same ciphertexts, as a refresh of each party's copy in a round of its
-              own leaves them) decrypt right, as in a broadcast-mode bootstrap. With copies_identical the caller vouches
-              that every party holds the same ciphertexts (collected from their holders, or summed alike from such): each
-              party decrypts its own copy and nothing is sent first.
+            - -1: x is the same ciphertexts at every compute party (an aggregate, whose every operation keeps its copies
+              the same, or ones collected from their holder); every compute party gets the plaintexts, each decrypting
+              its own copy. The hub's copy is no longer sent first (it healed copies that per-party refreshes had left
+              apart, which M-MHE-26 removed); debug builds check that the copies are the same.
         CP0 holds no key share and takes no part: it gets an empty plaintext per ciphertext of its own x.
         """
         assert source_pid != 0, "MPCMHE: CP0 holds no ciphertexts to decrypt (source_pid 0)"
@@ -341,8 +339,9 @@ class MPCMHE[TP]:
             return [Plaintext() for _ in range(len(x))]
         if source_pid == -2:
             return self._decrypt_to_holders(x)
-        if source_pid == -1 and not copies_identical:
-            source_pid = self.comms.hub_pid
+        if __debug__:
+            if source_pid == -1:
+                self._check_copies(x, "a decryption with source -1")
 
         # A single holder sends its whole list once, its length included, so the other parties' lists do not matter
         ciphertexts = self.comms.broadcast_from(x, source_pid) if source_pid > 0 else x
@@ -441,9 +440,12 @@ class MPCMHE[TP]:
             return
 
         if is_broadcast:
-            for cipher in x:
-                if cipher.requires_bootstrap(self.bootstrap_min_level + min_level_distance):
-                    self._collective_bootstrap(cipher, -1, copies_identical)
+            due = [cipher for cipher in x if cipher.requires_bootstrap(self.bootstrap_min_level + min_level_distance)]
+            if __debug__:
+                if due and not copies_identical:
+                    self._check_copies(due, "a broadcast-mode bootstrap")
+            for cipher in due:
+                self._collective_bootstrap(cipher, -1, copies_identical)
             return
         
         council = self.comms.collect(self.requires_bootstrap(x, min_level_distance))
@@ -461,6 +463,30 @@ class MPCMHE[TP]:
         self.bootstrap(x, is_broadcast, min_level_distance)
 
         return x
+
+    def _check_copies(self, x: List[Ciphertext], where: str):
+        # Debug builds only (the test runner): every compute party's copy of a tensor held the same at every party (an
+        # aggregate, or copies vouched for) compared by digest, in one collect among the compute parties; copies that
+        # differ raise at every compute party alike. Since every operation refreshes and converts a broadcast operand
+        # once for every party (M-MHE-26), copies apart mean a site that still does so per party: a broadcast-mode
+        # bootstrap would heal them from the hub's copy, but a decryption or a switch with source -1 (each party's own
+        # copy) would give garbage, silently and in step.
+        digests = [MPCMHE._copy_digest(ct) for ct in x]
+        everyone = self.comms.collect(digests)
+        for q in range(1, len(everyone)):
+            if everyone[q] != everyone[0]:
+                raise ValueError(f"MPCMHE: the copies of a broadcast ciphertext differ between CP1 and CP{q + 1} at {where}: an operation refreshed or converted it at each party apart (M-MHE-26)")
+
+    @staticmethod
+    def _copy_digest(ct: Ciphertext) -> u64:
+        h = u64(len(ct.value))
+        for poly in ct.value:
+            rows = poly._buf_coeffs
+            for i in range(len(rows)):
+                row = rows[i]
+                for j in range(len(row)):
+                    h = h * u64(1000003) + row[j]
+        return h
 
     def refresh_council(self, x: list[Ciphertext], status: int = 0) -> List[int]:
         # One refresh council among the compute parties (per-party ciphertexts, as bootstrap without is_broadcast) that
@@ -653,11 +679,14 @@ class MPCMHE[TP]:
     def sub(self, x: list, y: list) -> list:
         return self.isub(x.copy(), y)
     
-    def mul(self, x: list[Ciphertext], y: list) -> list[Ciphertext]:
+    def mul(self, x: list[Ciphertext], y: list, x_is_broadcast: bool = False, y_is_broadcast: bool = False) -> list[Ciphertext]:
         # Check if first operand should be refreshed before copying it downstream
-        # Second operand will be checked in imul
-        self.refresh(x)
-        return self.imul(x.copy(), y)
+        # Second operand will be checked in imul. As in imul, a broadcast operand (the same ciphertexts at every party:
+        # an aggregate, or a public mask's product of one) refreshes in the broadcast mode, one bootstrap for every
+        # party, and its copies stay the same; refreshed per party, each party's copy took a bootstrap of its own and the
+        # copies came apart (M-MHE-26)
+        self.refresh(x, x_is_broadcast)
+        return self.imul(x.copy(), y, x_is_broadcast, y_is_broadcast)
     
     def mul_noboot(self, x: list[Ciphertext], y: list) -> list[Ciphertext]:
         return self.imul_noboot(x.copy(), y)
@@ -665,7 +694,9 @@ class MPCMHE[TP]:
     def rotate(self, x: list[Ciphertext], k: int) -> list[Ciphertext]:
         return self.irotate(x.copy(), k)
     
-    def shift(self, x: list[Ciphertext], step: int) -> list[Ciphertext]:
+    def shift(self, x: list[Ciphertext], step: int, is_broadcast: bool = False) -> list[Ciphertext]:
+        # is_broadcast: x is the same at every party (an aggregate); its masks are public, so the masked products are
+        # too, and they refresh in the broadcast mode (M-MHE-26)
         slots = self.crypto_params.params.slots()
         assert step < slots, "MPCMHE: shifting requires step to be less than the number of slots per each cipher"
 
@@ -677,9 +708,9 @@ class MPCMHE[TP]:
         mask_enc = [cipher_mask for _ in range(len(x))]
         mask_inv_enc = [cipher_mask_inv for _ in range(len(x))]
         
-        offset_tensor_data = self.mul(rotated_tensor_data, mask_enc)
+        offset_tensor_data = self.mul(rotated_tensor_data, mask_enc, is_broadcast)
         offset_tensor_data.append(self.zero_cipher())
-        self.imul(rotated_tensor_data, mask_inv_enc)
+        self.imul(rotated_tensor_data, mask_inv_enc, is_broadcast)
         rotated_tensor_data.insert(0, self.zero_cipher())
         self.iadd(rotated_tensor_data, offset_tensor_data)
 
@@ -707,7 +738,9 @@ class MPCMHE[TP]:
 
         return rotated_tensor_data
     
-    def reduce_add(self, x: list[Ciphertext], size: int, keep_dims: bool = True) -> list[Ciphertext]:
+    def reduce_add(self, x: list[Ciphertext], size: int, keep_dims: bool = True, is_broadcast: bool = False) -> list[Ciphertext]:
+        # is_broadcast: x is the same at every party (an aggregate); the sum and its public mask's product are too, and
+        # the product refreshes in the broadcast mode (M-MHE-26: MPA.sum and MPA.dot of an aggregate)
         slots = self.crypto_params.params.slots()
         assert 0 < size, "MPCMHE.reduce_add: Invalid number of columns per cipher"
 
@@ -739,7 +772,7 @@ class MPCMHE[TP]:
         if offset or not keep_dims:
             mask_size = offset if keep_dims else 1
             mask = self.enc_vector([(1.0 if i < mask_size else 0.0) for i in range(slots)], T=Plaintext)
-            self.imul(reduced_vector[-1:], mask)
+            self.imul(reduced_vector[-1:], mask, is_broadcast)
         
         return reduced_vector
     
@@ -924,18 +957,16 @@ class MPCMHE[TP]:
             out.append(ct)
         return out
         
-    def ciphervector_to_additive_share_vector(self, ciphervector: List[Ciphertext], number_of_elements: int, modulus: mpc_uint, source_pid: int, copies_identical: bool = False) -> List[mpc_uint]:
+    def ciphervector_to_additive_share_vector(self, ciphervector: List[Ciphertext], number_of_elements: int, modulus: mpc_uint, source_pid: int) -> List[mpc_uint]:
         """
         The ciphertexts' values as additive shares modulo the MPC modulus, at every compute party (CP0 gets zeros). If
         source_pid is:
             - a compute party's PID (1, 2, ...): that party's ciphertexts are switched; the others' are ignored
-            - -1: the ciphertexts hold the same values at every compute party (an aggregate). The hub's copy is switched
-              (sent to the others, as for source_pid 1), so copies that came apart (each a valid encryption of the values,
-              but not the same ciphertexts) still give the right shares. With copies_identical the caller vouches that
-              every party holds the same ciphertexts (collected from their holders, or summed alike from such): each
-              party switches its own copy and nothing is sent first.
-        Every party's copy of an aggregate (-1) is rescaled in place and otherwise left as it is; a single holder's
-        ciphertexts, and copies vouched for, are rescaled and, below the switch's level, bootstrapped in place.
+            - -1: the ciphertexts are the same at every compute party (an aggregate, or ones collected from their
+              holder): each party switches its own copy, and nothing is sent first (the hub's copy no longer is: every
+              operation keeps an aggregate's copies the same, M-MHE-26); debug builds check that they are
+        The ciphertexts are rescaled and, below the switch's level, bootstrapped in place (an aggregate's copies alike,
+        in the broadcast mode).
         """
         assert source_pid > -2, f"MPCMHE: Invalid source PID: {source_pid}"
         self.stats.secure_mhe_mpc_switch_count += len(ciphervector)
@@ -952,11 +983,10 @@ class MPCMHE[TP]:
             ciphervector=ciphervector,
             number_of_elements=number_of_elements,
             modulus=modulus,
-            source_pid=source_pid,
-            copies_identical=copies_identical
+            source_pid=source_pid
         )
 
-    def _mhe_to_mpc(self, ciphervector: List[Ciphertext], number_of_elements: int, modulus: mpc_uint, source_pid: int, copies_identical: bool = False) -> List[mpc_uint]:
+    def _mhe_to_mpc(self, ciphervector: List[Ciphertext], number_of_elements: int, modulus: mpc_uint, source_pid: int) -> List[mpc_uint]:
         shared_vector = zeros_vec(number_of_elements)
         if self.pid == 0:
             return shared_vector
@@ -974,18 +1004,14 @@ class MPCMHE[TP]:
         # The masks must fit the ciphertext modulus: rescale (as refresh does), bootstrap the ciphertexts below the level
         # whose modulus holds them, and drop the others to that level, which leaves less to compute and send. A single
         # holder drops its ciphertexts before it broadcasts them; only those below the level go out as they are.
-        # An aggregate's copies (source -1) may have come apart (a refresh of each party's copy in a round of its own
-        # leaves each a valid encryption, not the same ciphertexts), and the shares combine every party's c1 with the
-        # hub's c0: the hub's copy goes to the others, as a single holder's does, so that every party switches the same
-        # ciphertexts (as a broadcast-mode bootstrap takes the hub's copy). Every party first rescales its own copy in
-        # place, as the switch always did (deterministic, so the copies stay alike), and the hub then works on a copy,
-        # so that the bootstrap below changes no party's copy of the aggregate. Copies the caller vouches for
-        # (copies_identical) are switched as they are.
-        if source_pid == -1 and not copies_identical:
-            self.rescale(ciphervector, params.default_scale)
-            source_pid = self.comms.hub_pid
-            if self.pid == source_pid:
-                ciphervector = [ct.copy() for ct in ciphervector]
+        # An aggregate's copies (source -1) are the same ciphertexts at every party (every operation keeps them so,
+        # M-MHE-26; debug builds check it): the shares combine every party's c1 with the hub's c0, and each party
+        # switches its own copy, rescaled and bootstrapped in place alike. (The hub's copy went to the others first while
+        # per-party refreshes left copies apart, H-59; the user chose to drop it once M-MHE-26 kept them the same,
+        # 2026-11-17.)
+        if __debug__:
+            if source_pid == -1:
+                self._check_copies(ciphervector, "a switch to MPC with source -1")
         if source_pid >= 0:
             if self.pid == source_pid and len(ciphervector):
                 self.rescale(ciphervector, params.default_scale)
@@ -996,8 +1022,8 @@ class MPCMHE[TP]:
 
         self.rescale(ciphervector, params.default_scale)
         mask_bits, level = self._mhe_to_mpc_mask_and_level(ciphervector)
-        # Every party holds the same ciphertexts now (the source's, or the copies vouched for): each bootstraps its own,
-        # in the broadcast mode, without the hub's copy sent again
+        # Every party holds the same ciphertexts now (the source's, or an aggregate's copies): each bootstraps its own,
+        # in the broadcast mode, without the hub's copy sent
         self.bootstrap(ciphervector, is_broadcast=True, min_level_distance=max(0, level - 1 - self.bootstrap_min_level), copies_identical=True)
         ciphervector = self._drop_above(ciphervector, level)  # none is below the level after the bootstrap
 

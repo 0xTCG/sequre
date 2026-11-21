@@ -239,6 +239,51 @@ def test_log_reg_methods[TP](mpc: MPCEnv[TP], modulus: TP):
                   abs(loss_raw[0] - want) < 1e-9 * float(rows) + 1e-9 and abs(loss_sec[0] - want) < 1e-4 * float(rows), True)
 
 
+def _rows_of(mpc, matrix, ratios: List[int]) -> MPP:
+    # Each compute party's rows of matrix by ratios (CP0 keeps the whole as its placeholder)
+    if mpc.pid == 0:
+        return MPP(mpc, zeros_like(matrix))
+    start = ratios[:mpc.pid - 1].sum()
+    return MPP(mpc, matrix[start:start + ratios[mpc.pid - 1]].copy())
+
+
+def test_log_reg_mpp[TP](mpc: MPCEnv[TP], modulus: TP):
+    """LogReg on MPPs with the weights encrypted row-wise, one epoch, against the plaintext fit. Its gradient
+    X.T @ (act - y) comes through MPC as row-wise partitions, the weights' layout (_tnt_by_detour): checked on LogReg's
+    own step, which A.T @ B's split in HE gave column-wise, and the update then converted through MPC in every epoch
+    (review c21-cr1-5; the values were right either way, review c21-cr2-2)."""
+    n_cp = mpc.comms.number_of_parties - 1
+    per, cols = 4, 3
+    total = per * n_cp
+    with mpc.randomness.global_stream():
+        X = array(random_floats((total, cols), scale=1.0)) - 0.5
+        w_true = array(random_floats((cols, 1), scale=1.0)) - 0.5
+    z = X @ w_true
+    y = zeros_like(z)
+    for i in range(total):
+        y[i, 0] = 1.0 if z[i, 0] > 0.0 else 0.0
+    w0 = ones((cols + 1, 1)) * 0.1
+    step, epochs = 0.1, 1
+    raw_w = LogReg(w0).fit(mpc, X=X, y=y, step=step, epochs=epochs).coef_
+    ratios = [per for _ in range(n_cp)]
+    w_ratios = [(cols + 1) // n_cp for _ in range(n_cp)]
+    w_ratios[-1] += cols + 1 - w_ratios.sum()
+    xm = _rows_of(mpc, X, ratios)
+    ym = _rows_of(mpc, y, ratios)
+    dw = LogReg[MPP[Tuple[int, int], float]]._step(mpc, xm, ym * 0.5, ym, step)
+    revealed_dw = dw.reveal()
+    if mpc.pid:
+        if dw._ratios[mpc.pid - 1]:
+            assert_eq(f"CP{mpc.pid}:\tLogReg's step on MPPs: row-wise partitions", dw.has_unified_encryption() and not dw._encryption_unified._transposed, True)
+        assert_eq_approx(f"CP{mpc.pid}:\tLogReg's step on MPPs", revealed_dw, X.T @ (y * 0.5 - y) * step, error=1e-3)
+    w = _rows_of(mpc, w0, w_ratios)
+    w.encrypt()
+    model = LogReg(w).fit(mpc, X=_rows_of(mpc, X, ratios), y=_rows_of(mpc, y, ratios), step=step, epochs=epochs)
+    revealed = model.coef_.reveal()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tSequre logistic regression (MPP) with X at {ratios}, weights encrypted row-wise at {w_ratios}", revealed, raw_w, error=1e-2)
+
+
 def test_log_reg[TP](mpc: MPCEnv[TP], modulus: TP):
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
     print(f'CP{mpc.pid}:\tTesting Sequre logistic regression on {alg_struct} ... \n')
@@ -332,6 +377,7 @@ def test_log_reg[TP](mpc: MPCEnv[TP], modulus: TP):
         assert_eq_approx(f"CP{mpc.pid}:\tSequre logistic regression (MPU via MPP weights) on {alg_struct}", mpu_w.reveal(mpc), raw_w, error=5.0)  # Figure out why this test fails when error is removed. Probably in sqrt.
 
     test_log_reg_methods(mpc, modulus)
+    test_log_reg_mpp(mpc, modulus)
 
     print(f'CP{mpc.pid}:\tSequre logistic regression on {alg_struct} tests passed.\n')
     print(f'CP{mpc.pid}:\tRuntimes:\n\t\tPlaintext: {plaintext_time}s\n\t\tMPC: {mpc_time}s\n\t\tMPU/MPA: {mpu_via_mpa_time}s\n\t\tMPU/MPP: {mpu_via_mpp_time}s\n')

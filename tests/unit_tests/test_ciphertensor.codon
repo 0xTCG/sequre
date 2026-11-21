@@ -795,7 +795,7 @@ def _matmul_ct_pt_case(mpc, rows: int, inner: int, cols: int, encoding: str, exp
     msg = f"{label} ({rows}x{inner} @ {inner}x{cols})"
     other = array(values_2)
     encrypted = Ciphertensor[ckks.Ciphertext].enc(mpc, values_1, encoding=encoding)
-    route = encrypted._ndarray_matmul_route([inner, cols], mpc.default_allow_mpc_switch, mpc.pid, debug=False)
+    route = encrypted._ndarray_matmul_route([inner, cols], mpc.default_allow_mpc_switch, mpc.default_allow_diagonal_results, mpc.pid, debug=False)
     assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor {msg}: route", route, expected_route)
     result = secure_operator.matmul(mpc, encrypted, other)
     if mpc.pid > 0 and route != MATMUL_VIA_MPC:
@@ -880,7 +880,7 @@ def test_ciphertensor_reversed_matmul_routing(mpc):
         values_1 = random_floats((3, 4), scale=1)
         values_2 = random_floats((4, 2), scale=1)
     encrypted = Ciphertensor[ckks.Ciphertext].enc(mpc, values_2, encoding=ENC_ROW)
-    route = encrypted.T._ndarray_matmul_route([4, 3], mpc.default_allow_mpc_switch, mpc.pid, debug=False)
+    route = encrypted.T._ndarray_matmul_route([4, 3], mpc.default_allow_mpc_switch, mpc.default_allow_diagonal_results, mpc.pid, debug=False)
     assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor reversed matmul (3x4 @ 4x2): route", route, MATMUL_TNT)
     result = array(values_1) @ encrypted
     _check_routed_matmul(mpc, result, values_1 @ values_2, "reversed matmul (3x4 plaintext @ 4x2 row-wise)")
@@ -1581,6 +1581,132 @@ def test_ciphertensor_pad(mpc):
             assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor pad {n} -> {new_size}", stats.min_precision.l2 > 10, True)
 
 
+def _aggregate_at(mpc, value, encoding: str, level: int) -> Ciphertensor[ckks.Ciphertext]:
+    # value as an aggregate (CP1's share is value, the others' zeros) in encoding, at level: the same ciphertexts at every
+    # compute party, flagged broadcast
+    share = value if mpc.pid == 1 else value.zeros()
+    agg = Ciphertensor[ckks.Ciphertext].enc(mpc, share, encoding=encoding).aggregate(mpc)
+    agg._data = mpc.mhe.drop_level(agg._data, level)
+    return agg
+
+
+def _broadcast_site(mpc, label: str, result: Ciphertensor[ckks.Ciphertext], before: int, want, flagged: bool, most: int):
+    # A result derived from aggregates: the same ciphertexts at every compute party, flagged broadcast where it derives
+    # from them alone (kernel products are left to the MP layer to flag), at most `most` bootstraps (one per ciphertext
+    # refreshed: a refresh per party took one per party), and its values (the hub's copy)
+    bootstraps = mpc.mhe.stats.secure_bootstrap_count - before
+    assert_eq(f"CP{mpc.pid}:\t{label}: the copies the same at every compute party", same_at_every_party(mpc, result._data), True)
+    if flagged:
+        assert_eq(f"CP{mpc.pid}:\t{label}: flagged broadcast", result._is_broadcast, True)
+    assert_eq(f"CP{mpc.pid}:\t{label}: at most {most} bootstraps (got {bootstraps})", bootstraps <= most, True)
+    assert_eq_approx(f"CP{mpc.pid}:\t{label}", result.reveal(mpc, source_pid=-1, T=float), want, error=2e-2)
+
+
+def test_ciphertensor_broadcast_refreshes(mpc):
+    """M-MHE-26: operations on aggregates (the same ciphertexts at every compute party) at the bootstrap level and one
+    level above it. Each mask product of a broadcast operand (getitemdup, replicate, pad, a 1-dim concat across a
+    ciphertext, reduce_add, the tile and fold masks of reduce_add_tiled, sums, shift, M1's masks, BSGS's last refresh)
+    refreshed it at every party in a round of its own, one bootstrap per party per ciphertext, and the copies came
+    apart; the element-wise coercion converted a broadcast operand's layout at every party apart (through MPC, or by
+    rotations whose masks refreshed per party). Now one bootstrap per ciphertext, collectively, the copies the same, and
+    the derived results flagged broadcast. M-MHE-28: replicate (and BSGS through it) of an input at the bootstrap level
+    rescaled below it and asserted in the bootstrap."""
+    lb = mpc.mhe.bootstrap_min_level
+    slots = mpc.mhe.crypto_params.params.slots()
+    # Drawn at every party, CP0 included, so that the global stream stays in step
+    with mpc.randomness.global_stream():
+        v10 = [float(int(x * 7.0)) - 3.5 for x in random_floats((10,))]
+        v5 = v10[:5]
+        w = [float(int(x * 7.0)) - 3.5 for x in random_floats((slots - 3,))]
+        m35 = array([[float(int(x * 7.0)) - 3.5 for x in row] for row in random_floats((3, 5))]) * 0.5
+        m82 = array([[float(int(x * 7.0)) - 3.5 for x in row] for row in random_floats((8, 2))])
+        m62 = array([[float(int(x * 7.0)) - 3.5 for x in row] for row in random_floats((6, 2))])
+        m44 = array([[float(int(x * 7.0)) - 3.5 for x in row] for row in random_floats((4, 4))])
+        m24 = array([[float(int(x * 7.0)) - 3.5 for x in row] for row in random_floats((2, 4))]) * 0.5
+        m34 = array([[float(int(x * 7.0)) - 3.5 for x in row] for row in random_floats((3, 4))]) * 0.5
+        m28 = array([[float(int(x * 7.0)) - 3.5 for x in row] for row in random_floats((2, 8))]) * 0.5
+        p88 = array([[float(int(x * 7.0)) - 3.5 for x in row] for row in random_floats((8, 8))]) * 0.25
+    if mpc.pid == 0:
+        return
+    for level in (lb, lb + 1):
+        at = f" of an aggregate at level {level}"
+        a10 = _aggregate_at(mpc, array(v10), ENC_ROW, level)
+        b0 = mpc.mhe.stats.secure_bootstrap_count
+        _broadcast_site(mpc, "getitemdup" + at, a10.getitemdup(mpc, 3, 10), b0, array([[v10[3] for _ in range(10)]]), True, 1)
+        a5 = _aggregate_at(mpc, array(v5), ENC_ROW, level)
+        b0 = mpc.mhe.stats.secure_bootstrap_count
+        _broadcast_site(mpc, "replicate 5 -> 12" + at, a5.replicate(mpc, 12), b0, array([[v5[i % 5] for i in range(12)]]), True, 4)
+        b0 = mpc.mhe.stats.secure_bootstrap_count
+        _broadcast_site(mpc, "pad 5 -> 12" + at, a5.pad(mpc, 12), b0, array([[v5[i] if i < 5 else 0.0 for i in range(12)]]), True, 1)
+        aw = _aggregate_at(mpc, array(w), ENC_ROW, level)
+        b0 = mpc.mhe.stats.secure_bootstrap_count
+        concat_want = v5.copy()
+        concat_want.extend(w)
+        _broadcast_site(mpc, "a 1-dim concat across a ciphertext" + at, a5.concat(mpc, aw, axis=0), b0, array([concat_want]), True, 2)
+        a8 = _aggregate_at(mpc, array(v10[:8]), ENC_ROW, level)
+        b0 = mpc.mhe.stats.secure_bootstrap_count
+        _broadcast_site(mpc, "reduce_add_tiled (tile mask)" + at, a8.reduce_add_tiled(mpc, 2), b0, array([[v10[0] + v10[2] + v10[4] + v10[6], v10[1] + v10[3] + v10[5] + v10[7]]]), True, 1)
+        ad = _aggregate_at(mpc, m82, ENC_DIAG, level)
+        b0 = mpc.mhe.stats.secure_bootstrap_count
+        _broadcast_site(mpc, "sum(0) of a tall diagonal matrix" + at, ad.sum(mpc, 0), b0, array([[sum(m82[i, 0] for i in range(8)), sum(m82[i, 1] for i in range(8))]]), True, 1)
+        b0 = mpc.mhe.stats.secure_bootstrap_count
+        _broadcast_site(mpc, "1-dim sum" + at, a10.sum(mpc, 0), b0, array([[sum(v10)]]), True, 1)
+        ar = _aggregate_at(mpc, m35, ENC_ROW, level)
+        b0 = mpc.mhe.stats.secure_bootstrap_count
+        _broadcast_site(mpc, "sum(1) of a row-wise matrix" + at, ar.sum(mpc, 1), b0, array([[sum(m35[i, j] for j in range(5)) for i in range(3)]]), True, 3)
+        shift_want = [0.0 for _ in range(2 * slots)]
+        for i in range(10):
+            shift_want[3 + i] = v10[i]
+        b0 = mpc.mhe.stats.secure_bootstrap_count
+        _broadcast_site(mpc, "shift" + at, a10.shift(mpc, slots - 3), b0, array([shift_want]), True, 1)
+        aa = _aggregate_at(mpc, m24, ENC_ROW, level)
+        ab = _aggregate_at(mpc, m34, ENC_ROW, level)
+        b0 = mpc.mhe.stats.secure_bootstrap_count
+        # M1 refreshes a copy of the row for each cell (2 x 3 cells) and the other's rows once: 9 at the bootstrap level
+        _broadcast_site(mpc, "M1 (an aggregate @ an aggregate.T)" + at, aa.matmul(mpc, ab.T), b0, m24 @ m34.T, False, 9)
+        a28 = _aggregate_at(mpc, m28, ENC_ROW, level)
+        b0 = mpc.mhe.stats.secure_bootstrap_count
+        _broadcast_site(mpc, "BSGS (an aggregate @ public 8x8)" + at, a28._matmul_bsgs(mpc, p88, debug=False), b0, m28 @ p88, False, 4)
+        cw = _aggregate_at(mpc, m62, ENC_COL, level)
+        rw = _aggregate_at(mpc, m62, ENC_ROW, level)
+        b0 = mpc.mhe.stats.secure_bootstrap_count
+        _broadcast_site(mpc, "a column-wise aggregate plus a row-wise one" + at, cw.add(mpc, rw), b0, m62 + m62, True, 6)
+        dg = _aggregate_at(mpc, m44, ENC_DIAG, level)
+        dt = _aggregate_at(mpc, m44.T, ENC_DIAG, level)
+        dt._transposed = True  # the same values (m44), stored as its transpose's diagonals and flagged transposed
+        b0 = mpc.mhe.stats.secure_bootstrap_count
+        _broadcast_site(mpc, "a diagonal aggregate plus one flagged transposed" + at, dg.add(mpc, dt), b0, m44 + m44, True, 4)
+
+    # M-MHE-28 on a party's own tensor (no broadcast flag): replicate and BSGS of inputs at the bootstrap level
+    own5 = Ciphertensor[ckks.Ciphertext].enc(mpc, array(v5), encoding=ENC_ROW)
+    own5._data = mpc.mhe.drop_level(own5._data, lb)
+    assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor replicate 5 -> 12 of a vector at the bootstrap level", own5.replicate(mpc, 12).reveal(mpc, T=float), array([[v5[i % 5] for i in range(12)]]), error=2e-2)
+    own28 = Ciphertensor[ckks.Ciphertext].enc(mpc, m28, encoding=ENC_ROW)
+    own28._data = mpc.mhe.drop_level(own28._data, lb)
+    assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor BSGS of a matrix at the bootstrap level", own28._matmul_bsgs(mpc, p88, debug=False).reveal(mpc, T=float), m28 @ p88, error=2e-2)
+
+
+def test_ciphertensor_copies_check(mpc):
+    """Debug builds (the test runner) compare an aggregate's copies at every broadcast-mode bootstrap, decryption and
+    switch with source -1, and raise alike at every compute party when they differ: a site that refreshes a broadcast
+    operand per party fails a test instead of being healed by the hub's copy. An aggregate refreshed at each party in
+    a round of its own (copies apart) raises at a decryption with source -1."""
+    with mpc.randomness.global_stream():
+        values = random_floats((8,))  # at every party, CP0 included: the global stream stays in step
+    if mpc.pid == 0 or not __debug__:
+        return
+    agg = Ciphertensor[ckks.Ciphertext].enc(mpc, array(values) if mpc.pid == 1 else array([0.0 for _ in values]), encoding=ENC_ROW).aggregate(mpc)
+    agg._data = mpc.mhe.drop_level(agg._data, mpc.mhe.bootstrap_min_level)
+    mpc.mhe.refresh(agg._data, False)  # every party's copy bootstrapped in a council of its own: copies apart
+    raised = False
+    try:
+        agg.decrypt(mpc, -1)
+    except ValueError:
+        raised = True
+    assert_eq(f"CP{mpc.pid}:\tSequre MHE ciphertensor an aggregate whose copies differ: its decryption with source -1 raises in debug builds", raised, True)
+    assert_eq_approx(f"CP{mpc.pid}:\tSequre MHE ciphertensor such an aggregate decrypted at each party", agg.reveal(mpc, T=float), array([values]), error=1e-3)
+
+
 def test_ciphertensor(mpc):
     print(f'CP{mpc.pid}:\tTesting Sequre MHE Ciphertensor ... \n')
     test_ciphertensor_send_receive(mpc)
@@ -1611,4 +1737,6 @@ def test_ciphertensor(mpc):
     test_ciphertensor_mixed_scales(mpc)
     test_ciphertensor_shared_rows(mpc)
     test_ciphertensor_pad(mpc)
+    test_ciphertensor_broadcast_refreshes(mpc)
+    test_ciphertensor_copies_check(mpc)
     print(f'CP{mpc.pid}:\tSequre MHE Ciphertensor tests passed.\n')

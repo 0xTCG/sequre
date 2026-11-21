@@ -146,6 +146,47 @@ def _padded_kind(descriptors: List[List[int]]) -> List[int]:
     return padded
 
 
+def _cuts_rows(ratios: List[int]) -> bool:
+    # Whether MPPAligner cuts a result back by rows at some compute party: one holding rows, but fewer than the most
+    # (a party with the most keeps its result as it is, one with none gets an empty one)
+    most = max(ratios)
+    return any(0 < r < most for r in ratios)
+
+
+def _any_diagonal(mpc, encryption: Ciphertensor[Ciphertext]) -> bool:
+    # Whether some compute party holds its per-partition product diagonal-encoded (one round among the compute parties)
+    return any(bool(d) for d in mpc.comms.collect(int(encryption._diagonal_contiguous)))
+
+
+def _tall(columns: int, ratios: List[int]) -> bool:
+    # Whether each party's per-partition product (the most rows of ratios, padded) has fewer columns than rows: a result
+    # converted through MPC is then encrypted back column-wise, one ciphertext per column, and row-wise otherwise, one
+    # per row, as Ciphertensor.enc chooses by shape (the user's choice, 2026-11-18: row-wise, a tall result took a
+    # ciphertext per row). Public data only, so every compute party decides alike.
+    return columns < max(ratios)
+
+
+def _cut_rows_through_mpc(mpc, product: Ciphertensor[Ciphertext], ratios: List[int], columns: int) -> Ciphertensor[Ciphertext]:
+    # MPPAligner's cut for per-partition products that cannot be cut by rows, each party's product padded to the most
+    # rows of ratios: TNT's diagonal-encoded results (H-60). Every party's product is collected (the same ciphertexts at
+    # every compute party, in each party's own layout), switched to shares (none for a party without rows), cut on the
+    # shares to that party's rows, and those rows encrypted back at their party, column-wise for a tall product (columns,
+    # the result's, public) and row-wise otherwise (_tall). Returns this party's rows, which the aligner's cut keeps as
+    # they are. Every compute party calls it; CP0 takes no part (the switches run among the compute parties). TNT and
+    # this conversion in place of TN where a party cuts: the user's choice, 2026-11-18.
+    products = mpc.comms.collect(product)
+    pieces = []
+    for q in range(len(products)):
+        if ratios[q]:
+            shares = products[q].to_sharetensor(mpc, mpc.default_mpc_modulus, source_pid=-1, S=Tuple[int, int], dtype=float)
+            pieces.append(shares[:ratios[q]])
+    stensor = pieces.unfence()
+    # In the layout chosen, whatever the ambient encoding (to_mpp encrypts in it, then transposes for column-wise)
+    with mpc.default_encoding(ENC_ROW):
+        rows = stensor.to_mpp(mpc, ratios.copy(), _tall(columns, ratios), dtype=float)
+    return rows._encryption_unified
+
+
 def _first_holder(descriptors: List[List[int]], field: int) -> int:
     for q in range(len(descriptors)):
         if descriptors[q][field]:
@@ -159,6 +200,10 @@ IDX_OK = 0
 IDX_INDEX_ERROR = 1
 IDX_NOT_IMPLEMENTED = 2
 IDX_VALUE_ERROR = 3
+# Not errors: a setitem value whose encryption is in the other layout than the target's at that party (row-wise into
+# column-wise storage, or back), which every compute party then converts before the setitem runs (L-261)
+IDX_CONVERT_TO_COLUMNS = 4
+IDX_CONVERT_TO_ROWS = 5
 
 
 def _plan_indexing(f) -> Tuple[List[Ciphertext], int, str]:
@@ -176,20 +221,22 @@ def _plan_indexing(f) -> Tuple[List[Ciphertext], int, str]:
         return List[Ciphertext](), IDX_VALUE_ERROR, e.message
 
 
-def _indexing_council(mpc, masked: List[Ciphertext], status: int, message: str):
+def _indexing_council(mpc, masked: List[Ciphertext], status: int, message: str) -> List[int]:
     # The one council of an MP getitem or setitem call at every compute party (CP0 takes no part): the ciphertexts this
-    # party's part masks, refreshed (none: it takes part all the same), and its status. A nonzero status at any party
+    # party's part masks, refreshed (none: it takes part all the same), and its status. An error status at any party
     # raises at every compute party alike, before the call's own HE work (the council's refreshes run first): that
-    # party's own message there, a pointer elsewhere.
+    # party's own message there, a pointer elsewhere. Returns every party's status (the same list at each), for the
+    # conversion requests of a setitem (IDX_CONVERT_*), which are not errors.
     statuses = mpc.mhe.refresh_council(masked, status)
     for q in range(len(statuses)):
-        if statuses[q] != IDX_OK:
+        if statuses[q] != IDX_OK and statuses[q] != IDX_CONVERT_TO_COLUMNS and statuses[q] != IDX_CONVERT_TO_ROWS:
             text = message if q == mpc.pid - 1 else f"MPP: indexing failed at CP{q + 1} (its error is raised there)"
             if statuses[q] == IDX_INDEX_ERROR:
                 raise IndexError(text)
             if statuses[q] == IDX_NOT_IMPLEMENTED:
                 raise NotImplementedError(text)
             raise ValueError(text)
+    return statuses
 
 
 def _normalized_index(idx: int, n: int, what: str) -> int:
@@ -1098,13 +1145,27 @@ class MPP[S, dtype]:
             partitions = self.collect()
             for partition in partitions:
                 partition._transposed = False
-            return partitions.unfence(mpc)
+            return MPP._joined(mpc, partitions)
         transposed, diagonal, agreed = _encrypted_layout(mpc.comms.collect(_partition_descriptor(self)))
         if not agreed:
             raise ValueError("MPP: the compute parties hold their partitions encrypted in different layouts")
         if diagonal:
             raise NotImplementedError("MPP: joining diagonal-encoded partitions is not implemented yet (Ciphertensor.extend does not stack diagonal storages)")
-        return self.collect(int(transposed)).unfence(mpc)
+        return MPP._joined(mpc, self.collect(int(transposed)))
+
+    @staticmethod
+    def _joined(mpc, partitions: List[Ciphertensor[Ciphertext]]) -> Ciphertensor[Ciphertext]:
+        # Every compute party extends the same collected partitions (copies, the same at every party) in the same order,
+        # so the join is the same ciphertexts at every party: a broadcast operand, whose refreshes run once,
+        # collectively. The copies are flagged before they are extended, so that an extension across a ciphertext's
+        # boundary refreshes its shifts and masks in the broadcast mode too (they ran per party, and the join's copies
+        # came apart: review c21-cr1-2); a product by the join then refreshes it once (MPA * MPP refreshed each party's
+        # copy in a round of its own and left the product's copies apart: M-MHE-26)
+        for partition in partitions:
+            partition._is_broadcast = True
+        joined = partitions.unfence(mpc)
+        joined._is_broadcast = True
+        return joined
     
     def join_at(self, target_pid: int) -> Ciphertensor[Ciphertext]:
         return self.collect_and_execute_at(target_pid, List.unfence)
@@ -1298,7 +1359,7 @@ class MPP[S, dtype]:
             arr = mpc.comms.collect(self._local_data.copy()).unfence()
         else:
             # Every partition collected from its holder: the same ciphertexts at every compute party
-            reveals = [enc.reveal(mpc, source_pid=-1, copies_identical=True, T=dtype) for enc in self.collect()]
+            reveals = [enc.reveal(mpc, source_pid=-1, T=dtype) for enc in self.collect()]
             non_empty_reveals = [e for e in reveals if not e.is_empty()]
 
             if static.len(S) == 1:
@@ -1632,6 +1693,14 @@ class MPP[S, dtype]:
             return MPP._matmul_case_tnt(mpc, self, other)
         else: # case not self._transposed and other._transposed
             return MPP._matmul_case_ntt(mpc, self, other)
+
+    def _tnt_by_detour(self, other: MPP[S, dtype]) -> MPP[S, dtype]:
+        # A.T @ B as matmul computes it (self lazily transposed, other not), except that a column-wise sum goes through
+        # MPC (the detour) and comes back as row-wise partitions, where matmul splits it in HE and keeps it column-wise:
+        # for a caller whose next operations meet row-wise partitions (LinReg's X.T @ y), for which the detour costs
+        # less than the split and a conversion (the user's choice, 2026-11-17). Every party calls it, CP0 included.
+        assert self._transposed and not other._transposed, "MPP: _tnt_by_detour multiplies a transposed MPP by one that is not"
+        return MPP._matmul_case_tnt(self._mpc, self, other, False)
     
     def replicate(self, new_size: int) -> MPP[S, dtype]:
         mpc = self._mpc
@@ -1947,6 +2016,57 @@ class MPP[S, dtype]:
         new_mpp._transposed = self._transposed
         return new_mpp
     
+    def _encrypted_as(self, transposed: bool) -> MPP[S, dtype]:
+        # The same values with every partition encrypted, row-wise or column-wise (transposed), through MPC: every
+        # partition switched to shares (one descriptor round among the compute parties) and each party's rows encrypted
+        # back in that layout. Every compute party calls it; CP0 takes no part in the switches and keeps its
+        # placeholder.
+        mpc = self._mpc
+        if mpc.pid == 0:
+            return self
+        stensor = self._to_sharetensor(self._partition_descriptors())
+        lazy_stensor = stensor.T if self._transposed else stensor
+        # Row-wise, or column-wise for transposed, whatever the ambient encoding (to_mpp encrypts in it: diagonal-wise
+        # under ENC_DIAG, review c21-cr2-3)
+        with mpc.default_encoding(ENC_ROW):
+            new_mpp = lazy_stensor.to_mpp(mpc, self._ratios.copy(), transposed, dtype=dtype)
+        new_mpp._transposed = self._transposed
+        return new_mpp
+
+    def _in_layout_of(self, other: MPP[S, dtype]) -> MPP[S, dtype]:
+        # self with its encrypted partitions in the layout of other's (column-wise if every encrypted partition of other
+        # is, as Sharetensor.to_mpp gives an operation on other's partitions back from MPC; row-wise otherwise), converted
+        # once (_encrypted_as) if any of self's partitions is held in another layout, diagonal or in the clear while
+        # some are encrypted; self as it is otherwise (one descriptor round among the compute parties for both). A
+        # caller that meets the same operand in every iteration of a loop converts it once here, where an element-wise
+        # operation would convert it in every iteration. Every compute party calls it; CP0 keeps its placeholder.
+        mpc = self._mpc
+        if static.len(S) != 2:
+            return self
+        if mpc.pid == 0:
+            return self
+        mine, theirs = _agree_on_partitions(self, other)
+        # Column-wise iff every encrypted partition of other is (a semi-encrypted one counts as row-wise)
+        target = False
+        for d in theirs:
+            if d[D_KIND] == MPP_UNIFIED or d[D_KIND] == MPP_SEMI:
+                target = True
+        for d in theirs:
+            if d[D_KIND] == MPP_SEMI or (d[D_KIND] == MPP_UNIFIED and not d[D_UNIFIED + 2]):
+                target = False
+        encrypted = False
+        alike = True
+        for d in mine:
+            if d[D_KIND] == MPP_UNIFIED or d[D_KIND] == MPP_SEMI:
+                encrypted = True
+            if d[D_KIND] == MPP_EMPTY:
+                continue
+            if d[D_KIND] != MPP_UNIFIED or bool(d[D_UNIFIED + 2]) != target or bool(d[D_UNIFIED + 3]):
+                alike = False
+        if not encrypted or alike:
+            return self
+        return self._encrypted_as(target)
+
     def cov_max(self, mpc, transpose_encryption: bool = False):
         stensor = self.to_sharetensor()
         result = maximum(mpc, stensor, stensor.T)
@@ -2085,20 +2205,30 @@ class MPP[S, dtype]:
         # row. Each multiplies its own partition, in the clear or in HE; if some party holds an encrypted one, those that
         # hold theirs in the clear (or none) run the same HE product on a placeholder of the same shape and layout, so
         # every party makes the same refresh councils. Whether to switch to MPC was decided for the whole MPP (matmul):
-        # each partition's own product stays in HE, as a switch there would need CP0.
+        # each partition's own product stays in HE, as a switch there would need CP0. A column-wise partition is
+        # multiplied by M2 on the transposes (V2_T), never by TNT: the aligner cuts each product back to the party's rows,
+        # and TNT's diagonal-encoded result was cut by its diagonals (H-60: wrong rows at every party holding fewer rows
+        # than the most). V2_T measured faster than TNT for up to about a hundred result columns (X 5 x 3 times 3 x q:
+        # 0.28-3.7 s against 1.39-4.74 s for q = 5 to 64), slower beyond (7.5 against 5.9 s at q = 128).
         with first.partition_aligner(ALIGN_UNIFORM) as aligner:
             kind = aligner.own_kind()
             shadow = MPP._shadow_operand(mpc, aligner.descriptors, max(first._ratios), other.shape[0])
             allow_mpc_switch = mpc.default_allow_mpc_switch
+            allow_diagonal = mpc.default_allow_diagonal_results
             mpc.default_allow_mpc_switch = False
-            if kind == MPP_CLEAR:
-                _local_data = first._local_data @ other
-            elif kind != MPP_EMPTY:
-                first.unify_encryption()
-                _encryption_unified = first._encryption_unified @ other
-            if shadow and (kind == MPP_CLEAR or kind == MPP_EMPTY):
-                shadow @ other
-            mpc.default_allow_mpc_switch = allow_mpc_switch
+            mpc.default_allow_diagonal_results = False
+            try:
+                if kind == MPP_CLEAR:
+                    _local_data = first._local_data @ other
+                elif kind != MPP_EMPTY:
+                    first.unify_encryption()
+                    _encryption_unified = first._encryption_unified @ other
+                if shadow and (kind == MPP_CLEAR or kind == MPP_EMPTY):
+                    shadow @ other
+            finally:
+                # Restored also when the product raises, so that a caller that goes on routes as CP0 does
+                mpc.default_allow_mpc_switch = allow_mpc_switch
+                mpc.default_allow_diagonal_results = allow_diagonal
             
             return aligner.new_mpp(
                 _local_data=_local_data,
@@ -2151,7 +2281,7 @@ class MPP[S, dtype]:
         return first.via_mpc(lambda stensor: secure_operator.matmul(mpc, stensor, other.to_sharetensor()))
 
     @sequre
-    def _matmul_case_tnt(mpc, first: MPP[S, dtype], other: MPP[S, dtype]) -> MPP[S, dtype]:
+    def _matmul_case_tnt(mpc, first: MPP[S, dtype], other: MPP[S, dtype], split_in_he: bool = True) -> MPP[S, dtype]:
         if DEBUG: print(f"CP{mpc.pid}:\tMPP matmul case transposed x non-transposed. Local shapes: {first.shape} x {other.shape}")
         
         if mpc.pid == 0:
@@ -2191,19 +2321,34 @@ class MPP[S, dtype]:
                 mpc.default_allow_mpc_switch = allow_mpc_switch
 
         # Every compute party ran the same product on partitions of the same shape, so the results' layouts agree
-        # without a council. A result that is not row-wise (diagonal; or column-wise: a column or a tall product in the
-        # clear, as Ciphertensor.enc encodes them, or the kernels' layout for an encrypted factor) is redistributed
-        # through MPC, which splits it by its rows and returns row-wise partitions; splitting its physical rows instead
-        # returned the wrong layout (H-25). Splitting a column-wise sum by its rows in HE (masked moves, as align_ratios
-        # moves column-wise partitions) is faster, but it leaves column-wise partitions, which the next product at
-        # unequal ratios cuts back wrongly (H-60) and LinReg converts every epoch: the detour stays until those change.
-        if enc._diagonal_contiguous or enc._transposed:
+        # without a council, and the sum's rows are split by the result ratios. A row-wise sum is split by whole stored
+        # rows at the hub. A column-wise one (a column or a tall product in the clear, as Ciphertensor.enc encodes them,
+        # or the kernels' layout for an encrypted factor) moves each party's logical rows into its partition by masked
+        # moves (MPP._realign_moved: the sum is the hub's only partition, the old ratios give it every row; one indexing
+        # council at every compute party), and the partitions stay column-wise; splitting its stored rows returned the
+        # wrong layout (H-25). That is faster than the detour through MPC it replaced, now that a product of column-wise
+        # partitions cuts right (H-60). A diagonal-encoded sum still goes through MPC, which splits it by its rows and
+        # returns row-wise partitions, and so does a column-wise one where the caller asks for row-wise partitions
+        # (split_in_he False: _tnt_by_detour).
+        if enc._diagonal_contiguous or (enc._transposed and not split_in_he):
             joined_sum = mpc.comms.collect(enc).sum(mpc)
             return joined_sum.to_sharetensor(
-                mpc, modulus=mpc.default_mpc_modulus, source_pid=-1, S=S, dtype=float, copies_identical=True).to_mpp(
+                mpc, modulus=mpc.default_mpc_modulus, source_pid=-1, S=S, dtype=float).to_mpp(
                     mpc, ratios=first._ratios, dtype=dtype)
-        
-        return mpc.comms.collect_at(enc, mpc.comms.hub_pid).sum(mpc).to_mpp(mpc, first._ratios, source_pid=mpc.comms.hub_pid, S=S, dtype=dtype)
+
+        hub = mpc.comms.hub_pid
+        summed = mpc.comms.collect_at(enc, hub).sum(mpc)
+        if enc._transposed:
+            n_cp = mpc.comms.number_of_parties - 1
+            result_rows = enc.actual_shape[0]
+            partitions = List[Ciphertensor[Ciphertext]](n_cp)
+            held = [0 for _ in range(n_cp)]
+            for p in range(1, n_cp + 1):
+                partitions.append(summed if p == hub else Ciphertensor[Ciphertext]())
+            held[hub - 1] = result_rows
+            return MPP._realign_moved(
+                mpc, partitions, held, MPP.apply_ratios(first._ratios, result_rows), hub, True, S=S, dtype=dtype)
+        return summed.to_mpp(mpc, first._ratios, source_pid=hub, S=S, dtype=dtype)
 
     @sequre
     def _matmul_case_ntt(mpc, first: MPP[S, dtype], other: MPP[S, dtype]) -> MPP[S, dtype]:
@@ -2226,6 +2371,14 @@ class MPP[S, dtype]:
         # first agree on how they hold the factors, in one round. A first factor that some of them hold in the clear and
         # others encrypted is encrypted at every party for the product (ALIGN_ENCRYPT). The partitions' own products
         # never switch to MPC, which would need CP0 (H-53).
+        # The aligner cuts each party's product back to its rows, which a diagonal-encoded result (TNT's, for a
+        # column-wise first factor) cannot be cut by (H-60): a product by a public operand never takes TNT (V2_T, which
+        # measured faster). Two encrypted factors take TNT, and its diagonal-encoded result is converted once through
+        # MPC, to row-wise partitions or, for a tall product, column-wise ones (_tall): where a party cuts, before the
+        # cut and cut on the shares (_cut_rows_through_mpc); elsewhere after the product (_converted_if_diagonal). That
+        # measured faster than TN at every shape tried (TN's error is lower: about 2e-5 against 1-4e-4 through MPC).
+        may_be_diagonal = False
+        cut = False
         first_descriptors, other_descriptors = _agree_on_partitions(first, other)
         with first.partition_aligner(ALIGN_ENCRYPT, first_descriptors) as aligner:
             first_clear = MPP._cohort_in_the_clear(aligner.descriptors)
@@ -2235,46 +2388,76 @@ class MPP[S, dtype]:
                 reference_pid = mpc.pid - 1  # Avoid CP0
 
                 allow_mpc_switch = mpc.default_allow_mpc_switch
+                allow_diagonal = mpc.default_allow_diagonal_results
                 mpc.default_allow_mpc_switch = False
-                if first_clear and other_clear:
-                    # Both factors in the clear: the own block of the result is a plaintext product, and the other
-                    # parties' blocks come from one HE product against their partitions, stacked (the parties before
-                    # this one, then those after it) and padded with zero rows to the count every party stacks
-                    left_rows = other._ratios[:reference_pid].sum()
-                    right_rows = other._ratios[reference_pid + 1:].sum()
-                    stacked_rows = other._ratios.sum() - min(other._ratios)
-                    if stacked_rows:
-                        stacked = MPP._stack_other_partitions(mpc, other_partitions, stacked_rows, first._local_data.shape[1])
-                        # Lazily transposed: its physical rows are the stacked rows, so the blocks are slices of them
-                        blocks = first._local_data @ stacked.T
-                        if left_rows: _encryption_left = blocks._get_rows_raw(slice(start=0, stop=left_rows, step=1))
-                        if right_rows: _encryption_right = blocks._get_rows_raw(slice(start=left_rows, stop=left_rows + right_rows, step=1))
+                allow_tnt = not first_clear
+                # Only a column-wise first factor takes TNT, so only then may the result be diagonal-encoded
+                may_be_diagonal = allow_tnt and _encrypted_layout(aligner.descriptors)[0]
+                cut = may_be_diagonal and _cuts_rows(first._ratios)
+                mpc.default_allow_diagonal_results = allow_tnt
+                try:
+                    if first_clear and other_clear:
+                        # Both factors in the clear: the own block of the result is a plaintext product, and the other
+                        # parties' blocks come from one HE product against their partitions, stacked (the parties before
+                        # this one, then those after it) and padded with zero rows to the count every party stacks
+                        left_rows = other._ratios[:reference_pid].sum()
+                        right_rows = other._ratios[reference_pid + 1:].sum()
+                        stacked_rows = other._ratios.sum() - min(other._ratios)
+                        if stacked_rows:
+                            stacked = MPP._stack_other_partitions(mpc, other_partitions, stacked_rows, first._local_data.shape[1])
+                            # Lazily transposed: its physical rows are the stacked rows, so the blocks are slices of them
+                            blocks = first._local_data @ stacked.T
+                            if left_rows: _encryption_left = blocks._get_rows_raw(slice(start=0, stop=left_rows, step=1))
+                            if right_rows: _encryption_right = blocks._get_rows_raw(slice(start=left_rows, stop=left_rows + right_rows, step=1))
                     
-                    if other.is_empty():
-                        # No own block: the other parties' blocks form the whole result
-                        if _encryption_left and _encryption_right:
-                            _encryption_unified = _encryption_left.concat(mpc, _encryption_right, axis=1)
+                        if other.is_empty():
+                            # No own block: the other parties' blocks form the whole result
+                            if _encryption_left and _encryption_right:
+                                _encryption_unified = _encryption_left.concat(mpc, _encryption_right, axis=1)
+                            else:
+                                _encryption_unified = _encryption_left if _encryption_left else _encryption_right
+                            _encryption_left = Ciphertensor[Ciphertext]()
+                            _encryption_right = Ciphertensor[Ciphertext]()
                         else:
-                            _encryption_unified = _encryption_left if _encryption_left else _encryption_right
-                        _encryption_left = Ciphertensor[Ciphertext]()
-                        _encryption_right = Ciphertensor[Ciphertext]()
+                            _local_data = first._local_data @ other._local_data.T
+                    elif first_clear:
+                        _encryption_unified = first._local_data @ other_partitions.unfence(mpc).T
                     else:
-                        _local_data = first._local_data @ other._local_data.T
-                elif first_clear:
-                    _encryption_unified = first._local_data @ other_partitions.unfence(mpc).T
-                else:
-                    first.unify_encryption()
-                    if other_clear and MPP._own_block_apart(mpc, aligner.descriptors, other._ratios):
-                        _encryption_unified = MPP._matmul_ntt_own_block_apart(mpc, first._encryption_unified, other, other_partitions)
-                    else:
-                        _encryption_unified = first._encryption_unified @ other_partitions.unfence(mpc).T
-                mpc.default_allow_mpc_switch = allow_mpc_switch
-        
-            return aligner.new_mpp(
+                        first.unify_encryption()
+                        if other_clear and MPP._own_block_apart(mpc, aligner.descriptors, other._ratios):
+                            _encryption_unified = MPP._matmul_ntt_own_block_apart(mpc, first._encryption_unified, other, other_partitions)
+                        else:
+                            _encryption_unified = first._encryption_unified @ other_partitions.unfence(mpc).T
+                finally:
+                    # Restored also when a product raises, so that a caller that goes on routes as CP0 does
+                    mpc.default_allow_mpc_switch = allow_mpc_switch
+                    mpc.default_allow_diagonal_results = allow_diagonal
+                if cut and _any_diagonal(mpc, _encryption_unified):
+                    _encryption_unified = _cut_rows_through_mpc(mpc, _encryption_unified, first._ratios, other._ratios.sum())
+
+            result = aligner.new_mpp(
                 _local_data=_local_data,
                 _encryption_left=_encryption_left,
                 _encryption_right=_encryption_right,
                 _encryption_unified=_encryption_unified)
+        return result._converted_if_diagonal(may_be_diagonal and not cut, other._ratios.sum())
+
+    def _converted_if_diagonal(self, may_be_diagonal: bool, columns: int) -> MPP[S, dtype]:
+        # A per-partition product's result whose partitions the TNT kernel may have left diagonal-encoded (may_be_diagonal,
+        # from agreed descriptors and public ratios: the same at every compute party), converted once through MPC if any
+        # compute party holds such a partition (one round among the compute parties), since alignments, indexing, sums
+        # and products refuse diagonal partitions: to row-wise partitions, or column-wise ones where each party's product
+        # is tall (columns, the result's, public: _tall); as it is otherwise. A column-wise first factor (an A.T @ B
+        # result, its sum split in HE) times an encrypted one gives such a result wherever no party cuts its rows; TNT and
+        # the conversion measured far faster than TN (the user's choices, 2026-11-17 and 2026-11-18). CP0 keeps its
+        # placeholder.
+        mpc = self._mpc
+        if static.len(S) != 2 or not may_be_diagonal or mpc.pid == 0:
+            return self
+        diagonal = int(self.has_unified_encryption() and self._encryption_unified._diagonal_contiguous)
+        if not any(bool(d) for d in mpc.comms.collect(diagonal)):
+            return self
+        return self._encrypted_as(_tall(columns, self._ratios))
 
     @staticmethod
     def _cohort_in_the_clear(descriptors: List[List[int]]) -> bool:
@@ -3217,10 +3400,13 @@ class MPP[S, dtype]:
                 item._transposed = False
         return False, target, item, empty, empty, ndarray[SV, dtype](), to_unified
 
-    def _set_block[T1, T2](self, rs: T1, cs: T2, value: MPP):
+    def _set_block[T1, T2](self, rs: T1, cs: T2, value: MPP, converted: bool = False):
         # X[rs, cs] = value on an MPP as held (rows rs: an int or a slice; columns cs: an int or a slice), in one council:
         # each compute party sets its rows of the range from its partition of value, which must hold exactly those rows
-        # (the value partitioned as the range is)
+        # (the value partitioned as the range is). A 2-dim value encrypted in the other layout than a target partition
+        # (row-wise into column-wise storage, or back) is asked for in that council instead: every compute party then
+        # converts the value through MPC (_encrypted_as) and the setitem runs again, with a council of its own (L-261:
+        # it raised NotImplementedError, which the column-wise results of A.T @ B made reachable from a row setitem).
         mpc = self._mpc
         start, stop = _index_range(rs, self._ratios.sum(), "rows")
         want = _sliced_ratios(self._ratios, start, stop)
@@ -3263,18 +3449,35 @@ class MPP[S, dtype]:
             except AssertionError as e:
                 status = IDX_VALUE_ERROR
                 message = e.message
-            if status == IDX_OK and take and not in_clear:
+            if status == IDX_OK and take and not in_clear and MPP._set_needs_conversion(target, item):
+                status = IDX_CONVERT_TO_COLUMNS if target._transposed else IDX_CONVERT_TO_ROWS
+            elif status == IDX_OK and take and not in_clear:
                 if isinstance(T1, int):
                     masked, status, message = _plan_indexing(lambda: self._set_part_masked(lo, c_lo, c_hi, target, item, left_item, right_item))
                 else:
                     masked, status, message = _plan_indexing(lambda: self._set_part_masked(slice(start=lo, stop=hi, step=1), c_lo, c_hi, target, item, left_item, right_item))
-        _indexing_council(mpc, masked, status, message)
+        statuses = _indexing_council(mpc, masked, status, message)
+        to_columns = IDX_CONVERT_TO_COLUMNS in statuses
+        to_rows = IDX_CONVERT_TO_ROWS in statuses
+        if to_columns or to_rows:
+            # Every compute party sees the same statuses, so all convert alike, or all raise
+            if (to_columns and to_rows) or converted:
+                raise NotImplementedError("MPP: setting a value into partitions encrypted in different layouts (row-wise and column-wise) is not implemented")
+            self._set_block(rs, cs, value._encrypted_as(to_columns), True)
+            return
         if not take:
             return
         if isinstance(T1, int):
             self._set_part_apply(lo, c_lo, c_hi, value, in_clear, target, item, left_item, right_item, local_item, to_unified)
         else:
             self._set_part_apply(slice(start=lo, stop=hi, step=1), c_lo, c_hi, value, in_clear, target, item, left_item, right_item, local_item, to_unified)
+
+    @staticmethod
+    def _set_needs_conversion(target: Ciphertensor[Ciphertext], item: Ciphertensor[Ciphertext]) -> bool:
+        # Whether a setitem's 2-dim encrypted item is stored in the other layout than its target (one row-wise, the other
+        # column-wise; diagonal storage is refused when planned)
+        return (bool(target) and bool(item) and target.ndim == 2 and item.ndim == 2 and
+                not target._diagonal_contiguous and not item._diagonal_contiguous and target._transposed != item._transposed)
 
     def _set_part_masked[TR](self, ri: TR, c_lo: int, c_hi: int, target: Ciphertensor[Ciphertext], item: Ciphertensor[Ciphertext], left_item: Ciphertensor[Ciphertext], right_item: Ciphertensor[Ciphertext]) -> List[Ciphertext]:
         # The ciphertexts _set_part_apply masks
@@ -3487,6 +3690,13 @@ class MPPAligner[S, dtype]:
         if self.mode == ALIGN_ENCRYPT:
             self._unify_for_products()
         if unaligned:
+            if static.len(S) == 2:
+                cut = MPPAligner._diagonal_cut(mpp._ratios, self.descriptors)
+                if cut >= 0:
+                    # Raised alike at every compute party (the descriptors are agreed). __exit__ does not run when
+                    # __enter__ raises, so a partition in the clear set aside for the product is restored first
+                    self._restore_stash()
+                    raise NotImplementedError(f"MPP: a cohort with diagonal-encoded partitions cannot be aligned to the most rows of unequal ratios {mpp._ratios} (CP{cut + 1} holds rows but fewer than the most): diagonal storage is not by rows")
             if static.len(S) == 1:
                 self.length = MPPAligner._vector_length(mpp)
             MPPAligner._align(mpp, self.descriptors, self.mode == ALIGN_PAD)
@@ -3495,13 +3705,31 @@ class MPPAligner[S, dtype]:
     def __exit__(self):
         if self.padded:
             MPPAligner._revert(self.mpp, self.length)
+        self._restore_stash()
+
+    def _restore_stash(self):
+        # This party's partition in the clear back in place of its encryption for the duration (ALIGN_ENCRYPT)
         if self.stashed:
             self.mpp._local_data = unwrap(self.stash_local)
             self.mpp._encryption_unified = unwrap(self.stash_unified)
+            self.stashed = False
 
     def own_kind(self) -> int:
         # This party's partition kind, as agreed (valid once the descriptors are)
         return self.descriptors[self.mpp._mpc.pid - 1][D_KIND]
+
+    @staticmethod
+    def _diagonal_cut(ratios: List[int], descriptors: List[List[int]]) -> int:
+        # The first compute party (its index) that holds rows, but fewer than the most, in a diagonal-encoded partition;
+        # -1 if none. Such a partition is stored by its diagonals, so it can be neither padded with rows nor cut back by
+        # them, and the aligner refuses it at every compute party alike: padding wrote its diagonals into a row-wise
+        # placeholder and the revert kept the first of them, at that party alone (H-60's class).
+        most = max(ratios)
+        for q in range(len(descriptors)):
+            d = descriptors[q]
+            if 0 < ratios[q] < most and (d[D_UNIFIED + 3] or d[D_LEFT + 3] or d[D_RIGHT + 3]):
+                return q
+        return -1
 
     def _unify_for_products(self):
         # For a product of two secret factors, whose per-party products must match in kind and layout: every encrypted

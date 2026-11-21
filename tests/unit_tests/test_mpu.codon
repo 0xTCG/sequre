@@ -867,15 +867,15 @@ def test_mpu_add_mpa_mpp_aggregate_refresh(mpc):
 
 
 def test_mpu_aggregate_drift(mpc):
-    """Aggregates whose copies came apart, then a bootstrap in the broadcast mode (review c19-cr6-1). A sum's mask product
-    and an MPA * MPP product refresh the aggregate, or the joined MPP, at each party in a round of its own (H-59), which
-    leaves every party's copy valid but different. The next broadcast-mode bootstrap takes the hub's copy and writes its
-    refresh into every party's copy: right, and the same at every party. Before, every party refreshed its own copy
-    collectively, which combined shares of different ciphertexts: garbage. That bootstrap comes from a product by a
-    constant (after a sum: six products by 1.5, the fifth bootstraps; after an MPA * MPP product: the same) or from a power
-    (after a sum: four products by 1.5, then a square, which bootstraps; review c19-cr7-1). Each starts one level above
-    the bootstrap level as a product (five products by 1.5 from fresh), where the sum's or the product's refresh
-    bootstraps."""
+    """A sum's mask product and an MPA * MPP product of an aggregate, then a bootstrap in the broadcast mode (review
+    c19-cr6-1). Those products refreshed the aggregate, or the joined MPP, at each party in a round of its own (H-59),
+    which left every party's copy valid but different, and the next broadcast-mode bootstrap healed them from the hub's
+    copy (before that every party refreshed its own copy collectively, which combined shares of different ciphertexts:
+    garbage). Since M-MHE-26 both refresh once for every party, so the copies stay the same throughout
+    (debug builds check them at every broadcast-mode bootstrap). That bootstrap comes from a product by a constant (after
+    a sum: six products by 1.5, the fifth bootstraps; after an MPA * MPP product: the same) or from a power (after a sum:
+    four products by 1.5, then a square, which bootstraps; review c19-cr7-1). Each starts one level above the bootstrap
+    level as a product (five products by 1.5 from fresh), where the sum's or the product's refresh bootstraps."""
     n_cp = mpc.comms.number_of_parties - 1
     ratios = unequal_ratios(n_cp)
     total = ratios.sum()
@@ -1037,12 +1037,13 @@ def leave_mpc(mpc, label: str, m: MPA, want, error: float):
 
 
 def test_mpu_aggregate_switch(mpc):
-    """H-59's switch and decryption, and H-56: an aggregate whose copies came apart (each party's copy refreshed in a round
-    of its own: a sum's mask product, or an MPA * MPP product's joined factor, from one level above the bootstrap level)
-    switches to MPC (to_sharetensor, via_mpc) and decrypts with source -1 to its value: the hub's copy is taken, as a
-    broadcast-mode bootstrap takes it. Each party's copy combined into the protocol gave garbage, silently and in step.
-    The switch leaves every party's copy as it was (the hub's is not rescaled alone): products by a constant afterwards
-    are right. clip of an additive MPU (shares in the clear, encrypted, a tall one) leaves the same ways out."""
+    """H-59's switch and decryption, and H-56: an aggregate after a sum's mask product, or an MPA * MPP product's joined
+    factor, from one level above the bootstrap level, switches to MPC (to_sharetensor, via_mpc) and decrypts with source
+    -1 to its value. Those refreshes left each party's copy different (each valid), and combining every party's copy
+    into the protocol gave garbage, silently and in step, until the hub's copy was taken there. Since M-MHE-26 the
+    refreshes run once for every party and the copies stay the same, so each party switches and decrypts its own copy
+    (the hub's is no longer sent; debug builds check the copies). Products by a constant after the switch are right. clip
+    of an additive MPU (shares in the clear, encrypted, a tall one) leaves the same ways out."""
     n_cp = mpc.comms.number_of_parties - 1
     ratios = unequal_ratios(n_cp)
     total = ratios.sum()
@@ -1176,6 +1177,260 @@ def test_mpu_update_layouts(mpc):
             assert_parties_in_step(mpc, label)
 
 
+def partitioned_column_wise(mpc, matrix, ratios: List[int]) -> MPU:
+    # A partitioned MPU whose partitions are encrypted column-wise (stored transposed), as a transposed MPP encrypts
+    start, stop = own_rows(mpc, ratios)
+    x = MPP(mpc, (matrix[start:stop] if mpc.pid else matrix).copy())
+    cw = x.T
+    cw.encrypt()
+    return MPU(_mpp=cw.T, _mpa=MPA[Tuple[int, int], float](mpc))
+
+
+def test_mpu_column_wise_products(mpc):
+    """H-60 in MPU's per-partition products with an aggregate, which MPPAligner cuts back to each party's rows: P @ A
+    with P's partitions column-wise (A an aggregate), and A @ P.T with A a column-wise aggregate (a tall MPA encrypts
+    column-wise) and P in the clear, row-wise and column-wise, at equal and unequal ratios and with an empty partition.
+    The TNT kernel's diagonal-encoded results were cut by their diagonals: P @ A gave wrong rows at the parties holding
+    fewer rows than the most."""
+    n_cp = mpc.comms.number_of_parties - 1
+    k = 3
+    for ratios in ([3 for _ in range(n_cp)], unequal_ratios(n_cp), ratios_with_empty(n_cp)):
+        total = ratios.sum()
+        x = cohort_matrix(mpc, total, k) * 0.5
+        a_wide = cohort_matrix(mpc, k, 8) * 0.5
+        label = f"MPU P @ A, P column-wise at {ratios}, A an aggregate {k}x8"
+        product = partitioned_column_wise(mpc, x, ratios) @ additive_as(mpc, a_wide, 4)
+        revealed = product.reveal()
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}", revealed, x @ a_wide, error=1e-2)
+        assert_parties_in_step(mpc, label)
+
+        a_tall = cohort_matrix(mpc, 8, k) * 0.5
+        for kind in (0, 1, 3):
+            p = partitioned_column_wise(mpc, x, ratios) if kind == 3 else partitioned_as(mpc, x, ratios, kind)
+            label = f"MPU A @ P.T, A a column-wise aggregate 8x{k}, P {['in the clear', 'encrypted', '', 'column-wise'][kind]} at {ratios}"
+            product = additive_as(mpc, a_tall, 4) @ p.T
+            revealed = product.reveal()
+            if mpc.pid:
+                assert_eq_approx(f"CP{mpc.pid}:\t{label}", revealed, a_tall @ x.T, error=1e-2)
+            assert_parties_in_step(mpc, label)
+
+
+def mpu_tnt_case(mpc, label: str, ratios: List[int], x, a_value, left: bool, columns: int):
+    # One MPU product with an aggregate that takes TNT, P @ A (left) or A @ P.T, with P's partitions column-wise at
+    # ratios: TNT's products switched through MPC, the result's partitions column-wise where each party's product is
+    # tall (fewer columns than the most rows) and row-wise otherwise, the values against plaintext
+    p = partitioned_column_wise(mpc, x, ratios)
+    a = additive_as(mpc, a_value, 4)
+    before = mpc.mhe.stats.secure_mhe_mpc_switch_count
+    product = p @ a if left else a @ p.T
+    switched = mpc.mhe.stats.secure_mhe_mpc_switch_count - before
+    want = x @ a_value if left else a_value @ x.T
+    tall = columns < max(ratios)
+    part = product._mpp
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\t{label}: TNT's products switched through MPC", switched > 0, True)
+        if part._ratios[mpc.pid - 1]:
+            enc = part._encryption_unified
+            assert_eq(f"CP{mpc.pid}:\t{label}: {'column' if tall else 'row'}-wise", part.has_unified_encryption() and enc._transposed == tall and not enc._diagonal_contiguous, True)
+    revealed = product.reveal()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\t{label}", revealed, want, error=1e-2)
+    assert_parties_in_step(mpc, label)
+
+
+def test_mpu_cut_products_switch_once(mpc):
+    """H-60 in MPU's products with an aggregate (the user's choices, 2026-11-18): P @ A with P's partitions column-wise,
+    and A @ P.T with A a column-wise aggregate and P's partitions column-wise, take TNT, and every party's
+    diagonal-encoded product is switched through MPC once, encrypted back column-wise where each party's product is tall
+    and row-wise otherwise (review c21-cr3-1), and cut on the shares where a party holds rows but fewer than the most;
+    TN ran there before, with no switch. A 3x8 (row-wise), 4x3 (a tall MPA encrypts column-wise: products 4 x the most
+    rows, wide) and 10x3 (products 10 x 5, TNT's tall, skinny storage) at unequal ratios and with an empty partition,
+    and A 3x3 at [2, 6] (products 6 x 3, skinny, review c21-cr3-3; an 8x3 A gives 8 x 5 products, which take TN).
+    Ciphertexts switched at every compute party, the layout at every party holding rows, values against plaintext."""
+    n_cp = mpc.comms.number_of_parties - 1
+    k = 3
+    for ratios in (unequal_ratios(n_cp), ratios_with_empty(n_cp)):
+        total = ratios.sum()
+        x = cohort_matrix(mpc, total, k) * 0.5
+        a_wide = cohort_matrix(mpc, k, 8) * 0.5
+        a_tall = cohort_matrix(mpc, 4, k) * 0.5
+        a_skinny = cohort_matrix(mpc, 10, k) * 0.5
+        mpu_tnt_case(mpc, f"MPU P @ A at {ratios}, P column-wise, A an aggregate {k}x8", ratios, x, a_wide, True, 8)
+        mpu_tnt_case(mpc, f"MPU A @ P.T at {ratios}, A a column-wise aggregate 4x{k}, P column-wise", ratios, x, a_tall, False, 4)
+        mpu_tnt_case(mpc, f"MPU A @ P.T at {ratios}, A a column-wise aggregate 10x{k}, P column-wise", ratios, x, a_skinny, False, 10)
+    # Sequre's list + list adds element-wise: the zeros of further compute parties are appended
+    skinny = [2, 6]
+    for _ in range(n_cp - 2):
+        skinny.append(0)
+    x = cohort_matrix(mpc, 8, k) * 0.5
+    a_square = cohort_matrix(mpc, k, k) * 0.5
+    mpu_tnt_case(mpc, f"MPU P @ A at {skinny}, P column-wise, A an aggregate {k}x{k}", skinny, x, a_square, True, k)
+
+
+def aggregate_at_level(mpc, value, level: int) -> MPU:
+    # An additive MPU that holds only an aggregate of value, at the given level (the same ciphertexts at every party)
+    m = additive_as(mpc, value, 4)
+    if mpc.pid:
+        m._mpa._aggregate._data = mpc.mhe.drop_level(m._mpa._aggregate._data, level)
+    return m
+
+
+def copies_and_bootstraps(mpc, label: str, m: MPA, bootstraps: int, most: int):
+    # The aggregate's copies the same at every compute party, and at most `most` collective bootstraps (one per
+    # ciphertext refreshed; a refresh per party took one per party per ciphertext)
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\t{label}: an aggregate", m.has_aggregate(), True)
+        assert_eq(f"CP{mpc.pid}:\t{label}: the aggregate's copies the same at every compute party", same_at_every_party(mpc, m._aggregate._data), True)
+        assert_eq(f"CP{mpc.pid}:\t{label}: at most {most} bootstraps (got {bootstraps})", bootstraps <= most, True)
+
+
+def test_mpu_aggregate_refreshes(mpc):
+    """M-MHE-26 through MPU: operations on an aggregate (the same ciphertexts at every party) at the bootstrap level and
+    one level above it. A sum over rows and a dot product (MPCMHE.reduce_add's mask product), MPA * MPP (the joined
+    partitions, the same at every party but refreshed per party), clip of a tall additive MPU (a layout conversion of a
+    broadcast operand, which via_mpc's default mode made at every party apart). Each refreshed the aggregate (or the
+    operand) at every party in a round of its own: one bootstrap per party per ciphertext, and copies that came apart
+    (each valid, not the same). Now one bootstrap per ciphertext, collectively, and the copies stay the same; the values
+    against plaintext through every way out."""
+    n_cp = mpc.comms.number_of_parties - 1
+    lb = mpc.mhe.bootstrap_min_level
+    m35 = cohort_matrix(mpc, 3, 5) * 0.5
+    for level in (lb, lb + 1):
+        before = mpc.mhe.stats.secure_bootstrap_count
+        s1 = aggregate_at_level(mpc, m35, level).sum(1)
+        boots = mpc.mhe.stats.secure_bootstrap_count - before
+        label = f"MPU (an aggregate at level {level}).sum(1)"
+        copies_and_bootstraps(mpc, label, s1._mpa, boots, 3)
+        leave_mpc(mpc, label, s1._mpa, array([sum(m35[i, j] for j in range(5)) for i in range(3)]), 1e-2)
+
+        before = mpc.mhe.stats.secure_bootstrap_count
+        d1 = aggregate_at_level(mpc, m35, level)._mpa.dot(1)
+        boots = mpc.mhe.stats.secure_bootstrap_count - before
+        label = f"MPA (an aggregate at level {level}).dot(1)"
+        copies_and_bootstraps(mpc, label, d1, boots, 6)
+        leave_mpc(mpc, label, d1, array([sum(m35[i, j] * m35[i, j] for j in range(5)) for i in range(3)]), 1e-2)
+
+        ratios = [2 for _ in range(n_cp)]
+        total = ratios.sum()
+        a = cohort_matrix(mpc, total, 3) * 0.5
+        b = cohort_matrix(mpc, total, 3) * 0.5
+        x = partitioned_as(mpc, b, ratios, 1)
+        if mpc.pid:
+            x._mpp._encryption_unified._data = mpc.mhe.drop_level(x._mpp._encryption_unified._data, level)
+        before = mpc.mhe.stats.secure_bootstrap_count
+        prod = additive_as(mpc, a, 4) * x
+        boots = mpc.mhe.stats.secure_bootstrap_count - before
+        label = f"MPU aggregate * partitions at level {level}"
+        copies_and_bootstraps(mpc, label, prod._mpa, boots, total)
+        leave_mpc(mpc, label, prod._mpa, a * b, 1e-2)
+
+    tall = cohort_matrix(mpc, 6, 2)
+    share = tall * (1.0 / n_cp) if mpc.pid else tall.zeros()
+    c = nl_clip(mpc, MPU(mpc, share, "additive"), -1.0, 1.0)
+    want = tall.copy()
+    for i in range(6):
+        for j in range(2):
+            want[i, j] = min(1.0, max(-1.0, tall[i, j]))
+    if mpc.pid and c._mpa.has_aggregate():
+        assert_eq(f"CP{mpc.pid}:\tMPU clip of a tall additive MPU: the aggregate's copies the same at every compute party", same_at_every_party(mpc, c._mpa._aggregate._data), True)
+    leave_mpc(mpc, "MPU clip of a tall additive MPU", c._mpa, want, 2e-2)
+
+
+def test_mpu_shares_after_aggregate(mpc):
+    """Review c21-cr1-1: an MPA's encrypted shares (each compute party's own) stay its own after aggregate(), which
+    reveal() and to_sharetensor() call, so that their refreshes run per party. Flagged broadcast (a draft of this
+    cluster's aggregate() left the party's own share flagged), a refresh took the hub's share for every party's: wrong
+    values, silently in a release build. Shares at the bootstrap level, revealed, then summed over rows, multiplied by
+    an aggregate and squared, each of which refreshes the shares; against plaintext."""
+    lb = mpc.mhe.bootstrap_min_level
+    a = cohort_matrix(mpc, 3, 5) * 0.5
+    g = cohort_matrix(mpc, 3, 5) * 0.25
+    m = encrypted_shares_at(mpc, a, lb, False)
+    revealed = m.reveal()
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tMPU shares at the bootstrap level after reveal(): still each party's own", m._mpa._encryption._is_broadcast, False)
+    summed = m.sum(1).reveal()
+    m = encrypted_shares_at(mpc, a, lb, False)
+    m.reveal()
+    times = (m * additive_as(mpc, g, 4)).reveal()
+    m = encrypted_shares_at(mpc, a, lb, False)
+    m.reveal()
+    squared = (m ** 2).reveal()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPU shares at the bootstrap level: reveal", revealed, a, error=1e-2)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPU shares after reveal(), summed over rows", summed, array([sum(a[i, j] for j in range(5)) for i in range(3)]), error=1e-2)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPU shares after reveal(), times an aggregate", times, a * g, error=1e-2)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPU shares after reveal(), squared", squared, a * a, error=1e-2)
+    assert_parties_in_step(mpc, "MPU shares after aggregate()")
+
+
+def test_mpu_join_across_ciphertexts(mpc):
+    """Review c21-cr1-2: MPA * MPP joins the partitions at every party (MPP.join), and a join of column-wise partitions
+    longer than a ciphertext's slots extends across a ciphertext's boundary by shifts and masks, which refresh. The
+    collected copies were unflagged, so those refreshes ran per party and the join's copies came apart, while the join
+    was flagged broadcast: the product's aggregate then switched to MPC as garbage (source -1 switches each party's own
+    copy). An aggregate times partitions of more rows than a ciphertext has slots, column-wise at unequal ratios and at
+    the bootstrap level: the product's copies the same at every party, its value revealed and switched to MPC. (Not
+    through via_mpc: back from MPC a tall matrix encrypts row-wise, a ciphertext per row.)"""
+    n_cp = mpc.comms.number_of_parties - 1
+    lb = mpc.mhe.bootstrap_min_level
+    slots = mpc.mhe.crypto_params.params.slots()
+    rows = slots + 808
+    ratios = [rows // n_cp for _ in range(n_cp)]
+    ratios[0] += rows - ratios.sum() + 500
+    ratios[1] -= 500
+    a = cohort_matrix(mpc, rows, 1) * 0.5
+    b = cohort_matrix(mpc, rows, 1) * 0.5
+    x = partitioned_column_wise(mpc, b, ratios)
+    if mpc.pid:
+        x._mpp._encryption_unified._data = mpc.mhe.drop_level(x._mpp._encryption_unified._data, lb)
+    before = mpc.mhe.stats.secure_bootstrap_count
+    prod = additive_as(mpc, a, 4) * x
+    boots = mpc.mhe.stats.secure_bootstrap_count - before
+    label = f"MPU aggregate * partitions of {rows} rows, column-wise at {ratios}, at the bootstrap level"
+    copies_and_bootstraps(mpc, label, prod._mpa, boots, (rows + slots - 1) // slots)
+    switched = prod._mpa.to_sharetensor().reveal(mpc)
+    revealed = prod.reveal()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\t{label}: reveal", revealed, a * b, error=1e-2)
+        assert_eq_approx(f"CP{mpc.pid}:\t{label}: to_sharetensor", switched, a * b, error=1e-2)
+    assert_parties_in_step(mpc, label)
+
+
+def test_mpu_clear_products_refresh_once(mpc):
+    """Review c21-cr1-4: A @ P.T and P @ A with P's partitions in the clear and A an aggregate at the bootstrap level.
+    Each party multiplies its own data by a copy of the aggregate (the product is its own), and the product refreshed
+    that copy per party: a bootstrap per party per ciphertext of A, at every such product, while the aggregate itself
+    stayed unrefreshed. Now the aggregate is refreshed first, once, in the broadcast mode, and keeps the refresh: one
+    bootstrap per ciphertext, none in the next product; the values against plaintext."""
+    n_cp = mpc.comms.number_of_parties - 1
+    lb = mpc.mhe.bootstrap_min_level
+    ratios = [3 for _ in range(n_cp)]
+    total = ratios.sum()
+    a = cohort_matrix(mpc, 2, 8) * 0.5
+    p = cohort_matrix(mpc, total, 8) * 0.5
+    q = cohort_matrix(mpc, total, 2) * 0.5
+    for case in ("A @ P.T", "P @ A"):
+        agg = aggregate_at_level(mpc, a, lb)
+        for again in (False, True):
+            label = f"MPU {case}, A an aggregate 2x8 at the bootstrap level, P in the clear at {ratios}" + (", again" if again else "")
+            most = 0 if again else 2
+            before = mpc.mhe.stats.secure_bootstrap_count
+            if case == "A @ P.T":
+                revealed = (agg @ partitioned_as(mpc, p, ratios, 0).T).reveal()
+                want = a @ p.T
+            else:
+                revealed = (partitioned_as(mpc, q, ratios, 0) @ agg).reveal()
+                want = q @ a
+            boots = mpc.mhe.stats.secure_bootstrap_count - before
+            if mpc.pid:
+                assert_eq(f"CP{mpc.pid}:\t{label}: at most {most} bootstraps (got {boots})", boots <= most, True)
+                assert_eq(f"CP{mpc.pid}:\t{label}: the aggregate refreshed in place", agg._mpa._aggregate._data[0].level() > lb, True)
+                assert_eq_approx(f"CP{mpc.pid}:\t{label}", revealed, want, error=1e-2)
+            assert_parties_in_step(mpc, label)
+
+
 def test_mpu[TP](mpc: MPCEnv[TP], modulus: TP):
     mpc.comms.sync_parties()
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
@@ -1226,5 +1481,11 @@ def test_mpu[TP](mpc: MPCEnv[TP], modulus: TP):
     test_mpu_aggregate_switch(mpc)
     test_mpu_column_times_mpa(mpc)
     test_mpu_update_layouts(mpc)
+    test_mpu_column_wise_products(mpc)
+    test_mpu_cut_products_switch_once(mpc)
+    test_mpu_aggregate_refreshes(mpc)
+    test_mpu_shares_after_aggregate(mpc)
+    test_mpu_join_across_ciphertexts(mpc)
+    test_mpu_clear_products_refresh_once(mpc)
 
     print(f'CP{mpc.pid}:\tSequre MHE MPU tests on {alg_struct} passed.\n')

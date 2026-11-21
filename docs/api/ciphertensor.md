@@ -197,7 +197,7 @@ The `@mhe_enc_opt` compiler pass selects the optimal encoding strategy per matri
 | `.decrypt(mpc, source_pid=-2)` | Collective decryption to plaintext. `-2` (default): every compute party gets its own tensor decrypted and learns nothing of the others' (call it at every compute party, even if it's tensor is empty); `-1`: a tensor that is the same at every compute party. See [`MPCMHE.decrypt`](mpc-instance.md) |
 | `.decode(mpc)` | Decode plaintext tensor to `ndarray` |
 | `.reveal(mpc, source_pid=-2)` | Decrypt and decode in one step (same `source_pid` modes as `.decrypt`) |
-| `.via_mpc(mpc, fn, *args)` | Execute a function through the [MPC layer](../user-guide/switching.md) (E2S → fn → S2E) |
+| `.via_mpc(mpc, fn, *args, mirrored=False, agree_with_cp0=True)` | Execute a function through the [MPC layer](../user-guide/switching.md) (E2S → fn → S2E); call it at every party, CP0 included (fn's protocol may need CP0). By default every compute party's tensor is switched in turn and each party gets back its own, except a tensor flagged broadcast (the same at every compute party, such as an aggregate), which the hub reports to every party in one small round and which is switched once: its result is the same at every party and flagged broadcast. `mirrored=True` switches it so without the round. A caller at the compute parties alone (fn needs no CP0) passes `agree_with_cp0=False`, and `mirrored` as it knows it. With `exclude_parties` there is no round: each party's tensor is switched apart |
 
 ## Indexing and iteration
 

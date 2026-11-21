@@ -11,7 +11,8 @@ from sequre.lattiseq.ckks import Ciphertext
 from sequre.types.ciphertensor import Ciphertensor
 from sequre.types.multiparty_partition import (
     MPP, ALIGN_ENCRYPT, _agree_on_partitions, _partition_descriptor, _encrypted_layout, _encrypt_like, _plan_indexing,
-    _indexing_council, D_KIND, D_SIZE, D_UNIFIED, D_LEFT, D_RIGHT, MPP_EMPTY, MPP_CLEAR, MPP_UNIFIED, MPP_SEMI)
+    _indexing_council, _cuts_rows, _any_diagonal, _cut_rows_through_mpc, D_KIND, D_SIZE, D_UNIFIED, D_LEFT, D_RIGHT,
+    MPP_EMPTY, MPP_CLEAR, MPP_UNIFIED, MPP_SEMI)
 from sequre.types.multiparty_aggregate import MPA
 from sequre.constants import HE_ENC_COST_ESTIMATE, ENC_ROW
 
@@ -1079,21 +1080,49 @@ class MPU[S, dtype]:
         # Every compute party runs the same HE product: an MPP that some parties hold in the clear and others encrypted is
         # encrypted at every party for it (ALIGN_ENCRYPT; one round), since a product in the clear and one of an
         # encryption by the aggregate differ in their refreshes and in their result's layout
+        # The aligner cuts each party's product back to its rows, which a diagonal-encoded result (TNT's, for a
+        # column-wise aggregate) cannot be cut by (H-60): a product by a partition in the clear never takes TNT; one by an
+        # encrypted partition does, and its diagonal-encoded result is converted once through MPC to row-wise partitions,
+        # or column-wise ones for a tall product, before the cut where a party cuts (as in MPP._matmul_case_ntt; the
+        # result's columns are the aggregate's rows)
+        may_be_diagonal = False
+        cut = False
         with mpp.partition_aligner(ALIGN_ENCRYPT) as aligner:
             if not mpp.is_empty():
-                if mpp.is_local():
-                    # Each party's own product: it never switches to MPC, which would need CP0 (as in H-53)
-                    allow_mpc_switch = mpc.default_allow_mpc_switch
-                    mpc.default_allow_mpc_switch = False
-                    _encryption = mpa._aggregate @ mpp._local_data.T
+                allow_mpc_switch = mpc.default_allow_mpc_switch
+                allow_diagonal = mpc.default_allow_diagonal_results
+                try:
+                    if mpp.is_local():
+                        # Each party's own product: it never switches to MPC, which would need CP0 (as in H-53). The
+                        # aggregate meets this party's data in the clear, so the product is this party's alone: it takes
+                        # an unflagged copy, whose refreshes run per party (a plaintext operand counts as public, and
+                        # the broadcast mode would take the hub's copy of a per-party product). The aggregate is
+                        # refreshed first, in place and in the broadcast mode (one bootstrap for every party, which the
+                        # aggregate keeps), so that the copy's refreshes find nothing due: refreshed in the product, the
+                        # copy took a bootstrap per party per due ciphertext at every such product (review c21-cr1-4)
+                        mpc.mhe.refresh(mpa._aggregate._data, True, min_level_distance=2)
+                        mpc.default_allow_mpc_switch = False
+                        mpc.default_allow_diagonal_results = False
+                        _encryption = MPU[S, dtype]._per_party_copy(mpa._aggregate) @ mpp._local_data.T
+                    else:
+                        mpp.unify_encryption()
+                        # Only a column-wise aggregate (a tall MPA's layout) takes TNT here
+                        may_be_diagonal = mpa._aggregate._transposed
+                        cut = may_be_diagonal and _cuts_rows(mpp._ratios)
+                        mpc.default_allow_diagonal_results = True
+                        _encryption = mpa._aggregate @ mpp._encryption_unified.T
+                finally:
+                    # Restored also when the product raises, so that a caller that goes on routes as CP0 does
                     mpc.default_allow_mpc_switch = allow_mpc_switch
-                else:
-                    mpp.unify_encryption()
-                    _encryption = mpa._aggregate @ mpp._encryption_unified.T
-            
+                    mpc.default_allow_diagonal_results = allow_diagonal
+
             _encryption._transposed ^= True
-            return aligner.new_mpp(
+            if cut and _any_diagonal(mpc, _encryption):
+                _encryption = _cut_rows_through_mpc(mpc, _encryption, mpp._ratios, mpa.shape[0])
+            result = aligner.new_mpp(
                 _encryption_unified=_encryption)
+        # TNT's diagonal-encoded result converted once where no party cut (as in MPP._matmul_case_ntt)
+        return result._converted_if_diagonal(may_be_diagonal and not cut, mpa.shape[0])
     
     @sequre
     def _matmul_mpp_t_mpa(mpc, mpp: MPP[S, dtype], mpa: MPA[S, dtype]) -> MPA[S, dtype]:
@@ -1124,6 +1153,14 @@ class MPU[S, dtype]:
             
             return MPA[S, dtype](mpc, _encryption)
     
+    @staticmethod
+    def _per_party_copy(aggregate: Ciphertensor[Ciphertext]) -> Ciphertensor[Ciphertext]:
+        # A copy of an aggregate for a product with a party's own data in the clear: its own ciphertexts (the product
+        # refreshes its operand in place) and no broadcast flag, so that every refresh in the product runs per party
+        out = aggregate.copy()
+        out._is_broadcast = False
+        return out
+
     @staticmethod
     def _own_aggregate_rows(mpc, aggregate: Ciphertensor[Ciphertext], ratios: List[int]) -> Ciphertensor[Ciphertext]:
         # This compute party's rows of an aggregate (the same ciphertexts at every party), empty for an empty partition
@@ -1161,20 +1198,40 @@ class MPU[S, dtype]:
         mpa.aggregate()
 
         _encryption = Ciphertensor[Ciphertext]()
-        # As _matmul_mpa_mpp_t: a mixed MPP is encrypted at every party for the product
+        # As _matmul_mpa_mpp_t: a mixed MPP is encrypted at every party for the product, and TNT's diagonal-encoded result
+        # is converted once through MPC to row-wise partitions, or column-wise ones for a tall product, before the cut
+        # where a party cuts (H-60; the result's columns are the aggregate's)
+        may_be_diagonal = False
+        cut = False
         with mpp.partition_aligner(ALIGN_ENCRYPT) as aligner:
             if not mpp.is_empty():
                 allow_mpc_switch = mpc.default_allow_mpc_switch
+                allow_diagonal = mpc.default_allow_diagonal_results
                 mpc.default_allow_mpc_switch = False
-                if mpp.is_local():
-                    _encryption = mpp._local_data @ mpa._aggregate
-                else:
-                    mpp.unify_encryption()
-                    _encryption = mpp._encryption_unified @ mpa._aggregate
-                mpc.default_allow_mpc_switch = allow_mpc_switch
-            
-            return aligner.new_mpp(
+                try:
+                    if mpp.is_local():
+                        # This party's data in the clear times the aggregate: an unflagged copy of the aggregate,
+                        # refreshed first in the broadcast mode (as in _matmul_mpa_mpp_t)
+                        mpc.mhe.refresh(mpa._aggregate._data, True, min_level_distance=2)
+                        mpc.default_allow_diagonal_results = False
+                        _encryption = mpp._local_data @ MPU[S, dtype]._per_party_copy(mpa._aggregate)
+                    else:
+                        mpp.unify_encryption()
+                        # Only column-wise partitions take TNT here
+                        may_be_diagonal = _encrypted_layout(aligner.descriptors)[0]
+                        cut = may_be_diagonal and _cuts_rows(mpp._ratios)
+                        mpc.default_allow_diagonal_results = True
+                        _encryption = mpp._encryption_unified @ mpa._aggregate
+                finally:
+                    mpc.default_allow_mpc_switch = allow_mpc_switch
+                    mpc.default_allow_diagonal_results = allow_diagonal
+
+            if cut and _any_diagonal(mpc, _encryption):
+                _encryption = _cut_rows_through_mpc(mpc, _encryption, mpp._ratios, mpa.shape[1])
+            result = aligner.new_mpp(
                 _encryption_unified=_encryption)
+        # TNT's diagonal-encoded result converted once where no party cut (as in MPP._matmul_case_ntt)
+        return result._converted_if_diagonal(may_be_diagonal and not cut, mpa.shape[1])
 
     @sequre
     def _matmul_mpp_t_mpp(mpc, first: MPP[S, dtype], other: MPP[S, dtype]) -> MPA[S, dtype]:
@@ -1230,8 +1287,11 @@ class MPU[S, dtype]:
             return mpp
         
         mpa.aggregate()
+        # Each party builds its own partition from the copy (its own row count): per-party data, refreshed per party (a
+        # broadcast flag would put a partition's refreshes in the broadcast mode, which takes the hub's copy)
         _agg = mpa._aggregate.copy()
         _agg._diagonal_contiguous = False
+        _agg._is_broadcast = False
 
         if mpp._encryption_unified._diagonal_contiguous or mpp._encryption_left._diagonal_contiguous or mpp._encryption_right._diagonal_contiguous:
             if min(mpp.shape) == 1:

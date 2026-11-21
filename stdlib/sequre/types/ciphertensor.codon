@@ -251,13 +251,16 @@ class Ciphertensor[ctype]:
     
     @property
     def T(self) -> Ciphertensor[ctype]:
+        # The same ciphertexts read transposed: a broadcast tensor's transpose is broadcast too (dropping the flag left
+        # its refreshes per party, M-MHE-26)
         ct = Ciphertensor[ctype](
             _data=self._data.copy(),
             shape=self.shape.copy(),
             slots=self.slots,
             _transposed=self._transposed ^ True,
             _diagonal_contiguous=self._diagonal_contiguous,
-            _skinny=self._skinny)
+            _skinny=self._skinny,
+            _is_broadcast=self._is_broadcast)
         ct._chunk_size = self._chunk_size
         return ct
     
@@ -304,8 +307,17 @@ class Ciphertensor[ctype]:
     def aggregate(self, mpc) -> Ciphertensor[ctype]:
         if mpc.pid == 0:
             return self
-        # Every party sums the same collected ciphertexts in the same order: the sum is identical at all of them.
-        ct = mpc.comms.collect(self).sum(mpc)
+        # Every party sums the same collected ciphertexts in the same order: the sum is identical at all of them. The
+        # collected shares are broadcast operands (the same at every party), so a share held in another layout than the
+        # first is converted once for every party, mirrored, not at each party apart (which left the sum's copies
+        # apart). Each is flagged as a shallow copy: collect hands back this party's own tensor itself, whose flag stays
+        # its own (flagged, a party's share would refresh in the broadcast mode, from the hub's copy)
+        parts = mpc.comms.collect(self)
+        for k in range(len(parts)):
+            view = parts[k].copy(shallow=True)
+            view._is_broadcast = True
+            parts[k] = view
+        ct = parts.sum(mpc)
         ct._is_broadcast = True
         return ct
     
@@ -315,8 +327,9 @@ class Ciphertensor[ctype]:
         
         target_cipher_idx = i // self.slots
         target_offset = i % self.slots
+        # The mask is public: a broadcast self's product refreshes in the broadcast mode and the result is broadcast
         mask = mpc.mhe.enc_vector(one_hot_vector(target_offset, self.slots, TP=float), T=Plaintext)
-        dedup_single = mpc.mhe.mul([self._data[target_cipher_idx]], mask)[0]
+        dedup_single = mpc.mhe.mul([self._data[target_cipher_idx]], mask, self._is_broadcast)[0]
 
         ciphers_count = (new_size + self.slots - 1) // self.slots
         if ciphers_count > 1:
@@ -344,7 +357,11 @@ class Ciphertensor[ctype]:
         return Ciphertensor[ctype](
             _data=_data,
             shape=[new_size],
-            slots=self.slots)
+            slots=self.slots,
+            _transposed=False,
+            _diagonal_contiguous=False,
+            _skinny=False,
+            _is_broadcast=self._is_broadcast)
     
     def diagonal(self, idx: int) -> Ciphertensor[ctype]:
         diag_count = min(self.shape)
@@ -554,19 +571,18 @@ class Ciphertensor[ctype]:
         
         return 1024  # Until mpc instance is added to self. Then return mpc.mhe.crypto_params.params.max_level().
     
-    def decrypt(self, mpc, source_pid: int = -2, copies_identical: bool = False) -> Ciphertensor[Plaintext]:
+    def decrypt(self, mpc, source_pid: int = -2) -> Ciphertensor[Plaintext]:
         """
         If source_pid is (see MPCMHE.decrypt):
             - -2 (the default): every compute party gets its own tensor decrypted, and no party learns another's; every
               compute party must call it, an empty tensor included
             - a compute party's PID (1, 2, ...): that party's tensor is decrypted for every compute party
-            - -1: the tensor holds the same values at every compute party (an aggregate); every compute party gets it.
-              The hub's copy is decrypted, so copies that came apart still decrypt right; copies_identical skips sending
-              it where the caller vouches that every party holds the same ciphertexts (collected ones)
+            - -1: the tensor is the same ciphertexts at every compute party (an aggregate, or a collected tensor); every
+              compute party gets it, each decrypting its own copy
         """
         assert isinstance(ctype, Ciphertext), "Ciphertensor: data already decrypted"
         return Ciphertensor[Plaintext](
-            _data=mpc.mhe.decrypt(self._data, source_pid, copies_identical),
+            _data=mpc.mhe.decrypt(self._data, source_pid),
             shape=self.shape.copy(),
             slots=self.slots,
             _transposed=self._transposed,
@@ -598,13 +614,13 @@ class Ciphertensor[ctype]:
         
         return arr.T if self._transposed else arr
     
-    def reveal[T=float](self, mpc, source_pid: int = -2, copies_identical: bool = False) -> ndarray[Tuple[int, int], T]:
+    def reveal[T=float](self, mpc, source_pid: int = -2) -> ndarray[Tuple[int, int], T]:
         if not bool(self):
             if isinstance(ctype, Ciphertext) and source_pid == -2:
                 mpc.mhe.decrypt(List[Ciphertext](), -2)  # every compute party takes part, an empty tensor included
             return ndarray[Tuple[int, int], T]()
 
-        plain = self.decrypt(mpc, source_pid, copies_identical) if isinstance(ctype, Ciphertext) else self
+        plain = self.decrypt(mpc, source_pid) if isinstance(ctype, Ciphertext) else self
         return plain.decode(mpc, T=T)
     
     def filter(self, mask) -> Ciphertensor[ctype]:
@@ -732,6 +748,7 @@ class Ciphertensor[ctype]:
         self_actual_shape = self.actual_shape
         other_actual_shape = other.actual_shape
 
+        self._is_broadcast = self._is_broadcast and other._is_broadcast
         if self.ndim == 1:
             self.iconcat(mpc, other, axis=0)
             return self
@@ -766,6 +783,7 @@ class Ciphertensor[ctype]:
         assert self.ndim == other.ndim, "Ciphertensor: incompatible dimensions for concatenation"
         assert self.slots == other.slots, "Ciphertensor: incompatible slots for concatenation"
         
+        self._is_broadcast = self._is_broadcast and other._is_broadcast
         if self.ndim == 1:
             self._data = Ciphertensor._concat_1_dim_raw(mpc, self, other)._data
         else:
@@ -836,6 +854,7 @@ class Ciphertensor[ctype]:
         other_cipher = self._check_other_operand_elem_wise(mpc, other)
 
         mpc.mhe.iadd(self._data, other_cipher._data)
+        self._is_broadcast = self._is_broadcast and Ciphertensor._operand_broadcast(other_cipher)
         return self
 
     def isub(self, mpc, other) -> Ciphertensor[Ciphertext]:
@@ -849,6 +868,7 @@ class Ciphertensor[ctype]:
         other_cipher = self._check_other_operand_elem_wise(mpc, other)
 
         mpc.mhe.isub(self._data, other_cipher._data)
+        self._is_broadcast = self._is_broadcast and Ciphertensor._operand_broadcast(other_cipher)
         return self
 
     def imul(self, mpc, other, no_refresh: bool = False) -> Ciphertensor[Ciphertext]:
@@ -861,8 +881,20 @@ class Ciphertensor[ctype]:
         assert not isinstance(ctype, Plaintext), "Ciphertensor: cannot multiply plaintext inplace"
         other_cipher = self._check_other_operand_elem_wise(mpc, other)
 
-        mpc.mhe.imul(self._data, other_cipher._data, self._is_broadcast, other_cipher._is_broadcast, no_refresh)
+        other_is_broadcast = Ciphertensor._operand_broadcast(other_cipher)
+        mpc.mhe.imul(self._data, other_cipher._data, self._is_broadcast, other_is_broadcast, no_refresh)
+        self._is_broadcast = self._is_broadcast and other_is_broadcast
         return self
+
+    @staticmethod
+    def _operand_broadcast(other) -> bool:
+        # Whether an element-wise operand is the same at every compute party: a ciphertext operand when flagged, a
+        # plaintext one always (public data: a party's own data meets an aggregate only in MPU's products, which multiply
+        # an unflagged copy of it). A result is broadcast when both operands are, so that a refresh of it in the broadcast
+        # mode (one bootstrap, the hub's copy) never meets values that differ between the parties.
+        if isinstance(other, Ciphertensor[Plaintext]):
+            return True
+        return other._is_broadcast
     
     def ipow(self, mpc, p: int) -> Ciphertensor[Ciphertext]:
         if mpc.pid == 0: return self
@@ -1012,18 +1044,26 @@ class Ciphertensor[ctype]:
         shape[-1] = (self.cipher_shape[-1] + 1) * self.slots
 
         return Ciphertensor[ctype](
-            _data=mpc.mhe.shift(self._data, step),
+            _data=mpc.mhe.shift(self._data, step, self._is_broadcast),
             shape=shape,
             slots=self.slots,
-            _transposed=self._transposed)
+            _transposed=self._transposed,
+            _diagonal_contiguous=False,
+            _skinny=False,
+            _is_broadcast=self._is_broadcast)
 
-    def replicate(self, mpc, new_size: int, allow_transposed: bool = False):
+    def replicate(self, mpc, new_size: int, allow_transposed: bool = False, refreshed: bool = False):
         """
         Examples: [] - Ciphertensor, () - Single ciphertext
             [(1, 2, 3, 4), (5, 6, 0, 0)].replicate(7) -> [(1, 2, 3, 4), (5, 6, 1, 0)]
             [(1, 2, 3, 4), (5, 6, 0, 0)].replicate(8) -> [(1, 2, 3, 4), (5, 6, 1, 2)]
             [(1, 2, 3, 4), (5, 6, 0, 0)].replicate(9) -> [(1, 2, 3, 4), (5, 6, 1, 2), (3, 0, 0, 0)]
             [(1, 2, 3, 4), (5, 6, 0, 0)].replicate(10) -> [(1, 2, 3, 4), (5, 6, 1, 2), (3, 4, 0, 0)]
+
+        The doubling adds the input's last ciphertext to a shifted product of it, which the next shift's refresh
+        rescales: an input at the bootstrap level was rescaled below it and then bootstrapped (an assertion, M-MHE-28).
+        So the input is refreshed first (a level above the bootstrap level), in its own mode, unless the caller says it
+        refreshed it (refreshed: at least that far) or it rests as a product of a refreshed ciphertext.
         """
         assert mpc.pid, "Not implemented yet: replicate at CP0"
         assert 0 < self.ndim < 3, "Ciphertensor: patch-copying can be applied only to 1-dim and 2-dim tensors"
@@ -1047,20 +1087,26 @@ class Ciphertensor[ctype]:
                 if new_size % self.shape[0]:
                     replicate_data.extend(replicate_tensor._get_rows_raw(slice(0, new_size % self.shape[0], 1))._data.copy())
             else:
+                if not refreshed:
+                    mpc.mhe.refresh(replicate_tensor._data, self._is_broadcast, min_level_distance=1)
                 for i in range(self.shape[0]):
-                    replicate_data.extend(replicate_tensor._get_rows_raw(i).replicate(mpc, new_size)._data)
+                    replicate_data.extend(replicate_tensor._get_rows_raw(i).replicate(mpc, new_size, False, True)._data)
 
             return Ciphertensor[ctype](
                 _data=replicate_data,
                 shape=[new_size, self.shape[1]] if self._transposed and allow_transposed else [self.shape[0], new_size],
                 slots=self.slots,
                 _transposed=self._transposed,
-                _diagonal_contiguous=self._diagonal_contiguous)
+                _diagonal_contiguous=self._diagonal_contiguous,
+                _skinny=False,
+                _is_broadcast=self._is_broadcast)
 
         if self.shape[-1] == 1:
             replicate_tensor = replicate_tensor.pad(mpc, new_size)
             return replicate_tensor.reduce_add(mpc)
         
+        if not refreshed:
+            mpc.mhe.refresh(replicate_tensor._data, self._is_broadcast, min_level_distance=1)
         while replicate_tensor.shape[0] < new_size:
             offset = replicate_tensor.shape[0] % self.slots
             if offset:
@@ -1086,7 +1132,7 @@ class Ciphertensor[ctype]:
         offset = new_size % self.slots
         if offset and ((new_size >> (new_size.__cttz__())) != self.shape[0]):  # if offset or self.shape[0] != new_size // 2^k
             mask = mpc.mhe.enc_vector([(1.0 if i < offset else 0.0) for i in range(self.slots)], T=Plaintext)
-            replicate_tensor._data[-1] = mpc.mhe.mul([replicate_tensor._data[-1]], mask)[0]
+            replicate_tensor._data[-1] = mpc.mhe.mul([replicate_tensor._data[-1]], mask, self._is_broadcast)[0]
 
         replicate_tensor.shape = [new_size]
 
@@ -1107,7 +1153,7 @@ class Ciphertensor[ctype]:
         offset = self.shape[0] % self.slots
         if offset and _data:
             mask = mpc.mhe.enc_vector([(1.0 if i < offset else 0.0) for i in range(self.slots)], T=Plaintext)
-            mpc.mhe.imul([_data[-1]], mask)
+            mpc.mhe.imul([_data[-1]], mask, self._is_broadcast)
 
         # Zero ciphertexts up to ceil(new_size / slots) in all (the count ignored the ciphertexts already there)
         zero_cipher = mpc.mhe.zero_cipher()
@@ -1118,7 +1164,10 @@ class Ciphertensor[ctype]:
             _data=_data,
             shape=[new_size],
             slots=self.slots,
-            _transposed=self._transposed)
+            _transposed=self._transposed,
+            _diagonal_contiguous=False,
+            _skinny=False,
+            _is_broadcast=self._is_broadcast)
     
     def reduce_add(self, mpc, keep_dims: bool = True) -> Ciphertensor[ctype]:
         assert mpc.pid, "Not implemented yet: reduce_add at CP0"
@@ -1132,9 +1181,10 @@ class Ciphertensor[ctype]:
             cipher = Ciphertensor[Plaintext].enc(mpc, [_sum for _ in range(size)])
         else:
             cipher = Ciphertensor[ctype](
-                _data=mpc.mhe.reduce_add(self._data, self.shape[-1], keep_dims=keep_dims),
+                _data=mpc.mhe.reduce_add(self._data, self.shape[-1], keep_dims, self._is_broadcast),
                 shape=[size],
                 slots=self.slots)
+            cipher._is_broadcast = self._is_broadcast
         
         cipher._transposed = self._transposed
         return cipher
@@ -1167,7 +1217,8 @@ class Ciphertensor[ctype]:
                 slots=self.slots,
                 _transposed=self._transposed,
                 _diagonal_contiguous=self._diagonal_contiguous,
-                _skinny=False)
+                _skinny=False,
+                _is_broadcast=self._is_broadcast)
             
             if not self._diagonal_contiguous or actual_tile_size >= self.shape[0]:
                 return ct
@@ -1180,7 +1231,7 @@ class Ciphertensor[ctype]:
             assert p % q == 0, f"Ciphertensor: cannot fold {p} diagonals into {q}: the ratio must be an integer"
             assert p <= self.slots >> 1, "Not implemented yet: reduce add of large skinny matrix"
             ct._diagonal_contiguous = False
-            patched_ct = ct.replicate(mpc, p << 1)
+            patched_ct = ct.replicate(mpc, p << 1, False, True)  # products of refreshed ciphertexts
             mpc.mhe.irotate(patched_ct._data, p)
             
             evaluator = mpc.mhe.crypto_params.evaluator
@@ -1192,7 +1243,7 @@ class Ciphertensor[ctype]:
                     shifted = [patched_ct._data[i + j * q].copy()]
                     Ciphertensor._rotate_slots(mpc, shifted, -j * q)
                     evaluator.add(folded, shifted[0], folded)
-                new_data.extend(mpc.mhe.mul([folded], mask))
+                new_data.extend(mpc.mhe.mul([folded], mask, self._is_broadcast))
             
             return Ciphertensor[ctype](
                 _data=new_data,
@@ -1200,7 +1251,8 @@ class Ciphertensor[ctype]:
                 slots=self.slots,
                 _transposed=self._transposed,
                 _diagonal_contiguous=True,
-                _skinny=True)
+                _skinny=True,
+                _is_broadcast=self._is_broadcast)
         
         if tile_size == 1:
             return self.reduce_add(mpc, keep_dims=False)
@@ -1219,9 +1271,13 @@ class Ciphertensor[ctype]:
         cipher = Ciphertensor._tile_sum(mpc, cipher, tile_size, min(size, self.slots) // tile_size)
         mask = mpc.mhe.enc_vector([(1.0 if i < tile_size else 0.0) for i in range(self.slots)], T=Plaintext)
         return Ciphertensor[ctype](
-            _data=mpc.mhe.mul([cipher], mask),
+            _data=mpc.mhe.mul([cipher], mask, self._is_broadcast),
             shape=[tile_size],
-            slots=self.slots)
+            slots=self.slots,
+            _transposed=False,
+            _diagonal_contiguous=False,
+            _skinny=False,
+            _is_broadcast=self._is_broadcast)
     
     def sum(self, mpc, axis: int) -> Ciphertensor[ctype]:
         assert mpc.pid, "Not implemented yet: sum at CP0"
@@ -1261,7 +1317,11 @@ class Ciphertensor[ctype]:
             return Ciphertensor[ctype](
                 _data=_sum_data,
                 shape=[self.shape[0]],
-                slots=self.slots)
+                slots=self.slots,
+                _transposed=False,
+                _diagonal_contiguous=False,
+                _skinny=False,
+                _is_broadcast=self._is_broadcast)
             
         raise ValueError("invalid axis for ciphertensor.sum")
     
@@ -1287,7 +1347,7 @@ class Ciphertensor[ctype]:
             other_shape = other.actual_shape
             assert self_shape[1] == other_shape[0], f"Ciphertensor: invalid matrix dimensions for matmul: {self_shape} x {other_shape}"
         
-            route, message = Ciphertensor._ct_matmul_route(self, other)
+            route, message = Ciphertensor._ct_matmul_route(self, other, mpc.default_allow_diagonal_results)
             if route == MATMUL_UNSUPPORTED:
                 raise ValueError(message)
             if mpc.pid == 0:
@@ -1315,9 +1375,10 @@ class Ciphertensor[ctype]:
             compile_error("Invalid matmul operand type")
 
     @staticmethod
-    def _ct_matmul_route(first, other) -> Tuple[int, str]:
+    def _ct_matmul_route(first, other, allow_diagonal: bool = True) -> Tuple[int, str]:
         # The kernel for first @ other (both Ciphertensors), from their logical shapes and layout flags, or
-        # MATMUL_UNSUPPORTED with the reason.
+        # MATMUL_UNSUPPORTED with the reason. Without allow_diagonal (mpc.default_allow_diagonal_results) a column-wise
+        # first factor takes TN where TNT would give a diagonal-encoded result (a result neither a row nor a column).
         first_shape = first.actual_shape
         other_shape = other.actual_shape
         p, m, q = first_shape[0], first_shape[1], other_shape[1]
@@ -1338,7 +1399,8 @@ class Ciphertensor[ctype]:
         if first._transposed and other._transposed:
             return (MATMUL_V2_T, "")
         if first._transposed:
-            return (MATMUL_TNT if Ciphertensor._tnt_supported(p, q, slots) else MATMUL_TN, "")
+            diagonal_result = p > 1 and q > 1
+            return (MATMUL_TNT if Ciphertensor._tnt_supported(p, q, slots) and (allow_diagonal or not diagonal_result) else MATMUL_TN, "")
         if other._transposed:
             return (MATMUL_V1, "")
         return (MATMUL_V2, "")
@@ -1384,7 +1446,9 @@ class Ciphertensor[ctype]:
             self.set(Ciphertensor[Plaintext].enc(mpc, self.decode(mpc, T=float)))
             return self
         
-        self.set(self.via_mpc(mpc, lambda stensor: stensor, S=Tuple[int, int]))
+        # A broadcast tensor is converted once, mirrored, and stays broadcast (set keeps the flag). Compute parties only,
+        # as every caller is: the flag decides, with no round with CP0
+        self.set(self.via_mpc(mpc, lambda stensor: stensor, mirrored=self._is_broadcast, agree_with_cp0=False, S=Tuple[int, int]))
         return self
     
     def get_actual(self, mpc) -> Ciphertensor[ctype]:
@@ -1405,7 +1469,7 @@ class Ciphertensor[ctype]:
         # The same values, row-wise: through MPC, as iget_actual converts in place. A diagonal-encoded tensor flagged
         # transposed went to diagonal_transpose, which gives its transpose (self.T), still diagonal-encoded: the
         # element-wise coercion then combined the wrong entries (H-55: W - X.T @ D with X.T @ D's shares so stored)
-        return self.via_mpc(mpc, lambda stensor: stensor, S=Tuple[int, int])
+        return self._converted(mpc, lambda stensor: stensor)
     
     def actual_transpose(self, mpc) -> Ciphertensor[ctype]:
         if self.ndim < 2:
@@ -1423,7 +1487,17 @@ class Ciphertensor[ctype]:
         if self._diagonal_contiguous:
             return self.diagonal_transpose(mpc)
         
-        return self.via_mpc(mpc, lambda stensor: stensor.T, S=Tuple[int, int])
+        return self._converted(mpc, lambda stensor: stensor.T)
+
+    def _converted(self, mpc, foo) -> Ciphertensor[ctype]:
+        # A layout conversion through MPC (foo on the shares). A broadcast tensor (the same ciphertexts at every compute
+        # party) is converted once, mirrored, into one result the same at every party, which stays broadcast; via_mpc's
+        # default mode converted every party's copy and each party kept its own (N - 1 conversions, copies apart:
+        # M-MHE-26). Per-party tensors convert each party's own, as before. Compute parties only, as every caller is:
+        # the flag decides, with no round with CP0.
+        out = self.via_mpc(mpc, foo, mirrored=self._is_broadcast, agree_with_cp0=False, S=Tuple[int, int])
+        out._is_broadcast = self._is_broadcast
+        return out
 
     def diagonal_transpose(self, mpc):
         assert self._diagonal_contiguous, "Ciphertensor: diagonal transpose should be called only on diagonal-encoded ciphertensors"
@@ -1447,7 +1521,8 @@ class Ciphertensor[ctype]:
             slots=self.slots,
             _transposed=False,
             _diagonal_contiguous=True,
-            _skinny=(self._skinny ^ True) and self.shape[0] != self.shape[1])
+            _skinny=(self._skinny ^ True) and self.shape[0] != self.shape[1],
+            _is_broadcast=self._is_broadcast)
     
     def diagonal_contig(self, mpc) -> Ciphertensor[ctype]:
         if self.ndim < 2 or self._diagonal_contiguous:
@@ -1458,7 +1533,7 @@ class Ciphertensor[ctype]:
             # TODO: Read dtype from self (add dtype static to Ciphertensor class)
             return Ciphertensor[Plaintext].enc(mpc, actual_plain, encoding=ENC_DIAG)
         
-        diag_ct = self.via_mpc(mpc, lambda stensor: stensor.diagonal_contig(), S=Tuple[int, int])
+        diag_ct = self._converted(mpc, lambda stensor: stensor.diagonal_contig())
         diag_ct._diagonal_contiguous = True
         
         m, n = self.actual_shape
@@ -1466,14 +1541,28 @@ class Ciphertensor[ctype]:
 
         return diag_ct
     
-    def via_mpc[S](self, mpc, foo, *args, mirrored=False, exclude_parties=Set[int]()):
+    def via_mpc[S](self, mpc, foo, *args, mirrored=False, exclude_parties=Set[int](), agree_with_cp0: bool = True):
+        # foo runs on shares (its MPC protocol may need CP0, which deals randomness). The default mode switches every
+        # compute party's tensor in turn (N - 1 switches) and gives each party its own result back; mirrored switches a
+        # tensor that every compute party holds alike (an aggregate) once, into a result the same at every party. In the
+        # default mode a tensor flagged broadcast takes the mirrored way, as its copies, switched apart, came back as
+        # different ciphertexts that a decryption with source -1 cannot combine (L-274). CP0 runs the MPC side but cannot
+        # see the flag, so the hub sends it to every party, CP0 included, in one small round (the user's choice,
+        # 2026-11-18); every party calls via_mpc then. A caller at the compute parties alone passes agree_with_cp0=False,
+        # and mirrored as it knows it. With exclude_parties there is no round, and each party's tensor is switched apart
+        # (no caller passes it).
+        if not mirrored and agree_with_cp0 and not exclude_parties:
+            mirrored = Ciphertensor._hub_flag(mpc, self._is_broadcast)
         if mirrored:
             # The same ciphertexts at every compute party (an aggregate): converted once. CP0's conversion is a
             # placeholder with the result's shape and layout flags, as in the default mode.
             stensor = self.to_sharetensor(mpc, modulus=mpc.default_mpc_modulus, source_pid=-1, S=S, dtype=float)
             mpc_output = foo(stensor, *args)
-            return mpc_output.to_ciphertensor(mpc)
-        
+            out = mpc_output.to_ciphertensor(mpc)
+            # Switched back for every compute party (target -1): the same ciphertexts at every party
+            out._is_broadcast = True
+            return out
+
         ctensors = mpc.comms.collect(self, exclude_parties=exclude_parties)
         processed_ctensors = {}
 
@@ -1483,7 +1572,7 @@ class Ciphertensor[ctype]:
 
             ctensor = ctensors[i] if mpc.pid else self
             # Collected from its holder: the same ciphertexts at every compute party
-            stensor = ctensor.to_sharetensor(mpc, modulus=mpc.default_mpc_modulus, source_pid=-1, S=S, dtype=float, copies_identical=True)
+            stensor = ctensor.to_sharetensor(mpc, modulus=mpc.default_mpc_modulus, source_pid=-1, S=S, dtype=float)
             stensor = foo(stensor, *args)
             processed_ctensors[i + 1] = stensor.to_ciphertensor(mpc)
         
@@ -1496,8 +1585,17 @@ class Ciphertensor[ctype]:
 
         if mpc.pid in exclude_parties:
             return self
-        
+
         return processed_ctensors[mpc.pid]
+
+    @staticmethod
+    def _hub_flag(mpc, flag: bool) -> bool:
+        # The hub's flag, sent to every other party, CP0 included (one round): every party calls it
+        hub = mpc.comms.hub_pid
+        if mpc.pid == hub:
+            mpc.comms.send_to_all_from(int(flag), hub, include_trusted_dealer=True)
+            return flag
+        return bool(mpc.comms.receive_as_jar(hub, int))
 
     def get_matmul_cost(self, other) -> float:
         # The cost of the route matmul takes (inf where it raises), from public shapes and flags only
@@ -1800,11 +1898,16 @@ class Ciphertensor[ctype]:
 
     def _rows_view(self) -> Ciphertensor[ctype]:
         # The stored rows (diagonals, or columns of a lazily transposed tensor) as a plain row-wise tensor over the
-        # same ciphertexts: no copy, no layout flags, so the caller's flags are never touched
+        # same ciphertexts: no copy, no layout flags, so the caller's flags are never touched; a broadcast tensor's view
+        # stays broadcast (its replicate refreshes once for every party)
         return Ciphertensor[ctype](
             _data=self._data,
             shape=self.shape.copy(),
-            slots=self.slots)
+            slots=self.slots,
+            _transposed=False,
+            _diagonal_contiguous=False,
+            _skinny=False,
+            _is_broadcast=self._is_broadcast)
 
     def _irotate_raw(self, step: int):
         assert self.ndim > 1, "Ciphertensor: cannot irotate raw from one-dimensional ciphertensor"
@@ -1821,7 +1924,7 @@ class Ciphertensor[ctype]:
 
         # Every party routes, the trusted dealer included: the route depends on public data only, so CP0 joins a
         # via-MPC route, and for the others returns a placeholder with the result's shape and layout flags (H-17)
-        route = self._ndarray_matmul_route(other_shape, mpc.default_allow_mpc_switch, mpc.pid, debug)
+        route = self._ndarray_matmul_route(other_shape, mpc.default_allow_mpc_switch, mpc.default_allow_diagonal_results, mpc.pid, debug)
         if route == MATMUL_VIA_MPC:
             return self.via_mpc(mpc, lambda stensor: secure_operator.matmul(mpc, stensor, other), S=Tuple[int, int])
         if mpc.pid == 0:
@@ -1833,6 +1936,10 @@ class Ciphertensor[ctype]:
         elif route == MATMUL_TNT:
             return self._matmul_tnt(mpc, other, debug)
         elif route == MATMUL_V2_T:
+            # M2 multiplies a copy of each of self's stored rows, which it refreshes (self.T copies the ciphertexts): self
+            # is refreshed first, once and in place, in its own mode, so that no copy needs a refresh and the refresh
+            # stays with self (a column-wise partition at the bootstrap level took a council per product, every product)
+            mpc.mhe.refresh(self._data, self._is_broadcast, min_level_distance=1)
             return other.T._matmul_v2(mpc, self.T, debug).T
         elif route == MATMUL_V1:
             other_cipher = Ciphertensor[Plaintext].enc(mpc, other.T, encoding=ENC_ROW)
@@ -1845,9 +1952,11 @@ class Ciphertensor[ctype]:
         else:
             return self._matmul_bsgs(mpc, other, debug)
 
-    def _ndarray_matmul_route(self, other_shape: List[int], allow_mpc_switch: bool, pid: int, debug: Static[bool]) -> int:
+    def _ndarray_matmul_route(self, other_shape: List[int], allow_mpc_switch: bool, allow_diagonal: bool, pid: int, debug: Static[bool]) -> int:
         # The kernel for self @ (plaintext of other_shape): the cheapest within its domain, from public shapes, layout
-        # flags and allow_mpc_switch only, so every party takes the same one
+        # flags, allow_mpc_switch and allow_diagonal only, so every party takes the same one. Without allow_diagonal
+        # (mpc.default_allow_diagonal_results) a column-wise self takes M2 on the transposes (V2_T) where TNT would give a
+        # diagonal-encoded result.
         self_shape = self.actual_shape
         if self._diagonal_contiguous:
             p, m, q = self_shape[0], self_shape[1], other_shape[1]
@@ -1858,6 +1967,8 @@ class Ciphertensor[ctype]:
             return MATMUL_V3_11
 
         if self._transposed:
+            if not allow_diagonal and self_shape[0] > 1 and other_shape[1] > 1:
+                return MATMUL_V2_T
             transposed_costs = (
                 Ciphertensor._get_matmul_tnt_cost_by_shape(self_shape, other_shape, self.slots),
                 Ciphertensor._get_matmul_v2_t_cost_by_shape(self_shape, other_shape, self.slots))
@@ -1937,7 +2048,7 @@ class Ciphertensor[ctype]:
 
         if self.shape[1] < n:
             mpc.mhe.refresh(self._data, self._is_broadcast, min_level_distance=2)
-            replicated = self.replicate(mpc, n)
+            replicated = self.replicate(mpc, n, False, True)
         else:
             replicated = self.copy()
         # Double each row so slot rotations emulate cyclic rotation without masking.
@@ -1995,7 +2106,9 @@ class Ciphertensor[ctype]:
 
             new_data.extend(acc_total._data)
 
-        mpc.mhe.refresh(new_data)
+        # Products of self's rows by public diagonals: the same at every party when self is (an aggregate), refreshed in
+        # the broadcast mode then (M-MHE-26)
+        mpc.mhe.refresh(new_data, self._is_broadcast)
 
         result = Ciphertensor[ctype](
             _data=new_data,
@@ -2036,12 +2149,12 @@ class Ciphertensor[ctype]:
                 reduction = self._get_rows_raw(i).mul(mpc, other._get_rows_raw(j)).reduce_add(mpc)
 
                 if reduction.shape[0] < result_width:
-                    reduction = reduction.replicate(mpc, result_width)
+                    reduction = reduction.replicate(mpc, result_width, False, True)  # reduce_add's refreshed product
 
                 target_cipher = new_row._data[result_columns[j] // self.slots]
                 mpc.mhe.crypto_params.evaluator.add(
                     target_cipher,
-                    mpc.mhe.mul([reduction._data[0]], masks[j])[0],
+                    mpc.mhe.mul([reduction._data[0]], masks[j], reduction._is_broadcast)[0],
                     target_cipher)
                 if debug: print(f"CP{mpc.pid}:\tCiphertensor M1 matmul: {i + 1}/{self_shape[0]} -- {j + 1}/{other_shape[0]}")
             if debug: print(f"CP{mpc.pid}:\t----------------------")
@@ -2119,7 +2232,7 @@ class Ciphertensor[ctype]:
         replicate_self = self
         if replicated_width > m:
             mpc.mhe.refresh(self._data, self._is_broadcast, min_level_distance=2)
-            replicate_self = self.replicate(mpc, replicated_width)
+            replicate_self = self.replicate(mpc, replicated_width, False, True)
         mpc.mhe.refresh(replicate_self._data, self._is_broadcast, min_level_distance=2)
         if isinstance(other_diag, Ciphertensor[Ciphertext]):
             mpc.mhe.refresh(other_diag._data, other_diag._is_broadcast)
@@ -2235,7 +2348,12 @@ class Ciphertensor[ctype]:
             _skinny=False)
 
         if other_actual_shape[1] < replicate_self.shape[1]:
-            return new_ciphertensor.reduce_add_tiled(mpc, other_actual_shape[1])
+            # The products of two broadcast operands are the same at every party: the tiles' masks refresh once for every
+            # party (the result itself is left unflagged, as the other kernels leave theirs)
+            new_ciphertensor._is_broadcast = self._is_broadcast and Ciphertensor._operand_broadcast(other)
+            folded = new_ciphertensor.reduce_add_tiled(mpc, other_actual_shape[1])
+            folded._is_broadcast = False
+            return folded
         
         return new_ciphertensor
 
@@ -2350,7 +2468,7 @@ class Ciphertensor[ctype]:
         replicate_self = self_rows
         if width + diag_count - 1 > n:
             mpc.mhe.refresh(self._data, self._is_broadcast, min_level_distance=2)
-            replicate_self = self_rows.replicate(mpc, width + diag_count - 1)
+            replicate_self = self_rows.replicate(mpc, width + diag_count - 1, False, True)
         mpc.mhe.refresh(replicate_self._data, self._is_broadcast, min_level_distance=2)
 
         # B's rows over the result's width. A plaintext B is replicated in the clear and encoded row-wise whatever the
@@ -2364,7 +2482,7 @@ class Ciphertensor[ctype]:
             other_rows = other
             if q < width:
                 mpc.mhe.refresh(other._data, other._is_broadcast, min_level_distance=2)
-                other_rows = other.replicate(mpc, width)
+                other_rows = other.replicate(mpc, width, False, True)
             mpc.mhe.refresh(other_rows._data, other._is_broadcast)
         
         evaluator = mpc.mhe.crypto_params.evaluator
@@ -2476,7 +2594,7 @@ class Ciphertensor[ctype]:
                     elif self._transposed and other.ndim == 2:
                         # Straight into self's column-wise storage: one conversion through MPC (get_actual's to row-wise
                         # storage and then actual_transpose's took two)
-                        pt = other.via_mpc(mpc, lambda stensor: stensor.T, S=Tuple[int, int])
+                        pt = other._converted(mpc, lambda stensor: stensor.T)
                         pt._transposed = True
                     else:
                         pt = other.get_actual(mpc)
@@ -2544,7 +2662,7 @@ class Ciphertensor[ctype]:
         else:
             rotated_other = other.shift(mpc, slots - offset)
             mask = mpc.mhe.enc_vector([(1.0 if i < offset else 0.0) for i in range(slots)], T=Plaintext)
-            mpc.mhe.imul([_data[-1]], mask)
+            mpc.mhe.imul([_data[-1]], mask, first._is_broadcast)
             # TODO: mpc.mhe.iadd is buggy (possibly due to different scales/levels of the operands)
             mpc.mhe.iadd([_data[-1]], [rotated_other._data[0]])
             _data.extend(rotated_other._data[1:])
@@ -2557,7 +2675,11 @@ class Ciphertensor[ctype]:
         return Ciphertensor[ctype](
             _data=_data,
             shape=[first.shape[0] + other.shape[0]],
-            slots=slots)
+            slots=slots,
+            _transposed=False,
+            _diagonal_contiguous=False,
+            _skinny=False,
+            _is_broadcast=first._is_broadcast and other._is_broadcast)
     
     def _iconcat_axis_1_raw(self, mpc, other):
         assert self.shape[0] == other.shape[0], "Ciphertensor: shapes missmatch while concatenating along axis 1"
@@ -3066,11 +3188,16 @@ class Ciphertensor[ctype]:
         
         shape, start, stop = self._adjust_row_indices(indices)
         
+        # Stored rows of a broadcast tensor are broadcast when every party takes the same ones, as with _getitem; a caller
+        # that takes other rows at each party clears the flag (MPPAligner's revert cuts per-party results, never flagged)
         return Ciphertensor[ctype](
             _data=self._data[start * self._chunk_size:stop * self._chunk_size],
             shape=shape,
             slots=self.slots,
-            _transposed=False if isinstance(indices, int) else self._transposed)
+            _transposed=False if isinstance(indices, int) else self._transposed,
+            _diagonal_contiguous=False,
+            _skinny=False,
+            _is_broadcast=self._is_broadcast)
     
     def _get_rows_nil_ideal(self, indices) -> Ciphertensor[ctype]:
         assert self.ndim > 1, "Ciphertensor: cannot get rows from one-dimensional ciphertensor"

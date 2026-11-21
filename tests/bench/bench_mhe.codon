@@ -148,10 +148,16 @@ CASES = [
     ("mp.mpp.align_ratios_enc", "", "MPP.align_ratios of row-wise encrypted 2x8x64 partitions to other ratios (4 rows move)"),
     ("mp.mpp.align_ratios_cw_enc", "", "MPP.align_ratios of column-wise encrypted 2x8x64 partitions to other ratios (4 rows move by masked moves, one council)"),
     ("mp.mpu.sub_diag_t", "", "MPU(additive) W - X.T @ D, 8x6: X.T @ D's shares diagonal-encoded and transposed, converted through MPC to W's column-wise encryption (Sequential's first-layer update)"),
-    ("mp.mpp.matmul_tnt_col", "", "MPP A.T @ y in the clear, 2x8x64 and 2x8x1 partitions: a column-wise product, its sum redistributed by rows through MPC"),
-    ("mp.mpp.matmul_tnt_col_enc", "", "MPP A.T @ y, both encrypted, 2x8x64 and 2x8x1 partitions: a column-wise product, its sum redistributed by rows through MPC"),
-    ("mp.mpp.matmul_tnt_cw_enc", "", "MPP A.T @ B, both encrypted, 2x8x64 and 2x8x3 partitions: the M2 kernel's column-wise product, its sum redistributed by rows through MPC"),
+    ("mp.mpp.matmul_tnt_col", "", "MPP A.T @ y in the clear, 2x8x64 and 2x8x1 partitions: a column-wise product, its sum split by rows in HE (masked moves)"),
+    ("mp.mpp.matmul_tnt_col_enc", "", "MPP A.T @ y, both encrypted, 2x8x64 and 2x8x1 partitions: a column-wise product, its sum split by rows in HE (masked moves)"),
+    ("mp.mpp.matmul_tnt_cw_enc", "", "MPP A.T @ B, both encrypted, 2x8x64 and 2x8x3 partitions: the M2 kernel's column-wise product, its sum split by rows in HE (masked moves)"),
     ("e2e.linreg.mpp_16x15", "", "LinReg BGD fit (2 epochs) on MPP partitions with MPP weights + reveal, 16x15 (X.T @ y column-wise)"),
+    ("mp.mpp.matmul_public_cw_uneq", "", "MPP X @ M, X 16x16 encrypted column-wise at unequal ratios (4 and 12 rows), M public 16x8: each party's product cut back to its rows"),
+    ("mp.mpp.matmul_ntt_cw_uneq", "", "MPP X @ G.T, X and G 16x3 encrypted column-wise at unequal ratios (4 and 12 rows): each party's product cut back to its rows"),
+    ("mp.mpa.sum_rows_aggregate", "", "MPA.sum(1) of an MPA that is only an aggregate, 16x64, at the bootstrap level (its mask products refreshed)"),
+    ("mp.mpa.dot_aggregate", "", "MPA.dot(1) of an MPA that is only an aggregate, 16x64, one level above the bootstrap level"),
+    ("mp.mpu.mpa_times_mpp", "", "MPU(additive aggregate 16x8) * MPU(partition 2x8x8 encrypted, at the bootstrap level): the joined partitions refreshed"),
+    ("ct.add_broadcast_layouts", "", "a column-wise aggregate 16x8 plus a row-wise aggregate 16x8: the row-wise one converted to column-wise through MPC"),
 ]
 
 handle_list_flag("mhe", CASES)
@@ -1745,7 +1751,7 @@ def bench_mp_arith(mpc, b: Bench):
     if b.any_selected("mp.mpp.matmul_tnt_col") or b.any_selected("mp.mpp.matmul_tnt_cw_enc"):
         # A.T @ B whose per-party products come out column-wise: a column (B = y, as LinReg's X.T @ y; a column encrypts
         # as one transposed row even from data in the clear) and B with 3 columns (encrypted factors: the M2 kernel's
-        # transposed result). The products' sum is redistributed by rows among the compute parties, through MPC.
+        # transposed result). The products' sum is split by rows among the compute parties in HE (masked moves).
         TA = array(shared_float_matrix(mpc, rows, cols, -1.0, 1.0))
         Ty = array(shared_float_matrix(mpc, rows, 1, -1.0, 1.0))
         TB3 = array(shared_float_matrix(mpc, rows, 3, -1.0, 1.0))
@@ -1822,6 +1828,154 @@ def bench_mp_arith(mpc, b: Bench):
             b.report(f"{rows}x{lcols};epochs={epochs}", t, max_abs_err_2d(wv, ref))
 
 
+def bench_mp_colwise(mpc, b: Bench):
+    # Column-wise products at unequal ratios (MPPAligner cuts each party's product back to its rows) and operations on
+    # aggregates (one collective bootstrap per ciphertext for every party, and conversions made once); the bootstraps
+    # per repetition are reported with the parameters
+    n_cp = mpc.comms.number_of_parties - 1
+    per = 8
+    rows = per * n_cp
+    uneq = [per for _ in range(n_cp)]
+    uneq[0] -= 4
+    uneq[1] += 4
+
+    if b.any_selected("mp.mpp.matmul_public_cw_uneq") or b.any_selected("mp.mpp.matmul_ntt_cw_uneq"):
+        X = array(shared_float_matrix(mpc, rows, 16, -1.0, 1.0))
+        M = array(shared_float_matrix(mpc, 16, 8, -1.0, 1.0))
+        X3 = array(shared_float_matrix(mpc, rows, 3, -1.0, 1.0))
+        G3 = array(shared_float_matrix(mpc, rows, 3, -1.0, 1.0))
+        start = uneq[:mpc.pid - 1].sum() if mpc.pid else 0
+        stop = start + uneq[mpc.pid - 1] if mpc.pid else rows
+
+        if b.want(mpc, "mp.mpp.matmul_public_cw_uneq"):
+            cw = MPP(mpc, X[start:stop].copy() if mpc.pid else X).T
+            cw.encrypt()
+            ex = cw.T
+            out = ex @ M
+            t = Timer(b.reps(5))
+            while t.next():
+                t.begin(mpc)
+                out = ex @ M
+                t.end(mpc)
+            rv = out.reveal()
+            if mpc.pid:
+                b.report(f"({rows}x16 at {uneq})@(16x8);column-wise", t, max_abs_err_2d(rv, X @ M))
+
+        if b.want(mpc, "mp.mpp.matmul_ntt_cw_uneq"):
+            cx = MPP(mpc, X3[start:stop].copy() if mpc.pid else X3).T
+            cx.encrypt()
+            cg = MPP(mpc, G3[start:stop].copy() if mpc.pid else G3).T
+            cg.encrypt()
+            ex3 = cx.T
+            eg3 = cg.T
+            out = ex3 @ eg3.T
+            t = Timer(b.reps(3))
+            while t.next():
+                t.begin(mpc)
+                out = ex3 @ eg3.T
+                t.end(mpc)
+            rv = out.reveal()
+            if mpc.pid:
+                b.report(f"({rows}x3 at {uneq})@({rows}x3).T;column-wise", t, max_abs_err_2d(rv, X3 @ G3.T))
+
+    if b.any_selected("mp.mpa.sum_rows_aggregate") or b.any_selected("mp.mpa.dot_aggregate"):
+        A = array(shared_float_matrix(mpc, rows, 64, -1.0, 1.0))
+        lb = mpc.mhe.bootstrap_min_level
+
+        if b.want(mpc, "mp.mpa.sum_rows_aggregate"):
+            out = MPA[Tuple[int], float](mpc)
+            boots = 0
+            t = Timer(b.reps(5))
+            while t.next():
+                m = MPA(mpc, A if mpc.pid == 1 else zeros_like(A))
+                m.aggregate()
+                if mpc.pid:
+                    m._plain = ndarray[Tuple[int, int], float]()
+                    m._aggregate._data = mpc.mhe.drop_level(m._aggregate._data, lb)
+                before = mpc.mhe.stats.secure_bootstrap_count
+                t.begin(mpc)
+                out = m.sum(1)
+                t.end(mpc)
+                boots = mpc.mhe.stats.secure_bootstrap_count - before
+            rv = out.reveal()
+            if mpc.pid:
+                want = array([sum(A[i, j] for j in range(64)) for i in range(rows)])
+                b.report(f"{rows}x64;level={lb};bootstraps={boots}", t, max_abs_err_1d(rv.tolist(), want.tolist()))
+
+        if b.want(mpc, "mp.mpa.dot_aggregate"):
+            out = MPA[Tuple[int], float](mpc)
+            boots = 0
+            t = Timer(b.reps(5))
+            while t.next():
+                m = MPA(mpc, A if mpc.pid == 1 else zeros_like(A))
+                m.aggregate()
+                if mpc.pid:
+                    m._plain = ndarray[Tuple[int, int], float]()
+                    m._aggregate._data = mpc.mhe.drop_level(m._aggregate._data, lb + 1)
+                before = mpc.mhe.stats.secure_bootstrap_count
+                t.begin(mpc)
+                out = m.dot(1)
+                t.end(mpc)
+                boots = mpc.mhe.stats.secure_bootstrap_count - before
+            rv = out.reveal()
+            if mpc.pid:
+                want = array([sum(A[i, j] * A[i, j] for j in range(64)) for i in range(rows)])
+                b.report(f"{rows}x64;level={lb + 1};bootstraps={boots}", t, max_abs_err_1d(rv.tolist(), want.tolist()))
+
+    if b.want(mpc, "mp.mpu.mpa_times_mpp"):
+        A8 = array(shared_float_matrix(mpc, rows, 8, -1.0, 1.0))
+        B8 = array(shared_float_matrix(mpc, rows, 8, -1.0, 1.0))
+        lb = mpc.mhe.bootstrap_min_level
+        out = MPU(mpc, A8 if mpc.pid == 1 else zeros_like(A8), "additive")
+        boots = 0
+        t = Timer(b.reps(5))
+        while t.next():
+            ua = MPU(mpc, A8 if mpc.pid == 1 else zeros_like(A8), "additive")
+            ua._mpa.aggregate()
+            if mpc.pid:
+                ua._mpa._plain = ndarray[Tuple[int, int], float]()
+            ub = MPU(mpc, partition_of(mpc, B8, per), "partition")
+            ub._mpp.encrypt()
+            if mpc.pid:
+                ub._mpp._encryption_unified._data = mpc.mhe.drop_level(ub._mpp._encryption_unified._data, lb)
+            before = mpc.mhe.stats.secure_bootstrap_count
+            t.begin(mpc)
+            out = ua * ub
+            t.end(mpc)
+            boots = mpc.mhe.stats.secure_bootstrap_count - before
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"{rows}x8;level={lb};bootstraps={boots}", t, max_abs_err_2d(rv, A8 * B8))
+
+    if b.want(mpc, "ct.add_broadcast_layouts"):
+        C8 = array(shared_float_matrix(mpc, rows, 8, -1.0, 1.0))
+        share = C8 if mpc.pid == 1 else zeros_like(C8)
+        out = Ciphertensor[Ciphertext]()
+        cw = Ciphertensor[Ciphertext]()
+        rw = Ciphertensor[Ciphertext]()
+        boots = 0
+        switches = 0
+        before = 0
+        switched = 0
+        t = Timer(b.reps(5))
+        while t.next():
+            if mpc.pid:
+                cw = Ciphertensor[Ciphertext].enc(mpc, share, encoding=ENC_COL).aggregate(mpc)
+                rw = Ciphertensor[Ciphertext].enc(mpc, share, encoding=ENC_ROW).aggregate(mpc)
+                before = mpc.mhe.stats.secure_bootstrap_count
+                switched = mpc.mhe.stats.secure_mhe_mpc_switch_count
+            t.begin(mpc)
+            if mpc.pid:
+                out = cw.add(mpc, rw)
+            t.end(mpc)
+            if mpc.pid:
+                boots = mpc.mhe.stats.secure_bootstrap_count - before
+                switches = mpc.mhe.stats.secure_mhe_mpc_switch_count - switched
+        if mpc.pid:
+            rv = out.reveal(mpc, source_pid=-1, T=float)
+            b.report(f"{rows}x8;bootstraps={boots};switched_ciphertexts={switches}", t, max_abs_err_2d(rv, C8 + C8))
+
+
 @main
 def bench_mhe_main(mpc):
     b = Bench("mhe", mpc.pid, CASES)
@@ -1843,6 +1997,7 @@ def bench_mhe_main(mpc):
     bench_mp(mpc, b)
     bench_e2e(mpc, b)
     bench_mp_arith(mpc, b)
+    bench_mp_colwise(mpc, b)
     b.finish(mpc)
 
 
