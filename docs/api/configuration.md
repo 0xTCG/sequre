@@ -15,7 +15,7 @@ Sequre's behavior is controlled through compile-time constants and environment v
 
 | Variable | Default | Description |
 |---|---|---|
-| `SEQURE_GMP_PATH` | _(auto-detected)_ | Path to GMP shared library (`.so` on Linux, `.dylib` on macOS) |
+| `SEQURE_GMP_PATH` | _(auto-detected)_ | Path to GMP shared library (`.so` on Linux, `.dylib` on macOS). Unset, the runtime takes the copy bundled with the plugin (`<plugin>/lib`, located when the program is compiled, so built binaries find it too), then a system library (see [libgmp](../user-guide/troubleshooting.md#libgmp-gmp)). |
 | `SEQURE_OPENSSL_PATH` | _(auto-detected)_ | Path to OpenSSL `libssl` |
 | `SEQURE_LIBCRYPTO_PATH` | _(auto-detected)_ | Path to OpenSSL `libcrypto` |
 
@@ -43,6 +43,10 @@ See [TLS configuration](../user-guide/running-distributed.md#tls-configuration).
 | Variable | Default | Description |
 |---|---|---|
 | `CODON_BIN` | _(none)_ | Override the path to the `codon` binary used by the launcher |
+| `CODON_PYTHON` | _(detected by the launcher)_ | Path to the Python shared library, for Python interop. The launcher detects it through `python3` for `sequre run` and `sequre build`; a built binary that uses Python needs it set (see [libpython](../user-guide/troubleshooting.md#libpython-for-python-interop)). |
+| `SEQURE_PLUGIN_PATH` | `<prefix>/lib/codon/plugins/sequre` | The Sequre plugin directory the launcher passes to `codon` (must hold `plugin.toml`) |
+| `SEQURE_ALIGN_SHIM` | `<prefix>/lib/sequre_align64.so` | x86-64 Linux: the alignment shim the launcher preloads for `sequre run` and links into the binaries of `sequre build` (see [Segmentation fault in MHE code](../user-guide/troubleshooting.md#segmentation-fault-in-mhe-code-x86-64)). A built binary loads a file of the same name in codon's `lib` directory instead, if there is one (the launcher warns). |
+| `SEQURE_NO_ALIGN_SHIM` | _(unset)_ | `1`: the launcher neither preloads nor links the alignment shim |
 
 ## Compile-time constants
 

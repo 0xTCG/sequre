@@ -26,8 +26,9 @@
 #                     send fails and stops CP0 (a failed SSL_write used to count as a success)
 #
 # Needs bash, openssl, and the parties' ports free on 127.0.0.1: 9001-9006 (COMMUNICATION_PORT + 1 to + 6). The program
-# runs MHE code, which needs Sequre's alignment shim on some x86-64 machines: if LD_PRELOAD is unset, the script
-# preloads $HOME/.sequre/lib/sequre_align64.so when it exists, as the sequre launcher does. About 3 minutes.
+# runs MHE code, which needs Sequre's alignment shim on x86-64: `sequre build` links it into the binary; for a binary
+# built without it (--binary, or an older launcher), the script preloads $HOME/.sequre/lib/sequre_align64.so when
+# LD_PRELOAD is unset and the file exists (harmless on top of a linked shim). About 3 minutes.
 
 set -uo pipefail
 
@@ -86,7 +87,7 @@ echo "Work directory: $WORK"
 if [[ -z "$BIN" ]]; then
     command -v sequre > /dev/null || { echo "test_tls.sh: sequre is not on PATH (or pass --binary)" >&2; exit 2; }
     echo "Building tests/network/tls_parties.codon ..."
-    # Built from the work directory: the launcher deletes the sock.* files of the directory it runs in
+    # Built from the work directory (launchers before this one deleted the sock.* files of the directory they ran in)
     if ! (cd "$WORK" && sequre build "$REPO/tests/network/tls_parties.codon" -o "$WORK/tls_parties" \
             > "$WORK/build.log" 2>&1); then
         echo "test_tls.sh: the build failed, see $WORK/build.log" >&2

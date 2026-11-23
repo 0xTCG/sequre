@@ -10,15 +10,20 @@
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/0xTCG/sequre/main/scripts/install.sh)"
 ```
 
-This installs Codon and Sequre to `~/.sequre` and adds it to your `PATH`.
+This installs Codon and Sequre to `~/.sequre` and offers to add it to your `PATH`. The installer downloads both archives and checks them before it unpacks either, so a failed download leaves an existing install as it was. Its environment variables: `SEQURE_INSTALL_DIR` (another install directory), `SEQURE_ARCHIVE` and `SEQURE_CODON_ARCHIVE` (a URL or a local file in place of the default downloads), and `SEQURE_UPDATE_PATH=yes` or `no` (answers the `PATH` question; with no terminal to ask on, the installer leaves `PATH` alone and says so).
 
 ??? note "Manual install"
     ```bash
     mkdir -p $HOME/.sequre
-    curl -L https://github.com/exaloop/codon/releases/download/v0.19.6/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz \
+    curl -fL https://github.com/exaloop/codon/releases/download/v0.19.6/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz \
       | tar zxvf - -C $HOME/.sequre --strip-components=1
-    curl -L https://github.com/0xTCG/sequre/releases/latest/download/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz \
+    curl -fL https://github.com/0xTCG/sequre/releases/latest/download/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz \
       | tar zxvf - -C $HOME/.sequre
+    # Linux x86_64 only: Codon's Ptr loads and stores must be unaligned (the x86-64 alignment workaround)
+    if [ "$(uname -s)-$(uname -m)" = "Linux-x86_64" ]; then
+      sed -i -E '/(^|[[:space:]])(load|store)[[:space:]]/ { /align/! { /%0$/ s/$/, align 1/ } }' \
+        $HOME/.sequre/lib/codon/stdlib/internal/types/ptr.codon
+    fi
     export PATH=$HOME/.sequre/bin:$PATH
     ```
 
@@ -100,6 +105,8 @@ sequre examples/addmul.codon --local
 sequre build examples/addmul.codon -o addmul
 ./addmul --local
 ```
+
+The binary runs without the launcher: on x86-64 Linux `sequre build` links Sequre's alignment shim into it, and the Sequre runtime finds the GMP library bundled with Sequre. A program that uses Python interop also needs `CODON_PYTHON` (the launcher sets it for `sequre run`; see [libpython](../user-guide/troubleshooting.md#libpython-for-python-interop)). The binary refers to Sequre's libraries by absolute path, so another machine that runs it needs Sequre installed at the same path (see [Running Distributed](../user-guide/running-distributed.md#manual-mode-mpc)).
 
 ## Release vs debug mode
 

@@ -27,7 +27,7 @@ Install Sequre (includes Codon):
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/0xTCG/sequre/develop/scripts/install.sh)"
 ```
 
-This installs to `~/.sequre` and adds it to your `PATH`. See [quickstart](https://0xtcg.github.io/sequre/getting-started/quickstart/) for manual install and building from source.
+This installs to `~/.sequre` and offers to add it to your `PATH`. See [quickstart](https://0xtcg.github.io/sequre/getting-started/quickstart/) for manual install and building from source.
 
 ### Run example
 
@@ -45,7 +45,7 @@ sequre build examples/addmul.codon -o addmul
 ./addmul --local
 ```
 
-> **Note:** Make sure to delete sockets (`rm sock.*`) if running a **local run** pre-built binary. `sequre` command does this automatically, otherwise, but built binaries do not.
+> **Note:** A built binary runs without the `sequre` launcher: on x86-64 Linux, `sequre build` links Sequre's alignment shim into it, and it finds the GMP library bundled with Sequre itself. A program that uses Python interop also needs `CODON_PYTHON` (see [troubleshooting](https://0xTCG.github.io/sequre/user-guide/troubleshooting/#libpython-for-python-interop)). The binary refers to Sequre's libraries by absolute path: to run it on another machine, install Sequre there at the same path.
 
 ### Release vs debug mode
 
@@ -126,7 +126,7 @@ SEQURE_CP_IPS=192.168.0.1,192.168.0.2,192.168.0.3 sequre my_protocol.codon <pid>
 
 The [MPC instance](https://0xtcg.github.io/sequre/api/mpc-instance/) provides access to MPC/MHE essentials (party state, PRG streams, network sockets, and sub-modules for arithmetic, fixed-point, boolean, polynomial, and MHE operations etc.).
 
-> **Note:** When working with many local runs, the socket files (`sock.*`) — needed for local communication — may collide between runs and cause connection issues. Delete stale files with `rm sock.*`.
+> **Note:** Local runs connect their parties through UNIX socket files (`sock.<port>`) in the working directory. Each run removes its files once its parties have connected, and a run that crashed before that leaves files the next run replaces. Two local runs in the same directory at the same time would use the same files: start them in different directories.
 
 Distributed mode requires mutual TLS certificates: one per party, from a CA all parties trust, naming its party (`cp<pid>` by default). Sequre handles MHE/MPC key management automatically, but **does not handle TLS certificate creation/maintenance**. For testing, generate test certificates with `scripts/generate_certs.sh`. For production, use a secure CA — see [TLS configuration](https://0xTCG.github.io/sequre/user-guide/running-distributed/#tls-configuration).
 
