@@ -59,12 +59,14 @@ fail() {
 
 # run_timeout <seconds> <command...>: runs the command in a process group of its own (a local run forks one process
 # per party) and kills the group when the time is up. The watchdog has a group of its own too, so that killing it
-# also ends its sleep.
+# also ends its sleep. The command keeps the caller's standard input (<&0): bash gives a background command in a
+# subshell /dev/null instead, even with job control on (bash 3.2, macOS's /bin/bash, does so in a pipeline too, which
+# fed the installer of `installer-no-tty` an empty script).
 run_timeout() {
   local limit=$1 pid dog rc
   shift
   set -m
-  "$@" &
+  "$@" <&0 &
   pid=$!
   (
     sleep "$limit"
@@ -123,7 +125,7 @@ echo "a,b" > "$D/sock.csv"
 echo stray > "$D/sock.9999"
 (cd "$D" && "$SEQURE" --help > help.txt 2>&1)
 (cd "$D" && run_timeout "$TIMEOUT" env CODON_DEBUG=0 "$SEQURE" build "$REPO/examples/addmul.codon" -o "$D/addmul" \
-  > build.txt 2>&1)
+  > build.txt 2>&1 < /dev/null)
 if [ "$(cat "$D/sock.csv" 2> /dev/null)" = "a,b" ] && [ "$(cat "$D/sock.9999" 2> /dev/null)" = stray ]; then
   ok launcher-files "sock.csv and sock.9999 kept"
 else
@@ -135,7 +137,7 @@ D=$WORK/run
 mkdir -p "$D"
 echo "a,b" > "$D/sock.csv"
 (cd "$D" && run_timeout "$TIMEOUT" env SEQURE_CP_COUNT=3 "$SEQURE" run "$REPO/examples/addmul.codon" --local \
-  > log.txt 2>&1)
+  > log.txt 2>&1 < /dev/null)
 rc=$?
 if [ $rc -ne 0 ] || ! check_results "$D/log.txt" 3; then
   tail -20 "$D/log.txt" | sed 's/^/      /'
@@ -151,7 +153,7 @@ D=$WORK/build
 mkdir -p "$D"
 BIN=$D/addmul
 (cd "$D" && run_timeout "$TIMEOUT" env CODON_DEBUG=0 SEQURE_TRACE_ARGS=1 "$SEQURE" build "$REPO/examples/addmul.codon" \
-  -o "$BIN" > build.txt 2>&1)
+  -o "$BIN" > build.txt 2>&1 < /dev/null)
 rc=$?
 if [ $rc -ne 0 ] || [ ! -x "$BIN" ]; then
   tail -20 "$D/build.txt" | sed 's/^/      /'
@@ -181,7 +183,7 @@ if [ -n "$BIN" ]; then
       darwin) trace=(DYLD_PRINT_LIBRARIES=1) ;;
     esac
     (cd "$D" && run_timeout "$TIMEOUT" env -i HOME="$HOME" PATH=/usr/bin:/bin SEQURE_CP_COUNT=$n ${trace[@]+"${trace[@]}"} \
-      "$BIN" --local > log.txt 2>&1)
+      "$BIN" --local > log.txt 2>&1 < /dev/null)
     rc=$?
     gmp=$(cat "$D"/ld.* "$D/log.txt" 2> /dev/null | grep -o -E '/[^ ]*libgmp[^ ]*' | sort -u | tr '\n' ' ')
     if [ $rc -ne 0 ] || ! check_results "$D/log.txt" $n; then
@@ -226,7 +228,8 @@ for i in range(1, N, 2):
             break
 print("damaged:", damaged)
 EOF
-  (cd "$D" && run_timeout "$TIMEOUT" env CODON_DEBUG=0 "$SEQURE" build -release shim.codon -o shim > build.txt 2>&1)
+  (cd "$D" && run_timeout "$TIMEOUT" env CODON_DEBUG=0 "$SEQURE" build -release shim.codon -o shim > build.txt 2>&1 \
+    < /dev/null)
   # Preloaded as well as linked: the check is about the shim, whichever way a binary gets it
   out=$(cd "$D" && env -i PATH=/usr/bin:/bin LD_PRELOAD="$PREFIX/lib/sequre_align64.so" ./shim 2>&1)
   if [ "$out" = "damaged: 0" ]; then
@@ -252,11 +255,11 @@ def run(mpc, n):
 run(len(s'ACGTACGT'))
 EOF
   (cd "$D" && run_timeout "$TIMEOUT" env CODON_DEBUG=0 "$SEQURE" build -release -plugin seq seq.codon -o seqbin \
-    > build.txt 2>&1)
+    > build.txt 2>&1 < /dev/null)
   rc=$?
   if [ $rc -eq 0 ]; then
     (cd "$D" && run_timeout "$TIMEOUT" env -i HOME="$HOME" PATH=/usr/bin:/bin ./seqbin --local --skip-mhe-setup \
-      > log.txt 2>&1)
+      > log.txt 2>&1 < /dev/null)
   fi
   if [ $rc -ne 0 ]; then
     tail -5 "$D/build.txt" | sed 's/^/      /'
@@ -332,7 +335,7 @@ if [ -n "$ARCHIVE" ]; then
   rc=$?
   if [ $rc -ne 0 ] || [ ! -x "$h/prefix/bin/sequre" ]; then
     tail -5 "$h/log.txt" | sed 's/^/      /'
-    fail installer-no-tty "exit status $rc"
+    fail installer-no-tty "exit status $rc$([ -x "$h/prefix/bin/sequre" ] || echo ', nothing installed')$([ -s "$h/log.txt" ] || echo ', no output')"
   elif [ "$(cat "$h/.bashrc")" != "# profile" ]; then
     fail installer-no-tty ".bashrc changed without being asked"
   elif ! grep -q 'No terminal to ask on' "$h/log.txt"; then
