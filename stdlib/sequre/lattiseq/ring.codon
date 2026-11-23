@@ -19,7 +19,7 @@ from pickler import pickle, unpickle
 from sequre.types.builtin import *
 from sequre.utils.utils import zeros_vec, zeros_mat, arange
 from sequre.constants import (
-    lattiseq_uint, lattiseq_int, SIMD_LANE_SIZE,
+    lattiseq_uint, lattiseq_int, lattiseq_crt_uint, SIMD_LANE_SIZE,
     LATTISEQ_INT_SIZE, NUM_THREADS, LATTISEQ_STANDARD_RING_ENUM,
     LATTISEQ_CONJUGATE_INVARIANT_RING_ENUM)
 
@@ -1555,7 +1555,7 @@ class Ring:
     # Output poly level must be equal or nb_rescales less than input level.
     def _mm_div_round_by_last_modulus_many_ntt_lvl(self, level: int, nb_rescales: int, p0: Poly, buff: Poly, p1: Poly):
         if nb_rescales == 0:
-            if p0 != p1:
+            if p0 is not p1:
                 p1._mm_set_coeffs(p0._mm_coeffs.copy())
         else:
             if nb_rescales > 1:
@@ -1578,24 +1578,59 @@ class Ring:
     # For example, if gap = 1, then all coefficients are reconstructed, while
     # if gap = 2 then only coefficients X^{2*i} are reconstructed.
     def poly_to_bigint_lvl(self, level: int, coeffs: list[list[u64]], gap: int, coeffs_bigint: list[lattiseq_uint]):
-        crt_reconstruction = list[lattiseq_uint](level + 1)
-        modulus_bigint = self.modulus_at_level[level]
+        modulus_bigint = self._modulus_bigint_at(level)
+        crt_reconstruction = self._crt_reconstruction(level, modulus_bigint)
 
+        i, j = 0, 0
+
+        coeffs_t = coeffs.transpose()
+        if self._crt_sum_fits(level):
+            while j < self.n:
+                coeffs_bigint[i] = lattiseq_uint(0)
+                for k in range(level + 1):
+                    coeffs_bigint[i] += coeffs_t[j][k].ext_to_lattiseq_uint() * crt_reconstruction[k]
+                coeffs_bigint[i] = coeffs_bigint[i].gmp_mod(modulus_bigint)
+                i, j = i + 1, j + gap
+        else:
+            modulus_wide = lattiseq_crt_uint(modulus_bigint)
+            crt_wide = [lattiseq_crt_uint(c) for c in crt_reconstruction]
+            while j < self.n:
+                acc = lattiseq_crt_uint(0)
+                for k in range(level + 1):
+                    acc += lattiseq_crt_uint(coeffs_t[j][k]) * crt_wide[k]
+                coeffs_bigint[i] = lattiseq_uint(acc.gmp_mod(modulus_wide))
+                i, j = i + 1, j + gap
+
+    # _modulus_bigint_at returns Q, the product of the moduli up to level: modulus_at_level holds only the levels whose
+    # Q fits the bigint in use, and a level above them is refused with a clear error instead of an IndexError.
+    def _modulus_bigint_at(self, level: int) -> lattiseq_uint:
+        if level >= len(self.modulus_at_level):
+            raise ValueError(
+                f"Ring: the product of the moduli up to level {level} does not fit the {LATTISEQ_INT_SIZE}-bit integer "
+                f"in use (levels up to {len(self.modulus_at_level) - 1} do): no CRT reconstruction at this level")
+        return self.modulus_at_level[level]
+
+    # _crt_reconstruction returns the CRT basis (Q / q_k) * ((Q / q_k)^-1 mod q_k), each element below Q.
+    def _crt_reconstruction(self, level: int, modulus_bigint: lattiseq_uint) -> list[lattiseq_uint]:
+        crt_reconstruction = list[lattiseq_uint](level + 1)
         for i in range(level + 1):
             qi = self.modulus[i]
             qib = qi.ext_to_lattiseq_uint()
             crt_reconstruction.append(modulus_bigint.gmp_floordiv_ui(qi))
             crt_reconstruction[i] *= crt_reconstruction[i].gmp_mod_inv(qib)
+        return crt_reconstruction
 
-        i, j = 0, 0
-
-        coeffs_t = coeffs.transpose()
-        while j < self.n:
-            coeffs_bigint[i] = lattiseq_uint(0)
-            for k in range(level + 1):
-                coeffs_bigint[i] += coeffs_t[j][k].ext_to_lattiseq_uint() * crt_reconstruction[k]
-            coeffs_bigint[i] = coeffs_bigint[i].gmp_mod(modulus_bigint)
-            i, j = i + 1, j + gap
+    # _crt_sum_fits tells whether the CRT sum, level + 1 products c_k * crt_k each below q_k * Q, fits the bigint in
+    # use, with a bit to spare for the sign (the centered variant sums in the signed lattiseq_int). Where it may not
+    # (long chains: PN15QP880 from level 11, PN16QP1761 from level 9), the reconstruction sums in lattiseq_crt_uint,
+    # LATTISEQ_CRT_EXTRA_BITS wider, which holds it for every level modulus_at_level holds.
+    def _crt_sum_fits(self, level: int) -> bool:
+        bits, widest = 0, 0
+        for i in range(level + 1):
+            b = int(self.modulus[i].bitlen())
+            bits += b
+            widest = max(widest, b)
+        return bits + widest + int((level + 1).bitlen()) < LATTISEQ_INT_SIZE
     
     # PolyToBigintCenteredLvl reconstructs p1 and returns the result in an array of Int.
     # Coefficients are centered around Q/2
@@ -1603,31 +1638,40 @@ class Ring:
     # For example, if gap = 1, then all coefficients are reconstructed, while
     # if gap = 2 then only coefficients X^{2*i} are reconstructed.
     def poly_to_bigint_centered_lvl(self, level: int, p1: Poly, gap: int, coeffs_bigint: list[lattiseq_int]):
-        crt_reconstruction = list[lattiseq_uint](level + 1)
-        modulus_biguint = self.modulus_at_level[level]
+        modulus_biguint = self._modulus_bigint_at(level)
         modulus_bigsint = lattiseq_int(modulus_biguint)
-
-        for i in range(level + 1):
-            qi = self.modulus[i]
-            qib = qi.ext_to_lattiseq_uint()
-            crt_reconstruction.append(modulus_biguint.gmp_floordiv_ui(qi))
-            crt_reconstruction[i] *= crt_reconstruction[i].gmp_mod_inv(qib)
+        crt_reconstruction = self._crt_reconstruction(level, modulus_biguint)
 
         modulus_bigint_half = modulus_bigsint.half()
 
         i, j = 0, 0
         p1_buf_coeffs_t = p1._buf_coeffs.transpose()
-        while j < self.n:
-            coeffs_bigint[i] = lattiseq_int(0)
-            for k in range(level + 1):
-                coeffs_bigint[i] += lattiseq_int(p1_buf_coeffs_t[j][k].ext_to_lattiseq_uint() * crt_reconstruction[k])
-            coeffs_bigint[i] = coeffs_bigint[i].gmp_mod(modulus_bigsint)
+        if self._crt_sum_fits(level):
+            while j < self.n:
+                coeffs_bigint[i] = lattiseq_int(0)
+                for k in range(level + 1):
+                    coeffs_bigint[i] += lattiseq_int(p1_buf_coeffs_t[j][k].ext_to_lattiseq_uint() * crt_reconstruction[k])
+                coeffs_bigint[i] = coeffs_bigint[i].gmp_mod(modulus_bigsint)
 
-            # Centers the coefficients
-            if coeffs_bigint[i] >= modulus_bigint_half:
-                coeffs_bigint[i] -= modulus_bigsint
+                # Centers the coefficients
+                if coeffs_bigint[i] >= modulus_bigint_half:
+                    coeffs_bigint[i] -= modulus_bigsint
 
-            i, j = i + 1, j + gap
+                i, j = i + 1, j + gap
+        else:
+            modulus_wide = lattiseq_crt_uint(modulus_biguint)
+            crt_wide = [lattiseq_crt_uint(c) for c in crt_reconstruction]
+            while j < self.n:
+                acc = lattiseq_crt_uint(0)
+                for k in range(level + 1):
+                    acc += lattiseq_crt_uint(p1_buf_coeffs_t[j][k]) * crt_wide[k]
+                coeffs_bigint[i] = lattiseq_int(lattiseq_uint(acc.gmp_mod(modulus_wide)))
+
+                # Centers the coefficients
+                if coeffs_bigint[i] >= modulus_bigint_half:
+                    coeffs_bigint[i] -= modulus_bigsint
+
+                i, j = i + 1, j + gap
     
     # SetCoefficientsBigintLvl sets the coefficients of p1 from an array of Int variables.
     def set_coefficients_bigint_lvl(self, level: int, coeffs: list[lattiseq_int], p1: Poly):

@@ -58,9 +58,9 @@ def collective_init(self, params, prec):
 
 ## Encryption & Decryption
 
-### `enc_vector[T](values) -> list[T]`
+### `enc_vector[T](values, level=-1, scale=0.0) -> list[T]`
 
-Encodes and encrypts a flat list of values into a list of CKKS ciphertexts (or plaintexts). Values are chunked by `slots` (number of CKKS slots per ciphertext).
+Encodes and encrypts a flat list of values into a list of CKKS ciphertexts (or plaintexts). Values are chunked by `slots` (number of CKKS slots per ciphertext), at the top level and the default scale, or at `level` and `scale` where given: `Ciphertensor` encodes a public operand of an addition at its receiving ciphertext's level and scale.
 
 - `T = Ciphertext` → encrypt via public key
 - `T = Plaintext` → encode only (no encryption)

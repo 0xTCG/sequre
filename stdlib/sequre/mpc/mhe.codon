@@ -216,7 +216,10 @@ class MPCMHE[TP]:
 
         print(f"CP{self.pid}:\tMHE initialized.")
     
-    def enc_vector[T](self, values: list) -> list[T]:
+    def enc_vector[T](self, values: list, level: int = -1, scale: float = 0.0) -> list[T]:
+        # Encodes (T = Plaintext) or encrypts (T = Ciphertext) values, a ciphertext's slots at a time: at the top level
+        # and the default scale, or at level and scale where given (Ciphertensor encodes a public operand of an addition
+        # at its receiving ciphertext's, so that their scales match without a move)
         nbr_max_coef = self.crypto_params.params.slots()
         length = len(values)
 
@@ -231,8 +234,8 @@ class MPCMHE[TP]:
             # Encoding values
             plaintext = new_plaintext(
                 self.crypto_params.params,
-                self.crypto_params.params.max_level(),
-                self.crypto_params.params.default_scale)
+                level if level >= 0 else self.crypto_params.params.max_level(),
+                scale if scale > 0.0 else self.crypto_params.params.default_scale)
 
             self.crypto_params.encoder.encode(
                 values[start:end].pad_vec_inplace(nbr_max_coef).to_complex(),
@@ -560,8 +563,10 @@ class MPCMHE[TP]:
         assert len(x) == len(y), "Ciphervector lenghts differ"
         
         for i in range(len(x)):
-            # TODO: Check level and scale matching
-            self.crypto_params.evaluator.add(x[i], y[i], x[i])
+            # The evaluator brings the operands onto one scale (Evaluator._mm_match_scales); _unstranded handles the one
+            # case it cannot see, a sum at the bootstrap level that would still need a rescale
+            a, b = self._unstranded(x[i], y[i])
+            self.crypto_params.evaluator.add(a, b, x[i])
         
         return x
     
@@ -569,10 +574,40 @@ class MPCMHE[TP]:
         assert len(x) == len(y), "Ciphervector lenghts differ"
         
         for i in range(len(x)):
-            # TODO: Check level and scale matching
-            self.crypto_params.evaluator.sub(x[i], y[i], x[i])
+            a, b = self._unstranded(x[i], y[i])
+            self.crypto_params.evaluator.sub(a, b, x[i])
         
         return x
+
+    def _unstranded(self, a: Ciphertext, b):
+        # A sum at the bootstrap level that still needs a rescale cannot be refreshed: the rescale would leave it below the
+        # level bootstrapping needs (L-267). It comes from a product (its rescale pending) above an operand at the
+        # bootstrap level (MPCMHE.drop_level puts one there). Here that product is rescaled first (a copy): the sum keeps
+        # the bootstrap level, needs no rescale and refreshes. The rescaled product meets the other operand at a rescale's
+        # ratio, which the evaluator matches exactly from one level apart (the higher operand moves onto the other's
+        # scale) and keeps as its residual at the same level. The evaluator itself leaves a product's rescale pending above
+        # level 0 (Evaluator._mm_match_scales, 1.). Local and the same at every party: no round. Returns the operands to
+        # add.
+        if not isinstance(b, Ciphertext):
+            return a, b
+        if a._nil_ideal or b._nil_ideal:
+            return a, b
+        params = self.crypto_params.params
+        lowest = self.bootstrap_min_level
+
+        def pending(ct: Ciphertext) -> bool:
+            # Whether the refresh's rescale (to the default scale) would divide ct by its last modulus
+            return ct.level() > 0 and ct.scale / float(params.ring_q.modulus[ct.level()]) >= params.default_scale / 2
+
+        if a.level() > lowest and b.level() == lowest and a.degree() == 1 and pending(a) and not pending(b):
+            rescaled = a.copy()
+            self.crypto_params.evaluator.rescale(rescaled, params.default_scale, rescaled)
+            return rescaled, b
+        if b.level() > lowest and a.level() == lowest and b.degree() == 1 and pending(b) and not pending(a):
+            rescaled = b.copy()
+            self.crypto_params.evaluator.rescale(rescaled, params.default_scale, rescaled)
+            return a, rescaled
+        return a, b
     
     def imul[T](self, x: list[Ciphertext], y: list[T], x_is_broadcast: bool = False, y_is_broadcast: bool = False, no_refresh: bool = False) -> list[Ciphertext]:
         if not (isinstance(T, Ciphertext) or isinstance(T, Plaintext)):
@@ -1388,10 +1423,17 @@ class MPCMHE[TP]:
         parameters = self.crypto_params.params
         level_start = ct.level()
 
-        assert (self.bootstrap_safe and
+        # Every compute party checks the same ciphertext here (the one broadcast, or identical copies), so all of them
+        # raise alike. Refreshes keep every ciphertext they see at or above the bootstrap level; one below it comes from
+        # operations that skip them (MPCMHE.drop_level below that level, products without refresh, mul_noboot).
+        if not (self.bootstrap_safe and
                 self.bootstrap_min_level <= level_start and
-                self.bootstrap_min_level < parameters.max_level()
-                ), f"Bootstrapping: Not enough levels to ensure correctness and 128 security.\n\tCurrent cipher level {level_start}.\n\tMin required level {self.bootstrap_min_level}.\n\tMax possible level for the selected parameters: {parameters.max_level()}\n"
+                self.bootstrap_min_level < parameters.max_level()):
+            raise ValueError(
+                f"Bootstrapping: Not enough levels to ensure correctness and 128 security.\n\tCurrent cipher level {level_start}"
+                f" (scale 2^{math.log2(ct.scale):.2f}).\n\tMin required level {self.bootstrap_min_level}.\n\tMax possible level"
+                f" for the selected parameters: {parameters.max_level()}\n\tRefreshes keep ciphertexts at or above the min level;"
+                f" this one skipped them (drop_level below it, products without refresh).\n")
 
         ref_protocol = self.refresh_protocol
         ref_share = ref_protocol.allocate_share(level_start, parameters.max_level())

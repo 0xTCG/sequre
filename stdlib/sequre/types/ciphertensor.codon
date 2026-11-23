@@ -415,6 +415,13 @@ class Ciphertensor[ctype]:
 
     @staticmethod
     def enc(mpc, data, padding: int = 0, encoding: str = "") -> Ciphertensor[ctype]:
+        return Ciphertensor[ctype].enc_at(mpc, data, padding, encoding, List[Tuple[int, float]]())
+
+    @staticmethod
+    def enc_at(mpc, data, padding: int, encoding: str, targets: List[Tuple[int, float]]) -> Ciphertensor[ctype]:
+        # enc, each ciphertext or plaintext at the level and scale targets gives for it in storage order (_target_at; a
+        # public operand of an addition at its receiving ciphertexts', Ciphertensor._encoding_targets); empty targets:
+        # the top level and the default scale throughout
         if not encoding:
             encoding = mpc.default_ciphertensor_encoding
         
@@ -433,21 +440,25 @@ class Ciphertensor[ctype]:
         
         if not isinstance(_data.S, Tuple[int, int]):
             assert encoding == ENC_ROW, "Ciphertensor: 1-dimensional tensors can be encoded only row-wise"
-            return Ciphertensor[ctype].enc_row_wise(mpc, _data, padding)
+            return Ciphertensor[ctype].enc_row_wise_at(mpc, _data, padding, targets)
         
         if encoding == ENC_ROW:
-            return Ciphertensor[ctype].enc_row_wise(mpc, _data, padding)
+            return Ciphertensor[ctype].enc_row_wise_at(mpc, _data, padding, targets)
         elif encoding == ENC_COL:
-            ctensor = Ciphertensor[ctype].enc_row_wise(mpc, _data.T, padding)
+            ctensor = Ciphertensor[ctype].enc_row_wise_at(mpc, _data.T, padding, targets)
             ctensor._transposed = True
             return ctensor
         elif encoding == ENC_DIAG:
-            return Ciphertensor[ctype].enc_diag_wise(mpc, _data, padding)
+            return Ciphertensor[ctype].enc_diag_wise_at(mpc, _data, padding, targets)
         else:
             raise ValueError("Invalid encoding")
     
     @staticmethod
     def enc_row_wise[S, dtype](mpc, data: ndarray[S, dtype], padding: int = 0) -> Ciphertensor[ctype]:
+        return Ciphertensor[ctype].enc_row_wise_at(mpc, data, padding, List[Tuple[int, float]]())
+
+    @staticmethod
+    def enc_row_wise_at[S, dtype](mpc, data: ndarray[S, dtype], padding: int, targets: List[Tuple[int, float]]) -> Ciphertensor[ctype]:
         if data.is_empty():
             return Ciphertensor[ctype](slots=mpc.mhe.crypto_params.params.slots())
         
@@ -460,7 +471,14 @@ class Ciphertensor[ctype]:
         _data = List[ctype](Ciphertensor._count_ciphers(data.shape, slots))
         
         for i in range(0, flat_data.size, vec_len):
-            _data.extend(mpc.mhe.enc_vector(flat_data[i:i + vec_len].tolist(), T=ctype))
+            row = flat_data[i:i + vec_len].tolist()
+            if not targets:
+                _data.extend(mpc.mhe.enc_vector(row, T=ctype))
+                continue
+            # A ciphertext's slots at a time, each at its target
+            for j in range(0, vec_len, slots):
+                level, scale = Ciphertensor._target_at(targets, len(_data))
+                _data.extend(mpc.mhe.enc_vector(row[j:j + slots], T=ctype, level=level, scale=scale))
 
         return Ciphertensor[ctype](
             _data=_data,
@@ -469,6 +487,10 @@ class Ciphertensor[ctype]:
     
     @staticmethod
     def enc_diag_wise[S, dtype](mpc, data: ndarray[S, dtype], padding: int = 0) -> Ciphertensor[ctype]:
+        return Ciphertensor[ctype].enc_diag_wise_at(mpc, data, padding, List[Tuple[int, float]]())
+
+    @staticmethod
+    def enc_diag_wise_at[S, dtype](mpc, data: ndarray[S, dtype], padding: int, targets: List[Tuple[int, float]]) -> Ciphertensor[ctype]:
         assert isinstance(S, Tuple[int, int]), "Ciphertensor: only 2-dimensional matrices can be diagonal-conting encoded"
         
         if data.is_empty():
@@ -484,21 +506,38 @@ class Ciphertensor[ctype]:
         for i in range(min(data.shape)):
             diagonals[i] = data.cyclic_diag(i)
         
-        diag_contig_ctensor = Ciphertensor[ctype].enc_row_wise(mpc, diagonals, padding)
+        diag_contig_ctensor = Ciphertensor[ctype].enc_row_wise_at(mpc, diagonals, padding, targets)
         diag_contig_ctensor._diagonal_contiguous = True
         diag_contig_ctensor._skinny = data.shape[1] < data.shape[0]
         return diag_contig_ctensor
     
     @staticmethod
     def enc_replicate(mpc, value, shape: list[int]) -> Ciphertensor[ctype]:
+        return Ciphertensor[ctype].enc_replicate_at(mpc, value, shape, List[Tuple[int, float]]())
+
+    @staticmethod
+    def enc_replicate_at(mpc, value, shape: list[int], targets: List[Tuple[int, float]]) -> Ciphertensor[ctype]:
+        # enc_replicate, each ciphertext or plaintext at its target (enc_at)
         if not (isinstance(value, int) or isinstance(value, float)):
             compile_error("Ciphertensor: invalid value type to replicate")
         
         slots = mpc.mhe.crypto_params.params.slots()
-        enc_row = mpc.mhe.enc_vector([value for _ in range(shape[-1])], T=ctype)
-        new_tensor_data = []
-        for _ in range(shape[:-1].reduce_mul()):
-            new_tensor_data.extend(enc_row.copy())
+        row = [value for _ in range(shape[-1])]
+        new_tensor_data = List[ctype]()
+        if not targets:
+            enc_row = mpc.mhe.enc_vector(row, T=ctype)
+            for _ in range(shape[:-1].reduce_mul()):
+                new_tensor_data.extend(enc_row.copy())
+        else:
+            # Each chunk of the row encoded once per distinct target and copied for the rows that share both
+            encoded = Dict[Tuple[int, int, float], List[ctype]]()
+            for _ in range(shape[:-1].reduce_mul()):
+                for j in range(0, shape[-1], slots):
+                    level, scale = Ciphertensor._target_at(targets, len(new_tensor_data))
+                    key = (j, level, scale)
+                    if key not in encoded:
+                        encoded[key] = mpc.mhe.enc_vector(row[j:j + slots], T=ctype, level=level, scale=scale)
+                    new_tensor_data.extend(encoded[key].copy())
         
         return Ciphertensor[ctype](
             _data=new_tensor_data,
@@ -851,7 +890,7 @@ class Ciphertensor[ctype]:
             return self
 
         assert not isinstance(ctype, Plaintext), "Ciphertensor: cannot add to plaintext inplace"
-        other_cipher = self._check_other_operand_elem_wise(mpc, other)
+        other_cipher = self._check_other_operand_elem_wise(mpc, other, at_scales=True)
 
         mpc.mhe.iadd(self._data, other_cipher._data)
         self._is_broadcast = self._is_broadcast and Ciphertensor._operand_broadcast(other_cipher)
@@ -865,7 +904,7 @@ class Ciphertensor[ctype]:
             return self
 
         assert not isinstance(ctype, Plaintext), "Ciphertensor: cannot subtract from plaintext inplace"
-        other_cipher = self._check_other_operand_elem_wise(mpc, other)
+        other_cipher = self._check_other_operand_elem_wise(mpc, other, at_scales=True)
 
         mpc.mhe.isub(self._data, other_cipher._data)
         self._is_broadcast = self._is_broadcast and Ciphertensor._operand_broadcast(other_cipher)
@@ -2255,8 +2294,9 @@ class Ciphertensor[ctype]:
             new_data.append(new_row[0])
 
         # The result is left unrescaled (rescaled lazily by the next multiplication): a rescale leaves a scale close to,
-        # but not at, the default one, and a later addition to a default-scale operand does not align the two (M-LAT-06),
-        # an error of about (q / scale - 1) times that operand's values.
+        # but not at, the default one, and a later addition to a default-scale operand at the same level could only align
+        # the two with a level of the sum (the evaluator keeps Lattigo's residual there, about (q / scale - 1) times that
+        # operand's values; one level apart it moves the higher operand onto the other's scale exactly).
         if q < width:
             # Tall B: sum the m / q tiles of each row into its first q slots and mask the partial sums past them
             mpc.mhe.refresh(new_data, is_broadcast)
@@ -2581,7 +2621,30 @@ class Ciphertensor[ctype]:
         raise NotImplementedError("Plaintext-plaintext elem-wise operations not implemented yet. Decoding is too expensive.")
         return Ciphertensor[Plaintext]()
     
-    def _check_other_operand_elem_wise(self, mpc, other):
+    @staticmethod
+    def _target_at(targets: List[Tuple[int, float]], k: int) -> Tuple[int, float]:
+        # The level and scale to encode the k-th ciphertext or plaintext at; (-1, 0.0), the top level and the default
+        # scale, beyond targets
+        return targets[k] if k < len(targets) else (-1, 0.0)
+
+    def _encoding_targets(self) -> List[Tuple[int, float]]:
+        # The level and scale of each of self's ciphertexts in storage order (the defaults for a nil-ideal one). A public
+        # operand of an addition encoded at these meets every ciphertext on its scale: an operand at the default scale
+        # would meet a ciphertext at a rescale's ratio from it, which the evaluator matches by moving the operand, one
+        # rescale each (Evaluator._mm_match_scales)
+        targets = List[Tuple[int, float]](len(self._data))
+        for ct in self._data:
+            if ct._nil_ideal:
+                targets.append((-1, 0.0))
+            else:
+                targets.append((ct.level(), ct.scale))
+        return targets
+
+    def _check_other_operand_elem_wise(self, mpc, other, at_scales: bool = False):
+        # The other operand of an element-wise operation in self's storage. A public one (an array, a list or a number) is
+        # encoded at the top level and the default scale, or with at_scales (an addition or subtraction) at each
+        # receiving ciphertext's level and scale. A product keeps the default scale: its operand's scale is part of the
+        # product's.
         enc_mode = ENC_DIAG if self._diagonal_contiguous else ENC_ROW
         if isinstance(other, Ciphertensor):
             # TODO: Temp and ad-hoc solution for self._diagonal_contiguous ^ other._diagonal_contiguous case.
@@ -2621,14 +2684,17 @@ class Ciphertensor[ctype]:
             pt = pt.local_broadcast(mpc, self.shape)
         elif isinstance(other, ndarray):
             operand = other.T if self._transposed else other
-            pt = Ciphertensor[Plaintext].enc(mpc, operand, encoding=enc_mode)
+            targets = self._encoding_targets() if at_scales else List[Tuple[int, float]]()
+            pt = Ciphertensor[Plaintext].enc_at(mpc, operand, 0, enc_mode, targets)
             pt._transposed = self._transposed
         elif isinstance(other, List):
             operand = other.transpose() if self._transposed else other
-            pt = Ciphertensor[Plaintext].enc(mpc, array(operand), encoding=enc_mode)
+            targets = self._encoding_targets() if at_scales else List[Tuple[int, float]]()
+            pt = Ciphertensor[Plaintext].enc_at(mpc, array(operand), 0, enc_mode, targets)
             pt._transposed = self._transposed
         elif isinstance(other, int) or isinstance(other, float):
-            ptensor = Ciphertensor[Plaintext].enc_replicate(mpc, other, self.shape)
+            targets = self._encoding_targets() if at_scales else List[Tuple[int, float]]()
+            ptensor = Ciphertensor[Plaintext].enc_replicate_at(mpc, other, self.shape, targets)
             ptensor._transposed = self._transposed
             ptensor._diagonal_contiguous = self._diagonal_contiguous
             pt = ptensor

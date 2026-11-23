@@ -18,6 +18,7 @@ import prg
 import secure_operator
 
 import sequre.lattiseq.ckks as ckks
+import sequre.lattiseq.rlwe as rlwe
 from sequre.lattiseq.exact_encoder import new_exact_encoder
 
 from sequre import main
@@ -53,7 +54,7 @@ CASES = [
     ("he.encrypt_pk", "", "public-key encryption of a top-level plaintext"),
     ("he.decrypt_sk", "", "secret-key (shard) decryption, local part of a collective decryption"),
     ("he.add", "", "ct + ct (in place), top level"),
-    ("he.add_const", "", "ct + 1.5 (in place, add_const)"),
+    ("he.add_const", "", "ct + 1.5 out of place, into a copy of ct (add_const)"),
     ("he.mul_const", "", "ct * 1.5 (in place, mul_const)"),
     ("he.mul_ct_pt", "", "ct * pt (mul_new, no relin/rescale)"),
     ("he.mul_relin", "", "ct * ct + relinearization (mul_relin_new, gadget product)"),
@@ -158,6 +159,8 @@ CASES = [
     ("mp.mpa.dot_aggregate", "", "MPA.dot(1) of an MPA that is only an aggregate, 16x64, one level above the bootstrap level"),
     ("mp.mpu.mpa_times_mpp", "", "MPU(additive aggregate 16x8) * MPU(partition 2x8x8 encrypted, at the bootstrap level): the joined partitions refreshed"),
     ("ct.add_broadcast_layouts", "", "a column-wise aggregate 16x8 plus a row-wise aggregate 16x8: the row-wise one converted to column-wise through MPC"),
+    ("he.add_scale_match", "", "ct + ct whose scales are a rescale apart (ratio 1 + 7.9e-5), one level apart: the higher one moves onto the other's scale (single key, witness: relative error)"),
+    ("he.add_scale_match_same", "", "the same at the same level (single key, witness: relative error)"),
 ]
 
 handle_list_flag("mhe", CASES)
@@ -1976,6 +1979,60 @@ def bench_mp_colwise(mpc, b: Bench):
             b.report(f"{rows}x8;bootstraps={boots};switched_ciphertexts={switches}", t, max_abs_err_2d(rv, C8 + C8))
 
 
+def bench_scale_match(mpc, b: Bench):
+    # Additions of ciphertexts whose scales differ by a rescale's ratio (a product rescaled by a 34-bit modulus against a
+    # fresh ciphertext, 1 + 7.9e-5 apart): one level apart, and at the same level. Single key at CP1 (keys of its own,
+    # untimed, so that the witness can decrypt); deterministic values (no shared draws). Witness: the largest error over
+    # the largest value.
+    if not (b.any_selected("he.add_scale_match") or b.any_selected("he.add_scale_match_same")):
+        return
+    params = mpc.mhe.crypto_params.params
+    ev = mpc.mhe.crypto_params.evaluator
+    slots = params.slots()
+    top = params.max_level()
+    scale = params.default_scale
+    ratio = 1.0 + 7.9e-5
+    va = list[complex](slots)
+    vb = list[complex](slots)
+    x = 12345
+    for _ in range(slots):
+        x = (x * 1103515245 + 12345) % 2147483648
+        va.append(complex(float(x % 2001) / 1000.0 - 1.0, 0.0))
+        x = (x * 1103515245 + 12345) % 2147483648
+        vb.append(complex(float(x % 2001) / 1000.0 - 1.0, 0.0))
+    for name, b_level in [("he.add_scale_match", top), ("he.add_scale_match_same", top - 1)]:
+        if not b.want(mpc, name):
+            continue
+        if mpc.pid == 1:
+            kgen = ckks.new_key_generator(params)
+            sk = kgen.gen_secret_key()
+            encryptor = ckks.new_encryptor(params, sk)
+            decryptor = ckks.new_decryptor(params, sk)
+            pt_a = ckks.new_plaintext(params, top - 1, scale * ratio)
+            mpc.mhe.crypto_params.encoder.encode(va, pt_a, params.log_slots)
+            pt_b = ckks.new_plaintext(params, b_level, scale)
+            mpc.mhe.crypto_params.encoder.encode(vb, pt_b, params.log_slots)
+            a = encryptor.encrypt_new(pt_a)
+            c = encryptor.encrypt_new(pt_b)
+            out = ckks.new_ciphertext(params, 1, top - 1, scale)
+            t = Timer(b.reps(9), sync=False, batch=20)
+            while t.next():
+                # New receivers, allocated outside the timed region (an addition may leave its receiver a level lower)
+                outs = [ckks.new_ciphertext(params, 1, top - 1, scale) for _ in range(t.batch)]
+                t.begin(mpc)
+                for k in range(t.batch):
+                    ev.add(a, c, outs[k])
+                t.end(mpc)
+                out = outs[0]
+            got = mpc.mhe.crypto_params.encoder.decode(decryptor.decrypt_new(out), params.log_slots)
+            largest, err = 0.0, 0.0
+            for i in range(slots):
+                want = va[i].real + vb[i].real
+                largest = max(largest, abs(want))
+                err = max(err, abs(got[i].real - want))
+            b.report(f"ratio={ratio};levels={top - 1},{b_level};to_level={out.level()}", t, err / largest)
+
+
 @main
 def bench_mhe_main(mpc):
     b = Bench("mhe", mpc.pid, CASES)
@@ -1998,6 +2055,7 @@ def bench_mhe_main(mpc):
     bench_e2e(mpc, b)
     bench_mp_arith(mpc, b)
     bench_mp_colwise(mpc, b)
+    bench_scale_match(mpc, b)
     b.finish(mpc)
 
 

@@ -15,6 +15,7 @@ Lattiseq is a ground-up Codon reimplementation of the Go-based [Lattigo](https:/
 | `ringqp.codon` | QP-basis ring: `Ring`, `Poly`, `UniformSampler` |
 | `params.codon` | Pre-defined CKKS parameter sets |
 | `dckks.codon` | Distributed CKKS protocols: PCKS, CKG, RKG, Refresh, E2S, S2E |
+| `bootstrapping.codon` | Single-key CKKS bootstrapping (`Bootstrapper`, Lattigo's circuit). At level 0 an input's scale may be any value up to $Q_0$ / message ratio, rounded to a power of two (Lattigo asks for that power of two exactly): the circuit multiplies the multiple of $Q_0$ that the mod-up adds by the fixed factor $T = SF / 2^{\mathrm{round}(\log_2 Q_0)}$, and the output scale records the input's ratio to that bound. Sequre's multiparty layer uses the collective refresh (`dckks.codon`) instead |
 | `drlwe.codon` | Distributed RLWE share types: `PCKSShare`, `CKGShare`, `RKGShare`, `RTGShare` |
 | `utils.codon` | Modular arithmetic utilities, PRNG |
 | `stats.codon` | Precision analysis for CKKS plaintexts |
@@ -30,6 +31,10 @@ Lattiseq is a ground-up Codon reimplementation of the Go-based [Lattigo](https:/
 | `PN16QP1761` | 16 | 32768 | 34 | 4 | 128-bit |
 
 Each set has a corresponding `CI` (continuous integration) variant with smaller parameters for faster testing.
+
+The ring's CRT reconstruction (decoding to big integers, E2S, the refresh protocol) works at every level whose modulus
+fits the 512-bit integer in use: up to level 11 of `PN15QP880` and level 9 of `PN16QP1761` (the default `PN14QP438` fits
+whole). A level above that is refused with a `ValueError`.
 
 ## Key types
 
@@ -56,7 +61,7 @@ Performs homomorphic operations on ciphertexts:
 
 | Operation | Method |
 |---|---|
-| Add | `evaluator.add(ct1, ct2)` |
+| Add | `evaluator.add(ct1, ct2)` (operands on different scales are brought onto one scale first: [CKKS operations](../deep-dive-lattiseq/ckks-operations.md#addition)) |
 | Multiply | `evaluator.mul(ct1, ct2)` |
 | Relinearize | `evaluator.relinearize(ct)` |
 | Rescale | `evaluator.rescale(ct)` |

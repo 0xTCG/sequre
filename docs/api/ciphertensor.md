@@ -96,8 +96,8 @@ These methods take `mpc` as the first argument and return a new ciphertensor:
 | Method | Description |
 |---|---|
 | `.neg(mpc)` | Element-wise negation |
-| `.add(mpc, other)` | Element-wise addition |
-| `.sub(mpc, other)` | Element-wise subtraction |
+| `.add(mpc, other)` | Element-wise addition. A public `other` (a number, a list or an array) is encoded at each ciphertext's level and scale, so the two add on one scale without a rescale (one encoded at the default scale would sit a rescale's ratio from a rescaled ciphertext, and the evaluator would move it exactly onto it, one rescale per ciphertext) |
+| `.sub(mpc, other)` | Element-wise subtraction; a public `other` as in `.add` |
 | `.mul(mpc, other, ...)` | Element-wise multiplication |
 | `.pow(mpc, p)` | Element-wise exponentiation |
 
@@ -105,8 +105,8 @@ These methods take `mpc` as the first argument and return a new ciphertensor:
 
 | Method | Description |
 |---|---|
-| `.iadd(mpc, other)` | In-place addition |
-| `.isub(mpc, other)` | In-place subtraction |
+| `.iadd(mpc, other)` | In-place addition; a public `other` as in `.add` |
+| `.isub(mpc, other)` | In-place subtraction; a public `other` as in `.add` |
 | `.imul(mpc, other, no_refresh=False)` | In-place multiplication (optional refresh suppression) |
 | `.ipow(mpc, p)` | In-place exponentiation |
 | `.ineg(mpc)` | In-place negation |

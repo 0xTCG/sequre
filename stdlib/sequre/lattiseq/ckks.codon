@@ -21,6 +21,32 @@ import rlwe, ring, ringqp, utils
 from threads import lattiseq_threads
 
 
+# Scales of two operands that differ by less than this, relative to the larger, count as the same scale: scales built
+# from the same moduli can differ in their last bits, while a real mismatch (a rescale by a modulus near the default
+# scale) is 1e-8 or more with the shipped parameter sets (1e-6 to 8e-5 with PN14QP438's 34-bit moduli). An addition
+# brings operands whose scales differ by more onto one scale first (Evaluator._mm_match_scales).
+CKKS_SCALE_REL_TOL = 1e-9
+
+# A scale ratio this large is a rescale still pending on the larger-scale operand.
+CKKS_PENDING_RESCALE_RATIO = 1048576.0
+
+# The integer factor of a move onto another scale (Evaluator._mm_move_onto) rounds within CKKS_SCALE_REL_TOL from here.
+CKKS_MOVE_MIN_FACTOR = 536870912.0
+
+
+def _nearest_integer(x: float) -> float:
+    # The integer nearest to x >= 0, as a float, without the 64-bit conversion math.floor makes (every float of 2^52 or
+    # more is an integer already)
+    if x >= 4503599627370496.0:
+        return x
+    return float(int(x + 0.5))
+
+
+def _scales_match(a: float, b: float) -> bool:
+    hi = a if a > b else b
+    return abs(a - b) <= CKKS_SCALE_REL_TOL * hi
+
+
 class Parameters(Static[rlwe.Parameters]):
     log_slots: int
     default_scale: float
@@ -1518,60 +1544,23 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers], Static[rlwe.Eva
             return
 
         assert not ct_out._nil_ideal, "CKKS.Ciphertext: output cipher cannot be nil-ideal"
-        
-        level = min(min(c_0.level(), c_1.level()), ct_out.level())
-        max_degree = max(c_0.degree(), c_1.degree())
-        min_degree = min(c_0.degree(), c_1.degree())
-
-        # Else resizes the receiver element
-        ct_out.resize(max_degree, ct_out.level())
-
-        c_0_scale = c_0.scale
-        c_1_scale = c_1.scale
-        ct_out_scale = ct_out.scale
-
-        if ct_out.level() > level:
-            self.drop_level(Ciphertext(ct_out, ct_out_scale), ct_out.level() - min(c_0.level(), c_1.level()))
 
         c_1_cipher = c_1.ciphertext() if isinstance(c_1, Plaintext) else c_1
-        tmp_0, tmp_1 = c_0, c_1_cipher
-        # Checks whether or not the receiver element is the same as one of the input elements
-        # and acts accordingly to avoid unnecessary element creation or element overwriting,
-        # and scales properly the element before the evaluation.
-        if __ptr__(ct_out) == __ptr__(c_0):
-            if c_0_scale > c_1_scale and math.floor(c_0_scale / c_1_scale) > 1:
-                tmp_1 = self.buff_ct
-                self._mm_mul_by_const(Ciphertext(c_1_cipher, c_1_scale), math.floor(c_0_scale / c_1_scale), Ciphertext(tmp_1, ct_out_scale))
-            elif c_1_scale > c_0_scale and math.floor(c_1_scale / c_0_scale) > 1:
-                self._mm_mul_by_const(Ciphertext(c_0, c_0_scale), math.floor(c_1_scale / c_0_scale), Ciphertext(c_0, c_0_scale))
-                ct_out.set_scale(c_1_scale)
-                tmp_1 = c_1_cipher
-            else:
-                tmp_1 = c_1_cipher
-            tmp_0 = c_0
-        elif ct_out == c_1_cipher:
-            if c_1_scale > c_0_scale and math.floor(c_1_scale / c_0_scale) > 1:
-                tmp_0 = self.buff_ct
-                self._mm_mul_by_const(Ciphertext(c_0, c_0_scale), math.floor(c_1_scale / c_0_scale), Ciphertext(tmp_0, ct_out_scale))
-            elif c_0_scale > c_1_scale and math.floor(c_0_scale / c_1_scale) > 1:
-                self._mm_mul_by_const(Ciphertext(c_1_cipher, c_1_scale), math.floor(c_0_scale / c_1_scale), Ciphertext(ct_out, ct_out_scale))
-                ct_out.set_scale(c_0_scale)
-                tmp_0 = c_0
-            else:
-                tmp_0 = c_0
-            tmp_1 = c_1_cipher
-        else:
-            if c_1_scale > c_0_scale and math.floor(c_1_scale / c_0_scale) > 1:
-                tmp_0 = self.buff_ct
-                self._mm_mul_by_const(Ciphertext(c_0, c_0_scale), math.floor(c_1_scale / c_0_scale), Ciphertext(tmp_0, ct_out_scale))
-                tmp_1 = c_1_cipher
-            elif c_0_scale > c_1_scale and math.floor(c_0_scale / c_1_scale) > 1:
-                tmp_1 = self.buff_ct
-                self._mm_mul_by_const(Ciphertext(c_1_cipher, c_1_scale), math.floor(c_0_scale / c_1_scale), Ciphertext(tmp_1, ct_out_scale))
-                tmp_0 = c_0
-            else:
-                tmp_0 = c_0
-                tmp_1 = c_1_cipher
+
+        # Both operands on one scale (_mm_match_scales): tmp_0 and tmp_1 are the operands themselves, new ciphertexts or
+        # the evaluator's buffer, holding the operands' values at the common scale up to level_0 and level_1, with the
+        # operands' degrees. Neither input is changed (except ct_out, by the result).
+        tmp_0, tmp_1, level_0, level_1 = self._mm_match_scales(c_0, c_1_cipher, ct_out)
+
+        level = min(min(level_0, level_1), ct_out.level())
+        max_degree = max(c_0.degree(), c_1_cipher.degree())
+        min_degree = min(c_0.degree(), c_1_cipher.degree())
+        out_scale = max(tmp_0.scale, tmp_1.scale)
+
+        # Resizes the receiver element
+        ct_out.resize(max_degree, ct_out.level())
+        if ct_out.level() > level:
+            self.drop_level(ct_out, ct_out.level() - level)
 
         for i in range(min_degree + 1):
             if evaluate_callable == "ring.add_lvl":
@@ -1581,17 +1570,145 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers], Static[rlwe.Eva
             else:
                 raise NotImplementedError("Generic evaluator supports only addition and subtraction at the moment.")
 
-        ct_out.set_scale(max(c_0_scale, c_1_scale))
+        ct_out.set_scale(out_scale)
 
         # If the inputs degrees differ, it copies the remaining degree on the receiver.
         # Also checks that the receiver is not one of the inputs to avoid unnecessary work.
-        if c_0.degree() > c_1.degree() and tmp_0 != ct_out:
+        if c_0.degree() > c_1_cipher.degree() and tmp_0 is not ct_out:
             for i in range(min_degree + 1, max_degree + 1):
                 ring._mm_copy_values_lvl(level, tmp_0.value[i], ct_out.value[i])
-        elif c_1.degree() > c_0.degree() and tmp_1 != ct_out:
+        elif c_1_cipher.degree() > c_0.degree() and tmp_1 is not ct_out:
             for i in range(min_degree + 1, max_degree + 1):
                 ring._mm_copy_values_lvl(level, tmp_1.value[i], ct_out.value[i])
-    
+
+    # _mm_match_scales returns the two operands of an addition on one scale (within CKKS_SCALE_REL_TOL), as the operands
+    # themselves, new ciphertexts or the evaluator's buffer holding their values, with the levels up to which each holds
+    # them (the buffer is at the top level); the inputs are not changed. A sum is computed at
+    # level_sum, the lowest of the operands' and the receiver's levels, so an operand above it has levels to spare:
+    #   1. A ratio of CKKS_PENDING_RESCALE_RATIO or more is a rescale still pending on the larger-scale operand (a
+    #      product). At level 0 such an operand above level 0 is rescaled toward the other's scale first (then moved onto
+    #      it, 3., where it keeps a level to spare): at the product's scale the sum's values would not fit level 0's
+    #      modulus. Above level 0 the integer of 2. matches it exactly, and the sum keeps the product's scale for its own
+    #      later rescale, as in Lattigo. Rescaling the product here would keep a level of the sum, and that staggers the
+    #      refreshes of recurrences such as Clenshaw's (a term kept one level low drags the next sums down, so the
+    #      multiparty layer refreshes more often). A sum at the multiparty layer's bootstrap level that still needs its
+    #      rescale could not be refreshed: MPCMHE rescales the product before such an addition (MPCMHE._unstranded).
+    #   2. An integer ratio (a rescale pending on the larger-scale operand, or scales chosen so) multiplies the
+    #      smaller-scale operand by that integer: exact, no level.
+    #   3. Any other ratio moves an operand with a level to spare onto the other's scale (_mm_move_onto): a product by
+    #      an integer constant and one rescale, exact to about 2^-30, and only that operand's level.
+    #   4. Otherwise (both operands at level_sum, or a ratio no move reaches exactly), as Lattigo and without a level:
+    #      the smaller-scale operand times the nearest integer for a ratio of 2 or more, the scales taken as equal below.
+    #      Exactness there would spend a level of the sum: that sum would sit one level lower with the same scale, so near
+    #      the bootstrap level it could no longer be refreshed, and near level 0 its values would no longer fit the
+    #      modulus. The residual is the ratio's distance to that integer (a rescale's 1e-6 to 1e-4 below 2).
+    def _mm_match_scales(self, a: Ciphertext, b: Ciphertext, out: Ciphertext) -> Tuple[Ciphertext, Ciphertext, int, int]:
+        if _scales_match(a.scale, b.scale):
+            return a, b, a.level(), b.level()
+
+        level_sum = min(min(a.level(), b.level()), out.level())
+        a_is_hi = a.scale > b.scale
+        hi = a if a_is_hi else b
+        lo = b if a_is_hi else a
+        ratio = hi.scale / lo.scale
+
+        # 1. At level 0, a pending rescale on a degree-1 operand above it: the integer of 2. would leave the sum at level 0
+        #    at the product's scale, where its values do not fit the modulus. Rescaled with its own levels, down to level 1
+        #    (then moved onto the other's scale, 3.) or, from level 1, to level 0 (then a rescale's ratio, 4.). A degree-2
+        #    operand (not relinearized) is not rescaled inside an addition: its rescale's noise is larger.
+        if ratio >= CKKS_PENDING_RESCALE_RATIO and hi.degree() == 1 and level_sum == 0 and hi.level() >= 1:
+            rescaled = self._mm_rescale_toward(hi, lo.scale, 1 if hi.level() >= 2 else 0)
+            if rescaled is not hi:
+                return self._mm_match_scales(rescaled, b, out) if a_is_hi else self._mm_match_scales(a, rescaled, out)
+
+        # 2. An integer ratio (above 2^62 any ratio is one to within CKKS_SCALE_REL_TOL: two integer factors)
+        k = _nearest_integer(ratio)
+        if k >= 2.0 and abs(ratio - k) <= CKKS_SCALE_REL_TOL * ratio:
+            scaled, factor = self._mm_scale_by_integer(lo, ratio)
+            scaled.scale = lo.scale * factor
+            return (a, scaled, a.level(), lo.level()) if a_is_hi else (scaled, b, lo.level(), b.level())
+
+        # 3. An operand with a level to spare moves onto the other's scale: the higher-level one first
+        first, second = (a, b) if a.level() >= b.level() else (b, a)
+        for x, y in [(first, second), (second, first)]:
+            if x.level() > level_sum and self._mm_can_move_onto(x, y.scale):
+                moved = self._mm_move_onto(x, y.scale)
+                return (moved, b, moved.level(), b.level()) if x is a else (a, moved, a.level(), moved.level())
+
+        # 4. No operand can move onto the other's scale without spending a level of the sum (both at level_sum, or a
+        #    ratio no move reaches exactly): as Lattigo, without a level. A ratio of 2 or more multiplies the smaller-scale
+        #    operand by the nearest integer, a residual of at most 1 / (2 ratio); below 2 the scales count as equal.
+        if ratio >= 2.0:
+            scaled, factor = self._mm_scale_by_integer(lo, ratio)
+            scaled.scale = hi.scale
+            return (a, scaled, a.level(), lo.level()) if a_is_hi else (scaled, b, lo.level(), b.level())
+        return a, b, a.level(), b.level()
+
+    # _mm_scale_by_integer multiplies ct by the integer nearest to ratio (ratio >= 2), into the evaluator's buffer
+    # (degree 2, top level: a common case, kept free of allocations, as Lattigo does) or a new ciphertext for a larger
+    # degree, and returns it with the factor used. Above 2^62 the factor is the product of two integers,
+    # 2^floor(log2(ratio) / 2) and the one nearest to the rest: within 2^-31 of ratio. The returned ciphertext's scale
+    # is the caller's to set.
+    def _mm_scale_by_integer(self, ct: Ciphertext, ratio: float) -> Tuple[Ciphertext, float]:
+        scaled = self.buff_ct
+        if ct.degree() > scaled.degree():
+            scaled = new_ciphertext(self.ckks_params, ct.degree(), ct.level(), ct.scale)
+        k = _nearest_integer(ratio)
+        if k < 4.6e18:
+            self._mm_mul_by_const(ct, u64(k), scaled)
+            return scaled, k
+        if ratio >= 2.1e37:
+            raise ValueError(f"CKKS: cannot add ciphertexts whose scales differ by the ratio {ratio} (2^124 or more)")
+        first = math.pow(2.0, float(int(math.log2(ratio) / 2.0)))
+        second = _nearest_integer(ratio / first)
+        self._mm_mul_by_const(ct, u64(first), scaled)
+        self._mm_mul_by_const(scaled, u64(second), scaled)
+        return scaled, first * second
+
+    # _mm_rescale_toward returns a new ciphertext: ct divided by its last moduli, as Rescale(ct, target) divides (the
+    # scale stays at target / 2 or more), but by no more moduli than ct's level above floor_level. ct itself when no
+    # modulus can be divided.
+    def _mm_rescale_toward(self, ct: Ciphertext, target: float, floor_level: int) -> Ciphertext:
+        ring_q = self.params.ring_q
+        level = ct.level()
+        scale = ct.scale
+        nb_rescales = 0
+        while level - nb_rescales > floor_level and scale / float(ring_q.modulus[level - nb_rescales]) >= target / 2:
+            scale /= float(ring_q.modulus[level - nb_rescales])
+            nb_rescales += 1
+        if nb_rescales == 0:
+            return ct
+        out = new_ciphertext(self.ckks_params, ct.degree(), level, ct.scale)
+        for i in range(ct.degree() + 1):
+            ring_q._mm_div_round_by_last_modulus_many_ntt_lvl(level, nb_rescales, ct.value[i], self.buff_q[0], out.value[i])
+        out.resize(ct.degree(), level - nb_rescales)
+        out.scale = scale
+        return out
+
+    # _mm_can_move_onto tells whether _mm_move_onto reaches target exactly: its integer factor round(q * target / scale)
+    # must be large enough to round within CKKS_SCALE_REL_TOL (2^29 or more) and fit 63 bits; ct must be above level 0.
+    def _mm_can_move_onto(self, ct: Ciphertext, target: float) -> bool:
+        if ct.level() == 0:
+            return False
+        k = float(self.params.ring_q.modulus[ct.level()]) * target / ct.scale
+        return k >= CKKS_MOVE_MIN_FACTOR and k < 9.2e18
+
+    # _mm_move_onto returns a new ciphertext, one level below ct, holding ct's values at the scale target: ct times the
+    # integer k = round(q * target / scale) (q the modulus at ct's level), divided by q in one rescale. Its scale,
+    # scale * k / q, is target to within 1 / (2k).
+    def _mm_move_onto(self, ct: Ciphertext, target: float) -> Ciphertext:
+        ring_q = self.params.ring_q
+        level = ct.level()
+        q = float(ring_q.modulus[level])
+        k = _nearest_integer(q * target / ct.scale)
+        out = new_ciphertext(self.ckks_params, ct.degree(), level, ct.scale)
+        self._mm_mul_by_const(ct, u64(k), out)
+        for i in range(out.degree() + 1):
+            ring_q._mm_div_round_by_last_modulus_many_ntt_lvl(level, 1, out.value[i], self.buff_q[0], out.value[i])
+        out.resize(ct.degree(), level - 1)
+        out.scale = ct.scale * k / q
+        return out
+
     def new_ciphertext_binary(self, op_0, op_1) -> Ciphertext:
         max_degree = max(op_0.degree(), op_1.degree())
         max_scale = max(op_0.scale, op_1.scale)
@@ -1610,7 +1727,7 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers], Static[rlwe.Eva
             raise ValueError("cannot check_binary: receiver operand degree is too small")
 
         op_0_values = [op_0.value] if isinstance(op_0, Plaintext) else op_0.value
-        op_1_values = [op_1.value] if isinstance(op_1, Plaintext) else op_0.value
+        op_1_values = [op_1.value] if isinstance(op_1, Plaintext) else op_1.value
 
         for pol in op_0_values:
             if not pol.is_ntt:
@@ -1646,27 +1763,59 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers], Static[rlwe.Eva
         self.neg(ct_0, ct_out)
         return ct_out
 
+    # add_const adds the constant to every slot of ct_in and writes the result in ct_out. With ct_out not ct_in, ct_out
+    # first receives every component of ct_in (at the lower of their levels) and its scale, so that ct_in stays as it
+    # was and ct_out shares no polynomial with it; the constant then goes to ct_out's first component.
     def add_const(self, ct_in: Ciphertext, constant, ct_out: Ciphertext):
-        if constant == type(constant)(0):
-            ct_out.set(ct_in)
+        if ct_out is not ct_in:
+            if ct_in._nil_ideal and constant == type(constant)(0):
+                # A fresh empty list: ct_out's own may be shared
+                ct_out.value = list[ring.Poly]()
+                ct_out.scale = 0.0
+                ct_out._nil_ideal = True
+                return
+            assert not ct_in._nil_ideal, "CKKS.Ciphertext: ciphers cannot be nil-ideal in add_const"
+            if constant == type(constant)(0):
+                self._mm_copy_into(ct_in, ct_out, 0)
+                return
+            # The components after the first; the first is ct_in's plus the constant, written by _mm_add_const
+            self._mm_copy_into(ct_in, ct_out, 1)
+            self._mm_add_const(ct_in, constant, ct_out)
             return
-        
-        self._mm_add_const(ct_in, constant, ct_out)
-    
+
+        if constant == type(constant)(0):
+            return
+
+        self._mm_add_const(ct_in, constant, ct_in)
+
+    # _mm_copy_into makes ct_out a copy of ct_in at the lower of their levels: its degree, its scale, and its components
+    # from first on, written into ct_out's own polynomials (resized as needed).
+    def _mm_copy_into(self, ct_in: Ciphertext, ct_out: Ciphertext, first: int):
+        assert not ct_out._nil_ideal, "CKKS.Ciphertext: output cipher cannot be nil-ideal"
+        level = min(ct_in.level(), ct_out.level())
+        ct_out.resize(ct_in.degree(), level)
+        for i in range(first, ct_in.degree() + 1):
+            ring._mm_copy_lvl(level, ct_in.value[i], ct_out.value[i])
+        ct_out.scale = ct_in.scale
+
     def add_const_new(self, ct_in: Ciphertext, constant) -> Ciphertext:
-        ct_out = new_ciphertext(self.ckks_params, ct_in.degree(), ct_in.level(), 0)
+        if ct_in._nil_ideal and constant == type(constant)(0):
+            # A new nil-ideal ciphertext: the shared NIL_IDEAL_CIPHERTEXT must not reach a caller that may write into it
+            return Ciphertext(list[ring.Poly](), 0.0, True)
+        ct_out = new_ciphertext(self.ckks_params, ct_in.degree(), ct_in.level(), ct_in.scale)
         self.add_const(ct_in, constant, ct_out)
         return ct_out
-    
+
     def sub_const(self, ct_in: Ciphertext, constant, ct_out: Ciphertext):
         self.add_const(ct_in, -constant, ct_out)
-    
-    def sub_const_new(self, ct_in: Ciphertext, constant) -> Ciphertext:
-        ct_out = new_ciphertext(self.ckks_params, ct_in.degree(), ct_in.level(), 0)
-        self.sub_const(ct_in, constant, ct_out)
-        return ct_out
 
-    # add adds op_1 to ct_in and returns the result in ct_out.
+    def sub_const_new(self, ct_in: Ciphertext, constant) -> Ciphertext:
+        return self.add_const_new(ct_in, -constant)
+
+    # add adds op_1 to ct_in and returns the result in ct_out, at the lowest of the three levels. Operands whose scales
+    # differ are brought onto one scale first (_mm_match_scales), never by spending a level of the sum: exactly where the
+    # ratio is an integer or an operand above the sum's level can move onto the other's scale; otherwise as Lattigo (a
+    # residual of the ratio's distance to the nearest integer, or to 1 below 2).
     def add(self, ct_in: Ciphertext, op_1, ct_out: Ciphertext):
         if ct_in._nil_ideal:
             ct_out.set(op_1)
@@ -1691,7 +1840,7 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers], Static[rlwe.Eva
         self.add(ct_in, op_1, ct_out)
         return ct_out
     
-    # sub subtracts op_1 from ct_in and returns the result in ct_out.
+    # sub subtracts op_1 from ct_in and returns the result in ct_out; the scales are matched as in add.
     def sub(self, ct_in: Ciphertext, op_1, ct_out: Ciphertext):
         if ct_in._nil_ideal:
             ct_out.set(self.neg_new(op_1.ciphertext()))
@@ -1872,7 +2021,7 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers], Static[rlwe.Eva
             ring_q._mm_mul_coeffs_montgomery_lvl(level, c01, tmp1.value[1], c2)  # c2 = c[1]*c[1]
             ring_q._mm_mul_coeffs_montgomery_lvl(level, c00, tmp1.value[1], c1)
 
-            if ct_in == op_1:  # squaring case
+            if ct_in is op_1:  # squaring case (the same object; two equal ciphertexts take the general case, alike)
                 ring_q._mm_add_lvl(level, c1, c1, c1)  # c1 = 2*c[0]*c[1]
             else:  # regular case
                 ring_q._mm_mul_coeffs_montgomery_and_add_lvl(level, c01, tmp1.value[0], c1)  # c1 = c0[0]*c1[1] + c0[1]*c1[0]

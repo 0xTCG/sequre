@@ -708,6 +708,115 @@ def test_decryption_to_holders(mpc):
     assert_parties_in_step(mpc, "MHE decryption from one holder")
 
 
+def max_slot_error(got: list[float], want: list[float]) -> float:
+    worst = 0.0
+    for i in range(len(want)):
+        d = abs(got[i] - want[i])
+        if d > worst or d != d:
+            worst = d if d == d else 1e300
+    return worst
+
+
+def test_sum_of_product_and_fresh(mpc):
+    """A refreshed product (its scale a modulus's ratio off the default, one level down) plus a fresh ciphertext: the sum
+    is right to the noise of the collective encryption and decryption (2e-5 to 4e-5 here). It used to take the two scales
+    as equal: an error of about 1e-5 of the values (5.6e-4 here), the same sign on every slot. With the fresh one dropped
+    to the product's level the sum keeps that residual and the level (exactness would spend a level of the sum)."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    with mpc.randomness.global_stream():
+        x_vals = random_floats((slots,))
+        y_vals = random_floats((slots,))
+    if mpc.pid > 0:
+        want = [x_vals[i] * y_vals[i] + x_vals[i] for i in range(slots)]
+        product = mpc.mhe.mul(mpc.mhe.enc_vector(x_vals, T=ckks.Ciphertext), mpc.mhe.enc_vector(y_vals, T=ckks.Ciphertext))
+        mpc.mhe.refresh(product)
+        fresh = mpc.mhe.enc_vector(x_vals, T=ckks.Ciphertext)
+        apart = mpc.mhe.add(product, fresh)
+        error = max_slot_error(mpc.mhe.decode(enc=mpc.mhe.decrypt(apart), dtype=float), want)
+        assert_eq(f"CP{mpc.pid}:\tMHE a refreshed product plus a fresh ciphertext one level up: error {error:.1e}, values up to 56", error < 1.5e-4 and apart[0].level() == product[0].level(), True)
+        dropped = mpc.mhe.drop_level(fresh, product[0].level())
+        same = mpc.mhe.add(product, dropped)
+        # As Lattigo: the smaller-scale operand read at the larger scale
+        hi, lo = max(product[0].scale, dropped[0].scale), min(product[0].scale, dropped[0].scale)
+        factor = lo / hi
+        lattigo = [x_vals[i] * y_vals[i] * (factor if product[0].scale < dropped[0].scale else 1.0) + x_vals[i] * (factor if dropped[0].scale < product[0].scale else 1.0) for i in range(slots)]
+        residual = max_slot_error(mpc.mhe.decode(enc=mpc.mhe.decrypt(same), dtype=float), lattigo)
+        assert_eq(f"CP{mpc.pid}:\tMHE the same at the product's level keeps the level and Lattigo's residual (departure {residual:.1e})", residual < 1.5e-4 and same[0].level() == product[0].level(), True)
+
+
+def test_sum_at_bootstrap_level(mpc):
+    """A ciphertext at the bootstrap level (MPCMHE.drop_level puts it there) plus a product, then a product by a constant,
+    whose refresh bootstraps the sum. The sum used to take the product's scale, and the refresh's rescale left it below
+    the level bootstrapping needs: every compute party aborted. Now MPCMHE rescales the product before the addition, from
+    any level above (MPCMHE._unstranded): the values are right, with one bootstrap per party. With x one level above the
+    bootstrap level, the sum keeps the product's scale, and its refresh rescales it to the bootstrap level and bootstraps
+    it, as before: one bootstrap per party. The same on an aggregate (the same ciphertexts at every party, refreshed in
+    the broadcast mode): one bootstrap for every party, and the copies stay the same."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    with mpc.randomness.global_stream():
+        x_vals = random_floats((slots,))
+        y_vals = random_floats((slots,))
+        z_vals = random_floats((slots,))
+    low = mpc.mhe.bootstrap_min_level
+    parties = mpc.comms.number_of_parties - 1
+    want = [(x_vals[i] + y_vals[i] * z_vals[i]) * 2.5 for i in range(slots)]
+    if mpc.pid > 0:
+        for target, product_level, bootstraps in ((low, -1, parties), (low + 1, -1, parties), (low, low + 1, parties)):
+            x = mpc.mhe.drop_level(mpc.mhe.enc_vector(x_vals, T=ckks.Ciphertext), target)
+            y = mpc.mhe.enc_vector(y_vals, T=ckks.Ciphertext)
+            z = mpc.mhe.enc_vector(z_vals, T=ckks.Ciphertext)
+            if product_level >= 0:
+                y = mpc.mhe.drop_level(y, product_level)
+                z = mpc.mhe.drop_level(z, product_level)
+            product = mpc.mhe.mul(y, z)
+            total = mpc.mhe.add(x, product)
+            before = mpc.mhe.stats.secure_bootstrap_count
+            result = mpc.mhe.mul_const(total, 2.5)
+            spent = mpc.mhe.stats.secure_bootstrap_count - before
+            error = max_slot_error(mpc.mhe.decode(enc=mpc.mhe.decrypt(result), dtype=float), want)
+            assert_eq(f"CP{mpc.pid}:\tMHE (x + y * z) * 2.5 with x at level {target} and y * z at level {product[0].level()}: {spent} bootstraps, error {error:.1e} (values up to 140)", error < 2e-4 * 140.0 and spent == bootstraps, True)
+
+    # An aggregate: CP1's encryptions, the same ciphertexts at every compute party
+    if mpc.pid > 0:
+        x = mpc.comms.broadcast_from(mpc.mhe.drop_level(mpc.mhe.enc_vector(x_vals, T=ckks.Ciphertext), low), 1)
+        y = mpc.comms.broadcast_from(mpc.mhe.drop_level(mpc.mhe.enc_vector(y_vals, T=ckks.Ciphertext), low + 1), 1)
+        z = mpc.comms.broadcast_from(mpc.mhe.drop_level(mpc.mhe.enc_vector(z_vals, T=ckks.Ciphertext), low + 1), 1)
+        total = mpc.mhe.add(x, mpc.mhe.mul(y, z, True, True))
+        before = mpc.mhe.stats.secure_bootstrap_count
+        result = mpc.mhe.mul_const(total, 2.5, True)
+        spent = mpc.mhe.stats.secure_bootstrap_count - before
+        same = same_at_every_party(mpc, result)
+        error = max_slot_error(mpc.mhe.decode(enc=mpc.mhe.decrypt(result, -1), dtype=float), want)
+        assert_eq(f"CP{mpc.pid}:\tMHE an aggregate's (x + y * z) * 2.5 at the bootstrap level: {spent} bootstrap(s), copies the same {same}, error {error:.1e}", error < 2e-4 * 140.0 and spent == 1 and same, True)
+    assert_parties_in_step(mpc, "MHE sums at the bootstrap level")
+
+
+def test_same_level_sum_above_bootstrap_level(mpc):
+    """Two products at one level above the bootstrap level whose scales differ by a rescale's ratio (p * p and p * x, p
+    with a rescale history), summed, then a product by a constant: the sum keeps its level, so its refresh rescales it to
+    the bootstrap level and bootstraps it. Bringing such a sum onto one scale exactly would spend its level, leave it at
+    the bootstrap level with a rescale still pending, and make that refresh impossible at every compute party."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    with mpc.randomness.global_stream():
+        p_vals = [0.9 + 0.2 * v for v in random_floats((slots,), scale=1.0)]
+        x_vals = random_floats((slots,), scale=1.0)
+    low = mpc.mhe.bootstrap_min_level
+    if mpc.pid > 0:
+        ones = [1.0 for _ in range(slots)]
+        p = mpc.mhe.enc_vector(p_vals, T=ckks.Ciphertext)
+        while p[0].level() > low + 1:
+            p = mpc.mhe.mul(p, mpc.mhe.enc_vector(ones, T=ckks.Ciphertext))
+            mpc.mhe.refresh(p)
+        x = mpc.mhe.enc_vector(x_vals, T=ckks.Ciphertext)
+        total = mpc.mhe.add(mpc.mhe.mul(p, p), mpc.mhe.mul(p, x))
+        level = total[0].level()
+        result = mpc.mhe.mul_const(total, 2.5)
+        want = [(p_vals[i] * p_vals[i] + p_vals[i] * x_vals[i]) * 2.5 for i in range(slots)]
+        error = max_slot_error(mpc.mhe.decode(enc=mpc.mhe.decrypt(result), dtype=float), want)
+        assert_eq(f"CP{mpc.pid}:\tMHE p * p + p * x at level {low + 1} (sum at level {level}), then * 2.5: error {error:.1e} (values up to 8)", level == low + 1 and error < 1e-3, True)
+    assert_parties_in_step(mpc, "MHE same-level sums above the bootstrap level")
+
+
 def test_mhe(mpc, modulus):
     # The HE tests, then the MHE <-> MPC conversions on the run's modulus (the field, or the ring with --use-ring)
     print(f'CP{mpc.pid}:\tTesting MHE ... \n')
@@ -718,6 +827,9 @@ def test_mhe(mpc, modulus):
     test_decryption_to_holders(mpc)
     test_arithmetics(mpc)
     test_collective_bootstrapping(mpc)
+    test_sum_of_product_and_fresh(mpc)
+    test_sum_at_bootstrap_level(mpc)
+    test_same_level_sum_above_bootstrap_level(mpc)
     test_cipher_to_additive_plaintext_conversion(mpc)
     with mpc.default_modulus(modulus):
         test_cipher_to_additive_share_vec_conversion(mpc, modulus)
