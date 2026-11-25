@@ -78,14 +78,17 @@ public:
 };
 
 class BET {
-  std::map<codon::ir::id_t, BETNode *> betPerVar;
+  std::vector<BETNode *> roots;
+  std::vector<codon::ir::id_t> rootIds;
 
 public:
   static const codon::ir::id_t BET_NO_VAR_ID = -1;
   static const codon::ir::id_t BET_RETURN_ID = -2;
+  
+  static const std::set<std::string> INSTR_BLIST;
 
   BET() {}
-  ~BET() { for ( auto &it: betPerVar ) delete it.second; }
+  ~BET() { for ( auto &it: roots ) delete it; }
 
   struct Iterator {
     using iterator_category = std::forward_iterator_tag;
@@ -122,10 +125,10 @@ public:
     std::vector<BETNode *> recstack;
   };
   
-  Iterator begin();
-  Iterator end() { return Iterator( {} ); }
+  Iterator begin() { return Iterator(roots); }
+  Iterator end() { return Iterator({}); }
 
-  void addBET( codon::ir::id_t var_id, BETNode *betNode ) { betPerVar[var_id] = betNode; }
+  void addBET( codon::ir::id_t varId, BETNode *betNode ) { roots.push_back(betNode); rootIds.push_back(varId); }
   void expandNode( BETNode * );
   
   BETNode *parseInstruction( Value * );

@@ -38,7 +38,7 @@ The `enc` static method selects between three strategies:
 |---|---|---|---|
 | Row-wise | `ENC_ROW` | `rows <= cols` (default) or 1-D | One row per ciphertext (or multi-cipher for wide rows) |
 | Column-wise | `ENC_COL` | `rows > cols` | One column per ciphertext |
-| Diagonal | `ENC_DIAG` | Set by `@mhe_enc_opt` pass | Diagonal `d_k` of the matrix per ciphertext |
+| Diagonal | `ENC_DIAG` | `encoding=ENC_DIAG`; the matmul routers also encode a plaintext operand diagonal-wise for M3 | Diagonal `d_k` of the matrix per ciphertext |
 
 ```python
 @staticmethod
@@ -101,7 +101,7 @@ This is used by `MPCComms` when sending encrypted tensors between parties.
 
 ## Cost model
 
-The compiler's `@mhe_cipher_opt` pass uses constant cost estimates to decide operation ordering:
+The matmul kernel routers use constant cost estimates (`@mhe_cipher_opt` counts operations instead: secure `@` products, secure products, secure-by-public products, secure additions):
 
 | Operation | Cost constant |
 |---|---|

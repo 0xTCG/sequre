@@ -5,6 +5,8 @@ namespace sequre {
 
 using namespace codon::ir;
 
+const std::set<std::string> BET::INSTR_BLIST { "print" };
+
 BETNode::BETNode()
   : value(nullptr), irType(nullptr), operation(""), leftChild(nullptr), rightChild(nullptr), expanded(false) {}
 
@@ -158,25 +160,19 @@ void BETNode::print( int level = 0, int maxLevel = 100 ) const {
   if ( rightChild ) rightChild->print(level + 1, maxLevel);
 }
 
-BET::Iterator BET::begin()  {
-  std::vector<BETNode *> recstack;
-
-  for ( auto it = betPerVar.rbegin(); it != betPerVar.rend(); ++it )
-    recstack.push_back(it->second);
-
-  return Iterator(recstack);
-}
-
 void BET::expandNode(BETNode *betNode) {
   if ( betNode->isExpanded() )
     return;
 
   if ( betNode->isLeaf() ) {
     assert( betNode->checkIsVariable() && "Node needs to be a variable for expansion" );
-    auto search = betPerVar.find(betNode->getVariableId());
+
+    auto searchId = betNode->getVariableId();
+    auto i        = 0;
+    for ( ; i != rootIds.size() && rootIds[i] != searchId; ++i );
     
-    if ( search != betPerVar.end() )
-      betNode->replace(search->second);
+    if ( i != rootIds.size() )
+      betNode->replace(roots[i]);
   } else {
     expandNode(betNode->getLeftChild());
     expandNode(betNode->getRightChild());
@@ -196,12 +192,17 @@ BETNode *BET::parseInstruction( Value *instr ) {
 
   auto *callInstr = cast<CallInstr>(instr);
   auto *betNode   = new BETNode();
-  if (!callInstr)
+  if ( !callInstr )
     return betNode;
+  
+  auto calleeName = getOperation(callInstr);
+  auto search     = INSTR_BLIST.find(calleeName);
+  if ( search != INSTR_BLIST.end() )
+    return nullptr;
 
   betNode->setValue(callInstr);
   betNode->setIRType(callInstr->getType());
-  betNode->setOperation(getOperation(callInstr));
+  betNode->setOperation(calleeName);
   
   if ( isBinaryInstr(callInstr) ) {
     auto *lhs = callInstr->front();
@@ -238,6 +239,9 @@ BETNode *BET::parseInstruction( Value *instr ) {
 void BET::parseSeries( SeriesFlow *series ) {
   for ( auto it : *series ) {
     auto *node = parseInstruction(it);
+
+    if ( !node )
+      continue;
     
     if ( cast<ReturnInstr>(it) ) {
       addBET(BET_RETURN_ID, node);
@@ -459,8 +463,8 @@ std::pair<int, int> BET::elementsCount() const {
   int nodesCount = 0;
   int edgesCount = 0;
   
-  for (auto& it: betPerVar)
-    it.second->elementsCount(nodesCount, edgesCount);
+  for (auto& root : roots)
+    root->elementsCount(nodesCount, edgesCount);
 
   return std::make_pair(nodesCount, edgesCount);
 }
@@ -501,7 +505,12 @@ Value *BET::getNodeEncoding( Module * M, BETNode *node, std::vector<Var *> const
 
 Value *BET::getEncoding( Module * M, std::vector<Var *> const &fargs ) {
   std::vector<Value *> nodesEncodings;
-  
+  std::vector<Value *> rootIdValues;
+
+  for ( auto rootId : rootIds )
+    rootIdValues.push_back(M->getInt(rootId));
+  nodesEncodings.push_back(util::makeTuple(rootIdValues, M));
+
   for ( auto& it : *this )
     nodesEncodings.push_back(getNodeEncoding(M, &it, fargs));
 

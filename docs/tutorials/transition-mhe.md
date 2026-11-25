@@ -84,22 +84,25 @@ This runs:
 
 Adding `--skip-mhe-setup` flag skips MHE setup. Useful when only MPC is needed.
 
-<!-- ## Compiler optimizations for MHE
+## Compiler optimizations for MHE
 
-Shechi includes compiler-level IR passes that optimize HE code automatically:
+Shechi includes opt-in compiler passes that rewrite a decorated function's HE code:
 
 ### `@mhe_cipher_opt` — expression reordering
 
-The compiler builds a Binary Expression Tree (BET) of the function's arithmetic, then:
+Under `@sequre`, the compiler rewrites the decorated function's sums of products of one ciphertext tensor with public operands (ndarrays, numbers, plaintexts):
 
-- Factorizes common subexpressions: `a*b + a*c` → `a*(b + c)` (saves one expensive HE multiply)
-- Reorders operations to minimize ciphertext-ciphertext multiplications
+- Factors an operand out of a sum: `a*b + a*c` with public `b`, `c` → `a*(b + c)` (one HE product instead of two)
+- Combines public operands first, so that fewer of them meet a ciphertext: `a*b + a*c + a*d` with public `b`, `c`, `d` → `a*((b + c) + d)`
+- Folds a definition into its only use, so that `e = a*b + a*c; return e + a*d` is factored as one sum
+
+An expression of two or more ciphertext tensors stays as written: their storage (transposed, diagonal, split among parties) is not in their types, and a new pairing could convert or bootstrap more. It leaves as written whatever it cannot prove equivalent and cheaper, and it assumes that the tensors of a decorated expression have one shape (see [Decorators](../api/decorators.md)).
 
 ### `@mhe_enc_opt` — encoding optimization
 
-For matrix multiplications, the compiler selects the optimal CKKS encoding strategy (row-wise, column-wise, or diagonal) via brute-force search over encoding candidates.
+Accepted and does nothing: the matmul routers already pick, for each product, the cheapest kernel and the encoding of a plaintext operand by cost.
 
-Both passes are applied automatically to `@sequre`-annotated functions when the operands are Ciphertensor or MPU types. -->
+Both are opt-in: a function gets a pass only with its decorator.
 
 ## When to use which
 

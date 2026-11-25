@@ -273,9 +273,17 @@ def tree_files(root):
     return sorted(out)
 
 
+def plugin_dir():
+    # The Sequre plugin directory the launcher builds with: SEQURE_PLUGIN_PATH, else the installed one
+    return os.environ.get("SEQURE_PLUGIN_PATH") or os.path.join(os.path.expanduser("~"), ".sequre", "lib", "codon",
+                                                                 "plugins", "sequre")
+
+
 def stdlib_hash():
+    # The stdlib the builds use: a plugin directory's own when SEQURE_PLUGIN_PATH names one, else this checkout's
+    # (which the installed plugin's stdlib links to in a development install)
     h = hashlib.sha256()
-    root = os.path.join(REPO, "stdlib")
+    root = os.path.join(plugin_dir(), "stdlib") if os.environ.get("SEQURE_PLUGIN_PATH") else os.path.join(REPO, "stdlib")
     for p in tree_files(root):
         h.update(os.path.relpath(p, root).encode())
         sha256_file(p, h)
@@ -283,11 +291,15 @@ def stdlib_hash():
 
 
 def toolchain_files():
+    # The codon the launcher runs (CODON_BIN, else the installed one) with its libraries, the launcher, and the plugin
+    # libraries of the plugin directory the builds use
     home = os.path.expanduser("~")
-    cands = [os.path.join(home, ".sequre", "bin", "codon"), os.path.join(home, ".sequre", "bin", "sequre"),
-             os.path.join(home, ".sequre", "lib", "codon", "libcodonc.so"),
-             os.path.join(home, ".sequre", "lib", "codon", "libcodonrt.so")]
-    cands += sorted(glob.glob(os.path.join(home, ".sequre", "lib", "codon", "plugins", "sequre", "build", "*.so")))
+    codon = os.environ.get("CODON_BIN") or os.path.join(home, ".sequre", "bin", "codon")
+    lib = os.path.join(os.path.dirname(os.path.dirname(codon)), "lib", "codon")
+    cands = [codon, os.path.join(home, ".sequre", "bin", "sequre"),
+             os.path.join(lib, "libcodonc.so"),
+             os.path.join(lib, "libcodonrt.so")]
+    cands += sorted(glob.glob(os.path.join(plugin_dir(), "build", "*.so")))
     return [p for p in cands if os.path.exists(p)]
 
 

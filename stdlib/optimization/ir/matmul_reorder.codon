@@ -1,137 +1,56 @@
 import secure_operator
-from functools import partial
-from patch import min_by_key, permutations
 
 
-def _single_matmul_cost_by_shapes(shape_1, shape_2):
-    return shape_1[0] * shape_1[1] * shape_2[1]
-
-
-def _single_matmul_cost(mat_1, mat_2):
-    return mat_1.get_matmul_cost(mat_2)
-
-
-def _merge_shapes_at_idx(shapes, idx):
-    shapes[idx] = (shapes[idx][0], shapes[idx + 1][1])
-    del shapes[idx + 1]
-
-
-def _update_order_after_merge(order, idx):
-    for j in range(len(order)):
-        if idx < order[j]:
-            order[j] -= 1
-
-
-def _matmul_cost_by_order(shapes, order):
-    total_cost = 0
-    shapes_copy = [e for e in shapes]
-    
-    for i in range(len(order)):
-        o = order[i]
-        total_cost += _single_matmul_cost_by_shapes(shapes_copy[o], shapes_copy[o + 1])
-        _merge_shapes_at_idx(shapes_copy, o)
-        _update_order_after_merge(order, o)
-    
-    return total_cost
-
-
-def _get_smallest_matmul_idx_via_shapes(shapes):
-    if len(shapes) < 3:
-        return 0
-    
-    smallest_idx = 0
-    smallest_cost = _single_matmul_cost_by_shapes(shapes[0], shapes[1])
-    
-    for i in range(1, len(shapes) - 1):
-        new_cost = _single_matmul_cost_by_shapes(shapes[i], shapes[i + 1])
-        if new_cost < smallest_cost:
-            smallest_cost = new_cost
-            smallest_idx = i
-    
-    return smallest_idx
-
-
-def _get_smallest_matmul_idx(mats):
-    if len(mats) < 3:
-        return 0
-    
-    smallest_idx = 0
-    smallest_cost = _single_matmul_cost(mats[0], mats[1])
-    
-    for i in range(1, len(mats) - 1):
-        new_cost = _single_matmul_cost(mats[i], mats[i + 1])
-        if new_cost < smallest_cost:
-            smallest_cost = new_cost
-            smallest_idx = i
-    
-    return smallest_idx
-
-
-def evaluate_by_order(mpc, mats, order, _op):
-    for i in range(len(order)):
-        o = order[i]
-        mats[o] = _op(mpc, mats[o], mats[o + 1])
+def evaluate_in_order(mpc, mats, order):
+    # Each step multiplies the operand at the step's index by the next one
+    for o in order:
+        mats[o] = secure_operator.matmul(mpc, mats[o], mats[o + 1])
         del mats[o + 1]
-        _update_order_after_merge(order, o)
     
     return mats[0]
 
 
-@tuple
-class MinCostMatmulOrderModes:
-    exhaustive = 0
-    greedy = 1
-
-
-def _exhaustive_min_cost_order(shapes):
-    return min_by_key(
-        iterable=permutations(range(len(shapes) - 1)),
-        key=partial(_matmul_cost_by_order, shapes))
-
-
-def _greedy_min_cost_order(shapes):
-    order = []
-    shapes_copy = [s for s in shapes]
-    indices = list(range(len(shapes) - 1))
+def order_cost(dims: List[int], order: List[int]) -> int:
+    # Rows x inner x columns summed over the products of a chain of matrices dims[i] x dims[i + 1] evaluated in the
+    # given order (each step: the index of a product's left operand in the list of operands as it shrinks)
+    ds = [d for d in dims]
+    cost = 0
+    for o in order:
+        cost += ds[o] * ds[o + 1] * ds[o + 2]
+        del ds[o + 1]
     
-    while len(shapes_copy) > 1:
-        smallest_matmul_idx = _get_smallest_matmul_idx_via_shapes(shapes_copy)
-        _merge_shapes_at_idx(shapes_copy, smallest_matmul_idx)
-        new_idx = indices[smallest_matmul_idx]
-        order.append(new_idx)
-        indices.remove(new_idx)
+    return cost
+
+
+def _add_steps(split: List[List[int]], i: int, j: int, starts: List[int], order: List[int]):
+    # The products of operands i..j in evaluation order: each as the index of its left side among the sides left
+    if i == j:
+        return
     
+    k = split[i][j]
+    _add_steps(split, i, k, starts, order)
+    _add_steps(split, k + 1, j, starts, order)
+    idx = starts.index(i)
+    order.append(idx)
+    del starts[idx + 1]
+
+
+def cheapest_order(dims: List[int]) -> List[int]:
+    # The order of least order_cost (the matrix-chain dynamic program; of equal ones, the first split found)
+    n = len(dims) - 1
+    best = [[0 for _ in range(n)] for _ in range(n)]
+    split = [[0 for _ in range(n)] for _ in range(n)]
+    for length in range(2, n + 1):
+        for i in range(n - length + 1):
+            j = i + length - 1
+            best[i][j] = -1
+            for k in range(i, j):
+                cost = best[i][k] + best[k + 1][j] + dims[i] * dims[k + 1] * dims[j + 1]
+                if best[i][j] < 0 or cost < best[i][j]:
+                    best[i][j] = cost
+                    split[i][j] = k
+    
+    order = List[int]()
+    starts = [i for i in range(n)]
+    _add_steps(split, 0, n - 1, starts, order)
     return order
-
-
-def _get_min_cost_order(shapes, mode):
-    if mode == MinCostMatmulOrderModes.exhaustive:
-        return _exhaustive_min_cost_order(shapes)
-    elif mode == MinCostMatmulOrderModes.greedy:
-        return _greedy_min_cost_order(shapes)
-    else:
-        raise NotImplementedError("MinCostMatmulOrderMode not supported")
-
-
-def reorder_and_evaluate(mpc, mats):
-    min_permutation = _get_min_cost_order(
-        shapes=[m.shape for m in mats],
-        mode=MinCostMatmulOrderModes.greedy)
-    
-    return evaluate_by_order(
-        mpc=mpc,
-        mats=[m for m in mats],
-        order=min_permutation,
-        _op=secure_operator.matmul)
-
-
-def evaluate_and_reorder(mpc, mats):
-    if len(mats) == 0:
-        raise ValueError("matmul reordering: empty matrix tuple")
-    
-    while len(mats) > 1:
-        idx = _get_smallest_matmul_idx(mats)
-        mats[idx] = secure_operator.matmul(mpc, mats[idx], mats[idx + 1])
-        del mats[idx + 1]
-    
-    return mats[0]

@@ -1,5 +1,15 @@
+# Run-time helpers of the Sequre plugin's IR optimizations (ir/analysis/cipher_opt.cpp finds them in this module).
+# `sequre` star-imports this module, so the names imported here stay importable from `sequre`, as they were.
+#
+# BOSTAN (Shechi, section 8.2: aggregation and encoding optimization on a secure expression tree) is kept here as
+# reference, neither imported nor built: bostan.codon (the plugin's run-time entry points), bet.codon (the run-time
+# tree), metadata.codon (partitioning and encoding metadata and their propagation), cost_estimator.codon, and the
+# plugin's ir/helpers/bet.{h,cpp}, all from the ir-opt branch (6508b9a, "MPP-opt: EOD"), where the plugin's wiring
+# (applyBostan in ir/mhe.cpp, the matmul hook in ir/expr.cpp) and MPU._matmul's aggregation_strategy are too. They
+# target the MPU and Ciphertensor APIs of April 2024 and await a port.
 import time
 
+import internal.static as static
 import secure_operator
 
 from sequre.stdlib.numpy.ndarray import ndarray
@@ -12,67 +22,43 @@ from sequre.constants import (
 from sequre.types.ciphertensor import Ciphertensor
 from sequre.lattiseq.ckks import Ciphertext
 
-from matmul_reorder import evaluate_and_reorder
-from bet import BET
+from matmul_reorder import evaluate_in_order, order_cost, cheapest_order
 
 
-def matmul_reordering(mpc, mats):
-    return evaluate_and_reorder(mpc, [m for m in mats])
-
-
-def bet_enc_init(bet_encoding, args):
-    return BET(bet_encoding, args)
-
-
-def bet_enc_opt(bet):
-    with time.timing("IR encoding optimization"):
-        bet.encoding_opt(method=IR_OPT_ENCODING_OPT_NAME_BRUTE_FORCE)
+def matmul_chain(mpc, mats, written):
+    # A chain of `@` of Sharetensors that @mhe_cipher_opt hands over: its operands and the order as written (for each
+    # product, the index of its left operand in the list of operands and products as it shrinks). It runs in the order
+    # of least rows x inner x columns (Sharetensor's cost model) when that is strictly cheaper than the written one, and
+    # as written otherwise (a tie, a vector, shapes that do not chain). Shapes are the same at every party.
+    ms = [m for m in mats]
+    order = [o for o in written]
+    dims = List[int]()
+    for i in range(len(ms)):
+        if ms[i].ndim != 2 or (i > 0 and ms[i].shape[0] != dims[i]):
+            return evaluate_in_order(mpc, ms, order)
+        if i == 0:
+            dims.append(ms[i].shape[0])
+        dims.append(ms[i].shape[1])
     
-    if DEBUG:
-        print(f"Optimized cost: {bet._cost}")
+    best = cheapest_order(dims)
+    if order_cost(dims, best) < order_cost(dims, order):
+        order = best
+    return evaluate_in_order(mpc, ms, order)
 
 
-def bet_enc_matmul(mpc, a, b, bet, a_node_id, b_node_id):
-    a_is_target = a_node_id in bet.encoding_candidates
-    b_is_target = b_node_id in bet.encoding_candidates
-
-    if not a_is_target and not b_is_target:
-        return secure_operator.matmul(mpc, a, b)
-    
-    assert a_is_target ^ b_is_target, "Only one operand can have variable encoding in matmul"
-
-    target_node_id = a_node_id if a_is_target else b_node_id
-    target_encoding = bet.encoding_candidates[target_node_id].metadata.encoding
-
-    assert 0 < target_encoding < 4, "Internal error: IR encoding optimization: invalid target encoding"
-
-    if isinstance(a, Ciphertensor):
-        assert b_is_target, "Internal error: second operand should be plain in matmul encoding IR optimization"
-        
-        if target_encoding == IR_OPT_ENCODING_ROW_WISE_ENUM:
-            encrypted_plain = Ciphertensor[Ciphertext].enc(mpc, b, encoding=ENC_ROW)
-        elif target_encoding == IR_OPT_ENCODING_COL_WISE_ENUM:
-            encrypted_plain = Ciphertensor[Ciphertext].enc(mpc, b.T, encoding=ENC_ROW)
-            encrypted_plain._transposed = True
-        else:
-            encrypted_plain = Ciphertensor[Ciphertext].enc(mpc, b, encoding=ENC_DIAG)
-        
-        return secure_operator.matmul(mpc, a, encrypted_plain)
-        
-    elif isinstance(b, Ciphertensor):
-        assert a_is_target, "Internal error: first operand should be plain in matmul encoding IR optimization"
-        
-        if target_encoding == IR_OPT_ENCODING_ROW_WISE_ENUM:
-            encrypted_plain = Ciphertensor[Ciphertext].enc(mpc, a.T, encoding=ENC_ROW)
-        elif target_encoding == IR_OPT_ENCODING_COL_WISE_ENUM:
-            encrypted_plain = Ciphertensor[Ciphertext].enc(mpc, a, encoding=ENC_ROW)
-            encrypted_plain._transposed = True
-        else:
-            encrypted_plain = Ciphertensor[Ciphertext].enc(mpc, a.T, encoding=ENC_DIAG)
-        
-        return secure_operator.matmul(mpc, b.T, encrypted_plain).T
-
-    if DEBUG:
-        print(f"WARNING: Unsupported type in IR encoding optimization. Using lazy approach ... ")
-    
-    return secure_operator.matmul(mpc, a, b)
+def fp_agree(ts, conds) -> bool:
+    # Whether each addition of two Sharetensors in an expression @mhe_cipher_opt rewrote adds two fixed-point values or
+    # two integer ones (Sequre refuses one of each): the rewritten expression runs only then, the expression as written
+    # otherwise. conds holds four ints per addition: for each side, a bit mask over ts (the side is fixed point when
+    # one of those is) and whether it is fixed point anyway (a product with a float).
+    flags = 0
+    for i in static.range(static.len(ts)):
+        if ts[i].fp:
+            flags |= 1 << i
+    cs = [c for c in conds]
+    for k in range(0, len(cs), 4):
+        left = (flags & cs[k]) != 0 or cs[k + 1] != 0
+        right = (flags & cs[k + 2]) != 0 or cs[k + 3] != 0
+        if left != right:
+            return False
+    return True

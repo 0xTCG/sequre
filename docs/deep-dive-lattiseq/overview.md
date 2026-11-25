@@ -10,7 +10,7 @@ Lattigo is written in Go. Sequre's compiler and runtime are built on Codon (comp
 - **Loss of compiler visibility** — the Sequre IR passes cannot inspect or optimize Go code
 - **Deployment friction** — users would need both Codon and Go toolchains
 
-By reimplementing in Codon, Lattiseq gives the compiler full visibility into HE operations, enabling optimizations like `@mhe_cipher_opt` (operation reordering) and `@mhe_enc_opt` (encoding selection).
+By reimplementing in Codon, Lattiseq gives the compiler full visibility into HE operations, enabling optimizations like `@mhe_cipher_opt` (operation reordering) and the matmul routers' choice of kernel and encoding by cost.
 
 ## Module structure
 

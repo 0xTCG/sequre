@@ -1,17 +1,19 @@
-import internal.static as static
+import math
+
+from numpy.ndarray import ndarray
 
 from sequre.constants import (
-    IR_OPT_ENCODING_OPT_NAME_BRUTE_FORCE,
-    IR_OPT_ENCODING_BRUTE_FORCE_MAX_MATMUL_COUNT,
-    IR_OPT_ENCODING_ROW_WISE_ENUM,
-    IR_OPT_ENCODING_COL_WISE_ENUM,
-    IR_OPT_ENCODING_DIAG_WISE_ENUM)
+    DEBUG,
+    BOSTAN_OPT_NAME_HILL_CLIMBING,
+    BOSTAN_HILL_CLIMBING_STEPS,
+    BOSTAN_OPT_NAME_BRUTE_FORCE,
+    BOSTAN_ENCODING_BRUTE_FORCE_MAX_MATMUL_COUNT)
 
-from common import (
+from metadata import (
     Metadata, _update_encoding_relevant_nodes,
     _resolve_node_metadata, _resolve_tree_metadata)
 from cost_estimator import CostEstimator
-from sequre.types.ciphertensor import Ciphertensor
+from sequre.types.multiparty_union import MPU
 
 
 @tuple
@@ -48,15 +50,12 @@ class BETNode:
         if self.left_child is not None and self.right_child is not None:
             return CostEstimator.estimate_binary_op_by_metadata(
                 op_name=self.operation,
-                lop_type_name=self.left_child.type_name,
-                rop_type_name=self.right_child.type_name,
                 lop_metadata=self.left_child.metadata,
                 rop_metadata=self.right_child.metadata)
 
         if self.left_child is not None:
             return CostEstimator.estimate_unary_op_by_metadata(
                 op_name=self.operation,
-                op_type_name=self.left_child.type_name,
                 op_metadata=self.left_child.metadata)
         
         return 0.0
@@ -76,48 +75,91 @@ class BETNode:
         if level >= maxLevel:
             return
 
-        print(f"{'\t' * level}{self.operation} {self.var_id} {self.metadata}")
+        print(f"{'\t' * level}{self.operation} {self.var_id} {self.id} {self.metadata}")
 
         if self.left_child is not None:
             self.left_child.print(level + 1, maxLevel)
         if self.right_child is not None:
             self.right_child.print(level + 1, maxLevel)
 
+    def set_defaults(self, aggregation_candidates):
+        self.set_default_aggregation_strategy(aggregation_candidates)
+    
+    def set_default_aggregation_strategy(self, aggregation_candidates):
+        if self.operation != "__matmul__":
+            return
+        
+        assert self.left_child is not None and self.right_child is not None, "Ivalid operands for __matmul__ in BET tree"
+        
+        aggregation_candidates[self.id] = self
+        lmd = self.left_child.metadata
+        rmd = self.right_child.metadata
+
+        if lmd.mpu.is_vertical() and rmd.mpu.is_horizontal():
+            return
+
+        if lmd.mpu.is_vertical() and not rmd.mpu.is_horizontal():
+            lmd.mpu.should_aggregate = True
+            return
+
+        rmd.mpu.should_aggregate = True
+    
+    def flip_aggregation_strategy(self):
+        assert self.operation == "__matmul__" and self.left_child is not None and self.right_child is not None, "Internal error"
+
+        lmd = self.left_child.metadata
+        rmd = self.right_child.metadata
+
+        if lmd.mpu.should_aggregate ^ rmd.mpu.should_aggregate:
+            lmd.mpu.should_aggregate ^= True
+            rmd.mpu.should_aggregate ^= True
+
 
 class BET:
-    bet_per_var: Dict[int, BETNode]
+    roots: List[BETNode]
+    root_ids: List[int]
+    aggregation_candidates: Dict[int, BETNode]
     encoding_candidates: Dict[int, BETNode]
+    encoding: int
 
     _cost: float
 
     def __init__(self, bet_encoding, args):
+        print("DEBUG", bet_encoding)
+        
+        self.encoding = 0
+        self.aggregation_candidates = {}
         self.encoding_candidates = {}
+        self._cost = math.inf
+        self.root_ids = list(bet_encoding[0])
 
-        recstack = []
-        for i in static.range(static.len(bet_encoding) -1, -1, -1):
+        recstack: List[BETNode] = []
+        for i in staticrange(staticlen(bet_encoding) - 1, 0, -1):
             node_enc = BETNodeEncoding(*bet_encoding[i])
 
             metadata = Metadata()
+            if node_enc.var_id in self.root_ids:
+                idx = self.root_ids.index(node_enc.var_id)
+                assert idx < len(recstack), "Internal error: parsing BET failed"
+
+                metadata = recstack[idx].metadata
+            
             if node_enc.arg_idx >= 0:
-                if node_enc.arg_idx >= static.len(args):
+                if node_enc.arg_idx >= staticlen(args):
                     raise ValueError("Arg idx out of range")
                 
                 # Hack to simulate getitem on heterogeneous tuple
-                for j in static.range(static.len(args)):
+                for j in staticrange(staticlen(args)):
                     if j == node_enc.arg_idx:
                         arg = args[j]
-                        if hasattr(arg, 'shape'):
-                            metadata.shape = list(arg.shape)
-                        if isinstance(arg, Ciphertensor):
-                            if arg._transposed:
-                                metadata.shape = metadata.shape[::-1]
-                            
-                            if arg._diagonal_contiguous:
-                                metadata.encoding = IR_OPT_ENCODING_DIAG_WISE_ENUM
-                            elif arg._transposed:
-                                metadata.encoding = IR_OPT_ENCODING_COL_WISE_ENUM
-                            else:
-                                metadata.encoding = IR_OPT_ENCODING_ROW_WISE_ENUM
+                        if isinstance(arg, MPU):
+                            metadata.set_mpu_metadata(arg)
+                        elif isinstance(arg, ndarray):
+                            compile_error("metadata.set_ndarray_metadata(arg) not implemented yet")
+                        elif isinstance(arg, ByVal):
+                            compile_error("metadata.set_byval_metadata(arg) not implemented yet")
+                        else:
+                            compile_error("Invalid type for BOSTAN encountered. BOSTAN works only on top of MPU, ndarray, and ByVal values.")
             
             bet_node = BETNode(
                 node_enc.node_id, node_enc.var_id,
@@ -128,30 +170,81 @@ class BET:
             if node_enc.right_child_id != -1:
                 bet_node.right_child = recstack.pop()
             
-            _update_encoding_relevant_nodes(bet_node, self.encoding_candidates)
+            bet_node.set_defaults(self.aggregation_candidates)
             _resolve_node_metadata(bet_node)
+            _update_encoding_relevant_nodes(bet_node, self.encoding_candidates)
             recstack.append(bet_node)
 
-        self.bet_per_var = {node.var_id: node for node in recstack}
+        self.roots = recstack
+
+        self.roots[0].print()
+
+        assert len(self.root_ids) == len(self.roots), "Internal error: missaligned BET encoding"
+
+    def cost(self) -> float:
+        total_cost = 0.0
+        
+        for node in self.roots:
+            total_cost += node.cost()
+        
+        return total_cost
+
+    def opt(self, agg_opt_method: Static[str], encoding_opt_method: Static[str]):
+        if agg_opt_method == BOSTAN_OPT_NAME_HILL_CLIMBING:
+            self._agg_opt_hill_climbing(encoding_opt_method)
+        else:
+            compile_error("BET: invalid encoding optimization method")
+
+    def _agg_opt_hill_climbing(self, encoding_opt_method: Static[str]):
+        aggregation_cantidates_count = len(self.aggregation_candidates)
+
+        if aggregation_cantidates_count == 0:
+            self.encoding_opt(encoding_opt_method)
+            return
+
+        cur_cost = self.cost()
+        for _ in range(BOSTAN_HILL_CLIMBING_STEPS):
+            tree_modified = False
+            for agg_candidate in self.aggregation_candidates.values():
+                # TODO: Don't flip if current aggregate target is encoding candidate
+                # TODO: Don't flip if not flippable case
+                agg_candidate.flip_aggregation_strategy()
+                self.resolve_tree()
+                
+                prev_encoding = self.encoding
+                self.encoding_opt(encoding_opt_method)
+                
+                if self.cost() < cur_cost:
+                    tree_modified = True
+                else:
+                    if prev_encoding != self.encoding:
+                        self._encoding_set(prev_encoding)
+                    agg_candidate.flip_aggregation_strategy()
+                    self.resolve_tree()
+                
+            if not tree_modified:
+                break
 
     def encoding_opt(self, method: Static[str]):
-        if method == IR_OPT_ENCODING_OPT_NAME_BRUTE_FORCE:
+        if len(self.encoding_candidates) == 0:
+            return
+        
+        if method == BOSTAN_OPT_NAME_BRUTE_FORCE:
             self._encoding_opt_brute_force()
         else:
             compile_error("BET: invalid encoding optimization method")
     
-    def cost(self) -> float:
-        total_cost = 0.0
-        
-        for node in self.bet_per_var.values():
-            total_cost += node.cost()
-        
-        return total_cost
+    def resolve_tree(self):
+        for tree_root in self.roots:
+            _resolve_tree_metadata(tree_root)
     
     def _encoding_opt_brute_force(self):
         matmul_count = len(self.encoding_candidates)
-        assert matmul_count <= IR_OPT_ENCODING_BRUTE_FORCE_MAX_MATMUL_COUNT, "Encoding optimization: Too many matrix multiplications for brute-force optimization"
-
+        if matmul_count > BOSTAN_ENCODING_BRUTE_FORCE_MAX_MATMUL_COUNT:
+            if DEBUG:
+                print("NOTE: Encoding optimization: Too many matrix multiplications for brute-force optimization. Using greedy solution ...")
+            return
+        
         if matmul_count == 0:
             return
 
@@ -172,12 +265,12 @@ class BET:
         self._cost = min_cost
 
     def _encoding_set(self, encoding: int):
+        self.encoding = encoding
         for node in self.encoding_candidates.values():
-            node.metadata.encoding = (encoding % 3) + 1
+            node.metadata.partition.encoding = (encoding % 3) + 1
             encoding //= 3
         
-        for tree_root in self.bet_per_var.values():
-            _resolve_tree_metadata(tree_root)
+        self.resolve_tree()
 
     def _encoding_list(self):
-        return [node.metadata.encoding for node in self.encoding_candidates.values()]
+        return [node.metadata.partition.encoding for node in self.encoding_candidates.values()]

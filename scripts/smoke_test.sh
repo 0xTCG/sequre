@@ -17,6 +17,8 @@
 #                   with the plugin (Linux and macOS) and leaves no socket file behind
 #   shim            x86-64 Linux: shrinking and freeing over-aligned blocks leaves their neighbours intact
 #   seq             a program that uses the seq plugin and Sequre, built with `sequre build -release -plugin seq`, runs
+#   ir-opt          a function under @mhe_cipher_opt is rewritten by the installed plugin (SEQURE_IR_OPT_DEBUG's
+#                   trace), gives the undecorated result and takes fewer secure products
 #   installer-*     with the archive given, scripts/install.sh: a download that fails (HTTP 404), a broken archive and
 #                   an archive whose launcher does not run each stop it with a non-zero status and leave an existing
 #                   install (a scratch one) as it was; with no terminal and the script on stdin (curl | bash) it
@@ -270,6 +272,60 @@ EOF
   else
     ok seq "bio and Sequre in one release build"
   fi
+fi
+
+# ir-opt: a function under @mhe_cipher_opt, built by the installed plugin (whose module names a release install gives
+# its own form), is rewritten, gives the undecorated result and takes one secure product where the undecorated one
+# takes four
+D=$WORK/ir-opt
+mkdir -p "$D"
+cat > "$D/iropt.codon" << 'EOF'
+from sequre import main, sequre, mhe_cipher_opt, Sharetensor as Stensor
+
+@sequre
+def plain(mpc, a, b, c, d):
+    e = a * c + a * d
+    f = b * c + b * d
+    return e + f
+
+@sequre
+@mhe_cipher_opt
+def opt(mpc, a, b, c, d):
+    e = a * c + a * d
+    f = b * c + b * d
+    return e + f
+
+@main
+def run(mpc, a, b, c, d):
+    sa = Stensor.enc(mpc, a)
+    sb = Stensor.enc(mpc, b)
+    sc = Stensor.enc(mpc, c)
+    sd = Stensor.enc(mpc, d)
+    m0 = mpc.stats.secure_mul_count
+    p = plain(mpc, sa, sb, sc, sd)
+    m1 = mpc.stats.secure_mul_count
+    o = opt(mpc, sa, sb, sc, sd)
+    m2 = mpc.stats.secure_mul_count
+    print(f"CP{mpc.pid}: iropt {o.reveal(mpc)} {p.reveal(mpc)} muls {m1 - m0} {m2 - m1}")
+
+run(7, 13, 19, 23)
+EOF
+(cd "$D" && run_timeout "$TIMEOUT" env CODON_DEBUG=0 SEQURE_IR_OPT_DEBUG=1 "$SEQURE" build iropt.codon -o iropt \
+  > build.txt 2>&1 < /dev/null)
+rc=$?
+if [ $rc -eq 0 ]; then
+  (cd "$D" && run_timeout "$TIMEOUT" env SEQURE_CP_COUNT=3 ./iropt --local --skip-mhe-setup > log.txt 2>&1 < /dev/null)
+fi
+if [ $rc -ne 0 ]; then
+  tail -5 "$D/build.txt" | sed 's/^/      /'
+  fail ir-opt "\`sequre build\` failed with exit status $rc"
+elif ! grep -q '^\[mhe_cipher_opt\] opt ' "$D/build.txt"; then
+  fail ir-opt "the plugin did not rewrite the decorated function"
+elif [ "$(grep -c 'iropt 840 840 muls 4 1' "$D/log.txt")" -ne 2 ]; then
+  tail -5 "$D/log.txt" | sed 's/^/      /'
+  fail ir-opt "the decorated function did not give the undecorated result with one product"
+else
+  ok ir-opt "rewritten at build time; (a + b) * (c + d) with one secure product"
 fi
 
 # installer-*

@@ -7,15 +7,12 @@ set(CMAKE_CXX_FLAGS_DEBUG "-g -fno-limit-debug-info")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 include_directories(.)
 
+# (ir/helpers/bet.{h,cpp}, BOSTAN's secure expression tree, are kept for its port and not built)
 set(SEQURE_FILES
-    ir/analysis/consecutive_matmul.cpp
-    ir/analysis/consecutive_matmul.h
-    ir/analysis/dead_code.cpp
-    ir/analysis/dead_code.h
+    ir/analysis/cipher_opt.cpp
+    ir/analysis/cipher_opt.h
     ir/helpers/utils.cpp
     ir/helpers/utils.h
-    ir/helpers/bet.cpp
-    ir/helpers/bet.h
     ir/obsolete/mpc.cpp
     ir/obsolete/mpc.h
     ir/mhe.cpp

@@ -45,7 +45,7 @@ c = ct_a * pt        # Ciphertext-plaintext multiply (cheaper)
 | CT × CT multiply + relin | ~34.4 ms |
 | Rotation (Galois) | ~32.9 ms |
 
-Plaintext operations are dramatically cheaper — the `@mhe_cipher_opt` compiler pass automatically reorders expressions to maximize plaintext ops.
+Plaintext operations are dramatically cheaper. The opt-in `@mhe_cipher_opt` decorator rewrites a function's sums of products of one ciphertext with plaintext operands to take fewer ciphertext products (see [Decorators](../api/decorators.md)).
 
 ## Encoding modes
 
@@ -57,7 +57,7 @@ For matrix operations, how values are packed into ciphertext slots matters for b
 | Column-wise | `ENC_COL` | One column per ciphertext |
 | Diagonal | `ENC_DIAG` | Diagonal packing for efficient matrix-vector products |
 
-<!-- The `@mhe_enc_opt` compiler pass selects the optimal encoding per matrix multiplication via brute-force search. -->
+The matmul routers pick a kernel, and the encoding of a plaintext operand, by cost for each product (the `@mhe_enc_opt` decorator is accepted and does nothing).
 
 ## Multiparty synergy
 

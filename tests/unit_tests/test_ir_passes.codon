@@ -1,6 +1,7 @@
 import secure_operator
 
 from sequre.stdlib.numpy.create import array
+from sequre.stdlib.numpy.ndarray import ndarray
 
 from sequre import sequre, mpc_poly_opt, mhe_cipher_opt, mhe_enc_opt
 from sequre.mpc.env import MPCEnv
@@ -8,7 +9,7 @@ from sequre.lattiseq.ckks import Ciphertext
 from sequre.types.sharetensor import Sharetensor
 from sequre.types.ciphertensor import Ciphertensor
 from sequre.types.multiparty_partition import MPP
-from sequre.utils.testing import assert_eq, assert_eq_approx
+from sequre.utils.testing import assert_eq, assert_eq_approx, assert_leq
 from sequre.utils.io import write_ndarray, read_ndarray
 from sequre.utils.utils import __rand_mat, random_floats, random_ints
 from sequre.constants import MPC_FIELD_SIZE, MPC_RING_SIZE
@@ -39,24 +40,30 @@ def cipher_plain_foo(mpc, a, b, c, d):
 @sequre
 @mhe_cipher_opt
 def cipher_plain_foo_split(mpc, a, b, c, d):
-    e = a * c + a * d  # a * (c + d)
-    f = b * c + b * d  # b * (c + d)
-    return e + f  # (a + b) * (c + d)
+    e = a * c + a * d  # a * (c + d) on Sharetensors
+    f = b * c + b * d  # b * (c + d) on Sharetensors
+    return e + f  # (a + b) * (c + d) on Sharetensors
 
 
 @sequre
 @mhe_cipher_opt
 def cipher_plain_foo_redundant(mpc, a, b, c, d):
-    # Forcing redundancy of (c + d)
+    # (c + d) twice: f folds into the return (its only use), e cannot (secure_operator.identity reads it), and the pass
+    # does not merge the two sums (no common-subexpression elimination), so nothing gets cheaper
     e = a * (c + d)
     f = b * (c + d)
-    h = secure_operator.identity(e)  # Force usage of variable e to avoid code elimination
+    h = secure_operator.identity(e)
     return h + f
 
 
 @sequre
 @mhe_cipher_opt
 def matmul_foo(mpc, a, b, c):
+    return a @ b.T @ c
+
+
+@sequre
+def matmul_plain(mpc, a, b, c):
     return a @ b.T @ c
 
 
@@ -72,6 +79,280 @@ def mhe_encoding_single_scope_foo(mpc, a, b):
     return a @ b.T + (b @ a.T).T
 
 
+@sequre
+def mhe_encoding_single_scope_plain(mpc, a, b):
+    return a @ b.T + (b @ a.T).T
+
+
+# Twins for the Sharetensor checks: each body under @mhe_cipher_opt and under @sequre alone
+
+@sequre
+@mhe_cipher_opt
+def opt_shared(mpc, a, b, c, d):
+    # H-40: e is read twice; folding it would compute a * b twice, factoring keeps one product less either way
+    e = a * b
+    return e * c + e * d
+
+
+@sequre
+def plain_shared(mpc, a, b, c, d):
+    e = a * b
+    return e * c + e * d
+
+
+@sequre
+@mhe_cipher_opt
+def opt_self_add(mpc, a, b, c, d):
+    # H-40: e + e is 2 * a * b
+    e = a * b
+    return e + e
+
+
+@sequre
+def plain_self_add(mpc, a, b, c, d):
+    e = a * b
+    return e + e
+
+
+@sequre
+@mhe_cipher_opt
+def opt_branch(mpc, a, b, c, d, flag: bool):
+    # H-41: e is reassigned under control flow, so its first definition must not be folded
+    e = a * c
+    if flag:
+        e = b * d
+    return e + a * d
+
+
+@sequre
+def plain_branch(mpc, a, b, c, d, flag: bool):
+    e = a * c
+    if flag:
+        e = b * d
+    return e + a * d
+
+
+@sequre
+@mhe_cipher_opt
+def opt_loop(mpc, a, b, c, d):
+    # H-41: e changes in the loop; the return still factors d out of e * d + a * d
+    e = a * c
+    for _ in range(2):
+        e = e + b
+    return e * d + a * d
+
+
+@sequre
+def plain_loop(mpc, a, b, c, d):
+    e = a * c
+    for _ in range(2):
+        e = e + b
+    return e * d + a * d
+
+
+@sequre
+@mhe_cipher_opt
+def opt_literals(mpc, a, b, c, d):
+    # H-42: literals and a property read are operands like any other
+    return a * c + a * 2 + b.T * 1.5 + b.T * d
+
+
+@sequre
+def plain_literals(mpc, a, b, c, d):
+    return a * c + a * 2 + b.T * 1.5 + b.T * d
+
+
+@sequre
+@mhe_cipher_opt
+def opt_dead(mpc, a, b, c, d):
+    # M-IR-01: an assignment nothing reads stays (its products are part of what the function does)
+    unused = a * c
+    return b * d + b * a
+
+
+@sequre
+def plain_dead(mpc, a, b, c, d):
+    unused = a * c
+    return b * d + b * a
+
+
+@sequre
+@mhe_cipher_opt
+def opt_outer(mpc, a, b, c, d):
+    # M-IR-04: a decorated function calling another, which is called from two sites
+    return opt_shared(mpc, a, b, c, d) + a * c + a * d
+
+
+@sequre
+def plain_outer(mpc, a, b, c, d):
+    return plain_shared(mpc, a, b, c, d) + a * c + a * d
+
+
+@sequre
+@mhe_cipher_opt
+def opt_fp_mix(mpc, a, b, c, d):
+    # c holds integers, a and b fixed-point values: a * c + a * b factors to a * (c + b), which adds an integer and a
+    # fixed-point Sharetensor (Sequre refuses that), so the expression runs as written unless all the flags agree
+    return a * c + a * b
+
+
+@sequre
+def plain_fp_mix(mpc, a, b, c, d):
+    return a * c + a * b
+
+
+@sequre
+@mhe_cipher_opt
+def opt_fp_mix_split(mpc, a, b, c, d):
+    # the same with folded definitions: as written, e and f are computed where they are used
+    e = a * c + a * d
+    f = b * c + b * d
+    return e + f
+
+
+@sequre
+def plain_fp_mix_split(mpc, a, b, c, d):
+    e = a * c + a * d
+    f = b * c + b * d
+    return e + f
+
+
+@sequre
+@mhe_cipher_opt
+def opt_fp_float(mpc, a, b, c, d):
+    # a * (c + 0.5) would add a float to the integer c (Sequre adds its fixed-point encoding without a word): as written
+    return a * c + a * 0.5
+
+
+@sequre
+def plain_fp_float(mpc, a, b, c, d):
+    return a * c + a * 0.5
+
+
+@sequre
+@mhe_cipher_opt
+def opt_fp_matmul(mpc, a, c, d, w):
+    # c @ w is fixed point (w holds floats), d integers: a * (c @ w + d) would add the two kinds: as written
+    return a * (c @ w) + a * d
+
+
+@sequre
+def plain_fp_matmul(mpc, a, c, d, w):
+    return a * (c @ w) + a * d
+
+
+@sequre
+@mhe_cipher_opt
+def opt_wrap(mpc, a, b, c, d):
+    # 2^32 * 2^32 wraps to 0 at 64 bits: the two literals are applied to a one at a time, as written
+    return a * 4294967296 * 4294967296
+
+
+@sequre
+def plain_wrap(mpc, a, b, c, d):
+    return a * 4294967296 * 4294967296
+
+
+@sequre
+@mhe_cipher_opt
+def opt_matmul_dup(mpc, a, b, c, d):
+    # folding e would evaluate a @ b three times: the function stays as written (two)
+    e = a @ b
+    return e * c + e + e + (a @ b) * d
+
+
+@sequre
+def plain_matmul_dup(mpc, a, b, c, d):
+    e = a @ b
+    return e * c + e + e + (a @ b) * d
+
+
+@sequre
+@mhe_cipher_opt
+def opt_matmul_merge(mpc, a, b, c, d):
+    # folding both definitions evaluates a @ b once: (a @ b) * (c + d)
+    e = a @ b
+    f = a @ b
+    return e * c + f * d
+
+
+@sequre
+def plain_matmul_merge(mpc, a, b, c, d):
+    e = a @ b
+    f = a @ b
+    return e * c + f * d
+
+
+@sequre
+@mhe_cipher_opt
+def opt_layout_result(mpc, a, c, d):
+    # c, d stored transposed: (c + d) * a would come out transposed, and setting a slice of it raises; an expression of
+    # several Ciphertensors stays as written
+    r = a * c + a * d
+    s = a * 1.0
+    s[0:2] = r[0:2]
+    return s
+
+
+@sequre
+def plain_layout_result(mpc, a, c, d):
+    r = a * c + a * d
+    s = a * 1.0
+    s[0:2] = r[0:2]
+    return s
+
+
+@sequre
+def lower_level(mpc, x, k: int):
+    # k plaintext products: k levels below x
+    y = x * 1.0
+    for _ in range(k):
+        y = y * 1.5
+    return y
+
+
+@sequre
+@mhe_cipher_opt
+def opt_refresh(mpc, a, b, c):
+    # a * (b + c) would refresh a temporary, where a * b + a * c refreshes the caller's b and c in place: an expression
+    # of several Ciphertensors stays as written, so the caller's tensors come back as high as from the written function
+    return a * b + a * c
+
+
+@sequre
+def plain_refresh(mpc, a, b, c):
+    return a * b + a * c
+
+
+@sequre
+@mhe_cipher_opt
+def opt_layouts(mpc, a, b, c):
+    # a * (b.T + c) would convert b.T to c's storage and the sum back to a's (two conversions through MPC, where the
+    # written form converts once): an expression of several Ciphertensors stays as written
+    return a * b.T + a * c
+
+
+@sequre
+def plain_layouts(mpc, a, b, c):
+    return a * b.T + a * c
+
+
+@sequre
+@mhe_cipher_opt
+def opt_chain(mpc, x, y, z):
+    return x @ y @ z
+
+
+@sequre
+def plain_chain(mpc, x, y, z):
+    return x @ y @ z
+
+
+@sequre
+def plain_chain_right(mpc, x, y, z):
+    return x @ (y @ z)
+
+
 def test_mpc_poly_opt[TP](mpc: MPCEnv[TP], modulus: TP):
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
     print(f'CP{mpc.pid}:\tTesting MPC polynomial optimization pass on {alg_struct} ... \n')
@@ -81,7 +362,7 @@ def test_mpc_poly_opt[TP](mpc: MPCEnv[TP], modulus: TP):
         values_a = random_ints((size,))[0]
         values_b = random_ints((size,))[0]
         values_c = random_ints((size,))[0]
-    
+
     stensor_a = Sharetensor.enc(mpc, values_a, 0, modulus)
     stensor_b = Sharetensor.enc(mpc, values_b, 0, modulus)
     stensor_c = Sharetensor.enc(mpc, values_c, 0, modulus)
@@ -110,14 +391,12 @@ def test_mhe_cipher_opt(mpc, msg):
         values_b = random_floats((rows, cols))
         values_c = random_floats((rows, cols))
         values_d = random_floats((rows, cols))
-    
+
     ctensor_a = Ciphertensor[Ciphertext].enc(mpc, values_a)
     ctensor_b = Ciphertensor[Ciphertext].enc(mpc, values_b)
     ctensor_c = Ciphertensor[Ciphertext].enc(mpc, values_c)
     ctensor_d = Ciphertensor[Ciphertext].enc(mpc, values_d)
 
-    pid = mpc.pid
-    mpc.comms.sequential(lambda p, a: print(f"CP{p}: MHE cipher-plain test data for debugging:", a), False, pid, array(values_a))
     if mpc.pid > 0:
         assert_eq_approx(f"CP{mpc.pid}:\tSafe-checking MHE cipher-plain optimization data loading", ctensor_a.reveal(mpc, T=float).tolist(), values_a, silent_pass=True)
         assert_eq_approx(f"CP{mpc.pid}:\tSafe-checking MHE cipher-plain optimization data loading", ctensor_b.reveal(mpc, T=float).tolist(), values_b, silent_pass=True)
@@ -130,20 +409,94 @@ def test_mhe_cipher_opt(mpc, msg):
         sequre_result = cipher_plain_foo(mpc, ctensor_a, ctensor_b, ctensor_c, ctensor_d)
     elif msg == "split":
         sequre_result = cipher_plain_foo_split(mpc, ctensor_a, ctensor_b, ctensor_c, ctensor_d)
-    # elif msg == "redundant":
-    #     sequre_result = cipher_plain_foo_redundant(mpc, ctensor_a, ctensor_b, ctensor_c, ctensor_d)
+    elif msg == "redundant":
+        sequre_result = cipher_plain_foo_redundant(mpc, ctensor_a, ctensor_b, ctensor_c, ctensor_d)
     else:
         raise ValueError("Invalid evaluator")
 
-    expected_mul_count = 2 if msg == "redundant" else 1
-    expected_add_count = 2
-    
+    # Ciphertensors carry storage the types do not show and their products refresh operands in place: an expression of
+    # two or more secure Ciphertensors stays as written (storage is a layout planner's to decide). compact and split: 4
+    # products, 3 additions; redundant: 2 products, 3 additions
+    expected_mul_count = 2 if msg == "redundant" else 4
+    expected_add_count = 3
+
     if mpc.pid:
         mul_count = mpc.stats.secure_mul_count - mul_count
         add_count = mpc.stats.secure_add_count - add_count
         assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization IR pass on Ciphertensors ({msg}): correctness', sequre_result.reveal(mpc, T=float).tolist(), (values_a + values_b) * (values_c + values_d))
-        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization IR pass on Ciphertensors ({msg}): multiplications count', mul_count, expected_mul_count)
-        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization IR pass on Ciphertensors ({msg}): additions count', add_count, expected_add_count)
+        assert_eq(f'CP{mpc.pid}:\tMHE cipher-plain optimization IR pass on Ciphertensors ({msg}): multiplications count', mul_count, expected_mul_count)
+        assert_eq(f'CP{mpc.pid}:\tMHE cipher-plain optimization IR pass on Ciphertensors ({msg}): additions count', add_count, expected_add_count)
+
+
+def test_mhe_cipher_opt_layouts(mpc):
+    # Ciphertensors stored differently (b.T is read transposed): as written, the undecorated products and switches
+    print(f'CP{mpc.pid}:\tTesting MHE cipher-plain optimization pass on Ciphertensors of two storages ... \n')
+    n = 4
+    with mpc.randomness.global_stream():
+        values = [random_floats((n, n)) for _ in range(3)]
+    a = Ciphertensor[Ciphertext].enc(mpc, values[0])
+    b = Ciphertensor[Ciphertext].enc(mpc, values[1])
+    c = Ciphertensor[Ciphertext].enc(mpc, values[2])
+    s = mpc.stats
+    before = (s.secure_mul_count, s.secure_mhe_mpc_switch_count)
+    plain_result = plain_layouts(mpc, a, b, c)
+    middle = (s.secure_mul_count, s.secure_mhe_mpc_switch_count)
+    opt_result = opt_layouts(mpc, a, b, c)
+    after = (s.secure_mul_count, s.secure_mhe_mpc_switch_count)
+    plain_value = plain_result.reveal(mpc, T=float)
+    opt_value = opt_result.reveal(mpc, T=float)
+    if mpc.pid:
+        pa, pb, pc = array(values[0]), array(values[1]), array(values[2])
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization on Ciphertensors of two storages: correctness', opt_value, pa * pb.T + pa * pc)
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization on Ciphertensors of two storages: same as undecorated', opt_value, plain_value)
+        assert_eq(f'CP{mpc.pid}:\tMHE cipher-plain optimization on Ciphertensors of two storages: as written (products, switches)', (after[0] - middle[0], after[1] - middle[1]), (middle[0] - before[0], middle[1] - before[1]))
+
+    # c, d stored transposed through variables: the result is stored as written (a's), a later setitem works
+    ct = Ciphertensor[Ciphertext].enc(mpc, array(values[1]).T.tolist()).T
+    dt = Ciphertensor[Ciphertext].enc(mpc, array(values[2]).T.tolist()).T
+    before = (s.secure_mul_count, s.secure_mhe_mpc_switch_count)
+    plain_result = plain_layout_result(mpc, a, ct, dt)
+    middle = (s.secure_mul_count, s.secure_mhe_mpc_switch_count)
+    opt_result = opt_layout_result(mpc, a, ct, dt)
+    after = (s.secure_mul_count, s.secure_mhe_mpc_switch_count)
+    plain_value = plain_result.reveal(mpc, T=float)
+    opt_value = opt_result.reveal(mpc, T=float)
+    if mpc.pid:
+        pa, pb, pc = array(values[0]), array(values[1]), array(values[2])
+        expected = pa.copy()
+        expected[0:2] = (pa * pb + pa * pc)[0:2]
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization on Ciphertensors stored transposed: correctness', opt_value, expected)
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization on Ciphertensors stored transposed: same as undecorated', opt_value, plain_value)
+        assert_eq(f'CP{mpc.pid}:\tMHE cipher-plain optimization on Ciphertensors stored transposed: as written (products, switches)', (after[0] - middle[0], after[1] - middle[1]), (middle[0] - before[0], middle[1] - before[1]))
+
+
+def test_mhe_cipher_opt_refreshes(mpc):
+    # Products refresh their right operands in place: b and c, low, are bootstrapped once by the written function and
+    # stay high for the next calls; the decorated function (as written) must leave them alike (no more bootstraps)
+    print(f'CP{mpc.pid}:\tTesting MHE cipher-plain optimization pass: in-place refreshes ... \n')
+    n, k = 4, 5
+    with mpc.randomness.global_stream():
+        values = [random_floats((n, n)) for _ in range(3)]
+    boots = List[int]()
+    levels = List[int]()
+    results = List[ndarray[Tuple[int, int], float]]()
+    for decorated in (False, True):
+        a = Ciphertensor[Ciphertext].enc(mpc, values[0])
+        b = lower_level(mpc, Ciphertensor[Ciphertext].enc(mpc, values[1]), k)
+        c = lower_level(mpc, Ciphertensor[Ciphertext].enc(mpc, values[2]), k)
+        b0 = mpc.stats.secure_bootstrap_count
+        r = a
+        for _ in range(3):
+            r = opt_refresh(mpc, a, b, c) if decorated else plain_refresh(mpc, a, b, c)
+        boots.append(mpc.stats.secure_bootstrap_count - b0)
+        levels.append(b._data[0].level() if mpc.pid else 0)
+        results.append(r.reveal(mpc, T=float))
+    if mpc.pid:
+        pa, pb, pc = array(values[0]), array(values[1]), array(values[2])
+        f = 1.5 ** k
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization: in-place refreshes: correctness', results[1], pa * (pb * f) + pa * (pc * f), rel_error=1e-4)
+        assert_leq(f'CP{mpc.pid}:\tMHE cipher-plain optimization: in-place refreshes: no more bootstraps over three calls', boots[1], boots[0])
+        assert_eq(f'CP{mpc.pid}:\tMHE cipher-plain optimization: in-place refreshes: the arguments left as high', levels[1], levels[0])
 
 
 def test_mhe_cipher_reorder_opt(mpc):
@@ -155,7 +508,7 @@ def test_mhe_cipher_reorder_opt(mpc):
         values_b = random_floats((rows, cols))
         values_c = random_floats((rows, cols))
         values_d = random_floats((rows, cols))
-    
+
     ctensor_a = Ciphertensor[Ciphertext].enc(mpc, values_a)
     ctensor_b = Ciphertensor[Ciphertext].enc(mpc, values_b)
 
@@ -163,16 +516,244 @@ def test_mhe_cipher_reorder_opt(mpc):
         assert_eq_approx(f"CP{mpc.pid}:\tSafe-checking MHE cipher-plain-reorder optimization data loading", ctensor_a.reveal(mpc, T=float).tolist(), values_a, silent_pass=True)
         assert_eq_approx(f"CP{mpc.pid}:\tSafe-checking MHE cipher-plain-reorder optimization data loading", ctensor_b.reveal(mpc, T=float).tolist(), values_b, silent_pass=True)
 
+    # One Ciphertensor, b, c and d public: a * (b + c + d), the public arrays added first, then one product
     mul_count = mpc.stats.secure_mul_count
     add_count = mpc.stats.secure_add_count
-    sequre_result = cipher_plain_reorder_foo(mpc, ctensor_a, ctensor_b, values_c, values_d)
+    sequre_result = cipher_plain_reorder_foo(mpc, ctensor_a, array(values_b), array(values_c), array(values_d))
 
     if mpc.pid:
         mul_count = mpc.stats.secure_mul_count - mul_count
         add_count = mpc.stats.secure_add_count - add_count
         assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain-reorder optimization IR pass on Ciphertensors: correctness', sequre_result.reveal(mpc, T=float).tolist(), values_a * (values_b + values_c + values_d))
-        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain-reorder optimization IR pass on Ciphertensors: multiplications count', mul_count, 1)
-        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain-reorder optimization IR pass on Ciphertensors: additions count', add_count, 1)
+        assert_eq(f'CP{mpc.pid}:\tMHE cipher-plain-reorder optimization IR pass on Ciphertensors: multiplications count', mul_count, 1)
+        assert_eq(f'CP{mpc.pid}:\tMHE cipher-plain-reorder optimization IR pass on Ciphertensors: additions count', add_count, 0)
+
+    # Two Ciphertensors, a and b (c and d public): as written, 3 products and 2 additions
+    mul_count = mpc.stats.secure_mul_count
+    add_count = mpc.stats.secure_add_count
+    sequre_result = cipher_plain_reorder_foo(mpc, ctensor_a, ctensor_b, array(values_c), array(values_d))
+
+    if mpc.pid:
+        mul_count = mpc.stats.secure_mul_count - mul_count
+        add_count = mpc.stats.secure_add_count - add_count
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain-reorder optimization IR pass on two Ciphertensors: correctness', sequre_result.reveal(mpc, T=float).tolist(), values_a * (values_b + values_c + values_d))
+        assert_eq(f'CP{mpc.pid}:\tMHE cipher-plain-reorder optimization IR pass on two Ciphertensors: as written, multiplications count', mul_count, 3)
+        assert_eq(f'CP{mpc.pid}:\tMHE cipher-plain-reorder optimization IR pass on two Ciphertensors: as written, additions count', add_count, 2)
+
+
+def _check_twins(mpc, name: str, opt_result, plain_result, expected, opt_counts, plain_counts, cheaper: bool,
+                 same: bool, error: float, rel_error: float = 0.0):
+    # The decorated result against the plaintext one and the undecorated one, and the counts (multiplications,
+    # additions, matmuls): never more, fewer where the pass must fire, the same where it must leave the code as written
+    opt_value = opt_result.reveal(mpc)
+    plain_value = plain_result.reveal(mpc)
+    if mpc.pid:
+        assert_eq_approx(f'CP{mpc.pid}:\t{name}: correctness', opt_value, expected, error=error, rel_error=rel_error)
+        assert_eq_approx(f'CP{mpc.pid}:\t{name}: same as undecorated', opt_value, plain_value, error=error, rel_error=rel_error)
+        assert_leq(f'CP{mpc.pid}:\t{name}: no more multiplications', opt_counts[0], plain_counts[0])
+        assert_leq(f'CP{mpc.pid}:\t{name}: no more additions', opt_counts[1], plain_counts[1])
+        assert_leq(f'CP{mpc.pid}:\t{name}: no more matmuls', opt_counts[2], plain_counts[2])
+        if cheaper:
+            assert_eq(f'CP{mpc.pid}:\t{name}: cheaper', opt_counts[2] < plain_counts[2] or (opt_counts[2] == plain_counts[2] and (opt_counts[0] < plain_counts[0] or (opt_counts[0] == plain_counts[0] and opt_counts[1] < plain_counts[1]))), True)
+        if same:
+            assert_eq(f'CP{mpc.pid}:\t{name}: as written', opt_counts, plain_counts)
+
+
+def _counts(mpc):
+    return (mpc.stats.secure_mul_count, mpc.stats.secure_add_count, mpc.stats.secure_matmul_count)
+
+
+def _since(mpc, before):
+    now = _counts(mpc)
+    return (now[0] - before[0], now[1] - before[1], now[2] - before[2])
+
+
+def test_mhe_cipher_opt_sharetensors[TP](mpc: MPCEnv[TP], modulus: TP):
+    # Shared subexpressions (H-40), definitions under control flow (H-41), literals and property reads (H-42), an
+    # unread assignment (M-IR-01) and a decorated function used from two sites and from another (M-IR-04)
+    alg_struct = "ring" if modulus.popcnt() == 1 else "field"
+    print(f'CP{mpc.pid}:\tTesting MHE cipher-plain optimization pass on Sharetensors on {alg_struct} ... \n')
+    n = 4
+    with mpc.randomness.global_stream():
+        raw = [array(random_floats((n, n))) for _ in range(4)]
+    pa, pb, pc, pd = raw[0], raw[1], raw[2], raw[3]
+    a = Sharetensor.enc(mpc, pa.tolist(), 0, modulus)
+    b = Sharetensor.enc(mpc, pb.tolist(), 0, modulus)
+    c = Sharetensor.enc(mpc, pc.tolist(), 0, modulus)
+    d = Sharetensor.enc(mpc, pd.tolist(), 0, modulus)
+    error = 0.01
+
+    s = _counts(mpc)
+    rp = plain_shared(mpc, a, b, c, d)
+    cp = _since(mpc, s)
+    s = _counts(mpc)
+    ro = opt_shared(mpc, a, b, c, d)
+    co = _since(mpc, s)
+    _check_twins(mpc, f'MHE cipher-plain optimization on Sharetensors on {alg_struct}: shared subexpression', ro, rp, pa * pb * (pc + pd), co, cp, True, False, error)
+
+    s = _counts(mpc)
+    rp = plain_self_add(mpc, a, b, c, d)
+    cp = _since(mpc, s)
+    s = _counts(mpc)
+    ro = opt_self_add(mpc, a, b, c, d)
+    co = _since(mpc, s)
+    _check_twins(mpc, f'MHE cipher-plain optimization on Sharetensors on {alg_struct}: a sum of a variable with itself', ro, rp, pa * pb * 2.0, co, cp, False, True, error)
+
+    for flag in (True, False):
+        s = _counts(mpc)
+        rp = plain_branch(mpc, a, b, c, d, flag)
+        cp = _since(mpc, s)
+        s = _counts(mpc)
+        ro = opt_branch(mpc, a, b, c, d, flag)
+        co = _since(mpc, s)
+        expected = (pb * pd if flag else pa * pc) + pa * pd
+        _check_twins(mpc, f'MHE cipher-plain optimization on Sharetensors on {alg_struct}: a definition reassigned in a branch ({flag})', ro, rp, expected, co, cp, False, False, error)
+
+    s = _counts(mpc)
+    rp = plain_loop(mpc, a, b, c, d)
+    cp = _since(mpc, s)
+    s = _counts(mpc)
+    ro = opt_loop(mpc, a, b, c, d)
+    co = _since(mpc, s)
+    _check_twins(mpc, f'MHE cipher-plain optimization on Sharetensors on {alg_struct}: a definition updated in a loop', ro, rp, (pa * pc + pb * 2.0) * pd + pa * pd, co, cp, True, False, error)
+
+    s = _counts(mpc)
+    rp = plain_literals(mpc, a, b, c, d)
+    cp = _since(mpc, s)
+    s = _counts(mpc)
+    ro = opt_literals(mpc, a, b, c, d)
+    co = _since(mpc, s)
+    _check_twins(mpc, f'MHE cipher-plain optimization on Sharetensors on {alg_struct}: literals and property reads', ro, rp, pa * pc + pa * 2.0 + pb.T * 1.5 + pb.T * pd, co, cp, True, False, error)
+
+    s = _counts(mpc)
+    rp = plain_dead(mpc, a, b, c, d)
+    cp = _since(mpc, s)
+    s = _counts(mpc)
+    ro = opt_dead(mpc, a, b, c, d)
+    co = _since(mpc, s)
+    _check_twins(mpc, f'MHE cipher-plain optimization on Sharetensors on {alg_struct}: an unread assignment stays', ro, rp, pb * pd + pb * pa, co, cp, True, False, error)
+    if mpc.pid:
+        # the unread a * c among the decorated function's products: one product less than the undecorated 3, not 2 less
+        assert_eq(f'CP{mpc.pid}:\tMHE cipher-plain optimization on Sharetensors on {alg_struct}: an unread assignment stays: its product runs', co[0], cp[0] - 1)
+
+    s = _counts(mpc)
+    rp = plain_outer(mpc, a, b, c, d)
+    cp = _since(mpc, s)
+    s = _counts(mpc)
+    ro = opt_outer(mpc, a, b, c, d)
+    co = _since(mpc, s)
+    _check_twins(mpc, f'MHE cipher-plain optimization on Sharetensors on {alg_struct}: nested decorated functions', ro, rp, pa * pb * (pc + pd) + pa * (pc + pd), co, cp, True, False, error)
+
+    # Fixed-point flags (a, b, d fixed point, ci integers): an expression over both kinds runs as written
+    with mpc.randomness.global_stream():
+        pci = array(random_ints((n, n), upper_limit=9))
+    ci = Sharetensor.enc(mpc, pci.tolist(), 0, modulus)
+    pcf = pci.astype(float)
+    s = _counts(mpc)
+    rp = plain_fp_mix(mpc, a, b, ci, d)
+    cp = _since(mpc, s)
+    s = _counts(mpc)
+    ro = opt_fp_mix(mpc, a, b, ci, d)
+    co = _since(mpc, s)
+    _check_twins(mpc, f'MHE cipher-plain optimization on Sharetensors on {alg_struct}: fixed-point and integer operands', ro, rp, pa * pcf + pa * pb, co, cp, False, True, error)
+    s = _counts(mpc)
+    rp = plain_fp_mix_split(mpc, a, b, ci, d)
+    cp = _since(mpc, s)
+    s = _counts(mpc)
+    ro = opt_fp_mix_split(mpc, a, b, ci, d)
+    co = _since(mpc, s)
+    _check_twins(mpc, f'MHE cipher-plain optimization on Sharetensors on {alg_struct}: fixed-point and integer operands, folded definitions', ro, rp, (pa + pb) * (pcf + pd), co, cp, False, True, error)
+    # (a + b) * (ci + cj): each addition adds two of a kind, so the rewrite runs
+    with mpc.randomness.global_stream():
+        pcj = array(random_ints((n, n), upper_limit=9))
+    cj = Sharetensor.enc(mpc, pcj.tolist(), 0, modulus)
+    s = _counts(mpc)
+    rp = plain_fp_mix_split(mpc, a, b, ci, cj)
+    cp = _since(mpc, s)
+    s = _counts(mpc)
+    ro = opt_fp_mix_split(mpc, a, b, ci, cj)
+    co = _since(mpc, s)
+    _check_twins(mpc, f'MHE cipher-plain optimization on Sharetensors on {alg_struct}: fixed-point and integer operands, each addition of a kind', ro, rp, (pa + pb) * (pcf + pcj.astype(float)), co, cp, True, False, error)
+
+    # A float, or a product with a float ndarray, added to an integer Sharetensor: as written
+    s = _counts(mpc)
+    rp = plain_fp_float(mpc, a, b, ci, d)
+    cp = _since(mpc, s)
+    s = _counts(mpc)
+    ro = opt_fp_float(mpc, a, b, ci, d)
+    co = _since(mpc, s)
+    _check_twins(mpc, f'MHE cipher-plain optimization on Sharetensors on {alg_struct}: a float meeting an integer Sharetensor', ro, rp, pa * pcf + pa * 0.5, co, cp, False, True, error)
+    w = pd.copy()
+    s = _counts(mpc)
+    rp = plain_fp_matmul(mpc, a, ci, cj, w)
+    cp = _since(mpc, s)
+    s = _counts(mpc)
+    ro = opt_fp_matmul(mpc, a, ci, cj, w)
+    co = _since(mpc, s)
+    _check_twins(mpc, f'MHE cipher-plain optimization on Sharetensors on {alg_struct}: a product with a float ndarray meeting an integer Sharetensor', ro, rp, pa * (pcf @ pd) + pa * pcj.astype(float), co, cp, False, True, error)
+
+    # Integer literals whose product wraps at 64 bits (on integer shares: fixed-point values that large do not reveal)
+    s = _counts(mpc)
+    rp = plain_wrap(mpc, ci, b, c, d)
+    cp = _since(mpc, s)
+    s = _counts(mpc)
+    ro = opt_wrap(mpc, ci, b, c, d)
+    co = _since(mpc, s)
+    _check_twins(mpc, f'MHE cipher-plain optimization on Sharetensors on {alg_struct}: integer literals that wrap', ro, rp, pcf * 18446744073709551616.0, co, cp, False, True, 0.0, 1e-6)
+
+    # Matmuls: never evaluated more often than written; folding may merge them
+    s = _counts(mpc)
+    rp = plain_matmul_dup(mpc, a, b, c, d)
+    cp = _since(mpc, s)
+    s = _counts(mpc)
+    ro = opt_matmul_dup(mpc, a, b, c, d)
+    co = _since(mpc, s)
+    pab = pa @ pb
+    _check_twins(mpc, f'MHE cipher-plain optimization on Sharetensors on {alg_struct}: a matmul folded into three reads', ro, rp, pab * pc + pab * 2.0 + pab * pd, co, cp, False, True, error)
+    s = _counts(mpc)
+    rp = plain_matmul_merge(mpc, a, b, c, d)
+    cp = _since(mpc, s)
+    s = _counts(mpc)
+    ro = opt_matmul_merge(mpc, a, b, c, d)
+    co = _since(mpc, s)
+    _check_twins(mpc, f'MHE cipher-plain optimization on Sharetensors on {alg_struct}: two equal matmuls merged', ro, rp, pab * (pc + pd), co, cp, True, False, error)
+    if mpc.pid:
+        assert_eq(f'CP{mpc.pid}:\tMHE cipher-plain optimization on Sharetensors on {alg_struct}: two equal matmuls merged: one matmul', co[2], 1)
+
+    # Chains of Sharetensors: the order of least rows x inner x columns when strictly cheaper than the written one.
+    # x @ y @ z with 4 x 1, 1 x 4 and 4 x 1 costs 32 left to right and 8 as x @ (y @ z); with 3 x 4, 4 x 1 and 1 x 2 it
+    # costs 18 as written and 32 the other way, which the first product's cost alone (12 against 8) would pick. The
+    # bytes each order sends tell them apart.
+    _check_chain(mpc, alg_struct, modulus, pa[:, :1], pb[:1, :], pc[:, :1], True, error)
+    _check_chain(mpc, alg_struct, modulus, pa[:3, :], pb[:, :1], pc[:1, :2], False, error)
+
+
+def _check_chain[TP](mpc: MPCEnv[TP], alg_struct: str, modulus: TP, px, py, pz, reorders: bool, error: float):
+    # Each order gets operands shared afresh: a Sharetensor keeps the Beaver partition of its last product, which a
+    # later product of it reuses (sending less)
+    shapes = f'{px.shape} @ {py.shape} @ {pz.shape}'
+    x, y, z = Sharetensor.enc(mpc, px.tolist(), 0, modulus), Sharetensor.enc(mpc, py.tolist(), 0, modulus), Sharetensor.enc(mpc, pz.tolist(), 0, modulus)
+    s0 = mpc.stats.bytes_sent
+    r_left = plain_chain(mpc, x, y, z)
+    s1 = mpc.stats.bytes_sent
+    x, y, z = Sharetensor.enc(mpc, px.tolist(), 0, modulus), Sharetensor.enc(mpc, py.tolist(), 0, modulus), Sharetensor.enc(mpc, pz.tolist(), 0, modulus)
+    s2 = mpc.stats.bytes_sent
+    r_right = plain_chain_right(mpc, x, y, z)
+    s3 = mpc.stats.bytes_sent
+    x, y, z = Sharetensor.enc(mpc, px.tolist(), 0, modulus), Sharetensor.enc(mpc, py.tolist(), 0, modulus), Sharetensor.enc(mpc, pz.tolist(), 0, modulus)
+    s4 = mpc.stats.bytes_sent
+    r_opt = opt_chain(mpc, x, y, z)
+    s5 = mpc.stats.bytes_sent
+    left_bytes, right_bytes, opt_bytes = s1 - s0, s3 - s2, s5 - s4
+    v_opt = r_opt.reveal(mpc)
+    v_left = r_left.reveal(mpc)
+    v_right = r_right.reveal(mpc)
+    if mpc.pid:
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE matmul chain on Sharetensors on {alg_struct} ({shapes}): correctness', v_opt, px @ py @ pz, error=error)
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE matmul chain on Sharetensors on {alg_struct} ({shapes}): undecorated correctness', v_left, px @ py @ pz, error=error)
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE matmul chain on Sharetensors on {alg_struct} ({shapes}): other order correctness', v_right, px @ py @ pz, error=error)
+        assert_eq(f'CP{mpc.pid}:\tMHE matmul chain on Sharetensors on {alg_struct} ({shapes}): the orders differ in bytes', left_bytes != right_bytes, True)
+        assert_eq(f'CP{mpc.pid}:\tMHE matmul chain on Sharetensors on {alg_struct} ({shapes}): {"x @ (y @ z)" if reorders else "as written"}', opt_bytes, right_bytes if reorders else left_bytes)
 
 
 def test_mhe_mpp_opt(mpc, modulus):
@@ -191,7 +772,7 @@ def test_mhe_mpp_opt(mpc, modulus):
         with open(c_partition_path, "wb") as f: write_ndarray(f, array(__rand_mat([rows, cols], 100, TP=int)), binary=True)
         with open(d_partition_path, "wb") as f: write_ndarray(f, array(__rand_mat([rows, cols], 100, TP=int)), binary=True)
     mpc.comms.sync_parties()
-        
+
     a_partition = read_ndarray(open(a_partition_path), (rows, cols), True, dtype=int)
     b_partition = read_ndarray(open(b_partition_path), (rows, cols), True, dtype=int)
     c_partition = read_ndarray(open(c_partition_path), (rows, cols), True, dtype=int)
@@ -221,60 +802,60 @@ def test_mhe_mpp_opt(mpc, modulus):
         mul_count = mpc.stats.secure_mul_count - mul_count
         add_count = mpc.stats.secure_add_count - add_count
         assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization IR pass on MPPs on {alg_struct}: correctness', sequre_result.reveal(mpc), (raw_a + raw_b) * (raw_c + raw_d))
-        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization IR pass on MPPs on {alg_struct}: multiplications count', mul_count, 1)
-        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization IR pass on MPPs on {alg_struct}: additions count', add_count, 2)
+        # as written (several MP tensors, like several Ciphertensors): 4 products, 3 additions
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization IR pass on MPPs on {alg_struct}: as written, multiplications count', mul_count, 4)
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE cipher-plain optimization IR pass on MPPs on {alg_struct}: as written, additions count', add_count, 3)
 
-    # The matmul reorder pass on a @ b.T @ c, in two cases: these 4 x 32 partitions, and 6 x 32 ones (below), for
-    # which the pass takes the other order with two compute parties
+    # a @ b.T @ c stays as written: only a chain of Sharetensors is reordered (no other type's cost model can cost a
+    # whole order before its products exist). Two cases: these 4 x 32 partitions, and 6 x 32 ones (below), where the
+    # greedy rule of earlier versions took b.T @ c first.
     with mpc.randomness.global_stream():
         a6 = array(random_ints((6, cols), upper_limit=99))
         b6 = array(random_ints((6, cols), upper_limit=99))
         c6 = array(random_ints((6, cols), upper_limit=99))
-    reorders = _check_matmul_reorder(mpc, alg_struct, rows, cols, mpp_a, mpp_b, mpp_c, raw_a, raw_b, raw_c)
-    reorders_6 = _check_matmul_reorder(
+    _check_matmul_chain(mpc, alg_struct, rows, cols, mpp_a, mpp_b, mpp_c, raw_a, raw_b, raw_c)
+    _check_matmul_chain(
         mpc, alg_struct, 6, cols, MPP(mpc, a6), MPP(mpc, b6), MPP(mpc, c6),
         [a6 for _ in range(mpc.comms.number_of_parties - 1)].unfence(),
         [b6 for _ in range(mpc.comms.number_of_parties - 1)].unfence(),
         [c6 for _ in range(mpc.comms.number_of_parties - 1)].unfence())
-    # A case evaluated left to right, (a @ b.T) @ c, or whose two orders count the same, would pass without the pass:
-    # at least one case must reorder visibly
-    if mpc.pid:
-        assert_eq(f'CP{mpc.pid}:\tMHE matmul reorder optimization IR pass on MPPs on {alg_struct}: a case reorders', reorders or reorders_6, True)
 
 
-def _check_matmul_reorder(mpc, alg_struct, rows_per_party, cols, mpp_a, mpp_b, mpp_c, raw_a, raw_b, raw_c) -> bool:
-    # The pass evaluates a @ b.T @ c greedily (evaluate_and_reorder): the adjacent pair with the lower get_matmul_cost
-    # first, a @ b.T on a tie. secure_matmul_complexity adds rows x inner x columns of each product's cohort shapes:
-    # with R = rows_per_party * (compute parties) and C = cols, (a @ b.T) @ c counts R C R + R R C = 2 R^2 C and
-    # a @ (b.T @ c) counts C R C + R C C = 2 R C^2. With the HE cost constants and 4 x 32 partitions, the model takes
-    # a @ b.T first with two compute parties (cost 0.369 against 0.495 for b.T @ c: 4096) and b.T @ c with three or four
-    # (0.495 against 0.737 and 0.911: 24576 and 32768); with 6 x 32 partitions it takes b.T @ c first already with two
-    # (0.593 against 0.679: 24576 against 9216 left to right). The int MPPs reveal rounded: in the order (a @ b.T) @ c
-    # the product of the other parties' blocks of a @ b.T goes through CKKS, and its error on the 4 x 32 case's values
-    # (up to 6.7e7) stays below 0.2 (0.04 rms), measured with two compute parties; a @ (b.T @ c) goes through MPC and
-    # comes out exact, which the 6 x 32 case's correctness relies on (its larger values would round off in the CKKS
-    # order). Returns whether the pass reorders visibly: b.T @ c first, and the two orders count differently (R != C).
-    first_ab = mpp_a.get_matmul_cost(mpp_b.T) <= mpp_b.T.get_matmul_cost(mpp_c)
+def _check_matmul_chain(mpc, alg_struct, rows_per_party, cols, mpp_a, mpp_b, mpp_c, raw_a, raw_b, raw_c):
+    # secure_matmul_complexity adds rows x inner x columns of each product's cohort shapes: with R = rows_per_party *
+    # (compute parties) and C = cols, the written (a @ b.T) @ c counts R C R + R R C = 2 R^2 C (a @ (b.T @ c) would
+    # count 2 R C^2). The decorated chain takes exactly the undecorated one's products and MHE-MPC switches. The int
+    # MPPs reveal rounded: the product of the other parties' blocks of a @ b.T goes through CKKS, and its error on the
+    # 4 x 32 case's values (up to 6.7e7) stays below 0.2 (0.04 rms), measured with two compute parties; the 6 x 32
+    # case's larger values round off more, so its tolerance is relative.
     cohort_rows = rows_per_party * (mpc.comms.number_of_parties - 1)
-    expected_complexity = 2 * cohort_rows * cohort_rows * cols if first_ab else 2 * cohort_rows * cols * cols
-    order = "(a @ b.T) @ c" if first_ab else "a @ (b.T @ c)"
-    matmul_complexity = mpc.stats.secure_matmul_complexity
+    expected_complexity = 2 * cohort_rows * cohort_rows * cols
+    s = mpc.stats
+    before = (s.secure_matmul_complexity, s.secure_mhe_mpc_switch_count)
+    plain_result = matmul_plain(mpc, mpp_a, mpp_b, mpp_c)
+    middle = (s.secure_matmul_complexity, s.secure_mhe_mpc_switch_count)
     sequre_result = matmul_foo(mpc, mpp_a, mpp_b, mpp_c)
+    after = (s.secure_matmul_complexity, s.secure_mhe_mpc_switch_count)
+    plain_value = plain_result.reveal(mpc)
+    opt_value = sequre_result.reveal(mpc)
 
     if mpc.pid:
-        matmul_complexity = mpc.stats.secure_matmul_complexity - matmul_complexity
-        assert_eq_approx(f'CP{mpc.pid}:\tMHE matmul reorder optimization IR pass on MPPs on {alg_struct}: correctness ({rows_per_party} rows per party)', sequre_result.reveal(mpc), raw_a @ raw_b.T @ raw_c)
-        assert_eq_approx(f'CP{mpc.pid}:\tMHE matmul reorder optimization IR pass on MPPs on {alg_struct}: multiplications complexity ({order}, {rows_per_party} rows per party)', matmul_complexity, float(expected_complexity))
-    return not first_ab and cohort_rows != cols
+        expected = raw_a @ raw_b.T @ raw_c
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE matmul chain on MPPs on {alg_struct}: correctness ({rows_per_party} rows per party)', opt_value, expected, rel_error=1e-6)
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE matmul chain on MPPs on {alg_struct}: same as undecorated ({rows_per_party} rows per party)', opt_value, plain_value, rel_error=1e-6)
+        assert_eq(f'CP{mpc.pid}:\tMHE matmul chain on MPPs on {alg_struct}: as written, (a @ b.T) @ c ({rows_per_party} rows per party)', after[0] - middle[0], expected_complexity)
+        assert_eq(f'CP{mpc.pid}:\tMHE matmul chain on MPPs on {alg_struct}: the undecorated products and switches ({rows_per_party} rows per party)', (after[0] - middle[0], after[1] - middle[1]), (middle[0] - before[0], middle[1] - before[1]))
+
 
 def test_mhe_encoding_opt(mpc):
+    # @mhe_enc_opt is accepted and does nothing: the decorated function must take exactly the undecorated one's path
     print(f'CP{mpc.pid}:\tTesting MHE encoding optimization pass on Ciphertensors ... \n')
     rows, cols = 4, 32
 
     with mpc.randomness.global_stream():
         values_a = random_floats((rows, cols))
         values_b = random_floats((rows, cols))
-    
+
     ctensor_a = Ciphertensor[Ciphertext].enc(mpc, values_a)
     ndarray_a = array(values_a)
     ndarray_b = array(values_b)
@@ -282,37 +863,45 @@ def test_mhe_encoding_opt(mpc):
     if mpc.pid > 0:
         assert_eq_approx(f"CP{mpc.pid}:\tSafe-checking MHE encoding optimization data loading", ctensor_a.reveal(mpc, T=float), ndarray_a, silent_pass=True)
 
-    raw_result = mhe_encoding_single_scope_foo(mpc, ndarray_a, ndarray_b)
-    mpc_switch_count = mpc.stats.secure_mhe_mpc_switch_count
+    expected = ndarray_a @ ndarray_b.T + (ndarray_b @ ndarray_a.T).T
+    s = mpc.stats
+    before = (s.secure_mhe_mpc_switch_count, s.secure_matmul_count, s.secure_add_count, s.secure_bootstrap_count)
+    plain_result = mhe_encoding_single_scope_plain(mpc, ctensor_a, ndarray_b)
+    middle = (s.secure_mhe_mpc_switch_count, s.secure_matmul_count, s.secure_add_count, s.secure_bootstrap_count)
     sequre_result = mhe_encoding_single_scope_foo(mpc, ctensor_a, ndarray_b)
+    after = (s.secure_mhe_mpc_switch_count, s.secure_matmul_count, s.secure_add_count, s.secure_bootstrap_count)
+    plain_counts = [middle[i] - before[i] for i in range(4)]
+    opt_counts = [after[i] - middle[i] for i in range(4)]
+    plain_value = plain_result.reveal(mpc, T=float)
+    opt_value = sequre_result.reveal(mpc, T=float)
 
     if mpc.pid:
-        mpc_switch_count = mpc.stats.secure_mhe_mpc_switch_count - mpc_switch_count
-        assert_eq_approx(f'CP{mpc.pid}:\tMHE encoding optimization (single scope) IR pass on Ciphertensors: correctness', sequre_result.reveal(mpc, T=float), raw_result)
-        assert_eq_approx(f'CP{mpc.pid}:\tMHE encoding optimization (single scope) IR pass on Ciphertensors: MPC switch count', mpc_switch_count, 0)
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE encoding optimization (single scope) IR pass on Ciphertensors: correctness', opt_value, expected)
+        assert_eq_approx(f'CP{mpc.pid}:\tMHE encoding optimization (single scope) IR pass on Ciphertensors: undecorated correctness', plain_value, expected)
+        assert_eq(f'CP{mpc.pid}:\tMHE encoding optimization (single scope) IR pass on Ciphertensors: no-op (switches, products, additions, bootstraps)', opt_counts, plain_counts)
 
 
 def test_ir_passes[TP](mpc: MPCEnv[TP]):
     print(f'CP{mpc.pid}:\tTesting IR passes ... \n')
 
-    # KNOWN BUG: test_mhe_encoding_opt silently crashes (SIGABRT, no diagnostic)
-    # somewhere in mhe_encoding_single_scope_foo's bet_enc_init/bet_enc_opt
-    # helpers (ir/mhe.cpp applyEncodingOptimization), the same fragile BET
-    # optimization machinery as the cipher_plain crash above.
-    # test_mhe_encoding_opt(mpc)
+    test_mhe_cipher_opt(mpc, "compact")
+    test_mhe_cipher_opt(mpc, "split")
+    test_mhe_cipher_opt(mpc, "redundant")
+    test_mhe_cipher_reorder_opt(mpc)
+    test_mhe_cipher_opt_layouts(mpc)
+    test_mhe_cipher_opt_refreshes(mpc)
+    test_mhe_encoding_opt(mpc)
+    with mpc.default_modulus(MPC_FIELD_SIZE):
+        test_mhe_cipher_opt_sharetensors(mpc, MPC_FIELD_SIZE)
+    with mpc.default_modulus(MPC_RING_SIZE):
+        test_mhe_cipher_opt_sharetensors(mpc, MPC_RING_SIZE)
+    test_mhe_mpp_opt(mpc, MPC_FIELD_SIZE)
+    with mpc.default_modulus(MPC_RING_SIZE):
+        test_mhe_mpp_opt(mpc, MPC_RING_SIZE)
+    # @mpc_poly_opt is a no-op since its pass (MPCOptimizations) was unregistered (L-138): test_mpc_poly_opt expects
+    # the rewrite's Beaver partition count, so it stays off until the pass comes back
     # test_mpc_poly_opt(mpc, MPC_FIELD_SIZE)
     # with mpc.default_modulus(MPC_RING_SIZE):
     #     test_mpc_poly_opt(mpc, MPC_RING_SIZE)
-    # KNOWN BUG: test_mhe_cipher_opt crashes the compiled libsequre plugin with
-    # "Assertion failed: (false), function generateExpression, file bet.cpp"
-    # (a List+Ciphertensor type mismatch generated by the BET factoring/expansion
-    # logic in ir/helpers/bet.cpp). Needs a fix in the C++ optimization pass.
-    # test_mhe_cipher_opt(mpc, "compact")
-    # test_mhe_cipher_opt(mpc, "split")
-    # test_mhe_cipher_opt(mpc, "redundant")
-    # test_mhe_cipher_reorder_opt(mpc)  # KNOWN BUG: same bet.cpp crash as test_mhe_cipher_opt above
-    test_mhe_mpp_opt(mpc, MPC_FIELD_SIZE)
-    # with mpc.default_modulus(MPC_RING_SIZE):
-    #     test_mhe_mpp_opt(mpc, MPC_RING_SIZE)
 
     print(f'CP{mpc.pid}:\tIR passes passed.\n')

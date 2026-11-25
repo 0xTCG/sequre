@@ -147,7 +147,7 @@ With a plaintext `ndarray` B, the dispatcher estimates the cost of each kernel w
 
 ## Encoding modes
 
-The `@mhe_enc_opt` compiler pass selects the optimal encoding strategy per matrix multiplication:
+A tensor is stored in one of these encodings (`Ciphertensor.enc(mpc, data, encoding=...)`; the matmul routers above choose a kernel, and the encoding of a plaintext operand, by cost):
 
 | Mode | Constant | Description |
 |---|---|---|

@@ -16,7 +16,7 @@ The primary attribute. Marks a function for Sequre's IR rewriting pipeline. The 
 
 1. **Expressiveness transformations** — rewrites operator overloads (e.g., `a > b` on encrypted types dispatches to secure comparison)
 2. **MPC optimizations** (`@mpc_poly_opt`) — polynomial-evaluation optimizations for MPC operations
-3. **MHE optimizations** (`@mhe_mat_opt`, `@mhe_cipher_opt`, `@mhe_enc_opt`) — HE-specific optimizations
+3. **MHE optimizations** (`@mhe_mat_opt`, `@mhe_cipher_opt`, `@mhe_enc_opt`) — opt-in optimizations; `@mhe_cipher_opt` factors and reorders a function's arithmetic on Sharetensors, and on a single Ciphertensor or MP tensor among public operands; `@mhe_enc_opt` is accepted and does nothing
 
 ```python
 from sequre.attributes import sequre
@@ -37,17 +37,56 @@ Enables polynomial optimization for MPC operations. The compiler rewrites sequen
 
 Enables matrix-multiplication optimization for MHE. The compiler analyzes matrix operands and selects the best multiplication strategy (row-packed, column-packed, or diagonal-packed).
 
-### `@mhe_cipher_opt`
-
-Enables ciphertext-expression optimization. The compiler reorders arithmetic expressions to maximize cheaper ciphertext-plaintext operations over expensive ciphertext-ciphertext operations.
-
-### `@mhe_enc_opt`
-
-Enables encoding-mode optimization. The compiler performs a brute-force search over possible encoding layouts (row-wise, column-wise, diagonal) for each matrix multiplication and selects the optimal one.
-
 ### `@debug`
 
 Enables debug instrumentation. The compiler inserts additional logging, assertions, and timing instrumentation into the annotated function. -->
+
+### `@mhe_cipher_opt`
+
+An opt-in rewrite of a function's arithmetic: fewer secure products and additions for the same results. Put it under `@sequre`, on a function whose first argument is the MPC instance:
+
+```python
+from sequre import sequre, mhe_cipher_opt
+
+@sequre
+@mhe_cipher_opt
+def f(mpc, a, b, c, d):
+    return a * c + a * d + b * c + b * d  # on Sharetensors: (a + b) * (c + d), one secure product instead of four
+```
+
+In each top-level statement of the function it:
+
+- **factors** an operand shared by terms of a sum: `a*c + a*d` becomes `a * (c + d)`;
+- **combines public operands first** (ndarrays, numbers, `Ciphertensor[Plaintext]`): `a*b + a*c + a*d`, with `b`, `c` and `d` public, becomes `a * ((b + c) + d)`, one secure product;
+- **folds a definition into its only use** when only plain assignments lie between them: `e = a*c + a*d`, `f = b*c + b*d`, `return e + f` is factored as one sum, and the assignments go (nothing else is ever removed);
+- **orders chains of `@` of Sharetensors**: `x @ y @ z`, three or more Sharetensor matrices, runs in the order of fewest rows × inner × columns when that is strictly cheaper than the written order. Chains of other types run as written: their products' cost depends on layouts known only once the products exist.
+
+On Sharetensors it rewrites any such expression. On Ciphertensors and MP tensors (`MPP`, `MPA`, `MPU`) it rewrites an expression only when it holds one of them, the other operands public: `a*c + a*d` with public `c` and `d` becomes `a * (c + d)`, but `a*c + a*d` of three Ciphertensors stays as written (below).
+
+What it promises:
+
+- The function gives the same results as without the decorator, up to fixed-point and CKKS rounding, with all of its effects in their order, at every party. That includes what Sequre's products do to their operands in place (refreshes, encryptions, aggregations): a Ciphertensor argument the written function would have bootstrapped comes back as high.
+- A rewrite never costs more: fewer secure `@` products, then fewer secure-by-secure products, then fewer secure-by-public products, then fewer secure additions; no `@` product evaluated more often than written, and no secure value under more products (levels) than before. Anything it cannot prove so stays as written.
+- It applies once per function, however many call sites the function has.
+
+What it leaves as written:
+
+- Expressions inside branches and loops, and expressions holding a call (other than `x.T` and `x @ y`), a ternary, an assignment expression or a list. The operands it plans are variables, `int` and `float` literals, field reads (`self.w`), `x.T` and `x @ y`, of type `int`, `float`, `ndarray`, `Sharetensor`, `Ciphertensor`, `MPP`, `MPA` or `MPU`.
+- Pairings Sequre does not run: a `Ciphertensor[Plaintext]` meets only `Ciphertensor[Ciphertext]` operands, and secure operands of two different types are combined only as the function already combines them.
+- Integer arithmetic that would wrap: two public integers (`int` values, ndarrays of ints) are never combined with each other, since their product or sum wraps at 64 bits where the secure arithmetic does not, unless both are literals and the result fits. An expression that already computes such a sum or product (`a * (n * m)`) stays as written.
+- Constants out of range next to Sharetensors: Sequre encodes a public value added to or multiplied with a Sharetensor in 31 integer bits, so there only literals are combined, and only while the combined value stays within that range.
+- Additions of a fixed-point and an integer Sharetensor, which Sequre refuses, and of a float to an integer Sharetensor, which it gets wrong. A rewritten expression runs only when each addition it makes adds two of a kind, and a float only to a fixed-point Sharetensor (checked at run time: a product is fixed point when a factor is, and a float makes it so); otherwise the expression runs as written.
+- Expressions of two or more secure Ciphertensors or MP tensors (`x` and `x.T` count as two). Their storage is not in their types: a Ciphertensor is stored transposed (as `b.T` is) or diagonal, an MPP or an MPU of partitions transposed or split differently among the parties, an MPA aggregated or not. An element-wise operation of two tensors stored differently converts one to the other's storage (a Ciphertensor's through MPC), and their products refresh, encrypt or aggregate operands in place, so a new pairing of two of them could change what the function converts, bootstraps and returns. Choosing their storage is left to a layout optimization.
+- Extra levels: an MPP or MPA times an int below 7 costs no level (Sequre adds), so such constants are not combined into a larger one.
+
+!!! warning
+    `@mhe_cipher_opt` assumes that every tensor in a decorated expression has the same shape (numbers broadcast). A function that adds or multiplies tensors of different shapes, such as a matrix and a row, must not use it.
+
+Set `SEQURE_IR_OPT_DEBUG=1` at compile time to see each rewrite.
+
+### `@mhe_enc_opt`
+
+Accepted, and does nothing: a function under it compiles and runs as without it. It used to encrypt the public operand of each `Ciphertensor @ ndarray` product in an encoding chosen by a search; on today's kernels that was slower than the matmul routers' own choice everywhere it was measured (the routers pick, per product, the cheapest kernel and the encoding of the plaintext operand by cost).
 
 ---
 
@@ -200,7 +239,7 @@ The Sequre compiler plugin processes `@sequre`-annotated functions through these
 
 | Pass | Description |
 |---|---|
+| **MHEOptimizations** | Runs first, on the functions under `@mhe_cipher_opt` only: factors and reorders their arithmetic (see above) |
 | **ExpressivenessTransformations** | Rewrites standard operators on secure types to their secure equivalents |
 | **MPCOptimizations** | Optimizes polynomial evaluations and MPC-specific patterns |
-| **MHEOptimizations** | Optimizes HE expression ordering, encoding modes, and matrix strategies |
 <!-- | **Debugger** | Inserts debug instrumentation when `@debug` is active | -->
