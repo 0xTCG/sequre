@@ -5,8 +5,9 @@ set -e
 # Example: ./install-via-docker.sh $HOME/.sequre
 # Example: ./install-via-docker.sh $HOME/.sequre /path/to/sequre
 #
-# Builds sequre inside Docker (manylinux2014) for ABI compatibility
-# and extracts the result to the specified installation path.
+# Builds sequre inside Docker (manylinux_2_28) for ABI compatibility
+# and extracts the result to the specified installation path. Linux only:
+# the image builds Linux binaries (on macOS, use scripts/install.sh).
 #
 # Options:
 #   --rebuild    Force rebuild of Docker image (re-downloads Codon/LLVM/seq)
@@ -40,6 +41,14 @@ fi
 # Verify sequre source exists
 if [ ! -f "$SEQURE_SRC/CMakeLists.txt" ]; then
   echo "Error: $SEQURE_SRC does not appear to be a valid sequre source directory"
+  exit 1
+fi
+
+# The image builds Linux binaries: on macOS they would land in the prefix and not run there
+if [ "$(uname -s)" != "Linux" ]; then
+  echo "Error: install-via-docker.sh builds Linux binaries and installs them on Linux only."
+  echo "On $(uname -s), install the release with scripts/install.sh, or build from source"
+  echo "(docs/getting-started/build-from-source.md)."
   exit 1
 fi
 
@@ -98,8 +107,8 @@ echo "Build complete. Extracting to $INSTALL_PATH..."
 mkdir -p "$INSTALL_PATH"
 tar xzvf "$TARBALL" -C "$INSTALL_PATH"
 
-# Apply the AVX-512 alignment workaround: patch Codon's bundled Ptr (the shim and
-# patched launcher are already in the tarball). No-op off x86_64.
+# Apply the x86-64 alignment workaround: patch Codon's bundled Ptr (the shim and
+# the launcher are already in the tarball). No-op off x86_64.
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 if [ -f "$SCRIPT_DIR/apply_avx512_workaround.sh" ]; then
   SEQURE_WORKAROUND_SKIP_LAUNCHER=1 bash "$SCRIPT_DIR/apply_avx512_workaround.sh" "$INSTALL_PATH"

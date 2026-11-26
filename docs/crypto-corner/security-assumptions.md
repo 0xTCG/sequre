@@ -9,7 +9,7 @@ This page documents the threat model and cryptographic hardness assumptions that
 Sequre assumes all parties follow the protocol correctly but may try to learn additional information from the messages they observe. This is the standard **semi-honest** model.
 
 - **No malicious behavior**: Parties do not send forged messages, deviate from the protocol, or abort strategically.
-- **No collusion beyond threshold**: For $N$ compute parties, security holds as long as no single party can reconstruct the full secret. In Sequre's additive secret-sharing setting, all $N$ parties must collude to break privacy.
+- **Collusion**: Privacy holds against any single party, and against any coalition of compute parties that leaves at least one compute party out, as long as the trusted dealer (CP0) is not part of it. CP0 deals the correlated randomness (Beaver triples, masks), so CP0 together with any one compute party can recover values that were opened against that randomness. The MHE collective secret key is shared among the compute parties only (CP0 holds a zero share), so a collective decryption needs all of them.
 
 ### Trusted dealer (CP0)
 
@@ -19,6 +19,12 @@ Party 0 (CP0) acts as a **trusted dealer** during the offline phase:
 - Does **not** participate in online computation (holds zero shares / zero secret-key polynomial)
 
 In production deployments, the trusted dealer can be replaced by an MPC preprocessing protocol or a hardware enclave.
+
+### Authenticated channels
+
+In distributed mode, every pair of parties talks over its own mutual-TLS connection. Each party holds a certificate from the deployment's CA that names that party (`SEQURE_PARTY_CERT_NAME`, default `cp<pid>`), and both ends of a connection check that the other's certificate comes from the CA and names the party expected there. So no party, and no one else the CA certified, can take another party's place or sit in the middle of a connection and read or change what it carries: the pairwise and global PRG seeds, shares, masks and opened values. This rests on the CA issuing each party's name to that party only. A failed check stops the run; aborts are outside the semi-honest model.
+
+Local mode runs all parties on one machine over UNIX sockets, without TLS. The data-sharing socket, where data owners (not parties) send their inputs, accepts any certificate from the CA.
 
 ## Hardness assumptions
 
@@ -43,19 +49,70 @@ Sequre does **not** use Paillier or other DCR-based schemes. All HE is RLWE-base
 
 ## Additive secret sharing security
 
-For the MPC (non-HE) path, security relies on **information-theoretic** properties of additive sharing:
+For the MPC (non-HE) path, values are additively shared over a prime field (or a power-of-two ring):
 
 $$x = x_1 + x_2 + \cdots + x_N \pmod{p}$$
 
-Each share $x_i$ is uniformly random given any proper subset of shares. This provides **perfect secrecy** against up to $N-1$ colluding parties (in the honest-majority or full-threshold variant used by Sequre).
+Shares and masks are drawn uniformly from the whole field with a cryptographically secure PRG, seeded pairwise between the parties over TLS. The shares seen by a coalition that misses at least one party (subject to the dealer caveat above) are therefore computationally indistinguishable from uniform: security rests on the PRG, not on perfect (information-theoretic) secrecy.
 
-## Smudging noise
+Values a single party must keep to itself come from its private stream, seeded from the operating system's randomness: the dealer's masks and random bits (truncation, comparisons, bit decomposition, the bitwise protocols) and each compute party's MPC ↔ MHE switching masks. The HE protocols' masks (collective bootstrapping, encryption to shares) come from Lattiseq's own generators, seeded the same way. Every such draw names its stream, so it stays private when a caller runs the protocol under the global stream (`global_stream()`, which every party, CP0 included, can compute). See [the PRG streams](../api/mpc-instance.md#mpcrandomness-mpcrandomness).
 
-During protocol switching (HE → MPC), each party reveals $\text{sk}_i \cdot c_1 + \text{mask}_i + e_i$. The smudging noise $e_i$ is sampled from a Gaussian with width controlled by `LATTISEQ_SIGMA_SMUDGE`. This prevents leakage from the partial decryption beyond what the output itself reveals:
+## Decor and bitwise (XOR) sharing
 
-$$\text{Statistical distance} \leq 2^{-\lambda}$$
+Sequre's nonlinear functions ([Nonlinear Functions](../user-guide/nonlinear-functions.md)) and its ring comparisons,
+division and square root add two kinds of messages to the MPC path. Neither needs a new assumption.
 
-where $\lambda$ is the security parameter (128 bits).
+**Decor's opening.** Each call scales its input to $t$ and partitions it like a Beaver multiplication: the compute
+parties open $t - r$ for a mask $r$ drawn uniformly over the whole modulus (field or ring) from the pairwise PRG
+streams. The opening is uniform and independent of the input. Every call draws a fresh mask: two openings against the
+same mask would reveal the difference of the two inputs.
+
+**The dealer's role.** CP0 knows $r$: it deals the shares of $h(r)$ that the decomposition combines, and an XOR sharing
+of $r$'s fractional bits for the carry. As with Beaver triples, CP0 together with any one compute party can recover $t$.
+Decor adds no trust beyond the existing [dealer assumption](#trusted-dealer-cp0).
+
+**Bitwise sharing.** The carry, the ring sign test and the ring normalizer XOR-share bits among the compute parties,
+packed into registers. Every mask is uniform over all bits of its register. What they open is masked uniformly over
+the opened width: the XOR-masked operands of AND gates, Beaver partitions, the sign test's $-a + r \bmod 2^{\text{bits}}$,
+the normalizer's $X - r \bmod 2^K$ and its masked one-hot bits, and each bit-to-arithmetic conversion's masked bit.
+
+**Public checks.** Before any communication, every party checks the function, interval, degree and tolerance
+(admissibility). The checks read public parameters only, so a refusal reveals nothing about the data.
+
+**Inputs outside the interval** give wrong results (for example, $f(x - kp)$ for Decor's bounded functions), not a leak.
+Only debug builds (`DEBUG = True`) open inputs, to warn about values outside the interval.
+
+## Noise and masks in the MHE protocols
+
+What each protocol reveals to the party that combines the shares (the hub):
+
+- **Collective decryption.** Each compute party sends the hub $s_i \cdot c_1 + e_i$, with Gaussian noise $e_i$ of standard deviation `SEQURE_SIGMA_SMUDGE` (default $2^{10}$; values below 3.2 are rejected). Without noise, the hub could compute every key share as $s_i = \text{share} / c_1$; with it, recovering $s_i$ is a ring-LWE problem. The noise does not *flood* the ciphertext noise statistically, so a decrypted result still carries some information about the ciphertext's own noise (the IND-CPA-D setting). Flooding needs a standard deviation of about $2^{20}$ or more together with a larger scale, because the decryption error grows in proportion to it: the measured maximum error at the default scale $2^{34}$ is about $5 \cdot 10^{-5}$ at $2^{10}$, $5 \cdot 10^{-4}$ at $2^{14}$, and $3 \cdot 10^{-2}$ at $2^{20}$.
+- **Decryption to the holder** (the default of `MPCMHE.decrypt` and `Ciphertensor.reveal`, behind `MPP.reveal_local`). Each compute party decrypts its own ciphertexts: it sends every other compute party the $c_1$ polynomial of each (never $c_0$) and gets back from each a decryption share $s_i \cdot c_1 + e_i$, smudged as above and sent to it alone; it adds its own $s \cdot c_1$ and $c_0$. The holder's view is the hub's view in a collective decryption (the same smudging guarantee). A party that is not the holder sees only $c_1$ polynomials, which are computed from ciphertexts and reveal nothing about the plaintexts under RLWE, and no share of anyone's decryption.
+- **HE → MPC switching** (encryption to shares). Every compute party except the hub sends the hub its decryption share masked by a uniformly random polynomial, and keeps the negated mask. The hub decrypts the plaintext's coefficients under the others' masks, and each party decodes its coefficient share exactly into fixed-point shares (with the [exact encoder](../deep-dive-lattiseq/ckks-operations.md#exact-encoding)).
+    - **Masks:** $\lambda + \log_2 N + \lceil \log_2 \Delta \rceil + k - f$ bits, where $\lambda$ = `MHE_MPC_SWITCH_LAMBDA` (128), $k$ and $f$ are the fixed-point total and fractional bits, and $N$ is the ring degree. That is 208 bits for $N = 2^{14}$ at scale $2^{34}$.
+    - **Hiding:** for slot values in the fixed-point range ($|v| < 2^{k-f-1}$), the hub's view is within statistical distance $2^{-128}$ of one that depends on neither the plaintext nor its noise.
+    - **Level:** the masks need a ciphertext modulus about two bits wider than themselves: level 5 of `PN14QP438` with three parties. Ciphertexts below that level are bootstrapped first; those above are dropped to it, which also makes the switch cheaper.
+- **MPC → HE switching** (shares to encryption). Only the hub sees the opened value $x - R$, where $R$ is the sum of the compute parties' masks, and the parties then encrypt their shares jointly. Each party exactly encodes its share and masks it with $s_i \cdot a$ for a common random polynomial $a$; the sum is a fresh encryption under the collective key.
+    - **Masks:** as large as keeps $x - R$ from wrapping around the MPC modulus, $\lceil \log_2 p \rceil - 2 - \lceil \log_2 (\text{compute parties}) \rceil$ bits. That is 171 bits with 192-bit shares and three parties.
+    - **Hiding:** a $k$-bit value is hidden up to a statistical distance of $2^{k - 1} / 2^{\text{mask bits}}$. That is $2^{-108}$ with 192-bit shares, $2^{-61}$ with 128-bit shares and $2^{-121}$ with 256-bit shares.
+- **Collective bootstrapping (refresh).** Partial decryptions are masked with random integers of $\lambda + \log_2 \Delta$ bits in the coefficient domain ($\lambda = 128$), which hide the plaintext and its noise statistically for slot values up to about 1.
+
+Values beyond the fixed-point range are hidden less well, in proportion to their magnitude.
+
+## What each reveal discloses
+
+A reveal discloses its result to the parties named below and nothing else, with the guarantees above (the smudging of decryption shares, the masks of the switches). CP0 learns none of these results: it gets placeholders.
+
+| Operation | Who learns what |
+|---|---|
+| `Sharetensor.reveal` | Every compute party: the value |
+| `MPCMHE.decrypt(x)`, `Ciphertensor.reveal(mpc)` (default) | Each compute party: the plaintexts of its own ciphertexts |
+| `MPCMHE.decrypt(x, p)` | Every compute party: the plaintexts of compute party `p`'s ciphertexts |
+| `MPCMHE.decrypt(x, -1)` | Every compute party: the plaintext of ciphertexts that are the same at all of them (an MPA aggregate) |
+| `MPP.reveal()`, `MPU.reveal()` (partition mode) | Every compute party: the whole matrix (all partitions) |
+| `MPP.reveal_local()` | Each compute party: its own partition, its semi-encrypted blocks included |
+| `MPA.reveal()`, `MPU.reveal()` (additive mode) | Every compute party: the sum of the shares. Shares in the clear go out under pairwise masks that cancel in the sum: each sent vector is uniform to a party that lacks one of its masks, so any coalition learns only the sum of the other parties' shares. With two compute parties, the sum and one's own share give the other's share: that is inherent to revealing a sum |
+| `MPA.reveal_local()`, `MPU.reveal_local()` (additive mode) | Each compute party: its own share (in the clear, or decrypted to it alone). An MPA that holds only its aggregate, the same ciphertexts at every party, reveals the sum to every compute party |
 
 ## CKKS approximate precision
 

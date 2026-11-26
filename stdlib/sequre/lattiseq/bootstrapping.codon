@@ -376,6 +376,20 @@ def new_bootstrapper(params: ckks.Parameters, btp_params: Parameters, btp_keys: 
     return _new_bootstrapper_base(params, btp_params.copy(), btp_keys)
 
 
+# _eval_mod_period_factor returns T = SF / 2^round(log2 Q0): the factor that brings Q0 * I, the multiple of Q0 the mod-up
+# adds, to the period EvalMod removes (EvalMod reads its input at the scale SF).
+def _eval_mod_period_factor(params: ckks.Parameters, scaling_factor: float) -> float:
+    q0 = float(params.ring_q.modulus[0])
+    return scaling_factor / math.pow(2.0, float(round(math.log2(q0))))
+
+
+# _post_mod_up_factor returns the integer bootstrap multiplies by after the mod-up: T rounded, at least 1. T is a
+# power of two in every default set; the CoeffsToSlots matrices take T over this factor.
+def _post_mod_up_factor(params: ckks.Parameters, scaling_factor: float) -> int:
+    t = _eval_mod_period_factor(params, scaling_factor)
+    return max(1, int(round(t)))
+
+
 def _new_bootstrapper_base(params: ckks.Parameters, btp_params: Parameters, btp_keys: EvaluationKeys) -> Bootstrapper:
     dslots = params.slots()
     logdslots = params.log_slots
@@ -398,14 +412,12 @@ def _new_bootstrapper_base(params: ckks.Parameters, btp_params: Parameters, btp_
     # Q0/|m|
     q0_over_message_ratio = math.pow(2.0, float(round(math.log2(q0 / eval_mod_poly.message_ratio()))))
 
-    # If the scale used during the EvalMod step is smaller than Q0, then we cannot increase the scale during
-    # the EvalMod step to get a free division by MessageRatio, and we need to do this division (totally or partly)
-    # during the CoeffstoSlots step
-    q_div = btp_params.eval_mod_parameters.scaling_factor / math.pow(2.0, float(round(math.log2(q0))))
-
-    # Sets q_div to 1 if there is enough room for the division to happen using scale manipulation.
-    if q_div > 1:
-        q_div = 1.0
+    # T = SF / 2^round(log2 Q0) brings Q0 * I, the multiple of Q0 the mod-up adds, to the period of EvalMod. bootstrap
+    # multiplies by its integer part after the mod-up (_post_mod_up_factor), and the CoeffsToSlots matrices take the
+    # rest, q_div: 1 when T is an integer (every default set), T when T < 1 (the scale used during EvalMod is smaller
+    # than Q0, so the division cannot be had for free by scale manipulation, as in Lattigo).
+    q_div = _eval_mod_period_factor(params, btp_params.eval_mod_parameters.scaling_factor) / float(
+        _post_mod_up_factor(params, btp_params.eval_mod_parameters.scaling_factor))
 
     encoder = ckks.new_encoder_complex(params)
 
@@ -456,18 +468,20 @@ def _new_bootstrapper_base(params: ckks.Parameters, btp_params: Parameters, btp_
 @extend
 class Bootstrapper:
     # bootstrap re-encrypts a ciphertext at lvl Q0 to a ciphertext at MaxLevel-k where k is the depth of the bootstrapping circuit.
-    # If the input ciphertext level is zero, the input scale must be an exact power of two smaller or equal to round(Q0/2^{10}).
-    # If the input ciphertext is at level one or more, the input scale does not need to be an exact power of two as one level
-    # can be used to do a scale matching.
+    # If the input ciphertext level is zero, its scale must not exceed Q0 / message ratio (rounded to a power of two:
+    # q0_over_message_ratio); it is multiplied by integers up to that bound, never above it. Lattigo asks for an exact
+    # power of two there. If the input ciphertext is at level one or more, one level is used to match the scale exactly.
     #
-    # The input is not modified. The output is at level output_level() and scale output_scale() and holds the same values.
+    # The input is not modified. The output is at level output_level() and holds the same values; its scale is
+    # output_scale() whenever the input is at level one or more, or at level zero with a power of two for scale.
     #
-    # One deviation from Lattigo, on the scale of the output. Lattigo sets it to the default scale whatever
-    # the scale the ciphertext had when it entered the circuit. With an input at level zero whose scale is
-    # not such a power of two, that scale is not exactly Q0 / message ratio, and Lattigo's output is off by
-    # the same ratio on every slot (up to 2^-13 for the default parameters). Here the scale of the output
-    # records that ratio instead, so the values are right; whenever Lattigo's requirement on the input scale
-    # is met the ratio is exactly one and the output scale is the default scale, as in Lattigo.
+    # Two deviations from Lattigo, both on inputs at level zero whose scale is not such a power of two:
+    #   - After the mod-up the ciphertext is multiplied by the fixed factor T = SF / 2^round(log2 Q0) (its integer part;
+    #     the CoeffsToSlots matrices take the rest), which brings the multiple of Q0 the mod-up adds to EvalMod's period.
+    #     Lattigo multiplies by round((SF / message ratio) / scale), which is T only for such powers of two: otherwise
+    #     EvalMod does not remove that multiple, and on the logN 15 default sets (T = 2^17, 2^15) the output is garbage.
+    #   - The scale of the output records the ratio of the input's scale, once multiplied up to the bound, to
+    #     Q0 / message ratio. Lattigo sets the default scale whatever that ratio, so its output is off by that ratio.
     def bootstrap(self, ct_in: Ciphertext) -> Ciphertext:
         evaluator = self.evaluator
         eval_mod_poly = self.eval_mod_poly
@@ -488,25 +502,33 @@ class Bootstrapper:
             if ct_low.level() != 0:
                 evaluator.drop_level(ct_low, ct_low.level())
         else:
-            # Does an integer constant mult by round((Q0/Delta_m)/ctscle)
             if self.q0_over_message_ratio < ct_low.scale:
                 raise ValueError("Cannot bootstrap: ciphetext scale > q/||m||)")
 
-            evaluator.scale_up(ct_low, float(round(self.q0_over_message_ratio / ct_low.scale)), ct_low)
+            # An integer constant mult by floor((Q0/Delta_m)/ctscale): rounded down, so that the scale stays at or below
+            # Q0/MessageRatio (rounded up, it could reach 4/3 of it, outside the range EvalMod is built for)
+            factor = math.floor(self.q0_over_message_ratio / ct_low.scale)
+            if factor > 1.0:
+                evaluator.scale_up(ct_low, factor, ct_low)
 
-        # Scales the message to Q0/|m|, which is the maximum possible before ModRaise to avoid plaintext overflow.
-        if float(round((q0 / eval_mod_poly.message_ratio()) / ct_low.scale)) > 1:
-            evaluator.scale_up(ct_low, float(round((q0 / eval_mod_poly.message_ratio()) / ct_low.scale)), ct_low)
+        # Scales the message to Q0/|m|, which is the maximum possible before ModRaise to avoid plaintext overflow: an
+        # integer factor, rounded down for the same reason.
+        factor = math.floor((q0 / eval_mod_poly.message_ratio()) / ct_low.scale)
+        if factor > 1.0:
+            evaluator.scale_up(ct_low, factor, ct_low)
+
+        # The ratio of the message's scale to the nominal Q0 / message ratio, which the scale of the output records
+        # (exactly 1 whenever the input was at level 1 or more, or at level 0 at a power of two)
+        scale_ratio = ct_low.scale / self.q0_over_message_ratio
 
         # Step 1 : Extend the basis from q to Q
         ct_raised = self.mod_up_from_q0(ct_low)
 
-        # Scale the message from Q0/|m| to QL/|m|, where QL is the largest modulus used during the bootstrapping.
-        if (eval_mod_poly.scaling_factor() / eval_mod_poly.message_ratio()) / ct_raised.scale > 1:
-            evaluator.scale_up(ct_raised, float(round((eval_mod_poly.scaling_factor() / eval_mod_poly.message_ratio()) / ct_raised.scale)), ct_raised)
-
-        # The scale the message has through CoeffsToSlots and EvalMod. Nominally scaling factor / message ratio.
-        scale_ratio = ct_raised.scale / (eval_mod_poly.scaling_factor() / eval_mod_poly.message_ratio())
+        # Multiplies by T (its integer part; CoeffsToSlots has the rest), so that Q0 * I, the multiple of Q0 the mod-up
+        # added, reaches EvalMod at its period whatever the scale: this also scales the message from Q0/|m| to SF/|m|.
+        post_factor = _post_mod_up_factor(self.params, eval_mod_poly.scaling_factor())
+        if post_factor > 1:
+            evaluator.scale_up(ct_raised, float(post_factor), ct_raised)
 
         # SubSum X -> (N/dslots) * Y^dslots
         evaluator.trace(ct_raised, self.params.log_slots, ct_raised)

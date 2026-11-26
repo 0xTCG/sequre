@@ -10,8 +10,10 @@ The switching mechanism is built on two low-level Lattiseq distributed protocols
 
 | Protocol | Direction | Description |
 |---|---|---|
-| **E2S** (Encryption-to-Shares) | MHE → MPC | Each party collectively decrypts a ciphertext into additive secret shares |
-| **S2E** (Shares-to-Encryption) | MPC → MHE | Each party re-encrypts its additive share; the ciphertexts are summed to produce a fresh collective ciphertext |
+| **E2S** (Encryption-to-Shares) | MHE → MPC | The parties decrypt a ciphertext collectively under random masks, so that each ends up with an additive share of its values and none sees them |
+| **S2E** (Shares-to-Encryption) | MPC → MHE | Each party encodes its additive share and masks it with its secret-key share; the sum is a fresh collective ciphertext |
+
+Both directions hide the values statistically from every party; [Security Assumptions](../crypto-corner/security-assumptions.md#noise-and-masks-in-the-mhe-protocols) gives the guarantees.
 
 A single round-trip (E2S → compute in MPC → S2E) is what `via_mpc` performs under the hood. The cost of one switch is estimated as:
 
@@ -56,8 +58,10 @@ The actual type conversions are implemented in `stdlib/sequre/types/internal.cod
 | `Sharetensor.to_ciphertensor(mpc)` | MPC → MHE | Re-encrypt via S2E into a collective ciphertext |
 | `MPP.to_sharetensor(mpc)` | MHE → MPC | Convert partitioned encryption to shares |
 | `Sharetensor.to_mpp(mpc, ratios)` | MPC → MHE | Convert shares to partitioned encryption |
-| `MPA.to_sharetensor(mpc)` | MHE → MPC | Convert aggregated encryption to shares |
+| `MPA.to_sharetensor(mpc)` | MHE → MPC | Convert to shares: shares every compute party holds in the clear directly (each party shares its own); otherwise the aggregate, which every party first forms (a share held in the clear encrypted for it), so an MPA held in the clear at some parties and encrypted at others converts too |
 | `Sharetensor.to_mpa(mpc)` | MPC → MHE | Convert shares to aggregated encryption |
+
+The shares that `MPP.to_sharetensor` and `MPA.to_sharetensor` return are fixed point whatever the dtype: partitions switched from MHE come out fixed point, and integer partitions held in the clear are scaled to match, so that every party (the trusted dealer included) takes the same fixed-point steps. Integer values must therefore fit the fixed-point range, $|x| < 2^{k-f-1}$ (2^31 by default).
 
 ## Automatic switching with `AllowMPCSwitch`
 
@@ -68,7 +72,9 @@ with mpc.allow_mpc_switch():
     result = ct_a @ plain_b  # cost estimator picks MHE or via_mpc
 ```
 
-Inside the context, `mpc.default_allow_mpc_switch` is set to `True`. The cost estimator compares four strategies for `Ciphertensor @ ndarray`:
+Every party must run the product, the trusted dealer (CP0) included: the via-MPC path needs it for the Beaver products and truncations. The cost estimator works from public data only (the shapes and layouts of the operands, and `mpc.default_allow_mpc_switch`), so every party picks the same strategy; CP0 joins the via-MPC path when it is chosen and otherwise gets a placeholder with the result's shape and layout.
+
+Inside the context, `mpc.default_allow_mpc_switch` is set to `True`. For a row-wise `Ciphertensor @ ndarray` the cost estimator compares five strategies:
 
 | Strategy | Label | Description |
 |---|---|---|
@@ -76,8 +82,16 @@ Inside the context, `mpc.default_allow_mpc_switch` is set to `True`. The cost es
 | M1 | `M1` | Column-packed HE matmul |
 | M2 | `M2` | Row-packed HE matmul |
 | M3 | `M3` | Diagonal-packed HE matmul |
+| BSGS | `BSGS` | Baby-step giant-step diagonal matmul (square plaintext of at most half the slots) |
 
-The cheapest strategy wins. When `AllowMPCSwitch` is not active, the "Via MPC" cost is set to infinity and only pure-HE paths are considered.
+The cheapest strategy wins, among those whose shape constraints hold (see the matrix products section of the [Ciphertensor API](../api/ciphertensor.md#matrix-products)). When `AllowMPCSwitch` is not active, the "Via MPC" cost is set to infinity and only pure-HE paths are considered. Column-wise (lazily transposed) and diagonal-encoded ciphertensors have no via-MPC path, nor does `Ciphertensor @ Ciphertensor`.
+
+MPP and MPA products with a plaintext matrix take the via-MPC path under `AllowMPCSwitch` too, for the whole tensor at once:
+
+- **MPP @ ndarray:** switching converts every partition's rows and multiplies them in MPC, while the HE path runs each compute party's product on its own partition at the same time (the partitions padded to the most rows). So the estimator compares the via-MPC cost of all the rows with the cheapest HE kernel on the largest partition, from the public ratios and shapes. When the via-MPC path wins, every party, CP0 included, takes one more round to find out whether the compute parties hold their partitions encrypted: only then does the MPP switch, at every party and with empty partitions joining in. Partitions held in the clear multiply locally.
+- **MPA @ ndarray:** an MPA held as an aggregate, or as encrypted shares, converts once (the aggregate's common ciphertexts, or the sum of the shares) and comes back as an aggregate. It is costed like a row-wise `Ciphertensor` of the MPA's shape, with the same extra round. An MPA that keeps its shares in the clear multiplies them locally.
+
+Each partition's own product never switches on its own: that would need the trusted dealer, which takes no part in it.
 
 !!! tip
     Enable `DEBUG` mode to see the cost breakdown printed at each matmul:
@@ -87,6 +101,7 @@ The cheapest strategy wins. When `AllowMPCSwitch` is not active, the "Via MPC" c
           M1: 45.67
           M2: 23.45
           M3: 89.01
+          BSGS: 34.56
     ```
 
 ## Methods that switch automatically
@@ -95,12 +110,14 @@ Several built-in operations use `via_mpc` under the hood without requiring `Allo
 
 ### Comparisons
 
-MPP and MPA comparisons (`>`, `<`) always switch to MPC because HE does not natively support comparison:
+HE does not support comparisons, so MPP and MPA comparisons (`>`, `<`) with a public value run the secure comparison in MPC:
 
 ```python
 mask = mpp > 0.0   # internally: mpp.via_mpc(lambda s: secure_operator.gt(mpc, s, 0.0))
 mask = mpa < 1.0   # internally: mpa.via_mpc(lambda s: secure_operator.lt(mpc, s, 1.0))
 ```
+
+The exception is an MPP (or a partition-mode MPU) that every compute party holds in the clear. There each compute party compares its own partition locally, the result stays in the clear at its owner, and the trusted dealer takes no part. The trusted dealer cannot see how the compute parties hold an MPP, so every comparison starts with one round among all parties, CP0 included, to agree on the path. Call comparisons at every party. An MPP that some compute parties hold encrypted and others in the clear goes through MPC as a whole.
 
 ### Layout transformations
 
@@ -142,8 +159,8 @@ Use `mpc.stats` or the `mpc.stats_log()` context manager to profile and log swit
 
 | Scenario | Recommendation |
 |---|---|
-| Comparison operators (`>`, `<`, `==`) | Automatic — always switches |
-| Matrix multiply (ciphertext × plaintext) | Use `AllowMPCSwitch` and let the cost estimator decide |
+| Comparison operators (`>`, `<`) | Automatic — switches, except on an MPP every compute party holds in the clear |
+| Matrix multiply (ciphertext × plaintext) | Use `AllowMPCSwitch` and let the cost estimator decide; run the product at every party, the trusted dealer included |
 | Matrix inverse, square root | Use `via_mpc` explicitly or call the stdlib `inv`/`sqrt` |
 | Custom non-linear function | Call `via_mpc` directly with a lambda |
 | All operations are linear (add, mul, rotate) | Stay in pure MHE — no switching needed |

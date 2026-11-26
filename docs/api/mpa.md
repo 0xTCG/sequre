@@ -20,7 +20,7 @@ _Defined in `stdlib/sequre/types/multiparty_aggregate.codon`_
 ```python
 from sequre.types.multiparty_aggregate import MPA
 
-# From plaintext (hub party gets actual data, others get zeros)
+# From plaintext: every party's argument is its own share, and the MPA's value is their sum (CP0's is ignored)
 mpa = MPA(mpc, my_plaintext_share)
 
 # From encrypted data
@@ -31,7 +31,7 @@ mpa = MPA(mpc, my_ciphertensor)
 
 | Method | Description |
 |---|---|
-| `MPA.enc(mpc, data)` | Create encrypted MPA (plaintext at party 1 only) |
+| `MPA.enc(mpc, data)` | MPA whose value is `data`: CP1's share is `data`, the others' zeros, all in the clear (`.encrypt()` encrypts them) |
 | `MPA.rand(shape, distribution, mpc, plain=False)` | Random MPA, plaintext or encrypted |
 
 ## Properties and state queries
@@ -62,11 +62,11 @@ mpa = MPA(mpc, my_ciphertensor)
 | `a * b` | Multiplication with lazy aggregation |
 | `a @ b` | Matrix multiplication |
 | `a / b` | Division by scalar |
-| `a ** n` | Integer exponentiation |
+| `a ** n` | The value (the sum of the shares) to the power `n`, as `n - 1` products `a * a` give it: an MPA that is only an aggregate gives the aggregate's power (every party alike); one that holds shares gives each compute party's encrypted share times the aggregate's power `n - 1` (encrypted shares; `a` keeps the encryption and aggregate it built, as `a * a` does). `a ** 0` is ones (as `.ones()`), `a ** 1` a copy, a negative `n` raises `ValueError` at every party |
 | `-a` | Negation |
 | `a > b` | Secure greater-than (uses [MPC switching](../user-guide/switching.md) internally) |
 | `a < b` | Secure less-than (uses [MPC switching](../user-guide/switching.md) internally) |
-| `a[i]`, `a[i] = v` | Indexing and slicing |
+| `a[i]`, `a[i] = v` | Indexing and slicing, at every party with the same index; negative ints count from the end (an int out of range raises `IndexError`). A float `v` sets the selected entries of the value: the hub's share takes `v` and the other compute parties' shares 0, in the clear or encrypted (trivial ciphertexts of the public value, in the share's layout), and an aggregate takes `v` in every copy alike; an encryption or aggregate kept beside shares in the clear is dropped (`encrypt()`, `aggregate()` rebuild it). What it writes is copied first, so an MPA sharing storage with this one (a view's parent, the operand of `m + c`) is left as it was: a float setitem on a view does not write through. The compute parties are expected to hold the MPA alike (all in the clear or all encrypted) |
 | `bool(a)` | Boolean conversion |
 | `len(a)` | Length of first dimension |
 
@@ -76,23 +76,23 @@ mpa = MPA(mpc, my_ciphertensor)
 |---|---|
 | `.encrypt()` | Convert plaintext to encrypted component |
 | `.aggregate()` | Aggregate plaintext/encrypted into aggregated component |
-| `.reveal()` | Reveal with secure aggregation to all parties |
-| `.reveal_local()` | Reveal local share only |
+| `.reveal()` | The sum of the shares, to every compute party, and nothing else about them. Shares every compute party holds in the clear are sent under pairwise masks that cancel in the sum (fixed point with twice the MPC fraction bits for floats, 64 by default; ints exact); encrypted ones go through the aggregate |
+| `.reveal_local()` | This compute party's own share: in the clear as it is, or an encrypted share decrypted to it alone (call it at every compute party). An MPA that holds only its aggregate, the same ciphertexts at every party, has no share of its own: revealing it reveals the sum, to every compute party |
 | `.level()` | Minimum encryption level |
 
 ## Distributed operations
 
 | Method | Description |
 |---|---|
-| `.sum(axis)` | Sum along axis |
-| `.dot(axis)` | Dot product along axis |
+| `.sum(axis)` | Sum along axis of each share as held (in the clear, encrypted, or the aggregate) |
+| `.dot(axis)` | `(x * x).sum(axis)` |
 
 ## Shape manipulation
 
 | Method | Description |
 |---|---|
 | `.expand_dims(axis=0)` | Insert dimension (1-D only) |
-| `.pad_with_value(val, size, axis, ...)` | Pad with value |
+| `.pad_with_value(val, size, axis, ...)` | Append `size` columns (axis 1) whose entries add up to `val`: the hub's share and its encryption hold `val` and the other parties' 0; an aggregate takes `val` and stays one |
 | `.erase_element(index)` | Remove element by index |
 | `.filter(mask)` | Boolean mask filtering |
 | `.hstack(other)` | Horizontal concatenation |
@@ -115,6 +115,6 @@ mpa = MPA(mpc, my_ciphertensor)
 | `.to_fp()` | Convert to floating point |
 | `.copy()` | Deep copy all components |
 | `.zeros(shape)` / `.zeros()` | Zero tensor |
-| `.ones(...)` | Ones tensor |
+| `.ones(...)` | An MPA whose value is ones, in the clear: the hub's share ones, the other compute parties' zeros |
 | `.rand(distribution, ...)` | Random values |
 | `.get_matmul_cost(other)` | Estimate matmul cost |

@@ -1,6 +1,103 @@
-from sequre import sequre, sq
-from sequre.constants import SUPPORTED_ACTIVATIONS, RELU_ACTIVATION, LINEAR_ACTIVATION
+""" Neural-net activations and their derivatives, over plaintext and every secure type.
 
+Every activation f comes as f(mpc, x, ...), its derivative df(mpc, x, ...) and f_with_derivative(mpc, x, ...), which
+returns (f(x), f'(x)) from one evaluation where it can: sigmoid' = s (1 - s), tanh' = 1 - t^2, tan' = 1 + t^2,
+cot' = -(1 + c^2), exp' = exp; sin and cos (and sinh and cosh) come from one joint Decor opening on a Sharetensor.
+
+Evaluation:
+- relu, leaky_relu, hardtanh, relu6: comparisons (exact up to the fixed-point encodings; hardtanh and relu6 take both
+  masks from one comparison call on a Sharetensor); linear; asigmoid
+  (x / sqrt(x^2 + 1): Sequre's square root and division).
+- sigmoid, tanh, exp, sin, cos, tan, cot, sinh, cosh: sequre.stdlib.nonlinear, by `method` (compile time):
+  "chebyshev" (default, as for binary LogReg on the field: the degree-`degree` Chebyshev interpolant on the interval;
+  at the default degree 20 it errs by about 1.8e-3 for sigmoid on (-10, 10) and 3.7e-3 for tanh on (-5, 5)) or "decor"
+  (exact up to the fixed-point encodings, about 4e-6 for both, and any x for sin, cos, tan and cot). The neural-net
+  stack keeps Chebyshev by default: Decor's dividing activations (sigmoid, tanh, tan, cot, gelu, silu) use the field's
+  division on the field, the default modulus, where a Decor network trains about 3.2x slower; on the ring a Decor
+  network costs about as much as the default Chebyshev one (15% more in the benchmark's tanh + sigmoid network), and
+  less than a Chebyshev interpolant as accurate as Decor. The nonlinear module itself defaults to Decor (sigmoid and
+  tanh to auto).
+- gelu (tanh form: 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))) and silu (x sigmoid(x)): composed, by `method`.
+- softmax (each row; a 1-D x as one row): nonlinear.softmax (max shift; the exp by `method`, Decor division). Its
+  derivative is a Jacobian, not element-wise: dsoftmax raises, and Sequential uses the fused gradient y_hat - y with
+  the categorical cross-entropy.
+- erf: Chebyshev (no Decor decomposition) under either method; derf = 2 / sqrt(pi) e^(-x^2) takes its exp by `method`.
+
+interval = (0, 0) means the method's default (nonlinear.default_interval); degree = 0 the method's default. Decor's
+sin, cos, tan and cot are periodic (any x): interval and clip do not apply to them and are ignored. clip clips the input
+to the interval first (default False, as in sequre.stdlib.nonlinear: the documented domain, no implicit clipping); Dense layers clip by
+default. A clipped activation is flat beyond its interval, so f_with_derivative and df return 0 there as the
+derivative on a Sharetensor or an ndarray (the training types: the mask comes from the clip's own comparison, one
+product more; sin and cos, and sinh and cosh, are clipped once for both; gelu and silu mask the term of their inner
+tanh or sigmoid, so their slope there is the clipped function's: 0.5 (1 + t) and s); the other types return f' at the
+clipped point (erf's derivative beyond (-4, 4) is below 1.3e-7), and gelu and silu keep their inner term there: gelu's
+0.5 x (1 - t^2) u' grows like |x|^3 beyond the inner interval, so train clipped gelu or silu layers on Sharetensors. A
+public Sharetensor (after publish) is clipped as a sharing held by CP1 (secret results). Constructions multiply 0/1 comparison masks by floats before adding float constants (M-MPC-09: a float added to
+integer shares is not scaled). Inputs are not modified.
+"""
+
+import secure_operator
+
+from sequre import sequre, sq
+from sequre.constants import (
+    SUPPORTED_ACTIVATIONS, SUPPORTED_ML_METHODS, RELU_ACTIVATION, LINEAR_ACTIVATION, ASIGMOID_ACTIVATION,
+    SIGMOID_ACTIVATION, TANH_ACTIVATION, EXP_ACTIVATION, SIN_ACTIVATION, COS_ACTIVATION, TAN_ACTIVATION,
+    COT_ACTIVATION, SINH_ACTIVATION, COSH_ACTIVATION, LEAKY_RELU_ACTIVATION, HARDTANH_ACTIVATION, RELU6_ACTIVATION,
+    GELU_ACTIVATION, SILU_ACTIVATION, SOFTMAX_ACTIVATION, ERF_ACTIVATION, LEAKY_RELU_SLOPE, GELU_ALPHA, GELU_BETA,
+    METHOD_DECOR, METHOD_CHEBYSHEV, DECOR_TOLERANCE)
+from sequre.types.sharetensor import Sharetensor
+from sequre.stdlib.numpy.ndarray import ndarray
+from sequre.stdlib.nonlinear import (
+    sigmoid as nl_sigmoid, tanh as nl_tanh, exp as nl_exp, sin as nl_sin, cos as nl_cos, tan as nl_tan,
+    cot as nl_cot, sinh as nl_sinh, cosh as nl_cosh, erf as nl_erf, softmax as nl_softmax,
+    default_interval, _plan as nl_plan)
+from sequre.decor.core import (
+    via_decor_sincos, via_decor_sinhcosh, _clip as decor_clip, _clip_keep as decor_clip_keep,
+    _times_mask as decor_times_mask, _admit as decor_admit)
+
+
+TWO_OVER_SQRT_PI = 1.1283791670955126
+# derf's exp runs on -x^2: (-16, 0] covers |x| <= 4 (erf's default interval); clipped below, e^-16 = 1.1e-7
+DERF_EXP_INTERVAL = (-16.0, 0.0)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Element-wise arithmetic shared by the derivatives (any type)
+# ---------------------------------------------------------------------------------------------------------------------
+
+@sequre
+def _logistic_slope(mpc, s):
+    return s * (1 - s)
+
+
+@sequre
+def _one_minus_square(mpc, t):
+    return 1 - t * t
+
+
+@sequre
+def _one_plus_square(mpc, t):
+    return 1 + t * t
+
+
+@sequre
+def _minus_one_plus_square(mpc, t):
+    return -(1 + t * t)
+
+
+@sequre
+def _negative(mpc, t):
+    return -t
+
+
+@sequre
+def _times(mpc, a, b):
+    return a * b
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Linear, relu, asigmoid (unchanged)
+# ---------------------------------------------------------------------------------------------------------------------
 
 @sequre
 def linear(mpc, x):
@@ -49,21 +146,685 @@ def asigmoid_with_derivative(mpc, x):
     return x * denom, denom ** 3
 
 
-def activate(mpc, x, activation: str):
+# ---------------------------------------------------------------------------------------------------------------------
+# Piecewise linear: comparisons
+# ---------------------------------------------------------------------------------------------------------------------
+
+@sequre
+def leaky_relu(mpc, x, slope: float = LEAKY_RELU_SLOPE):
+    """ x for x > 0, slope x otherwise: one comparison. """
+    is_pos = (x > 0).astype(type(x._internal_type))
+    return x * is_pos * (1 - slope) + x * slope
+
+
+@sequre
+def dleaky_relu(mpc, x, slope: float = LEAKY_RELU_SLOPE):
+    return (x > 0).astype(type(x._internal_type)) * (1 - slope) + slope
+
+
+@sequre
+def leaky_relu_with_derivative(mpc, x, slope: float = LEAKY_RELU_SLOPE):
+    is_pos = (x > 0).astype(type(x._internal_type))
+    return x * is_pos * (1 - slope) + x * slope, is_pos * (1 - slope) + slope
+
+
+@sequre
+def _band_generic(mpc, x, lo: float, hi: float):
+    above = (x > hi).astype(type(x._internal_type))
+    below = (x > lo).astype(type(x._internal_type))
+    return above, below
+
+
+def _band_sharetensor(mpc, x, lo: float, hi: float):
+    # Both masks from one comparison call: (x - hi, x - lo) concatenated, compared with 0, split
+    modulus = x.modulus
+    xx = x if x.is_fp() else x.to_fp()
+    d_hi = secure_operator.sub(mpc, xx, hi)
+    d_lo = secure_operator.sub(mpc, xx, lo)
+    if isinstance(xx.share, list[list]):
+        a, b = d_hi.share.flatten(), d_lo.share.flatten()
+    elif isinstance(xx.share, list):
+        a, b = d_hi.share.copy(), d_lo.share.copy()
+    else:
+        a, b = [d_hi.share], [d_lo.share]
+    n = len(a)
+    both = a.copy()
+    both.extend(b)
+    st = Sharetensor(both, modulus)
+    st.fp = True
+    masks = secure_operator.gt(mpc, st, 0).share
+    if isinstance(xx.share, list[list]):
+        return Sharetensor(masks[:n].reshape(xx.shape), modulus), Sharetensor(masks[n:].reshape(xx.shape), modulus)
+    elif isinstance(xx.share, list):
+        return Sharetensor(masks[:n], modulus), Sharetensor(masks[n:], modulus)
+    else:
+        return Sharetensor(masks[0], modulus), Sharetensor(masks[1], modulus)
+
+
+def _band(mpc, x, lo: float, hi: float):
+    # (above, below) = ([x > hi], [x > lo]), 0/1 integers: one comparison call on a Sharetensor, two otherwise
+    if isinstance(x, Sharetensor):
+        return _band_sharetensor(mpc, x, lo, hi)
+    else:
+        return _band_generic(mpc, x, lo, hi)
+
+
+@sequre
+def _hardtanh_value(mpc, x, above, below, lo: float, hi: float):
+    # In the band (below = 1, above = 0) x passes; above it hi, below it lo
+    return x * (below - above) + above * hi + (1 - below) * lo
+
+
+def hardtanh(mpc, x, lo: float = -1.0, hi: float = 1.0):
+    """ x clamped to [lo, hi]: two comparisons. """
+    above, below = _band(mpc, x, lo, hi)
+    return _hardtanh_value(mpc, x, above, below, lo, hi)
+
+
+def dhardtanh(mpc, x, lo: float = -1.0, hi: float = 1.0):
+    above, below = _band(mpc, x, lo, hi)
+    return _band_mask(mpc, above, below)
+
+
+def hardtanh_with_derivative(mpc, x, lo: float = -1.0, hi: float = 1.0):
+    above, below = _band(mpc, x, lo, hi)
+    return _hardtanh_value(mpc, x, above, below, lo, hi), _band_mask(mpc, above, below)
+
+
+@sequre
+def _band_mask(mpc, above, below):
+    return below - above
+
+
+def relu6(mpc, x):
+    """ x clamped to [0, 6]. """
+    return hardtanh(mpc, x, 0.0, 6.0)
+
+
+def drelu6(mpc, x):
+    return dhardtanh(mpc, x, 0.0, 6.0)
+
+
+def relu6_with_derivative(mpc, x):
+    return hardtanh_with_derivative(mpc, x, 0.0, 6.0)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Clipped activations' derivatives (Sharetensor and ndarray: the training types)
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _clip_band(mpc, x, func: Static[str], method: Static[str], interval, degree: int):
+    # The training forward of a clipped activation: the nonlinear module's public checks first (before any round, as
+    # clip=True makes them), then x clipped to the interval once, with its in-band mask (1 inside, 0 beyond either
+    # end): on a Sharetensor from the clip's own comparison (the mask as 0/1 integer shares), on an ndarray in the clear
+    nl_plan(func, method, interval, degree, True, DECOR_TOLERANCE)
+    a, b = float(interval[0]), float(interval[1])
+    lo, hi = default_interval(func, method) if a == 0.0 and b == 0.0 else (a, b)
+    if isinstance(x, Sharetensor):
+        return decor_clip_keep(mpc, x if x.is_fp() else x.to_fp(), lo, hi)
+    else:
+        xf = x.astype(float)
+        return (xf._propagate_call(lambda v: min(max(v, lo), hi)),
+                xf._propagate_call(lambda v: 1.0 if lo <= v and v <= hi else 0.0))
+
+
+def _in_band(mpc, d, band):
+    # A clipped activation's derivative is 0 beyond the interval (the clipped function is flat there): d times the
+    # in-band mask (one product, no truncation, on a Sharetensor)
+    if isinstance(d, Sharetensor):
+        return decor_times_mask(mpc, d, band)
+    else:
+        return d * band
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Through sequre.stdlib.nonlinear
+# ---------------------------------------------------------------------------------------------------------------------
+
+def sigmoid(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    """ 1 / (1 + e^-x). """
+    return nl_sigmoid(mpc, x, method=method, interval=interval, degree=degree, clip=clip)
+
+
+def dsigmoid(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+        if clip:
+            return sigmoid_with_derivative(mpc, x, method, interval, degree, clip)[1]
+    return _logistic_slope(mpc, sigmoid(mpc, x, method, interval, degree, clip))
+
+
+def sigmoid_with_derivative(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0,
+                            clip: bool = False):
+    if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+        if clip:
+            xc, band = _clip_band(mpc, x, "sigmoid", method, interval, degree)
+            s = sigmoid(mpc, xc, method, interval, degree, False)
+            return s, _in_band(mpc, _logistic_slope(mpc, s), band)
+    s = sigmoid(mpc, x, method, interval, degree, clip)
+    return s, _logistic_slope(mpc, s)
+
+
+def tanh(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    """ tanh(x). """
+    return nl_tanh(mpc, x, method=method, interval=interval, degree=degree, clip=clip)
+
+
+def dtanh(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+        if clip:
+            return tanh_with_derivative(mpc, x, method, interval, degree, clip)[1]
+    return _one_minus_square(mpc, tanh(mpc, x, method, interval, degree, clip))
+
+
+def tanh_with_derivative(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0,
+                         clip: bool = False):
+    if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+        if clip:
+            xc, band = _clip_band(mpc, x, "tanh", method, interval, degree)
+            t = tanh(mpc, xc, method, interval, degree, False)
+            return t, _in_band(mpc, _one_minus_square(mpc, t), band)
+    t = tanh(mpc, x, method, interval, degree, clip)
+    return t, _one_minus_square(mpc, t)
+
+
+def exp(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    """ e^x (its own derivative). """
+    return nl_exp(mpc, x, method=method, interval=interval, degree=degree, clip=clip)
+
+
+def dexp(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+        if clip:
+            return exp_with_derivative(mpc, x, method, interval, degree, clip)[1]
+    return exp(mpc, x, method, interval, degree, clip)
+
+
+def exp_with_derivative(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0,
+                        clip: bool = False):
+    if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+        if clip:
+            xc, band = _clip_band(mpc, x, "exp", method, interval, degree)
+            e = exp(mpc, xc, method, interval, degree, False)
+            return e, _in_band(mpc, e.copy(), band)
+    e = exp(mpc, x, method, interval, degree, clip)
+    return e, e.copy()
+
+
+def sin(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    """ sin(x), radians (Decor: any x; interval and clip ignored). """
+    if method == METHOD_DECOR:
+        return nl_sin(mpc, x, method=method)
+    else:
+        return nl_sin(mpc, x, method=method, interval=interval, degree=degree, clip=clip)
+
+
+def cos(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    """ cos(x), radians (Decor: any x; interval and clip ignored). """
+    if method == METHOD_DECOR:
+        return nl_cos(mpc, x, method=method)
+    else:
+        return nl_cos(mpc, x, method=method, interval=interval, degree=degree, clip=clip)
+
+
+def _sin_cos(mpc, x, method: Static[str], interval, degree: int, clip: bool):
+    # (sin x, cos x): one joint Decor opening on a Sharetensor, two evaluations otherwise
+    if method == METHOD_DECOR and isinstance(x, Sharetensor):
+        return via_decor_sincos(mpc, x)
+    else:
+        return sin(mpc, x, method, interval, degree, clip), cos(mpc, x, method, interval, degree, clip)
+
+
+def dsin(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    # Clipped, the polynomial methods (Decor's sin takes any x): cos at the clipped point only, 0 beyond the interval
+    if method != METHOD_DECOR:
+        if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+            if clip:
+                nl_plan("cos", method, interval, degree, True, DECOR_TOLERANCE)
+                xc, band = _clip_band(mpc, x, "sin", method, interval, degree)
+                return _in_band(mpc, cos(mpc, xc, method, interval, degree, False), band)
+    return cos(mpc, x, method, interval, degree, clip)
+
+
+def dcos(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    # Clipped, the polynomial methods: -sin at the clipped point only, 0 beyond the interval
+    if method != METHOD_DECOR:
+        if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+            if clip:
+                nl_plan("sin", method, interval, degree, True, DECOR_TOLERANCE)
+                xc, band = _clip_band(mpc, x, "cos", method, interval, degree)
+                return _in_band(mpc, _negative(mpc, sin(mpc, xc, method, interval, degree, False)), band)
+    return _negative(mpc, sin(mpc, x, method, interval, degree, clip))
+
+
+def sin_with_derivative(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0,
+                        clip: bool = False):
+    # Clipped (the polynomial methods; Decor's sin takes any x): clipped once for both, the derivative masked
+    if method != METHOD_DECOR:
+        if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+            if clip:
+                xc, band = _clip_band(mpc, x, "sin", method, interval, degree)
+                s, c = _sin_cos(mpc, xc, method, interval, degree, False)
+                return s, _in_band(mpc, c, band)
+    return _sin_cos(mpc, x, method, interval, degree, clip)
+
+
+def cos_with_derivative(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0,
+                        clip: bool = False):
+    if method != METHOD_DECOR:
+        if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+            if clip:
+                xc, band = _clip_band(mpc, x, "cos", method, interval, degree)
+                s, c = _sin_cos(mpc, xc, method, interval, degree, False)
+                return c, _in_band(mpc, _negative(mpc, s), band)
+    s, c = _sin_cos(mpc, x, method, interval, degree, clip)
+    return c, _negative(mpc, s)
+
+
+def tan(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    """ tan(x), radians, away from the poles (Decor: interval and clip ignored). """
+    if method == METHOD_DECOR:
+        return nl_tan(mpc, x, method=method)
+    else:
+        return nl_tan(mpc, x, method=method, interval=interval, degree=degree, clip=clip)
+
+
+def dtan(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+        if clip:
+            return tan_with_derivative(mpc, x, method, interval, degree, clip)[1]
+    return _one_plus_square(mpc, tan(mpc, x, method, interval, degree, clip))
+
+
+def tan_with_derivative(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0,
+                        clip: bool = False):
+    if method != METHOD_DECOR:
+        if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+            if clip:
+                xc, band = _clip_band(mpc, x, "tan", method, interval, degree)
+                t = tan(mpc, xc, method, interval, degree, False)
+                return t, _in_band(mpc, _one_plus_square(mpc, t), band)
+    t = tan(mpc, x, method, interval, degree, clip)
+    return t, _one_plus_square(mpc, t)
+
+
+def cot(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    """ cot(x), radians, away from the poles (Decor: interval and clip ignored). """
+    if method == METHOD_DECOR:
+        return nl_cot(mpc, x, method=method)
+    else:
+        return nl_cot(mpc, x, method=method, interval=interval, degree=degree, clip=clip)
+
+
+def dcot(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+        if clip:
+            return cot_with_derivative(mpc, x, method, interval, degree, clip)[1]
+    return _minus_one_plus_square(mpc, cot(mpc, x, method, interval, degree, clip))
+
+
+def cot_with_derivative(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0,
+                        clip: bool = False):
+    if method != METHOD_DECOR:
+        if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+            if clip:
+                xc, band = _clip_band(mpc, x, "cot", method, interval, degree)
+                c = cot(mpc, xc, method, interval, degree, False)
+                return c, _in_band(mpc, _minus_one_plus_square(mpc, c), band)
+    c = cot(mpc, x, method, interval, degree, clip)
+    return c, _minus_one_plus_square(mpc, c)
+
+
+def sinh(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    """ sinh(x). """
+    return nl_sinh(mpc, x, method=method, interval=interval, degree=degree, clip=clip)
+
+
+def cosh(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    """ cosh(x). """
+    return nl_cosh(mpc, x, method=method, interval=interval, degree=degree, clip=clip)
+
+
+def _decor_sinhcosh_interval(interval, degree: int) -> Tuple[float, float]:
+    # The public checks of Decor's joint sinh/cosh, before any round (as sequre.stdlib.nonlinear makes them)
+    if degree != 0:
+        raise ValueError("activations sinh/cosh: Decor takes no degree")
+    a, b = interval[0], interval[1]
+    iv = default_interval("sinh", METHOD_DECOR) if a == 0.0 and b == 0.0 else (float(a), float(b))
+    if not (iv[1] > iv[0]):
+        raise ValueError(f"activations sinh/cosh: the interval {iv} must have a < b")
+    decor_admit("sinh", iv, List[float](), DECOR_TOLERANCE)
+    decor_admit("cosh", iv, List[float](), DECOR_TOLERANCE)
+    return iv
+
+
+def _sinh_cosh(mpc, x, method: Static[str], interval, degree: int, clip: bool):
+    # (sinh x, cosh x): one joint Decor opening on a Sharetensor, two evaluations otherwise
+    if method == METHOD_DECOR and isinstance(x, Sharetensor):
+        iv = _decor_sinhcosh_interval(interval, degree)
+        xx = x if x.is_fp() else x.to_fp()
+        if clip:
+            xx = decor_clip(mpc, xx, iv[0], iv[1])
+        return via_decor_sinhcosh(mpc, xx, iv)
+    else:
+        return sinh(mpc, x, method, interval, degree, clip), cosh(mpc, x, method, interval, degree, clip)
+
+
+def _sinh_cosh_band(mpc, x, method: Static[str], interval, degree: int):
+    # (sinh, cosh, in-band mask) of x clipped to the interval once, for a Sharetensor or an ndarray
+    if method == METHOD_DECOR and isinstance(x, Sharetensor):
+        iv = _decor_sinhcosh_interval(interval, degree)
+        xc, band = decor_clip_keep(mpc, x if x.is_fp() else x.to_fp(), iv[0], iv[1])
+        h, c = via_decor_sinhcosh(mpc, xc, iv)
+        return h, c, band
+    nl_plan("cosh", method, interval, degree, True, DECOR_TOLERANCE)
+    xc, band = _clip_band(mpc, x, "sinh", method, interval, degree)
+    return sinh(mpc, xc, method, interval, degree, False), cosh(mpc, xc, method, interval, degree, False), band
+
+
+def dsinh(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+        if clip:
+            if method == METHOD_DECOR:
+                # Decor: one joint opening gives both
+                return sinh_with_derivative(mpc, x, method, interval, degree, clip)[1]
+            # the polynomial methods: cosh at the clipped point only, 0 beyond the interval
+            nl_plan("cosh", method, interval, degree, True, DECOR_TOLERANCE)
+            xc, band = _clip_band(mpc, x, "sinh", method, interval, degree)
+            return _in_band(mpc, cosh(mpc, xc, method, interval, degree, False), band)
+    return cosh(mpc, x, method, interval, degree, clip)
+
+
+def dcosh(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+        if clip:
+            if method == METHOD_DECOR:
+                return cosh_with_derivative(mpc, x, method, interval, degree, clip)[1]
+            nl_plan("sinh", method, interval, degree, True, DECOR_TOLERANCE)
+            xc, band = _clip_band(mpc, x, "cosh", method, interval, degree)
+            return _in_band(mpc, sinh(mpc, xc, method, interval, degree, False), band)
+    return sinh(mpc, x, method, interval, degree, clip)
+
+
+def sinh_with_derivative(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0,
+                         clip: bool = False):
+    if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+        if clip:
+            h, c, band = _sinh_cosh_band(mpc, x, method, interval, degree)
+            return h, _in_band(mpc, c, band)
+    return _sinh_cosh(mpc, x, method, interval, degree, clip)
+
+
+def cosh_with_derivative(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0,
+                         clip: bool = False):
+    if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+        if clip:
+            h, c, band = _sinh_cosh_band(mpc, x, method, interval, degree)
+            return c, _in_band(mpc, h, band)
+    h, c = _sinh_cosh(mpc, x, method, interval, degree, clip)
+    return c, h
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Composites
+# ---------------------------------------------------------------------------------------------------------------------
+
+@sequre
+def _gelu_inner(mpc, x):
+    # sqrt(2/pi) (x + 0.044715 x^3) and its derivative sqrt(2/pi) (1 + 3 * 0.044715 x^2)
+    x2 = x * x
+    return (x + x2 * x * GELU_BETA) * GELU_ALPHA, (x2 * (3 * GELU_BETA) + 1) * GELU_ALPHA
+
+
+@sequre
+def _gelu_value(mpc, x, t):
+    return x * (t + 1) * 0.5
+
+
+@sequre
+def _gelu_slope(mpc, x, t, dinner):
+    # 0.5 (1 + t) + 0.5 x (1 - t^2) u'
+    return (t + 1) * 0.5 + x * (1 - t * t) * dinner * 0.5
+
+
+def gelu(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    """
+    0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3))) (the tanh form). interval and clip apply to the tanh's argument: with
+    the default tanh interval, (-5, 5) at F = 32 for Decor and Chebyshev ((-8, 8) for Decor at F = 64), x must lie
+    within about +-3.8 (+-4.8); beyond it the unclipped tanh wraps (Decor) or extrapolates (Chebyshev). clip=True
+    saturates the tanh there instead: gelu is then off by 0.5 |x| (1 - t(5)), 4.5e-5 |x| with Decor (1.1e-7 |x| at
+    F = 64) and 2.2e-4 |x| with the default degree-20 Chebyshev interpolant (t(5) = 0.99956); with the derivative
+    (Sharetensor, ndarray) the inner term is masked there, so the slope is the clipped function's, 0.5 (1 + t).
+    """
+    inner, _ = _gelu_inner(mpc, x)
+    return _gelu_value(mpc, x, tanh(mpc, inner, method, interval, degree, clip))
+
+
+def gelu_with_derivative(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0,
+                         clip: bool = False):
+    inner, dinner = _gelu_inner(mpc, x)
+    if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+        if clip:
+            # The tanh's argument clipped once, with its band: beyond it t is fixed, so the term with u' is masked
+            uc, band = _clip_band(mpc, inner, "tanh", method, interval, degree)
+            t = tanh(mpc, uc, method, interval, degree, False)
+            return _gelu_value(mpc, x, t), _gelu_slope(mpc, x, t, _in_band(mpc, dinner, band))
+    t = tanh(mpc, inner, method, interval, degree, clip)
+    return _gelu_value(mpc, x, t), _gelu_slope(mpc, x, t, dinner)
+
+
+def dgelu(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    return gelu_with_derivative(mpc, x, method, interval, degree, clip)[1]
+
+
+@sequre
+def _silu_slope(mpc, x, s):
+    # s (1 + x (1 - s))
+    return s * (x * (1 - s) + 1)
+
+
+def silu(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    """
+    x sigmoid(x) (swish). interval and clip apply to the sigmoid, so x must lie in the sigmoid's interval ((-10, 10) at
+    F = 32 by default); clip=True saturates the sigmoid beyond it (with the derivative, on Sharetensor and ndarray, the
+    term x s' is masked there: the slope is the clipped function's, s).
+    """
+    return _times(mpc, x, sigmoid(mpc, x, method, interval, degree, clip))
+
+
+def _fp_operand(x):
+    # x as a fixed-point operand (Sharetensors of integers are scaled; other types as they are)
+    if isinstance(x, Sharetensor):
+        return x if x.is_fp() else x.to_fp()
+    else:
+        return x
+
+
+def silu_with_derivative(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0,
+                         clip: bool = False):
+    if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+        if clip:
+            # The sigmoid's argument clipped once, with its band: beyond it s is fixed, so the term x s' is masked
+            xc, band = _clip_band(mpc, x, "sigmoid", method, interval, degree)
+            s = sigmoid(mpc, xc, method, interval, degree, False)
+            return _times(mpc, x, s), _silu_slope(mpc, _in_band(mpc, _fp_operand(x), band), s)
+    s = sigmoid(mpc, x, method, interval, degree, clip)
+    return _times(mpc, x, s), _silu_slope(mpc, x, s)
+
+
+def dsilu(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+        if clip:
+            return silu_with_derivative(mpc, x, method, interval, degree, clip)[1]
+    return _silu_slope(mpc, x, sigmoid(mpc, x, method, interval, degree, clip))
+
+
+def softmax(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    """
+    The softmax of each row (a 1-D x: of the whole vector) by nonlinear.softmax: max shift, the exp on (-16, 0] by
+    `method` (Chebyshev degree `degree`), Decor division. interval and clip do not apply (the width is its interval).
+    """
+    return nl_softmax(mpc, x, method=method, degree=degree)
+
+
+def dsoftmax(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    raise ValueError("softmax has no element-wise derivative (its Jacobian is not diagonal): pair it with the "
+                     "categorical cross-entropy, whose fused gradient is y_hat - y")
+    return x
+
+
+def erf(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    """ The error function: Chebyshev (no Decor decomposition) whatever the method; interval and clip as in nonlinear. """
+    return nl_erf(mpc, x, method=METHOD_CHEBYSHEV, interval=interval, degree=degree, clip=clip)
+
+
+@sequre
+def _minus_square(mpc, x):
+    return -(x * x)
+
+
+def derf(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False):
+    """
+    2 / sqrt(pi) e^(-x^2): the exp by `method` on DERF_EXP_INTERVAL (clipped below). With clip, on a Sharetensor or an
+    ndarray, 0 beyond erf's interval (the clipped erf is flat there), as erf_with_derivative gives it.
+    """
+    if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+        if clip:
+            xc, band = _clip_band(mpc, x, "erf", METHOD_CHEBYSHEV, interval, degree)
+            return _in_band(mpc, _derf_value(mpc, xc, method), band)
+    return _derf_value(mpc, x, method)
+
+
+def _derf_value(mpc, x, method: Static[str]):
+    # 2 / sqrt(pi) e^(-x^2), the exp by `method` on DERF_EXP_INTERVAL (clipped below)
+    e = nl_exp(mpc, _minus_square(mpc, x), method=method, interval=DERF_EXP_INTERVAL, clip=True)
+    return _times(mpc, e, TWO_OVER_SQRT_PI)
+
+
+def erf_with_derivative(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0,
+                        clip: bool = False):
+    if isinstance(x, Sharetensor) or isinstance(x, ndarray):
+        if clip:
+            xc, band = _clip_band(mpc, x, "erf", METHOD_CHEBYSHEV, interval, degree)
+            return erf(mpc, xc, method, interval, degree, False), _in_band(mpc, derf(mpc, xc, method, interval, degree, False), band)
+    return erf(mpc, x, method, interval, degree, clip), derf(mpc, x, method, interval, degree, clip)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Dispatch on runtime names (layers store the activation and the method as strings)
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _check(activation: str, method: str):
     assert activation in SUPPORTED_ACTIVATIONS, f"Neural net: activation {activation} is not supported"
-    
+    assert method in SUPPORTED_ML_METHODS, f"Neural net: method {method} is not supported ({SUPPORTED_ML_METHODS})"
+
+
+def _activate(mpc, x, activation: str, method: Static[str], interval, degree: int, clip: bool):
     if activation == RELU_ACTIVATION:
         return relu(mpc, x)
-    
-    if activation == LINEAR_ACTIVATION:
+    elif activation == LINEAR_ACTIVATION:
         return linear(mpc, x)
+    elif activation == ASIGMOID_ACTIVATION:
+        return asigmoid(mpc, x)
+    elif activation == SIGMOID_ACTIVATION:
+        return sigmoid(mpc, x, method, interval, degree, clip)
+    elif activation == TANH_ACTIVATION:
+        return tanh(mpc, x, method, interval, degree, clip)
+    elif activation == EXP_ACTIVATION:
+        return exp(mpc, x, method, interval, degree, clip)
+    elif activation == SIN_ACTIVATION:
+        return sin(mpc, x, method, interval, degree, clip)
+    elif activation == COS_ACTIVATION:
+        return cos(mpc, x, method, interval, degree, clip)
+    elif activation == TAN_ACTIVATION:
+        return tan(mpc, x, method, interval, degree, clip)
+    elif activation == COT_ACTIVATION:
+        return cot(mpc, x, method, interval, degree, clip)
+    elif activation == SINH_ACTIVATION:
+        return sinh(mpc, x, method, interval, degree, clip)
+    elif activation == COSH_ACTIVATION:
+        return cosh(mpc, x, method, interval, degree, clip)
+    elif activation == LEAKY_RELU_ACTIVATION:
+        return leaky_relu(mpc, x)
+    elif activation == HARDTANH_ACTIVATION:
+        return hardtanh(mpc, x)
+    elif activation == RELU6_ACTIVATION:
+        return relu6(mpc, x)
+    elif activation == GELU_ACTIVATION:
+        return gelu(mpc, x, method, interval, degree, clip)
+    elif activation == SILU_ACTIVATION:
+        return silu(mpc, x, method, interval, degree, clip)
+    elif activation == SOFTMAX_ACTIVATION:
+        return softmax(mpc, x, method, interval, degree, clip)
+    else:
+        return erf(mpc, x, method, interval, degree, clip)
 
 
-def dactivate(mpc, x, activation: str):
-    assert activation in SUPPORTED_ACTIVATIONS, f"Neural net: activation {activation} is not supported"
-    
+def _activate_with_derivative(mpc, x, activation: str, method: Static[str], interval, degree: int, clip: bool):
     if activation == RELU_ACTIVATION:
-        return drelu(mpc, x)
-    
-    if activation == LINEAR_ACTIVATION:
-        return dlinear(mpc, x)
+        return relu_with_derivative(mpc, x)
+    elif activation == LINEAR_ACTIVATION:
+        return linear_with_derivative(mpc, x)
+    elif activation == ASIGMOID_ACTIVATION:
+        return asigmoid_with_derivative(mpc, x)
+    elif activation == SIGMOID_ACTIVATION:
+        return sigmoid_with_derivative(mpc, x, method, interval, degree, clip)
+    elif activation == TANH_ACTIVATION:
+        return tanh_with_derivative(mpc, x, method, interval, degree, clip)
+    elif activation == EXP_ACTIVATION:
+        return exp_with_derivative(mpc, x, method, interval, degree, clip)
+    elif activation == SIN_ACTIVATION:
+        return sin_with_derivative(mpc, x, method, interval, degree, clip)
+    elif activation == COS_ACTIVATION:
+        return cos_with_derivative(mpc, x, method, interval, degree, clip)
+    elif activation == TAN_ACTIVATION:
+        return tan_with_derivative(mpc, x, method, interval, degree, clip)
+    elif activation == COT_ACTIVATION:
+        return cot_with_derivative(mpc, x, method, interval, degree, clip)
+    elif activation == SINH_ACTIVATION:
+        return sinh_with_derivative(mpc, x, method, interval, degree, clip)
+    elif activation == COSH_ACTIVATION:
+        return cosh_with_derivative(mpc, x, method, interval, degree, clip)
+    elif activation == LEAKY_RELU_ACTIVATION:
+        return leaky_relu_with_derivative(mpc, x)
+    elif activation == HARDTANH_ACTIVATION:
+        return hardtanh_with_derivative(mpc, x)
+    elif activation == RELU6_ACTIVATION:
+        return relu6_with_derivative(mpc, x)
+    elif activation == GELU_ACTIVATION:
+        return gelu_with_derivative(mpc, x, method, interval, degree, clip)
+    elif activation == SILU_ACTIVATION:
+        return silu_with_derivative(mpc, x, method, interval, degree, clip)
+    elif activation == SOFTMAX_ACTIVATION:
+        # No element-wise derivative (its Jacobian is not diagonal); a fused softmax output keeps none (skip_derivative)
+        raise ValueError("softmax has no element-wise derivative: pair it with the categorical cross-entropy")
+        return x, x
+    else:
+        return erf_with_derivative(mpc, x, method, interval, degree, clip)
+
+
+def activate(mpc, x, activation: str, method: str = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0,
+             clip: bool = False):
+    """ activation(x) for a runtime activation name and method ("decor" or "chebyshev"). """
+    _check(activation, method)
+    if method == METHOD_DECOR:
+        return _activate(mpc, x, activation, METHOD_DECOR, interval, degree, clip)
+    else:
+        return _activate(mpc, x, activation, METHOD_CHEBYSHEV, interval, degree, clip)
+
+
+def activate_with_derivative(mpc, x, activation: str, method: str = METHOD_CHEBYSHEV, interval = (0.0, 0.0),
+                             degree: int = 0, clip: bool = False):
+    """ (activation(x), activation'(x)) from one evaluation where possible (softmax raises: no element-wise derivative). """
+    _check(activation, method)
+    if method == METHOD_DECOR:
+        return _activate_with_derivative(mpc, x, activation, METHOD_DECOR, interval, degree, clip)
+    else:
+        return _activate_with_derivative(mpc, x, activation, METHOD_CHEBYSHEV, interval, degree, clip)
+
+
+def dactivate(mpc, x, activation: str, method: str = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0,
+              clip: bool = False):
+    """ activation'(x) (softmax raises: no element-wise derivative). """
+    if activation == SOFTMAX_ACTIVATION:
+        raise ValueError("softmax has no element-wise derivative: pair it with the categorical cross-entropy")
+    return activate_with_derivative(mpc, x, activation, method, interval, degree, clip)[1]

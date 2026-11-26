@@ -1,0 +1,383 @@
+""" Plaintext helpers of the Decor protocols.
+
+The dealer evaluates the target function's h on its mask and the parties evaluate g at the opened point, both in the
+clear, so Decor needs element-wise math over the same containers the protocols carry (scalars, lists, matrices). Also
+here: coefficient generation in Codon (trapezoidal Fourier integrals, Chebyshev to monomial), exact derivatives for
+Taylor polynomials, and fixed-point conversions relative to an interval or a period.
+"""
+
+import math
+
+from sequre.attributes import sequre
+from sequre.constants import FBITS_MASK
+from sequre.types.utils import double_to_fp, fp_to_double
+
+
+def recursive_reduce(func, iterable):
+    """ func applied element-wise over a scalar, a list or a list of lists. """
+    if isinstance(iterable, ByVal):
+        return func(iterable)
+
+    if isinstance(iterable, list):
+        return [recursive_reduce(func, v) for v in iterable]
+
+    compile_error("recursive_reduce: expected a scalar or a (nested) list")
+
+
+def _sigmoid(x: float) -> float:
+    # 1 / (1 + e^-x) without overflow for large |x|
+    if x >= 0.0:
+        return 1.0 / (1.0 + math.exp(-x))
+    e = math.exp(x)
+    return e / (1.0 + e)
+
+
+def sin(value):
+    return recursive_reduce(math.sin, value)
+
+
+def cos(value):
+    return recursive_reduce(math.cos, value)
+
+
+def tan(value):
+    return recursive_reduce(math.tan, value)
+
+
+def cot(value):
+    return recursive_reduce(lambda x: 1.0 / math.tan(x), value)
+
+
+def sinh(value):
+    return recursive_reduce(math.sinh, value)
+
+
+def cosh(value):
+    return recursive_reduce(math.cosh, value)
+
+
+def tanh(value):
+    return recursive_reduce(math.tanh, value)
+
+
+def sech(value):
+    return recursive_reduce(lambda x: 1.0 / math.cosh(x), value)
+
+
+def exp(value):
+    return recursive_reduce(math.exp, value)
+
+
+def sigmoid(value):
+    return recursive_reduce(_sigmoid, value)
+
+
+def log(value):
+    return recursive_reduce(math.log, value)
+
+
+def sqrt(value):
+    return recursive_reduce(math.sqrt, value)
+
+
+def mul_inv(value):
+    return recursive_reduce(lambda x: 1.0 / x, value)
+
+
+def erf(value):
+    """ Gauss error function. It has no addition theorem, so no Decor decomposition: Chebyshev or Taylor only. """
+    return recursive_reduce(math.erf, value)
+
+
+def sgn(value):
+    return recursive_reduce(lambda x: 1.0 if x > 0.0 else (-1.0 if x < 0.0 else 0.0), value)
+
+
+def floor(value):
+    return recursive_reduce(lambda x: float(math.floor(x)), value)
+
+
+def ceil(value):
+    return recursive_reduce(lambda x: float(math.ceil(x)), value)
+
+
+def square_wave(value, period: float = math.pi):
+    return recursive_reduce(lambda x: 1.0 if math.cos(x * (2.0 * math.pi / period)) > 0.0 else (
+        -1.0 if math.cos(x * (2.0 * math.pi / period)) < 0.0 else 0.0), value)
+
+
+def sawtooth_wave(value, period: float = math.pi):
+    return recursive_reduce(lambda x: (x / period) - math.floor((x / period) + 0.5), value)
+
+
+def softmax(value):
+    """ Softmax over the last axis (each row of a matrix); 1.0 for a scalar. Shifted by the maximum for stability. """
+    if isinstance(value, ByVal):
+        return 1.0
+    elif isinstance(value, list[list]):
+        return [softmax(v) for v in value]
+    elif isinstance(value, list):
+        m = max(value)
+        exps = [math.exp(v - m) for v in value]
+        total = sum(exps)
+        return [e / total for e in exps]
+    else:
+        compile_error("softmax: expected a scalar or a (nested) list")
+
+
+def powers(value: List[float], degree: int) -> List[List[float]]:
+    """ [x^0, x^1, ..., x^degree], element-wise over value. """
+    if degree < 0:
+        raise ValueError("powers: negative degree")
+
+    pows = [[1.0 for _ in range(len(value))] for _ in range(degree + 1)]
+    for i in range(1, degree + 1):
+        pows[i] = [pows[i - 1][j] * value[j] for j in range(len(value))]
+
+    return pows
+
+
+def linspace(a: float, b: float, count: int) -> List[float]:
+    if count < 2:
+        raise ValueError("linspace: count must be at least 2")
+    step = (b - a) / float(count - 1)
+    return [a + step * float(i) for i in range(count)]
+
+
+def trapz(y: List[float], x: List[float]) -> float:
+    """ Trapezoidal integral of y over the sample points x. """
+    total = 0.0
+    for i in range(1, len(x)):
+        total += (x[i] - x[i - 1]) * (y[i] + y[i - 1])
+    return total * 0.5
+
+
+def cheb2poly(c: List[float]) -> List[float]:
+    """
+    Monomial coefficients (constant first) of sum_k c[k] T_k(x), the Chebyshev series on [-1, 1]. Builds T_k through
+    T_(k+1) = 2x T_k - T_(k-1): O(n^2). The monomial form of a high-degree series has large alternating coefficients
+    (2^(n-2) for T_n), so it loses precision in double arithmetic beyond degree ~30.
+    """
+    n = len(c)
+    res = [0.0 for _ in range(n)]
+    if n == 0:
+        return res
+
+    t_prev = [0.0 for _ in range(n)]
+    t_prev[0] = 1.0
+    for j in range(n): res[j] += c[0] * t_prev[j]
+    if n == 1:
+        return res
+
+    t = [0.0 for _ in range(n)]
+    t[1] = 1.0
+    for j in range(n): res[j] += c[1] * t[j]
+
+    for k in range(2, n):
+        t_next = [0.0 for _ in range(n)]
+        for j in range(n):
+            if j > 0:
+                t_next[j] += 2.0 * t[j - 1]
+            t_next[j] -= t_prev[j]
+        for j in range(n): res[j] += c[k] * t_next[j]
+        t_prev, t = t, t_next
+
+    return res
+
+
+def poly_eval(coeffs: List[float], x: float) -> float:
+    """ Horner evaluation of sum_k coeffs[k] x^k. """
+    acc = 0.0
+    for k in range(len(coeffs) - 1, -1, -1):
+        acc = acc * x + coeffs[k]
+    return acc
+
+
+def poly_shifted_coeffs(coeffs: List[float], u: float) -> List[float]:
+    """
+    W_j = P^(j)(u) / j! for P = sum_k coeffs[k] x^k: the coefficients of P(u + v) as a polynomial in v (exact Taylor
+    expansion, all degrees). Synthetic division (repeated Horner): O(d^2) per point.
+    """
+    w = coeffs.copy()
+    d = len(w)
+    for j in range(d):
+        for k in range(d - 2, j - 1, -1):
+            w[k] += u * w[k + 1]
+    return w
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Exact derivatives for Taylor polynomials, keyed by function name. f^(n)(x) for n = 0 .. degree.
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _poly_derivative(p: List[float]) -> List[float]:
+    if len(p) <= 1:
+        return [0.0]
+    return [p[k] * float(k) for k in range(1, len(p))]
+
+
+def _poly_mul(p: List[float], q: List[float]) -> List[float]:
+    r = [0.0 for _ in range(len(p) + len(q) - 1)]
+    for i in range(len(p)):
+        for j in range(len(q)):
+            r[i + j] += p[i] * q[j]
+    return r
+
+
+def _derivatives_by_recurrence(y: float, degree: int, factor: List[float]) -> List[float]:
+    # f' = factor(f) for a polynomial factor (sigmoid: s - s^2; tanh: 1 - t^2; tan: 1 + t^2; cot: -1 - c^2): then
+    # f^(n) = P_n(f) with P_0 = f and P_(n+1) = P_n' * factor, polynomials in f evaluated at y = f(x).
+    p = [0.0, 1.0]
+    res = [y]
+    for _ in range(degree):
+        p = _poly_mul(_poly_derivative(p), factor)
+        res.append(poly_eval(p, y))
+    return res
+
+
+def derivatives(func: Static[str], x: float, degree: int) -> List[float]:
+    """ [f(x), f'(x), ..., f^(degree)(x)] for the named function, from closed forms (no finite differences). """
+    if degree < 0:
+        raise ValueError("derivatives: negative degree")
+
+    res = List[float](degree + 1)
+    if func == "sin" or func == "cos":
+        s, c = math.sin(x), math.cos(x)
+        cycle = [s, c, -s, -c] if func == "sin" else [c, -s, -c, s]
+        for n in range(degree + 1): res.append(cycle[n % 4])
+    elif func == "sinh" or func == "cosh":
+        sh, ch = math.sinh(x), math.cosh(x)
+        cycle = [sh, ch] if func == "sinh" else [ch, sh]
+        for n in range(degree + 1): res.append(cycle[n % 2])
+    elif func == "exp":
+        e = math.exp(x)
+        for _ in range(degree + 1): res.append(e)
+    elif func == "log":
+        res.append(math.log(x))
+        fact = 1.0
+        for n in range(1, degree + 1):
+            # (-1)^(n-1) (n-1)! x^-n
+            res.append((1.0 if n % 2 == 1 else -1.0) * fact * x ** float(-n))
+            fact *= float(n)
+    elif func == "inv":
+        fact = 1.0
+        for n in range(degree + 1):
+            # (-1)^n n! x^(-n-1)
+            res.append((1.0 if n % 2 == 0 else -1.0) * fact * x ** float(-n - 1))
+            fact *= float(n + 1)
+    elif func == "sqrt":
+        coef = 1.0
+        for n in range(degree + 1):
+            # (1/2)(1/2 - 1)...(1/2 - n + 1) x^(1/2 - n)
+            res.append(coef * x ** (0.5 - float(n)))
+            coef *= 0.5 - float(n)
+    elif func == "sigmoid":
+        return _derivatives_by_recurrence(_sigmoid(x), degree, [0.0, 1.0, -1.0])
+    elif func == "tanh":
+        return _derivatives_by_recurrence(math.tanh(x), degree, [1.0, 0.0, -1.0])
+    elif func == "tan":
+        return _derivatives_by_recurrence(math.tan(x), degree, [1.0, 0.0, 1.0])
+    elif func == "cot":
+        return _derivatives_by_recurrence(1.0 / math.tan(x), degree, [-1.0, 0.0, -1.0])
+    elif func == "erf":
+        # erf^(n)(x) = (2 / sqrt(pi)) (-1)^(n-1) H_(n-1)(x) e^(-x^2) (physicists' Hermite polynomials)
+        res.append(math.erf(x))
+        g = 2.0 / math.sqrt(math.pi) * math.exp(-x * x)
+        h_prev, h = 0.0, 1.0  # H_(-1) unused, H_0 = 1
+        for n in range(1, degree + 1):
+            res.append((1.0 if n % 2 == 1 else -1.0) * h * g)
+            # H_n = 2x H_(n-1) - 2(n-1) H_(n-2)
+            h_prev, h = h, 2.0 * x * h - 2.0 * float(n - 1) * h_prev
+    else:
+        compile_error("derivatives: no closed form for " + func)
+
+    return res
+
+
+def taylor_coeffs(func: Static[str], pivot: float, degree: int) -> List[float]:
+    """ Coefficients c_n = f^(n)(pivot) / n! of the Taylor polynomial in (x - pivot). """
+    d = derivatives(func, pivot, degree)
+    res = List[float](degree + 1)
+    fact = 1.0
+    for n in range(degree + 1):
+        if n > 0:
+            fact *= float(n)
+        res.append(d[n] / fact)
+    return res
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Fixed-point conversions relative to an interval or a period. Decor works with x scaled to [0, 1) over its interval
+# (or period): the fractional bits of the opened value and of the mask then add up to the scaled input modulo 1.
+# ---------------------------------------------------------------------------------------------------------------------
+
+def interval_double_to_fp(value, interval, modulus):
+    a, b = interval
+    return double_to_fp(recursive_reduce(lambda v: (v - a) / (b - a), value), modulus)
+
+
+def interval_fp_to_double(value, interval, modulus):
+    a, b = interval
+    return recursive_reduce(lambda v: v * (b - a) + a, fp_to_double(value, modulus))
+
+
+def period_double_to_fp(value, period: float, modulus):
+    return double_to_fp(recursive_reduce(lambda v: v / period, value), modulus)
+
+
+def period_fp_to_double(value, period: float, modulus):
+    return recursive_reduce(lambda v: v * period, fp_to_double(value, modulus))
+
+
+def trig_double_to_fp(value, modulus):
+    return period_double_to_fp(value, 2.0 * math.pi, modulus)
+
+
+def trig_fp_to_double(value, modulus):
+    return period_fp_to_double(value, 2.0 * math.pi, modulus)
+
+
+def frac_fp_to_double(value, modulus) -> float:
+    # The fractional bits of a fixed-point word as a double in [0, 1)
+    return recursive_reduce(lambda v: fp_to_double(v & FBITS_MASK, modulus), value)
+
+
+@sequre
+def secure_powers(mpc, value, degree: int):
+    """
+    [x^0, ..., x^degree] of a 1-D fixed-point Sharetensor as one Sharetensor (a new leading axis): x^0 and x^1 are
+    free, each further power a product and a truncation (about 2 (degree - 1) rounds; fewer when operands' Beaver
+    partitions are cached).
+    """
+    if degree < 0:
+        raise ValueError("secure_powers: negative degree")
+
+    pows = value.zeros().expand_dims() + 1.0
+    if degree >= 1:
+        pows.append(value)
+    for i in range(2, degree + 1):
+        pows.append(pows[i - 1] * value)
+
+    return pows
+
+
+@sequre
+def modulo_float(mpc, value, period: float):
+    """
+    A Sharetensor congruent to value modulo period, for periodic targets only: the fractional bits of value / period
+    are kept share by share, so the result is frac(value / period) * period plus c * period for an unknown integer
+    0 <= c < n_cp (the parties' fractional parts carry into the integer part when added; ring shares). A periodic
+    function of period `period` (sin, cos, a Fourier series) gives the same result for any c; anything else does not.
+    """
+    assert value.modulus.popcnt() == 1, "modulo_float: needs ring shares (field shares do not reduce bit by bit)"
+    value_cp = value.copy()
+
+    value_p = value / period
+    value_cp.share = value_p.share & FBITS_MASK
+
+    if value_p.r:
+        value_cp.x_r = value_p.x_r & FBITS_MASK
+        value_cp.r = value_p.r & FBITS_MASK
+
+    value_cp = value_cp * period
+    return value_cp

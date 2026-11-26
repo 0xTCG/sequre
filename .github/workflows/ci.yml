@@ -1,73 +1,97 @@
 name: Sequre CI
 
+# Builds the release archive for each platform the docs advertise and smoke-tests it: installs it with
+# scripts/install.sh into a clean prefix, runs an example with the MHE setup, builds one and runs the binary in a clean
+# environment, and checks every packed binary's machine type (scripts/smoke_test.sh). Pull requests and manual runs
+# stop there and need no write access; a v* tag also creates the GitHub release and uploads the archives, once every
+# platform has passed.
 on:
   push:
     tags:
-      - '*'
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
-  create_release:
-    name: Create GitHub Release
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-    permissions:
-      contents: write
-    steps:
-      - name: Create Release
-        if: contains(github.ref, 'tags/v')
-        id: create_release
-        uses: ncipollo/release-action@v1
-        with:
-          prerelease: ${{ contains(github.ref_name, '-') }}
-
   build:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            arch: linux-x86_64
-            artifact: manylinux-x86_64
+          - os: ubuntu-24.04
+            platform: linux-x86_64
             dockerfile: Dockerfile.x86_64
+          - os: ubuntu-24.04-arm
+            platform: linux-aarch64
+            dockerfile: Dockerfile.aarch64
           - os: macos-15
-            arch: darwin-arm64
-            artifact: darwin-arm64
+            platform: darwin-arm64
     runs-on: ${{ matrix.os }}
-    name: Sequre CI (${{ matrix.arch }})
-    needs: create_release
-    permissions:
-      contents: write
+    name: Build and smoke test (${{ matrix.platform }})
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build (Linux)
-        if: startsWith(matrix.os, 'ubuntu')
+      - name: Build (Linux, manylinux_2_28)
+        if: runner.os == 'Linux'
         run: |
-          cd .github/actions/build-manylinux && docker build -t sequre-build -f ${{ matrix.dockerfile }} .
-          cd ${{ github.workspace }}
-          docker run -v $(pwd):/github/workspace sequre-build
+          docker build -t sequre-build -f .github/actions/build-manylinux/${{ matrix.dockerfile }} .github/actions/build-manylinux
+          docker run --rm -v "$GITHUB_WORKSPACE:/github/workspace" sequre-build
 
       - name: Build (macOS)
-        if: startsWith(matrix.os, 'macos')
+        if: runner.os == 'macOS'
         run: |
           sudo mkdir -p /opt/llvm-codon
-          sudo chown -R $(whoami) /opt
-          bash .github/actions/build-manylinux/entrypoint.sh ${{ github.workspace }}
+          sudo chown -R "$(whoami)" /opt
+          bash .github/actions/build-manylinux/entrypoint.sh "$GITHUB_WORKSPACE"
 
-      - name: Upload Release Asset
-        if: contains(github.ref, 'tags/v')
-        uses: actions/upload-release-asset@v1.0.2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create_release.outputs.upload_url }}
-          asset_path: ./sequre-${{ matrix.arch }}.tar.gz
-          asset_name: sequre-${{ matrix.arch }}.tar.gz
-          asset_content_type: application/gzip
+      - name: Install the archive into a clean prefix
+        run: |
+          SEQURE_INSTALL_DIR="$RUNNER_TEMP/sequre" SEQURE_ARCHIVE="$GITHUB_WORKSPACE/sequre-${{ matrix.platform }}.tar.gz" \
+            SEQURE_UPDATE_PATH=no bash scripts/install.sh
 
-      - name: Upload Artifacts
+      - name: Smoke test
+        run: bash scripts/smoke_test.sh "$RUNNER_TEMP/sequre" "sequre-${{ matrix.platform }}.tar.gz"
+
+      - name: Upload the archive
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: sequre-${{ matrix.arch }}.tar.gz
+          name: sequre-${{ matrix.platform }}
+          path: sequre-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Create the GitHub release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sequre-*
+          merge-multiple: true
+
+      - name: Create the release with its archives (or replace them on a rerun)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l sequre-*.tar.gz
+          # gh creates a release that has files as a draft, uploads them, then publishes it: the release never exists
+          # without its archives (releases/latest/download/... would 404 meanwhile)
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" sequre-*.tar.gz --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            case "$TAG" in
+              *-*) gh release create "$TAG" sequre-*.tar.gz --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "" --prerelease ;;
+              *) gh release create "$TAG" sequre-*.tar.gz --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "" ;;
+            esac
+          fi

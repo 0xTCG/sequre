@@ -36,7 +36,36 @@ values = encoder.decode(plaintext: Plaintext, log_slots: int) -> list[complex]
 2. Divide by the current scale
 3. Apply the canonical embedding (DFT on roots of unity)
 
-The encoding uses 128-bit complex arithmetic internally for precision.
+The encoding computes in double precision (`complex`, two 64-bit floats), so its error grows with the magnitude of the values: a slot of magnitude $|v|$ comes back off by about $|v| \cdot 2^{-52}$.
+
+### Exact encoding
+
+`ExactEncoder` (`exact_encoder.codon`) removes that growth. Protocols that hide a value under a large random mask, encrypt the masked value and remove the mask under encryption need it: with masks of $2^{150}$, the float encoder's error is about $2^{98}$.
+
+Its values are fixed-point integers: a slot holds $z = Z / 2^{f}$, with the real and imaginary parts of $Z$ given as `lattiseq_exact_int` (`Int[LATTISEQ_EXACT_INT_SIZE]`).
+
+- **Encoding** computes the coefficients $\text{round}(\Delta \cdot \text{IFFT}(z))$ with an FFT on fixed-point integers (products in twice the width, roots of unity computed once in multi-precision floats). The FFT keeps enough fractional bits that the value it rounds is within $2^{-16}$ of the true one, whatever the magnitude.
+- **Decoding** reconstructs the centered coefficients exactly from their residues (CRT) and returns $\text{round}(2^{f} \cdot \text{FFT}(c) / \Delta)$ the same way.
+
+What remains is the error of CKKS itself: each coefficient is rounded to an integer, which costs at most $N / (2\Delta)$ per slot (about $6 \cdot 10^{-9}$ for $N = 2^{14}$ and $\Delta = 2^{34}$, for any magnitude).
+
+```python
+from sequre.lattiseq.exact_encoder import new_exact_encoder
+
+exact = new_exact_encoder(params)
+exact.encode_fixed_point(real, imag, frac_bits, plaintext, log_slots)  # lists of lattiseq_exact_int
+real, imag = exact.decode_fixed_point(plaintext, log_slots, frac_bits)
+```
+
+`encode_coeffs` / `decode_coeffs` do the same on integer coefficient vectors, and `coeffs_to_poly` / `poly_to_coeffs` convert exactly between those and residue form, for protocols that hold shares of a plaintext's coefficients.
+
+Limits:
+
+- **Integer width.** `LATTISEQ_EXACT_INT_SIZE` is 256 bits (512 with 256-bit MPC integers), and about 25 bits of it are working room. Encoding takes $\log_2(\max|z| \cdot \Delta)$ plus those bits. Decoding takes $\log_2 \max|c| + \log_2(\text{slots}) + f - \log_2 \Delta$ plus those bits. Larger values raise `ValueError` instead of losing precision.
+- **Wrapping modulo Q.** Encoded coefficients are reduced modulo the plaintext's moduli without a range check. Reduction is a ring homomorphism, so a sum of encodings of large masked values still decodes to the sum of the values, as long as the sum is itself small.
+- **Ring.** Only the standard ring is supported.
+
+Measured with 4 threads ($2^{13}$ slots, top level of `PN14QP438`): encoding takes 5.5 ms and decoding 4.8 ms, against 1.3 ms and 10 ms for the float encoder.
 
 ## Encrypt / Decrypt
 
@@ -68,7 +97,33 @@ The `Evaluator` holds the `EvaluationKey` (relinearization + rotation keys) and 
 evaluator.add(ct_a, ct_b, ct_out)
 ```
 
-Coefficient-wise addition of the two ciphertexts. **Noise grows additively.** This is essentially free.
+Coefficient-wise addition of the two ciphertexts. **Noise grows additively.** This is essentially free when both are on
+one scale (within $10^{-9}$ relative, the last bits of scales built from the same moduli).
+
+A rescale divides by a prime close to, not equal to, the default scale, so a product's scale and a fresh ciphertext's
+differ by about $10^{-5}$. Adding them as if their scales were equal would misread one operand by that much, on every
+slot with the same sign. The evaluator brings the operands onto one scale first:
+
+1. At level 0, a product whose rescale is still pending (a scale ratio of $2^{20}$ or more) is rescaled first, with its
+   own levels (and moved onto the other operand's scale when it keeps a level to spare): at level 0 the product's scale
+   would not fit the modulus. Above level 0 the integer of the next step matches it exactly, and the sum keeps the
+   product's scale for its own rescale, as in Lattigo. (Rescaling the product inside the addition would keep a level of
+   the sum, but in a recurrence such as Clenshaw's a term kept one level low drags the next sums down, and the
+   multiparty layer then refreshes more often. That layer rescales a product added to a ciphertext at its bootstrap
+   level itself, so that the sum can be refreshed.)
+2. An integer ratio multiplies the smaller-scale operand by that integer: exact, and no level (above $2^{62}$, two
+   integer factors).
+3. Any other ratio moves an operand that has a level to spare onto the other's scale: a product by the integer
+   $\mathrm{round}(q \cdot s_{target} / s)$ and one rescale, exact to about $2^{-30}$. Only that operand's level is spent,
+   as the sum is at the lower level anyway. A move costs that rescale's time, so `Ciphertensor` encodes a public operand
+   of an addition (a number, a list or an array) at each receiving ciphertext's level and scale, where it needs none.
+4. Otherwise (two operands at the sum's level, or a ratio no move reaches exactly) the addition proceeds as in Lattigo,
+   without a level: a ratio of 2 or more multiplies the smaller-scale operand by the nearest integer, and a smaller
+   ratio counts as equal, a residual of the ratio's distance to 1 (a rescale's $10^{-6}$ to $10^{-4}$). Exactness there
+   would spend a level of the sum at the same scale, which near the bootstrap level leaves a sum that can no longer be
+   refreshed, and near level 0 one whose values no longer fit the modulus.
+
+Lattigo takes ratios below 2 as equal and multiplies by $\lfloor \text{ratio} \rfloor$ above, whatever the levels.
 
 ### Scalar operations
 
@@ -77,7 +132,9 @@ evaluator.add_const(ct, constant, ct_out)   # ct + Δ·constant
 evaluator.mul_const(ct, constant, ct_out)   # ct × constant
 ```
 
-`add_const` encodes the constant at the ciphertext's scale and adds. `mul_const` multiplies coefficients directly — the scale doubles.
+`add_const` encodes the constant at the ciphertext's scale and adds. With `ct_out` another ciphertext, `ct_out` first
+receives every component of `ct` and its scale, so `ct` is left as it was; `add_const_new` and `sub_const_new` return a new
+ciphertext. `mul_const` multiplies coefficients directly — the scale doubles.
 
 ### Multiplication
 

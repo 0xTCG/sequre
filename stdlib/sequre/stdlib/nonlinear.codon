@@ -1,0 +1,997 @@
+""" One API for nonlinear functions, over plaintext and every secure type.
+
+Functions: exp, sigmoid, tanh, sin, cos, tan, cot, sinh, cosh, log, inv and erf, as f(mpc, x, method, interval, degree,
+clip, tolerance); softmax; polynomial; and approx(mpc, x, op, interval, method, degree) for any plaintext function op.
+
+The method (a compile-time string) picks what is computed, and every type returns the same thing for it, for inputs in
+the interval:
+- "decor": the function itself, by Decor's decomposition (sequre.decor), up to its fixed-point encodings
+  (decor_error_bound): sin, cos, tan, cot, exp, sinh, cosh, sigmoid, tanh, inv, softmax, polynomial. The default for
+  these but sigmoid and tanh.
+- "auto": sigmoid and tanh within Decor's error bound (at least 2^-44), by the cheaper method for the shares' modulus:
+  Decor on ring shares; on field shares, where Decor's division takes about 35 times the ring's time, the Chebyshev
+  interpolant of the smallest degree whose truncation (coefficients within double-precision noise count as zero) stays
+  within half of max(Decor's error bound on the interval, NONLINEAR_AUTO_FLOOR = 2^-44) (auto_degree), plus Clenshaw's
+  rounding (a few units of 2^-F per degree). At F = 64 on narrow intervals Decor's bound falls below what
+  double-precision coefficients reach, and auto stays within 2^-44 instead. Plaintext, public
+  Sharetensors and MPP partitions in the clear give the function itself; MPP, MPA, MPU and Ciphertensor follow the
+  modulus of their MPC conversion (the default MPC modulus). The default for sigmoid and tanh.
+- "chebyshev": the degree-`degree` Chebyshev interpolant on the interval (Clenshaw's recurrence): any function (softmax:
+  its exp). The default for log and erf, which have no Decor decomposition.
+- "fourier": the degree-`degree` Fourier series on the interval (through Decor's trigonometric decomposition): any
+  function; it rings near the interval's ends for a target that is not periodic there.
+- "taylor": the degree-`degree` Taylor polynomial around the interval's centre (through Decor's polynomial
+  decomposition): the twelve functions above; accurate near the centre only, so it takes no default interval.
+An unsupported (function, method) pair is a compile error.
+
+interval = (0, 0) means the function's default for the method (default_interval; Taylor has none and raises
+ValueError); degree = 0 the method's default (Chebyshev CHEBYSHEV_DEGREE, Fourier NONLINEAR_FOURIER_DEGREE, Taylor
+NONLINEAR_TAYLOR_DEGREE). Decor's sin, cos, tan, cot and inv take no interval, and neither Decor nor auto a degree:
+passing one (or a negative degree) raises ValueError. tolerance applies where Decor's admissibility check does (Decor's
+bounded functions, auto, the Taylor method, polynomial).
+
+Domain: outside the interval the results differ by method, and for some by type. Decor's bounded functions and the
+Taylor method (Decor's polynomial decomposition on the interval) give f(x - k p) on the secure types (the
+decomposition's period p; see sequre.decor.via_decor) but f(x) on plaintext and on MPP partitions in the clear.
+Chebyshev extrapolates its polynomial (its interpolant of erf on (-4, 4) gives -43 at 5) and Fourier repeats with
+period b - a, alike on every type. auto behaves as the method it runs. clip=True clips the input to the interval first,
+on every type, and makes the results agree.
+
+Admissibility: public checks at every party, before any communication and for every type: Decor's (fixed-point range,
+divisor, error bound against the tolerance), Clenshaw's intermediates (2 sum_k (k + 1) |c_k| below the fixed-point
+range) and the Fourier coefficients' sum. They raise ValueError.
+
+Types, with every party (CP0 included) taking the same path:
+- float, List[float] (nested lists too), ndarray: plaintext, in double precision.
+- Sharetensor: the method's protocol (an empty input returns at once). A public Sharetensor (each party holds the whole
+  value, as after publish): in the clear at every compute party, like an ndarray; the result stays public.
+- MPP: when every compute party holds its partition in the clear (one round, CP0 included), each evaluates its own
+  partition locally (CP0 keeps a placeholder); otherwise the MPC conversion (via_mpc).
+- MPA: via_mpc (additive shares: no local shortcut). MPU: its MPP or MPA. Ciphertensor (1-D or 2-D): via_mpc, which
+  runs the protocol once per compute party's ciphertexts.
+Chebyshev without clip runs Clenshaw on the input's own arithmetic for every type but plain lists and public
+Sharetensors (ndarray, MPP, MPA, MPU, Ciphertensor, as stdlib.builtin's chebyshev_* always did).
+
+Cost (ring, 1e3 elements, 3 local parties): sin/cos 3 rounds, exp/sinh/cosh 10, sigmoid/tanh 51 (Decor on the field:
+121, and about 35 times the ring's time: the field's division), Chebyshev 2 degree + 2 rounds. Refuses to run inside
+MPCEnv.delayed_truncation().
+"""
+
+import math
+
+from sequre.attributes import sequre
+from sequre.constants import (
+    CHEBYSHEV_DEGREE, DECOR_TOLERANCE, MPC_NBIT_K, NONLINEAR_FOURIER_DEGREE, NONLINEAR_TAYLOR_DEGREE,
+    NONLINEAR_SOFTMAX_WIDTH, NONLINEAR_AUTO_MAX_DEGREE, NONLINEAR_AUTO_FLOOR, METHOD_DECOR, METHOD_CHEBYSHEV,
+    METHOD_FOURIER, METHOD_TAYLOR, METHOD_AUTO)
+from sequre.stdlib.numpy.ndarray import ndarray
+from sequre.types.sharetensor import Sharetensor
+from sequre.types.ciphertensor import Ciphertensor
+from sequre.types.utils import double_to_fp, fp_to_double
+from sequre.stdlib.numpy.create import array
+from sequre.types.multiparty_partition import MPP
+from sequre.types.multiparty_aggregate import MPA
+from sequre.types.multiparty_union import MPU
+from sequre.stdlib.chebyshev import chebyshev_evaluate, chebyshev_coeffs, chebyshev_nodes
+from sequre.decor.core import (
+    via_decor, default_interval as decor_default_interval, decor_error_bound, _clip, _fp_tensor, _is_empty,
+    _empty_like, _one_round_product, _admit, _decor_polynomial, _validate_domain, FP_MAX)
+from sequre.decor.primitives import decor_mul_inv, ring_gt
+from sequre.decor.fourier import FourierSeries, fourier_coeffs, fourier_evaluate
+from sequre.decor.functions import recursive_reduce, poly_eval, taylor_coeffs, _sigmoid
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The support table and the defaults
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _check_support(func: Static[str], method: Static[str]):
+    if method == METHOD_DECOR:
+        if func == "log" or func == "erf":
+            compile_error("nonlinear." + func + ": no Decor decomposition (method chebyshev, fourier or taylor)")
+    elif method == METHOD_AUTO:
+        if func != "sigmoid" and func != "tanh":
+            compile_error("nonlinear." + func + ": the auto method applies to sigmoid and tanh")
+    elif method == METHOD_CHEBYSHEV or method == METHOD_FOURIER or method == METHOD_TAYLOR:
+        pass
+    else:
+        compile_error(
+            "nonlinear." + func + ": unknown method " + method + " (decor, auto, chebyshev, fourier or taylor)")
+
+
+def _is_trig(func: Static[str]) -> bool:
+    return func == "sin" or func == "cos" or func == "tan" or func == "cot"
+
+
+def _needs_interval(func: Static[str], method: Static[str]) -> bool:
+    # Decor's sin, cos, tan, cot (any x) and inv (any admissible divisor) take no interval
+    return not (method == METHOD_DECOR and (_is_trig(func) or func == "inv"))
+
+
+def default_interval(func: Static[str], method: Static[str] = METHOD_DECOR) -> Tuple[float, float]:
+    """
+    The default interval of func for method. Decor and auto: the DECOR_INTERVAL_* constants (exp, sinh, cosh, sigmoid,
+    tanh; Decor's sin, cos, tan, cot and inv take none). Chebyshev, Fourier: sin, cos (-pi, pi); tan (-1.2, 1.2);
+    cot (0.4, 2.7); exp (-8, 8); sinh, cosh, tanh (-5, 5); sigmoid (-10, 10); log, inv (0.5, 8); erf (-4, 4). Taylor
+    has none (its polynomial is accurate near the interval's centre only: sigmoid's degree-8 one on (-10, 10) gives
+    -1918 at 10) and raises ValueError.
+    """
+    if method == METHOD_DECOR or method == METHOD_AUTO:
+        return decor_default_interval(func)
+    if method == METHOD_TAYLOR:
+        raise ValueError(f"nonlinear.{func}: the Taylor method takes no default interval (a Taylor polynomial is "
+                         "accurate near its centre only): pass one")
+    if func == "sin" or func == "cos":
+        return (-math.pi, math.pi)
+    elif func == "tan":
+        return (-1.2, 1.2)
+    elif func == "cot":
+        return (0.4, 2.7)
+    elif func == "exp":
+        return (-8.0, 8.0)
+    elif func == "sinh" or func == "cosh" or func == "tanh":
+        return (-5.0, 5.0)
+    elif func == "sigmoid":
+        return (-10.0, 10.0)
+    elif func == "log" or func == "inv":
+        return (0.5, 8.0)
+    elif func == "erf":
+        return (-4.0, 4.0)
+    else:
+        compile_error("nonlinear.default_interval: unknown function " + func)
+
+
+def _degree(method: Static[str], degree: int) -> int:
+    if degree < 0:
+        raise ValueError(f"nonlinear: the degree must be positive (0: the method's default), not {degree}")
+    if degree > 0:
+        return degree
+    if method == METHOD_CHEBYSHEV:
+        return CHEBYSHEV_DEGREE
+    elif method == METHOD_FOURIER:
+        return NONLINEAR_FOURIER_DEGREE
+    elif method == METHOD_TAYLOR:
+        return NONLINEAR_TAYLOR_DEGREE
+    return 0
+
+
+def _interval(func: Static[str], method: Static[str], interval) -> Tuple[float, float]:
+    a, b = float(interval[0]), float(interval[1])
+    if a == 0.0 and b == 0.0:
+        return default_interval(func, method)
+    if not (b > a):
+        raise ValueError(f"nonlinear.{func}: the interval {(a, b)} must have a < b")
+    return (a, b)
+
+
+def _check_chebyshev(label: str, interval, coeffs: List[float]):
+    # Clenshaw's intermediates b_k = sum_{j >= k} c_j U_{j - k}(t), |U_n(t)| <= n + 1 on the interval, and the products
+    # 2 t b_k: all below 2 sum_k (k + 1) |c_k|, which must stay in the fixed-point range
+    bound = 0.0
+    for k in range(len(coeffs)):
+        bound += float(k + 1) * abs(coeffs[k])
+    bound *= 2.0
+    if not (bound < FP_MAX):
+        raise ValueError(
+            f"{label} on {interval}: Clenshaw's intermediates reach {bound:.4g}, beyond the fixed-point range "
+            f"{FP_MAX:.4g}; narrow the interval or lower the degree")
+
+
+def _check_fourier(label: str, interval, a0: float, a: List[float], b: List[float]):
+    bound = abs(a0)
+    for k in range(len(a)):
+        bound += abs(a[k]) + abs(b[k])
+    if not (bound < FP_MAX):
+        raise ValueError(f"{label} on {interval}: the Fourier coefficients sum to {bound:.4g}, beyond the fixed-point "
+                         f"range {FP_MAX:.4g}; narrow the interval or lower the degree")
+
+
+def _value(func: Static[str], v: float) -> float:
+    # The function itself, in double precision
+    if func == "exp":
+        return math.exp(v)
+    elif func == "sigmoid":
+        return _sigmoid(v)
+    elif func == "tanh":
+        return math.tanh(v)
+    elif func == "sin":
+        return math.sin(v)
+    elif func == "cos":
+        return math.cos(v)
+    elif func == "tan":
+        return math.tan(v)
+    elif func == "cot":
+        return 1.0 / math.tan(v)
+    elif func == "sinh":
+        return math.sinh(v)
+    elif func == "cosh":
+        return math.cosh(v)
+    elif func == "log":
+        return math.log(v)
+    elif func == "inv":
+        return 1.0 / v
+    elif func == "erf":
+        return math.erf(v)
+    else:
+        compile_error("nonlinear: unknown function " + func)
+
+
+def _clenshaw(coeffs: List[float], interval, v: float) -> float:
+    # sum_k coeffs[k] T_k(scaled v), as chebyshev_evaluate computes it
+    a, b = interval
+    t = v * (2.0 / (b - a)) - (a + b) / (b - a)
+    b1, b2 = 0.0, 0.0
+    for k in range(len(coeffs) - 1, 0, -1):
+        b1, b2 = 2.0 * t * b1 - b2 + coeffs[k], b1
+    return t * b1 - b2 + coeffs[0]
+
+
+class _Plan:
+    """ What a call computes, fixed before any communication: the method's coefficients, computed once. """
+    interval: Tuple[float, float]
+    degree: int
+    clip: bool
+    cheb: List[float]
+    fourier_a0: float
+    fourier_a: List[float]
+    fourier_b: List[float]
+    taylor: List[float]
+
+    def __init__(self, interval: Tuple[float, float], degree: int, clip: bool):
+        self.interval = interval
+        self.degree = degree
+        self.clip = clip
+        self.cheb = List[float]()
+        self.fourier_a0 = 0.0
+        self.fourier_a = List[float]()
+        self.fourier_b = List[float]()
+        self.taylor = List[float]()
+
+
+def _plan(func: Static[str], method: Static[str], interval, degree: int, clip: bool, tolerance: float) -> _Plan:
+    # Every public check, at every party before any communication, whatever the type
+    _check_support(func, method)
+    if not _needs_interval(func, method):
+        if not (float(interval[0]) == 0.0 and float(interval[1]) == 0.0):
+            raise ValueError(f"nonlinear.{func}: Decor's {func} takes no interval")
+        if clip:
+            raise ValueError(f"nonlinear.{func}: clip applies to functions on an interval (Decor's {func} takes none)")
+    if method == METHOD_DECOR and degree != 0:
+        raise ValueError(f"nonlinear.{func}: Decor takes no degree")
+    if method == METHOD_AUTO and degree != 0:
+        raise ValueError(f"nonlinear.{func}: the auto method picks the Chebyshev degree on field shares itself (method "
+                         "chebyshev takes a degree)")
+    iv = _interval(func, method, interval) if _needs_interval(func, method) else (0.0, 0.0)
+    plan = _Plan(iv, _degree(method, degree), clip)
+    label = "nonlinear." + func + " (" + method + ")"
+    if method == METHOD_DECOR:
+        if func == "exp" or func == "sinh" or func == "cosh" or func == "sigmoid" or func == "tanh":
+            _admit(func, iv, List[float](), tolerance)
+    elif method == METHOD_AUTO:
+        # Decor's checks, whatever the modulus (the same refusals on both); the field's interpolant is computed where a
+        # call reaches field shares (_auto_chebyshev)
+        _admit(func, iv, List[float](), tolerance)
+    elif method == METHOD_CHEBYSHEV:
+        plan.cheb = chebyshev_coeffs(lambda v: _value(func, v), chebyshev_nodes(plan.degree + 1, iv), iv)
+        _check_chebyshev(label, iv, plan.cheb)
+    elif method == METHOD_FOURIER:
+        series = fourier_coeffs(lambda v: _value(func, v), iv, plan.degree)
+        plan.fourier_a0, plan.fourier_a, plan.fourier_b = series.a0, series.a, series.b
+        _check_fourier(label, iv, plan.fourier_a0, plan.fourier_a, plan.fourier_b)
+    elif method == METHOD_TAYLOR:
+        pivot = (iv[0] + iv[1]) / 2.0
+        plan.taylor = taylor_coeffs(func, pivot, plan.degree)
+        _admit("polynomial", (iv[0] - pivot, iv[1] - pivot), plan.taylor, tolerance)
+    return plan
+
+
+def _plain_poly(method: Static[str], plan: _Plan, w: float) -> float:
+    # A polynomial method's result in double precision at one (already clipped) point
+    a, b = plan.interval
+    if method == METHOD_CHEBYSHEV:
+        return _clenshaw(plan.cheb, plan.interval, w)
+    elif method == METHOD_FOURIER:
+        t = (w - a) / (b - a)
+        s = plan.fourier_a0
+        for k in range(len(plan.fourier_a)):
+            ang = 2.0 * math.pi * float(k + 1) * t
+            s += plan.fourier_a[k] * math.cos(ang) + plan.fourier_b[k] * math.sin(ang)
+        return s
+    elif method == METHOD_TAYLOR:
+        return poly_eval(plan.taylor, w - (a + b) / 2.0)
+    else:
+        compile_error("nonlinear: no polynomial method " + method)
+
+
+def _plain(func: Static[str], method: Static[str], plan: _Plan, v: float) -> float:
+    # The method's result in double precision at one point (auto: the function itself, which it approximates within
+    # Decor's bound on every modulus)
+    w = min(max(v, plan.interval[0]), plan.interval[1]) if plan.clip else v
+    if method == METHOD_DECOR or method == METHOD_AUTO:
+        return _value(func, w)
+    else:
+        return _plain_poly(method, plan, w)
+
+
+# auto's interpolants on field shares, by (function, a, b): public and deterministic, computed once per process
+_AUTO_CHEBYSHEV = Dict[Tuple[str, float, float], List[float]]()
+
+
+def _auto_coeffs(func: Static[str], n: int, iv) -> List[float]:
+    # The degree-n Chebyshev interpolant of func on iv: chebyshev_coeffs' nodes and formula, with T_k at the nodes
+    # computed as cos(k theta_i), about 1e-15 of noise per coefficient (the recurrence's grows with n: 1e-13 at n = 1024)
+    m = n + 1
+    a, b = float(iv[0]), float(iv[1])
+    theta = [(float(i) + 0.5) * math.pi / float(m) for i in range(m)]
+    ys = [_value(func, 0.5 * (a + b) + 0.5 * (b - a) * math.cos(t)) for t in theta]
+    coeffs = List[float]()
+    for k in range(m):
+        s = 0.0
+        for i in range(m):
+            s += ys[i] * math.cos(float(k) * theta[i])
+        coeffs.append(s * (1.0 if k == 0 else 2.0) / float(m))
+    return coeffs
+
+
+def _auto_chebyshev(func: Static[str], plan: _Plan):
+    # auto on field shares: func's Chebyshev series on the plan's interval, cut at the smallest degree whose remaining
+    # coefficients sum to at most half of max(Decor's error bound there, NONLINEAR_AUTO_FLOOR); Clenshaw's truncations
+    # add a few units of 2^-F per step. The coefficients come from a degree-n interpolant, n doubled until the cut falls
+    # in its lower half (the upper half, and beyond it the interpolant's aliasing, then lie far below the cut's tail).
+    # Coefficients within double-precision noise (2^-52 (16 + n / 8) of the function's scale, above what the
+    # interpolants show) count as zero: they bound the reachable accuracy, not the truncation.
+    if len(plan.cheb) > 0:
+        return
+    iv = plan.interval
+    key = (func, float(iv[0]), float(iv[1]))
+    if key in _AUTO_CHEBYSHEV:
+        plan.cheb = _AUTO_CHEBYSHEV[key].copy()
+        plan.degree = len(plan.cheb) - 1
+        return
+    target = 0.5 * max(decor_error_bound(func, iv), NONLINEAR_AUTO_FLOOR)
+    n = 32
+    while n <= 2 * NONLINEAR_AUTO_MAX_DEGREE:
+        c = _auto_coeffs(func, n, iv)
+        scale = 1.0
+        for v in c:
+            scale = max(scale, abs(v))
+        noise = 2.0 ** -52 * (16.0 + float(n) / 8.0) * scale
+        cut = n
+        tail = 0.0
+        while cut > 0:
+            size = abs(c[cut])
+            if size > noise:
+                if tail + size > target:
+                    break
+                tail += size
+            cut -= 1
+        if 2 * cut <= n:
+            coeffs = c[:cut + 1]
+            _check_chebyshev(f"nonlinear.{func} (auto, field)", iv, coeffs)
+            _AUTO_CHEBYSHEV[key] = coeffs.copy()
+            plan.cheb = coeffs
+            plan.degree = cut
+            return
+        n *= 2
+    raise ValueError(f"nonlinear.{func} (auto, field): no Chebyshev interpolant of degree up to "
+                     f"{NONLINEAR_AUTO_MAX_DEGREE} reaches Decor's accuracy on {iv}; pass method decor or chebyshev")
+
+
+def _auto_on_field(mpc, x) -> bool:
+    # Whether an auto call reaches a protocol on field shares: a secret Sharetensor of the field, or a multiparty or HE
+    # type whose MPC conversion takes the default MPC modulus, a field
+    if isinstance(x, Sharetensor):
+        return not x.public and x.modulus.popcnt() != 1
+    elif isinstance(x, MPP):
+        return mpc.default_mpc_modulus.popcnt() != 1
+    elif isinstance(x, MPA):
+        return mpc.default_mpc_modulus.popcnt() != 1
+    elif isinstance(x, MPU):
+        return mpc.default_mpc_modulus.popcnt() != 1
+    elif isinstance(x, Ciphertensor):
+        return mpc.default_mpc_modulus.popcnt() != 1
+    else:
+        return False
+
+
+def auto_degree(func: Static[str], interval = (0.0, 0.0), tolerance: float = DECOR_TOLERANCE) -> int:
+    """
+    The degree of the Chebyshev interpolant the auto method evaluates on field shares for func (sigmoid or tanh) on
+    interval (Decor's default interval when not given): public, no communication. Raises ValueError where auto refuses
+    the interval (Decor's admissibility check at tolerance).
+    """
+    plan = _plan(func, METHOD_AUTO, interval, 0, False, tolerance)
+    _auto_chebyshev(func, plan)
+    return plan.degree
+
+
+def _centred(mpc, x, pivot: float):
+    # x - pivot (a public constant added at one party: local)
+    modulus = x.modulus
+    shifted = x.share.sub_mod(double_to_fp(pivot, modulus), modulus) if mpc.pid == 1 else x.share.copy()
+    return _fp_tensor(shifted, modulus)
+
+
+def _secure_poly(mpc, xx, method: Static[str], plan: _Plan):
+    # A polynomial method on a fixed-point Sharetensor (clipped already when asked), from the plan's coefficients
+    a, b = plan.interval
+    if method == METHOD_CHEBYSHEV:
+        return chebyshev_evaluate(mpc, xx, plan.cheb, plan.interval)
+    elif method == METHOD_FOURIER:
+        return fourier_evaluate(mpc, xx, FourierSeries(plan.fourier_a0, plan.fourier_a, plan.fourier_b, plan.interval))
+    elif method == METHOD_TAYLOR:
+        pivot = (a + b) / 2.0
+        centred = _centred(mpc, xx, pivot)
+        _validate_domain(mpc, centred, (a - pivot, b - pivot), "polynomial (Taylor)")
+        return _decor_polynomial(mpc, centred, (a - pivot, b - pivot), plan.taylor)
+    else:
+        compile_error("nonlinear: no polynomial method " + method)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Dispatch over the types
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _sharetensor(mpc, x, func: Static[str], method: Static[str], plan: _Plan, tolerance: float):
+    if method == METHOD_AUTO:
+        # Decor on ring shares; on field shares the interpolant (computed before any round when _function foresaw the
+        # field, as for a Sharetensor; here otherwise, the same at every party)
+        if x.modulus.popcnt() == 1:
+            return _sharetensor(mpc, x, func, METHOD_DECOR, plan, tolerance)
+        _auto_chebyshev(func, plan)
+        return _sharetensor(mpc, x, func, METHOD_CHEBYSHEV, plan, tolerance)
+    elif method == METHOD_DECOR:
+        if func == "sin" or func == "cos" or func == "tan" or func == "cot":
+            return via_decor(mpc, x, func=func)
+        elif func == "inv":
+            mpc.fp.require_truncation("nonlinear.inv")
+            if _is_empty(x):
+                return _empty_like(x)
+            return decor_mul_inv(mpc, x)
+        else:
+            return via_decor(mpc, x, func=func, interval=plan.interval, clip=plan.clip, tolerance=tolerance)
+    else:
+        mpc.fp.require_truncation("nonlinear." + func)
+        if _is_empty(x):
+            return _empty_like(x)
+        xx = x if x.is_fp() else x.to_fp()
+        if plan.clip:
+            xx = _clip(mpc, xx, plan.interval[0], plan.interval[1])
+        return _secure_poly(mpc, xx, method, plan)
+
+
+def _mpp_in_the_clear(x, f):
+    # Each compute party's partition through the plaintext f; CP0 keeps a placeholder (as MPP's comparisons in the
+    # clear do)
+    mpc = x._mpc
+    if mpc.pid == 0:
+        data = x._local_data.zeros()
+    elif x.is_empty():
+        data = type(x._local_data)()
+    else:
+        data = x._local_data._propagate_call(f)
+    return type(x)(_mpc=mpc, _ratios=x._ratios.copy(), _local_data=data, _transposed=x._transposed)
+
+
+def _public_in_the_clear(mpc, x, f):
+    # A public Sharetensor (each party holds the whole value, as after publish) through the plaintext f at every compute
+    # party: no communication, and the result stays public. CP0 keeps zeros, as for MPP partitions in the clear.
+    xx = x if x.is_fp() else x.to_fp()
+    if mpc.pid == 0:
+        share = xx.share.zeros()
+    else:
+        share = double_to_fp(recursive_reduce(f, fp_to_double(xx.share, xx.modulus)), xx.modulus)
+    out = Sharetensor(share, xx.modulus)
+    out.fp = True
+    out.public = True
+    return out
+
+
+def _apply(mpc, x, func: Static[str], method: Static[str], plan: _Plan, tolerance: float):
+    if isinstance(x, Sharetensor):
+        if x.public:
+            return _public_in_the_clear(mpc, x, lambda v: _plain(func, method, plan, v))
+        return _sharetensor(mpc, x, func, method, plan, tolerance)
+    elif isinstance(x, MPP):
+        if method == METHOD_CHEBYSHEV and not plan.clip:
+            return chebyshev_evaluate(mpc, x, plan.cheb, plan.interval)
+        if x._cohort_in_the_clear():
+            return _mpp_in_the_clear(x, lambda v: _plain(func, method, plan, v))
+        return x.via_mpc(lambda st: _sharetensor(mpc, st, func, method, plan, tolerance))
+    elif isinstance(x, MPA):
+        if method == METHOD_CHEBYSHEV and not plan.clip:
+            return chebyshev_evaluate(mpc, x, plan.cheb, plan.interval)
+        return x.via_mpc(lambda st: _sharetensor(mpc, st, func, method, plan, tolerance))
+    elif isinstance(x, MPU):
+        if method == METHOD_CHEBYSHEV and not plan.clip:
+            return chebyshev_evaluate(mpc, x, plan.cheb, plan.interval)
+        x.check_valid()
+        if x.is_mpp():
+            return type(x)(_mpp=_apply(mpc, x._mpp, func, method, plan, tolerance), _mpa=type(x._mpa)(mpc))
+        return type(x)(_mpp=type(x._mpp)(mpc), _mpa=_apply(mpc, x._mpa, func, method, plan, tolerance))
+    elif isinstance(x, Ciphertensor):
+        if method == METHOD_CHEBYSHEV and not plan.clip:
+            return chebyshev_evaluate(mpc, x, plan.cheb, plan.interval)
+        if x.ndim == 1:
+            return x.via_mpc(mpc, lambda st: _sharetensor(mpc, st, func, method, plan, tolerance), S=Tuple[int])
+        return x.via_mpc(mpc, lambda st: _sharetensor(mpc, st, func, method, plan, tolerance), S=Tuple[int, int])
+    elif isinstance(x, ndarray):
+        if method == METHOD_CHEBYSHEV and not plan.clip:
+            return chebyshev_evaluate(mpc, x, plan.cheb, plan.interval)
+        return x.astype(float)._propagate_call(lambda v: _plain(func, method, plan, v))
+    else:
+        return recursive_reduce(lambda v: _plain(func, method, plan, float(v)), x)
+
+
+def _function(mpc, x, func: Static[str], method: Static[str], interval, degree: int, clip: bool, tolerance: float):
+    plan = _plan(func, method, interval, degree, clip, tolerance)
+    if method == METHOD_AUTO:
+        if _auto_on_field(mpc, x):
+            _auto_chebyshev(func, plan)
+    return _apply(mpc, x, func, method, plan, tolerance)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The functions
+# ---------------------------------------------------------------------------------------------------------------------
+
+def exp(mpc, x, method: Static[str] = METHOD_DECOR, interval = (0.0, 0.0), degree: int = 0, clip: bool = False,
+        tolerance: float = DECOR_TOLERANCE):
+    """ e^x (see the module docstring for method, interval, degree, clip, tolerance and the types). """
+    return _function(mpc, x, "exp", method, interval, degree, clip, tolerance)
+
+
+def sigmoid(mpc, x, method: Static[str] = METHOD_AUTO, interval = (0.0, 0.0), degree: int = 0, clip: bool = False,
+            tolerance: float = DECOR_TOLERANCE):
+    """
+    1 / (1 + e^-x). The default, auto, runs Decor on ring shares and a Chebyshev interpolant within Decor's error bound
+    (at least 2^-44) on field shares, where Decor costs about 35 times the ring's time (the field's division).
+    """
+    return _function(mpc, x, "sigmoid", method, interval, degree, clip, tolerance)
+
+
+def tanh(mpc, x, method: Static[str] = METHOD_AUTO, interval = (0.0, 0.0), degree: int = 0, clip: bool = False,
+         tolerance: float = DECOR_TOLERANCE):
+    """
+    tanh(x). The default, auto, runs Decor on ring shares and a Chebyshev interpolant within Decor's error bound (at
+    least 2^-44) on field shares, where Decor costs about 35 times the ring's time (the field's division).
+    """
+    return _function(mpc, x, "tanh", method, interval, degree, clip, tolerance)
+
+
+def sin(mpc, x, method: Static[str] = METHOD_DECOR, interval = (0.0, 0.0), degree: int = 0, clip: bool = False,
+        tolerance: float = DECOR_TOLERANCE):
+    """ sin(x), x in radians (Decor: any x, 3 rounds). """
+    return _function(mpc, x, "sin", method, interval, degree, clip, tolerance)
+
+
+def cos(mpc, x, method: Static[str] = METHOD_DECOR, interval = (0.0, 0.0), degree: int = 0, clip: bool = False,
+        tolerance: float = DECOR_TOLERANCE):
+    """ cos(x), x in radians (Decor: any x, 3 rounds). """
+    return _function(mpc, x, "cos", method, interval, degree, clip, tolerance)
+
+
+def tan(mpc, x, method: Static[str] = METHOD_DECOR, interval = (0.0, 0.0), degree: int = 0, clip: bool = False,
+        tolerance: float = DECOR_TOLERANCE):
+    """ tan(x), x in radians away from the poles (Decor: sin / cos through Decor division). """
+    return _function(mpc, x, "tan", method, interval, degree, clip, tolerance)
+
+
+def cot(mpc, x, method: Static[str] = METHOD_DECOR, interval = (0.0, 0.0), degree: int = 0, clip: bool = False,
+        tolerance: float = DECOR_TOLERANCE):
+    """ cot(x), x in radians away from the poles (Decor: cos / sin through Decor division). """
+    return _function(mpc, x, "cot", method, interval, degree, clip, tolerance)
+
+
+def sinh(mpc, x, method: Static[str] = METHOD_DECOR, interval = (0.0, 0.0), degree: int = 0, clip: bool = False,
+         tolerance: float = DECOR_TOLERANCE):
+    """ sinh(x). """
+    return _function(mpc, x, "sinh", method, interval, degree, clip, tolerance)
+
+
+def cosh(mpc, x, method: Static[str] = METHOD_DECOR, interval = (0.0, 0.0), degree: int = 0, clip: bool = False,
+         tolerance: float = DECOR_TOLERANCE):
+    """ cosh(x). """
+    return _function(mpc, x, "cosh", method, interval, degree, clip, tolerance)
+
+
+def log(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False,
+        tolerance: float = DECOR_TOLERANCE):
+    """ The natural logarithm of x > 0 on the interval (no Decor decomposition: Chebyshev by default). """
+    return _function(mpc, x, "log", method, interval, degree, clip, tolerance)
+
+
+def inv(mpc, x, method: Static[str] = METHOD_DECOR, interval = (0.0, 0.0), degree: int = 0, clip: bool = False,
+        tolerance: float = DECOR_TOLERANCE):
+    """
+    1 / x. Decor: Decor division (any sign; 2^-(F - 12) <= |x| <= 2^(K - F - 2); the field's division on the field).
+    The polynomial methods approximate 1 / x on an interval that excludes 0.
+    """
+    return _function(mpc, x, "inv", method, interval, degree, clip, tolerance)
+
+
+def erf(mpc, x, method: Static[str] = METHOD_CHEBYSHEV, interval = (0.0, 0.0), degree: int = 0, clip: bool = False,
+        tolerance: float = DECOR_TOLERANCE):
+    """
+    The error function (no Decor decomposition: Chebyshev by default, degree 20 on (-4, 4): about 2e-4). Outside the
+    interval Chebyshev extrapolates (the default gives -43 at 5), Fourier repeats, and Taylor wraps on the secure types
+    (see Domain in the module docstring): clip=True saturates at the ends instead.
+    """
+    return _function(mpc, x, "erf", method, interval, degree, clip, tolerance)
+
+
+def approx(mpc, x, op, interval, method: Static[str] = METHOD_CHEBYSHEV, degree: int = 0, clip: bool = False):
+    """
+    op(x) for a plaintext function op of one float, by its Chebyshev interpolant (default) or Fourier series of degree
+    `degree` on interval; types, domain and checks as in the module docstring.
+    """
+    if method != METHOD_CHEBYSHEV and method != METHOD_FOURIER:
+        compile_error("nonlinear.approx: method " + method + " needs a named function (chebyshev or fourier here)")
+    a, b = float(interval[0]), float(interval[1])
+    if not (b > a):
+        raise ValueError(f"nonlinear.approx: the interval {(a, b)} must have a < b")
+    plan = _Plan((a, b), _degree(method, degree), clip)
+    if method == METHOD_CHEBYSHEV:
+        plan.cheb = chebyshev_coeffs(op, chebyshev_nodes(plan.degree + 1, (a, b)), (a, b))
+        _check_chebyshev("nonlinear.approx (chebyshev)", (a, b), plan.cheb)
+    else:
+        series = fourier_coeffs(op, (a, b), plan.degree)
+        plan.fourier_a0, plan.fourier_a, plan.fourier_b = series.a0, series.a, series.b
+        _check_fourier("nonlinear.approx (fourier)", (a, b), plan.fourier_a0, plan.fourier_a, plan.fourier_b)
+    return _approx_apply(mpc, x, method, plan)
+
+
+def _plain_approx(method: Static[str], plan: _Plan, v: float) -> float:
+    return _plain_poly(method, plan, min(max(v, plan.interval[0]), plan.interval[1]) if plan.clip else v)
+
+
+def _approx_sharetensor(mpc, x, method: Static[str], plan: _Plan):
+    if method == METHOD_CHEBYSHEV and not plan.clip:
+        # the input as it is, as stdlib.builtin's chebyshev_* always evaluated it
+        return chebyshev_evaluate(mpc, x, plan.cheb, plan.interval)
+    mpc.fp.require_truncation("nonlinear.approx")
+    if _is_empty(x):
+        return _empty_like(x)
+    xx = x if x.is_fp() else x.to_fp()
+    if plan.clip:
+        xx = _clip(mpc, xx, plan.interval[0], plan.interval[1])
+    return _secure_poly(mpc, xx, method, plan)
+
+
+def _approx_apply(mpc, x, method: Static[str], plan: _Plan):
+    if isinstance(x, Sharetensor):
+        if x.public:
+            return _public_in_the_clear(mpc, x, lambda v: _plain_approx(method, plan, v))
+        if method == METHOD_CHEBYSHEV and not plan.clip and _is_empty(x):
+            mpc.fp.require_truncation("nonlinear.approx")
+            return _empty_like(x)
+        return _approx_sharetensor(mpc, x, method, plan)
+    elif isinstance(x, MPP):
+        if method == METHOD_CHEBYSHEV and not plan.clip:
+            return chebyshev_evaluate(mpc, x, plan.cheb, plan.interval)
+        if x._cohort_in_the_clear():
+            return _mpp_in_the_clear(x, lambda v: _plain_approx(method, plan, v))
+        return x.via_mpc(lambda st: _approx_sharetensor(mpc, st, method, plan))
+    elif isinstance(x, MPA):
+        if method == METHOD_CHEBYSHEV and not plan.clip:
+            return chebyshev_evaluate(mpc, x, plan.cheb, plan.interval)
+        return x.via_mpc(lambda st: _approx_sharetensor(mpc, st, method, plan))
+    elif isinstance(x, MPU):
+        if method == METHOD_CHEBYSHEV and not plan.clip:
+            return chebyshev_evaluate(mpc, x, plan.cheb, plan.interval)
+        x.check_valid()
+        if x.is_mpp():
+            return type(x)(_mpp=_approx_apply(mpc, x._mpp, method, plan), _mpa=type(x._mpa)(mpc))
+        return type(x)(_mpp=type(x._mpp)(mpc), _mpa=_approx_apply(mpc, x._mpa, method, plan))
+    elif isinstance(x, Ciphertensor):
+        if method == METHOD_CHEBYSHEV and not plan.clip:
+            return chebyshev_evaluate(mpc, x, plan.cheb, plan.interval)
+        if x.ndim == 1:
+            return x.via_mpc(mpc, lambda st: _approx_sharetensor(mpc, st, method, plan), S=Tuple[int])
+        return x.via_mpc(mpc, lambda st: _approx_sharetensor(mpc, st, method, plan), S=Tuple[int, int])
+    elif isinstance(x, ndarray):
+        if method == METHOD_CHEBYSHEV and not plan.clip:
+            return chebyshev_evaluate(mpc, x, plan.cheb, plan.interval)
+        return x.astype(float)._propagate_call(lambda v: _plain_approx(method, plan, v))
+    else:
+        return recursive_reduce(lambda v: _plain_approx(method, plan, float(v)), x)
+
+
+def polynomial(mpc, x, coeffs: List[float], interval, method: Static[str] = METHOD_DECOR, clip: bool = False,
+               tolerance: float = DECOR_TOLERANCE):
+    """
+    sum_k coeffs[k] x^k for x in interval, by Decor's polynomial decomposition (constant rounds; admissibility-checked
+    before any communication, for every type: see sequre.decor.via_decor); plaintext types evaluate it directly.
+    """
+    if method != METHOD_DECOR:
+        compile_error("nonlinear.polynomial: method " + method + " (decor only)")
+    if len(coeffs) == 0:
+        raise ValueError("nonlinear.polynomial: no coefficients")
+    a, b = float(interval[0]), float(interval[1])
+    if not (b > a):
+        raise ValueError(f"nonlinear.polynomial: the interval {(a, b)} must have a < b")
+    _admit("polynomial", (a, b), coeffs, tolerance)
+    return _polynomial_apply(mpc, x, coeffs, (a, b), clip, tolerance)
+
+
+def _polynomial_plain(coeffs: List[float], interval, clip: bool, v: float) -> float:
+    return poly_eval(coeffs, min(max(v, interval[0]), interval[1]) if clip else v)
+
+
+def _polynomial_apply(mpc, x, coeffs: List[float], interval, clip: bool, tolerance: float):
+    if isinstance(x, Sharetensor):
+        if x.public:
+            return _public_in_the_clear(mpc, x, lambda v: _polynomial_plain(coeffs, interval, clip, v))
+        return via_decor(mpc, x, func="polynomial", interval=interval, coeffs=coeffs, clip=clip, tolerance=tolerance)
+    elif isinstance(x, MPP):
+        if x._cohort_in_the_clear():
+            return _mpp_in_the_clear(x, lambda v: _polynomial_plain(coeffs, interval, clip, v))
+        return x.via_mpc(lambda st: _polynomial_apply(mpc, st, coeffs, interval, clip, tolerance))
+    elif isinstance(x, MPA):
+        return x.via_mpc(lambda st: _polynomial_apply(mpc, st, coeffs, interval, clip, tolerance))
+    elif isinstance(x, MPU):
+        x.check_valid()
+        if x.is_mpp():
+            return type(x)(_mpp=_polynomial_apply(mpc, x._mpp, coeffs, interval, clip, tolerance),
+                           _mpa=type(x._mpa)(mpc))
+        return type(x)(_mpp=type(x._mpp)(mpc), _mpa=_polynomial_apply(mpc, x._mpa, coeffs, interval, clip, tolerance))
+    elif isinstance(x, Ciphertensor):
+        if x.ndim == 1:
+            return x.via_mpc(mpc, lambda st: _polynomial_apply(mpc, st, coeffs, interval, clip, tolerance),
+                             S=Tuple[int])
+        return x.via_mpc(mpc, lambda st: _polynomial_apply(mpc, st, coeffs, interval, clip, tolerance),
+                         S=Tuple[int, int])
+    elif isinstance(x, ndarray):
+        return x.astype(float)._propagate_call(lambda v: _polynomial_plain(coeffs, interval, clip, v))
+    else:
+        return recursive_reduce(lambda v: _polynomial_plain(coeffs, interval, clip, float(v)), x)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Softmax
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _pair_max(mpc, a, b):
+    # max(a, b) element-wise for fixed-point Sharetensors of one shape: b + [a > b] (a - b), with the comparison through
+    # ring_gt (the K + 1-bit sign test on the ring, the field comparison on the field) and one product of the 0/1 mask
+    # (an integer: no truncation)
+    modulus = a.modulus
+    d = _fp_tensor(a.share.sub_mod(b.share, modulus), modulus)
+    mask = ring_gt(mpc, d, 0.0, bits=MPC_NBIT_K + 1)
+    return _fp_tensor(b.share.add_mod(_one_round_product(mpc, mask.share, d.share, modulus), modulus), modulus)
+
+
+def _row_max(mpc, x):
+    # The maximum of each row of a 2-D fixed-point Sharetensor, as a column (rows x 1): a pairwise tree over the
+    # columns, ceil(log2(cols)) levels of one comparison and one product each
+    cols = len(x.share[0])
+    cur = x
+    while cols > 1:
+        half = cols // 2
+        left = Sharetensor([row[:half] for row in cur.share], cur.modulus)
+        right = Sharetensor([row[half:2 * half] for row in cur.share], cur.modulus)
+        left.fp = True
+        right.fp = True
+        m = _pair_max(mpc, left, right)
+        if cols % 2:
+            # the odd column carries over (an explicit append: Sequre's list + adds element-wise)
+            share = m.share.copy()
+            for i in range(len(share)):
+                row = share[i].copy()
+                row.append(cur.share[i][cols - 1])
+                share[i] = row
+            m = Sharetensor(share, cur.modulus)
+            m.fp = True
+        cur = m
+        cols = len(cur.share[0])
+    return cur
+
+
+def _softmax_exp(mpc, z, method: Static[str], width: float, plan: _Plan, clip_both: bool):
+    # e^z on (-width, 0], z clipped below only when z <= 0 is known (the max shift), at both ends otherwise: by Decor or
+    # the plan's Chebyshev interpolant
+    if method == METHOD_DECOR:
+        if clip_both:
+            return via_decor(mpc, z, func="exp", interval=(-width, 0.0), clip=True)
+        else:
+            return via_decor(mpc, _clip_below(mpc, z, -width), func="exp", interval=(-width, 0.0))
+    else:
+        if clip_both:
+            return _sharetensor(mpc, z, "exp", method, plan, DECOR_TOLERANCE)
+        else:
+            below = _Plan(plan.interval, plan.degree, False)
+            below.cheb = plan.cheb
+            return _sharetensor(mpc, _clip_below(mpc, z, -width), "exp", method, below, DECOR_TOLERANCE)
+
+
+def _softmax_rows(mpc, x, method: Static[str], shift: Static[str], width: float, offset: float, plan: _Plan):
+    # Row-wise softmax of a 2-D fixed-point Sharetensor with at least one column
+    modulus = x.modulus
+    rows = len(x.share)
+    cols = len(x.share[0])
+    if shift == "max":
+        # z = x - max <= 0 exactly (the maximum is one of the row's own values): only the lower end needs the clip
+        m = _row_max(mpc, x)
+        z = _fp_tensor([[e.sub_mod(m.share[i][0], modulus) for e in x.share[i]] for i in range(rows)], modulus)
+        e = _softmax_exp(mpc, z, method, width, plan, False)
+    elif shift == "fixed":
+        z = _fp_tensor(x.share.sub_mod(double_to_fp(offset, modulus), modulus) if mpc.pid == 1 else x.share.copy(),
+                       modulus)
+        e = _softmax_exp(mpc, z, method, width, plan, True)
+    else:
+        compile_error("nonlinear.softmax: unknown shift " + shift + " (max or fixed)")
+    s = e.sum(axis=1)
+    inv = decor_mul_inv(mpc, s, sign_check=False)
+    spread = Sharetensor([[inv.share[i] for _ in range(cols)] for i in range(rows)], modulus)
+    spread.fp = True
+    return _times(mpc, e, spread)
+
+
+@sequre
+def _times(mpc, a, b):
+    return a * b
+
+
+def _clip_below(mpc, z, low: float):
+    # max(z, low) for a 2-D fixed-point Sharetensor: one comparison of low - z with 0, one product of the 0/1 mask
+    modulus = z.modulus
+    rows = len(z.share)
+    cols = len(z.share[0])
+    neg = z.share.zeros().sub_mod(z.share, modulus)
+    d = _fp_tensor(neg.add_mod(double_to_fp(low, modulus), modulus) if mpc.pid == 1 else neg, modulus)
+    flat = _fp_tensor(d.share.flatten(), modulus)
+    mask = ring_gt(mpc, flat, 0.0, bits=MPC_NBIT_K + 1).share
+    mask2 = [mask[i * cols:(i + 1) * cols] for i in range(rows)]
+    return _fp_tensor(z.share.add_mod(_one_round_product(mpc, mask2, d.share, modulus), modulus), modulus)
+
+
+def _widest_softmax_width() -> float:
+    # The widest W (in steps of 0.5) whose exp interval (-W, 0] passes Decor's check at DECOR_TOLERANCE
+    w = 1.0
+    while w < 256.0:
+        try:
+            _admit("exp", (-(w + 0.5), 0.0), List[float](), DECOR_TOLERANCE)
+        except ValueError:
+            return w
+        w += 0.5
+    return w
+
+
+def _softmax_plain_exp(method: Static[str], shift: Static[str], plan: _Plan, v: float, row_max: float,
+                       offset: float) -> float:
+    # One exponential of the plaintext softmax: Decor computes e^x itself (any shift gives the same softmax: e^(x - max));
+    # Chebyshev its interpolant of e^z on (-width, 0], clipped, at z = x - max or x - offset
+    if method == METHOD_DECOR:
+        return math.exp(v - row_max)
+    z = v - row_max if shift == "max" else v - offset
+    return _plain("exp", method, plan, z)
+
+
+def _softmax_plain(a, method: Static[str] = METHOD_DECOR, shift: Static[str] = "max", offset: float = 0.0,
+                   plan: _Plan = _Plan((0.0, 0.0), 0, False)):
+    # Row-wise softmax of a float ndarray (1-D: the whole vector), the method's exponentials (see _softmax_plain_exp)
+    out = a.astype(float)
+    if isinstance(out.shape, Tuple[int, int]):
+        rows, cols = out.shape[0], out.shape[1]
+        for i in range(rows):
+            m = out[i, 0]
+            for j in range(1, cols):
+                m = max(m, out[i, j])
+            total = 0.0
+            for j in range(cols):
+                out[i, j] = _softmax_plain_exp(method, shift, plan, out[i, j], m, offset)
+                total += out[i, j]
+            for j in range(cols):
+                out[i, j] = out[i, j] / total
+    else:
+        n = out.shape[0]
+        if n > 0:
+            m = out[0]
+            for j in range(1, n):
+                m = max(m, out[j])
+            total = 0.0
+            for j in range(n):
+                out[j] = _softmax_plain_exp(method, shift, plan, out[j], m, offset)
+                total += out[j]
+            for j in range(n):
+                out[j] = out[j] / total
+    return out
+
+
+def _mpp_softmax_in_the_clear(x, method: Static[str], shift: Static[str], offset: float, plan: _Plan):
+    # Row-wise softmax of each compute party's partition (its rows are whole rows: the MPP is not transposed)
+    mpc = x._mpc
+    if mpc.pid == 0:
+        data = x._local_data.zeros()
+    elif x.is_empty():
+        data = type(x._local_data)()
+    else:
+        data = _softmax_plain(x._local_data, method, shift, offset, plan)
+    return type(x)(_mpc=mpc, _ratios=x._ratios.copy(), _local_data=data, _transposed=x._transposed)
+
+
+def softmax(mpc, x, method: Static[str] = METHOD_DECOR, shift: Static[str] = "max",
+            width: float = NONLINEAR_SOFTMAX_WIDTH, offset: float = 0.0, degree: int = 0):
+    """
+    The softmax of each row of a matrix (the whole vector for a 1-D x): e^(x - shift) / sum(e^(x - shift)). The exp
+    runs on (-width, 0], clipped at -width (e^-16 = 1.1e-7 at the default width 16), then one inverse per row (Decor
+    division) and one product.
+    method "decor" (default): Decor's exp. "chebyshev": the degree-`degree` Chebyshev interpolant of e^z on (-width, 0]
+    (degree 0: CHEBYSHEV_DEGREE), the division still Decor's; every type returns the same (in the clear: the
+    interpolant and an exact division).
+    shift "max" (default): each row's maximum by a pairwise tree of comparisons (ceil(log2(cols)) levels), so every
+    exponent is at most 0 and each row sum S at least 1: with Decor, absolute error about (1 + cols) e plus a few units,
+    with e the exp's error bound (decor_error_bound("exp", (-width, 0)), 7e-7 at F = 32).
+    shift "fixed": the public offset instead (no comparisons for the maximum). The exponents must stay at most 0 (a row
+    above the offset saturates at 0: wrong), and the error is divided by the row sum S >= e^(row max - offset): at most
+    (1 + cols) e e^(offset - row max), so with Decor 1e-3 is guaranteed for row maxima within about 6.6 of the offset
+    with one column, 4.9 with 10 and 3.8 with 30 at F = 32 (typically within about 7), and S must stay above the
+    division's smallest divisor 2^-(F - 12) (row max - offset > -13.9). offset applies to the fixed shift only.
+    """
+    if method != METHOD_DECOR and method != METHOD_CHEBYSHEV:
+        compile_error("nonlinear.softmax: method " + method + " (decor or chebyshev)")
+    if shift == "max" and offset != 0.0:
+        raise ValueError("nonlinear.softmax: offset applies to the fixed shift only (shift=\"fixed\")")
+    if not (width > 0.0):
+        raise ValueError(f"nonlinear.softmax: the width must be positive, not {width}")
+    if method == METHOD_DECOR:
+        if degree != 0:
+            raise ValueError("nonlinear.softmax: Decor takes no degree")
+        try:
+            _admit("exp", (-width, 0.0), List[float](), DECOR_TOLERANCE)
+        except ValueError:
+            raise ValueError(f"nonlinear.softmax: width {width} is beyond Decor exp's admissible intervals (-W, 0] at "
+                             f"this precision; the widest admissible is about {_widest_softmax_width():.0f}")
+        plan = _Plan((-width, 0.0), 0, True)
+    else:
+        plan = _plan("exp", METHOD_CHEBYSHEV, (-width, 0.0), degree, True, DECOR_TOLERANCE)
+    if isinstance(x, Sharetensor):
+        mpc.fp.require_truncation("nonlinear.softmax")
+        xx = x if x.is_fp() else x.to_fp()
+        if xx.public and not _is_empty(xx):
+            # a public tensor through the plaintext softmax at every compute party; the result stays public
+            if mpc.pid == 0:
+                pshare = xx.share.zeros()
+            else:
+                pshare = double_to_fp(_softmax_plain(array(fp_to_double(xx.share, xx.modulus)), method, shift, offset, plan).tolist(), xx.modulus)
+            pout = Sharetensor(pshare, xx.modulus)
+            pout.fp = True
+            pout.public = True
+            return pout
+        if isinstance(xx.share, list[list]):
+            if _is_empty(xx):
+                return xx.copy()
+            return _softmax_rows(mpc, xx, method, shift, width, offset, plan)
+        if len(xx.share) == 0:
+            return xx.copy()
+        row = Sharetensor([xx.share], xx.modulus)
+        row.fp = True
+        res = _softmax_rows(mpc, row, method, shift, width, offset, plan)
+        out = Sharetensor(res.share[0], xx.modulus)
+        out.fp = True
+        return out
+    elif isinstance(x, MPP):
+        # Locally only when each partition holds whole rows: a 2-D MPP that is not transposed (a 1-D MPP is split by
+        # elements, which the vector's softmax spans)
+        if isinstance(x._local_data.shape, Tuple[int, int]):
+            if not x._transposed and x._cohort_in_the_clear():
+                return _mpp_softmax_in_the_clear(x, method, shift, offset, plan)
+        return x.via_mpc(lambda st: softmax(mpc, st, method, shift, width, offset, degree))
+    elif isinstance(x, MPA):
+        return x.via_mpc(lambda st: softmax(mpc, st, method, shift, width, offset, degree))
+    elif isinstance(x, MPU):
+        x.check_valid()
+        if x.is_mpp():
+            return type(x)(_mpp=softmax(mpc, x._mpp, method, shift, width, offset, degree), _mpa=type(x._mpa)(mpc))
+        return type(x)(_mpp=type(x._mpp)(mpc), _mpa=softmax(mpc, x._mpa, method, shift, width, offset, degree))
+    elif isinstance(x, Ciphertensor):
+        if x.ndim == 1:
+            return x.via_mpc(mpc, lambda st: softmax(mpc, st, method, shift, width, offset, degree), S=Tuple[int])
+        return x.via_mpc(mpc, lambda st: softmax(mpc, st, method, shift, width, offset, degree), S=Tuple[int, int])
+    elif isinstance(x, ndarray):
+        return _softmax_plain(x, method, shift, offset, plan)
+    elif method == METHOD_DECOR:
+        from sequre.decor.functions import softmax as plain_softmax
+        return plain_softmax(x)
+    else:
+        compile_error("nonlinear.softmax: the Chebyshev method takes an ndarray in the clear (not a plain list)")

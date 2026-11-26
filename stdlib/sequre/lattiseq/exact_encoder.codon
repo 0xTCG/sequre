@@ -1,0 +1,594 @@
+"""
+Exact CKKS encoding: encoding and decoding whose error does not grow with the magnitude of the values.
+
+ckks.EncoderComplex128 runs the encoding FFT in double precision, so a slot of magnitude |v| comes back off by about
+|v| * 2^-52. Protocols that hide values under large random masks, such as the conversions between secret shares and
+ciphertexts, need an encoding whose error does not depend on the magnitude. Lattigo uses math/big.Float for this
+(EncoderBigComplex); this encoder uses fixed-point integers.
+
+A slot holds z = Z / 2^frac_bits, with the integer Z (real and imaginary parts) given as a lattiseq_exact_int. Encoding
+computes the plaintext coefficients round(scale * IFFT(z)) with an integer FFT on LATTISEQ_EXACT_INT_SIZE-bit values
+(products in twice that width, roots of unity to LATTISEQ_EXACT_INT_SIZE - 2 bits). The FFT carries enough fractional
+bits that the value it rounds is within 2^-EXACT_GUARD_BITS of the true one, whatever the magnitude of the input.
+Decoding reconstructs the centered coefficients exactly (CRT) and returns round(2^frac_bits * FFT(c) / scale) the same
+way. What remains is the error of CKKS itself, the rounding of the coefficients to integers: at most 1/2 per
+coefficient, so at most N / (2 * scale) per slot (about sqrt(N) / (3.5 * scale) for random values).
+
+Inputs too large for the integer width raise ValueError instead of losing precision. With 2^13 slots, encoding needs
+about log2(max|z| * scale) + 25 bits, decoding log2(max|coefficient|) + log2(slots) + frac_bits - log2(scale) + 25 bits;
+the error message gives the exact count. The FFTs run on lattiseq_threads() threads.
+
+Encoded coefficients are reduced modulo the plaintext's moduli without a range check: reduction is a ring
+homomorphism, so a sum of encodings of large masked values still decodes to the sum of the values, as long as that sum
+is itself small. Decoding needs the centered coefficients to fit the integer width (it checks).
+
+Only the standard ring is supported (not the conjugate-invariant one).
+"""
+import math
+
+from sequre.types.builtin import *
+from sequre.types.gmp import mpz_t, _new_mpz_t
+from sequre.constants import (
+    GMP_PATH, LATTISEQ_INT_SIZE, LATTISEQ_EXACT_INT_SIZE, LATTISEQ_EXACT_WIDE_SIZE, LATTISEQ_GALOIS_GEN,
+    LATTISEQ_MIN_LOG_SLOTS, LATTISEQ_STANDARD_RING_ENUM, lattiseq_int, lattiseq_uint, lattiseq_exact_int,
+    lattiseq_exact_wide_int)
+
+import ckks, ring
+from threads import lattiseq_threads
+from bigfloat import BigFloat, mpf_t
+from cosine_approx import PI_STR
+
+
+from C import GMP_PATH.__gmpf_mul_2exp(mpf_t, mpf_t, u64) as _mpf_mul_2exp
+from C import GMP_PATH.__gmpz_set_f(mpz_t, mpf_t) as _mpz_set_f
+
+
+xint = lattiseq_exact_int
+wint = lattiseq_exact_wide_int
+
+# The value the FFT rounds is within 2^-EXACT_GUARD_BITS of the true one, in units of the result.
+EXACT_GUARD_BITS: int = 16
+# Roots of unity are fixed-point integers scaled by 2^EXACT_ROOT_BITS.
+EXACT_ROOT_BITS: Static[int] = LATTISEQ_EXACT_INT_SIZE - 2
+# FFT inputs are bounded by 2^EXACT_INPUT_BITS per component: one bit for the sign, one for the growth of a component
+# when a complex value rotates (by at most sqrt(2)), one spare.
+EXACT_INPUT_BITS: int = LATTISEQ_EXACT_INT_SIZE - 3
+# Fractional bits of the float interface (encode/decode): floats from 2^-11 up convert exactly.
+EXACT_FLOAT_FRAC_BITS: int = 64
+# Vectors shorter than this are transformed on one thread.
+EXACT_PARALLEL_MIN_SLOTS: int = 1024
+
+
+# _round_shift returns x * 2^-s rounded to the nearest integer (ties upwards); a negative s multiplies by 2^-s exactly.
+def _round_shift(x, s: int):
+    T = type(x)
+    if s > 0: return (x + (T(1) << T(s - 1))) >> T(s)
+    if s < 0: return x << T(-s)
+    return x
+
+
+# _bitlen returns the bit length of |x|.
+def _bitlen(x) -> int:
+    return int(x.bitlen())
+
+
+# _max_bitlen returns the largest bit length of the |x| in values.
+def _max_bitlen(values) -> int:
+    b = 0
+    for v in values: b = max(b, _bitlen(v))
+    return b
+
+
+# _scale_parts splits a positive finite scale into an odd integer and a power of two: scale = mantissa * 2^exponent.
+def _scale_parts(scale: float) -> Tuple[int, int]:
+    if not (scale > 0.0) or math.isinf(scale):
+        raise ValueError(f"exact encoder: the scale must be positive and finite, not {scale}")
+    fraction, exponent = math.frexp(scale)  # scale = fraction * 2^exponent, 0.5 <= fraction < 1
+    mantissa = int(fraction * 9007199254740992.0)  # fraction * 2^53 is an integer below 2^53
+    exponent -= 53
+    while mantissa & 1 == 0:
+        mantissa >>= 1
+        exponent += 1
+    return mantissa, exponent
+
+
+# _div_u64 returns x / d rounded towards zero.
+def _div_u64(x: wint, d: u64) -> wint:
+    LIMBS: Static[int] = LATTISEQ_EXACT_WIDE_SIZE // 64
+    negative = x < wint(0)
+    a = -x if negative else x
+    limbs = Ptr[u64](__ptr__(a).as_byte())
+    out = Ptr[u64](LIMBS)
+    divisor = UInt[128](d)
+    rem = UInt[128](0)
+    for i in range(LIMBS - 1, -1, -1):
+        cur = (rem << UInt[128](64)) | UInt[128](limbs[i])
+        q = cur // divisor
+        rem = cur - q * divisor
+        out[i] = u64(q)
+    quotient = Ptr[wint](out.as_byte())[0]
+    return -quotient if negative else quotient
+
+
+# _float_to_fixed returns round(v * 2^frac_bits) (ties away from zero).
+def _float_to_fixed(v: float, frac_bits: int) -> xint:
+    t = math.ldexp(v, frac_bits)
+    if math.isnan(t) or math.isinf(t) or abs(t) >= math.ldexp(1.0, EXACT_INPUT_BITS):
+        raise ValueError(f"exact encoder: {v} does not fit {EXACT_INPUT_BITS} bits at {frac_bits} fractional bits")
+    if abs(t) < 4611686018427387904.0:  # 2^62
+        r = int(math.floor(abs(t) + 0.5))
+        return xint(-r if t < 0 else r)
+    return xint(t)  # an integer already (floats from 2^53 up are)
+
+
+# _fixed_to_float returns Z * 2^-frac_bits, rounded to a float.
+def _fixed_to_float(z: xint, frac_bits: int) -> float:
+    return math.ldexp(z.to_float(), -frac_bits)
+
+
+# _bigfloat_to_fixed returns round(x * 2^bits) (ties away from zero).
+def _bigfloat_to_fixed(x: BigFloat, bits: int) -> xint:
+    t = BigFloat(x.prec()).set(x)
+    _mpf_mul_2exp(t._mpf, t._mpf, u64(bits))
+    t.add(t, BigFloat(x.prec()).set_float64(0.5 if t.sign() >= 0 else -0.5))
+    z = _new_mpz_t()
+    _mpz_set_f(z, t._mpf)  # truncates towards zero
+    return z.to_int_n(LATTISEQ_EXACT_INT_SIZE)
+
+
+# _sin_cos returns sin(theta) and cos(theta) for a small theta, by their Taylor series at the precision of theta.
+def _sin_cos(theta: BigFloat) -> Tuple[BigFloat, BigFloat]:
+    prec = theta.prec()
+    theta2 = BigFloat(prec).mul(theta, theta)
+    sin = BigFloat(prec).set(theta)
+    cos = BigFloat(prec).set_float64(1.0)
+    term_sin = BigFloat(prec).set(theta)
+    term_cos = BigFloat(prec).set_float64(1.0)
+    divisor = BigFloat(prec)
+    tiny = math.ldexp(1.0, -(prec + 8))
+
+    k = 1
+    while True:
+        term_cos.mul(term_cos, theta2)
+        term_cos.quo(term_cos, divisor.set_float64(float((2 * k - 1) * (2 * k))))
+        term_sin.mul(term_sin, theta2)
+        term_sin.quo(term_sin, divisor.set_float64(float((2 * k) * (2 * k + 1))))
+        if k & 1:
+            cos.sub(cos, term_cos)
+            sin.sub(sin, term_sin)
+        else:
+            cos.add(cos, term_cos)
+            sin.add(sin, term_sin)
+        if term_cos.float64() < tiny and term_sin.float64() < tiny: break
+        k += 1
+
+    return sin, cos
+
+
+# _exact_roots returns the real and imaginary parts of exp(2 * pi * i * k / m), k = 0..m, as fixed-point integers
+# scaled by 2^EXACT_ROOT_BITS. Only k <= m/8 is computed (in multi-precision floats, 64 bits beyond the fixed point);
+# the rest follows from the symmetries of the circle, so that the table is exactly symmetric.
+def _exact_roots(m: int) -> Tuple[List[xint], List[xint]]:
+    prec = EXACT_ROOT_BITS + 64
+    eighth, quarter = m >> 3, m >> 2
+
+    theta = BigFloat(prec).set_string(PI_STR)
+    theta.mul(theta, BigFloat(prec).set_float64(2.0))
+    theta.quo(theta, BigFloat(prec).set_float64(float(m)))
+    sin1, cos1 = _sin_cos(theta)
+
+    base_cos = List[xint](eighth + 1)
+    base_sin = List[xint](eighth + 1)
+    cur_cos = BigFloat(prec).set_float64(1.0)
+    cur_sin = BigFloat(prec).set_float64(0.0)
+    next_cos, next_sin, tmp = BigFloat(prec), BigFloat(prec), BigFloat(prec)
+    for _ in range(eighth + 1):
+        base_cos.append(_bigfloat_to_fixed(cur_cos, EXACT_ROOT_BITS))
+        base_sin.append(_bigfloat_to_fixed(cur_sin, EXACT_ROOT_BITS))
+        next_cos.mul(cur_cos, cos1)
+        next_cos.sub(next_cos, tmp.mul(cur_sin, sin1))
+        next_sin.mul(cur_sin, cos1)
+        next_sin.add(next_sin, tmp.mul(cur_cos, sin1))
+        cur_cos.set(next_cos)
+        cur_sin.set(next_sin)
+
+    roots_re = List[xint](m + 1)
+    roots_im = List[xint](m + 1)
+    for k in range(m + 1):
+        j = k % m
+        conj = j > (m >> 1)  # exp(-i a) = conj(exp(i a))
+        if conj: j = m - j
+        rotate = j > quarter  # exp(i (pi/2 + a)) = i exp(i a)
+        if rotate: j -= quarter
+        if j > eighth:  # exp(i (pi/2 - a)) = i conj(exp(i a))
+            re, im = base_sin[quarter - j], base_cos[quarter - j]
+        else:
+            re, im = base_cos[j], base_sin[j]
+        if rotate: re, im = -im, re
+        if conj: im = -im
+        roots_re.append(re)
+        roots_im.append(im)
+
+    return roots_re, roots_im
+
+
+# _bit_reverse applies the bit-reversal permutation to the first n entries of values, in place.
+def _bit_reverse(values: List[xint], n: int):
+    j = 0
+    for i in range(1, n):
+        bit = n >> 1
+        while j >= bit:
+            j -= bit
+            bit >>= 1
+        j += bit
+        if i < j: values[i], values[j] = values[j], values[i]
+
+
+# _special_ifft performs the CKKS special inverse FFT (ckks.special_ifft_vec, including its division by n) on the
+# fixed-point vector re + i * im, in place. Every butterfly halves its outputs with one rounding, so the components
+# never exceed sqrt(2) times the largest input component. Each stage adds at most about 1.2 units of error (1/2 from
+# the rounding, up to 1/2 from the roots' own rounding at the largest values), so the result is within
+# 2 * (log2(n) + 1) units of the exact one.
+def _special_ifft(re: List[xint], im: List[xint], n: int, m: int, rot_group: List[int],
+                  roots_re: List[xint], roots_im: List[xint]):
+    logn = int(n.bitlen()) - 1
+    logm = int(m.bitlen()) - 1
+    threads = lattiseq_threads() if n >= EXACT_PARALLEL_MIN_SLOTS else 1
+
+    for log_len in range(logn, 0, -1):
+        lenh = 1 << (log_len - 1)
+        lenq = 1 << (log_len + 2)
+        log_gap = logm - 2 - log_len
+        mask = lenq - 1
+        # The n / 2 butterflies of a stage are independent: butterfly b pairs k and k + lenh, k = i + j with i the
+        # start of its block of 2 * lenh and j its place in the block. The wide constants are built inside the loop:
+        # Codon 0.19.6 miscompiles parallel loops that capture a value wider than 64 bits (Int/UInt of 128 bits or
+        # more, SIMD vectors) from outside, which then read wrong values or crash.
+        @par(num_threads=threads)
+        for b in range(n >> 1):
+            shift = wint(EXACT_ROOT_BITS + 1)
+            half = wint(1) << wint(EXACT_ROOT_BITS)
+            j = b & (lenh - 1)
+            k = ((b >> (log_len - 1)) << log_len) + j
+            kh = k + lenh
+            idx = (lenq - (rot_group[j] & mask)) << log_gap
+            ur, ui, vr, vi = re[k], im[k], re[kh], im[kh]
+            re[k] = (ur + vr + xint(1)) >> xint(1)
+            im[k] = (ui + vi + xint(1)) >> xint(1)
+            dr, di = wint(ur - vr), wint(ui - vi)
+            wr, wi = wint(roots_re[idx]), wint(roots_im[idx])
+            re[kh] = xint((dr * wr - di * wi + half) >> shift)
+            im[kh] = xint((dr * wi + di * wr + half) >> shift)
+
+    _bit_reverse(re, n)
+    _bit_reverse(im, n)
+
+
+# _special_fft performs the CKKS special FFT (ckks.special_fft_vec) divided by n on the fixed-point vector re + i * im,
+# in place. Every butterfly halves its outputs with one rounding, as in _special_ifft; the result is within
+# 2 * (log2(n) + 1) units of the exact FFT / n.
+def _special_fft(re: List[xint], im: List[xint], n: int, m: int, rot_group: List[int],
+                 roots_re: List[xint], roots_im: List[xint]):
+    _bit_reverse(re, n)
+    _bit_reverse(im, n)
+    logn = int(n.bitlen()) - 1
+    logm = int(m.bitlen()) - 1
+    threads = lattiseq_threads() if n >= EXACT_PARALLEL_MIN_SLOTS else 1
+
+    for log_len in range(1, logn + 1):
+        lenh = 1 << (log_len - 1)
+        lenq = 1 << (log_len + 2)
+        log_gap = logm - 2 - log_len
+        mask = lenq - 1
+        @par(num_threads=threads)
+        for b in range(n >> 1):  # independent butterflies, numbered (and constants built) as in _special_ifft
+            root_bits = wint(EXACT_ROOT_BITS)
+            shift = wint(EXACT_ROOT_BITS + 1)
+            half = wint(1) << root_bits
+            j = b & (lenh - 1)
+            k = ((b >> (log_len - 1)) << log_len) + j
+            kh = k + lenh
+            idx = (rot_group[j] & mask) << log_gap
+            wr, wi = wint(roots_re[idx]), wint(roots_im[idx])
+            vr, vi = wint(re[kh]), wint(im[kh])
+            pr = vr * wr - vi * wi
+            pi = vr * wi + vi * wr
+            ur = (wint(re[k]) << root_bits) + half
+            ui = (wint(im[k]) << root_bits) + half
+            re[k] = xint((ur + pr) >> shift)
+            im[k] = xint((ui + pi) >> shift)
+            re[kh] = xint((ur - pr) >> shift)
+            im[kh] = xint((ui - pi) >> shift)
+
+
+# _residue returns x mod q for a signed big integer x, from the limbs of |x| and pows[j] = 2^(64 j) mod q.
+def _residue(x, q: u64, bred_params: List[u64], pows: List[u64]) -> u64:
+    T = type(x)
+    negative = x < T(0)
+    a = -x if negative else x
+    limbs = Ptr[u64](__ptr__(a).as_byte())
+    r = u64(0)
+    for j in range((_bitlen(a) + 63) >> 6):
+        r += ring.bred(ring.bred_add(limbs[j], q, bred_params[0]), pows[j], q, bred_params)
+        if r >= q: r -= q
+    if negative and r != u64(0): r = q - r
+    return r
+
+
+# _CRTLevel holds the constants of the CRT reconstruction modulo q_0 * ... * q_level.
+class _CRTLevel:
+    modulus: lattiseq_int           # Q = q_0 * ... * q_level
+    half: lattiseq_int              # floor(Q / 2)
+    factors: List[lattiseq_uint]    # Q / q_k
+    inverses: List[u64]             # (Q / q_k)^-1 mod q_k
+    reciprocals: List[float]        # 1 / q_k
+
+
+# ExactEncoder encodes and decodes fixed-point values with errors independent of their magnitude (see the module).
+class ExactEncoder:
+    params: ckks.Parameters
+    m: int
+    rot_group: List[int]
+    roots_re: List[xint]
+    roots_im: List[xint]
+    moduli: List[u64]
+    bred_params: List[List[u64]]
+    pows: List[List[u64]]           # pows[k][j] = 2^(64 j) mod q_k
+    crt_levels: List[_CRTLevel]     # for the levels whose reconstruction fits a lattiseq_int
+    buff: ring.Poly
+
+    def __init__(self, params: ckks.Parameters):
+        if params.ring_type != LATTISEQ_STANDARD_RING_ENUM:
+            raise NotImplementedError("exact encoder: only the standard ring is supported")
+
+        ring_q = params.ring_q
+        m = int(ring_q.nth_root)
+        self.params = params
+        self.m = m
+
+        self.rot_group = List[int](m >> 2)
+        five_pows = 1
+        for _ in range(m >> 2):
+            self.rot_group.append(five_pows)
+            five_pows = (five_pows * LATTISEQ_GALOIS_GEN) & (m - 1)
+
+        self.roots_re, self.roots_im = _exact_roots(m)
+
+        self.moduli = ring_q.modulus.copy()
+        self.bred_params = [ring.bred_params(q) for q in self.moduli]
+        limbs = max(LATTISEQ_INT_SIZE, LATTISEQ_EXACT_INT_SIZE) // 64
+        self.pows = List[List[u64]](len(self.moduli))
+        for k, q in enumerate(self.moduli):
+            two_64 = (u64(-1).__naive_mod(q) + u64(1)).__naive_mod(q)
+            pows = [u64(1).__naive_mod(q)]
+            for _ in range(1, limbs): pows.append(ring.bred(pows[-1], two_64, q, self.bred_params[k]))
+            self.pows.append(pows)
+
+        self.crt_levels = List[_CRTLevel](len(self.moduli))
+        bits = 0
+        for level in range(len(self.moduli)):
+            bits += _bitlen(int(self.moduli[level]))
+            # The reconstruction sums level + 1 products below Q in a signed integer.
+            if bits + _bitlen(level + 1) + 1 > LATTISEQ_INT_SIZE: break
+            self.crt_levels.append(self._crt_level(level))
+
+        self.buff = ring_q.new_poly()
+
+    def _crt_level(self, level: int) -> _CRTLevel:
+        modulus = lattiseq_int(1)
+        for k in range(level + 1): modulus *= lattiseq_int(int(self.moduli[k]))
+
+        factors = List[lattiseq_uint](level + 1)
+        inverses = List[u64](level + 1)
+        reciprocals = List[float](level + 1)
+        for k in range(level + 1):
+            q = self.moduli[k]
+            factor = lattiseq_uint(1)
+            factor_mod_q = u64(1)
+            for j in range(level + 1):
+                if j == k: continue
+                factor *= self.moduli[j].ext_to_lattiseq_uint()
+                factor_mod_q = ring.bred(factor_mod_q, self.moduli[j].__naive_mod(q), q, self.bred_params[k])
+            factors.append(factor)
+            inverses.append(ring.mod_exp_u64(factor_mod_q, q - u64(2), q))
+            reciprocals.append(1.0 / float(q))
+
+        return _CRTLevel(modulus=modulus, half=modulus >> lattiseq_int(1), factors=factors, inverses=inverses,
+                         reciprocals=reciprocals)
+
+    def _check_log_slots(self, log_slots: int):
+        if log_slots < LATTISEQ_MIN_LOG_SLOTS or log_slots > self.params.max_log_slots():
+            raise ValueError(f"exact encoder: log_slots ({log_slots}) must be between {LATTISEQ_MIN_LOG_SLOTS} and {self.params.max_log_slots()}")
+
+    # encode_coeffs returns the 2 * 2^log_slots integer coefficients round(scale * IFFT(z)) of the slots
+    # z = (real + i * imag) / 2^frac_bits, the coefficients of the real parts first. Missing values are zeros.
+    def encode_coeffs(self, real: List[xint], imag: List[xint], frac_bits: int, scale: float, log_slots: int) -> List[xint]:
+        self._check_log_slots(log_slots)
+        n = 1 << log_slots
+        if len(real) > n or len(imag) > n:
+            raise ValueError(f"exact encoder: {max(len(real), len(imag))} values do not fit {n} slots")
+
+        mantissa, exponent = _scale_parts(scale)
+        scale_bits = _bitlen(mantissa) + exponent  # scale < 2^scale_bits
+        # The FFT works on Z * 2^guard. Its error, below 2 * (log2(n) + 1) units, is then below 2^-EXACT_GUARD_BITS
+        # coefficient units.
+        guard = EXACT_GUARD_BITS + _bitlen(2 * (log_slots + 1)) + scale_bits - frac_bits
+        needed = max(_max_bitlen(real), _max_bitlen(imag)) + guard + (1 if guard < 0 else 0)
+        if needed > EXACT_INPUT_BITS:
+            raise ValueError(f"exact encoder: encoding these values (at {frac_bits} fractional bits, scale {scale}) needs {needed + 3}-bit integers, more than the {LATTISEQ_EXACT_INT_SIZE} of LATTISEQ_EXACT_INT_SIZE")
+
+        re = List[xint](n)
+        im = List[xint](n)
+        for i in range(n):
+            re.append(_round_shift(real[i], -guard) if i < len(real) else xint(0))
+            im.append(_round_shift(imag[i], -guard) if i < len(imag) else xint(0))
+
+        _special_ifft(re, im, n, self.m, self.rot_group, self.roots_re, self.roots_im)
+
+        # c = round(Y * scale / 2^(frac_bits + guard)) = round(Y * mantissa * 2^-(frac_bits + guard - exponent))
+        shift = frac_bits + guard - exponent
+        mant = wint(mantissa)
+        coeffs = List[xint](2 * n)
+        for v in re: coeffs.append(xint(_round_shift(wint(v) * mant, shift)))
+        for v in im: coeffs.append(xint(_round_shift(wint(v) * mant, shift)))
+        return coeffs
+
+    # decode_coeffs returns the real and imaginary parts of the slots round(2^frac_bits * FFT(c) / scale) of the
+    # 2 * 2^log_slots integer coefficients c (those of the real parts first), as encode_coeffs returns them.
+    def decode_coeffs(self, coeffs: List[xint], scale: float, log_slots: int, frac_bits: int) -> Tuple[List[xint], List[xint]]:
+        self._check_log_slots(log_slots)
+        n = 1 << log_slots
+        if len(coeffs) != 2 * n:
+            raise ValueError(f"exact encoder: decoding {n} slots takes {2 * n} coefficients, not {len(coeffs)}")
+
+        mantissa, exponent = _scale_parts(scale)
+        scale_floor_bits = _bitlen(mantissa) - 1 + exponent  # scale >= 2^scale_floor_bits
+        # The FFT works on c * 2^guard and divides by n. Its error, below 2 * (log2(n) + 1) units, times
+        # n * 2^frac_bits / scale is then below 2^-EXACT_GUARD_BITS output units.
+        guard = EXACT_GUARD_BITS + _bitlen(2 * (log_slots + 1)) + log_slots + frac_bits - scale_floor_bits
+        needed = _max_bitlen(coeffs) + guard + (1 if guard < 0 else 0)
+        if needed > EXACT_INPUT_BITS:
+            raise ValueError(f"exact encoder: decoding these coefficients (to {frac_bits} fractional bits, scale {scale}) needs {needed + 3}-bit integers, more than the {LATTISEQ_EXACT_INT_SIZE} of LATTISEQ_EXACT_INT_SIZE")
+
+        re = List[xint](n)
+        im = List[xint](n)
+        for i in range(n):
+            re.append(_round_shift(coeffs[i], -guard))
+            im.append(_round_shift(coeffs[n + i], -guard))
+
+        _special_fft(re, im, n, self.m, self.rot_group, self.roots_re, self.roots_im)
+
+        # Z = round(Y * n * 2^(frac_bits - guard) / scale) = round(Y * 2^shift / mantissa)
+        shift = log_slots + frac_bits - guard - exponent
+        out_re = List[xint](n)
+        out_im = List[xint](n)
+        if mantissa == 1:
+            for v in re: out_re.append(xint(_round_shift(wint(v), -shift)))
+            for v in im: out_im.append(xint(_round_shift(wint(v), -shift)))
+        else:
+            # Divide with 32 more fractional bits, then round once.
+            mant = u64(mantissa)
+            for v in re: out_re.append(xint(_round_shift(_div_u64(_round_shift(wint(v), -(shift + 32)), mant), 32)))
+            for v in im: out_im.append(xint(_round_shift(_div_u64(_round_shift(wint(v), -(shift + 32)), mant), 32)))
+        return out_re, out_im
+
+    # coeffs_to_poly writes the coefficients from encode_coeffs on poly, at every level of poly, in the NTT domain
+    # (outside the Montgomery domain), as ckks.EncoderComplex128.encode does.
+    def coeffs_to_poly(self, coeffs: List[xint], log_slots: int, poly: ring.Poly):
+        self._check_log_slots(log_slots)
+        if len(coeffs) != 2 << log_slots:
+            raise ValueError(f"exact encoder: {2 << log_slots} coefficients expected, not {len(coeffs)}")
+
+        level = poly.level()
+        residues = poly._buf_coeffs
+        threads = lattiseq_threads() if len(coeffs) >= EXACT_PARALLEL_MIN_SLOTS else 1
+        @par(num_threads=threads)
+        for j in range(len(coeffs)):
+            c = coeffs[j]
+            negative = c < xint(0)
+            a = -c if negative else c
+            limbs = Ptr[u64](__ptr__(a).as_byte())
+            count = (_bitlen(a) + 63) >> 6
+            for k in range(level + 1):
+                q, bred_params, pows = self.moduli[k], self.bred_params[k], self.pows[k]
+                r = u64(0)
+                for t in range(count):
+                    r += ring.bred(ring.bred_add(limbs[t], q, bred_params[0]), pows[t], q, bred_params)
+                    if r >= q: r -= q
+                residues[k][j] = q - r if negative and r != u64(0) else r
+
+        ckks._mm_ntt_and_montgomery_lvl(level, log_slots, self.params.ring_q, False, poly)
+        poly.is_ntt = True
+
+    # poly_to_coeffs returns the centered coefficients of poly that encode its 2^log_slots slots, as encode_coeffs
+    # returns them, reconstructed exactly from all levels of poly. Raises ValueError if they do not fit the integer width.
+    def poly_to_coeffs(self, poly: ring.Poly, log_slots: int) -> List[xint]:
+        self._check_log_slots(log_slots)
+        level = poly.level()
+        src = poly
+        if poly.is_ntt:
+            self.params.ring_q._mm_inv_ntt_lvl(level, poly, self.buff)
+            src = self.buff
+        residues = src._buf_coeffs
+
+        n = 1 << log_slots
+        max_slots = self.m >> 2
+        gap = max_slots // n
+        coeffs = [xint(0) for _ in range(2 * n)]
+        status = [0 for _ in range(2 * n)]
+        threads = lattiseq_threads() if n >= EXACT_PARALLEL_MIN_SLOTS else 1
+        @par(num_threads=threads)
+        for i in range(2 * n):
+            idx = i * gap if i < n else max_slots + (i - n) * gap
+            coeffs[i], status[i] = self._reconstruct(residues, idx, level)
+
+        for i in range(2 * n):
+            if status[i] == 1:
+                raise ValueError(f"exact encoder: a coefficient exceeds the {LATTISEQ_INT_SIZE}-bit reconstruction range")
+            if status[i] == 2:
+                raise ValueError(f"exact encoder: a coefficient does not fit the {EXACT_INPUT_BITS} bits the {LATTISEQ_EXACT_INT_SIZE}-bit integers (LATTISEQ_EXACT_INT_SIZE) leave for it")
+        return coeffs
+
+    # _reconstruct returns the centered integer with the residues residues[k][idx], k = 0..level, and a status: 0, or
+    # 1 if it exceeds the range of the reconstruction, 2 if it does not fit the FFT's integers.
+    def _reconstruct(self, residues: List[List[u64]], idx: int, level: int) -> Tuple[xint, int]:
+        crt = self.crt_levels[min(level, len(self.crt_levels) - 1)]
+        top = len(crt.factors)
+
+        acc = lattiseq_uint(0)
+        quotient = 0.0
+        for k in range(top):
+            t = ring.bred(residues[k][idx], crt.inverses[k], self.moduli[k], self.bred_params[k])
+            acc += crt.factors[k] * t.ext_to_lattiseq_uint()
+            quotient += float(t) * crt.reciprocals[k]
+        # acc is congruent to the coefficient modulo Q and below top * Q; the float quotient is off by one only within
+        # about 2^-45 * Q of +-Q/2, which the comparisons below correct.
+        x = lattiseq_int(acc) - crt.modulus * lattiseq_int(int(math.floor(quotient + 0.5)))
+        if x > crt.half: x -= crt.modulus
+        elif x < -crt.half: x += crt.modulus
+
+        # Levels beyond those a lattiseq_int reconstructs must agree: the coefficient is then below Q / 2 for the
+        # reconstructed Q, hence the same modulo every larger Q.
+        for k in range(top, level + 1):
+            if _residue(x, self.moduli[k], self.bred_params[k], self.pows[k]) != residues[k][idx]:
+                return xint(0), 1
+        if _bitlen(x) > EXACT_INPUT_BITS: return xint(0), 2
+        return xint(x), 0
+
+    # encode_fixed_point encodes the slots (real + i * imag) / 2^frac_bits on plaintext, at its level and scale, in the
+    # NTT domain. Missing values are zeros.
+    def encode_fixed_point(self, real: List[xint], imag: List[xint], frac_bits: int, plaintext: ckks.Plaintext, log_slots: int):
+        self.coeffs_to_poly(self.encode_coeffs(real, imag, frac_bits, plaintext.scale, log_slots), log_slots, plaintext.value)
+
+    # decode_fixed_point returns the real and imaginary parts of the slots of plaintext times 2^frac_bits, rounded.
+    def decode_fixed_point(self, plaintext: ckks.Plaintext, log_slots: int, frac_bits: int) -> Tuple[List[xint], List[xint]]:
+        return self.decode_coeffs(self.poly_to_coeffs(plaintext.value, log_slots), plaintext.scale, log_slots, frac_bits)
+
+    # encode encodes floats or complex numbers on plaintext, as ckks.EncoderComplex128.encode does, exactly: each value
+    # first becomes a fixed-point integer with EXACT_FLOAT_FRAC_BITS fractional bits.
+    def encode(self, values, plaintext: ckks.Plaintext, log_slots: int):
+        real = List[xint](len(values))
+        imag = List[xint](len(values))
+        if isinstance(values, List[complex]):
+            for v in values:
+                real.append(_float_to_fixed(v.real, EXACT_FLOAT_FRAC_BITS))
+                imag.append(_float_to_fixed(v.imag, EXACT_FLOAT_FRAC_BITS))
+        elif isinstance(values, List[float]):
+            for v in values: real.append(_float_to_fixed(v, EXACT_FLOAT_FRAC_BITS))
+        else:
+            compile_error("exact encoder: values must be a list of complex or float")
+        self.encode_fixed_point(real, imag, EXACT_FLOAT_FRAC_BITS, plaintext, log_slots)
+
+    # decode returns the slots of plaintext as complex numbers, as ckks.EncoderComplex128.decode does, decoded exactly
+    # to 2^-EXACT_GUARD_BITS of 1 / scale and then rounded to floats.
+    def decode(self, plaintext: ckks.Plaintext, log_slots: int) -> List[complex]:
+        mantissa, exponent = _scale_parts(plaintext.scale)
+        frac_bits = max(0, _bitlen(mantissa) + exponent + EXACT_GUARD_BITS)
+        real, imag = self.decode_fixed_point(plaintext, log_slots, frac_bits)
+        return [complex(_fixed_to_float(real[i], frac_bits), _fixed_to_float(imag[i], frac_bits)) for i in range(len(real))]
+
+
+# new_exact_encoder creates an ExactEncoder for params. It computes the roots of unity in multi-precision arithmetic,
+# which takes a few tens of milliseconds for N = 2^14.
+def new_exact_encoder(params: ckks.Parameters) -> ExactEncoder:
+    return ExactEncoder(params)

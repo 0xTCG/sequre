@@ -1,7 +1,22 @@
-from sequre.utils.testing import assert_eq
+from sequre.utils.testing import assert_eq, assert_eq_approx, assert_geq, assert_leq
 from sequre.utils.utils import __rand_mat
 from sequre.constants import MPC_FIELD_SIZE
 from sequre.utils.io import write_matrix, read_matrix
+import math
+import os
+
+from pickler import pickle, unpickle
+
+from sequre.stdlib.numpy.create import array, ones, zeros
+from sequre.stdlib.numpy.ndarray import ndarray
+from sequre.network.common import (
+    accept, close, listen, shutdown, recv, send, init_openssl, ssl_error_queue,
+    TLS_client_method, TLS_server_method, SSL_CTX_new, SSL_CTX_free, SSL_new, SSL_free,
+    SSL_read, SSL_write, SSL_accept_handshake, SSL_connect_handshake)
+from sequre.network.socket import socket as c_socket, bind, connect, setsockopt, unlink
+from sequre.constants import _find_lib, _plugin_lib, GMP_PATH, ENV_GMP_PATH
+
+from C import access(cobj, i32) -> i32 as _c_access
 
 
 def test_io():
@@ -17,9 +32,298 @@ def test_io():
         assert_eq('Binary file i/o', read_matrix(f, rows, cols, True, TP=type(MPC_FIELD_SIZE)), random_matrix)
     
 
-def test_helpers():
+def _fails(check) -> bool:
+    try:
+        check()
+    except AssertionError:
+        return True
+    return False
+
+
+def test_assertion_helpers():
+    print(f'Testing assertion helpers ... \n')
+    empty = List[float]()
+
+    # Checks that must pass
+    assert_eq_approx('Approx: equal vectors', [1.0, 2.0], [1.0, 2.01], silent_pass=True)
+    assert_eq_approx('Approx: nested lists', [[1.0, 2.0], [3.0, 4.0]], [[1.0, 2.0], [3.0, 4.01]], silent_pass=True)
+    assert_eq_approx('Approx: ndarrays', array([1.0, 2.0, 3.0]), array([1.0, 2.0, 3.01]), silent_pass=True)
+    assert_eq_approx('Approx: scalar against a vector', array([1.0, 1.01]), 1.0, silent_pass=True)
+    assert_eq_approx('Approx: exact match with zero tolerance', [1.5], [1.5], error=0.0, silent_pass=True)
+    assert_eq_approx('Approx: within the relative tolerance', 1000.5, 1000.0, error=0.0, rel_error=0.001, silent_pass=True)
+    assert_eq('Eq: empty lists are equal', empty, empty, silent_pass=True)
+    assert_geq('Geq: element-wise', [2.0, 3.0], [1.0, 3.0], silent_pass=True)
+    assert_leq('Leq: element-wise', [1.0, 3.0], [2.0, 3.0], silent_pass=True)
+
+    # Checks that must fail; each of these passed before the shape and emptiness checks
+    assert _fails(lambda: assert_eq_approx('', [1.0], [1.0, 2.0], silent_pass=True)), 'assert_eq_approx passed a shorter result'
+    assert _fails(lambda: assert_eq_approx('', [1.0, 2.0], [1.0], silent_pass=True)), 'assert_eq_approx passed a longer result'
+    assert _fails(lambda: assert_eq_approx('', empty, empty, silent_pass=True)), 'assert_eq_approx passed empty values'
+    assert _fails(lambda: assert_eq_approx('', [[1.0], [2.0]], [[1.0, 5.0], [2.0, 5.0]], silent_pass=True)), \
+        'assert_eq_approx passed a narrower nested result'
+    assert _fails(lambda: assert_eq_approx('', array([1.0]), array([1.0, 1.0, 1.0]), silent_pass=True)), \
+        'assert_eq_approx passed a broadcast ndarray'
+    assert _fails(lambda: assert_eq('', array([1.0]), array([1.0, 1.0]), silent_pass=True)), 'assert_eq passed a broadcast ndarray'
+    assert _fails(lambda: assert_geq('', [2.0], [1.0, 5.0], silent_pass=True)), 'assert_geq passed a shorter result'
+    assert _fails(lambda: assert_leq('', empty, empty, silent_pass=True)), 'assert_leq passed empty values'
+
+    # Checks that must still fail
+    assert _fails(lambda: assert_eq_approx('', 1002.0, 1000.0, error=0.0, rel_error=0.001, silent_pass=True)), \
+        'assert_eq_approx passed a value outside the relative tolerance'
+    assert _fails(lambda: assert_eq_approx('', float('nan'), 0.0, silent_pass=True)), 'assert_eq_approx passed NaN'
+    assert _fails(lambda: assert_eq_approx('', 1.1, 1.0, silent_pass=True)), 'assert_eq_approx passed a value out of tolerance'
+
+    # List comparisons refuse lists of different lengths instead of comparing a prefix
+    raised = False
+    try:
+        _ = [1.0] < [2.0, 3.0]
+    except ValueError:
+        raised = True
+    assert raised, 'Comparing lists of different lengths did not raise'
+
+    print(f'Assertion helpers tests passed.\n')
+
+
+def test_network_c_results():
+    # The network layer reads every C result at its real width. Declared as 64-bit ints, OpenSSL's and glibc's accept,
+    # connect and close returned -1 as 4294967295 (measured), so a failed handshake, read or write passed for a success.
+    # Each call below fails (a closed descriptor, a TLS session with no socket) and must read as -1.
+    print(f'Testing the network layer\'s C results ... \n')
+    buf = Ptr[byte](16)
+    addr = Ptr[byte](16)
+    assert_eq('accept on a closed descriptor reads -1', int(accept(i32(-1), cobj(), cobj())), -1)
+    assert_eq('close of a closed descriptor reads -1', int(close(i32(-1))), -1)
+    assert_eq('listen on a closed descriptor reads -1', int(listen(i32(-1), i32(1))), -1)
+    assert_eq('shutdown of a closed descriptor reads -1', int(shutdown(i32(-1), i32(2))), -1)
+    assert_eq('recv on a closed descriptor reads -1', recv(i32(-1), buf, 16, i32(0)), -1)
+    assert_eq('send on a closed descriptor reads -1', send(i32(-1), buf, 16, i32(0)), -1)
+    assert_eq('socket of an unknown address family reads -1', int(c_socket(i32(12345), i32(1), i32(0))), -1)
+    assert_eq('bind of a closed descriptor reads -1', int(bind(i32(-1), addr, u32(16))), -1)
+    assert_eq('connect of a closed descriptor reads -1', int(connect(i32(-1), addr, u32(16))), -1)
+    assert_eq('setsockopt on a closed descriptor reads -1', int(setsockopt(i32(-1), i32(1), i32(2), buf, u32(4))), -1)
+    assert_eq('unlink of a missing file reads -1', int(unlink('tests/data/no-such-socket-file'.c_str())), -1)
+
+    init_openssl()
+    for is_server in (False, True):
+        side = 'server' if is_server else 'client'
+        ctx = SSL_CTX_new(TLS_server_method() if is_server else TLS_client_method())
+        ssl = SSL_new(ctx)
+        assert_eq(f'SSL_read on a {side} session without a socket reads -1', int(SSL_read(ssl, buf, i32(16))), -1)
+        assert_eq(f'SSL_write on a {side} session without a socket reads -1', int(SSL_write(ssl, buf, i32(16))), -1)
+        handshake = SSL_new(ctx)
+        rc = int(SSL_accept_handshake(handshake)) if is_server else int(SSL_connect_handshake(handshake))
+        assert_eq(f'{"SSL_accept" if is_server else "SSL_connect"} on a session without a socket reads -1', rc, -1)
+        ssl_error_queue()  # leaves OpenSSL's error queue empty
+        SSL_free(handshake)
+        SSL_free(ssl)
+        SSL_CTX_free(ctx)
+
+    print(f'Network C results tests passed.\n')
+
+
+def _exists(path: str) -> bool:
+    return path != '' and int(_c_access(path.c_str(), i32(0))) == 0
+
+
+def test_find_lib():
+    # _find_lib takes the environment variable if it is set, else the first candidate that exists. GMP's candidates
+    # start with the copy bundled with the plugin: <plugin>/lib/libgmp.{so,dylib}, three directories above
+    # <plugin>/stdlib/sequre/constants.codon. (os.getenv reads the environment as it was at startup, so the checks use
+    # a variable that is always set and one that never is.)
+    print(f'Testing the library lookup ... \n')
+    unset = 'SEQURE_TEST_VARIABLE_NEVER_SET'
+    missing = 'tests/data/no-such-library.so'
+    present = 'tests/data/temp.bin'  # written by test_io
+    assert_eq('_find_lib takes the first candidate that exists', _find_lib(unset, [missing, '', present]), present)
+    assert_eq('_find_lib takes the environment variable over the candidates', _find_lib('HOME', [present]),
+              os.getenv('HOME'))
+    raised = False
+    try:
+        _find_lib(unset, [missing, ''])
+    except RuntimeError:
+        raised = True
+    assert_eq('_find_lib raises when no candidate exists', raised, True)
+
+    name = 'libgmp.dylib' if __apple__ else 'libgmp.so'
+    bundled = _plugin_lib(name)
+    suffix = f'/lib/{name}'
+    plugin_dir = bundled[:len(bundled) - len(suffix)]
+    assert_eq('_plugin_lib gives <a directory>/lib/<name>', bundled.endswith(suffix) and plugin_dir != '', True)
+    assert_eq('_plugin_lib names the directory that holds this stdlib (stdlib/sequre/constants.codon)',
+              _exists(f'{plugin_dir}/stdlib/sequre/constants.codon'), True)
+    env_gmp = os.getenv(ENV_GMP_PATH)
+    if env_gmp:
+        assert_eq('GMP_PATH is SEQURE_GMP_PATH when it is set', GMP_PATH, env_gmp)
+    elif _exists(bundled):
+        assert_eq('GMP_PATH is the bundled copy when SEQURE_GMP_PATH is unset', GMP_PATH, bundled)
+    else:
+        assert_eq('GMP_PATH is a system library when neither is there', _exists(GMP_PATH), True)
+    print(f'Library lookup tests passed.\n')
+
+
+def test_local_socket_files(mpc):
+    # The party that binds a UNIX socket removes its file once the peer has connected (when the listening socket
+    # closes), so a local run leaves no socket file behind, even when it fails later. CP0 binds every one of its
+    # sockets.
+    print(f'Testing the socket files of a local run ... \n')
+    checked = 0
+    for pid, sock in mpc.comms.sockets.items():
+        if sock.is_unix and mpc.pid < pid:
+            assert_eq(f'CP{mpc.pid}: the socket file {sock.socket_address} of the channel to CP{pid} is removed',
+                      _exists(sock.socket_address), False)
+            checked += 1
+    assert_eq(f'CP{mpc.pid} checked its local sockets', checked == len(mpc.comms.sockets) or not mpc.comms.local, True)
+    print(f'Local socket file tests passed.\n')
+
+
+def _pickle_round_trip(x, T: type) -> T:
+    # Unpasteurized, as the parties send it; the guard band after x._pickle_size() bytes must come out untouched
+    size = x._pickle_size()
+    jar = ptr[byte](size + 64)
+    for i in range(64):
+        jar[size + i] = byte(0xA5)
+    pickle(x, jar, False)
+    untouched = True
+    for i in range(64):
+        if jar[size + i] != byte(0xA5): untouched = False
+    assert untouched, f"ndarray pickling wrote past _pickle_size() ({size} bytes)"
+    return unpickle(jar, False, T)
+
+
+def test_ndarray_views():
+    """H-14: the ndarray extension's methods on views, whose elements are not where a C-contiguous array's would be: a
+    column x[:, j] (strided), every other row x[::2] (rows apart), every other element v[1::2]. The methods read
+    _data[i] for i < size, so a column came out as the start of row 0, and extend read past the buffer."""
+    print(f'Testing ndarray views ... \n')
+    x = array([[1., -2., 3.], [-4., 5., -6.], [7., -8., 9.]])
+    col = x[:, 1]
+    rows = x[::2]
+    v = array([0., 1., -2., 3., -4., 5.])
+    odd = v[1::2]
+    assert_eq('ndarray views: a column is not C-contiguous', col.flags.c_contiguous, False)
+
+    assert_eq('ndarray views: copy of a column', col.copy(), array([-2., 5., -8.]))
+    assert_eq('ndarray views: copy of every other row', rows.copy(), array([[1., -2., 3.], [7., -8., 9.]]))
+    assert_eq('ndarray views: a copy is C-contiguous', (col.copy().flags.c_contiguous, rows.copy().flags.c_contiguous), (True, True))
+    own = x.copy()
+    own[0, 0] = 100.
+    assert_eq('ndarray views: a copy of a contiguous array has its own buffer', (x[0, 0], own[0, 0]), (1., 100.))
+    assert_eq('ndarray views: abs of a column', col.abs(), array([2., 5., 8.]))
+    assert_eq('ndarray views: abs of every other element', odd.abs(), array([1., 3., 5.]))
+    assert_eq('ndarray views: count', (col.count(5.), col.count(3.), rows.count(-8.), rows.count(5.)), (1, 0, 1, 0))
+    assert_eq('ndarray views: sign of a column', col.sign(), array([-1., 1., -1.]))
+    assert_eq('ndarray views: sign of every other row', rows.sign(), array([[1., -1., 1.], [1., -1., 1.]]))
+    assert_eq('ndarray views: sqrt (each element through a function)', odd.sqrt(), array([1., math.sqrt(3.), math.sqrt(5.)]))
+    assert_eq('ndarray views: to_list of a column', col.to_list(), [-2., 5., -8.])
+    assert_eq('ndarray views: to_list of every other row', rows.to_list(), [[1., -2., 3.], [7., -8., 9.]])
+    assert_eq('ndarray views: resize a column', col.resize((2,)), array([-2., 5.]))
+    assert_eq('ndarray views: resize every other element', odd.resize((4,)), array([1., 3., 5., 0.]))
+    assert_eq('ndarray views: expand_dims of a column, axis 0', col.expand_dims(), array([[-2., 5., -8.]]))
+    assert_eq('ndarray views: expand_dims of a column, axis 1', col.expand_dims(1), array([[-2.], [5.], [-8.]]))
+    expanded = col.expand_dims()
+    expanded[0, 1] = 50.
+    assert_eq('ndarray views: expand_dims shares the view\'s elements, as for a contiguous array', x[1, 1], 50.)
+    x[1, 1] = 5.
+
+    first = x[:, 0]
+    first.extend(x[:, 2])
+    assert_eq('ndarray views: extend a column by a column', first, array([1., -4., 7., 3., -6., 9.]))
+    assert_eq('ndarray views: extend leaves a C-contiguous array', first.flags.c_contiguous, True)
+    stacked = x[::2]
+    stacked.extend(x[1:2])
+    assert_eq('ndarray views: extend every other row by a row', stacked, array([[1., -2., 3.], [7., -8., 9.], [-4., 5., -6.]]))
+    assert_eq('ndarray views: x unchanged by extending its views', x, array([[1., -2., 3.], [-4., 5., -6.], [7., -8., 9.]]))
+
+    assert_eq('ndarray views: pickling a column', _pickle_round_trip(col, ndarray[Tuple[int], float]), array([-2., 5., -8.]))
+    assert_eq('ndarray views: pickling every other row', _pickle_round_trip(rows, ndarray[Tuple[int, int], float]), array([[1., -2., 3.], [7., -8., 9.]]))
+    assert_eq('ndarray views: pickling a contiguous array', _pickle_round_trip(x, ndarray[Tuple[int, int], float]), x)
+
+    nan = float('nan')
+    w = array([[1., 7.], [nan, 4.], [nan, 6.]])  # the buffer's first three elements are not column 0
+    cleaned = w[:, 0].nan_to_num(copy=True, nan=-1.)
+    assert_eq('ndarray views: nan_to_num of a column, copied', cleaned, array([1., -1., -1.]))
+    assert_eq('ndarray views: nan_to_num of a copy leaves the array', math.isnan(w[1, 0]), True)
+    w[:, 0].nan_to_num(copy=False, nan=-1.)
+    assert_eq('ndarray views: nan_to_num of a column, in place', (w[1, 0], w[2, 0], w[0, 1]), (-1., -1., 7.))
+
+    y = array([[1., 2.], [3., 4.]])
+    shared = y.to_list()
+    shared[1][0] = 30.
+    assert_eq('ndarray: to_list of a contiguous array shares its buffer (as before)', y[1, 0], 30.)
+    print(f'ndarray views tests passed.\n')
+
+
+def test_ndarray_padding():
+    """H-15: pad along an axis past the first dropped each row's boundary element and stepped by bytes; H-16:
+    pad_with_value ignored its value (always ones)."""
+    print(f'Testing ndarray padding ... \n')
+    m = array([[1., 2.], [3., 4.], [5., 6.]])
+    assert_eq('ndarray pad: rows (axis 0)', m.pad(1, axis=0), array([[1., 2.], [3., 4.], [5., 6.], [0., 0.]]))
+    assert_eq('ndarray pad: columns (axis 1)', m.pad(2, axis=1), array([[1., 2., 0., 0.], [3., 4., 0., 0.], [5., 6., 0., 0.]]))
+    assert_eq('ndarray pad: a vector', array([1., 2.]).pad(2, axis=0), array([1., 2., 0., 0.]))
+    assert_eq('ndarray pad: by nothing', m.pad(0, axis=1), m)
+    cube = array([[[1., 2.], [3., 4.]], [[5., 6.], [7., 8.]]])
+    assert_eq('ndarray pad: 3-dim, axis 1', cube.pad(1, axis=1), array([[[1., 2.], [3., 4.], [0., 0.]], [[5., 6.], [7., 8.], [0., 0.]]]))
+    assert_eq('ndarray pad: 3-dim, axis 2', cube.pad(1, axis=2), array([[[1., 2., 0.], [3., 4., 0.]], [[5., 6., 0.], [7., 8., 0.]]]))
+    assert_eq('ndarray pad: a column view', m[:, 1].pad(1, axis=0), array([2., 4., 6., 0.]))
+    assert_eq('ndarray pad: no rows', zeros((0, 2)).pad(1, axis=1).shape, (0, 3))
+
+    assert_eq('ndarray pad_with_value: columns of 7.5', m.pad_with_value(7.5, 2, 1), array([[1., 2., 7.5, 7.5], [3., 4., 7.5, 7.5], [5., 6., 7.5, 7.5]]))
+    assert_eq('ndarray pad_with_value: a row of -1', m.pad_with_value(-1, 1, 0), array([[1., 2.], [3., 4.], [5., 6.], [-1., -1.]]))
+    assert_eq('ndarray pad_with_value: an int array', array([[1, 2], [3, 4]]).pad_with_value(9, 1, 1), array([[1, 2, 9], [3, 4, 9]]))
+    assert_eq('ndarray pad_with_value: every other row', m[::2].pad_with_value(0.5, 1, 1), array([[1., 2., 0.5], [5., 6., 0.5]]))
+    assert_eq('ndarray pad_with_value: a column onto no rows', zeros((0, 3)).pad_with_value(1., 1, 1).shape, (0, 4))
+    assert_eq('ndarray pad_with_value: rows onto no rows', zeros((0, 2)).pad_with_value(1., 2, 0), ones((2, 2)))
+    print(f'ndarray padding tests passed.\n')
+
+
+def test_ndarray_slices():
+    """L-046: slice steps in 2-dim get/setitem, and the fork's strided writes, which took the contiguous shortcut by the
+    parent's flags; L-228 (.T of no rows), L-051 (erase_element(-1)), L-053 (a full rotate_local), M-NUM-05 (sign
+    read element 0); on lists L-047 (expand_dims(1) of a vector), L-051, L-052 (vstack shared the other's rows)."""
+    print(f'Testing ndarray slices ... \n')
+    z = zeros((6,))
+    z[::2] = array([1., 2., 3.])
+    assert_eq('ndarray slices: setitem every other element', z, array([1., 0., 2., 0., 3., 0.]))
+    cols = zeros((3, 4))
+    cols[:, ::2] = array([[1., 2.], [3., 4.], [5., 6.]])
+    assert_eq('ndarray slices: setitem every other column', cols, array([[1., 0., 2., 0.], [3., 0., 4., 0.], [5., 0., 6., 0.]]))
+    every_other = zeros((4, 2))
+    every_other[::2, :] = array([[1., 2.], [3., 4.]])
+    assert_eq('ndarray slices: setitem every other row', every_other, array([[1., 2.], [0., 0.], [3., 4.], [0., 0.]]))
+    grid = array([[0., 1., 2., 3.], [4., 5., 6., 7.], [8., 9., 10., 11.], [12., 13., 14., 15.]])
+    assert_eq('ndarray slices: getitem with steps', grid[::2, 1::2], array([[1., 3.], [9., 11.]]))
+    assert_eq('ndarray slices: getitem of an empty range', grid[3:1, :].shape, (0, 4))
+
+    assert_eq('ndarray: sign of each element', array([-1., 0., 2.]).sign(), array([-1., 0., 1.]))
+    assert_eq('ndarray: sign of each element, the first positive', array([3., -2., 0.]).sign(), array([1., -1., 0.]))
+    assert_eq('ndarray: transpose of no rows', zeros((0, 3)).T.shape, (3, 0))
+    assert_eq('ndarray: erase_element(-1)', array([1., 2., 3.]).erase_element(-1), array([1., 2.]))
+    r = array([[1., 2., 3., 4.]])
+    assert_eq('ndarray: rotate_local by part', r.rotate_local(-1, 2), array([[2., 1., 3., 4.]]))
+    assert_eq('ndarray: rotate_local in full', r.rotate_local(-2, 2), array([[1., 2., 3., 4.]]))
+
+    assert_eq('List: expand_dims(1) of a vector', [1., 2.].expand_dims(1), [[1.], [2.]])
+    assert_eq('List: erase_element(-1)', [1., 2., 3.].erase_element(-1), [1., 2.])
+    top = [[1., 2.]]
+    bottom = [[3., 4.]]
+    stacked = top.vstack(bottom)
+    stacked[1][0] = 30.
+    assert_eq('List: vstack copies the other matrix\'s rows', bottom, [[3., 4.]])
+    assert_eq('List: vstack', stacked, [[1., 2.], [30., 4.]])
+    print(f'ndarray slices tests passed.\n')
+
+
+def test_helpers(mpc):
     print(f'Testing helpers ... \n')
-    
+
     test_io()
-    
+    test_assertion_helpers()
+    test_network_c_results()
+    test_find_lib()
+    test_local_socket_files(mpc)
+    test_ndarray_views()
+    test_ndarray_padding()
+    test_ndarray_slices()
+
     print(f'Helpers tests passed.\n')

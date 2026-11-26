@@ -1256,24 +1256,65 @@ def test_bootstrap_input_levels_and_scales(bc: BootstrapContext, tag: str):
 
     # At level 0 the plaintext can only be multiplied by an integer. With a scale that is not a power of two
     # the scale inside the circuit is then slightly off the nominal one. The output scale records it (Lattigo
-    # returns the default scale and values that are off by that ratio).
+    # returns the default scale and values that are off by that ratio). The integers are rounded down
+    # (expected_level0_ratio), so here the ratio is just below 1.
     scale = params.default_scale * 1.00007
     ciphertext = encrypt_values(bc.tc, values, 0, scale)
     bootstrapped = bc.btp.bootstrap(ciphertext)
     name = f"Bootstrap from level 0 and scale 2^{math.log2(scale):.6f} [{tag}]"
     check_bootstrapped(bc, name, bootstrapped, values, 1e-6)
     ratio = bootstrapped.scale / params.default_scale
-    integer_factor = float(round(bc.btp.q0_over_message_ratio / scale))
-    expected_ratio = scale * integer_factor / bc.btp.q0_over_message_ratio
+    expected_ratio = expected_level0_ratio(bc, scale)
     check_true(
-        f"{name}: output scale", abs(ratio - expected_ratio) < 1e-12 and abs(ratio - 1.0) > 1e-6,
-        f"output scale / default scale = {ratio}, expected scale * {integer_factor} / (Q0 / message ratio) = {expected_ratio}")
+        f"{name}: output scale", abs(ratio - expected_ratio) < 1e-12 and abs(ratio - 1.0) > 1e-6 and ratio < 1.0,
+        f"output scale / default scale = {ratio}, expected {expected_ratio}")
 
     # A scale above Q0 / message ratio at level 0 is an error
     too_large = encrypt_values(bc.tc, values, 0, bc.btp.q0_over_message_ratio * 2)
     def scale_too_large():
         bc.btp.bootstrap(too_large)
     check_raises(f"Bootstrap of a level 0 ciphertext with a scale above Q0 / message ratio [{tag}]", scale_too_large)
+
+
+# The ratio a level-0 input's scale ends at against Q0 / message ratio (rounded to a power of two), which the output
+# scale records: bootstrap multiplies the input by integers rounded down, first toward that power of two, then toward
+# Q0 / message ratio itself, never above either (rounded up, the scale inside the circuit could reach 4/3 of the bound,
+# outside the range EvalMod is built for).
+def expected_level0_ratio(bc: BootstrapContext, scale: float) -> float:
+    q0 = float(bc.tc.params.ring_q.modulus[0])
+    message_ratio = bc.btp.eval_mod_poly.message_ratio()
+    s = scale
+    factor = math.floor(bc.btp.q0_over_message_ratio / s)
+    if factor > 1.0:
+        s *= factor
+    factor = math.floor((q0 / message_ratio) / s)
+    if factor > 1.0:
+        s *= factor
+    return s / bc.btp.q0_over_message_ratio
+
+
+# Level-0 inputs whose scale is not a power of two, and one at Q0 / message ratio over 1.5: the values come back right
+# and the output scale records the input's ratio (expected_level0_ratio), with the scale inside the circuit at or below
+# Q0 / message ratio, or its power of two where that is larger (which bootstrap accepts, as Lattigo does: its default
+# scale on N15QP768H192H32 is that power of two, 1.00005 times Q0 / message ratio). After the mod-up the circuit multiplies by T = SF / 2^round(log2 Q0), whatever the input's scale,
+# so that EvalMod removes the multiple of Q0 the mod-up adds: it used to multiply by round((SF / message ratio) /
+# scale), which is T only for powers of two, and the logN 15 default sets (T = 2^17 and 2^15) returned garbage.
+def test_bootstrap_level0_scales(bc: BootstrapContext, tag: str, tolerance: float):
+    params = bc.tc.params
+    values = bootstrap_test_values(params.slots())
+    q0 = float(params.ring_q.modulus[0])
+    message_ratio = bc.btp.eval_mod_poly.message_ratio()
+    for label, scale in [("1 - 1e-5 times the default scale", params.default_scale * (1.0 - 1e-5)),
+                         ("Q0 / message ratio over 1.5", bc.btp.q0_over_message_ratio / 1.5)]:
+        bootstrapped = bc.btp.bootstrap(encrypt_values(bc.tc, values, 0, scale))
+        name = f"Bootstrap from level 0 at {label} [{tag}]"
+        check_values(f"{name}: values", decrypt_values(bc.tc, bootstrapped), values, tolerance)
+        expected = expected_level0_ratio(bc, scale)
+        ratio = bootstrapped.scale / bc.btp.output_scale()
+        bound = max(1.0, (q0 / message_ratio) / bc.btp.q0_over_message_ratio)
+        check_true(
+            f"{name}: output scale", abs(ratio / expected - 1.0) < 1e-12 and expected <= bound,
+            f"output scale / output_scale() = {ratio}, expected {expected}; scale in the circuit {expected:.6f} of Q0 / message ratio (a power of two), at most {bound:.6f}")
 
 
 def test_bootstrap_cycles(bc: BootstrapContext, tag: str, stop_level: int):
@@ -1397,8 +1438,8 @@ def test_bootstrap_with_evaluation_keys_only(literal: btp_default.DefaultParamet
     params = ckks.new_parameters_from_literal(literal.scheme_params)
     encoder = ckks.new_encoder_complex(params)
     kgen = ckks.new_key_generator(params)
-    sk = kgen.gen_secret_key(store_key=True)  # gen_public_key encrypts under the key the generator stores
-    pk = kgen.gen_public_key()
+    sk = kgen.gen_secret_key()
+    pk = kgen.gen_public_key(sk)
     decryptor = ckks.new_decryptor(params, sk)
     encryptor = ckks.new_encryptor(params, pk)
     evk = bootstrapping.gen_evaluation_keys(literal.bootstrapping_params, params, sk)
@@ -1583,13 +1624,17 @@ def test_bootstrap_errors(bc: BootstrapContext, literal: btp_default.DefaultPara
             rlk=evk.rlk, rtks=rlwe.RotationKeySet(keys=keys), swk_dts=evk.swk_dts, swk_std=evk.swk_std))
     check_raises(f"NewBootstrapper: conjugation key missing [{tag}]", conjugation_key_missing)
 
-    # The literal the tests share is as it was: the bootstrapper works on a copy
+    # A bootstrapper built from the literal leaves it as it was (it completes a copy: the scaling of the two encoding
+    # matrices gets the circuit's factors multiplied in, and building another bootstrapper from the literal must not
+    # multiply them in again)
+    built = bootstrapping.new_bootstrapper(params, literal.bootstrapping_params, evk)
     check_true(
         f"NewBootstrapper leaves the parameter literal untouched [{tag}]",
         literal.bootstrapping_params.coeffs_to_slots_parameters.scaling == 0.0
         and literal.bootstrapping_params.slots_to_coeffs_parameters.scaling == 0.0
-        and bc.btp.btp_params.coeffs_to_slots_parameters.scaling != 0.0,
-        f"literal CoeffsToSlots scaling {literal.bootstrapping_params.coeffs_to_slots_parameters.scaling}, bootstrapper's {bc.btp.btp_params.coeffs_to_slots_parameters.scaling}")
+        and built.btp_params.coeffs_to_slots_parameters.scaling != 0.0
+        and built.btp_params.slots_to_coeffs_parameters.scaling != 0.0,
+        f"literal CoeffsToSlots scaling {literal.bootstrapping_params.coeffs_to_slots_parameters.scaling}, the bootstrapper's {built.btp_params.coeffs_to_slots_parameters.scaling}")
 
 
 def test_bootstrapping_parameters(tag: str):
@@ -1693,6 +1738,7 @@ def test_bootstrap_default_parameter_sets():
             f"level {bc.btp.output_level()} (SlotsToCoeffs from {stc.level_start} over {stc.depth(True)} moduli), scale 2^{math.log2(bc.btp.output_scale()):.4f}")
 
         test_bootstrap_full_circuit(bc, tag, not half_modulus, tolerance, lattigo_mean_precision[i])
+        test_bootstrap_level0_scales(bc, tag, tolerance)
 
         if half_modulus:
             # One more multiplication uses the other half of the modulus and lands on the default scale
@@ -1712,6 +1758,27 @@ def test_bootstrap_default_parameter_sets():
             check_values(
                 f"Multiplication and rescale after the bootstrap: values [{tag}]", decrypt_values(bc.tc, bootstrapped),
                 [values[j] * factor[j] for j in range(params.slots())], 2 * tolerance)
+
+
+# A set whose EvalMod scaling factor is below Q0: N16QP1546H192H32's moduli, shrunk to logN = 13, with a 61-bit Q0, so
+# T = SF / 2^round(log2 Q0) = 1/2. The circuit cannot divide by T for free in the scale, and the CoeffsToSlots matrices
+# take it (as in Lattigo). The output scale used to divide by T again: every value came back multiplied by T.
+def test_bootstrap_period_factor_below_one():
+    literal = btp_default.N16QP1546H192H32.insecure_copy(13, 12)
+    prime = u64(0x1fffffffff380001)  # an NTT prime just below 2^61 that no modulus of the set uses
+    literal.scheme_params.q[0] = prime
+    literal.bootstrapping_params.eval_mod_parameters.q = prime
+    tag = "N16QP1546H192H32 moduli with a 61-bit Q0 (T = 1/2), logN=13, logSlots=12"
+    print(f"\nBootstrapping/PeriodFactorBelowOne [{tag}]")
+    bc = new_bootstrap_context(literal, False)
+    params = bc.tc.params
+    t = bc.btp_params.eval_mod_parameters.scaling_factor / math.pow(2.0, float(round(math.log2(float(params.ring_q.modulus[0])))))
+    check_true(f"Setup [{tag}]", t == 0.5, f"T = {t}")
+    test_bootstrap_full_circuit(bc, tag, True, 1e-6, 0.0)
+    test_bootstrap_level0_scales(bc, tag, 1e-6)
+    values = bootstrap_test_values(params.slots())
+    bootstrapped = bc.btp.bootstrap(encrypt_values(bc.tc, values, 1, params.default_scale * 0.87654321))
+    check_bootstrapped(bc, f"Bootstrap from level 1 [{tag}]", bootstrapped, values, 1e-6)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1775,8 +1842,8 @@ def test_pickling():
     literal = btp_default.N16QP1546H192H32.insecure_copy(13, 12)
     params = ckks.new_parameters_from_literal(literal.scheme_params)
     kgen = ckks.new_key_generator(params)
-    sk = kgen.gen_secret_key(store_key=True)
-    pk = kgen.gen_public_key()
+    sk = kgen.gen_secret_key()
+    pk = kgen.gen_public_key(sk)
     evk = bootstrapping.gen_evaluation_keys(literal.bootstrapping_params, params, sk)
     decryptor = ckks.new_decryptor(params, sk)
 
@@ -1890,6 +1957,7 @@ def test_bootstrapping():
     test_bootstrap_with_evaluation_keys_only(
         btp_default.N16QP1546H192H32.insecure_copy(13, 12), "logN=13, logSlots=12, N16QP1546H192H32 moduli")
     test_bootstrap_default_parameter_sets()
+    test_bootstrap_period_factor_below_one()
     test_pickling()
     test_concurrent_bootstraps()
 

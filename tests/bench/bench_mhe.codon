@@ -1,0 +1,2062 @@
+"""
+MHE performance-regression cases: collective key generation, local CKKS (Lattiseq) operations, collective
+decryption/bootstrapping, MPC<->MHE switching, Ciphertensor operations and matmul variants, the multiparty types
+(MPP/MPA/MPU) and MHE end-to-end workloads.
+
+Run with --skip-mhe-setup: the binary calls mpc.mhe.default_setup() itself, inside the timed case mhe.setup.keygen
+(always run and reported, since every other case needs the keys).
+
+    sequre build -release tests/bench/bench_mhe.codon -o bench_mhe
+    LD_PRELOAD=$HOME/.sequre/lib/sequre_align64.so ./bench_mhe --local --skip-mhe-setup [--cases=...] [--out=DIR]
+    ./bench_mhe --list
+
+Without the alignment shim, HE code segfaults on AVX hosts. See tests/bench/harness.codon for the output
+format and scripts/bench.sh for the workflow.
+"""
+import math
+import prg
+import secure_operator
+
+import sequre.lattiseq.ckks as ckks
+import sequre.lattiseq.rlwe as rlwe
+from sequre.lattiseq.exact_encoder import new_exact_encoder
+
+from sequre import main
+from sequre.attributes import sequre
+from sequre.constants import MPC_FIELD_SIZE, ENC_ROW, ENC_COL, ENC_DIAG, mpc_uint, lattiseq_exact_int
+from sequre.lattiseq.ckks import Ciphertext, Plaintext
+from sequre.types.ciphertensor import Ciphertensor
+from sequre.types.multiparty_partition import MPP
+from sequre.types.multiparty_aggregate import MPA
+from sequre.types.multiparty_union import MPU
+from sequre.types.sharetensor import Sharetensor
+from sequre.utils.utils import random_ints
+from sequre.stdlib.lin_alg import l2
+from sequre.stdlib.nonlinear import sigmoid as nl_sigmoid
+from sequre.stdlib.learn.lin_reg import LinReg
+from sequre.stdlib.numpy.create import array, ones, zeros, zeros_like
+from sequre.stdlib.numpy.ndarray import ndarray
+
+from harness import (
+    Bench, Timer, handle_list_flag, shared_floats, shared_float_matrix, private_floats,
+    max_abs_err_1d, max_abs_err_2d)
+from ...applications.king import king
+
+
+# (name, flags, description). flags: "" | "iso" (bench.sh runs it in its own process, after the rest)
+#                                     | "skip:<reason>" (known broken; runs only when named exactly: --cases=<name>$)
+CASES = [
+    ("mhe.setup.keygen", "always", "mhe.default_setup(): PN14QP438 params + collective pk, relin key, ~150 rotation keys"),
+    ("he.encode", "", "CKKS encode of 8192 complex slots at the top level"),
+    ("he.decode", "", "CKKS decode of a top-level plaintext (8192 slots)"),
+    ("he.encode_exact", "", "exact (fixed-point) encode of 8192 complex slots of magnitude 2^150 at the top level"),
+    ("he.decode_exact", "", "exact (fixed-point) decode of that plaintext to 32 fractional bits"),
+    ("he.encrypt_pk", "", "public-key encryption of a top-level plaintext"),
+    ("he.decrypt_sk", "", "secret-key (shard) decryption, local part of a collective decryption"),
+    ("he.add", "", "ct + ct (in place), top level"),
+    ("he.add_const", "", "ct + 1.5 out of place, into a copy of ct (add_const)"),
+    ("he.mul_const", "", "ct * 1.5 (in place, mul_const)"),
+    ("he.mul_ct_pt", "", "ct * pt (mul_new, no relin/rescale)"),
+    ("he.mul_relin", "", "ct * ct + relinearization (mul_relin_new, gadget product)"),
+    ("he.rescale", "", "rescale of a fresh ct*pt product"),
+    ("he.rotate.step1", "", "rotation by 1 at the top level (one key switch)"),
+    ("he.rotate.step1_low", "", "rotation by 1 near the bootstrap level"),
+    ("he.rotate.step100", "", "rotation by 100 via mhe.rotate (butterfly: 64+32+4, three key switches)"),
+    ("he.drop_level", "", "drop_level by one level (in place)"),
+    ("he.copy", "", "ciphertext copy (top level)"),
+    ("net.send.ciphertexts_8", "", "CP1 -> CP2 -> CP1 round trip of 8 top-level ciphertexts (pickling + socket)"),
+    ("mhe.decrypt.collective_1ct", "", "collective decryption of one ciphertext (source CP1, PCKS)"),
+    ("mhe.bootstrap.collective_1ct", "", "collective bootstrap (refresh protocol) of one ciphertext from CP1"),
+    ("mhe.switch.mpc_to_mhe_1ct", "", "Sharetensor.to_ciphertensor of 8192 values"),
+    ("mhe.switch.mpc_to_mhe_8ct", "", "Sharetensor.to_ciphertensor of 8x8192 values"),
+    ("mhe.switch.mhe_to_mpc_1ct", "", "Ciphertensor.to_sharetensor of 8192 values, source CP1"),
+    ("mhe.switch.mhe_to_mpc_8ct", "", "Ciphertensor.to_sharetensor of 8x8192 values, source CP1"),
+    ("ct.enc.mat_8x1024", "", "Ciphertensor.enc of an 8x1024 matrix (8 ciphertexts)"),
+    ("ct.reveal.mat_8x1024", "", "Ciphertensor.reveal of an 8x1024 matrix at every party (each party's decrypted to it alone)"),
+    ("ct.add.mat_8x1024", "", "ct + ct element-wise, 8x1024"),
+    ("ct.mul.mat_8x1024", "", "ct * ct element-wise (relin + refresh council), 8x1024"),
+    ("ct.mul_public.mat_8x1024", "", "ct * ndarray element-wise (encode + ct*pt), 8x1024"),
+    ("ct.rotate.vec_1024_step7", "", "1-dim Ciphertensor rotate by 7, length 1024"),
+    ("ct.rotate.vec_1024_step100", "", "1-dim Ciphertensor rotate by 100 (butterfly), length 1024"),
+    ("ct.rotate.vec_12288_step8323", "", "1-dim Ciphertensor rotate by 8323 of 12288 values: a step beyond the slots, a partial second ciphertext"),
+    ("ct.reduce_add.vec_1024", "", "1-dim reduce_add (keep_dims), length 1024"),
+    ("ct.sum.axis0_8x1024", "", "sum over rows (axis 0) of an 8x1024 matrix"),
+    ("ct.sum.axis1_8x1024", "", "sum over columns (axis 1) of an 8x1024 matrix"),
+    ("ct.concat.axis0_8x1024", "", "concat of two 8x1024 matrices along axis 0"),
+    ("ct.concat.vec_1024_1024", "", "1-dim concat of two length-1024 vectors (rotation by 1024)"),
+    ("ct.concat.vec_100_10", "", "1-dim concat of length-100 and length-10 vectors (rotation by 100: three power-of-two key switches, no key of its own)"),
+    ("ct.getitem.row_8x1024", "", "x[3] row of an 8x1024 matrix"),
+    ("ct.getitem.slice_8x1024", "", "x[2:6, 0:512] of an 8x1024 matrix (masking)"),
+    ("ct.getitem.cols_2x8192", "", "x[:, 1:] of a 2x8192 matrix: a column range ending on the ciphertext boundary (masking and a rotation by 1)"),
+    ("ct.setitem.row_8x1024", "", "x[3] = v on an 8x1024 matrix"),
+    ("ct.T.mat_8x1024", "", "transpose (.T) of an 8x1024 matrix"),
+    ("ct.matmul_cost.ct_pt", "", "Ciphertensor.get_matmul_cost(ndarray), 16x16 operands"),
+    ("ct.matmul_cost.pt_ct", "", "ndarray.get_matmul_cost(Ciphertensor), 16x16 operands"),
+    ("ct.matmul.v1_8x8", "", "_matmul_v1 (M1): A @ B.T, B lazily transposed, 8x8"),
+    ("ct.matmul.v2_8x8", "", "_matmul_v2 (M2): A @ B, both row-wise, 8x8"),
+    ("ct.matmul.v3_16x16", "", "_matmul_v3 (M3, row x diag): A @ B, B diagonal-encoded, 16x16"),
+    ("ct.matmul.v3dd_8x8", "", "_matmul_v3 (M3, diag x diag): A @ B, both diagonal-encoded, 8x8"),
+    ("ct.matmul.tnt_16x16", "", "_matmul_tnt: A (col-wise, transposed) @ plaintext B, 16x16"),
+    ("ct.matmul.tnt_128x16", "", "_matmul_tnt with a tall 128x16 A (col-wise) @ plaintext 16x16: a [16,128] diagonal-encoded result"),
+    ("ct.matmul.tn_12x8", "", "_matmul_tn (TNT's fallback): A (col-wise) 12x8 @ encrypted 8x8, a tall result whose 8 columns do not divide its 12 rows"),
+    ("ct.matmul.bsgs_8x64", "", "_matmul_bsgs (baby-step giant-step): row-wise A 8x64 @ plaintext 64x64"),
+    ("ct.matmul.v3pt_8x64", "", "_matmul_v3 (M3) with a diagonal-encoded plaintext: A 8x64 @ plaintext 64x64 (BSGS reference)"),
+    ("ct.matmul.auto_ct_pt_8x64", "", "ct @ ndarray through the cost router (via-MPC excluded), 8x64 @ 64x64"),
+    ("ct.matmul.auto_ct_pt_16x16", "", "ct @ ndarray through the cost router (via-MPC excluded), 16x16"),
+    ("ct.matmul.pt_mat_ct_vec_64", "", "ndarray 64x64 @ encrypted 64x1 column vector (perf_bench L4 case)"),
+    ("ct.matmul.via_mpc_16x16", "", "ct @ ndarray under allow_mpc_switch() at every party: the router picks via-MPC (E2S, MPC matmul, S2E)"),
+    ("mp.mpp.add_enc", "", "encrypted MPP + encrypted MPP, 2x8x64 partitions"),
+    ("mp.mpp.mul_enc", "", "encrypted MPP * encrypted MPP, 2x8x64 partitions"),
+    ("mp.mpp.reveal_enc", "", "reveal of an encrypted MPP, 2x8x64 partitions"),
+    ("mp.mpp.sum_axis0_enc", "", "encrypted MPP sum over rows, across parties (each party's partial sums to CP1, which adds them), 2x8x64"),
+    ("mp.mpp.sum_axis1_enc", "", "encrypted MPP sum over columns, per partition, 2x8x64"),
+    ("mp.mpp.matmul_ntt", "", "MPP A @ B.T (collect encrypted partitions), 2x8x64 partitions"),
+    ("mp.mpp.matmul_enc_ntt", "", "encrypted MPP A @ MPP B.T with B in the clear (ct @ ct and ct @ pt products), 2x4x64 partitions"),
+    ("mp.mpp.matmul_tnt", "", "MPP A.T @ B (local products + collect + to_mpp), 2x8x64 partitions"),
+    ("mp.mpp.matmul_ntnt", "", "MPP A @ C via MPC (to_sharetensor + Beaver + to_mpp), 16x64 @ 64x16"),
+    ("mp.mpp.matmul_public_via_mpc", "", "encrypted MPP 16x64 @ ndarray 64x3 under allow_mpc_switch(): the whole MPP via MPC (switch, MPC matmul, switch back), every party joins"),
+    ("mp.mpp.gt_local", "", "MPP > 0 on local partitions: one round with every party, then each compute party compares its own, 2x8x64"),
+    ("mp.mpp.reveal_local", "", "MPP.reveal_local of encrypted 2x8x64 partitions: each party's decrypted to it alone"),
+    ("mp.mpp.sigmoid_decor_clear", "", "nonlinear.sigmoid (Decor) of an MPP in the clear: one agreement round (no opening: rounds_per_rep 0), then each party's partition locally, 2x8x64"),
+    ("mp.mpp.sigmoid_decor_enc", "", "nonlinear.sigmoid (Decor) of an encrypted MPP: via MPC (switch, Decor sigmoid, switch back), 2x8x64"),
+    ("mp.mpa.aggregate", "", "MPA.aggregate of additive 16x64 shares (encrypt + all-to-all collect + sum)"),
+    ("mp.mpa.mul", "", "MPA * MPA element-wise (encrypt, aggregate, ct*ct), 16x64"),
+    ("mp.mpa.matmul_abt", "", "MPA A @ B.T (encrypt, aggregate, M1 matmul), 4x32"),
+    ("mp.mpa.matmul_public_via_mpc", "", "aggregate MPA 16x64 @ ndarray 64x3 under allow_mpc_switch(): one conversion via MPC and back, every party joins"),
+    ("mp.mpa.reveal_plain", "", "MPA.reveal of additive 16x64 shares every compute party holds in the clear (the sum to every party)"),
+    ("mp.mpu.add_local", "", "MPU(partition) + MPU(partition) on local plaintext partitions, 2x8x64"),
+    ("mp.mpu.add_mpa_mpp", "", "MPU(additive) + MPU(partition): each party adds its partition into its MPA share in the clear, 2x8x64"),
+    ("mp.mpu.add_mpa_enc_mpp", "", "MPU(additive, shares only encrypted) + MPU(partition) in the clear: each party adds its partition into its encrypted share, 2x8x64"),
+    ("mp.mpp.getitem_row_enc", "", "encrypted MPP X[3]: one row of CP1's row-wise partition (a view), 2x8x64"),
+    ("mp.mpp.getitem_rows_enc", "", "encrypted MPP X[4:12]: rows across a partition boundary (views), 2x8x64"),
+    ("mp.mpp.getitem_cols_enc", "", "encrypted MPP X[:, 0:16]: a column block of row-wise partitions (masked), 2x8x64"),
+    ("mp.mpp.column_enc", "", "encrypted MPP X.T[5]: a column of each row-wise partition (masked and rotated), 2x8x64"),
+    ("mp.mpp.setitem_rows_enc", "", "encrypted MPP X[4:12] = Y[4:12]: whole rows of row-wise partitions, 2x8x64"),
+    ("mp.mpp.setitem_cols_enc", "", "encrypted MPP X[:, 0:16] = Y[:, 0:16]: a column block of row-wise partitions (masked), 2x8x64"),
+    ("mp.mpp.getitem_vec_enc", "", "encrypted partitioned vector (a column, 8 values per party) v[3], 2x8"),
+    ("mp.mpu.matmul_ntt", "", "MPU(partition) A @ B.T, 2x8x64 partitions"),
+    ("mp.mpu.matmul_mpp_mpa", "", "MPU(partition) 16x64 @ MPU(additive) 64x1"),
+    ("mp.mpu.sum_axis0_local", "", "MPU(partition).sum(0) on local plaintext partitions: each party's column sums become its MPA share, 2x8x64"),
+    ("e2e.l2.mpu_16x256", "", "l2 distance + reveal on MPU partitions, 2x8x256"),
+    ("e2e.king.mpp_16x1024", "", "KING + reveal on MPP partitions, 2x8 individuals x 1024 SNPs"),
+    ("e2e.linreg.mpu_16x15", "", "LinReg BGD fit (2 epochs) on MPU partitions with MPA weights + reveal, 16x15"),
+    ("e2e.linreg.mpu_predict_16x15", "", "LinReg predict with noise on MPU partitions with MPA weights (the MI imputation step), 16x15"),
+    ("mhe.decrypt.aggregate_1ct", "", "collective decryption of one ciphertext every compute party holds alike (source -1, an aggregate's)"),
+    ("mhe.switch.mhe_to_mpc_aggregate_8ct", "", "Ciphertensor.to_sharetensor of 8x8192 values every compute party holds alike (source -1)"),
+    ("mp.mpa.to_sharetensor_aggregate", "", "MPA.to_sharetensor of an MPA that is only an aggregate (the switch with source -1), 16x64"),
+    ("mp.mpa.pow2_shares", "", "MPA ** 2 of additive 16x64 shares in the clear, split over the compute parties"),
+    ("mp.mpu.matmul_tt", "", "MPU(partition) A.T @ B.T, A 2x8x16 and B 2x8x16 partitions"),
+    ("mp.mpp.align_ratios_enc", "", "MPP.align_ratios of row-wise encrypted 2x8x64 partitions to other ratios (4 rows move)"),
+    ("mp.mpp.align_ratios_cw_enc", "", "MPP.align_ratios of column-wise encrypted 2x8x64 partitions to other ratios (4 rows move by masked moves, one council)"),
+    ("mp.mpu.sub_diag_t", "", "MPU(additive) W - X.T @ D, 8x6: X.T @ D's shares diagonal-encoded and transposed, converted through MPC to W's column-wise encryption (Sequential's first-layer update)"),
+    ("mp.mpp.matmul_tnt_col", "", "MPP A.T @ y in the clear, 2x8x64 and 2x8x1 partitions: a column-wise product, its sum split by rows in HE (masked moves)"),
+    ("mp.mpp.matmul_tnt_col_enc", "", "MPP A.T @ y, both encrypted, 2x8x64 and 2x8x1 partitions: a column-wise product, its sum split by rows in HE (masked moves)"),
+    ("mp.mpp.matmul_tnt_cw_enc", "", "MPP A.T @ B, both encrypted, 2x8x64 and 2x8x3 partitions: the M2 kernel's column-wise product, its sum split by rows in HE (masked moves)"),
+    ("e2e.linreg.mpp_16x15", "", "LinReg BGD fit (2 epochs) on MPP partitions with MPP weights + reveal, 16x15 (X.T @ y column-wise)"),
+    ("mp.mpp.matmul_public_cw_uneq", "", "MPP X @ M, X 16x16 encrypted column-wise at unequal ratios (4 and 12 rows), M public 16x8: each party's product cut back to its rows"),
+    ("mp.mpp.matmul_ntt_cw_uneq", "", "MPP X @ G.T, X and G 16x3 encrypted column-wise at unequal ratios (4 and 12 rows): each party's product cut back to its rows"),
+    ("mp.mpa.sum_rows_aggregate", "", "MPA.sum(1) of an MPA that is only an aggregate, 16x64, at the bootstrap level (its mask products refreshed)"),
+    ("mp.mpa.dot_aggregate", "", "MPA.dot(1) of an MPA that is only an aggregate, 16x64, one level above the bootstrap level"),
+    ("mp.mpu.mpa_times_mpp", "", "MPU(additive aggregate 16x8) * MPU(partition 2x8x8 encrypted, at the bootstrap level): the joined partitions refreshed"),
+    ("ct.add_broadcast_layouts", "", "a column-wise aggregate 16x8 plus a row-wise aggregate 16x8: the row-wise one converted to column-wise through MPC"),
+    ("he.add_scale_match", "", "ct + ct whose scales are a rescale apart (ratio 1 + 7.9e-5), one level apart: the higher one moves onto the other's scale (single key, witness: relative error)"),
+    ("he.add_scale_match_same", "", "the same at the same level (single key, witness: relative error)"),
+]
+
+handle_list_flag("mhe", CASES)
+
+
+@sequre
+def ct_getrow(mpc, x, i: int):
+    return x[i]
+
+
+@sequre
+def ct_getslice(mpc, x):
+    return x[2:6, 0:512]
+
+
+@sequre
+def ct_setrow(mpc, x, i: int, v):
+    x[i] = v
+
+
+@sequre
+def ct_getcols_from_1(mpc, x):
+    return x[:, 1:]
+
+
+def fresh[TP](x: Sharetensor[TP]) -> Sharetensor[TP]:
+    y = Sharetensor(x.share, x.modulus)
+    y.fp = x.fp
+    return y
+
+
+def partition_of(mpc, data, per_party: int):
+    # The rows of the cohort matrix this party holds (CP0: zeros of the full shape, as the MP types expect).
+    if mpc.pid == 0:
+        return zeros_like(data)
+    return data[(mpc.pid - 1) * per_party:mpc.pid * per_party]
+
+
+def ct_err_2d(mpc, ct, want) -> float:
+    # Collective reveal (compute parties only; Ciphertensor.reveal crashes at CP0).
+    if mpc.pid == 0:
+        return 0.0
+    return max_abs_err_2d(ct.reveal(mpc, T=float), want)
+
+
+def ct_err_1d(mpc, ct, want) -> float:
+    if mpc.pid == 0:
+        return 0.0
+    return max_abs_err_1d(ct.reveal(mpc, T=float).flatten(), want)
+
+
+########################## he: local CKKS operations (solo, CP1) ##########################
+
+def exact_random_values(n: int, bits: int, seed: u64) -> List[lattiseq_exact_int]:
+    # Signed values below 2^bits from a local xorshift generator: CP1 alone draws them, so they must not advance any
+    # random stream the parties share.
+    state = seed
+    out = List[lattiseq_exact_int](n)
+    for _ in range(n):
+        x = lattiseq_exact_int(0)
+        left = bits
+        while left > 0:
+            state ^= state << u64(13)
+            state ^= state >> u64(7)
+            state ^= state << u64(17)
+            take = min(left, 60)
+            x = (x << lattiseq_exact_int(take)) | lattiseq_exact_int(int(state >> u64(64 - take)))
+            left -= take
+        out.append(-x if state & u64(1) else x)
+    return out
+
+
+def exact_encoding_error(exact, pt, real: List[lattiseq_exact_int], imag: List[lattiseq_exact_int], frac: int, log_slots: int) -> float:
+    # The largest error in a slot, in real units.
+    back_real, back_imag = exact.decode_fixed_point(pt, log_slots, frac)
+    err = 0.0
+    for i in range(len(real)):
+        err = max(err, abs((back_real[i] - real[i]).to_float()), abs((back_imag[i] - imag[i]).to_float()))
+    return err / 2.0 ** frac
+
+
+def bench_he_exact(mpc, b: Bench, params):
+    # Masked-size values: 2^150 at 32 fractional bits. Witness: the largest error in a slot, which stays at CKKS's own
+    # ~6e-9 whatever the magnitude (the float encoder's would be about 2^150 * 2^-52). Every party prepares the data
+    # (a few milliseconds) and calls want(); CP1 times.
+    frac = 32
+    slots = params.slots()
+    top = params.max_level()
+    exact = new_exact_encoder(params)
+    real = exact_random_values(slots, 150 + frac, u64(0x9E3779B97F4A7C15))
+    imag = exact_random_values(slots, 150 + frac, u64(0xC2B2AE3D27D4EB4F))
+    pt = ckks.new_plaintext(params, top, params.default_scale)
+    exact.encode_fixed_point(real, imag, frac, pt, params.log_slots)
+
+    if b.want(mpc, "he.encode_exact"):
+        if mpc.pid == 1:
+            out = ckks.new_plaintext(params, top, params.default_scale)
+            t = Timer(b.reps(9), sync=False, batch=2)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    exact.encode_fixed_point(real, imag, frac, out, params.log_slots)
+                t.end(mpc)
+            b.report(f"slots={slots};level={top};bits=150", t, exact_encoding_error(exact, out, real, imag, frac, params.log_slots))
+
+    if b.want(mpc, "he.decode_exact"):
+        if mpc.pid == 1:
+            t = Timer(b.reps(9), sync=False, batch=2)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    exact.decode_fixed_point(pt, params.log_slots, frac)
+                t.end(mpc)
+            b.report(f"slots={slots};level={top};bits=150", t, exact_encoding_error(exact, pt, real, imag, frac, params.log_slots))
+
+
+def bench_he(mpc, b: Bench):
+    if not b.any_selected("he."):
+        return
+    cp = mpc.mhe.crypto_params
+    params = cp.params
+    ev = cp.evaluator
+    slots = params.slots()
+    top = params.max_level()
+
+    vals = [complex(v, 0.0) for v in private_floats(slots, -1.0, 1.0)]
+    vals_b = [complex(v, 0.0) for v in private_floats(slots, -1.0, 1.0)]
+    pt = ckks.new_plaintext(params, top, params.default_scale)
+    cp.encoder.encode(vals, pt, params.log_slots)
+    pt_b = ckks.new_plaintext(params, top, params.default_scale)
+    cp.encoder.encode(vals_b, pt_b, params.log_slots)
+    ct = cp.encryptor.encrypt_new(pt)
+    ct_b = cp.encryptor.encrypt_new(pt_b)
+
+    if b.want(mpc, "he.encode"):
+        if mpc.pid == 1:
+            out = ckks.new_plaintext(params, top, params.default_scale)
+            t = Timer(b.reps(9), sync=False, batch=10)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    cp.encoder.encode(vals, out, params.log_slots)
+                t.end(mpc)
+            dec = cp.encoder.decode(out, params.log_slots)
+            err = 0.0
+            for i in range(slots):
+                d = abs(dec[i] - vals[i])
+                if d > err: err = d
+            b.report(f"slots={slots};level={top}", t, err)
+
+    if b.want(mpc, "he.decode"):
+        if mpc.pid == 1:
+            dec = cp.encoder.decode(pt, params.log_slots)
+            t = Timer(b.reps(9), sync=False, batch=2)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    dec = cp.encoder.decode(pt, params.log_slots)
+                t.end(mpc)
+            err = 0.0
+            for i in range(slots):
+                d = abs(dec[i] - vals[i])
+                if d > err: err = d
+            b.report(f"slots={slots};level={top}", t, err)
+
+    if b.any_selected("he.encode_exact") or b.any_selected("he.decode_exact"):
+        bench_he_exact(mpc, b, params)
+
+    if b.want(mpc, "he.encrypt_pk"):
+        if mpc.pid == 1:
+            out = ct
+            t = Timer(b.reps(9), sync=False, batch=3)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    out = cp.encryptor.encrypt_new(pt)
+                t.end(mpc)
+            b.report(f"level={top}", t, float(out.level()))
+
+    if b.want(mpc, "he.decrypt_sk"):
+        if mpc.pid == 1:
+            out = pt
+            t = Timer(b.reps(9), sync=False, batch=20)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    out = cp.decryptor.decrypt_new(ct)
+                t.end(mpc)
+            b.report(f"level={top}", t, float(out.level()))
+
+    if b.want(mpc, "he.add"):
+        if mpc.pid == 1:
+            out = ct.copy()
+            t = Timer(b.reps(9), sync=False, batch=200)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    ev.add(ct, ct_b, out)
+                t.end(mpc)
+            b.report(f"level={top}", t, float(out.level()))
+
+    if b.want(mpc, "he.add_const"):
+        if mpc.pid == 1:
+            out = ct.copy()
+            t = Timer(b.reps(9), sync=False, batch=200)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    ev.add_const(ct, 1.5, out)
+                t.end(mpc)
+            b.report(f"level={top}", t, float(out.level()))
+
+    if b.want(mpc, "he.mul_const"):
+        if mpc.pid == 1:
+            out = ct.copy()
+            t = Timer(b.reps(9), sync=False, batch=50)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    ev.mul_const(ct, 1.5, out)
+                t.end(mpc)
+            b.report(f"level={top}", t, float(out.level()))
+
+    if b.want(mpc, "he.mul_ct_pt"):
+        if mpc.pid == 1:
+            out = ct
+            t = Timer(b.reps(9), sync=False, batch=20)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    out = ev.mul_new(ct, pt_b)
+                t.end(mpc)
+            b.report(f"level={top}", t, float(out.degree()))
+
+    if b.want(mpc, "he.mul_relin"):
+        if mpc.pid == 1:
+            out = ct
+            t = Timer(b.reps(9), sync=False, batch=3)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    out = ev.mul_relin_new(ct, ct_b)
+                t.end(mpc)
+            b.report(f"level={top}", t, float(out.degree()))
+
+    if b.want(mpc, "he.rescale"):
+        if mpc.pid == 1:
+            t = Timer(b.reps(9), sync=False, batch=5)
+            level_after = 0
+            while t.next():
+                prods = [ev.mul_new(ct, pt_b) for _ in range(t.batch)]
+                t.begin(mpc)
+                for k in range(t.batch):
+                    ev.rescale(prods[k], params.default_scale, prods[k])
+                t.end(mpc)
+                level_after = prods[0].level()
+            b.report(f"from_level={top}", t, float(level_after))
+
+    if b.want(mpc, "he.rotate.step1"):
+        if mpc.pid == 1:
+            out = ct
+            t = Timer(b.reps(9), sync=False, batch=3)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    out = ev.rotate_new(ct, 1)
+                t.end(mpc)
+            b.report(f"level={top}", t, float(out.level()))
+
+    if b.want(mpc, "he.rotate.step1_low"):
+        if mpc.pid == 1:
+            low = ct.copy()
+            ev.drop_level(low, low.level() - (mpc.mhe.bootstrap_min_level + 1))
+            out = low
+            t = Timer(b.reps(9), sync=False, batch=5)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    out = ev.rotate_new(low, 1)
+                t.end(mpc)
+            b.report(f"level={low.level()}", t, float(out.level()))
+
+    if b.want(mpc, "he.rotate.step100"):
+        if mpc.pid == 1:
+            src = [ct]
+            out = src
+            t = Timer(b.reps(9), sync=False, batch=2)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    out = mpc.mhe.rotate(src, 100)
+                t.end(mpc)
+            b.report(f"level={top};keyswitches=3", t, float(out[0].level()))
+
+    if b.want(mpc, "he.drop_level"):
+        if mpc.pid == 1:
+            t = Timer(b.reps(9), sync=False, batch=50)
+            while t.next():
+                copies = [ct.copy() for _ in range(t.batch)]
+                t.begin(mpc)
+                for k in range(t.batch):
+                    ev.drop_level(copies[k], 1)
+                t.end(mpc)
+            b.report(f"from_level={top}", t, float(top - 1))
+
+    if b.want(mpc, "he.copy"):
+        if mpc.pid == 1:
+            out = ct
+            t = Timer(b.reps(9), sync=False, batch=20)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    out = ct.copy()
+                t.end(mpc)
+            b.report(f"level={top}", t, float(out.level()))
+
+
+########################## net + collective MHE ##########################
+
+def bench_mhe_collective(mpc, b: Bench):
+    params = mpc.mhe.crypto_params.params
+    slots = params.slots()
+
+    if b.want(mpc, "net.send.ciphertexts_8"):
+        vs = private_floats(8 * slots, -1.0, 1.0)
+        cts = mpc.mhe.enc_vector(vs, T=Ciphertext)
+        back = cts
+        t = Timer(b.reps(9), batch=4)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                if mpc.pid == 1:
+                    mpc.comms.send_as_jar(cts, 2)
+                    back = mpc.comms.receive_as_jar(2, List[Ciphertext])
+                elif mpc.pid == 2:
+                    got = mpc.comms.receive_as_jar(1, List[Ciphertext])
+                    mpc.comms.send_as_jar(got, 1)
+            t.end(mpc)
+        if mpc.pid:
+            b.report(f"n_ct=8;level={params.max_level()};roundtrip", t, float(len(back)))
+
+    if b.want(mpc, "mhe.decrypt.collective_1ct"):
+        vs = shared_floats(mpc, slots, -1.0, 1.0)
+        cv = mpc.mhe.enc_vector(vs, T=Ciphertext)
+        pts = List[Plaintext]()
+        t = Timer(b.reps(9))
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                pts = mpc.mhe.decrypt(cv, 1)
+            t.end(mpc)
+        if mpc.pid:
+            b.report(f"source=1;level={cv[0].level()}", t, max_abs_err_1d(mpc.mhe.decode(pts, dtype=float), vs))
+
+    if b.want(mpc, "mhe.bootstrap.collective_1ct"):
+        vs = shared_floats(mpc, slots, -1.0, 1.0)
+        cv = mpc.mhe.enc_vector(vs, T=Ciphertext)
+        target = mpc.mhe.bootstrap_min_level + 1
+        mpc.mhe.crypto_params.evaluator.drop_level(cv[0], cv[0].level() - target)
+        last = cv[0]
+        t = Timer(b.reps(7))
+        while t.next():
+            work = cv[0].copy()
+            t.begin(mpc)
+            if mpc.pid:
+                mpc.mhe._collective_bootstrap(work, 1)
+            t.end(mpc)
+            last = work
+        if mpc.pid:
+            # CP1 (the hub) refreshes its own ciphertext in place; reveal it from CP1.
+            err = max_abs_err_1d(mpc.mhe.decode(mpc.mhe.decrypt([last], 1), dtype=float), vs)
+            b.report(f"source=1;from_level={target};to_level={last.level() if mpc.pid == 1 else -1}", t, err)
+
+
+def bench_switch(mpc, b: Bench):
+    modulus = MPC_FIELD_SIZE
+    slots = mpc.mhe.crypto_params.params.slots()
+
+    for n_ct in (1, 8):
+        name = f"mhe.switch.mpc_to_mhe_{n_ct}ct"
+        if b.want(mpc, name):
+            n = n_ct * slots
+            xs = shared_floats(mpc, n, -1.0, 1.0)
+            x = Sharetensor.enc(mpc, xs)
+            ct = x.to_ciphertensor(mpc)
+            t = Timer(b.reps(7 if n_ct == 1 else 5))
+            while t.next():
+                t.begin(mpc)
+                ct = x.to_ciphertensor(mpc)
+                t.end(mpc)
+            err = ct_err_1d(mpc, ct, xs)
+            if mpc.pid:
+                b.report(f"n={n}", t, err)
+
+    for n_ct in (1, 8):
+        name = f"mhe.switch.mhe_to_mpc_{n_ct}ct"
+        if b.want(mpc, name):
+            n = n_ct * slots
+            xs = shared_floats(mpc, n, -1.0, 1.0)
+            ct = Ciphertensor[Ciphertext].enc(mpc, xs)
+            st = ct.to_sharetensor(mpc, modulus, 1, S=Tuple[int])
+            t = Timer(b.reps(7 if n_ct == 1 else 5))
+            while t.next():
+                t.begin(mpc)
+                st = ct.to_sharetensor(mpc, modulus, 1, S=Tuple[int])
+                t.end(mpc)
+            rv = st.reveal(mpc)
+            if mpc.pid:
+                b.report(f"n={n};source=1", t, max_abs_err_1d(rv, xs))
+
+
+########################## ct: Ciphertensor ##########################
+
+def bench_ct(mpc, b: Bench):
+    if not b.any_selected_but("ct.", "ct.matmul"):
+        return
+    rows, cols = 8, 1024
+    A = shared_float_matrix(mpc, rows, cols, -1.0, 1.0)
+    B = shared_float_matrix(mpc, rows, cols, -1.0, 1.0)
+    v = shared_floats(mpc, cols, -1.0, 1.0)
+    w = shared_floats(mpc, cols, -1.0, 1.0)
+    ctA = Ciphertensor[Ciphertext].enc(mpc, A)
+    ctB = Ciphertensor[Ciphertext].enc(mpc, B)
+    ctv = Ciphertensor[Ciphertext].enc(mpc, v)
+    ctw = Ciphertensor[Ciphertext].enc(mpc, w)
+    ndB = array(B)
+    shape = f"{rows}x{cols}"
+
+    if b.want(mpc, "ct.enc.mat_8x1024"):
+        out = ctA
+        t = Timer(b.reps(7))
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                out = Ciphertensor[Ciphertext].enc(mpc, A)
+            t.end(mpc)
+        err = ct_err_2d(mpc, out, A)
+        if mpc.pid:
+            b.report(shape, t, err)
+
+    if b.want(mpc, "ct.reveal.mat_8x1024"):
+        rv = array([[0.0]])
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                rv = ctA.reveal(mpc, T=float)
+            t.end(mpc)
+        if mpc.pid:
+            b.report(f"{shape};source=all", t, max_abs_err_2d(rv, A))
+
+    if b.want(mpc, "ct.add.mat_8x1024"):
+        out = ctA
+        t = Timer(b.reps(9), batch=20)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                for _ in range(t.batch):
+                    out = secure_operator.add(mpc, ctA, ctB)
+            t.end(mpc)
+        err = ct_err_2d(mpc, out, [[A[i][j] + B[i][j] for j in range(cols)] for i in range(rows)])
+        if mpc.pid:
+            b.report(shape, t, err)
+
+    if b.want(mpc, "ct.mul.mat_8x1024"):
+        out = ctA
+        t = Timer(b.reps(9), batch=2)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                for _ in range(t.batch):
+                    out = secure_operator.mul(mpc, ctA, ctB)
+            t.end(mpc)
+        err = ct_err_2d(mpc, out, [[A[i][j] * B[i][j] for j in range(cols)] for i in range(rows)])
+        if mpc.pid:
+            b.report(shape, t, err)
+
+    if b.want(mpc, "ct.mul_public.mat_8x1024"):
+        out = ctA
+        t = Timer(b.reps(9), batch=2)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                for _ in range(t.batch):
+                    out = secure_operator.mul(mpc, ctA, ndB)
+            t.end(mpc)
+        err = ct_err_2d(mpc, out, [[A[i][j] * B[i][j] for j in range(cols)] for i in range(rows)])
+        if mpc.pid:
+            b.report(shape, t, err)
+
+    if b.want(mpc, "ct.rotate.vec_12288_step8323"):
+        # v repeated 12 times (no new shared draws)
+        long_v = List[float](12 * cols)
+        for _ in range(12):
+            long_v.extend(v)
+        ct_long = Ciphertensor[Ciphertext].enc(mpc, long_v)
+        out = ct_long
+        t = Timer(b.reps(9), batch=2)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                for _ in range(t.batch):
+                    out = ct_long.rotate(mpc, 8323)
+            t.end(mpc)
+        err = ct_err_1d(mpc, out, [long_v[(i + 8323) % len(long_v)] for i in range(len(long_v))])
+        if mpc.pid:
+            b.report(f"n={len(long_v)};step=8323", t, err)
+
+    for step in (7, 100):
+        if b.want(mpc, f"ct.rotate.vec_1024_step{step}"):
+            out = ctv
+            t = Timer(b.reps(9), batch=2)
+            while t.next():
+                t.begin(mpc)
+                if mpc.pid:
+                    for _ in range(t.batch):
+                        out = ctv.rotate(mpc, step)
+                t.end(mpc)
+            err = ct_err_1d(mpc, out, [v[(i + step) % cols] for i in range(cols)])
+            if mpc.pid:
+                b.report(f"n={cols};step={step}", t, err)
+
+    if b.want(mpc, "ct.reduce_add.vec_1024"):
+        out = ctv
+        t = Timer(b.reps(9), batch=2)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                for _ in range(t.batch):
+                    out = ctv.reduce_add(mpc)
+            t.end(mpc)
+        total = 0.0
+        for x in v: total += x
+        err = ct_err_1d(mpc, out, [total for _ in range(cols)])
+        if mpc.pid:
+            b.report(f"n={cols}", t, err)
+
+    for axis in (0, 1):
+        if b.want(mpc, f"ct.sum.axis{axis}_8x1024"):
+            out = ctA
+            t = Timer(b.reps(9 if axis == 0 else 5), batch=(10 if axis == 0 else 1))
+            while t.next():
+                t.begin(mpc)
+                if mpc.pid:
+                    for _ in range(t.batch):
+                        out = ctA.sum(mpc, axis)
+                t.end(mpc)
+            if axis == 0:
+                want = [sum([A[i][j] for i in range(rows)]) for j in range(cols)]
+            else:
+                want = [sum(A[i]) for i in range(rows)]
+            err = ct_err_1d(mpc, out, want)
+            if mpc.pid:
+                b.report(f"{shape};axis={axis}", t, err)
+
+    if b.want(mpc, "ct.concat.axis0_8x1024"):
+        out = ctA
+        t = Timer(b.reps(9), batch=20)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                for _ in range(t.batch):
+                    out = ctA.concat(mpc, ctB, axis=0)
+            t.end(mpc)
+        both = [A[i] for i in range(rows)]
+        for i in range(rows): both.append(B[i])
+        err = ct_err_2d(mpc, out, both)
+        if mpc.pid:
+            b.report(f"{shape}++{shape}", t, err)
+
+    if b.want(mpc, "ct.concat.vec_1024_1024"):
+        out = ctv
+        t = Timer(b.reps(9), batch=2)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                for _ in range(t.batch):
+                    out = ctv.concat(mpc, ctw, axis=0)
+            t.end(mpc)
+        both = v.copy()
+        both.extend(w)
+        err = ct_err_1d(mpc, out, both)
+        if mpc.pid:
+            b.report(f"n={cols}++{cols}", t, err)
+
+    if b.want(mpc, "ct.concat.vec_100_10"):
+        # The first 100 and 10 entries of v and w (no new shared draws)
+        v100 = v[:100]
+        w10 = w[:10]
+        ctv100 = Ciphertensor[Ciphertext].enc(mpc, v100)
+        ctw10 = Ciphertensor[Ciphertext].enc(mpc, w10)
+        out = ctv100
+        t = Timer(b.reps(9), batch=2)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                for _ in range(t.batch):
+                    out = ctv100.concat(mpc, ctw10, axis=0)
+            t.end(mpc)
+        both = v100.copy()
+        both.extend(w10)
+        err = ct_err_1d(mpc, out, both)
+        if mpc.pid:
+            b.report("n=100++10", t, err)
+
+    if b.want(mpc, "ct.getitem.row_8x1024"):
+        out = ctv
+        t = Timer(b.reps(9), batch=1000)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                for _ in range(t.batch):
+                    out = ct_getrow(mpc, ctA, 3)
+            t.end(mpc)
+        err = ct_err_1d(mpc, out, A[3])
+        if mpc.pid:
+            b.report(f"{shape};row=3", t, err)
+
+    if b.want(mpc, "ct.getitem.slice_8x1024"):
+        out = ctA
+        t = Timer(b.reps(9))
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                out = ct_getslice(mpc, ctA)
+            t.end(mpc)
+        err = ct_err_2d(mpc, out, [[A[i][j] for j in range(512)] for i in range(2, 6)])
+        if mpc.pid:
+            b.report(f"{shape};[2:6,0:512]", t, err)
+
+    if b.want(mpc, "ct.getitem.cols_2x8192"):
+        # Rows 0 and 1 of A, each repeated 8 times: one full ciphertext per row (no new shared draws)
+        wide = List[List[float]](2)
+        for r in range(2):
+            wide_row = List[float](8 * cols)
+            for _ in range(8):
+                wide_row.extend(A[r])
+            wide.append(wide_row)
+        ct_wide = Ciphertensor[Ciphertext].enc(mpc, wide)
+        out = ct_wide
+        t = Timer(b.reps(9))
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                out = ct_getcols_from_1(mpc, ct_wide)
+            t.end(mpc)
+        err = ct_err_2d(mpc, out, [row[1:] for row in wide])
+        if mpc.pid:
+            b.report("2x8192;[:,1:]", t, err)
+
+    if b.want(mpc, "ct.setitem.row_8x1024"):
+        target = ctA.copy()
+        t = Timer(b.reps(9), batch=1000)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                for _ in range(t.batch):
+                    ct_setrow(mpc, target, 3, ctv)
+            t.end(mpc)
+        want = [A[i] for i in range(rows)]
+        want[3] = v
+        err = ct_err_2d(mpc, target, want)
+        if mpc.pid:
+            b.report(f"{shape};row=3", t, err)
+
+    if b.want(mpc, "ct.T.mat_8x1024"):
+        out = ctA
+        t = Timer(b.reps(9), batch=20)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                for _ in range(t.batch):
+                    out = ctA.T
+            t.end(mpc)
+        if mpc.pid:
+            b.report(shape, t, float(len(out._data)))
+
+
+def bench_ct_matmul(mpc, b: Bench):
+    # Multi-second cases use warmup=0 and 2-3 repetitions: their first run is not slower (no lazy state), and the
+    # suite has to stay short. Shapes are the ones the unit tests show working (test_ciphertensor.codon).
+    if not b.any_selected("ct.matmul"):
+        return
+    A8 = shared_float_matrix(mpc, 8, 8, -1.0, 1.0)
+    B8 = shared_float_matrix(mpc, 8, 8, -1.0, 1.0)
+    A16 = shared_float_matrix(mpc, 16, 16, -1.0, 1.0)
+    B16 = shared_float_matrix(mpc, 16, 16, -1.0, 1.0)
+    A8x64 = shared_float_matrix(mpc, 8, 64, -1.0, 1.0)
+    B64 = shared_float_matrix(mpc, 64, 64, -1.0, 1.0)
+    v64 = shared_float_matrix(mpc, 64, 1, -1.0, 1.0)
+    nA8, nB8, nA16, nB16 = array(A8), array(B8), array(A16), array(B16)
+    nA8x64, nB64, nv64 = array(A8x64), array(B64), array(v64)
+
+    if b.want(mpc, "ct.matmul_cost.ct_pt"):
+        ct = Ciphertensor[Ciphertext].enc(mpc, A16, encoding=ENC_ROW)
+        cost = 0.0
+        t = Timer(b.reps(9), batch=10000)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                for _ in range(t.batch):
+                    cost = ct.get_matmul_cost(nB16)
+            t.end(mpc)
+        if mpc.pid:
+            b.report("16x16@16x16", t, cost)
+
+    if b.want(mpc, "ct.matmul_cost.pt_ct"):
+        ct = Ciphertensor[Ciphertext].enc(mpc, B16, encoding=ENC_ROW)
+        cost = 0.0
+        t = Timer(b.reps(9), batch=5)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                for _ in range(t.batch):
+                    cost = nA16.get_matmul_cost(ct)
+            t.end(mpc)
+        if mpc.pid:
+            b.report("16x16@16x16", t, cost)
+
+    if b.want(mpc, "ct.matmul.v1_8x8"):
+        a = Ciphertensor[Ciphertext].enc(mpc, A8, encoding=ENC_ROW)
+        bt = Ciphertensor[Ciphertext].enc(mpc, B8, encoding=ENC_ROW).T
+        out = a
+        t = Timer(b.reps(2), warmup=0)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                out = a._matmul_v1(mpc, bt, debug=False)
+            t.end(mpc)
+        err = ct_err_2d(mpc, out, nA8 @ nB8.T)
+        if mpc.pid:
+            b.report("8x8@(8x8).T", t, err)
+
+    if b.want(mpc, "ct.matmul.v2_8x8"):
+        a = Ciphertensor[Ciphertext].enc(mpc, A8, encoding=ENC_ROW)
+        bb = Ciphertensor[Ciphertext].enc(mpc, B8, encoding=ENC_ROW)
+        out = a
+        t = Timer(b.reps(2), warmup=0)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                out = a._matmul_v2(mpc, bb, debug=False)
+            t.end(mpc)
+        err = ct_err_2d(mpc, out, nA8 @ nB8)
+        if mpc.pid:
+            b.report("8x8@8x8", t, err)
+
+    if b.want(mpc, "ct.matmul.v3_16x16"):
+        a = Ciphertensor[Ciphertext].enc(mpc, A16, encoding=ENC_ROW)
+        bd = Ciphertensor[Ciphertext].enc(mpc, B16, encoding=ENC_DIAG)
+        out = a
+        t = Timer(b.reps(2), warmup=0)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                out = a._matmul_v3(mpc, bd, debug=False)
+            t.end(mpc)
+        err = ct_err_2d(mpc, out, nA16 @ nB16)
+        if mpc.pid:
+            b.report("16x16@diag(16x16)", t, err)
+
+    if b.want(mpc, "ct.matmul.v3dd_8x8"):
+        ad = Ciphertensor[Ciphertext].enc(mpc, A8, encoding=ENC_DIAG)
+        bd = Ciphertensor[Ciphertext].enc(mpc, B8, encoding=ENC_DIAG)
+        out = ad
+        t = Timer(b.reps(2), warmup=0)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                out = ad._matmul_v3(mpc, bd, debug=False)
+            t.end(mpc)
+        err = ct_err_2d(mpc, out, nA8 @ nB8)
+        if mpc.pid:
+            b.report("diag(8x8)@diag(8x8)", t, err)
+
+    for rows in (16, 128):
+        name = "ct.matmul.tnt_16x16" if rows == 16 else "ct.matmul.tnt_128x16"
+        if b.want(mpc, name):
+            # The 128-row A is cut from B64 instead of drawn: no extra draw shifts the shared data of later cases
+            X = shared_float_matrix(mpc, rows, 16, -1.0, 1.0) if rows == 16 else [B64[i // 4][(i % 4) * 16:(i % 4 + 1) * 16] for i in range(rows)]
+            ac = Ciphertensor[Ciphertext].enc(mpc, X, encoding=ENC_COL)
+            out = ac
+            t = Timer(b.reps(2), warmup=0)
+            while t.next():
+                t.begin(mpc)
+                if mpc.pid:
+                    out = ac._matmul_tnt(mpc, nB16, debug=False)
+                t.end(mpc)
+            err = ct_err_2d(mpc, out, array(X) @ nB16)
+            if mpc.pid:
+                b.report(f"col({rows}x16)@16x16", t, err)
+
+    if b.want(mpc, "ct.matmul.tn_12x8"):
+        # A cut from A16 (no extra draw), so its 8 columns do not divide its 12 rows: outside TNT's domain
+        X = [row[:8] for row in A16[:12]]
+        ac = Ciphertensor[Ciphertext].enc(mpc, X, encoding=ENC_COL)
+        bb = Ciphertensor[Ciphertext].enc(mpc, B8, encoding=ENC_ROW)
+        out = ac
+        t = Timer(b.reps(2), warmup=0)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                out = ac._matmul_tn(mpc, bb, debug=False)
+            t.end(mpc)
+        err = ct_err_2d(mpc, out, array(X) @ nB8)
+        if mpc.pid:
+            b.report("col(12x8)@8x8", t, err)
+
+    if b.want(mpc, "ct.matmul.bsgs_8x64"):
+        a = Ciphertensor[Ciphertext].enc(mpc, A8x64, encoding=ENC_ROW)
+        out = a
+        t = Timer(b.reps(3), warmup=0)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                out = a._matmul_bsgs(mpc, nB64, debug=False)
+            t.end(mpc)
+        err = ct_err_2d(mpc, out, nA8x64 @ nB64)
+        if mpc.pid:
+            b.report("8x64@64x64", t, err)
+
+    if b.want(mpc, "ct.matmul.v3pt_8x64"):
+        a = Ciphertensor[Ciphertext].enc(mpc, A8x64, encoding=ENC_ROW)
+        out = a
+        t = Timer(b.reps(2), warmup=0)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                # what the cost router runs for its M3 choice: encode the plaintext diagonal-wise, then _matmul_v3
+                out = a._matmul_v3(mpc, Ciphertensor[Plaintext].enc(mpc, nB64, encoding=ENC_DIAG), debug=False)
+            t.end(mpc)
+        err = ct_err_2d(mpc, out, nA8x64 @ nB64)
+        if mpc.pid:
+            b.report("8x64@diag(64x64)", t, err)
+
+    if b.want(mpc, "ct.matmul.auto_ct_pt_8x64"):
+        a = Ciphertensor[Ciphertext].enc(mpc, A8x64, encoding=ENC_ROW)
+        out = a
+        t = Timer(b.reps(3), warmup=0)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                out = secure_operator.matmul(mpc, a, nB64)
+            t.end(mpc)
+        err = ct_err_2d(mpc, out, nA8x64 @ nB64)
+        if mpc.pid:
+            b.report("8x64@64x64", t, err)
+
+    if b.want(mpc, "ct.matmul.auto_ct_pt_16x16"):
+        a = Ciphertensor[Ciphertext].enc(mpc, A16, encoding=ENC_ROW)
+        out = a
+        t = Timer(b.reps(3), warmup=0)
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                out = secure_operator.matmul(mpc, a, nB16)
+            t.end(mpc)
+        err = ct_err_2d(mpc, out, nA16 @ nB16)
+        if mpc.pid:
+            b.report("16x16@16x16", t, err)
+
+    if b.want(mpc, "ct.matmul.pt_mat_ct_vec_64"):
+        cv = Ciphertensor[Ciphertext].enc(mpc, v64)
+        out = cv
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                out = nB64.matmul(mpc, cv, debug=False)
+            t.end(mpc)
+        err = ct_err_2d(mpc, out, nB64 @ nv64)
+        if mpc.pid:
+            b.report("64x64@64x1", t, err)
+
+    if b.want(mpc, "ct.matmul.via_mpc_16x16"):
+        a = Ciphertensor[Ciphertext].enc(mpc, A16, encoding=ENC_ROW)
+        out = a
+        t = Timer(b.reps(1), warmup=0)
+        while t.next():
+            t.begin(mpc)
+            # Every party runs the product, the trusted dealer included: it takes the same route and joins via-MPC
+            with mpc.allow_mpc_switch():
+                out = secure_operator.matmul(mpc, a, nB16)
+            t.end(mpc)
+        err = ct_err_2d(mpc, out, nA16 @ nB16)
+        if mpc.pid:
+            b.report("16x16@16x16", t, err)
+
+
+########################## mp: MPP / MPA / MPU ##########################
+
+def bench_mp(mpc, b: Bench):
+    if not b.any_selected("mp."):
+        return
+    n_cp = mpc.comms.number_of_parties - 1
+    per, cols = 8, 64
+    rows = per * n_cp
+    A = array(shared_float_matrix(mpc, rows, cols, -1.0, 1.0))
+    B = array(shared_float_matrix(mpc, rows, cols, -1.0, 1.0))
+    C = array(shared_float_matrix(mpc, cols, 16, -1.0, 1.0))
+    pA = partition_of(mpc, A, per)
+    pB = partition_of(mpc, B, per)
+    pC = partition_of(mpc, C, cols // n_cp)
+
+    mppA = MPP(mpc, pA)
+    mppB = MPP(mpc, pB)
+    mppC = MPP(mpc, pC)
+    encA = mppA.copy()
+    encA.encrypt()
+    encB = mppB.copy()
+    encB.encrypt()
+
+    if b.want(mpc, "mp.mpp.add_enc"):
+        out = encA
+        t = Timer(b.reps(9), batch=10)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                out = encA + encB
+            t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"{n_cp}x{per}x{cols}", t, max_abs_err_2d(rv, A + B))
+
+    if b.want(mpc, "mp.mpp.mul_enc"):
+        out = encA
+        t = Timer(b.reps(9), batch=2)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                out = encA * encB
+            t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"{n_cp}x{per}x{cols}", t, max_abs_err_2d(rv, A * B))
+
+    if b.want(mpc, "mp.mpp.reveal_enc"):
+        rv = A
+        t = Timer(b.reps(7))
+        while t.next():
+            t.begin(mpc)
+            rv = encA.reveal()
+            t.end(mpc)
+        if mpc.pid:
+            b.report(f"{n_cp}x{per}x{cols}", t, max_abs_err_2d(rv, A))
+
+    for axis in (0, 1):
+        if b.want(mpc, f"mp.mpp.sum_axis{axis}_enc"):
+            out = encA.sum(axis)
+            t = Timer(b.reps(5))
+            while t.next():
+                t.begin(mpc)
+                out = encA.sum(axis)
+                t.end(mpc)
+            rv = out.reveal()
+            if mpc.pid:
+                want = A.sum(axis=axis)
+                b.report(f"{n_cp}x{per}x{cols};axis={axis}", t, max_abs_err_1d(rv, want))
+
+    if b.want(mpc, "mp.mpp.matmul_ntt"):
+        out = mppA
+        t = Timer(b.reps(3))
+        while t.next():
+            t.begin(mpc)
+            out = mppA @ mppB.T
+            t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"({rows}x{cols})@({rows}x{cols}).T", t, max_abs_err_2d(rv, A @ B.T))
+
+    if b.want(mpc, "mp.mpp.matmul_enc_ntt"):
+        # The first 4 rows of every party's partitions of A and B: no new shared draws. Products with an encrypted
+        # first factor include ct @ ct products, about 0.1 s per result cell, hence the small partitions.
+        sub = 4
+        sA = array([[A[(i // sub) * per + i % sub, j] for j in range(cols)] for i in range(sub * n_cp)])
+        sB = array([[B[(i // sub) * per + i % sub, j] for j in range(cols)] for i in range(sub * n_cp)])
+        encA4 = MPP(mpc, partition_of(mpc, sA, sub))
+        encA4.encrypt()
+        mppB4 = MPP(mpc, partition_of(mpc, sB, sub))
+        out = encA4
+        t = Timer(b.reps(3), warmup=0)
+        while t.next():
+            t.begin(mpc)
+            out = encA4 @ mppB4.T
+            t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"({sub * n_cp}x{cols})@({sub * n_cp}x{cols}).T", t, max_abs_err_2d(rv, sA @ sB.T))
+
+    if b.want(mpc, "mp.mpp.matmul_tnt"):
+        out = mppA
+        t = Timer(b.reps(3))
+        while t.next():
+            t.begin(mpc)
+            out = mppA.T @ mppB
+            t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"({rows}x{cols}).T@({rows}x{cols})", t, max_abs_err_2d(rv, A.T @ B))
+
+    if b.want(mpc, "mp.mpp.matmul_ntnt"):
+        out = mppA
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            out = mppA @ mppC
+            t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"({rows}x{cols})@({cols}x16)", t, max_abs_err_2d(rv, A @ C))
+
+    if b.want(mpc, "mp.mpp.matmul_public_via_mpc"):
+        # The first three columns of C: no new shared draws, which would change the data of the cases after this one
+        W = array([[C[i, j] for j in range(3)] for i in range(cols)])
+        out = encA
+        t = Timer(b.reps(5))
+        with mpc.allow_mpc_switch():
+            while t.next():
+                t.begin(mpc)
+                out = encA @ W
+                t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"({rows}x{cols})@({cols}x3)", t, max_abs_err_2d(rv, A @ W))
+
+    if b.want(mpc, "mp.mpp.gt_local"):
+        out = mppA > 0
+        t = Timer(b.reps(9), batch=10)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                out = mppA > 0
+            t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"{n_cp}x{per}x{cols}", t, max_abs_err_2d(rv, (A > 0.0).astype(float)))
+
+    for case, x in (("mp.mpp.sigmoid_decor_clear", mppA), ("mp.mpp.sigmoid_decor_enc", encA)):
+        if b.want(mpc, case):
+            # Decor named explicitly: sigmoid's default (auto) runs Chebyshev on the field conversion's shares
+            out = nl_sigmoid(mpc, x, method="decor")
+            t = Timer(b.reps(5))
+            while t.next():
+                t.begin(mpc)
+                out = nl_sigmoid(mpc, x, method="decor")
+                t.end(mpc)
+            rv = out.reveal()
+            if mpc.pid:
+                b.report(f"{n_cp}x{per}x{cols}", t, max_abs_err_2d(rv, A.sigmoid()))
+
+    if b.want(mpc, "mp.mpp.reveal_local"):
+        rv = pA
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            rv = encA.reveal_local()
+            t.end(mpc)
+        if mpc.pid:
+            b.report(f"{n_cp}x{per}x{cols}", t, max_abs_err_2d(rv, pA))
+
+    if b.any_selected("mp.mpa."):
+        # Additive shares: CP1 holds A - R, CP2 holds R (R public to both: fine for timing), sum = A.
+        R = array(shared_float_matrix(mpc, rows, cols, -1.0, 1.0))
+        share = zeros_like(A) if mpc.pid == 0 else (A - R if mpc.pid == 1 else R)
+        share_b = zeros_like(B) if mpc.pid == 0 else (B - R if mpc.pid == 1 else R)
+
+        if b.want(mpc, "mp.mpa.aggregate"):
+            m = MPA(mpc, share)
+            t = Timer(b.reps(7))
+            while t.next():
+                m = MPA(mpc, share)
+                t.begin(mpc)
+                m.aggregate()
+                t.end(mpc)
+            rv = m.reveal()
+            if mpc.pid:
+                b.report(f"{rows}x{cols}", t, max_abs_err_2d(rv, A))
+
+        if b.want(mpc, "mp.mpa.mul"):
+            out = MPA(mpc, share)
+            t = Timer(b.reps(5))
+            while t.next():
+                ma = MPA(mpc, share)
+                mb = MPA(mpc, share_b)
+                t.begin(mpc)
+                out = ma * mb
+                t.end(mpc)
+            rv = out.reveal()
+            if mpc.pid:
+                b.report(f"{rows}x{cols}", t, max_abs_err_2d(rv, A * B))
+
+        if b.want(mpc, "mp.mpa.matmul_abt"):
+            sa = array([[share[i, j] for j in range(32)] for i in range(4)])
+            sb = array([[share_b[i, j] for j in range(32)] for i in range(4)])
+            ra = array([[A[i, j] for j in range(32)] for i in range(4)])
+            rb = array([[B[i, j] for j in range(32)] for i in range(4)])
+            out = MPA(mpc, sa)
+            t = Timer(b.reps(3), warmup=0)
+            while t.next():
+                ma = MPA(mpc, sa)
+                mb = MPA(mpc, sb)
+                t.begin(mpc)
+                out = ma @ mb.T
+                t.end(mpc)
+            rv = out.reveal()
+            if mpc.pid:
+                b.report("(4x32)@(4x32).T", t, max_abs_err_2d(rv, ra @ rb.T))
+
+        if b.want(mpc, "mp.mpa.matmul_public_via_mpc"):
+            W = array([[C[i, j] for j in range(3)] for i in range(cols)])
+            aggregated = MPA(mpc, share)
+            aggregated.aggregate()
+            # The aggregate alone: an MPA that also keeps its shares in the clear multiplies those
+            m = MPA[Tuple[int, int], float]._from_parts(
+                mpc, zeros_like(A) if mpc.pid == 0 else ndarray[Tuple[int, int], float](), Ciphertensor[Ciphertext](),
+                aggregated._aggregate if mpc.pid else Ciphertensor[Ciphertext]())
+            out = m
+            t = Timer(b.reps(5))
+            with mpc.allow_mpc_switch():
+                while t.next():
+                    t.begin(mpc)
+                    out = m @ W
+                    t.end(mpc)
+            rv = out.reveal()
+            if mpc.pid:
+                b.report(f"({rows}x{cols})@({cols}x3)", t, max_abs_err_2d(rv, A @ W))
+
+        if b.want(mpc, "mp.mpa.reveal_plain"):
+            m = MPA(mpc, share)
+            rv = A
+            t = Timer(b.reps(9), batch=10)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    rv = m.reveal()
+                t.end(mpc)
+            if mpc.pid:
+                b.report(f"{rows}x{cols}", t, max_abs_err_2d(rv, A))
+
+    if b.want(mpc, "mp.mpu.add_local"):
+        ua = MPU(mpc, pA, "partition")
+        ub = MPU(mpc, pB, "partition")
+        out = ua
+        t = Timer(b.reps(9), batch=1000)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                out = ua + ub
+            t.end(mpc)
+        rv = out.reveal(mpc)
+        if mpc.pid:
+            b.report(f"{n_cp}x{per}x{cols}", t, max_abs_err_2d(rv, A + B))
+
+    if b.want(mpc, "mp.mpu.add_mpa_mpp") or b.want(mpc, "mp.mpu.add_mpa_enc_mpp"):
+        # Additive shares as in mp.mpa (CP1 A - R, CP2 R) plus a partition of B, in the clear
+        R2 = array(shared_float_matrix(mpc, rows, cols, -1.0, 1.0))
+        share2 = zeros_like(A) if mpc.pid == 0 else (A - R2 if mpc.pid == 1 else R2)
+        ux = MPU(mpc, pB, "partition")
+        if b.want(mpc, "mp.mpu.add_mpa_mpp"):
+            um = MPU(mpc, share2, "additive")
+            sum_out = um + ux
+            t = Timer(b.reps(9), batch=100)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    sum_out = um + ux
+                t.end(mpc)
+            rv = sum_out.reveal(mpc)
+            if mpc.pid:
+                b.report(f"{n_cp}x{per}x{cols}", t, max_abs_err_2d(rv, A + B))
+        if b.want(mpc, "mp.mpu.add_mpa_enc_mpp"):
+            # Shares held only encrypted (MPA.encrypt() keeps the shares in the clear beside their encryption, and the
+            # sum of the two kinds is another case)
+            if mpc.pid:
+                em = MPA[Tuple[int, int], float](mpc, Ciphertensor[Ciphertext].enc(mpc, share2, encoding=ENC_ROW))
+            else:
+                em = MPA[Tuple[int, int], float](mpc, share2)
+            ue = MPU[Tuple[int, int], float](_mpp=MPP[Tuple[int, int], float](mpc), _mpa=em)
+            enc_sum = ue + ux
+            t = Timer(b.reps(9), batch=5)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    enc_sum = ue + ux
+                t.end(mpc)
+            rv = enc_sum.reveal(mpc)
+            if mpc.pid:
+                b.report(f"{n_cp}x{per}x{cols}", t, max_abs_err_2d(rv, A + B))
+
+    if b.want(mpc, "mp.mpp.getitem_row_enc"):
+        row_out = encA[3]
+        t = Timer(b.reps(9), batch=100)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                row_out = encA[3]
+            t.end(mpc)
+        rv = row_out.reveal()
+        if mpc.pid:
+            b.report(f"{n_cp}x{per}x{cols};row=3", t, max_abs_err_1d(rv, A[3]))
+
+    if b.want(mpc, "mp.mpp.getitem_rows_enc"):
+        rows_out = encA[4:12]
+        t = Timer(b.reps(9), batch=100)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                rows_out = encA[4:12]
+            t.end(mpc)
+        rv = rows_out.reveal()
+        if mpc.pid:
+            b.report(f"{n_cp}x{per}x{cols};rows=4:12", t, max_abs_err_2d(rv, A[4:12]))
+
+    if b.want(mpc, "mp.mpp.getitem_cols_enc"):
+        cols_out = encA[:, 0:16]
+        t = Timer(b.reps(7))
+        while t.next():
+            t.begin(mpc)
+            cols_out = encA[:, 0:16]
+            t.end(mpc)
+        rv = cols_out.reveal()
+        if mpc.pid:
+            b.report(f"{n_cp}x{per}x{cols};cols=0:16", t, max_abs_err_2d(rv, A[:, 0:16]))
+
+    if b.want(mpc, "mp.mpp.column_enc"):
+        col_out = encA.T[5]
+        t = Timer(b.reps(7))
+        while t.next():
+            t.begin(mpc)
+            col_out = encA.T[5]
+            t.end(mpc)
+        rv = col_out.reveal()
+        if mpc.pid:
+            b.report(f"{n_cp}x{per}x{cols};col=5", t, max_abs_err_1d(rv, array([A[i, 5] for i in range(rows)])))
+
+    if b.want(mpc, "mp.mpp.setitem_rows_enc"):
+        set_rows = encA.copy()
+        rows_value = encB[4:12]
+        t = Timer(b.reps(9), batch=100)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                set_rows[4:12] = rows_value
+            t.end(mpc)
+        rv = set_rows.reveal()
+        if mpc.pid:
+            want_rows = A.copy()
+            for i in range(4, 12):
+                for j in range(cols):
+                    want_rows[i, j] = B[i, j]
+            b.report(f"{n_cp}x{per}x{cols};rows=4:12", t, max_abs_err_2d(rv, want_rows))
+
+    if b.want(mpc, "mp.mpp.setitem_cols_enc"):
+        set_cols = encA.copy()
+        cols_value = encB[:, 0:16]
+        t = Timer(b.reps(7))
+        while t.next():
+            t.begin(mpc)
+            set_cols[:, 0:16] = cols_value
+            t.end(mpc)
+        rv = set_cols.reveal()
+        if mpc.pid:
+            want_cols = A.copy()
+            for i in range(rows):
+                for j in range(16):
+                    want_cols[i, j] = B[i, j]
+            b.report(f"{n_cp}x{per}x{cols};cols=0:16", t, max_abs_err_2d(rv, want_cols))
+
+    if b.want(mpc, "mp.mpp.getitem_vec_enc"):
+        column0 = [A[i, 0] for i in range(rows)]
+        start0 = 0 if mpc.pid == 0 else (mpc.pid - 1) * per
+        vec_mpp = MPP[Tuple[int], float](
+            _mpc=mpc, _ratios=[per for _ in range(n_cp)],
+            _local_data=array(column0) if mpc.pid == 0 else array(column0[start0:start0 + per]), _transposed=True)
+        vec_mpp.encrypt()
+        elem_out = vec_mpp[3]
+        t = Timer(b.reps(7))
+        while t.next():
+            t.begin(mpc)
+            elem_out = vec_mpp[3]
+            t.end(mpc)
+        rv = elem_out.reveal()
+        if mpc.pid:
+            b.report(f"{n_cp}x{per};index=3", t, max_abs_err_1d(rv, array([column0[3]])))
+
+    if b.want(mpc, "mp.mpu.matmul_ntt"):
+        ua = MPU(mpc, pA, "partition")
+        ub = MPU(mpc, pB, "partition")
+        out = ua
+        t = Timer(b.reps(3))
+        while t.next():
+            t.begin(mpc)
+            out = ua @ ub.T
+            t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"({rows}x{cols})@({rows}x{cols}).T", t, max_abs_err_2d(rv, A @ B.T))
+
+    if b.want(mpc, "mp.mpu.matmul_mpp_mpa"):
+        wv = array(shared_float_matrix(mpc, cols, 1, -1.0, 1.0))
+        ux = MPU(mpc, pA, "partition")
+        uw = MPU(mpc, wv if mpc.pid == 1 else zeros_like(wv), "additive")
+        out = ux
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            out = ux @ uw
+            t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"({rows}x{cols})@({cols}x1)", t, max_abs_err_2d(rv, A @ wv))
+
+    if b.want(mpc, "mp.mpu.sum_axis0_local"):
+        # The rows of mp.mpu.add_local (no new shared draws)
+        ua = MPU(mpc, pA, "partition")
+        out = ua.sum(0)
+        t = Timer(b.reps(9), batch=100)
+        while t.next():
+            t.begin(mpc)
+            for _ in range(t.batch):
+                out = ua.sum(0)
+            t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"{n_cp}x{per}x{cols}", t, max_abs_err_1d(rv, A.sum(axis=0)))
+
+
+########################## e2e: MHE end-to-end workloads ##########################
+
+def plain_l2(rows: List[List[float]]) -> List[List[float]]:
+    m = len(rows)
+    out = [[0.0 for _ in range(m)] for _ in range(m)]
+    for i in range(m):
+        for j in range(m):
+            s = 0.0
+            for k in range(len(rows[i])):
+                d = rows[i][k] - rows[j][k]
+                s += d * d
+            out[i][j] = math.sqrt(s)
+    return out
+
+
+def off_diagonal_err(have, want: List[List[float]]) -> float:
+    err = 0.0
+    for i in range(len(want)):
+        for j in range(len(want)):
+            if i != j:
+                d = abs(float(have[i][j]) - want[i][j])
+                if d > err: err = d
+    return err
+
+
+def bench_e2e(mpc, b: Bench):
+    n_cp = mpc.comms.number_of_parties - 1
+
+    if b.want(mpc, "e2e.l2.mpu_16x256"):
+        per, cols = 8, 256
+        rows = per * n_cp
+        raw = shared_float_matrix(mpc, rows, cols, -1.0, 1.0)
+        part = partition_of(mpc, array(raw), per)
+        dv = array([[0.0]])
+        t = Timer(b.reps(2), warmup=0)
+        while t.next():
+            t.begin(mpc)
+            mpu = MPU(mpc, part, "partition")
+            d = l2(mpc, mpu)
+            dv = d.reveal(mpc)
+            t.end(mpc)
+        if mpc.pid:
+            b.report(f"{rows}x{cols}", t, off_diagonal_err(dv, plain_l2(raw)))
+
+    if b.want(mpc, "e2e.king.mpp_16x1024"):
+        per, cols = 8, 1024
+        rows = per * n_cp
+        with mpc.randomness.global_stream():
+            geno = random_ints((rows, cols), 0, 2)
+        raw_data = array(geno, dtype=float)
+        het_scale = float(cols // 100)
+        raw_het_inv = array([[(1.0 / float(row.count(1))) * het_scale for _ in range(rows)] for row in geno], dtype=float)
+        pd = partition_of(mpc, raw_data, per)
+        ph = partition_of(mpc, raw_het_inv, per)
+        kv = array([[0.0]])
+        t = Timer(b.reps(2), warmup=0)
+        while t.next():
+            t.begin(mpc)
+            sd = MPP(mpc, pd)
+            sh = MPP(mpc, ph)
+            k = king(mpc, sd, sh)
+            kv = k.reveal()
+            t.end(mpc)
+        if mpc.pid:
+            ref = king(mpc, raw_data, raw_het_inv)
+            b.report(f"{rows}x{cols}", t, off_diagonal_err(kv, ref.tolist()))
+
+    if b.want(mpc, "e2e.linreg.mpu_16x15"):
+        per, cols = 8, 15
+        rows = per * n_cp
+        X = array(shared_float_matrix(mpc, rows, cols, 0.0, 1.0))
+        target_w = array(shared_float_matrix(mpc, cols, 1, 0.0, 1.0))
+        y = X @ target_w + 1.0
+        raw_w0 = ones((cols + 1, 1))
+        step, epochs = 0.001, 2
+        px = partition_of(mpc, X, per)
+        py = partition_of(mpc, y, per)
+        wv = array([[0.0]])
+        t = Timer(b.reps(2), warmup=0)
+        while t.next():
+            t.begin(mpc)
+            ux = MPU(mpc, px, "partition")
+            uy = MPU(mpc, py, "partition")
+            uw = MPU(mpc, raw_w0 if mpc.pid == 1 else zeros_like(raw_w0), "additive")
+            model = LinReg(uw).fit(mpc, X=ux, y=uy, step=step, epochs=epochs)
+            wv = model.coef_.reveal(mpc)
+            t.end(mpc)
+        if mpc.pid:
+            ref = LinReg(raw_w0).fit(mpc, X=X, y=y, step=step, epochs=epochs).coef_
+            b.report(f"{rows}x{cols};epochs={epochs}", t, max_abs_err_2d(wv, ref))
+
+    if b.want(mpc, "e2e.linreg.mpu_predict_16x15"):
+        # A tiny noise scale: the case times the noise's generation, and the witness stays the prediction's HE error
+        per, cols = 8, 15
+        rows = per * n_cp
+        noise_scale = 1e-6
+        X = array(shared_float_matrix(mpc, rows, cols, 0.0, 1.0))
+        raw_w = array(shared_float_matrix(mpc, cols + 1, 1, 0.0, 1.0))
+        ux = MPU(mpc, partition_of(mpc, X, per), "partition")
+        model = LinReg(MPU(mpc, raw_w if mpc.pid == 1 else zeros_like(raw_w), "additive"))
+        out = model.predict(mpc, ux, noise_scale)
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            out = model.predict(mpc, ux, noise_scale)
+            t.end(mpc)
+        pv = out.reveal(mpc)
+        if mpc.pid:
+            ref = LinReg(raw_w).predict(mpc, X)
+            b.report(f"{rows}x{cols};noise={noise_scale}", t, max_abs_err_2d(pv, ref))
+
+
+########################## MP arithmetic and the aggregate's switch (last: their shared draws shift no other case's data) ##########################
+
+def bench_mp_arith(mpc, b: Bench):
+    n_cp = mpc.comms.number_of_parties - 1
+    slots = mpc.mhe.crypto_params.params.slots()
+    modulus = MPC_FIELD_SIZE
+    per, cols = 8, 64
+    rows = per * n_cp
+
+    if b.want(mpc, "mhe.decrypt.aggregate_1ct"):
+        vs = shared_floats(mpc, slots, -1.0, 1.0)
+        # Every compute party holds CP1's ciphertext: the same ciphertexts, as an aggregate's
+        cv = mpc.comms.broadcast_from(mpc.mhe.enc_vector(vs, T=Ciphertext), 1)
+        pts = List[Plaintext]()
+        t = Timer(b.reps(9))
+        while t.next():
+            t.begin(mpc)
+            if mpc.pid:
+                pts = mpc.mhe.decrypt(cv, -1)
+            t.end(mpc)
+        if mpc.pid:
+            b.report(f"source=-1;level={cv[0].level()}", t, max_abs_err_1d(mpc.mhe.decode(pts, dtype=float), vs))
+
+    if b.want(mpc, "mhe.switch.mhe_to_mpc_aggregate_8ct"):
+        n = 8 * slots
+        xs = shared_floats(mpc, n, -1.0, 1.0)
+        ct = mpc.comms.broadcast_from(Ciphertensor[Ciphertext].enc(mpc, xs), 1) if mpc.pid else Ciphertensor[Ciphertext].enc(mpc, xs)
+        ct._is_broadcast = True
+        st = ct.to_sharetensor(mpc, modulus, -1, S=Tuple[int])
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            st = ct.to_sharetensor(mpc, modulus, -1, S=Tuple[int])
+            t.end(mpc)
+        rv = st.reveal(mpc)
+        if mpc.pid:
+            b.report(f"n={n};source=-1", t, max_abs_err_1d(rv, xs))
+
+    if b.any_selected("mp.mpa.to_sharetensor_aggregate") or b.any_selected("mp.mpa.pow2_shares"):
+        A = array(shared_float_matrix(mpc, rows, cols, -1.0, 1.0))
+        # Additive shares of A: CP1 holds three quarters, the other compute parties the rest in equal parts
+        weight = 0.75 if mpc.pid == 1 else 0.25 / float(n_cp - 1)
+        share = zeros_like(A) if mpc.pid == 0 else A * weight
+
+        if b.want(mpc, "mp.mpa.to_sharetensor_aggregate"):
+            aggregated = MPA(mpc, share)
+            aggregated.aggregate()
+            m = MPA[Tuple[int, int], float]._from_parts(
+                mpc, zeros_like(A) if mpc.pid == 0 else ndarray[Tuple[int, int], float](), Ciphertensor[Ciphertext](),
+                aggregated._aggregate if mpc.pid else Ciphertensor[Ciphertext]())
+            st = m.to_sharetensor()
+            t = Timer(b.reps(5))
+            while t.next():
+                t.begin(mpc)
+                st = m.to_sharetensor()
+                t.end(mpc)
+            rv = st.reveal(mpc)
+            if mpc.pid:
+                b.report(f"{rows}x{cols}", t, max_abs_err_2d(rv, A))
+
+        if b.want(mpc, "mp.mpa.pow2_shares"):
+            out = MPA(mpc, share)
+            t = Timer(b.reps(5))
+            while t.next():
+                m = MPA(mpc, share)
+                t.begin(mpc)
+                out = m ** 2
+                t.end(mpc)
+            rv = out.reveal()
+            if mpc.pid:
+                b.report(f"{rows}x{cols}", t, max_abs_err_2d(rv, A * A))
+
+    if b.want(mpc, "mp.mpu.matmul_tt"):
+        # A.T @ B.T = (B @ A).T for A (rows x 16) and B (rows x rows), 8 rows of each per party
+        tcols = 16
+        TA = array(shared_float_matrix(mpc, rows, tcols, -1.0, 1.0))
+        TB = array(shared_float_matrix(mpc, rows, rows, -1.0, 1.0))
+        ua = MPU(mpc, partition_of(mpc, TA, per), "partition")
+        ub = MPU(mpc, partition_of(mpc, TB, per), "partition")
+        out = ua.T @ ub.T
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            out = ua.T @ ub.T
+            t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"({rows}x{tcols}).T@({rows}x{rows}).T", t, max_abs_err_2d(rv, TA.T @ TB.T))
+
+    if b.want(mpc, "mp.mpp.align_ratios_enc"):
+        M = array(shared_float_matrix(mpc, rows, cols, -1.0, 1.0))
+        enc = MPP(mpc, partition_of(mpc, M, per))
+        enc.encrypt()
+        target = [per for _ in range(n_cp)]
+        target[0] -= 4
+        target[1] += 4
+        out = enc.align_ratios(target, False)
+        t = Timer(b.reps(7))
+        while t.next():
+            t.begin(mpc)
+            out = enc.align_ratios(target, False)
+            t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"{n_cp}x{per}x{cols};to={target}", t, max_abs_err_2d(rv, M))
+
+    if b.want(mpc, "mp.mpp.align_ratios_cw_enc"):
+        M = array(shared_float_matrix(mpc, rows, cols, -1.0, 1.0))
+        # Partitions encrypted column-wise (stored transposed): rows move between the parties by masked moves
+        cw = MPP(mpc, partition_of(mpc, M, per)).T
+        cw.encrypt()
+        enc = cw.T
+        target = [per for _ in range(n_cp)]
+        target[0] -= 4
+        target[1] += 4
+        out = enc.align_ratios(target, False)
+        t = Timer(b.reps(5))
+        while t.next():
+            t.begin(mpc)
+            out = enc.align_ratios(target, False)
+            t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"{n_cp}x{per}x{cols};to={target};column-wise", t, max_abs_err_2d(rv, M))
+
+    if b.want(mpc, "mp.mpu.sub_diag_t"):
+        # The first layer's update in Sequential on MPUs: W - X.T @ D, with W's shares in the clear (encrypted
+        # column-wise, as a tall MPA is) and X.T @ D's shares diagonal-encoded and flagged transposed (X in the clear, D
+        # encrypted): the product's shares go to W's layout through MPC
+        X = array(shared_float_matrix(mpc, rows, 8, -1.0, 1.0))
+        D = array(shared_float_matrix(mpc, rows, 6, -1.0, 1.0))
+        W0 = array(shared_float_matrix(mpc, 8, 6, -1.0, 1.0))
+        ux = MPU(mpc, partition_of(mpc, X, per), "partition")
+        ud = MPU(mpc, partition_of(mpc, D, per), "partition")
+        ud._mpp.encrypt()
+        dw = ux.T @ ud
+        layout = ""
+        if mpc.pid:
+            e = dw._mpa._encryption
+            layout = f"diagonal={int(e._diagonal_contiguous)};transposed={int(e._transposed)}"
+        out = MPU(mpc, W0 if mpc.pid == 1 else zeros_like(W0), "additive") - dw
+        t = Timer(b.reps(5))
+        while t.next():
+            uw = MPU(mpc, W0 if mpc.pid == 1 else zeros_like(W0), "additive")
+            t.begin(mpc)
+            out = uw - dw
+            t.end(mpc)
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"(8x6)-({rows}x8).T@({rows}x6);{layout}", t, max_abs_err_2d(rv, W0 - X.T @ D))
+
+    if b.any_selected("mp.mpp.matmul_tnt_col") or b.any_selected("mp.mpp.matmul_tnt_cw_enc"):
+        # A.T @ B whose per-party products come out column-wise: a column (B = y, as LinReg's X.T @ y; a column encrypts
+        # as one transposed row even from data in the clear) and B with 3 columns (encrypted factors: the M2 kernel's
+        # transposed result). The products' sum is split by rows among the compute parties in HE (masked moves).
+        TA = array(shared_float_matrix(mpc, rows, cols, -1.0, 1.0))
+        Ty = array(shared_float_matrix(mpc, rows, 1, -1.0, 1.0))
+        TB3 = array(shared_float_matrix(mpc, rows, 3, -1.0, 1.0))
+        ma = MPP(mpc, partition_of(mpc, TA, per))
+        my = MPP(mpc, partition_of(mpc, Ty, per))
+
+        if b.want(mpc, "mp.mpp.matmul_tnt_col"):
+            out = ma.T @ my
+            t = Timer(b.reps(5))
+            while t.next():
+                t.begin(mpc)
+                out = ma.T @ my
+                t.end(mpc)
+            rv = out.reveal()
+            if mpc.pid:
+                b.report(f"({rows}x{cols}).T@({rows}x1)", t, max_abs_err_2d(rv, TA.T @ Ty))
+
+        if b.want(mpc, "mp.mpp.matmul_tnt_col_enc"):
+            ea = ma.copy()
+            ea.encrypt()
+            ey = my.copy()
+            ey.encrypt()
+            out = ea.T @ ey
+            t = Timer(b.reps(5))
+            while t.next():
+                t.begin(mpc)
+                out = ea.T @ ey
+                t.end(mpc)
+            rv = out.reveal()
+            if mpc.pid:
+                b.report(f"({rows}x{cols}).T@({rows}x1);encrypted", t, max_abs_err_2d(rv, TA.T @ Ty))
+
+        if b.want(mpc, "mp.mpp.matmul_tnt_cw_enc"):
+            ea = ma.copy()
+            ea.encrypt()
+            eb = MPP(mpc, partition_of(mpc, TB3, per))
+            eb.encrypt()
+            out = ea.T @ eb
+            t = Timer(b.reps(5))
+            while t.next():
+                t.begin(mpc)
+                out = ea.T @ eb
+                t.end(mpc)
+            rv = out.reveal()
+            if mpc.pid:
+                b.report(f"({rows}x{cols}).T@({rows}x3);encrypted", t, max_abs_err_2d(rv, TA.T @ TB3))
+
+    if b.want(mpc, "e2e.linreg.mpp_16x15"):
+        # LinReg on MPPs: X, y and the initial weights partitioned in the clear (X.T @ y is a column-wise product)
+        lcols = 15
+        X = array(shared_float_matrix(mpc, rows, lcols, 0.0, 1.0))
+        target_w = array(shared_float_matrix(mpc, lcols, 1, 0.0, 1.0))
+        y = X @ target_w + 1.0
+        raw_w0 = ones((lcols + 1, 1))
+        # The weights' rows split as evenly as possible, the remainder to the last compute party
+        per_w = (lcols + 1) // n_cp
+        w_stop = lcols + 1 if mpc.pid == n_cp else mpc.pid * per_w
+        step, epochs = 0.001, 2
+        px = partition_of(mpc, X, per)
+        py = partition_of(mpc, y, per)
+        pw = zeros_like(raw_w0) if mpc.pid == 0 else raw_w0[(mpc.pid - 1) * per_w:w_stop]
+        wv = array([[0.0]])
+        t = Timer(b.reps(2), warmup=0)
+        while t.next():
+            t.begin(mpc)
+            mx = MPP(mpc, px)
+            my = MPP(mpc, py)
+            mw = MPP(mpc, pw)
+            model = LinReg(mw).fit(mpc, X=mx, y=my, step=step, epochs=epochs)
+            wv = model.coef_.reveal()
+            t.end(mpc)
+        if mpc.pid:
+            ref = LinReg(raw_w0).fit(mpc, X=X, y=y, step=step, epochs=epochs).coef_
+            b.report(f"{rows}x{lcols};epochs={epochs}", t, max_abs_err_2d(wv, ref))
+
+
+def bench_mp_colwise(mpc, b: Bench):
+    # Column-wise products at unequal ratios (MPPAligner cuts each party's product back to its rows) and operations on
+    # aggregates (one collective bootstrap per ciphertext for every party, and conversions made once); the bootstraps
+    # per repetition are reported with the parameters
+    n_cp = mpc.comms.number_of_parties - 1
+    per = 8
+    rows = per * n_cp
+    uneq = [per for _ in range(n_cp)]
+    uneq[0] -= 4
+    uneq[1] += 4
+
+    if b.any_selected("mp.mpp.matmul_public_cw_uneq") or b.any_selected("mp.mpp.matmul_ntt_cw_uneq"):
+        X = array(shared_float_matrix(mpc, rows, 16, -1.0, 1.0))
+        M = array(shared_float_matrix(mpc, 16, 8, -1.0, 1.0))
+        X3 = array(shared_float_matrix(mpc, rows, 3, -1.0, 1.0))
+        G3 = array(shared_float_matrix(mpc, rows, 3, -1.0, 1.0))
+        start = uneq[:mpc.pid - 1].sum() if mpc.pid else 0
+        stop = start + uneq[mpc.pid - 1] if mpc.pid else rows
+
+        if b.want(mpc, "mp.mpp.matmul_public_cw_uneq"):
+            cw = MPP(mpc, X[start:stop].copy() if mpc.pid else X).T
+            cw.encrypt()
+            ex = cw.T
+            out = ex @ M
+            t = Timer(b.reps(5))
+            while t.next():
+                t.begin(mpc)
+                out = ex @ M
+                t.end(mpc)
+            rv = out.reveal()
+            if mpc.pid:
+                b.report(f"({rows}x16 at {uneq})@(16x8);column-wise", t, max_abs_err_2d(rv, X @ M))
+
+        if b.want(mpc, "mp.mpp.matmul_ntt_cw_uneq"):
+            cx = MPP(mpc, X3[start:stop].copy() if mpc.pid else X3).T
+            cx.encrypt()
+            cg = MPP(mpc, G3[start:stop].copy() if mpc.pid else G3).T
+            cg.encrypt()
+            ex3 = cx.T
+            eg3 = cg.T
+            out = ex3 @ eg3.T
+            t = Timer(b.reps(3))
+            while t.next():
+                t.begin(mpc)
+                out = ex3 @ eg3.T
+                t.end(mpc)
+            rv = out.reveal()
+            if mpc.pid:
+                b.report(f"({rows}x3 at {uneq})@({rows}x3).T;column-wise", t, max_abs_err_2d(rv, X3 @ G3.T))
+
+    if b.any_selected("mp.mpa.sum_rows_aggregate") or b.any_selected("mp.mpa.dot_aggregate"):
+        A = array(shared_float_matrix(mpc, rows, 64, -1.0, 1.0))
+        lb = mpc.mhe.bootstrap_min_level
+
+        if b.want(mpc, "mp.mpa.sum_rows_aggregate"):
+            out = MPA[Tuple[int], float](mpc)
+            boots = 0
+            t = Timer(b.reps(5))
+            while t.next():
+                m = MPA(mpc, A if mpc.pid == 1 else zeros_like(A))
+                m.aggregate()
+                if mpc.pid:
+                    m._plain = ndarray[Tuple[int, int], float]()
+                    m._aggregate._data = mpc.mhe.drop_level(m._aggregate._data, lb)
+                before = mpc.mhe.stats.secure_bootstrap_count
+                t.begin(mpc)
+                out = m.sum(1)
+                t.end(mpc)
+                boots = mpc.mhe.stats.secure_bootstrap_count - before
+            rv = out.reveal()
+            if mpc.pid:
+                want = array([sum(A[i, j] for j in range(64)) for i in range(rows)])
+                b.report(f"{rows}x64;level={lb};bootstraps={boots}", t, max_abs_err_1d(rv.tolist(), want.tolist()))
+
+        if b.want(mpc, "mp.mpa.dot_aggregate"):
+            out = MPA[Tuple[int], float](mpc)
+            boots = 0
+            t = Timer(b.reps(5))
+            while t.next():
+                m = MPA(mpc, A if mpc.pid == 1 else zeros_like(A))
+                m.aggregate()
+                if mpc.pid:
+                    m._plain = ndarray[Tuple[int, int], float]()
+                    m._aggregate._data = mpc.mhe.drop_level(m._aggregate._data, lb + 1)
+                before = mpc.mhe.stats.secure_bootstrap_count
+                t.begin(mpc)
+                out = m.dot(1)
+                t.end(mpc)
+                boots = mpc.mhe.stats.secure_bootstrap_count - before
+            rv = out.reveal()
+            if mpc.pid:
+                want = array([sum(A[i, j] * A[i, j] for j in range(64)) for i in range(rows)])
+                b.report(f"{rows}x64;level={lb + 1};bootstraps={boots}", t, max_abs_err_1d(rv.tolist(), want.tolist()))
+
+    if b.want(mpc, "mp.mpu.mpa_times_mpp"):
+        A8 = array(shared_float_matrix(mpc, rows, 8, -1.0, 1.0))
+        B8 = array(shared_float_matrix(mpc, rows, 8, -1.0, 1.0))
+        lb = mpc.mhe.bootstrap_min_level
+        out = MPU(mpc, A8 if mpc.pid == 1 else zeros_like(A8), "additive")
+        boots = 0
+        t = Timer(b.reps(5))
+        while t.next():
+            ua = MPU(mpc, A8 if mpc.pid == 1 else zeros_like(A8), "additive")
+            ua._mpa.aggregate()
+            if mpc.pid:
+                ua._mpa._plain = ndarray[Tuple[int, int], float]()
+            ub = MPU(mpc, partition_of(mpc, B8, per), "partition")
+            ub._mpp.encrypt()
+            if mpc.pid:
+                ub._mpp._encryption_unified._data = mpc.mhe.drop_level(ub._mpp._encryption_unified._data, lb)
+            before = mpc.mhe.stats.secure_bootstrap_count
+            t.begin(mpc)
+            out = ua * ub
+            t.end(mpc)
+            boots = mpc.mhe.stats.secure_bootstrap_count - before
+        rv = out.reveal()
+        if mpc.pid:
+            b.report(f"{rows}x8;level={lb};bootstraps={boots}", t, max_abs_err_2d(rv, A8 * B8))
+
+    if b.want(mpc, "ct.add_broadcast_layouts"):
+        C8 = array(shared_float_matrix(mpc, rows, 8, -1.0, 1.0))
+        share = C8 if mpc.pid == 1 else zeros_like(C8)
+        out = Ciphertensor[Ciphertext]()
+        cw = Ciphertensor[Ciphertext]()
+        rw = Ciphertensor[Ciphertext]()
+        boots = 0
+        switches = 0
+        before = 0
+        switched = 0
+        t = Timer(b.reps(5))
+        while t.next():
+            if mpc.pid:
+                cw = Ciphertensor[Ciphertext].enc(mpc, share, encoding=ENC_COL).aggregate(mpc)
+                rw = Ciphertensor[Ciphertext].enc(mpc, share, encoding=ENC_ROW).aggregate(mpc)
+                before = mpc.mhe.stats.secure_bootstrap_count
+                switched = mpc.mhe.stats.secure_mhe_mpc_switch_count
+            t.begin(mpc)
+            if mpc.pid:
+                out = cw.add(mpc, rw)
+            t.end(mpc)
+            if mpc.pid:
+                boots = mpc.mhe.stats.secure_bootstrap_count - before
+                switches = mpc.mhe.stats.secure_mhe_mpc_switch_count - switched
+        if mpc.pid:
+            rv = out.reveal(mpc, source_pid=-1, T=float)
+            b.report(f"{rows}x8;bootstraps={boots};switched_ciphertexts={switches}", t, max_abs_err_2d(rv, C8 + C8))
+
+
+def bench_scale_match(mpc, b: Bench):
+    # Additions of ciphertexts whose scales differ by a rescale's ratio (a product rescaled by a 34-bit modulus against a
+    # fresh ciphertext, 1 + 7.9e-5 apart): one level apart, and at the same level. Single key at CP1 (keys of its own,
+    # untimed, so that the witness can decrypt); deterministic values (no shared draws). Witness: the largest error over
+    # the largest value.
+    if not (b.any_selected("he.add_scale_match") or b.any_selected("he.add_scale_match_same")):
+        return
+    params = mpc.mhe.crypto_params.params
+    ev = mpc.mhe.crypto_params.evaluator
+    slots = params.slots()
+    top = params.max_level()
+    scale = params.default_scale
+    ratio = 1.0 + 7.9e-5
+    va = list[complex](slots)
+    vb = list[complex](slots)
+    x = 12345
+    for _ in range(slots):
+        x = (x * 1103515245 + 12345) % 2147483648
+        va.append(complex(float(x % 2001) / 1000.0 - 1.0, 0.0))
+        x = (x * 1103515245 + 12345) % 2147483648
+        vb.append(complex(float(x % 2001) / 1000.0 - 1.0, 0.0))
+    for name, b_level in [("he.add_scale_match", top), ("he.add_scale_match_same", top - 1)]:
+        if not b.want(mpc, name):
+            continue
+        if mpc.pid == 1:
+            kgen = ckks.new_key_generator(params)
+            sk = kgen.gen_secret_key()
+            encryptor = ckks.new_encryptor(params, sk)
+            decryptor = ckks.new_decryptor(params, sk)
+            pt_a = ckks.new_plaintext(params, top - 1, scale * ratio)
+            mpc.mhe.crypto_params.encoder.encode(va, pt_a, params.log_slots)
+            pt_b = ckks.new_plaintext(params, b_level, scale)
+            mpc.mhe.crypto_params.encoder.encode(vb, pt_b, params.log_slots)
+            a = encryptor.encrypt_new(pt_a)
+            c = encryptor.encrypt_new(pt_b)
+            out = ckks.new_ciphertext(params, 1, top - 1, scale)
+            t = Timer(b.reps(9), sync=False, batch=20)
+            while t.next():
+                # New receivers, allocated outside the timed region (an addition may leave its receiver a level lower)
+                outs = [ckks.new_ciphertext(params, 1, top - 1, scale) for _ in range(t.batch)]
+                t.begin(mpc)
+                for k in range(t.batch):
+                    ev.add(a, c, outs[k])
+                t.end(mpc)
+                out = outs[0]
+            got = mpc.mhe.crypto_params.encoder.decode(decryptor.decrypt_new(out), params.log_slots)
+            largest, err = 0.0, 0.0
+            for i in range(slots):
+                want = va[i].real + vb[i].real
+                largest = max(largest, abs(want))
+                err = max(err, abs(got[i].real - want))
+            b.report(f"ratio={ratio};levels={top - 1},{b_level};to_level={out.level()}", t, err / largest)
+
+
+@main
+def bench_mhe_main(mpc):
+    b = Bench("mhe", mpc.pid, CASES)
+    b.start(mpc)
+
+    # The keys are needed by every other case: always generate them, timed (and reported) as mhe.setup.keygen.
+    b.always(mpc, "mhe.setup.keygen")
+    t = Timer(1, warmup=0, sync=False)
+    t.begin(mpc)
+    mpc.mhe.default_setup()
+    t.end(mpc)
+    b.report("PN14QP438", t, float(mpc.mhe.crypto_params.params.slots()))
+
+    bench_he(mpc, b)
+    bench_mhe_collective(mpc, b)
+    bench_switch(mpc, b)
+    bench_ct(mpc, b)
+    bench_ct_matmul(mpc, b)
+    bench_mp(mpc, b)
+    bench_e2e(mpc, b)
+    bench_mp_arith(mpc, b)
+    bench_mp_colwise(mpc, b)
+    bench_scale_match(mpc, b)
+    b.finish(mpc)
+
+
+bench_mhe_main()

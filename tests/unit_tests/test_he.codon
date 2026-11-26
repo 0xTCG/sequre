@@ -2,12 +2,15 @@ import math, prg
 
 import sequre.lattiseq.ckks as ckks
 import sequre.lattiseq.rlwe as rlwe
+import sequre.lattiseq.dckks as dckks
 import sequre.lattiseq.params as ckks_params
+import sequre.lattiseq.ring as ring
 
+from sequre.lattiseq.exact_encoder import new_exact_encoder
 from sequre.lattiseq.stats import plot_precision_stats
 from sequre.utils.testing import assert_eq
 from sequre.utils.utils import random_complex
-from sequre.constants import LATTISEQ_STANDARD_RING_ENUM
+from sequre.constants import LATTISEQ_STANDARD_RING_ENUM, LATTISEQ_EXACT_INT_SIZE, lattiseq_exact_int, lattiseq_uint, lattiseq_int
 
 
 def test_encryption_decryption_for_values(values, plaintext, params, encoder, encryptor, decryptor):
@@ -329,9 +332,595 @@ def test_lattiseq():
     test_evaluator(params, encoder, encryptor, decryptor, evaluator, shifts)
     
 
+def measured_decryption_share_noise(params, encoder, encryptor, sk, sigma: float) -> float:
+    # With a zero target key, a collective-decryption (PCKS) share minus s * c1 is exactly the noise the party added.
+    pcks = dckks.new_pcks_protocol(params, sigma)
+    pt = ckks.new_plaintext(params, params.max_level(), params.default_scale)
+    encoder.encode([complex(1.0, 0.0) for _ in range(params.slots())], pt, params.log_slots)
+    ct = encryptor.encrypt_new(pt)
+    level = ct.level()
+    share = pcks.allocate_share(level)
+    pcks._mm_gen_share(sk, rlwe.new_public_key(params.get_rlwe_params()), ct.value[1], share)
+    ring_q = params.ring_q
+    noise = ring_q.new_poly_lvl(level)
+    ring_q._mm_mul_coeffs_montgomery_lvl(level, ct.value[1], sk.value.q, noise)
+    ring_q._mm_sub_lvl(level, share.value[0], noise, noise)
+    ring_q._mm_inv_ntt_lvl(level, noise, noise)
+    q0 = ring_q.modulus[0]
+    total = 0.0
+    for c in noise._buf_coeffs[0]:
+        v = float(c) if c < (q0 >> u64(1)) else -float(q0 - c)
+        total += v * v
+    return math.sqrt(total / float(len(noise._buf_coeffs[0])))
+
+
+def test_decryption_share_smudging():
+    # A decryption share without noise is s_i * c1, from which the party collecting the shares computes s_i = share / c1.
+    # The noise used to be added before a division by the special primes P and vanished (measured std 0).
+    params = ckks.new_parameters_from_literal(ckks_params.PN14QP438)
+    encoder = ckks.new_encoder_complex(params)
+    sk = ckks.new_key_generator(params).gen_secret_key()
+    encryptor = ckks.new_encryptor(params, sk)
+    for sigma in (3.2, 1024.0):
+        std = measured_decryption_share_noise(params, encoder, encryptor, sk, sigma)
+        assert_eq(f"Collective decryption share carries its noise (sigma {sigma}, measured {std:.2f})", 0.5 * sigma < std < 1.5 * sigma, True)
+
+
+def random_fixed_point(bits: int) -> lattiseq_exact_int:
+    # A random integer of magnitude below 2^bits, either sign.
+    x = lattiseq_exact_int(0)
+    while bits > 0:
+        take = min(bits, 60)
+        x = (x << lattiseq_exact_int(take)) | lattiseq_exact_int(prg.getrandbits(take))
+        bits -= take
+    return -x if prg.getrandbits(1) else x
+
+
+def max_abs_difference(a: List[lattiseq_exact_int], b: List[lattiseq_exact_int]) -> float:
+    return max(abs((a[i] - b[i]).to_float()) for i in range(len(a)))
+
+
+def test_exact_encoder():
+    # The float encoder's error grows with the values (about |v| * 2^-52 per slot); the exact encoder's must not, for
+    # protocols that hide values under large random masks.
+    params = ckks.new_parameters_from_literal(ckks_params.PN14QP438)
+    exact = new_exact_encoder(params)
+    encoder = ckks.new_encoder_complex(params)
+    sk = ckks.new_key_generator(params).gen_secret_key()
+    encryptor = ckks.new_encryptor(params, sk)
+    decryptor = ckks.new_decryptor(params, sk)
+    n, log_slots, scale, top = params.slots(), params.log_slots, params.default_scale, params.max_level()
+    frac = 32
+    unit = 2.0 ** frac
+    bound = params.n() / (2 * scale)  # CKKS's own error per slot: at most 1/2 per rounded coefficient
+    no_values = List[lattiseq_exact_int]()
+
+    # The float encoder's conventions (slot order, imaginary parts, rounding).
+    values = [complex(2 * prg.random() - 1, 2 * prg.random() - 1) for _ in range(n)]
+    pt_exact = ckks.new_plaintext(params, top, scale)
+    exact.encode(values, pt_exact, log_slots)
+    pt_float = ckks.new_plaintext(params, top, scale)
+    encoder.encode(values, pt_float, log_slots)
+    coeffs_exact = exact.poly_to_coeffs(pt_exact.value, log_slots)
+    coeffs_float = exact.poly_to_coeffs(pt_float.value, log_slots)
+    assert_eq("Exact encoder: same coefficients as the float encoder, up to rounding", max_abs_difference(coeffs_exact, coeffs_float) <= 1, True)
+    decoded = encoder.decode(pt_exact, log_slots)
+    assert_eq("Exact encoder: the float decoder decodes its plaintexts", max(abs(decoded[i] - values[i]) for i in range(n)) < bound, True)
+    decoded = exact.decode(pt_float, log_slots)
+    assert_eq("Exact encoder: decodes the float encoder's plaintexts", max(abs(decoded[i] - values[i]) for i in range(n)) < bound, True)
+
+    # Integer slots at scale 2^40 come back unchanged: the FFTs stay within half a unit, up to 2^185.
+    for bits in (64, 185):
+        real = [random_fixed_point(bits) for _ in range(n)]
+        imag = [random_fixed_point(bits) for _ in range(n)]
+        back_real, back_imag = exact.decode_coeffs(exact.encode_coeffs(real, imag, 0, 2.0 ** 40, log_slots), 2.0 ** 40, log_slots, 0)
+        assert_eq(f"Exact encoder: 2^{bits} integers round-trip unchanged", back_real == real and back_imag == imag, True)
+
+    # Through a plaintext, 2^150 values come back within CKKS's own error, like small ones.
+    real = [random_fixed_point(150 + frac) for _ in range(n)]
+    imag = [random_fixed_point(150 + frac) for _ in range(n)]
+    pt = ckks.new_plaintext(params, top, scale)
+    exact.encode_fixed_point(real, imag, frac, pt, log_slots)
+    back_real, back_imag = exact.decode_fixed_point(pt, log_slots, frac)
+    error = max(max_abs_difference(back_real, real), max_abs_difference(back_imag, imag)) / unit
+    assert_eq(f"Exact encoder: 2^150 values round-trip within N / (2 scale) (error {error:.2e})", error < bound, True)
+
+    # Enc(x - R) + Enc(R) decrypts to x, with R ~ 2^150 (the float encoder loses x entirely).
+    x = [random_fixed_point(frac + 4) for _ in range(n)]
+    r = [random_fixed_point(150 + frac) for _ in range(n)]
+    pt_masked = ckks.new_plaintext(params, top, scale)
+    exact.encode_fixed_point([x[i] - r[i] for i in range(n)], no_values, frac, pt_masked, log_slots)
+    pt_mask = ckks.new_plaintext(params, top, scale)
+    exact.encode_fixed_point(r, no_values, frac, pt_mask, log_slots)
+    ct = encryptor.encrypt_new(pt_masked)
+    ct_mask = encryptor.encrypt_new(pt_mask)
+    for i in range(2): params.ring_q._mm_add_lvl(ct.level(), ct.value[i], ct_mask.value[i], ct.value[i])
+    back_real, back_imag = exact.decode_fixed_point(decryptor.decrypt_new(ct), log_slots, frac)
+    error = max(max_abs_difference(back_real, x), max(abs(v.to_float()) for v in back_imag)) / unit
+    assert_eq(f"Exact encoder: Enc(x - R) + Enc(R) decrypts to x with R ~ 2^150 (error {error:.2e})", error < 1e-6, True)
+
+    # Residues and CRT reconstruction are exact.
+    for level, bits in ((top, 240), (3, 140)):
+        coeffs = [random_fixed_point(bits) for _ in range(2 * n)]
+        pt = ckks.new_plaintext(params, level, scale)
+        exact.coeffs_to_poly(coeffs, log_slots, pt.value)
+        assert_eq(f"Exact encoder: 2^{bits} coefficients at level {level} come back from their residues", exact.poly_to_coeffs(pt.value, log_slots) == coeffs, True)
+
+    # Decoding is linear on additive coefficient shares: decode(m + M) - decode(M) = decode(m) up to rounding.
+    m = [random_fixed_point(60) for _ in range(2 * n)]
+    mask = [random_fixed_point(190) for _ in range(2 * n)]
+    sum_real, sum_imag = exact.decode_coeffs([m[i] + mask[i] for i in range(2 * n)], scale, log_slots, frac)
+    mask_real, mask_imag = exact.decode_coeffs(mask, scale, log_slots, frac)
+    m_real, m_imag = exact.decode_coeffs(m, scale, log_slots, frac)
+    deviation = max(max(abs((sum_real[i] - mask_real[i] - m_real[i]).to_float()), abs((sum_imag[i] - mask_imag[i] - m_imag[i]).to_float())) for i in range(n))
+    assert_eq("Exact encoder: decoding shares with 2^190 masks is linear up to one unit", deviation <= 1, True)
+
+    # Sparse slots, lower levels and a scale that is not a power of two.
+    sparse = [random_fixed_point(80 + frac) for _ in range(32)]
+    pt = ckks.new_plaintext(params, top, scale)
+    exact.encode_fixed_point(sparse, sparse, frac, pt, 5)
+    back_real, back_imag = exact.decode_fixed_point(pt, 5, frac)
+    assert_eq("Exact encoder: 32 sparse slots round-trip", max(max_abs_difference(back_real, sparse), max_abs_difference(back_imag, sparse)) / unit < bound, True)
+    for level, pt_scale in ((0, scale), (3, scale * 1.3719)):
+        small = [random_fixed_point(frac + 3) for _ in range(n)]
+        pt = ckks.new_plaintext(params, level, pt_scale)
+        exact.encode_fixed_point(small, no_values, frac, pt, log_slots)
+        back_real, back_imag = exact.decode_fixed_point(pt, log_slots, frac)
+        error = max(max_abs_difference(back_real, small), max(abs(v.to_float()) for v in back_imag)) / unit
+        assert_eq(f"Exact encoder: round trip at level {level}, scale {pt_scale:.4g}", error < bound, True)
+
+    # Values that do not fit its integers raise instead of losing precision.
+    raised = False
+    try:
+        exact.encode_fixed_point([random_fixed_point(LATTISEQ_EXACT_INT_SIZE - 10)], no_values, frac, ckks.new_plaintext(params, top, scale), log_slots)
+    except ValueError:
+        raised = True
+    assert_eq("Exact encoder: too large values raise ValueError", raised, True)
+
+
+def test_multi_modulus_rescale():
+    # Dividing by the last two moduli at once (the coefficient-domain path rescale takes for two or more) must match two
+    # single divisions. Its parallel loop used to capture a SIMD vector, which Codon miscompiles: it crashed.
+    params = ckks.new_parameters_from_literal(ckks_params.PN14QP438)
+    ring_q = params.ring_q
+    encoder = ckks.new_encoder_complex(params)
+    encryptor = ckks.new_encryptor(params, ckks.new_key_generator(params).gen_secret_key())
+    pt = ckks.new_plaintext(params, params.max_level(), params.default_scale)
+    encoder.encode([complex(0.5, 0.25) for _ in range(params.slots())], pt, params.log_slots)
+    ct = encryptor.encrypt_new(pt)
+    level = ct.level()
+
+    both = ring_q.new_poly_lvl(level - 2)
+    ring_q._mm_div_round_by_last_modulus_many_ntt_lvl(level, 2, ct.value[0], ring_q.new_poly_lvl(level), both)
+    one = ring_q.new_poly_lvl(level - 1)
+    ring_q._mm_div_round_by_last_modulus_ntt_lvl(level, ct.value[0], ring_q.new_poly_lvl(level), one)
+    two = ring_q.new_poly_lvl(level - 2)
+    ring_q._mm_div_round_by_last_modulus_ntt_lvl(level - 1, one, ring_q.new_poly_lvl(level - 1), two)
+
+    differ = sum(1 for k in range(level - 1) for j in range(params.n()) if both._buf_coeffs[k][j] != two._buf_coeffs[k][j])
+    assert_eq("Rescale by two moduli at once matches two single rescales", differ, 0)
+
+
+def max_decryption_error(params, encoder, sk, ct, values) -> float:
+    # The largest difference between values and ct decrypted with sk
+    decoded = encoder.decode(ckks.new_decryptor(params, sk).decrypt_new(ct), params.log_slots)
+    return max(abs(decoded[i] - values[i]) for i in range(len(values)))
+
+
+def test_public_key_generation():
+    # A public key is an encryption of zero under a secret key. A key generator stores the all-zero key until
+    # gen_secret_key(store_key=True) replaces it, and the public key of the all-zero key would let anyone decrypt: c0
+    # alone is the message plus noise. gen_public_key() used to encrypt under the stored key whatever it was.
+    params = ckks.new_parameters_from_literal(ckks_params.PN14QP438)
+    encoder = ckks.new_encoder_complex(params)
+    values = [complex(0.125 * float(i % 16) - 1.0, 0.0) for i in range(params.slots())]
+    pt = ckks.new_plaintext(params, params.max_level(), params.default_scale)
+    encoder.encode(values, pt, params.log_slots)
+    zero_sk = ckks.new_secret_key(params)
+
+    kgen = ckks.new_key_generator(params)
+    raised = False
+    try:
+        kgen.gen_public_key()
+    except ValueError:
+        raised = True
+    assert_eq("gen_public_key() raises when the generator stores no key", raised, True)
+
+    sk = kgen.gen_secret_key()
+    ct = ckks.new_encryptor(params, kgen.gen_public_key(sk)).encrypt_new(pt)
+    assert_eq("gen_public_key(sk): its encryptions decrypt with sk",
+              max_decryption_error(params, encoder, sk, ct, values) < 1e-3, True)
+    assert_eq("gen_public_key(sk): its encryptions do not decrypt with the all-zero key",
+              max_decryption_error(params, encoder, zero_sk, ct, values) > 1.0, True)
+
+    raised = False
+    try:
+        kgen.gen_public_key()
+    except ValueError:
+        raised = True
+    assert_eq("gen_secret_key() does not store its key: gen_public_key() still raises", raised, True)
+
+    raised = False
+    try:
+        kgen.gen_public_key(zero_sk)
+    except ValueError:
+        raised = True
+    assert_eq("gen_public_key(sk) raises for the all-zero key", raised, True)
+
+    raised = False
+    try:
+        rlwe.new_key_generator(params.get_rlwe_params()).gen_public_key()
+    except ValueError:
+        raised = True
+    assert_eq("rlwe.KeyGenerator: gen_public_key() raises when the generator stores no key", raised, True)
+
+    # The stored-key sequence, also through the CKKS wrapper's copy of its generator
+    kgen_stored = ckks.new_key_generator(params)
+    sk_stored = kgen_stored.gen_secret_key(store_key=True)
+    for via_rlwe in (False, True):
+        pk = kgen_stored.get_rlwe_keygen().gen_public_key() if via_rlwe else kgen_stored.gen_public_key()
+        ct = ckks.new_encryptor(params, pk).encrypt_new(pt)
+        tag = "the RLWE generator of a CKKS generator" if via_rlwe else "a CKKS generator"
+        assert_eq(f"gen_public_key() of {tag} after gen_secret_key(store_key=True): decrypts with the stored key",
+                  max_decryption_error(params, encoder, sk_stored, ct, values) < 1e-3, True)
+        assert_eq(f"gen_public_key() of {tag} after gen_secret_key(store_key=True): not with the all-zero key",
+                  max_decryption_error(params, encoder, zero_sk, ct, values) > 1.0, True)
+
+
+def test_mod_down_rounding():
+    """The mod-down after a key switch or a public-key encryption (division by the special modulus P, both variants)
+    rounds: x * P + r goes to x for r below P / 2 and to x + 1 above it. It used to floor (x for every r below P), which
+    left every pk encryption and key switch with e0 + e1 * s, E[e1] = -1/2 on every coefficient: a fixed error pattern
+    per secret key, up to about 4e-5 in the first slots at the default scale. Every level of P (the public-key encryption
+    uses level 0, the key switches the top one) and two levels of Q. The offsets stay P / 1000 away from P / 2 and from
+    P: the basis extension counts its overflow in floating point, so residues within about 2^-53 * P of the boundary may
+    come out either way (a tie, to 1e-16)."""
+    params = ckks.new_parameters_from_literal(ckks_params.PN14QP438)
+    ring_q, ring_p = params.ring_q, params.ring_p
+    extender = ring.new_basis_extender(ring_q, ring_p)
+    n = params.n()
+    for level_p in range(params.p_count()):
+        big_p = u128(1)
+        for j in range(level_p + 1): big_p *= u128(ring_p.modulus[j])
+        half = (big_p - u128(1)) >> u128(1)
+        away = big_p // u128(1000)
+        offsets = [u128(0), u128(1), half - away, half + away, big_p - away]
+        carries = [0, 0, 0, 1, 1]  # round(r / P); a floor gives 0 for all
+        for level_q in (params.max_level(), 0):
+            for ntt in (False, True):
+                p1_q = ring_q.new_poly_lvl(level_q)
+                p1_p = ring_p.new_poly_lvl(level_p)
+                out = ring_q.new_poly_lvl(level_q)
+                for x in range(n):
+                    quotient = u128(x % 5)
+                    r = offsets[x % len(offsets)]
+                    for i in range(level_q + 1):
+                        qi = u128(ring_q.modulus[i])
+                        p1_q._buf_coeffs[i][x] = u64((quotient * (big_p % qi) + r % qi) % qi)
+                    for j in range(level_p + 1):
+                        p1_p._buf_coeffs[j][x] = u64(r % u128(ring_p.modulus[j]))
+                if ntt:
+                    ring_q._mm_ntt_lvl(level_q, p1_q, p1_q)
+                    ring_p._mm_ntt_lvl(level_p, p1_p, p1_p)
+                    extender._mm_mod_down_qp_to_q_ntt(level_q, level_p, p1_q, p1_p, out)
+                    ring_q._mm_inv_ntt_lvl(level_q, out, out)
+                else:
+                    extender._mm_mod_down_qp_to_q(level_q, level_p, p1_q, p1_p, out)
+                wrong = 0
+                for x in range(n):
+                    want = u64(x % 5 + carries[x % len(offsets)])
+                    for i in range(level_q + 1):
+                        if out._buf_coeffs[i][x] != want: wrong += 1
+                variant = "NTT" if ntt else "coefficient"
+                assert_eq(f"Lattiseq mod-down ({variant} domain, P level {level_p}, Q level {level_q}) rounds x * P + r to the nearest integer ({wrong} wrong residues)", wrong, 0)
+
+def test_pk_encryption_bias():
+    """Public-key encryptions of zero, 40 per key for three keys: in each of the first three slots the mean error is
+    within 7 standard errors of zero (a t statistic; one encryption's slot error is 0.5e-7 to 4e-7 here, depending on
+    the key and the slot, measured). A mod-down that floors leaves E[e1] * s (see test_mod_down_rounding): 1e-6 to 4e-5
+    in slot 0 for four keys measured, 30 standard errors or more."""
+    params = ckks.new_parameters_from_literal(ckks_params.PN14QP438)
+    encoder = ckks.new_encoder_complex(params)
+    pt = ckks.new_plaintext(params, params.max_level(), params.default_scale)
+    encoder.encode([complex(0.0, 0.0) for _ in range(params.slots())], pt, params.log_slots)
+    count, slots = 40, 3
+    worst = 0.0
+    for _ in range(3):
+        kgen = ckks.new_key_generator(params)
+        sk = kgen.gen_secret_key()
+        encryptor = ckks.new_encryptor(params, kgen.gen_public_key(sk))
+        decryptor = ckks.new_decryptor(params, sk)
+        errors = [[complex(0.0, 0.0) for _ in range(count)] for _ in range(slots)]
+        for t in range(count):
+            decoded = encoder.decode(decryptor.decrypt_new(encryptor.encrypt_new(pt)), params.log_slots)
+            for k in range(slots): errors[k][t] = decoded[k]
+        for k in range(slots):
+            mean = sum(errors[k]) / float(count)
+            spread = math.sqrt(sum(abs(e - mean) ** 2 for e in errors[k]) / float(count - 1))
+            worst = max(worst, abs(mean) / (spread / math.sqrt(float(count))))
+    assert_eq(f"Lattiseq pk encryptions carry no per-key bias in the first slots (largest mean error {worst:.1f} standard errors)", worst < 7.0, True)
+
+def scale_test_values(n: int, seed: int) -> list[complex]:
+    # Deterministic values in [-3.5, 3.5]
+    v = list[complex](n)
+    x = seed * 7919 + 13
+    for i in range(n):
+        x = (x * 1103515245 + 12345) % 2147483648
+        v.append(complex(float(x % 7001) / 1000.0 - 3.5, 0.0))
+    return v
+
+
+def max_relative_error(got: list[complex], want: list[complex]) -> float:
+    # The largest error over the largest value
+    largest, worst = 0.0, 0.0
+    for i in range(len(want)):
+        largest = max(largest, abs(want[i].real))
+        d = abs(got[i].real - want[i].real)
+        if d > worst or d != d:
+            worst = d if d == d else 1e300
+    return worst / largest
+
+
+def encrypt_at(params, encoder, encryptor, values: list[complex], level: int, scale: float) -> ckks.Ciphertext:
+    pt = ckks.new_plaintext(params, level, scale)
+    encoder.encode(values, pt, params.log_slots)
+    return encryptor.encrypt_new(pt)
+
+
+def add_or_sub(evaluator, op: str, a: ckks.Ciphertext, b: ckks.Ciphertext, out: ckks.Ciphertext):
+    if op == "add":
+        evaluator.add(a, b, out)
+    else:
+        evaluator.sub(a, b, out)
+
+
+def test_add_scale_matching(params, encoder, encryptor, decryptor, evaluator):
+    """Additions and subtractions of two ciphertexts whose scales differ. Exact, at the lower operand's level (no level of
+    the sum spent): every ratio class (within 1e-9, a rescale's 1 +- 1e-5, 1.5, a non-integer 2.5, the integers 3 and 2^34)
+    with the second operand one level lower, and integer ratios at the same level, for every receiver (a new ciphertext,
+    either operand, a copy of the second one: the first operand at 3 times the second's scale, with a copy of the second as
+    receiver, took the branch meant for the second operand itself, identity compared by value; a ratio of 2^68, beyond
+    a 64-bit integer, takes two integer factors); then a product's rescale plus a fresh ciphertext one level apart, and a
+    product one level above a level-0 ciphertext (rescaled first: at level 0 its scale does not fit the modulus). At the
+    same level a ratio that is not an integer keeps Lattigo's residual and
+    the level (exactness would spend a level of the sum): two products at level 1 sum at level 1. The parent took every
+    ratio below 2 as equal (about (ratio - 1) / 2 relative, the same sign on every slot) whatever the levels, and
+    multiplied by floor(ratio) above."""
+    n = params.slots()
+    va = scale_test_values(n, 2)
+    vb = scale_test_values(n, 3)
+    top = params.max_level()
+    d = params.default_scale
+    worst = 0.0
+    worst_case = ""
+    levels_ok = True
+    # (a's scale, b's scale, how many levels b is below a); the last case is M-LAT-03's (a copy of b as receiver)
+    cases = [(d, d * r, 1) for r in [1.0 + 1e-10, 1.0 + 1e-5, 1.0 - 1e-5, 1.5, 2.5, 3.0, d]]
+    cases.extend([(d, d * r, 0) for r in [1.0 + 1e-10, 3.0, d, d * d]])
+    cases.append((d * 3.0, d, 0))
+    for a_scale, b_scale, drop in cases:
+        for op in ["add", "sub"]:
+            for receiver in ["new", "a", "b", "copy of b"]:
+                a = encrypt_at(params, encoder, encryptor, va, top, a_scale)
+                b = encrypt_at(params, encoder, encryptor, vb, top - drop, b_scale)
+                want = [complex(va[i].real + (vb[i].real if op == "add" else -vb[i].real), 0.0) for i in range(n)]
+                out = ckks.new_ciphertext(params, 1, min(a.level(), b.level()), 0.0)
+                if receiver == "a":
+                    out = a
+                elif receiver == "b":
+                    out = b
+                elif receiver == "copy of b":
+                    out = b.copy()
+                add_or_sub(evaluator, op, a, b, out)
+                levels_ok = levels_ok and out.level() == top - drop
+                e = max_relative_error(encoder.decode(decryptor.decrypt_new(out), params.log_slots), want)
+                if e > worst:
+                    worst = e
+                    worst_case = f"{op}, scales {a_scale / d} and {b_scale / d} of the default, b {drop} level(s) lower, receiver {receiver}"
+    assert_eq(f"Lattiseq additions at differing scales are exact one level apart and for integer ratios, at the lower level, for every receiver (largest relative error {worst:.2e}: {worst_case})", worst < 1e-6 and levels_ok, True)
+
+    worst_excess = 0.0
+    levels_ok = True
+    for ratio in [1.0 + 1e-5, 1.0 - 1e-5, 1.5, 2.5]:
+        a = encrypt_at(params, encoder, encryptor, va, top, d)
+        b = encrypt_at(params, encoder, encryptor, vb, top, d * ratio)
+        out = ckks.new_ciphertext(params, 1, top, 0.0)
+        evaluator.add(a, b, out)
+        levels_ok = levels_ok and out.level() == top
+        # As Lattigo: below 2 the smaller-scale operand is read at the larger scale; above, it is multiplied by the nearest
+        # integer and read at the larger scale
+        k = 1.0 if ratio < 2.0 else math.floor(ratio + 0.5)
+        low_is_a = ratio > 1.0
+        factor = (k / ratio) if low_is_a else (ratio / k)
+        want = [complex((va[i].real * factor if low_is_a else va[i].real) + (vb[i].real if low_is_a else vb[i].real * factor), 0.0) for i in range(n)]
+        worst_excess = max(worst_excess, max_relative_error(encoder.decode(decryptor.decrypt_new(out), params.log_slots), want))
+    assert_eq(f"Lattiseq additions at the same level whose scale ratio is not an integer keep the level and Lattigo's residual (largest departure from it {worst_excess:.2e})", worst_excess < 1e-6 and levels_ok, True)
+
+    a = encrypt_at(params, encoder, encryptor, va, top, d)
+    b = encrypt_at(params, encoder, encryptor, vb, top, d)
+    product = evaluator.mul_relin_new(a, b)
+    evaluator.rescale(product, d, product)
+    want = [complex(va[i].real * vb[i].real + va[i].real, 0.0) for i in range(n)]
+    fresh = encrypt_at(params, encoder, encryptor, va, top, d)
+    total = ckks.new_ciphertext(params, 1, product.level(), 0.0)
+    evaluator.add(product, fresh, total)
+    e_levels = max_relative_error(encoder.decode(decryptor.decrypt_new(total), params.log_slots), want)
+    assert_eq(f"Lattiseq a * b (rescaled, scale {product.scale / d} of the default) + a fresh ciphertext one level apart is exact ({e_levels:.2e}) at the product's level ({total.level()})", e_levels < 1e-6 and total.level() == product.level(), True)
+
+    # A product (its rescale pending) one level above a level-0 ciphertext: the sum at level 0 keeps its values (the
+    # product rescaled, then a rescale's residual), where multiplying the level-0 one by the product's ratio overflows
+    x0 = encrypt_at(params, encoder, encryptor, va, 0, d)
+    p1 = evaluator.mul_relin_new(encrypt_at(params, encoder, encryptor, va, 1, d), encrypt_at(params, encoder, encryptor, vb, 1, d))
+    bottom = evaluator.add_new(p1, x0)
+    want = [complex(va[i].real * vb[i].real + va[i].real, 0.0) for i in range(n)]
+    e_bottom = max_relative_error(encoder.decode(decryptor.decrypt_new(bottom), params.log_slots), want)
+    assert_eq(f"Lattiseq a product at level 1 plus a ciphertext at level 0 sums at level 0 ({bottom.level()}) and keeps its values ({e_bottom:.1e})", bottom.level() == 0 and e_bottom < 1e-4, True)
+
+    # Two products at level 1 whose scales differ by a rescale's ratio: the sum stays at level 1 (one level lower at the
+    # same scale, about 2^68, its values would no longer fit level 0's modulus)
+    x1 = encrypt_at(params, encoder, encryptor, va, 1, d)
+    y1 = encrypt_at(params, encoder, encryptor, vb, 1, d)
+    z1 = encrypt_at(params, encoder, encryptor, vb, 1, d * (1.0 + 4e-5))
+    c1 = evaluator.mul_relin_new(x1, y1)
+    d1 = evaluator.mul_relin_new(x1, z1)
+    low_sum = evaluator.add_new(c1, d1)
+    want = [complex(2.0 * va[i].real * vb[i].real, 0.0) for i in range(n)]
+    e_low = max_relative_error(encoder.decode(decryptor.decrypt_new(low_sum), params.log_slots), want)
+    assert_eq(f"Lattiseq a sum of two products at level 1 stays at level 1 ({low_sum.level()}) and keeps its values ({e_low:.1e})", low_sum.level() == 1 and e_low < 1e-4, True)
+
+
+def test_check_binary_ntt(params, encoder, encryptor, evaluator):
+    """check_binary checks that the second operand is in the NTT domain (it checked the first one twice)."""
+    n = params.slots()
+    a = encrypt_at(params, encoder, encryptor, scale_test_values(n, 6), params.max_level(), params.default_scale)
+    b = encrypt_at(params, encoder, encryptor, scale_test_values(n, 7), params.max_level(), params.default_scale)
+    b.value[0].is_ntt = False
+    b.value[1].is_ntt = False
+    refused = False
+    try:
+        evaluator.check_binary(a, b, ckks.new_ciphertext(params, 1, a.level(), 0.0), 1)
+    except ValueError:
+        refused = True
+    assert_eq("Lattiseq check_binary refuses a second operand outside the NTT domain", refused, True)
+
+
+def test_constants_out_of_place(params, encoder, encryptor, decryptor, evaluator):
+    """add_const_new and sub_const_new return the input plus or minus the constant (they returned a ciphertext with no
+    second component), add_const with another ciphertext as receiver writes all of it (it left the receiver's second
+    component as it was), and a constant 0 out of place copies instead of sharing the input's polynomials."""
+    n = params.slots()
+    v = scale_test_values(n, 8)
+    w = scale_test_values(n, 9)
+    top = params.max_level()
+    d = params.default_scale
+    plus = [complex(x.real + 1.5, 0.0) for x in v]
+    minus = [complex(x.real - 1.5, 0.0) for x in v]
+    a = encrypt_at(params, encoder, encryptor, v, top, d)
+    e_add = max_relative_error(encoder.decode(decryptor.decrypt_new(evaluator.add_const_new(a, 1.5)), params.log_slots), plus)
+    e_sub = max_relative_error(encoder.decode(decryptor.decrypt_new(evaluator.sub_const_new(a, 1.5)), params.log_slots), minus)
+    out = encrypt_at(params, encoder, encryptor, w, top, d)
+    evaluator.add_const(a, 1.5, out)
+    e_out = max_relative_error(encoder.decode(decryptor.decrypt_new(out), params.log_slots), plus)
+    out_zero = encrypt_at(params, encoder, encryptor, w, top, d)
+    evaluator.add_const(a, 0.0, out_zero)
+    evaluator.add_const(out_zero, 1.0, out_zero)
+    e_input = max_relative_error(encoder.decode(decryptor.decrypt_new(a), params.log_slots), v)
+    assert_eq(f"Lattiseq add_const_new, sub_const_new and add_const out of place are right ({e_add:.1e}, {e_sub:.1e}, {e_out:.1e}) and leave their input ({e_input:.1e})", max(max(e_add, e_sub), max(e_out, e_input)) < 1e-5, True)
+
+
+def crt_wrong_coefficients(literal, level: int) -> int:
+    # poly_to_bigint_lvl of a polynomial with residues near the top of each modulus (every other coefficient: the
+    # worst case for the CRT sum) and random ones, checked residue by residue
+    params = ckks.new_parameters_from_literal(literal)
+    ring_q = params.ring_q
+    p = ring.new_poly(ring_q.n, level)
+    x = u64(88172645463325252)
+    for k in range(level + 1):
+        qk = ring_q.modulus[k]
+        for j in range(ring_q.n):
+            x ^= x << u64(13)
+            x ^= x >> u64(7)
+            x ^= x << u64(17)
+            p._buf_coeffs[k][j] = (qk - u64(1) - (x % u64(1000))) if j % 2 == 0 else (x % qk)
+    coeffs = [lattiseq_uint(0) for _ in range(ring_q.n)]
+    ring_q.poly_to_bigint_lvl(level, p._buf_coeffs, 1, coeffs)
+    wrong = 0
+    for j in range(ring_q.n):
+        for k in range(level + 1):
+            if coeffs[j].gmp_mod(ring_q.modulus[k].ext_to_lattiseq_uint()) != p._buf_coeffs[k][j].ext_to_lattiseq_uint():
+                wrong += 1
+                break
+    return wrong
+
+
+def crt_centered_wrong_coefficients(literal, level: int) -> int:
+    # poly_to_bigint_centered_lvl of the same kind of polynomial: each result in [-Q/2, Q/2), congruent to every residue
+    params = ckks.new_parameters_from_literal(literal)
+    ring_q = params.ring_q
+    p = ring.new_poly(ring_q.n, level)
+    x = u64(1442695040888963407)
+    for k in range(level + 1):
+        qk = ring_q.modulus[k]
+        for j in range(ring_q.n):
+            x ^= x << u64(13)
+            x ^= x >> u64(7)
+            x ^= x << u64(17)
+            p._buf_coeffs[k][j] = (qk - u64(1) - (x % u64(1000))) if j % 2 == 0 else (x % qk)
+    coeffs = [lattiseq_int(0) for _ in range(ring_q.n)]
+    ring_q.poly_to_bigint_centered_lvl(level, p, 1, coeffs)
+    big_q = lattiseq_int(ring_q.modulus_at_level[level])
+    half = big_q.half()
+    wrong = 0
+    for j in range(ring_q.n):
+        c = coeffs[j]
+        if c >= half or c < -half:
+            wrong += 1
+            continue
+        for k in range(level + 1):
+            if c.gmp_mod(lattiseq_int(ring_q.modulus[k].ext_to_lattiseq_uint())) != lattiseq_int(p._buf_coeffs[k][j].ext_to_lattiseq_uint()):
+                wrong += 1
+                break
+    return wrong
+
+
+def test_crt_long_chains():
+    """The CRT reconstruction is exact at every level whose modulus fits the bigint in use, including the long chains
+    where the sum of its products does not (PN15QP880 level 11, PN16QP1761 level 9: every coefficient wrapped before),
+    and refuses a level beyond them with a clear error (an IndexError before)."""
+    wrong = crt_wrong_coefficients(ckks_params.PN14QP438, 8) + crt_wrong_coefficients(ckks_params.PN15QP880, 10)
+    wrong_long = crt_wrong_coefficients(ckks_params.PN15QP880, 11) + crt_wrong_coefficients(ckks_params.PN16QP1761, 9)
+    assert_eq(f"Lattiseq CRT reconstruction is exact on short chains ({wrong} wrong) and on long ones ({wrong_long} wrong)", wrong + wrong_long, 0)
+    centered = crt_centered_wrong_coefficients(ckks_params.PN14QP438, 8) + crt_centered_wrong_coefficients(ckks_params.PN15QP880, 11) + crt_centered_wrong_coefficients(ckks_params.PN16QP1761, 9)
+    assert_eq(f"Lattiseq centered CRT reconstruction is exact, the long chains included ({centered} wrong)", centered, 0)
+    params = ckks.new_parameters_from_literal(ckks_params.PN16QP1761)
+    refused = False
+    try:
+        out = [lattiseq_int(0) for _ in range(params.ring_q.n)]
+        params.ring_q.poly_to_bigint_centered_lvl(10, ring.new_poly(params.ring_q.n, 10), 1, out)
+    except ValueError:
+        refused = True
+    assert_eq("Lattiseq CRT reconstruction refuses a level whose modulus does not fit the bigint in use", refused, True)
+
+
+def test_e2s_bound():
+    """E2S gen_share compares its mask bound with the product of the moduli without wrapping: at PN16QP1761 level 12 that
+    product has 596 bits, and the 512-bit product it used to compute had 509, so 510-bit masks were refused although the
+    level holds them. Masks too wide for the 512-bit integer, and a level too small for them, stay refused. (At such a
+    level get_share, the protocol's second half, refuses in turn: its CRT reconstruction needs Q to fit the integer.)"""
+    params = ckks.new_parameters_from_literal(ckks_params.PN16QP1761)
+    kgen = ckks.new_key_generator(params)
+    sk = kgen.gen_secret_key()
+    e2s = dckks.new_e2s_protocol(params, 3.2)
+    secret = dckks.new_additive_share_bigint(params, params.log_slots)
+    outcome = list[bool]()
+    for level, log_bound in [(12, 510), (12, 168), (10, 510), (12, 511)]:
+        share = e2s.allocate_share(level)
+        ct = ckks.new_ciphertext(params, 1, level, params.default_scale)
+        refused = False
+        try:
+            e2s.gen_share(sk, log_bound, params.log_slots, ct.value[1], secret, share)
+        except ValueError:
+            refused = True
+        outcome.append(refused)
+    assert_eq(f"Lattiseq E2S accepts masks the level holds and refuses the others (level 12: 510 bits refused {outcome[0]}, 168 {outcome[1]}; level 10 (506 bits): 510 refused {outcome[2]}; 511 bits refused {outcome[3]})", outcome == [False, False, True, True], True)
+
+
 def test_he():
     print('Testing HE ... \n')
-    
+
     test_lattiseq()
+    test_decryption_share_smudging()
+    test_exact_encoder()
+    test_multi_modulus_rescale()
+    test_public_key_generation()
+    test_mod_down_rounding()
+    test_pk_encryption_bias()
+
+    params, encoder, encryptor, decryptor, evaluator, _ = lattiseq_test_setup()
+    test_add_scale_matching(params, encoder, encryptor, decryptor, evaluator)
+    test_check_binary_ntt(params, encoder, encryptor, evaluator)
+    test_constants_out_of_place(params, encoder, encryptor, decryptor, evaluator)
+    test_crt_long_chains()
+    test_e2s_bound()
 
     print('HE tests passed.\n')

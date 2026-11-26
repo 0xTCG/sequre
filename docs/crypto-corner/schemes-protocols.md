@@ -137,7 +137,7 @@ Sequre can convert between the two representations:
 Secure comparisons ($>, <, ==$) cannot be done natively in CKKS. Sequre handles comparisons via MPC:
 
 1. Switch from MHE to MPC (if currently in HE)
-2. Execute the comparison using bit-decomposition in the MPC domain
+2. Execute the comparison in the MPC domain: a sign test (on the ring over XOR-shared bits; on the field from the parity of $2a$ behind a masked opening), and on the field an equality test for $==$ and $\ne$ (a masked opening and an OR over bits). What each guarantees: [Sharetensor comparisons](../api/sharetensor.md#comparisons)
 3. Switch back to MHE (if needed)
 
 This is one of the key motivations for the hybrid MPC+MHE approach: MPC handles non-linear operations while MHE handles linear algebra efficiently.

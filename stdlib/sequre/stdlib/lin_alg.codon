@@ -2,8 +2,12 @@ from sequre.stdlib.numpy.create import ones
 
 from sequre.attributes import sequre, mhe_cipher_opt
 from sequre.types.internal import Internal as sq
-from sequre.constants import EIGEN_DECOMP_ITER_PER_EVAL
+from sequre.constants import EIGEN_DECOMP_ITER_PER_EVAL, MPC_NBIT_F
 from sequre.types.sharetensor import Sharetensor
+
+# Regularizes householder's square roots: 16 units in the last place of the fixed-point format, above the truncation
+# noise of a near-zero x . x on shares, and about 4e-9 of a unit vector's x . x
+HOUSEHOLDER_EPSILON: float = 2.0 ** -float(MPC_NBIT_F - 4)
 
 
 @sequre
@@ -21,17 +25,28 @@ def l2(mpc, data):
 
 @sequre
 def householder(mpc, x):
+    # The unit vector v of the reflection I - 2 v^T v that maps x to a multiple of e0: v = (x + shift * e0) / |v| with
+    # shift = sign(x0) * |x|. The norm is sqrt(x . x + eps), and |v|^2 = 2 (x . x + x0 * shift) + eps exactly, so v is a
+    # unit vector for every x in the clear and on shares, also where x . x is zero or a few units of fixed-point noise:
+    # the zero vector gives v = +-e0, the same reflection whatever the sign (secure code cannot tell a zero vector
+    # without a comparison, and used to divide 0 by 0). For x . x well above eps the reflection is the usual one, to a
+    # relative eps / (x . x). On MPP and MPU inputs x . x carries the HE noise (about 1e-6), far above eps: there a zero
+    # or tiny x still gives an arbitrary v (L-251); normal vectors are fine on every type.
+    if len(x) == 0:
+        return x.copy()
     xdot = sq.dot(mpc, x, axis=0)
-    shift = sq.sqrt(mpc, xdot) * ((x[0] > 0).astype(float) * 2 - 1)
+    shift = sq.sqrt(mpc, xdot + HOUSEHOLDER_EPSILON) * ((x[0] > 0).astype(float) * 2 - 1)
     v = x.copy()
     v[0] += shift
-    return v / sq.sqrt(mpc, (xdot + x[0] * shift) * 2)
+    return v / sq.sqrt(mpc, (xdot + x[0] * shift) * 2 + HOUSEHOLDER_EPSILON)
 
 
 @sequre
 def qr_fact_square(mpc, A):
+    if len(A) == 0:
+        return A.copy(), A.copy()
     R = A.zeros()
-    Q = A.zeros()
+    Q = A.zeros() + A.I  # a 1 x 1 matrix takes no reflection
     B = A.zeros()
 
     for i in range(len(A) - 1):
@@ -43,13 +58,16 @@ def qr_fact_square(mpc, A):
         R[i:, i] = B[:, 0]
         A = B[1:, 1:]
 
-    R[-1, -1] = B[1, 1]
+    # The last diagonal entry: what is left of A (all of it when it is 1 x 1)
+    R[-1, -1] = A[0, 0]
 
     return Q, R
 
 
 @sequre
 def tridiag(mpc, A):
+    if len(A) == 0:
+        return A.copy(), A.copy()
     Q = A.zeros() + A.I
     T = A.zeros()
     B = A.zeros()
@@ -67,13 +85,16 @@ def tridiag(mpc, A):
         T[i, i + 1] = B[0, 1]
         A = B[1:, 1:]
 
-    T[-2:, -2:] = B[1:3, 1:3]
+    # The last 2 x 2 block: what is left of A (all of it when A is 2 x 2 or 1 x 1, already tridiagonal)
+    T[-2:, -2:] = A
 
     return T, Q
 
 
 @sequre
 def eigen_decomp(mpc, A, iter_per_eval = EIGEN_DECOMP_ITER_PER_EVAL):
+    if len(A) == 0:
+        return A.copy(), A.flatten()
     L = A[0].zeros()
     A, Q = tridiag(mpc, A)
     V = Q.T

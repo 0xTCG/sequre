@@ -11,13 +11,71 @@ from sequre.mpc.env import MPCEnv
 from sequre.stdlib.learn.lin_reg import LinReg
 
 
+def _partition_rows(mpc, matrix, ratios: List[int]) -> MPP:
+    # Each compute party's rows of matrix by ratios (CP0 keeps the whole as its placeholder)
+    if mpc.pid == 0:
+        return MPP(mpc, zeros_like(matrix))
+    start = ratios[:mpc.pid - 1].sum()
+    return MPP(mpc, matrix[start:start + ratios[mpc.pid - 1]].copy())
+
+
+def _switches(mpc) -> int:
+    # Ciphertexts switched between MHE and MPC so far, both ways, at this party
+    return mpc.mhe.stats.secure_mhe_mpc_switch_count + mpc.mhe.stats.secure_mpc_mhe_switch_count
+
+
+def _held_weights(mpc, w0, ratios: List[int], encrypted: bool) -> MPP:
+    w = _partition_rows(mpc, w0, ratios)
+    if encrypted:
+        w.encrypt()
+    return w
+
+
+def test_lin_reg_mpp_layouts[TP](mpc: MPCEnv[TP], modulus: TP):
+    """LinReg on MPPs at the configurations in which converting ref (X.T @ y, whose sum A.T @ B splits in HE as
+    column-wise partitions) in every epoch made LinReg slower (review c20-cr4-3): X at unequal ratios with the weights at
+    other ones, and the weights encrypted row-wise; against plaintext. LinReg computes ref through MPC as row-wise
+    partitions, cov's layout, so no epoch converts anything: a further epoch switches as many ciphertexts between MHE
+    and MPC as one cov @ w (w encrypted row-wise, as every epoch after the first holds it) does (review c21-cr1-9)."""
+    n_cp = mpc.comms.number_of_parties - 1
+    per, cols = 5, 4
+    ratios = [per - 2 if q == 0 else (per + 2 if q == 1 else per) for q in range(n_cp)]
+    with mpc.randomness.global_stream():
+        X = array(random_floats((ratios.sum(), cols)))
+        w_true = array(random_floats((cols, 1), scale=1))
+    y = X @ w_true + 1.0
+    w0 = ones((cols + 1, 1))
+    w_ratios = [(cols + 1) // n_cp for _ in range(n_cp)]
+    w_ratios[-1] += cols + 1 - w_ratios.sum()
+    step, epochs = 0.001, 3
+    raw_w = LinReg(w0).fit(mpc, X=X, y=y, step=step, epochs=epochs).coef_
+    X_tilde = _partition_rows(mpc, X, ratios).pad_with_value(1, 1, 1, mpc)
+    cov = X_tilde.T @ X_tilde
+    w_enc = _held_weights(mpc, w0, w_ratios, True)
+    s3 = _switches(mpc)
+    cov @ w_enc
+    per_product = _switches(mpc) - s3
+    for encrypted_w in (False, True):
+        s0 = _switches(mpc)
+        LinReg(_held_weights(mpc, w0, w_ratios, encrypted_w)).fit(mpc, X=_partition_rows(mpc, X, ratios), y=_partition_rows(mpc, y, ratios), step=step, epochs=epochs - 1)
+        s1 = _switches(mpc)
+        model = LinReg(_held_weights(mpc, w0, w_ratios, encrypted_w)).fit(mpc, X=_partition_rows(mpc, X, ratios), y=_partition_rows(mpc, y, ratios), step=step, epochs=epochs)
+        s2 = _switches(mpc)
+        revealed = model.coef_.reveal()
+        label = f"Sequre linear regression (MPP) with X at {ratios}, weights at {w_ratios}" + (" encrypted row-wise" if encrypted_w else " in the clear")
+        per_epoch = (s2 - s1) - (s1 - s0)
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}", revealed, raw_w, error=1e-3)
+            assert_eq(f"CP{mpc.pid}:\t{label}: a further epoch switches {per_epoch} ciphertexts, as one cov @ w ({per_product})", per_epoch, per_product)
+
+
 def test_lin_reg[TP](mpc: MPCEnv[TP], modulus: TP):
     alg_struct = "ring" if modulus.popcnt() == 1 else "field"
     print(f'CP{mpc.pid}:\tTesting Sequre linear regression on {alg_struct} ... \n')
 
     rows_per_party = 4
     cols_per_party = 15
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         X = array(random_floats(((mpc.comms.number_of_parties - 1) * rows_per_party, cols_per_party)))
         target_w = array(random_floats((cols_per_party, 1), scale=1))
         target_b = 1.0
@@ -110,6 +168,8 @@ def test_lin_reg[TP](mpc: MPCEnv[TP], modulus: TP):
 
     if mpc.pid == 0:
         assert_eq(f"CP{mpc.pid}:\tSafe-checking linear regression result shape (MPU via MPP weights) on {alg_struct}", mpu_w.shape, raw_w.shape)
+
+    test_lin_reg_mpp_layouts(mpc, modulus)
 
     print(f'CP{mpc.pid}:\tSequre linear regression on {alg_struct} tests passed.\n')
     print(f'CP{mpc.pid}:\tRuntimes:\n\t\tPlaintext: {plaintext_time}s\n\t\tMPC: {mpc_time}s\n\t\tMPP: {mpp_time}s\n\t\tMPU/MPA: {mpu_via_mpa_time}s\n\t\tMPU/MPP: {mpu_via_mpp_time}s\n')

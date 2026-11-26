@@ -1,6 +1,8 @@
 import math
 
 from sequre.attributes import sequre
+from sequre.types.sharetensor import Sharetensor
+from sequre.constants import POLY_EVAL_CLENSHAW, POLY_EVAL_DECOR, POLY_EVAL_NAIVE, DECOR_TOLERANCE, MPC_NBIT_F
 
 
 def chebyshev_nodes(n, interval):
@@ -34,9 +36,45 @@ def chebyshev_coeffs(op, nodes, interval):
     return coeffs
 
 
+def _scaling_admit(label: str, monomial: List[float], interval, tolerance: float):
+    # The scaling t = (2x - a - b) / (b - a) encodes 2 / (b - a) and (a + b) / (b - a) in fixed point and truncates
+    # once: t errs by up to (max(|a|, |b|) + 3) 2^-F, which the polynomial carries by its slope (max |P'| on [-1, 1]).
+    # The decor and naive evaluations refuse, before any round, an interval where that alone exceeds the tolerance
+    # times max(1, max |P|).
+    from sequre.decor.functions import poly_eval
+    a, b = float(interval[0]), float(interval[1])
+    grid = [-1.0 + 2.0 * float(i) / 256.0 for i in range(257)]
+    slope_coeffs = [float(k) * monomial[k] for k in range(1, len(monomial))]
+    slope = 0.0
+    scale = 1.0
+    for t in grid:
+        if len(slope_coeffs):
+            slope = max(slope, abs(poly_eval(slope_coeffs, t)))
+        scale = max(scale, abs(poly_eval(monomial, t)))
+    err = slope * (max(abs(a), abs(b)) + 3.0) * 2.0 ** -float(MPC_NBIT_F)
+    if not (err <= tolerance * scale):
+        raise ValueError(
+            f"{label}: the scaling to [-1, 1] errs by up to {err:.3g} on {interval} (its encoded constants), beyond "
+            f"the tolerance {tolerance:.3g} times {scale:.4g}; narrow the interval or move it towards 0")
+
+
+@sequre
+def _scaled(mpc, x, interval):
+    a, b = interval
+    return x * (2 / (b - a)) - (a + b) / (b - a)
+
+
 @sequre
 def chebyshev_evaluate(mpc, x, coeffs, interval, validate=False):
+    # Clenshaw's recurrence over sum_k coeffs[k] T_k(scaled x): a product and a truncation per degree (2 degree + 2
+    # rounds from degree 3 on). Any degree >= 0. Refuses to run inside MPCEnv.delayed_truncation().
+    mpc.fp.require_truncation("chebyshev_evaluate")
     n = len(coeffs)
+    if n == 1:
+        # a constant: no scaling, no product (a fixed-point zero of x's shape plus the constant)
+        if isinstance(x, Sharetensor):
+            return x.to_fp() * 0 + coeffs[0]
+        return x * 0.0 + coeffs[0]
     a, b = interval
     scaled_x = x * (2 / (b - a)) - (a + b) / (b - a)
 
@@ -46,7 +84,13 @@ def chebyshev_evaluate(mpc, x, coeffs, interval, validate=False):
             min_val = x.reveal(mpc).min()
             max_val = x.reveal(mpc).max()
             assert interval[0] <= min_val <= max_val <= interval[1], f"\tCP{mpc.pid}: Chebyshev interpolation: The input values fall within segment [{min_val}, {max_val}] which is not contained within the Chebyshev interval {interval}."
-    
+
+    if n == 2:
+        return scaled_x * coeffs[1] + coeffs[0]
+    if n == 3:
+        # c0 + c1 x + c2 (2 x^2 - 1)
+        return scaled_x * (scaled_x * (coeffs[2] * 2) + coeffs[1]) + (coeffs[0] - coeffs[2])
+
     w_2 = scaled_x * (coeffs[n - 1] * 2) + coeffs[n - 2]
     w_1 = scaled_x * w_2 * 2 - (coeffs[n - 1] - coeffs[n - 3])
     w_0 = scaled_x * w_1 * 2 - w_2 + coeffs[n - 4]
@@ -54,14 +98,55 @@ def chebyshev_evaluate(mpc, x, coeffs, interval, validate=False):
     for i in range(n - 5, -1, -1):
         w_2, w_1 = w_1, w_0
         w_0 = scaled_x * w_1 * 2 - w_2 + coeffs[i]
-    
+
     return w_0 - scaled_x * w_1
 
 
-def via_chebyshev(mpc, x, op, interval, degree: int):
+def via_chebyshev(mpc, x, op, interval, degree: int, evaluation: Static[str] = POLY_EVAL_CLENSHAW):
+    """
+    op(x) on interval by its degree-`degree` Chebyshev interpolant. evaluation: "clenshaw" (default; a product and a
+    truncation per degree: 2 degree + 2 rounds from degree 3 on), "decor" (the monomial form through Decor's polynomial
+    decomposition: constant rounds, but the decomposition evaluates the polynomial's shifted coefficients on [-2, 2],
+    where they grow like 5.8^degree times the Chebyshev coefficients, so the admissibility check's error bound limits
+    the degree: at most 12 for sigmoid on (-8, 8) at F = 32) or "naive" (the scaling, then secure powers of the monomial form:
+    about 2 degree rounds; its error, about 2^-F sum_k (k + 1) |m_k| over the monomial coefficients m_k, grows with them
+    too, so a degree whose estimate, 2^-F (2 + (degree + 1) + 2 sum_k (k - 1) |m_k|), exceeds the tolerance or whose sum
+    leaves the fixed-point range is refused before any round: up to degree 24 for sigmoid on (-8, 8) at F = 32). Every
+    evaluation scales x to [-1, 1] with fixed-point constants, which errs by up to (max(|a|, |b|) + 3) 2^-F times the
+    interpolant's slope; the decor and naive evaluations refuse an interval where that exceeds the tolerance (Clenshaw
+    keeps Sequre's behavior). x: a 1-D or 2-D fixed-point Sharetensor; a public one (after publish) is evaluated as a
+    sharing held by CP1. Refuses to run inside MPCEnv.delayed_truncation().
+    """
+    mpc.fp.require_truncation("via_chebyshev")
+    if isinstance(x, Sharetensor):
+        from sequre.decor.primitives import _hub_held
+        x = _hub_held(mpc, x)
     coeffs = chebyshev_coeffs(
         op=op,
         nodes=chebyshev_nodes(degree + 1, interval),
         interval=interval)
 
-    return chebyshev_evaluate(mpc, x, coeffs, interval)
+    if evaluation == POLY_EVAL_CLENSHAW:
+        return chebyshev_evaluate(mpc, x, coeffs, interval)
+
+    from sequre.decor.functions import cheb2poly
+    monomial = cheb2poly(coeffs)
+    if evaluation == POLY_EVAL_DECOR:
+        from sequre.decor.core import _admit, _decor_polynomial
+        # via_decor's admissibility check and the scaling's, before the scaling's round
+        _admit("polynomial", (-1.0, 1.0), monomial, DECOR_TOLERANCE)
+        _scaling_admit(f"via_chebyshev (decor) of degree {degree}", monomial, interval, DECOR_TOLERANCE)
+        scaled = _scaled(mpc, x if x.is_fp() else x.to_fp(), interval)
+        return _decor_polynomial(mpc, scaled, (-1.0, 1.0), monomial)
+    elif evaluation == POLY_EVAL_NAIVE:
+        from sequre.decor.taylor import _naive_polynomial, _naive_admit
+        # the powers' range and precision, and the scaling's, before the scaling's round
+        _naive_admit(f"via_chebyshev (naive) of degree {degree} on {interval}", monomial, 1.0, DECOR_TOLERANCE)
+        _scaling_admit(f"via_chebyshev (naive) of degree {degree}", monomial, interval, DECOR_TOLERANCE)
+        scaled = _scaled(mpc, x if x.is_fp() else x.to_fp(), interval)
+        if isinstance(scaled.share, list[list]):
+            shape = scaled.shape
+            return _naive_polynomial(mpc, scaled.flatten(), monomial).reshape(shape)
+        return _naive_polynomial(mpc, scaled, monomial)
+    else:
+        compile_error("via_chebyshev: unknown evaluation " + evaluation + " (clenshaw, decor or naive)")

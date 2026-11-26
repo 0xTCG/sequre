@@ -1,13 +1,57 @@
-from sequre.stdlib.numpy.create import ones, zeros_like, rand
+from sequre.stdlib.numpy.create import array, ones, zeros, zeros_like, rand
 from sequre.stdlib.numpy.ndarray import ndarray
 
 from sequre.types.sharetensor import Sharetensor
 from sequre.types.multiparty_union import MPU
 from sequre.mpc.env import MPCEnv
 from sequre.stdlib.learn.lin_reg import LinReg
-from sequre.stdlib.learn.mi import MI
+from sequre.stdlib.learn.mi import MI, Imputer
 from sequre.utils.testing import assert_eq, assert_eq_approx
 from sequre.constants import ENC_DIAG, ENC_ROW
+
+from ..unit_tests.multiparty_testing import decryption_bytes, own_ciphertexts, assert_parties_in_step
+
+
+def test_mi_update_owners_only(mpc):
+    """C-04: Imputer.update on MPU data gives each party its own imputed values and no other party anything. It sends
+    exactly one decryption of each party's imputed rows to that party (a reveal_local), so the traffic grows with the
+    missing rows, not with their square: it used to reveal every imputed value to every party, once per missing row.
+    Each party's missing entries take their values and every other entry stays. One missing row per party, two per
+    party, and missing rows at the first compute party only (the other imputed partitions empty)."""
+    n_cp = mpc.comms.number_of_parties - 1
+    per, cols, miss_col = 4, 3, 1
+    rows = per * n_cp
+    with mpc.randomness.global_stream():
+        data = rand((rows, cols), "uniform") * 7
+        values = rand((rows, 1), "uniform") * 7  # the value imputed into each row, if it is missing
+    start = per * (mpc.pid - 1) if mpc.pid else 0
+    stop = start + per if mpc.pid else rows
+    mpu_data = MPU(mpc, data[start:stop] if mpc.pid else data, "partition")
+    cases = [
+        ("one missing row per party", [q * per for q in range(n_cp)]),
+        ("two missing rows per party", [q * per + d for q in range(n_cp) for d in (0, 2)]),
+        ("missing rows at CP1 only", [0, 1, 3])]
+    sent_by_case = List[int]()
+    for label, miss_rows in cases:
+        own_missing = [i for i in miss_rows if start <= i < stop] if mpc.pid else miss_rows
+        imputed_own = array([[values[i, 0]] for i in own_missing]) if own_missing else zeros((0, 1))
+        imputed_y = MPU(mpc, imputed_own, "partition")
+        imputed_y.encrypt()
+        expected = decryption_bytes(mpc, own_ciphertexts(imputed_y._mpp)) if mpc.pid else 0
+        sent = mpc.stats.bytes_sent
+        updated = Imputer.update(mpu_data, imputed_y, miss_rows, miss_col, False)
+        sent = mpc.stats.bytes_sent - sent
+        assert_eq(f"CP{mpc.pid}:\tMI update, {label}: one decryption of each party's imputed rows to it, nothing else", sent, expected)
+        if mpc.pid:
+            want = data[start:stop].copy()
+            for i in own_missing:
+                want[i - start, miss_col] = values[i, 0]
+            assert_eq_approx(f"CP{mpc.pid}:\tMI update, {label}: its own missing entries imputed, the rest as they were", updated._mpp._local_data, want, error=1e-3)
+        sent_by_case.append(sent)
+        assert_parties_in_step(mpc, f"MI update, {label}")
+    if mpc.pid:
+        growth = float(sent_by_case[1]) / float(sent_by_case[0])
+        assert_eq(f"CP{mpc.pid}:\tMI update traffic for twice the missing rows: x{growth:.2f} (linear, not quadratic)", growth <= 2.5, True)
 
 
 def test_mi[TP](mpc: MPCEnv[TP], modulus: TP):
@@ -16,7 +60,7 @@ def test_mi[TP](mpc: MPCEnv[TP], modulus: TP):
 
     rows_per_party = 4
     cols_per_party = 8
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         complete_data = rand(((mpc.comms.number_of_parties - 1) * rows_per_party, cols_per_party), "uniform") * 7
         labels = complete_data @ rand((cols_per_party, 1), "uniform") + 1.0
 
@@ -26,7 +70,7 @@ def test_mi[TP](mpc: MPCEnv[TP], modulus: TP):
     miss_rate = rows_per_party // 2
     
     miss_rows_set = set[int]()
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         for _ in range(miss_rate):
             miss_row = int.rand(len(data) - 1, "uniform")
             data[miss_row][miss_col] = miss_val
@@ -43,10 +87,12 @@ def test_mi[TP](mpc: MPCEnv[TP], modulus: TP):
     raw_fit_model = LinReg(raw_fm_initial_w)
 
     factor = 5
+    # The plaintext and the Sharetensor fits draw the same imputation noise: both from the global stream, rewound
     mpc.randomness.reset_global_seed()
-    raw_mi, raw_imputed_datasets = MI(factor, raw_impute_model, raw_fit_model).fit(
-        mpc, data, labels, miss_rows, miss_col,
-        step_size, step_size, epochs, epochs, noise_scale, "batched")
+    with mpc.randomness.global_stream():
+        raw_mi, raw_imputed_datasets = MI(factor, raw_impute_model, raw_fit_model).fit(
+            mpc, data, labels, miss_rows, miss_col,
+            step_size, step_size, epochs, epochs, noise_scale, "batched")
     
     raw_w = raw_mi.model.coef_
 
@@ -63,9 +109,10 @@ def test_mi[TP](mpc: MPCEnv[TP], modulus: TP):
     mpc_fit_model = LinReg(mpc_fm_initial_w)
 
     mpc.randomness.reset_global_seed()
-    mpc_mi, mpc_imputed_datasets = MI(factor, mpc_impute_model, mpc_fit_model).fit(
-        mpc, mpc_data, mpc_labels, miss_rows, miss_col,
-        step_size, step_size, epochs, epochs, noise_scale, "batched")
+    with mpc.randomness.global_stream():
+        mpc_mi, mpc_imputed_datasets = MI(factor, mpc_impute_model, mpc_fit_model).fit(
+            mpc, mpc_data, mpc_labels, miss_rows, miss_col,
+            step_size, step_size, epochs, epochs, noise_scale, "batched")
 
     mpc_w = mpc_mi.model.coef_
 
@@ -88,7 +135,8 @@ def test_mi[TP](mpc: MPCEnv[TP], modulus: TP):
         mpu_impute_model = LinReg(mpu_im_initial_w)
         mpu_fit_model = LinReg(mpu_fm_initial_w)
         
-        mpc.randomness.reset_global_seed()
+        # Each party draws the noise for its own missing rows from its private stream: under the shared seed each party
+        # would draw for its own rows (CP0 for its placeholder's), and the global stream would fall out of step
         mpu_mi, mpu_imputed_datasets = MI(factor, mpu_impute_model, mpu_fit_model).fit(
             mpc, mpu_data, mpu_labels, miss_rows, miss_col,
             step_size, step_size, epochs, epochs, noise_scale, "batched")
@@ -100,5 +148,6 @@ def test_mi[TP](mpc: MPCEnv[TP], modulus: TP):
         else:
             assert_eq_approx(f"CP{mpc.pid}:\tSequre multiple imputation (MPU) on {alg_struct}", mpu_w.reveal(mpc), raw_w)
         
+    test_mi_update_owners_only(mpc)
     print(f'CP{mpc.pid}:\tSequre multiple imputation on {alg_struct} tests passed.\n')
     

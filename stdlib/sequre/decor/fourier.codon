@@ -1,0 +1,129 @@
+""" Fourier series through Decor's trigonometric decomposition.
+
+Any term a_k cos(2 pi k t) + b_k sin(2 pi k t) expands under angle addition into public coefficients at the opened point
+times dealer shares at the mask, so a whole truncated series costs the rounds of a single sine (3: scaling, opening,
+truncation) at any degree: the degree adds local work and dealer randomness, not rounds.
+
+The series of a target that is not periodic on its interval (f(a) != f(b)) rings near the interval's ends (Gibbs
+phenomenon: about 9% of the jump, at any degree); Chebyshev or Decor's closed forms suit such targets better.
+"""
+
+import math
+
+from sequre.constants import DECOR_FOURIER_EPSILON
+from sequre.types.sharetensor import Sharetensor
+from sequre.types.utils import double_to_fp
+
+from functions import recursive_reduce, linspace, trapz
+from core import (
+    _turns, _as_fp, _opening_fraction, _mask_fraction, _affine, _fp_tensor, _share_terms, _is_empty, _empty_like,
+    FP_MAX)
+
+
+class FourierSeries:
+    """ f(x) ~ a0 + sum_k a[k] cos(2 pi (k + 1) t) + b[k] sin(2 pi (k + 1) t), t = (x - a) / (b - a). """
+    a0: float
+    a: List[float]
+    b: List[float]
+    interval: Tuple[float, float]
+
+    def __init__(self, a0: float, a: List[float], b: List[float], interval: Tuple[float, float]):
+        self.a0 = a0
+        self.a = a
+        self.b = b
+        self.interval = interval
+
+    def degree(self) -> int:
+        return len(self.a)
+
+    def kept(self) -> List[int]:
+        # Harmonics whose coefficients are not both below DECOR_FOURIER_EPSILON, one unit of the fixed-point encoding
+        # (public: the same at every party)
+        eps = DECOR_FOURIER_EPSILON
+        return [k for k in range(len(self.a)) if abs(self.a[k]) >= eps or abs(self.b[k]) >= eps]
+
+    def __call__(self, x: float) -> float:
+        lo, hi = self.interval
+        t = (x - lo) / (hi - lo)
+        s = self.a0
+        for k in range(len(self.a)):
+            w = 2.0 * math.pi * float(k + 1) * t
+            s += self.a[k] * math.cos(w) + self.b[k] * math.sin(w)
+        return s
+
+
+def fourier_coeffs(op, interval, degree: int, node_count: int = 1000) -> FourierSeries:
+    """
+    The degree-term Fourier series of op over interval, by trapezoidal integration over node_count points (computed in
+    Codon, once: precompute and reuse it across calls with fourier_evaluate).
+    """
+    if degree < 1:
+        raise ValueError("fourier_coeffs: the degree must be at least 1")
+    lo, hi = float(interval[0]), float(interval[1])
+    p = hi - lo
+    ts = linspace(0.0, 1.0, node_count)
+    ys = [float(op(lo + p * t)) for t in ts]
+    a0 = trapz(ys, ts)
+    a = List[float](degree)
+    b = List[float](degree)
+    for k in range(1, degree + 1):
+        w = 2.0 * math.pi * float(k)
+        a.append(2.0 * trapz([ys[i] * math.cos(w * ts[i]) for i in range(node_count)], ts))
+        b.append(2.0 * trapz([ys[i] * math.sin(w * ts[i]) for i in range(node_count)], ts))
+    return FourierSeries(a0, a, b, (lo, hi))
+
+
+def fourier_evaluate(mpc, x, series: FourierSeries):
+    """
+    The series at a fixed-point Sharetensor x (1-D or 2-D, ring or field): one fresh opening, one truncation. With
+    u = 2 pi frac(t - r) public and v = 2 pi frac(r) from the dealer, each harmonic k contributes
+    cos(kv) [a_k cos(ku) + b_k sin(ku)] + sin(kv) [b_k cos(ku) - a_k sin(ku)].
+    Error: the encodings of the weights and of the dealer's cos(kv), sin(kv) (about 2^-F per unit of
+    sum_k |a_k| + |b_k|), plus the phase's: t carries one unit of 2^-F from the scaling and |x - a| (2^-(F + e) +
+    2^-52 / (b - a)) from the encoded 1 / (b - a) (e = floor(log2(b - a)); the second term is the double's error, at
+    most 2^-52 of a turn for x in the interval), and harmonic k turns that into 2 pi k (|a_k| + |b_k|) times as much.
+    Refuses to run inside MPCEnv.delayed_truncation().
+    """
+    mpc.fp.require_truncation("fourier_evaluate")
+    lo, hi = series.interval
+    bound = abs(series.a0)
+    for k in range(series.degree()):
+        bound += abs(series.a[k]) + abs(series.b[k])
+    if not (bound < FP_MAX):
+        raise ValueError(f"fourier_evaluate: coefficients sum to {bound:.4g}, beyond the fixed-point range {FP_MAX:.4g}")
+
+    if _is_empty(x):
+        return _empty_like(x)
+    t, _, _ = _turns(mpc, _as_fp(mpc, x), lo, hi - lo)
+    modulus = t.modulus
+    x_r, r = mpc.arithmetic.__beaver_partition(t.share, modulus)
+    kept = series.kept()
+
+    v = _affine(_mask_fraction(r, modulus), 2.0 * math.pi, 0.0)
+    u = _affine(_opening_fraction(x_r, modulus), 2.0 * math.pi, 0.0)
+
+    terms = List[type(t.share)](2 * len(kept))
+    weights = List[type(recursive_reduce(math.cos, u))](2 * len(kept))
+    for k in kept:
+        kk = float(k + 1)
+        ak, bk = series.a[k], series.b[k]
+        if mpc.pid == 0:
+            terms.append(double_to_fp(recursive_reduce(lambda e: math.cos(kk * e), v), modulus))
+            terms.append(double_to_fp(recursive_reduce(lambda e: math.sin(kk * e), v), modulus))
+        else:
+            terms.append(t.share.zeros())
+            terms.append(t.share.zeros())
+        weights.append(recursive_reduce(lambda e: ak * math.cos(kk * e) + bk * math.sin(kk * e), u))
+        weights.append(recursive_reduce(lambda e: bk * math.cos(kk * e) - ak * math.sin(kk * e), u))
+
+    if not kept:
+        res = t.share.zeros()
+    else:
+        res = mpc.fp.weighted_sum(_share_terms(mpc, terms, modulus), weights, modulus)
+    res = mpc.arithmetic.add_public(res, double_to_fp(series.a0, modulus), modulus)
+    return _fp_tensor(res, modulus)
+
+
+def via_fourier(mpc, x, op, interval, degree: int, node_count: int = 1000):
+    """ op(x) on interval by its degree-term Fourier series (fourier_coeffs + fourier_evaluate). """
+    return fourier_evaluate(mpc, x, fourier_coeffs(op, interval, degree, node_count))

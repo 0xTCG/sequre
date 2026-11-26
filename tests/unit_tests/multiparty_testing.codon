@@ -1,0 +1,138 @@
+"""Helpers for the multiparty-type tests (MPP, MPA, MPU): partitions of different sizes, held by any number of compute
+parties, with different data at each, and a check that every party is still in step."""
+
+import secure_operator
+
+from internal.gc import sizeof
+
+from sequre.stdlib.numpy.create import array, zeros
+from sequre.lattiseq.ckks import Ciphertext
+from sequre.types.multiparty_partition import MPP
+from sequre.types.sharetensor import Sharetensor
+from sequre.utils.testing import assert_eq_approx
+from sequre.utils.utils import random_ints
+
+
+def unequal_ratios(n_cp: int) -> List[int]:
+    # Row counts that differ between the compute parties: [3, 5] with two, [2, 3, 5] with three, one more row for each
+    # further party
+    if n_cp == 1:
+        return [5]
+    if n_cp == 2:
+        return [3, 5]
+    ratios = [2, 3, 5]
+    for i in range(3, n_cp):
+        ratios.append(i + 3)
+    return ratios
+
+
+def ratios_with_empty(n_cp: int) -> List[int]:
+    # One compute party holds no rows: the first of two, the second of three or more
+    if n_cp == 2:
+        return [0, 5]
+    ratios = unequal_ratios(n_cp)
+    ratios[1] = 0
+    return ratios
+
+
+def sum_ratios(n_cp: int) -> List[List[int]]:
+    # Small partitions for sums (an encrypted row sum reduces each row): equal, unequal ([1, 2], [1, 2, 3], ...), and
+    # unequal with an empty one ([0, 2], [1, 0, 3], ...)
+    equal = [2 for _ in range(n_cp)]
+    unequal = [q + 1 for q in range(n_cp)]
+    with_empty = unequal.copy()
+    with_empty[0 if n_cp == 2 else 1] = 0
+    return [equal, unequal, with_empty]
+
+
+def own_rows(mpc, ratios: List[int]) -> Tuple[int, int]:
+    # The rows this compute party holds; all of them at CP0
+    if mpc.pid == 0:
+        return 0, ratios.sum()
+    start = ratios[:mpc.pid - 1].sum()
+    return start, start + ratios[mpc.pid - 1]
+
+
+def cohort_matrix(mpc, rows: int, cols: int):
+    # A matrix drawn from the shared seed, so every party knows all of it while each compute party holds only its own
+    # rows. Its entries are the halves in [-3.5, 3.5]: none lies within 0.5 of an integer, which leaves comparisons
+    # with an integer a margin against the encryption noise.
+    with mpc.randomness.global_stream():
+        ints = array(random_ints((rows, cols), 0, 7))
+    return ints.astype(float) - 3.5
+
+
+def partition(mpc, matrix, ratios: List[int]) -> MPP:
+    # Each compute party's rows of matrix as an MPP held in the clear (CP0 keeps a placeholder)
+    start, stop = own_rows(mpc, ratios)
+    return MPP(mpc, matrix[start:stop] if mpc.pid else matrix)
+
+
+def encrypted_at(mpc, mpp: MPP, parties: List[int]) -> MPP:
+    # A copy of mpp whose partitions the given compute parties hold encrypted and the others in the clear (a mixed
+    # cohort): encrypt() is local to each party
+    out = mpp.copy()
+    if mpc.pid in parties:
+        out.encrypt()
+    return out
+
+
+def holders(ratios: List[int]) -> List[int]:
+    # The compute parties that hold rows
+    return [q + 1 for q in range(len(ratios)) if ratios[q]]
+
+
+def column(matrix, j: int):
+    # A copy of column j, in a buffer of its own
+    return array([matrix[i, j] for i in range(matrix.shape[0])])
+
+
+def with_columns(matrix, count: int, value: float):
+    # matrix with count more columns of value, entry by entry (what pad_with_value(value, count, 1) should give)
+    rows, cols = matrix.shape
+    out = zeros((rows, cols + count))
+    for i in range(rows):
+        for j in range(cols + count):
+            out[i, j] = matrix[i, j] if j < cols else value
+    return out
+
+def assert_parties_in_step(mpc, name: str):
+    # A product of shared values, whose Beaver triple CP0 deals, and its reveal, checked against plaintext. Call it at
+    # every party after an operation that could leave the parties out of step: a party a message behind or ahead then
+    # reads the wrong bytes, so the check fails or hangs instead of the slip going unnoticed.
+    x = Sharetensor.enc(mpc, [1.5, -2.0, 3.25])
+    product = secure_operator.mul(mpc, x, x).reveal(mpc)
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\t{name}: parties in step", product, array([2.25, 4.0, 10.5625]), error=1e-3)
+
+
+def decryption_bytes(mpc, ciphertexts: List[Ciphertext]) -> int:
+    # The bytes this compute party sends in a decryption of each party's ciphertexts to that party alone (MPCMHE.decrypt's
+    # default mode), with ciphertexts its own: the c1 polynomial of each (never c0) to every other compute party, and to
+    # every other party that holds ciphertexts a decryption share of each of them (a polynomial at the c1's level), each
+    # message behind its length. It takes a round of its own (the parties' sizes), so call it at every compute party
+    # before the decryption, not inside a byte count.
+    ring_q = mpc.mhe.crypto_params.params.ring_q
+    c1s = [ct.value[1] for ct in ciphertexts if not ct._nil_ideal]
+    shares = [ring_q.new_poly_lvl(c1.level()) for c1 in c1s]
+    mine = [c1s._pickle_size(), shares._pickle_size(), len(c1s)]
+    everyone = mpc.comms.collect(mine)
+    total = 0
+    for q in range(1, mpc.comms.number_of_parties):
+        if q != mpc.pid:
+            total += sizeof(int) + mine[0]
+            if everyone[q - 1][2]:
+                total += sizeof(int) + everyone[q - 1][1]
+    return total
+
+
+def own_ciphertexts(mpp: MPP) -> List[Ciphertext]:
+    # The ciphertexts of this compute party's partition that MPP.reveal_local decrypts: the unified encryption, or a
+    # semi-encrypted partition's left and right blocks
+    out = List[Ciphertext]()
+    if mpp.has_unified_encryption():
+        out.extend(mpp._encryption_unified._data)
+    else:
+        out.extend(mpp._encryption_left._data)
+        out.extend(mpp._encryption_right._data)
+    return out

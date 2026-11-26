@@ -58,9 +58,9 @@ def collective_init(self, params, prec):
 
 ## Encryption & Decryption
 
-### `enc_vector[T](values) -> list[T]`
+### `enc_vector[T](values, level=-1, scale=0.0) -> list[T]`
 
-Encodes and encrypts a flat list of values into a list of CKKS ciphertexts (or plaintexts). Values are chunked by `slots` (number of CKKS slots per ciphertext).
+Encodes and encrypts a flat list of values into a list of CKKS ciphertexts (or plaintexts). Values are chunked by `slots` (number of CKKS slots per ciphertext), at the top level and the default scale, or at `level` and `scale` where given: `Ciphertensor` encodes a public operand of an addition at its receiving ciphertext's level and scale.
 
 - `T = Ciphertext` → encrypt via public key
 - `T = Plaintext` → encode only (no encryption)
@@ -71,9 +71,11 @@ Collective decryption. Behaviour depends on `source_pid`:
 
 | `source_pid` | Meaning |
 |---|---|
-| `>= 0` | Decrypt ciphertexts held by that party, broadcast result |
-| `-1` | Ciphertexts already shared between all parties |
-| `-2` | Decrypt each party's ciphertexts one-by-one |
+| `-2` (default) | Every compute party gets the plaintexts of its own ciphertexts, and no other party learns them. Each compute party sends the others the `c1` polynomial of each of its ciphertexts (never `c0`); each answers with its PCKS decryption share $s_i \cdot c_1 + e_i$ (smudged, `SEQURE_SIGMA_SMUDGE`), sent to that holder only; the holder adds its own $s \cdot c_1$ and $c_0$. Every compute party takes both rounds, whatever it holds (an empty list included) |
+| `>= 1` | Decrypt the ciphertexts held by that compute party for every compute party (its list is broadcast once, so the others' lists do not matter) |
+| `-1` | Ciphertexts already the same at every compute party (an aggregate), decrypted for every compute party |
+
+CP0 holds a zero key share and takes no part; `source_pid = 0` is an error.
 
 ### `reveal[dtype](x, source_pid) -> list[dtype]`
 
@@ -122,25 +124,22 @@ The `bootstrap_min_level` and `bootstrap_log_bound` parameters control the secur
 
 These methods convert between the HE and MPC representations:
 
+Both directions use statistically hiding masks and the exact encoder (`exact_encoder`), whose error does not grow with the masks. [Security Assumptions](../crypto-corner/security-assumptions.md#noise-and-masks-in-the-mhe-protocols) gives the mask sizes and guarantees.
+
 ### `additive_share_vector_to_ciphervector` (MPC → MHE)
 
-1. Convert integer shares to fixed-point if needed
-2. Mask with random values bounded by `max_mask_bits`
-3. Reveal masked shares
-4. Each party encrypts its portion
-5. Aggregate encrypted vectors at hub
+1. Each compute party subtracts a random mask of `_mpc_to_mhe_mask_bits` bits (171 with 192-bit shares) from its share. The hub alone opens the result, `x - R`.
+2. The parties now hold integer shares of `x`: `x - R + R_hub` at the hub, `R_i` at the others. Each party exactly encodes its share, as fixed point or, for integer shares, as integers.
+3. Shares to encryption: for a common random polynomial `a` per ciphertext (from `crp_gen`), each party computes `encode(share_i) - sk_shard × a + e_i`.
+4. The sum at the hub (or `target_pid`), paired with `a`, is a fresh ciphertext of `x`. The hub sends it to all parties unless there is a target.
 
 ### `ciphervector_to_additive_share_vector` (MHE → MPC)
 
-1. Broadcast ciphertext from source party
-2. Refresh to ensure enough levels
-3. Flatten levels across all ciphertexts
-4. Each party computes `sk_shard × c1 + mask + smudging_noise`
-5. Aggregate at hub → yields `c0 + sum(sk_i × c1) + sum(mask_i) + sum(e_i)`
-6. Hub decodes and subtracts its mask to get its additive share
-7. Other parties use their mask as their additive share
-
-The smudging noise (`gaussian_sampler`) provides defense-in-depth against leakage from the partial decryption shares.
+1. Rescale, and find the lowest level whose modulus holds the masks (`_mhe_to_mpc_level`: level 5 for `PN14QP438`). A single holder (`source_pid`) drops its ciphertexts above that level to it before it broadcasts them.
+2. Bootstrap the ciphertexts below that level, and drop the others to it.
+3. Each party except the hub computes `sk_shard × c1 + M_i + e_i`, with `M_i` a uniformly random polynomial of `_mhe_to_mpc_mask_bits` bits (208 for N = 2^14), and keeps `-M_i`. The hub computes `sk_shard × c1`.
+4. Aggregate at the hub, which yields `c0 + sum(sk_i × c1) + sum(M_i) + sum(e_i)`: the plaintext's coefficients under the others' masks, reconstructed exactly from their residues.
+5. Every party decodes its coefficient share exactly into fixed-point slot values, its additive share modulo the MPC modulus.
 
 ## Next steps
 

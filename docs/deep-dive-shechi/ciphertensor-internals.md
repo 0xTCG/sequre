@@ -52,15 +52,17 @@ def enc(mpc, data, padding=0, encoding=""):
 
 ### Diagonal packing
 
-For a matrix $A \in \mathbb{R}^{m \times n}$, the $k$-th diagonal is:
+For a matrix $A \in \mathbb{R}^{m \times n}$, ciphertext $k$ ($k < \min(m, n)$) holds the cyclic diagonal
 
-$$d_k[i] = A[i, (i + k) \bmod n], \quad i = 0, \ldots, m-1$$
+$$d_k[t] = A[(t + k) \bmod m,\; t \bmod n], \quad t = 0, \ldots, \max(m, n) - 1,$$
 
-This layout enables matrix-vector multiplication via rotate-and-sum:
+so the storage has shape $[\min(m, n), \max(m, n)]$, with `_skinny` set when $n < m$. A wide matrix ($m \le n$) is stored whole; a tall one only when $n$ divides $m$ (otherwise some elements are stored twice and others not at all), and `enc_diag_wise` refuses other tall matrices.
 
-$$A \cdot v = \sum_{k=0}^{n-1} d_k \odot \text{rot}(v, k)$$
+This layout enables vector-matrix multiplication via rotate-and-sum (for a row vector $v$ of length $m \le n$, replicated with period $m$):
 
-which costs $n$ rotations + $n$ plaintext multiplies (or ciphertext multiplies), compared to $m \times n$ multiplies in naive row packing.
+$$(v^\top A)[t] = \sum_{k=0}^{\min(m, n)-1} \text{rot}(v, k)[t] \cdot d_k[t]$$
+
+which costs $\min(m, n) - 1$ rotations and $\min(m, n)$ plaintext (or ciphertext) multiplies, compared to $m \times n$ multiplies in naive row packing. The M3 matmul kernels apply it to every row of the left operand.
 
 ## Key operations
 

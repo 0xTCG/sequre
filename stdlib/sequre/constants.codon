@@ -6,16 +6,31 @@ from settings import *
 from C import access(cobj, i32) -> i32 as _c_access
 
 def _find_lib(env_var: str, candidates: List[str]) -> str:
+    # The environment variable if it is set, else the first candidate that exists ("" candidates are skipped)
     val = os.getenv(env_var, default="")
     if val:
         return val
     for path in candidates:
-        if _c_access(path.ptr, 0i32) == 0i32:
+        if path and _c_access(path.c_str(), 0i32) == 0i32:
             return path
+    tried = ', '.join([path for path in candidates if path])
     raise RuntimeError(
-        f"Could not find library for {env_var}. "
-        f"Set the {env_var} environment variable to the correct path."
+        f"Could not find the library for {env_var} (looked for {tried}). "
+        f"Install it, or set the {env_var} environment variable to its path."
     )
+
+
+def _plugin_lib(name: str) -> str:
+    # The copy of a library that ships with the Sequre plugin, <plugin>/lib/<name>: this module is
+    # <plugin>/stdlib/sequre/constants.codon. Codon sets __file__ at compile time, with symlinks resolved, so a built
+    # binary looks where the plugin was when it was compiled. "" if the path has fewer components than that.
+    path = __file__
+    for _ in range(3):
+        cut = path.rfind('/')
+        if cut <= 0:
+            return ''
+        path = path[:cut]
+    return f'{path}/lib/{name}'
 
 
 # Environment variables
@@ -29,16 +44,26 @@ ENV_CERT_DIR: Static[str] = "SEQURE_CERT_DIR"
 ENV_CA_CERT_FILE: Static[str] = "SEQURE_CA_CERT_FILE"
 ENV_PARTY_CERT_FILE: Static[str] = "SEQURE_PARTY_CERT_FILE"
 ENV_PARTY_KEY_FILE: Static[str] = "SEQURE_PARTY_KEY_FILE"
+ENV_PARTY_CERT_NAME: Static[str] = "SEQURE_PARTY_CERT_NAME"
+ENV_SIGMA_SMUDGE: Static[str] = "SEQURE_SIGMA_SMUDGE"
 ENV_PID: Static[str] = "PID"
 
-# GMP
+# GMP: SEQURE_GMP_PATH, else the copy bundled with the plugin (what the sequre launcher sets SEQURE_GMP_PATH to), else
+# a system library: the development name, then the runtime name that hosts without GMP's development package have
 GMP_PATH = _find_lib(ENV_GMP_PATH, [
+    _plugin_lib("libgmp.dylib" if __apple__ else "libgmp.so"),
     "/opt/homebrew/lib/libgmp.dylib",
+    "/opt/homebrew/lib/libgmp.10.dylib",
     "/usr/local/lib/libgmp.dylib",
+    "/usr/local/lib/libgmp.10.dylib",
     "/usr/lib/x86_64-linux-gnu/libgmp.so",
+    "/usr/lib/x86_64-linux-gnu/libgmp.so.10",
     "/usr/lib/aarch64-linux-gnu/libgmp.so",
+    "/usr/lib/aarch64-linux-gnu/libgmp.so.10",
     "/usr/lib64/libgmp.so",
+    "/usr/lib64/libgmp.so.10",
     "/usr/lib/libgmp.so",
+    "/usr/lib/libgmp.so.10",
 ])
 GMP_LIMB_SIZE: Static[int] = 64
 assert LATTISEQ_INT_SIZE % GMP_LIMB_SIZE == 0, f"GMP limb size {GMP_LIMB_SIZE} should be a multiple of Lattiseq big int size {LATTISEQ_INT_SIZE}."
@@ -70,6 +95,9 @@ CERT_DIR: str = os.getenv(ENV_CERT_DIR, default="certs")
 CA_CERT_FILE: str = os.getenv(ENV_CA_CERT_FILE, default="ca.pem")
 PARTY_CERT_FILE: str = os.getenv(ENV_PARTY_CERT_FILE, default="cp{pid}.pem")
 PARTY_KEY_FILE: str = os.getenv(ENV_PARTY_KEY_FILE, default="cp{pid}-key.pem")
+# The name each party's certificate carries (subjectAltName DNS entry, or the subject CN in a certificate without
+# any), "{pid}" replaced by the party ID: every TLS channel checks that the peer's certificate names its party
+PARTY_CERT_NAME: str = os.getenv(ENV_PARTY_CERT_NAME, default="cp{pid}")
 
 # Debugging toggles (DO NOT set these to False in production use)
 # These are only meant for debugging purposes.
@@ -84,6 +112,21 @@ mpc_uint = UInt[MPC_INT_SIZE]  # Can be either UInt[128] or UInt[192] at the mom
 
 lattiseq_uint = UInt[LATTISEQ_INT_SIZE]
 lattiseq_int = Int[LATTISEQ_INT_SIZE]
+
+# The CRT reconstruction (lattiseq/ring.codon poly_to_bigint_lvl) sums level + 1 products, each below q_k * Q with
+# Q < 2^LATTISEQ_INT_SIZE and q_k < 2^62: these many bits more hold that sum for chains of up to 2^60 moduli. Used only
+# at the levels where the sum may not fit lattiseq_uint (long chains).
+LATTISEQ_CRT_EXTRA_BITS: Static[int] = 128
+LATTISEQ_CRT_WIDE_SIZE: Static[int] = LATTISEQ_INT_SIZE + LATTISEQ_CRT_EXTRA_BITS
+lattiseq_crt_uint = UInt[LATTISEQ_CRT_WIDE_SIZE]
+
+# Integers of the exact (fixed-point) CKKS encoder, lattiseq/exact_encoder.codon, and of its products. Its inputs must
+# leave 25-40 bits of room below this width. Masked MPC values reach about 2^195 (in plaintext coefficient units) with
+# 192-bit shares and about 2^230 with 256-bit shares, which then need 512 bits.
+LATTISEQ_EXACT_INT_SIZE: Static[int] = 256 if MPC_INT_SIZE < 256 else 512
+LATTISEQ_EXACT_WIDE_SIZE: Static[int] = 2 * LATTISEQ_EXACT_INT_SIZE
+lattiseq_exact_int = Int[LATTISEQ_EXACT_INT_SIZE]
+lattiseq_exact_wide_int = Int[LATTISEQ_EXACT_WIDE_SIZE]
 
 gmp_limb_t = UInt[GMP_LIMB_SIZE]
 
@@ -110,6 +153,73 @@ assert MPC_RING_SIZE.popcnt() == 1, "Ring size not a power of 2."
 assert MPC_SECOND_FIELD_SIZE < 128, "Second field size must be less than 128"
 assert MPC_THIRD_FIELD_SIZE < 128, "Third field size must be less than 128"
 assert MPC_NBIT_K + MPC_NBIT_F + MPC_NBIT_V + 2 < MPC_MODULUS_BITS, "FP config overflows the size of modulus."
+
+# Bitwise (XOR) shared MPC (mpc/bitwise.codon). The bits of a shared value are packed into registers of PACKING_SIZE
+# bits, so one bitwise operation on a size_t covers PACKING_SIZE secret bits. PACKING_SIZE equals MPC_NBIT_K, so a
+# fixed-point value's K bits fit one register (64 bits in the 128- and 192-bit builds, 128 in the 256-bit build).
+PACKING_SIZE: Static[int] = MPC_NBIT_K
+size_t = UInt[PACKING_SIZE]
+
+# Decor
+# Mask selecting the fractional bits of a fixed-point value.
+FBITS_MASK = (mpc_uint(1) << mpc_uint(MPC_NBIT_F)) - mpc_uint(1)
+# Decor compares values in [0, 1) over a reduced ring of MPC_NBIT_F + 1 bits: the fractional bits plus a sign bit.
+MPC_DECOR_MODULUS_BITS: Static[int] = MPC_NBIT_F + 1
+MPC_DECOR_RING_SIZE = mpc_uint(1) << mpc_uint(MPC_DECOR_MODULUS_BITS)
+# Decor division: methods and default iteration counts. The initial estimate 5b^2 - 10b + 5.943 of 1/b on [0.25, 1)
+# has a relative error of at most 0.107, and each iteration squares it: 0.107^(2^n) < 2^-(F + 1) needs n = 4 at F = 32
+# and n = 5 at F = 64. Goldschmidt's two products per iteration are independent and share their rounds (2 per
+# iteration, Newton's dependent pair 4): 49 rounds per inverse at the defaults (a division x / y adds the product with
+# x and its truncation: 51), Newton 55, both within a few units of 2^-F.
+DECOR_NEWTON_METHOD: Static[str] = "newton"
+DECOR_GOLDSCHMIDT_METHOD: Static[str] = "goldschmidt"
+DECOR_DIV_DEFAULT_METHOD: Static[str] = DECOR_GOLDSCHMIDT_METHOD
+DECOR_DIV_DEFAULT_NITER: Static[int] = 4 if MPC_NBIT_F <= 32 else 5
+# Combiner of Decor's sigmoid and tanh: "select" (the logistic / tanh addition theorems: select the opened branch, one
+# product, a division by a positive denominator) or "exp" (Decor exp, then the inverse of 1 + e^-x).
+DECOR_SIGMOID_COMBINER: Static[str] = "select"
+# Fourier terms whose two coefficients are both below one unit of the fixed-point encoding are dropped (no dealer
+# randomness, no local work).
+DECOR_FOURIER_EPSILON: float = 2.0 ** -float(MPC_NBIT_F)
+# Decor's admissibility check raises when the estimated worst-case error of a bounded function on its interval exceeds
+# DECOR_TOLERANCE times max(1, max |f| on the interval): at least F/2 - 4 correct bits relative to the function's scale
+# (2.4e-4 at F = 32, 3.7e-9 at F = 64). via_decor takes a per-call tolerance.
+DECOR_TOLERANCE: float = 2.0 ** -float(MPC_NBIT_F // 2 - 4)
+
+# Default Decor intervals per function. F = 32 (a numerics study, 400 points, ring and field alike): max abs error
+# on these (typical runs) exp 3e-5 (relative 1e-8 at e^8), sigmoid 4e-6, tanh 3e-6, sinh/cosh 2e-6; decor_error_bound
+# gives 4.9e-5, 2.6e-5, 1.3e-5 and 5.3e-6. Wider intervals lose precision; the check admits at F = 32 symmetric widths
+# up to |b| ~ 14 for exp and ~ 11 for sinh/cosh (fixed-point range), ~ 12.3 for sigmoid and ~ 6.5 for tanh (tolerance).
+# F = 64 (256-bit build): from the error bound, which a plaintext simulation of the protocol's arithmetic confirms;
+# the plaintext evaluations in double precision (2^-52) cap the precision there. The 256-bit build passes the decor,
+# bitwise, activations and nonlinear tests on both moduli, whose tolerances come from these bounds.
+DECOR_INTERVAL_EXP = (-8.0, 8.0) if MPC_NBIT_F <= 32 else (-20.0, 20.0)
+DECOR_INTERVAL_SIGMOID = (-10.0, 10.0) if MPC_NBIT_F <= 32 else (-15.0, 15.0)
+DECOR_INTERVAL_TANH = (-5.0, 5.0) if MPC_NBIT_F <= 32 else (-8.0, 8.0)
+DECOR_INTERVAL_SINH = (-5.0, 5.0) if MPC_NBIT_F <= 32 else (-8.0, 8.0)
+
+# Nonlinear-function methods, and the evaluation of a polynomial (Chebyshev, Taylor)
+METHOD_DECOR: Static[str] = "decor"
+METHOD_CHEBYSHEV: Static[str] = "chebyshev"
+METHOD_FOURIER: Static[str] = "fourier"
+METHOD_TAYLOR: Static[str] = "taylor"
+# sigmoid's and tanh's default: Decor on ring shares, a Chebyshev interpolant within Decor's error bound (at least
+# NONLINEAR_AUTO_FLOOR) on field shares
+METHOD_AUTO: Static[str] = "auto"
+POLY_EVAL_CLENSHAW: Static[str] = "clenshaw"
+POLY_EVAL_DECOR: Static[str] = "decor"
+POLY_EVAL_NAIVE: Static[str] = "naive"
+# sequre.stdlib.nonlinear: default degrees of the Fourier and Taylor methods (Chebyshev's is CHEBYSHEV_DEGREE), and the
+# width W of softmax's exponent interval (-W, 0] (below -W it saturates at e^-W; e^-16 = 1.1e-7)
+NONLINEAR_FOURIER_DEGREE: int = 16
+NONLINEAR_TAYLOR_DEGREE: int = 8
+NONLINEAR_SOFTMAX_WIDTH: float = 16.0
+# The highest Chebyshev degree the auto method may pick on field shares (it refuses an interval that needs more), and
+# the floor of its truncation target: half of max(decor_error_bound, NONLINEAR_AUTO_FLOOR). Double-precision
+# coefficients carry about 1e-15 each, so a target far below 2^-44 is out of reach (F = 64 on narrow intervals, where
+# Decor's bound falls below 1e-15)
+NONLINEAR_AUTO_MAX_DEGREE: int = 512
+NONLINEAR_AUTO_FLOOR: float = 2.0 ** -44
 
 # Echo MPC config
 print(f"MPC config:\n\tMPC Galois field / Z_(2^k) ring size: {MPC_MODULUS_BITS} bits")
@@ -169,7 +279,18 @@ LATTISEQ_MAX_LOGN: Static[int] = 17
 LATTISEQ_MIN_LOGN: Static[int] = 4
 LATTISEQ_MAX_MODULI_COUNT: Static[int] = 34
 LATTISEQ_DEFAULT_SIGMA: float = 3.2
-LATTISEQ_SIGMA_SMUDGE: float = float(1048576)
+# Standard deviation of the noise each party adds to its share of a collective decryption (smudging; env var
+# SEQURE_SIGMA_SMUDGE). Any value of at least LATTISEQ_DEFAULT_SIGMA keeps the parties from solving for the collective
+# secret key from a decryption (D - c0 = c1 * s + noise is then a ring-LWE instance). It does not flood the ciphertext
+# noise statistically, which needs about 2^20 or more and a larger scale: the decryption error grows in proportion to
+# it (max error measured at the default scale 2^34: ~5e-5 at 2^10, ~5e-4 at 2^14, ~3e-2 at 2^20).
+LATTISEQ_SIGMA_SMUDGE: float = float(os.getenv(ENV_SIGMA_SMUDGE, default="1024"))
+assert LATTISEQ_SIGMA_SMUDGE >= LATTISEQ_DEFAULT_SIGMA, \
+    f"{ENV_SIGMA_SMUDGE} ({LATTISEQ_SIGMA_SMUDGE}) must be at least {LATTISEQ_DEFAULT_SIGMA}: smaller smudging noise exposes the collective secret key"
+# Statistical security parameter of the masks in the HE->MPC switch (MPCMHE._mhe_to_mpc): the hub's view of a
+# plaintext is within statistical distance 2^-MHE_MPC_SWITCH_LAMBDA of one independent of it. The MPC->HE switch uses
+# masks as large as the MPC modulus allows instead (MPCMHE._mpc_to_mhe_mask_bits).
+MHE_MPC_SWITCH_LAMBDA: int = 128
 LATTISEQ_MAX_MODULI_SIZE: Static[int] = 60
 LATTISEQ_GALOIS_GEN: Static[int] = 5
 LATTISEQ_MIN_LOG_SLOTS: Static[int] = 0
@@ -182,10 +303,10 @@ LATTISEQ_ROTATION_KEYS_COUNT: Static[int] = 64
 #   add ~2e-5, ct-pt mul ~5e-4, ct-ct mul+relin ~1.1e-2, rotate ~1.0e-2,
 #   encode ~1.4e-3, pk-encrypt ~8e-3 (rescale ~2.5e-3 has no stored constant).
 # Decode/decrypt below are left at their prior values (no fresh measurement).
-# WARNING: these values change the matmul-reorder IR pass decision for
-# `a @ b.T @ c` on MPPs and can expose a latent correctness bug in the newly
-# chosen ordering path (test_ir_passes: "MHE matmul reorder ... correctness
-# failed"), tracked separately.
+# These values decide the order the matmul-reorder IR pass takes: for
+# test_ir_passes' `a @ b.T @ c` on MPPs in the clear (4 x 32 partitions),
+# (a @ b.T) @ c with two compute parties and a @ (b.T @ c) with three or more.
+# The test derives its expected multiplication complexity from the same costs.
 HE_ADD_COST_ESTIMATE: float = 0.00002
 HE_MUL_COST_ESTIMATE: float = 0.0005
 HE_MUL_RELIN_COST_ESTIMATE: float = 0.011
@@ -226,6 +347,10 @@ class _RUN_TOGGLES:
     IR_PASSES_TEST_FLAG: str = "--ir-passes"
     STDLIB_BUILTIN_TEST_FLAG: str = "--stdlib-builtin"
     BOOTSTRAPPING_TEST_FLAG: str = "--bootstrapping"
+    BITWISE_TEST_FLAG: str = "--bitwise"
+    DECOR_TEST_FLAG: str = "--decor"
+    NONLINEAR_TEST_FLAG: str = "--nonlinear"
+    ACTIVATIONS_TEST_FLAG: str = "--activations"
 
     LATTISEQ_FLAG: str = "--lattiseq"
     LATTISEQ_MULT3_FLAG: str = "--lattiseq-mult3"
@@ -243,6 +368,8 @@ class _RUN_TOGGLES:
     GWAS_W_NORM_FLAG: str = "--gwas-with-norm"
     GWAS_WO_NORM_FLAG: str = "--gwas-without-norm"
     DTI_FLAG: str = "--dti"
+    SIREN_FLAG: str = "--siren"
+    GWAS_LOGREG_FLAG: str = "--gwas-logreg"
     OPAL_FLAG: str = "--opal"
     GANON_FLAG: str = "--ganon"
     GENOTYPE_IMPUTATION_FLAG: str = "--genotype-imputation"
@@ -279,9 +406,35 @@ MI_STOCHASTIC_MODE: Static[str] = "stochastic"
 ## Activations
 RELU_ACTIVATION: Static[str] = "relu"
 LINEAR_ACTIVATION: Static[str] = "linear"
+ASIGMOID_ACTIVATION: Static[str] = "asigmoid"
+SIGMOID_ACTIVATION: Static[str] = "sigmoid"
+TANH_ACTIVATION: Static[str] = "tanh"
+EXP_ACTIVATION: Static[str] = "exp"
+SIN_ACTIVATION: Static[str] = "sin"
+COS_ACTIVATION: Static[str] = "cos"
+TAN_ACTIVATION: Static[str] = "tan"
+COT_ACTIVATION: Static[str] = "cot"
+SINH_ACTIVATION: Static[str] = "sinh"
+COSH_ACTIVATION: Static[str] = "cosh"
+LEAKY_RELU_ACTIVATION: Static[str] = "leaky_relu"
+HARDTANH_ACTIVATION: Static[str] = "hardtanh"
+RELU6_ACTIVATION: Static[str] = "relu6"
+GELU_ACTIVATION: Static[str] = "gelu"
+SILU_ACTIVATION: Static[str] = "silu"
+SOFTMAX_ACTIVATION: Static[str] = "softmax"
+ERF_ACTIVATION: Static[str] = "erf"
+LEAKY_RELU_SLOPE: float = 0.01
+# gelu's tanh form (Hendrycks and Gimpel): 0.5 x (1 + tanh(GELU_ALPHA (x + GELU_BETA x^3))), GELU_ALPHA = sqrt(2 / pi)
+GELU_ALPHA: float = 0.7978845608028654
+GELU_BETA: float = 0.044715
 
 ## Losses
 HINGE_LOSS: Static[str] = "hinge"
+MSE_LOSS: Static[str] = "mse"
+BCE_LOSS: Static[str] = "binary_crossentropy"
+CCE_LOSS: Static[str] = "categorical_crossentropy"
+# The log in the cross-entropies runs on this interval by default (predictions are clipped into it): log(1e-4) = -9.2
+LOSS_LOG_INTERVAL = (0.0001, 1.0)
 
 ## Optimizers
 BGD_OPTIMIZER: Static[str] = "bgd"
@@ -299,10 +452,36 @@ ONES_INITIALIZER: Static[str] = ONES_DISTRIBUTION
 ## Supported methods
 SUPPORTED_ACTIVATIONS = [
     RELU_ACTIVATION,
-    LINEAR_ACTIVATION
+    LINEAR_ACTIVATION,
+    ASIGMOID_ACTIVATION,
+    SIGMOID_ACTIVATION,
+    TANH_ACTIVATION,
+    EXP_ACTIVATION,
+    SIN_ACTIVATION,
+    COS_ACTIVATION,
+    TAN_ACTIVATION,
+    COT_ACTIVATION,
+    SINH_ACTIVATION,
+    COSH_ACTIVATION,
+    LEAKY_RELU_ACTIVATION,
+    HARDTANH_ACTIVATION,
+    RELU6_ACTIVATION,
+    GELU_ACTIVATION,
+    SILU_ACTIVATION,
+    SOFTMAX_ACTIVATION,
+    ERF_ACTIVATION
 ]
 SUPPORTED_LOSSES = [
-    HINGE_LOSS
+    HINGE_LOSS,
+    MSE_LOSS,
+    BCE_LOSS,
+    CCE_LOSS
+]
+# The evaluation methods a layer or LogReg can store (a runtime string; sequre.stdlib.nonlinear takes them as
+# compile-time strings)
+SUPPORTED_ML_METHODS = [
+    METHOD_DECOR,
+    METHOD_CHEBYSHEV
 ]
 SUPPORTED_OPTIMIZERS = [
     BGD_OPTIMIZER,

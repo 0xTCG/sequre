@@ -2,17 +2,20 @@
 set -e
 set -o pipefail
 
-# Workaround for a Codon AVX-512 heap-vector alignment bug: Codon emits aligned
-# 512-bit moves (vmovaps %zmm) for heap-resident Vec[*,8], but GC_malloc only
-# 16-byte-aligns memory, so those moves fault (SIGSEGV) on x86-64 AVX-512 CPUs.
-# Hit by Sequre's MHE/CKKS path (e.g. `sequre run ... --local`).
+# Workaround for a Codon x86-64 heap-vector alignment bug: Codon emits aligned
+# vector moves (vmovaps, 256-bit with AVX2 and 512-bit with AVX-512) for
+# heap-resident Vec[*,8], but GC_malloc only 16-byte-aligns memory, so those
+# moves fault (SIGSEGV) on x86-64 CPUs with AVX2 or AVX-512. Hit by Sequre's
+# MHE/CKKS path (e.g. `sequre run ... --local`).
 #
 # Applies the install-side pieces that a fresh/bundled Codon does not carry:
 #   1. Patch Codon's stdlib Ptr load/store to be unaligned (covers Ptr[Vec][i]
 #      / Vec._load at arbitrary offsets).
-#   2. Build the LD_PRELOAD over-align shim into $PREFIX/lib (covers
-#      compiler-emitted aligned stores: Vec struct fields, vectorized loops).
-#      The launcher auto-preloads it (maybe_set_align_shim()).
+#   2. Build the over-align shim into $PREFIX/lib (covers compiler-emitted
+#      aligned stores: Vec struct fields, vectorized loops). The launcher
+#      preloads it for `sequre run` and links it into the binaries of
+#      `sequre build`. Rebuilt when sequre_align64.c is newer than it, so a
+#      source update reaches it.
 #
 # The third piece (stdlib/prg.codon's @llvm vector loads -> align 1) lives in
 # Sequre's own source and ships in the plugin (lib/codon/plugins/sequre/stdlib),
@@ -55,34 +58,44 @@ else
     echo "Ptr load/store already unaligned; skipping: $PTR"
   else
     echo "WARNING: could not patch $PTR (unexpected layout)." >&2
-    echo "         The AVX-512 workaround is incomplete; sequre --local may crash." >&2
+    echo "         The x86-64 alignment workaround is incomplete; sequre --local may crash." >&2
   fi
 fi
 
-# 2. Build the over-align LD_PRELOAD shim (skip if the release already bundled it).
-if [ -f "$SHIM_SO" ]; then
-  echo "Over-align shim already present: $SHIM_SO"
+# 2. Build the over-align shim, when it is missing or older than its source (so
+#    a stale shim never stays behind a source update). Built into a temporary
+#    file first: a failed build keeps the shim that was there.
+if [ -f "$SHIM_SO" ] && { [ ! -f "$SHIM_C" ] || [ ! "$SHIM_C" -nt "$SHIM_SO" ]; }; then
+  echo "Over-align shim up to date: $SHIM_SO"
 elif [ ! -f "$SHIM_C" ]; then
   echo "WARNING: shim missing and source $SHIM_C not found; sequre --local may crash." >&2
-elif command -v "$CC" >/dev/null 2>&1; then
-  mkdir -p "$SEQURE_PREFIX/lib"
-  "$CC" -shared -fPIC -O2 -o "$SHIM_SO" "$SHIM_C" -ldl
-  echo "Built over-align shim: $SHIM_SO"
+elif ! command -v "$CC" >/dev/null 2>&1; then
+  if [ -f "$SHIM_SO" ]; then
+    echo "WARNING: $SHIM_SO is older than $SHIM_C, and there is no C compiler ('$CC') to rebuild it." >&2
+  else
+    echo "WARNING: shim missing and no C compiler ('$CC'); sequre --local may crash." >&2
+  fi
 else
-  echo "WARNING: shim missing and no C compiler ('$CC'); sequre --local may crash." >&2
+  mkdir -p "$SEQURE_PREFIX/lib"
+  if "$CC" -shared -fPIC -O2 -o "$SHIM_SO.tmp.$$" "$SHIM_C" -ldl && mv -f "$SHIM_SO.tmp.$$" "$SHIM_SO"; then
+    echo "Built over-align shim: $SHIM_SO"
+  else
+    rm -f "$SHIM_SO.tmp.$$"
+    echo "WARNING: could not build the over-align shim from $SHIM_C; sequre --local may crash." >&2
+  fi
 fi
 
-# 3. Rebuild the launcher so it auto-preloads the shim (maybe_set_align_shim()),
-#    unless the caller already built it from the patched source.
+# 3. Rebuild the launcher so it preloads and links the shim, unless the caller
+#    already built it from the current source.
 if [ "${SEQURE_WORKAROUND_SKIP_LAUNCHER:-0}" != "1" ]; then
   LAUNCHER_C="$SRC/sequre_launcher.c"
   if [ -f "$LAUNCHER_C" ]; then
     if "$CC" -O2 -o "$SEQURE_PREFIX/bin/sequre" "$LAUNCHER_C"; then
-      echo "Rebuilt launcher with shim auto-preload: $SEQURE_PREFIX/bin/sequre"
+      echo "Rebuilt launcher: $SEQURE_PREFIX/bin/sequre"
     else
       echo "warning: launcher rebuild failed; set LD_PRELOAD=$SHIM_SO manually." >&2
     fi
   fi
 fi
 
-echo "Done. The sequre launcher auto-preloads the shim (disable: SEQURE_NO_ALIGN_SHIM=1)."
+echo "Done. The sequre launcher preloads the shim for \`sequre run\` and links it into built binaries (disable: SEQURE_NO_ALIGN_SHIM=1)."

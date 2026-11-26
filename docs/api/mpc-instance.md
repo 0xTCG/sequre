@@ -19,12 +19,14 @@ _Defined in `stdlib/sequre/mpc/env.codon`_
 | `default_mpc_modulus` | `TP` | Default modulus for MPC arithmetic |
 | `default_ciphertensor_encoding` | `str` | Default encoding for ciphertensors |
 | `default_allow_mpc_switch` | `bool` | Whether automatic MPC ↔ MHE switching is enabled |
+| `default_allow_diagonal_results` | `bool` | Whether a matrix product may take a kernel whose result is diagonal-encoded (TNT, for a column-wise first factor); `True` by default. MPP and MPU operations clear it around their per-partition products by a plaintext operand, which they cut back to each party's rows (a diagonal storage cannot be cut by rows): such a product then takes M2 on the transposes. A product of two ciphertext operands sets it, whatever it was, and takes TNT where its first factor is column-wise and its second is not stored transposed; TNT's diagonal-encoded result is converted once through MPC, to row-wise partitions or, where each party's product has fewer columns than rows, column-wise ones, and cut to each party's rows on the shares where a party holds rows but fewer than the most |
 | `stats` | `MPCStats` | Operation counters and byte-transfer tracking |
 | `randomness` | `MPCRandomness` | PRG streams and seed management |
 | `comms` | `MPCComms[TP]` | Network I/O (send, receive, reveal, broadcast) |
 | `arithmetic` | `MPCArithmetic[TP]` | Beaver-triple multiplication and partitioning |
 | `polynomial` | `MPCPolynomial[TP]` | Lagrange interpolation, polynomial evaluation |
 | `boolean` | `MPCBoolean[TP]` | Bit decomposition, boolean circuits |
+| `bitwise` | `MPCBitwise[TP]` | XOR-shared (bitwise) protocols: carries, the ring sign test and normalizer |
 | `fp` | `MPCFP[TP]` | Fixed-point truncation and normalization |
 | `mhe` | `MPCMHE[TP]` | Multiparty homomorphic encryption (CKKS) |
 
@@ -34,6 +36,9 @@ _Defined in `stdlib/sequre/mpc/env.codon`_
 |---|---|
 | `council(value)` | Collect boolean votes from all parties. Returns `list[bool]`. Used to check and communicate certain properties between parties (e.g., if a variable is CKKS encrypted at each parties). |
 | `done()` | Synchronize parties and close all connections |
+
+The context managers (`allow_mpc_switch`, `default_modulus`, `default_encoding`, `delayed_truncation`, `detach_dealer`,
+`stats_log`) are described under [Context managers](#context-managers).
 
 ## Initialization
 
@@ -90,7 +95,7 @@ Beaver-triple based secure arithmetic over secret-shared values.
 
 | Method | Signature | Description |
 |---|---|---|
-| `add_public` | `(x, a, modulus)` | Add a public value `a` to secret-shared `x` (only at party 1) |
+| `add_public` | `(x, a, modulus)` | Add a public value `a` to secret-shared `x` (only at party 1; the other parties return `x` itself) |
 | `multiply` | `(a, b, modulus)` | Beaver-triple secure element-wise multiplication |
 | `multiply_matmul` | `(a, b, modulus)` | Beaver-triple secure matrix multiplication |
 | `inner_prod` | `(a, modulus)` | Secure inner product of secret-shared vectors |
@@ -98,8 +103,6 @@ Beaver-triple based secure arithmetic over secret-shared values.
 | `beaver_inner_prod_pair` | `(ar, am, br, bm, modulus)` | Pairwise inner product on pre-partitioned Beaver shares |
 | `multiply_bulk` | `(a, b, modulus)` | Batch element-wise multiplication over a list of matrices |
 | `multiply_mat_bulk` | `(a, b, modulus)` | Batch matrix multiplication over a list of matrices |
-| `ring_to_field` | `(target)` | Convert a secret-shared value from ring modulus to field modulus |
-| `field_to_ring` | `(target)` | Convert a secret-shared value from field modulus to ring modulus |
 | `validate_partitions` | `(x, x_r, r, modulus, message)` | Debug utility: assert that Beaver partitions are correct |
 | `reset_stats` | `()` | Reset arithmetic operation counters |
 | `print_stats` | `(file_stream=None)` | Print arithmetic stats (partitions, reconstructions) |
@@ -123,7 +126,8 @@ Boolean circuits and comparison protocols over secret-shared values. Implements 
 | `fan_in_and` | `(a, modulus)` | Compute AND reduction (via De Morgan + `fan_in_or`) |
 | `prefix_and` | `(a, modulus)` | Compute prefix-AND (via De Morgan + `prefix_or`) |
 | `flip_bit` | `(a, modulus)` | Negate shared bits: $1 - a$ |
-| `is_positive` | `(a, modulus)` | Test whether a secret-shared value is positive. Returns shared bit |
+| `is_positive` | `(a, modulus, nbits=MPC_MODULUS_BITS)` | $[a > 0]$ as a shared bit. On the ring: the sign test over the modulus' bits (`mpc.bitwise.sign_ring`), exact for every $\lvert a \rvert < 2^{L-1}$ (`nbits` is ignored). On the field: the parity of $2a$, masked by a uniform field element and opened, whose overflow is found by comparing the low `nbits` bits of the mask and the opening: exact for every $\lvert a \rvert \le (p-1)/2$ with the default (all $L$ bits), wrong with probability about $2\lvert a \rvert / 2^{\text{nbits}}$ with fewer (Sharetensor comparisons pass $K + F$ for differences of two fixed-point values) |
+| `is_nonzero` | `(a, modulus, nbits=MPC_MODULUS_BITS)` | $[a \ne 0]$ as a shared bit, field only: $a + r$ is opened for a uniform field element $r$, and an OR over the XOR of the low `nbits` bits of $r$ and the opening decides. Exact (not just with high probability) for every $\lvert a \rvert < 2^{\text{nbits}} - c$, where $p = 2^L - c$ ($c$ = 1, 3 and 9 with 128-, 192- and 256-bit shares): with the default, every value. About a quarter of `is_positive`'s cost at the same width. Sharetensor `==` and `!=` use it on the field |
 | `less_than_bits_public` | `(a, b_pub, modulus)` | Bitwise comparison $a < b$ where `b` is public |
 | `less_than_bits` | `(a, b, modulus)` | Bitwise comparison $a < b$ where both are secret-shared |
 | `less_than_public` | `(a, bpub, modulus)` | Comparison $a < b$ where `b` is public. Works on scalars, 1D, and 2D inputs |
@@ -134,6 +138,33 @@ Boolean circuits and comparison protocols over secret-shared values. Implements 
 | `greater_than` | `(a, b, modulus)` | Comparison $a > b$ on secret-shared values |
 | `not_greater_than` | `(a, b, modulus)` | Comparison $a \leq b$ on secret-shared values |
 | `not_greater_than_public` | `(a, bpub, modulus)` | Comparison $a \leq b$ where `b` is public |
+
+The comparison methods from `less_than_public` on take `is_positive`'s default width: exact on both moduli whenever the
+difference of their operands lies in the signed range ($\lvert a - b \rvert \le (p-1)/2$ on the field, $< 2^{L-1}$ on the ring;
+on the field all $L$ bits), negative public operands included.
+
+---
+
+### `mpc.bitwise` — `MPCBitwise[TP]`
+
+_Defined in `stdlib/sequre/mpc/bitwise.codon`_
+
+Bitwise (XOR) secret sharing. The compute parties hold registers whose XOR is the secret, packed so that one machine
+instruction covers `PACKING_SIZE` secret bits. The dealer (CP0) supplies the masks through the pairwise PRG streams, as
+for the arithmetic Beaver partitions. On top of the bit operations sit a carry computation of logarithmic depth, a sign
+test for ring shares and a normalizer for ring shares. Comparisons, division and square root on the ring, and Decor's
+carry, use them.
+
+| Method | Signature | Description |
+|---|---|---|
+| `share_from` | `(data, source_pid)` | XOR-share data held by `source_pid` among the compute parties |
+| `share_from_trusted_dealer` | `(data)` | XOR-share the dealer's data |
+| `reveal` | `(value)` | Open XOR shares to the compute parties |
+| `land`, `lor`, `lor_public` | `(a, b)` | AND (two rounds: each operand is partitioned in its own opening; the carry and prefix circuits partition both in one), OR (the same), OR with a public operand (local) |
+| `carry_out_public` | `(a_pub, b, num_bits)` | The carry out of adding a public value and an XOR-shared one ($\log_2$ depth) |
+| `carry_out_public_arithmetic` | `(a_pub, b, num_bits, modulus)` | The same carry, returned as arithmetic shares |
+| `sign_ring` | `(a, modulus, bits)` | $[a > 0]$ for ring shares whose value lies in $(-2^{bits - 1}, 2^{bits - 1})$ |
+| `normalizer` | `(x, modulus)` | $(4^i, 2^i)$ with $x \cdot 4^i \in [2^{K-2}, 2^K)$: scales a positive ring value into $[1/4, 1)$ for division and square root |
 
 ---
 
@@ -148,6 +179,9 @@ Fixed-point arithmetic protocols for secret-shared values.
 | `trunc` | `(a, modulus, k=MPC_NBIT_K+MPC_NBIT_F, m=MPC_NBIT_F)` | Fixed-point truncation. Divides by $2^m$ under the secret-sharing. Supports both power-of-two and prime moduli |
 | `reset_stats` | `()` | Reset truncation counters |
 | `print_stats` | `(file_stream=None)` | Print fixed-point stats (truncation count) |
+| `weighted_sum` | `(shares, weights, modulus, k, m)` | $\sum_i w_i \cdot \text{shares}_i$ for public float weights, with one truncation |
+| `truncation_allowed` | `()` | `False` inside `mpc.delayed_truncation()` |
+| `require_truncation` | `(caller)` | Raise `ValueError` at every party when called inside `mpc.delayed_truncation()` (division, square root and Decor call it) |
 
 ---
 
@@ -222,7 +256,7 @@ Network communication layer for MPC. Handles point-to-point messaging, collectiv
 | `broadcast_from[T]` | `(value, source_pid)` | One-to-all broadcast from a source party |
 | `send_to_all_from` | `(value, source_pid, include_trusted_dealer=False)` | Send a value from one party to all others |
 | `is_broadcast` | `(value)` | Broadcast a boolean consensus: collect, AND-reduce, and broadcast result |
-| `sync_parties` | `(lite=True, include_trusted_dealer=True)` | Barrier synchronization across all parties |
+| `sync_parties` | `(lite=True, include_trusted_dealer=True)` | Barrier across the parties. Also checks that every party's global PRG stream is at the same point: otherwise it fails ("out of sync") at every party taking part, after the exchange. Draws nothing. Without the dealer, CP0 takes no part (it returns at once, and may skip the call) |
 
 #### Dealer buffer management
 
@@ -271,10 +305,11 @@ Multiparty homomorphic encryption based on the CKKS scheme. Provides collective 
 
 | Method | Signature | Description |
 |---|---|---|
-| `enc_vector[T]` | `(values)` | Encode and encrypt a list of values into a list of `Ciphertext` or `Plaintext` (type selected by `T`) |
-| `decrypt` | `(x, source_pid=-2)` | Collectively decrypt ciphertexts. `source_pid`: specific party, `-2` = round-robin, `-1` = already broadcast |
+| `enc_vector[T]` | `(values, level=-1, scale=0.0)` | Encode and encrypt a list of values into a list of `Ciphertext` or `Plaintext` (type selected by `T`), at the top level and the default scale, or at `level` and `scale` where given |
+| `enc_public_vector` | `(values)` | Trivial encryptions of public values (the same at every party), laid out as `enc_vector` lays them out: identical at every party, noiseless, no public-key encryption |
+| `decrypt` | `(x, source_pid=-2)` | Collectively decrypt ciphertexts. `-2` (default): every compute party gets the plaintexts of its own ciphertexts and no other party learns them; each sends the others only the `c1` of its ciphertexts and gets back their decryption shares, so every compute party must call it, with an empty list if it holds none. A compute party's PID: that party's ciphertexts, decrypted for every compute party. `-1`: ciphertexts that are the same at every compute party (an aggregate, whose every operation keeps its copies the same, or ones collected from their holder), decrypted for every compute party, each decrypting its own copy (debug builds first check that the copies are the same, and raise at every compute party if not). CP0 takes no part (`source_pid=0` is an error). See [Security assumptions](../crypto-corner/security-assumptions.md#what-each-reveal-discloses) |
 | `decode[dtype]` | `(enc)` | Decode a list of `Plaintext` into `list[dtype]` (`int`, `float`, or `complex`) |
-| `reveal[dtype]` | `(x, source_pid=-2)` | Decrypt then decode (convenience wrapper) |
+| `reveal[dtype]` | `(x, source_pid=-2)` | Decrypt then decode (convenience wrapper; same `source_pid` modes) |
 
 #### E2S / S2E protocol switching
 
@@ -283,7 +318,7 @@ Multiparty homomorphic encryption based on the CKKS scheme. Provides collective 
 | `cipher_to_additive_plaintext` | `(ct, hub_pid)` | E2S: convert a `Ciphertext` to an `AdditiveShareBigint` |
 | `additive_plaintext_to_cipher` | `(secret_share, hub_pid)` | S2E: convert an `AdditiveShareBigint` back to a `Ciphertext` |
 | `additive_share_vector_to_ciphervector` | `(shared_tensor, modulus, is_fp, target_pid=-1)` | MPC→MHE: convert MPC secret shares to a ciphervector |
-| `ciphervector_to_additive_share_vector` | `(ciphervector, number_of_elements, modulus, source_pid)` | MHE→MPC: convert a ciphervector to MPC secret shares |
+| `ciphervector_to_additive_share_vector` | `(ciphervector, number_of_elements, modulus, source_pid)` | MHE→MPC: convert a ciphervector to MPC secret shares. A compute party's PID: that party's ciphertexts (the others' are ignored). `-1`: ciphertexts that are the same at every compute party (an aggregate, or ones collected from their holder): each party switches its own copy (debug builds check the copies first, as `decrypt` does). The ciphertexts are rescaled and, below the switch's level, bootstrapped in place (an aggregate's copies in the broadcast mode, alike). Placeholders (nil-ideal ciphertexts, the padding of unequal partitions) switch as zeros |
 
 #### Ciphertext arithmetic (in-place)
 
@@ -297,7 +332,7 @@ Multiparty homomorphic encryption based on the CKKS scheme. Provides collective 
 | `iadd_const` | `(x, constant)` | Add a scalar constant in-place |
 | `isub_const` | `(x, constant)` | Subtract a scalar constant in-place |
 | `imul_const` | `(x, constant)` | Multiply by a scalar constant in-place |
-| `irotate` | `(x, k)` | Rotate ciphertext slots by `k` positions in-place |
+| `irotate` | `(x, k)` | Rotate ciphertext slots left by `k` positions in-place, for any `k` (modulo the slots, either sign) |
 | `irotate_butterfly` | `(x, k)` | Butterfly-decomposed rotation for large `k` |
 
 #### Ciphertext arithmetic (out-of-place)
@@ -307,7 +342,7 @@ Multiparty homomorphic encryption based on the CKKS scheme. Provides collective 
 | `neg` | `(x)` | Return negated copy |
 | `add` | `(x, y)` | Return sum of ciphervectors |
 | `sub` | `(x, y)` | Return difference of ciphervectors |
-| `mul` | `(x, y)` | Return product of ciphervectors |
+| `mul` | `(x, y, x_is_broadcast=False, y_is_broadcast=False)` | Return product of ciphervectors; as in `imul`, an operand flagged broadcast (the same ciphertexts at every party) is refreshed in the broadcast mode, one bootstrap for every party |
 | `mul_noboot` | `(x, y)` | Return product without bootstrapping |
 | `add_const` | `(x, constant)` | Return ciphervector + constant |
 | `sub_const` | `(x, constant)` | Return ciphervector − constant |
@@ -320,31 +355,33 @@ Multiparty homomorphic encryption based on the CKKS scheme. Provides collective 
 |---|---|---|
 | `rescale` | `(x, target_scale)` | Rescale ciphertexts to `target_scale` |
 | `requires_bootstrap` | `(x, min_level_distance=0)` | Check which ciphertexts need bootstrapping (returns `list[bool]`) |
-| `bootstrap` | `(x, is_broadcast=False, min_level_distance=0)` | Collectively bootstrap ciphertexts that need it |
+| `bootstrap` | `(x, is_broadcast=False, min_level_distance=0, copies_identical=False)` | Collectively bootstrap ciphertexts that need it. With `is_broadcast` (ciphertexts that are the same at every party, such as an aggregate) one bootstrap serves every party: each takes the hub's copy and gets its refresh, so the copies come out the same, also where they had come apart (debug builds check them first, as `decrypt` does); `copies_identical=True` (the switch to MPC, on ciphertexts it just received from one party or an aggregate's copies) bootstraps each party's own copy without the hub's sent first. Otherwise one council decides, and each party's ciphertexts are bootstrapped in rounds of their own |
 | `refresh` | `(x, is_broadcast=False, min_level_distance=0)` | Rescale then bootstrap as needed (recommended before heavy computation) |
-| `drop_level` | `(a, out_level)` | Drop ciphertext level (works on `list[Ciphertext]` and `list[list[Ciphertext]]`) |
+| `refresh_council` | `(x, status=0)` | One refresh council among the compute parties that also carries a status from each: rescale `x`, then one collect gives every party's status and which of its ciphertexts need a collective bootstrap. Returns every compute party's status (the same list at each), so that the caller can raise at every party alike when one is nonzero; every bootstrap any party needs runs first, whatever the statuses. `x` may be empty: the parties need only hold the same number of councils |
+| `drop_level` | `(a, out_level)` | Drop ciphertext level (works on `list[Ciphertext]` and `list[list[Ciphertext]]`). A ciphertext below `bootstrap_min_level` cannot be bootstrapped: its next refresh raises a `ValueError` at every compute party. A product added to a ciphertext dropped to that level is rescaled first (with its own levels), so that the sum stays at the level without a rescale pending and refreshes |
 | `flatten_levels` | `(x)` | Drop all ciphertexts in a matrix to the minimum level. Returns `(matrix, min_level)` |
 
 #### Shifting & reduction
 
 | Method | Signature | Description |
 |---|---|---|
-| `shift` | `(x, step)` | Shift ciphervector by `step` slots (inter-ciphertext, with masking) |
+| `shift` | `(x, step, is_broadcast=False)` | Shift ciphervector by `step` slots (inter-ciphertext, with masking); with `is_broadcast` the masked products of a broadcast `x` refresh in the broadcast mode |
 | `shift_noboot` | `(x, step)` | Shift without bootstrapping |
-| `reduce_add` | `(x, size, keep_dims=True)` | Sum-reduce a ciphervector along the slot axis |
+| `reduce_add` | `(x, size, keep_dims=True, is_broadcast=False)` | Sum-reduce a ciphervector along the slot axis; with `is_broadcast` the mask product of a broadcast `x` refreshes in the broadcast mode |
 
 #### Masking
 
 | Method | Signature | Description |
 |---|---|---|
-| `mask_one[T]` | `(x, idx, complement=False)` | Mask a single slot (or its complement) in a ciphertext or ciphervector |
-| `mask_range[T]` | `(x, start, stop, complement=False)` | Mask a range of slots in a ciphertext |
+| `mask_one[T]` | `(x, idx, complement=False)` | Keep a single slot (or every other one) of a ciphertext or ciphervector (a public plaintext mask) |
+| `mask_range[T]` | `(x, start, stop, complement=False)` | Keep slots `[start, stop)`, `0 <= start <= stop <= slots`, of a ciphertext (or every other one; a public plaintext mask) |
 
 #### Utilities
 
 | Method | Signature | Description |
 |---|---|---|
-| `zero_cipher` | `()` | Create an encryption of zero |
+| `zero_cipher` | `()` | The trivial encryption of zero, `(0, 0)`: identical at every party and free |
+| `trivial_cipher` | `(plaintext)` | The trivial encryption `(plaintext, 0)` of a public plaintext |
 
 ---
 
@@ -352,14 +389,41 @@ Multiparty homomorphic encryption based on the CKKS scheme. Provides collective 
 
 _Defined in `stdlib/sequre/mpc/randomness.codon`_
 
-PRG (pseudorandom generator) stream management for MPC. Each pair of parties shares a PRG stream seeded via a secure key exchange during initialization.
+PRG (pseudorandom generator) streams. Every party has:
+
+- a **private stream** (key: its own pid), seeded from the operating system's randomness and known to it alone;
+- a **pairwise stream** with each other party `p` (key `p`), seeded with a seed the two exchange at startup;
+- the **global stream** (key `-1`), seeded with a seed CP0 broadcasts at startup and known to every party:
+  `with randomness.global_stream():` (the same as `seed_switch(-1)`).
+
+The seeds are fresh every run. One stream is live at a time, and draws (`rand`, `prg.random()`, ...) come from it.
+Outside every switch the private stream is live.
+
+**Switches nest.** Inside `with randomness.seed_switch(p):` stream `p` is live; when the block exits, the stream that
+was live before it is live again, and every stream continues from where it stopped. A switch to the stream already
+live continues it. Exits must match: `restore_seed(p)` closes the innermost switch, which must be one to `p`
+(`ValueError` otherwise, and nothing changes). Prefer the `with` form: its exit runs even when the block raises, and it
+also closes a switch left open inside the block, then raises `ValueError`, which replaces an exception the block raised.
+
+**Which stream a draw uses.** Protocols name the stream of each secret draw: the dealer's values (truncation and
+comparison masks, random bits) and each party's MPC ↔ MHE switching masks come from the party's private stream, masks
+two parties agree on from their pairwise stream, and the HE protocols' masks (collective bootstrapping, encryption to
+shares) from Lattiseq's own generators. So a protocol called inside `global_stream()` keeps its secrets private and
+draws nothing from the global stream. Draws that name no stream come from the live one: initial weights
+(`randomize_weights`, a model's `compile`), `Sharetensor.rand`, MI's imputation noise, and data you draw yourself.
+`MPA.rand` is the exception: an MPA's random data is public, so it always draws from the global stream, and so do MPU's
+default (additive) `rand` and initial weights and noise on MPA-backed data.
+Draw values every party must agree on (public data, initial weights to compare with a plaintext run) under
+`global_stream()`, making the same draws at every party, CP0 included: otherwise the global stream falls out of step,
+and `sync_parties` fails.
 
 #### Fields
 
 | Field | Type | Description |
 |---|---|---|
 | `pid` | `int` | This party's ID |
-| `prg_states` | `dict[int, tuple[array[u32], int]]` | Saved PRG states keyed by party ID |
+| `live` | `int` | The live stream's key |
+| `prg_states` | `dict[int, tuple[array[u32], int]]` | The saved state of every stream except the live one, keyed by stream (−1: global; own pid: private; other pids: pairwise) |
 | `other_seeds` | `dict[int, seed_t]` | Seeds shared with each other party |
 | `global_seed` | `seed_t` | Global seed shared via trusted dealer broadcast |
 
@@ -367,16 +431,23 @@ PRG (pseudorandom generator) stream management for MPC. Each pair of parties sha
 
 | Method | Signature | Description |
 |---|---|---|
-| `reset_streams` | `()` | Reset all PRG streams (private, shared, and global) using current seeds |
-| `reset_global_seed` | `()` | Reset the global seed stream (pid = −1) |
-| `reset_seed` | `(pid, seed)` | Re-seed and save the PRG state for a specific stream |
-| `get_state` | `()` | Get the current PRG generator state |
-| `set_state` | `(state)` | Set the PRG generator state |
-| `switch_seed` | `(pid)` | Save current private PRG state and load the shared stream for `pid` |
-| `restore_seed` | `(pid)` | Save shared stream state for `pid` and restore private PRG state |
-| `freeze_seed` | `(pid)` | Like `switch_seed`, but copies the state so the shared stream is not advanced |
-| `unfreeze_seed` | `(pid)` | Restore from the frozen shared stream state |
-| `seed_switch` | `(pid)` | Context manager: `with randomness.seed_switch(pid): ...` — switches to the shared PRG for `pid` and restores on exit |
+| `seed_switch` | `(pid)` | Context manager: `with randomness.seed_switch(pid): ...` draws from stream `pid` inside the block (switches nest) |
+| `global_stream` | `()` | Context manager: `with randomness.global_stream(): ...` draws from the global stream inside the block, for values every party draws alike (call it at every party, CP0 too). An alias of `seed_switch(-1)` |
+| `private` | `()` | Context manager: `with randomness.private(): ...` draws from this party's private stream inside the block, whatever stream is live |
+| `switch_seed` | `(pid)` | Opens a switch to stream `pid`, until the matching `restore_seed(pid)` |
+| `restore_seed` | `(pid)` | Closes the innermost switch, which must be one to `pid` (`ValueError` otherwise) |
+| `freeze_seed` | `(pid)` | Opens a switch to stream `pid`, as `switch_seed`, and remembers where the stream is. Only the global stream (`pid = -1`) can be frozen: any other `pid` raises `ValueError` (see below) |
+| `unfreeze_seed` | `(pid)` | Rewinds stream `pid` to where `freeze_seed(pid)` found it, as often as called, so that the next draws repeat the earlier ones. The innermost switch must be that `freeze_seed`'s (`ValueError` otherwise); it stays open until `restore_seed(pid)`, which keeps the draws made since the last `unfreeze_seed`. Example, the same shuffle of two lists: `freeze_seed(-1)`, `prg.shuffle(X)`, `unfreeze_seed(-1)`, `prg.shuffle(y)`, `restore_seed(-1)` |
+| `get_state` | `()` | A copy of the live stream's state |
+| `set_state` | `(state)` | Sets the live stream's state to a copy of `state` |
+| `stream_digest` | `(pid)` | A digest of where stream `pid` is (nothing is drawn): parties that drew alike from a stream they share get equal digests |
+| `reset_seed` | `(pid, seed)` | Re-seeds stream `pid`. The live stream stays where it is, unless it is `pid`'s |
+| `reset_global_seed` | `()` | Rewinds the global stream to its seed, the same at every party: to repeat shared draws, for example to run a plaintext and a secure computation from the same initial weights. No other stream changes |
+| `reset_streams` | `()` | Re-seeds every stream from the current seeds; runs at startup. No switch may be open |
+
+Rewind only the global stream (`freeze_seed`/`unfreeze_seed`, `set_state`, `reset_global_seed`). Rewinding a stream
+protocols draw from, your private stream or a pairwise one, makes the protocols reuse their masks, and two openings
+against the same mask reveal the difference of their inputs. `freeze_seed` refuses those streams.
 
 ---
 
@@ -460,11 +531,11 @@ Convenience context managers accessible via methods on `MPCEnv`:
 
 ### `mpc.allow_mpc_switch()`
 
-Enables automatic [MPC ↔ MHE switching](../user-guide/switching.md) for the duration of the block. Inside this context, operations like `Ciphertensor.matmul` may automatically convert to Sharetensor (via the E2S protocol), run the operation using Beaver-triple MPC, and convert back (via S2E) when a cost estimator determines this is cheaper than a pure-HE path.
+Enables automatic [MPC ↔ MHE switching](../user-guide/switching.md) for the duration of the block. Inside this context, a `Ciphertensor @ ndarray` product may convert the ciphertensor to a Sharetensor (via the E2S protocol), multiply using Beaver-triple MPC, and convert back (via S2E) when a cost estimator determines this is cheaper than a pure-HE path. Every party runs the product, the trusted dealer included.
 
 ```python
 with mpc.allow_mpc_switch():
-    result = ct_a @ ct_b  # matmul may use MPC path if cheaper
+    result = ct_a @ plain_b  # matmul may use MPC path if cheaper
 ```
 
 See the dedicated [MPC ↔ MHE Switching](../user-guide/switching.md) page for details.
@@ -486,6 +557,31 @@ Temporarily switch the default ciphertensor encoding string. Restores the origin
 ```python
 with mpc.default_encoding("diagonal"):
     ...
+```
+
+### `mpc.delayed_truncation()`
+
+Suspends fixed-point truncation for the block: `mpc.fp.trunc` returns its input, and products keep scale $2^{2F}$.
+Truncate the result once after the block. For a sum of single fixed-point products this saves an opening per product,
+and it is valid while the untruncated sum stays below the truncation bound ($2^{K+F}$ by default). Protocols whose own
+truncations cannot be deferred (division, square root, Decor's nonlinear functions, Chebyshev's recurrence) raise
+`ValueError` inside the block, at every party before any round. Scopes nest; nothing is truncated on exit.
+
+```python
+with mpc.delayed_truncation():
+    acc = a * b + c * d          # scale 2^(2F): no truncation yet
+acc.itrunc(mpc)                  # one truncation for the whole sum (in place)
+```
+
+### `mpc.detach_dealer()`
+
+Buffers the dealer's (CP0's) sends while the block runs and flushes them when the outermost block exits, so that a
+benchmark can time the online phase without the dealer's traffic. A measurement aid only: the dealer must not receive
+inside the block (`MPCComms` raises if it does), and the buffer holds the whole block's traffic in memory. Blocks nest.
+
+```python
+with mpc.detach_dealer():
+    y = sigmoid(mpc, x)          # CP0's masks are buffered, then sent at the end of the block
 ```
 
 ### `mpc.stats_log(msg, file_path, mode, file_only)`

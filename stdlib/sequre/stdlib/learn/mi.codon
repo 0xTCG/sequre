@@ -156,30 +156,52 @@ class Imputer[M]:
 
     @staticmethod
     def update(data, imputed_y, miss_rows, miss_col, inplace):
-        idx = 0
         imputed_data = data if inplace else data.copy()
-        for i in miss_rows:
-            if isinstance(data, MPU):
-                imputed_data[i, miss_col] = imputed_y.reveal()[idx, 0]
-            else:
+        if isinstance(data, MPU):
+            Imputer._write_own_rows(imputed_data, imputed_y, sorted(miss_rows), miss_col)
+        else:
+            idx = 0
+            for i in miss_rows:
                 imputed_data[i, miss_col] = imputed_y[idx, 0]
-            idx += 1
+                idx += 1
 
         return imputed_data
     
     @staticmethod
     def update_via_mask(data, imputed_y, mask, miss_col, inplace):
-        idx = 0
         imputed_data = data if inplace else data.copy()
-        for i in range(len(mask)):
-            if mask[i]:
-                if isinstance(data, MPU):
-                    imputed_data[i, miss_col] = imputed_y.reveal()[idx, 0]
-                else:
+        if isinstance(data, MPU):
+            Imputer._write_own_rows(imputed_data, imputed_y, [i for i in range(len(mask)) if mask[i]], miss_col)
+        else:
+            idx = 0
+            for i in range(len(mask)):
+                if mask[i]:
                     imputed_data[i, miss_col] = imputed_y[idx, 0]
-                idx += 1
+                    idx += 1
 
         return imputed_data
+
+    @staticmethod
+    def _write_own_rows(data, imputed_y, rows: List[int], miss_col: int):
+        # MPU data: each party's imputed values go to that party alone. imputed_y holds each party's missing rows (rows:
+        # the cohort's, ascending) as its partition, in order; one reveal_local, in which every compute party takes part,
+        # decrypts each party's to it alone, and each writes its own into its partition, which is in the clear. No party
+        # learns another's imputed values, and the traffic grows with the missing rows, not with their square.
+        mpc = data.mpc
+        own = imputed_y.reveal_local()
+        if mpc.pid == 0:
+            return
+
+        mpp = data._mpp
+        assert not mpp._transposed, "Imputer: cannot impute into a transposed MPU"
+        assert mpp.is_local() or mpp.is_empty(), "Imputer: MPU data must be held in the clear to take imputed values"
+        start = mpp._ratios[:mpc.pid - 1].sum()
+        stop = start + mpp._ratios[mpc.pid - 1]
+        j = 0
+        for i in rows:
+            if start <= i < stop:
+                mpp._local_data[i - start, miss_col] = own[j, 0]
+                j += 1
     
 
 class MI[IM, FM]:
@@ -197,6 +219,11 @@ class MI[IM, FM]:
         return MI._rubin(mpc, weights)
     
     def fit(self, mpc, data, labels, miss_rows, miss_col, im_step, fm_step, im_epochs, fm_epochs, noise_scale, mode, dump_imputed_data=False, verbose=False):
+        """
+        noise_scale: the standard deviation of the noise added to each imputed value, so that the imputed datasets
+        differ (multiple imputation). dump_imputed_data: a debugging aid that reveals every imputed dataset, whole, to
+        every party (CP2 writes them to files); never use it on private data.
+        """
         assert mode in {MI_BATCHED_MODE, MI_STOCHASTIC_MODE}, f"MI: Invalid imputation model training mode: {mode}. Should be either {MI_BATCHED_MODE} or {MI_STOCHASTIC_MODE}."
         complete_data, incomplete_data, complete_labels = Imputer.split_train_test(data, miss_col, miss_rows)
         
@@ -249,7 +276,10 @@ class MICE[IM, FM]:
     def fit(self, mpc, data, labels, miss_rows,
             im_step, fm_step, im_epochs, fm_epochs, noise_scale,
             dump_imputed_data=False, verbose=False):
-        # Fit with chain equations
+        """
+        Fit with chain equations. dump_imputed_data: a debugging aid that reveals every imputed dataset, whole, to every
+        party (CP2 writes them to files); never use it on private data.
+        """
         imputed_data = [data.copy() for _ in range(self.factor)]
         
         miss_col = 0
@@ -296,7 +326,10 @@ class MICE[IM, FM]:
     def fit_no_ce(self, mpc, incomplete_data, complete_data, labels, miss_row_masks,
             im_step, fm_step, im_epochs, fm_epochs, noise_scale,
             dump_imputed_data=False, verbose=False):
-        # Fit without chain equations
+        """
+        Fit without chain equations. dump_imputed_data: a debugging aid that reveals every imputed dataset, whole, to
+        every party (CP2 writes them to files); never use it on private data.
+        """
         miss_col = 0
         for imputer in self.imputers:
             train_data = complete_data[:, :miss_col].hstack(complete_data[:, miss_col+1:])

@@ -1,9 +1,21 @@
-from sequre.stdlib.numpy.create import array, ones, zeros_like
+import secure_operator
+import sequre.lattiseq.ckks as ckks
+
+from sequre.stdlib.numpy.create import array, ones, zeros, zeros_like
+from sequre.stdlib.numpy.ndarray import ndarray
 
 from sequre.mpc.env import MPCEnv
+from sequre.types.ciphertensor import Ciphertensor
 from sequre.types.multiparty_aggregate import MPA
-from sequre.utils.testing import assert_eq_approx
-from sequre.utils.utils import random_floats
+from sequre.utils.testing import assert_eq, assert_eq_approx, same_at_every_party
+from sequre.utils.utils import random_floats, random_ints
+
+from internal.gc import sizeof
+
+from sequre.types.utils import double_to_fp, fp_to_double
+from sequre.constants import MPC_MODULUS_BITS, mpc_uint, ENC_ROW, ENC_DIAG
+
+from multiparty_testing import cohort_matrix, assert_parties_in_step, column, with_columns
 
 
 def test_mpa_getitem(mpa_a, raw_a):
@@ -115,14 +127,28 @@ def test_mpa_elem_wise_operations(mpa_a, mpa_b, raw_a, raw_b):
 
 def test_mpa_matmul_operations(mpa_a, mpa_b, raw_a, raw_b):
     mpc = mpa_a._mpc
+    # The dot products (about 1,800 with two compute parties, 3,900 with three: the sums of the parties' shares grow with
+    # them) take an HE multiplication and a rotate-and-sum. Their error is relative to their size, about 1.4e-8 per
+    # element (rms), measured since Lattiseq's mod-down rounds (L-249; 60 key sets, two and three compute parties, field
+    # and ring): at most 5.3e-8 for a row of a 2-dim dot, 3.8e-8 for a 1-dim dot. The bounds, 2^-22.5 and 2^-23, sit 1.7
+    # bits above those. On 4 rows and 1 element a loss of 3 bits passes these checks about half the time; the dots of a
+    # 32-row MPA below (the same products, one row per ciphertext) catch it in about 99% of runs. (An absolute 0.005,
+    # about 2^-20 relative with three compute parties, failed in 9 of 40 runs with the mod-down that floored.)
     mpa_dot = mpa_a.dot(axis=1)
     raw_dot = (raw_a * raw_a).sum(axis=1)
     if mpc.pid:
-        assert_eq_approx(f"CP{mpc.pid}:\tMPA dot 2-dim", mpa_dot.reveal(), raw_dot, error=0.005)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA dot 2-dim", mpa_dot.reveal(), raw_dot, error=1e-6, rel_error=2.0 ** -22.5)
     
     mpa_dot_1_dim = mpa_a[0].dot(axis=0)
     if mpc.pid:
-        assert_eq_approx(f"CP{mpc.pid}:\tMPA dot 1-dim", mpa_dot_1_dim.reveal()[0], raw_dot[0], error=0.005)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA dot 1-dim", mpa_dot_1_dim.reveal()[0], raw_dot[0], error=1e-6, rel_error=2.0 ** -23)
+
+    big_share = array(random_floats((32, 32)))
+    mpa_big = MPA(mpc, big_share)
+    raw_big = mpc.comms.collect(big_share).sum() if mpc.pid else zeros_like(big_share)
+    mpa_big_dot = mpa_big.dot(axis=1)
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA dot 2-dim on 32 rows", mpa_big_dot.reveal(), (raw_big * raw_big).sum(axis=1), error=1e-6, rel_error=2.0 ** -22.5)
     
     mpa_matmul = mpa_a @ mpa_b.T
     raw_matmul = raw_a @ raw_b.T
@@ -143,7 +169,662 @@ def test_mpa_matmul_operations(mpa_a, mpa_b, raw_a, raw_b):
     raw_a_row_mat = raw_a[0].expand_dims(axis=0)
     if mpc.pid:
         assert_eq_approx(f"CP{mpc.pid}:\tMPA matrix multiplication transposed x non-transposed w/ dim expansion", row_mat_matmul.reveal(), raw_a_row_mat.T @ raw_a_row_mat, error=0.02)
-    
+
+
+def test_mpa_aggregates_stay_identical(_mpa_a, raw_a):
+    """An aggregate is the same ciphertexts at every party and stays so: through a product of aggregates, a public product
+    (which accumulates into zero ciphertexts), a refresh (one collective bootstrap per ciphertext), and in MPA.rand. The
+    switch to MPC, where every party decrypts with its own copy, depends on it."""
+    mpc = _mpa_a._mpc
+    mpa_a = _mpa_a.copy()
+    with mpc.randomness.global_stream():
+        W = array(random_floats((raw_a.shape[1], 3)))
+
+    square = mpa_a * mpa_a
+    product = square @ W
+    expected = (raw_a * raw_a) @ W
+    stensor = product.to_sharetensor()
+    random_mpa = MPA[Tuple[int, int], float].rand((3, 8), "uniform", mpc)
+
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tMPA product of aggregates is the same at every party", same_at_every_party(mpc, square._aggregate._data), True)
+        assert_eq(f"CP{mpc.pid}:\tMPA aggregate times public matrix is the same at every party", same_at_every_party(mpc, product._aggregate._data), True)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA aggregate times public matrix -> MPC switch", stensor.reveal(mpc), expected, error=0.02, rel_error=2e-5)
+        assert_eq(f"CP{mpc.pid}:\tMPA.rand is the same at every party", same_at_every_party(mpc, random_mpa._aggregate._data), True)
+
+        refreshed = product._aggregate.copy()
+        refreshed._data = mpc.mhe.drop_level(refreshed._data, mpc.mhe.bootstrap_min_level)
+        before = mpc.mhe.stats.secure_bootstrap_count
+        mpc.mhe.refresh(refreshed._data, refreshed._is_broadcast)
+        assert_eq(f"CP{mpc.pid}:\tMPA aggregate refresh: one bootstrap per ciphertext", mpc.mhe.stats.secure_bootstrap_count - before, len(refreshed._data))
+        assert_eq(f"CP{mpc.pid}:\tMPA aggregate refresh: the same at every party", same_at_every_party(mpc, refreshed._data), True)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA aggregate refresh: decryption of the common copy", refreshed.reveal(mpc, source_pid=-1), expected, error=0.02, rel_error=2e-5)
+
+
+def test_mpa_matmul_operand_order(_mpa_a, _mpa_b, raw_a, raw_b):
+    """Products whose left factor is an aggregate keep the factors' order (non-square factors): with a distributed right
+    factor, and with an aggregate right factor."""
+    mpc = _mpa_a._mpc
+    mpa_a = _mpa_a.copy()
+    square = mpa_a * mpa_a
+
+    mpa_b_t = _mpa_b.T
+    distributed = square @ mpa_b_t
+    mpa_b_t_square = mpa_b_t * mpa_b_t
+    aggregated = square @ mpa_b_t_square
+
+    raw_square = raw_a * raw_a
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA aggregate x distributed matmul", distributed.reveal(), raw_square @ raw_b.T, error=0.05, rel_error=2e-5)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA aggregate x aggregate matmul", aggregated.reveal(), raw_square @ (raw_b.T * raw_b.T), error=0.05, rel_error=2e-5)
+
+
+def test_mpa_matmul_cost_agreement(_mpa_a, raw_a):
+    """Every party, CP0 included, estimates the same cost for a public product of an aggregate: the matmul reorder pass
+    compares such estimates at every party."""
+    mpc = _mpa_a._mpc
+    mpa_a = _mpa_a.copy()
+    square = mpa_a * mpa_a
+    costs = mpc.comms.collect(square.get_matmul_cost(ones((raw_a.shape[1], 3))), True)
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tMPA public product cost is the same at every party", all(c == costs[0] for c in costs), True)
+
+
+def test_mpa_int_to_sharetensor(mpc):
+    """An aggregated int MPA switches to fixed-point shares at every party, CP0 included, so the next fixed-point step
+    (the truncation after a product) runs at all of them."""
+    local = array(random_ints((4, 8), 0, 31))
+    raw = mpc.comms.collect(local).sum() if mpc.pid else zeros_like(local)
+    mpa = MPA(mpc, local)
+    mpa.aggregate()
+    stensor = mpa.to_sharetensor()
+    flags = mpc.comms.collect(stensor.fp, True)
+    squared = secure_operator.mul(mpc, stensor, stensor)
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tMPA int -> MPC switch: the same fixed-point flag at every party", all(f == flags[0] for f in flags), True)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA int -> MPC switch: squared shares", squared.reveal(mpc), (raw * raw).astype(float), error=0.05)
+
+
+def test_mpa_public_product_via_mpc(mpc):
+    """H-53: MPA @ ndarray under allow_mpc_switch, with the switch to MPC chosen: an aggregate and encrypted shares
+    convert once, at every party (CP0 joins), and come back as an aggregate; shares in the clear multiply locally.
+    Ciphertensor.via_mpc(mirrored=True), the conversion of ciphertexts every compute party holds alike, gives CP0 a
+    placeholder with the result's shape. M-MP-19: encrypt() leaves an MPA that holds only an aggregate as it is, and
+    encrypts each party's own share of one that also holds its shares in the clear."""
+    rows, cols = 4, 64
+    public = cohort_matrix(mpc, cols, 3) * 0.25
+    share = array(random_floats((rows, cols), scale=1.0))
+    raw = mpc.comms.collect(share).sum() if mpc.pid else zeros_like(share)
+    expected = raw @ public
+
+    # An MPA that keeps its shares in the clear multiplies them, whatever else it holds: the other two hold only an
+    # aggregate, or only encrypted shares
+    plain = MPA(mpc, share)
+    aggregated = MPA(mpc, share)
+    aggregated.aggregate()
+    aggregate = MPA[Tuple[int, int], float]._from_parts(mpc, zeros((rows, cols)) if mpc.pid == 0 else ndarray[Tuple[int, int], float](), Ciphertensor[ckks.Ciphertext](), aggregated._aggregate.copy() if mpc.pid else Ciphertensor[ckks.Ciphertext]())
+    encrypted = MPA(mpc, Ciphertensor[ckks.Ciphertext].enc(mpc, share)) if mpc.pid else MPA(mpc, zeros((rows, cols)))
+    with mpc.allow_mpc_switch():
+        switches = [aggregate._public_matmul_via_mpc([cols, 3]), encrypted._public_matmul_via_mpc([cols, 3]), plain._public_matmul_via_mpc([cols, 3])]
+        product_aggregate = aggregate @ public
+        assert_parties_in_step(mpc, "MPA aggregate @ ndarray via MPC")
+        product_encrypted = encrypted @ public
+        assert_parties_in_step(mpc, "MPA encrypted shares @ ndarray via MPC")
+        product_plain = plain @ public
+        assert_parties_in_step(mpc, "MPA shares in the clear @ ndarray under allow_mpc_switch")
+
+    revealed = [product_aggregate.reveal(), product_encrypted.reveal(), product_plain.reveal()]
+    assert_eq(f"CP{mpc.pid}:\tMPA @ ndarray under allow_mpc_switch: routes (aggregate, encrypted shares, in the clear)", switches, [True, True, False])
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA aggregate @ ndarray via MPC", revealed[0], expected, error=0.01)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA encrypted shares @ ndarray via MPC", revealed[1], expected, error=0.01)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA shares in the clear @ ndarray under allow_mpc_switch", revealed[2], expected, error=0.01)
+        assert_eq(f"CP{mpc.pid}:\tMPA aggregate @ ndarray via MPC: an aggregate, the same at every party", product_aggregate.is_aggregate() and same_at_every_party(mpc, product_aggregate._aggregate._data), True)
+
+    # The mirrored conversion directly: CP0 converts a placeholder of the aggregate's layout
+    ciphers = aggregated._aggregate if mpc.pid else Ciphertensor[ckks.Ciphertext].zeros(mpc, [rows, cols])
+    mirrored = ciphers.via_mpc(mpc, lambda stensor: secure_operator.matmul(mpc, stensor, public), mirrored=True, S=Tuple[int, int])
+    shapes = mpc.comms.collect(mirrored.shape, True)
+    assert_eq(f"CP{mpc.pid}:\tCiphertensor via MPC, mirrored: the result's shape at every party, CP0 included", all(sh == [rows, 3] for sh in shapes), True)
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tCiphertensor via MPC, mirrored", mirrored.reveal(mpc, source_pid=-1), expected, error=0.01)
+    assert_parties_in_step(mpc, "Ciphertensor via MPC, mirrored")
+
+    # M-MP-19: encrypt() leaves an MPA that holds only an aggregate as it is: encrypted already, the same at every party
+    aggregate_only = MPA[Tuple[int, int], float]._from_parts(mpc, zeros((rows, cols)) if mpc.pid == 0 else ndarray[Tuple[int, int], float](), Ciphertensor[ckks.Ciphertext](), aggregated._aggregate.copy() if mpc.pid else Ciphertensor[ckks.Ciphertext]())
+    aggregate_only.encrypt()
+    if mpc.pid:
+        same = same_at_every_party(mpc, aggregate_only._aggregate._data)
+        assert_eq(f"CP{mpc.pid}:\tMPA encrypt of an aggregate-only MPA: still only an aggregate, the same at every party", aggregate_only.is_aggregate() and same, True)
+    revealed_aggregate_only = aggregate_only.reveal()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA encrypt of an aggregate-only MPA: its value", revealed_aggregate_only, raw, error=1e-3)
+
+    # An MPA that holds its shares in the clear and an aggregate gets each party's own share encrypted, and keeps the
+    # aggregate as it was
+    all_shares = mpc.comms.collect(share) if mpc.pid else [share]
+    aggregated.encrypt()
+    if mpc.pid:
+        same = same_at_every_party(mpc, aggregated._aggregate._data)
+        assert_eq(f"CP{mpc.pid}:\tMPA encrypt with shares in the clear and an aggregate: the aggregate kept, the same at every party", aggregated.has_aggregate() and aggregated.has_encryption() and same, True)
+    for p in range(1, mpc.comms.number_of_parties):
+        # CP{p}'s encryption alone, zeros (encrypted the same way) at the other parties
+        own = MPA(mpc, aggregated._encryption if mpc.pid == p else Ciphertensor[ckks.Ciphertext].enc(mpc, zeros((rows, cols)))) if mpc.pid else MPA(mpc, zeros((rows, cols)))
+        revealed_own = own.reveal()
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\tMPA encrypt with shares in the clear and an aggregate: CP{p}'s encryption holds its own share", revealed_own, all_shares[p - 1], error=1e-3)
+
+
+def test_mpa_via_mpc_default_mode(mpc):
+    """L-274 (the user's choice, 2026-11-18): Ciphertensor.via_mpc in its default mode on an aggregate (the same
+    ciphertexts at every compute party) switched every party's copy apart, each party keeping a fresh encryption of its
+    own, which a decryption with source -1 cannot combine (it raised in debug builds; garbage in release builds). The hub
+    now tells every party, CP0 included, that the tensor is broadcast (one round), and it is switched once, as mirrored:
+    as many ciphertexts switched as it holds, a result the same at every party and flagged broadcast, its decryption with
+    source -1 right. A party's own tensor in the default mode still comes back as that party's own result."""
+    rows, cols = 4, 8
+    public = cohort_matrix(mpc, cols, 3) * 0.25
+    share = array(random_floats((rows, cols), scale=1.0))
+    raw = mpc.comms.collect(share).sum() if mpc.pid else zeros_like(share)
+    aggregated = MPA(mpc, share)
+    aggregated.aggregate()
+    ciphers = aggregated._aggregate if mpc.pid else Ciphertensor[ckks.Ciphertext].zeros(mpc, [rows, cols])
+    label = "Ciphertensor via MPC, default mode, an aggregate"
+    before = mpc.mhe.stats.secure_mhe_mpc_switch_count
+    out = ciphers.via_mpc(mpc, lambda stensor: secure_operator.matmul(mpc, stensor, public), S=Tuple[int, int])
+    switched = mpc.mhe.stats.secure_mhe_mpc_switch_count - before
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\t{label}: switched once ({switched} ciphertexts for {len(ciphers._data)})", switched, len(ciphers._data))
+        assert_eq(f"CP{mpc.pid}:\t{label}: the result the same at every party, flagged broadcast", out._is_broadcast and same_at_every_party(mpc, out._data), True)
+        assert_eq_approx(f"CP{mpc.pid}:\t{label}: decrypted with source -1", out.reveal(mpc, source_pid=-1), raw @ public, error=0.01)
+    assert_parties_in_step(mpc, label)
+
+    # Each party's own share, encrypted: every party's switched in turn, and each party gets its own result back
+    own = Ciphertensor[ckks.Ciphertext].enc(mpc, share) if mpc.pid else Ciphertensor[ckks.Ciphertext].zeros(mpc, [rows, cols])
+    label = "Ciphertensor via MPC, default mode, each party's own tensor"
+    per_party = own.via_mpc(mpc, lambda stensor: secure_operator.matmul(mpc, stensor, public), S=Tuple[int, int])
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\t{label}: not flagged broadcast", per_party._is_broadcast, False)
+        assert_eq_approx(f"CP{mpc.pid}:\t{label}", per_party.reveal(mpc), share @ public, error=0.01)
+    assert_parties_in_step(mpc, label)
+
+
+def test_mpa_reveal_sums_only(mpc):
+    """MPA.reveal of shares the compute parties hold in the clear reveals their sum and nothing else (M-MP-15): each
+    party sends the others its share under pairwise masks that cancel in the sum, so a vector a party receives differs
+    from the sender's share (it used to receive the raw share), and reveal sends exactly the branch round and those
+    vectors. Float and int shares, a 1-dim MPA, and a party without a share (it adds zeros); CP0 sends nothing."""
+    n_cp = mpc.comms.number_of_parties - 1
+    rows, cols = 3, 5
+    with mpc.randomness.global_stream():
+        shares = [array(random_floats((rows, cols))) for _ in range(n_cp)]
+        int_shares = [array(random_ints((rows, cols), -50, 50)) for _ in range(n_cp)]
+    total = shares[0].copy()
+    int_total = int_shares[0].copy()
+    for q in range(1, n_cp):
+        total = total + shares[q]
+        int_total = int_total + int_shares[q]
+    mpa = MPA(mpc, shares[mpc.pid - 1] if mpc.pid else zeros((rows, cols)))
+
+    # The vectors the parties send: each differs from its sender's share in every entry, and they add up to the sum
+    masked = mpa._masked_plain_share(rows * cols) if mpc.pid else List[mpc_uint]()
+    if mpc.pid:
+        modulus = mpc.default_mpc_modulus
+        k, f = MPA._plain_encoding(n_cp)
+        received = mpc.comms.collect(masked)
+        summed = received[0]
+        for q in range(1, n_cp + 1):
+            raw = [double_to_fp(v, modulus, k, f) for v in shares[q - 1].flatten().tolist()]
+            equal = sum(int(raw[i] == received[q - 1][i]) for i in range(len(raw)))
+            assert_eq(f"CP{mpc.pid}:\tMPA reveal: CP{q} sends its share masked (entries equal to the share: {equal})", equal, 0)
+            if q > 1:
+                summed = summed.add_mod(received[q - 1], modulus)
+        flat_total = total.flatten()
+        error = max(abs(fp_to_double(summed[i], modulus, MPC_MODULUS_BITS - 1, f) - flat_total[i]) for i in range(len(summed)))
+        assert_eq(f"CP{mpc.pid}:\tMPA reveal: the masked shares add up to the sum (error {error:.2e})", error < 1e-9, True)
+
+    sent = mpc.stats.bytes_sent
+    revealed = mpa.reveal()
+    sent = mpc.stats.bytes_sent - sent
+    expected = (n_cp - 1) * (2 * sizeof(int) + [1, rows, cols]._pickle_size() + masked._pickle_size()) if mpc.pid else 0
+    assert_eq(f"CP{mpc.pid}:\tMPA reveal sends the branch round and the masked shares only", sent, expected)
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA reveal of shares in the clear: the sum", revealed, total, error=1e-9)
+    assert_parties_in_step(mpc, "MPA reveal of shares in the clear")
+
+    revealed_int = MPA(mpc, int_shares[mpc.pid - 1] if mpc.pid else zeros((rows, cols), dtype=int)).reveal()
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tMPA reveal of int shares in the clear: the exact sum", revealed_int, int_total)
+    assert_parties_in_step(mpc, "MPA reveal of int shares in the clear")
+
+    without_last = MPA(mpc, shares[mpc.pid - 1]) if 0 < mpc.pid < n_cp else MPA[Tuple[int, int], float](mpc) if mpc.pid else MPA(mpc, zeros((rows, cols)))
+    revealed_partial = without_last.reveal()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA reveal with a compute party without a share", revealed_partial, total - shares[n_cp - 1], error=1e-9)
+    assert_parties_in_step(mpc, "MPA reveal with a compute party without a share")
+
+    vector = MPA(mpc, array([1.5, -2.25, 3.0]) if mpc.pid else zeros((3,)))
+    revealed_vector = vector.reveal()
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA reveal of a 1-dim MPA", revealed_vector, array([1.5, -2.25, 3.0]) * float(n_cp), error=1e-9)
+    assert_parties_in_step(mpc, "MPA reveal of a 1-dim MPA")
+
+
+def test_mpa_mixed_to_sharetensor(mpc):
+    """M-MP-24: an MPA that CP1 holds in the clear and the other compute parties encrypted (built by hand: no operation
+    leaves one) switches to MPC: every compute party enters one council, and every party aggregates, a share in the
+    clear encrypted for it. Only the parties in the clear entered the council, and the others went straight to the
+    aggregate's collect, so the parties' messages no longer matched."""
+    n_cp = mpc.comms.number_of_parties - 1
+    share = cohort_matrix(mpc, 2, 4)
+    if mpc.pid == 0:
+        mixed = MPA[Tuple[int, int], float](mpc, share.zeros())
+    elif mpc.pid == 1:
+        mixed = MPA[Tuple[int, int], float](mpc, share)
+    else:
+        mixed = MPA[Tuple[int, int], float](mpc, Ciphertensor[ckks.Ciphertext].enc(mpc, share, encoding=ENC_ROW))
+    revealed = mixed.to_sharetensor().reveal(mpc)
+    assert_parties_in_step(mpc, "MPA held in the clear and encrypted, to MPC")
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA held in the clear at CP1 and encrypted elsewhere, to MPC", array(revealed), share * float(n_cp), error=0.01)
+
+    # A vector, under default_encoding(ENC_DIAG): the share in the clear is encrypted row-wise for the aggregate, a
+    # vector's only layout (the ambient encoding asserted at CP1 alone)
+    vector = column(cohort_matrix(mpc, 4, 1), 0)
+    with mpc.default_encoding(ENC_DIAG):
+        if mpc.pid == 0:
+            mixed_vector = MPA[Tuple[int], float](mpc, vector.zeros())
+        elif mpc.pid == 1:
+            mixed_vector = MPA[Tuple[int], float](mpc, vector)
+        else:
+            mixed_vector = MPA[Tuple[int], float](mpc, Ciphertensor[ckks.Ciphertext].enc(mpc, vector, encoding=ENC_ROW))
+        revealed_vector = mixed_vector.to_sharetensor().reveal(mpc)
+    assert_parties_in_step(mpc, "MPA vector held in the clear and encrypted, to MPC under ENC_DIAG")
+    if mpc.pid:
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA vector held in the clear at CP1 and encrypted elsewhere, to MPC under ENC_DIAG", array(revealed_vector), vector * float(n_cp), error=0.01)
+
+
+def test_mpa_pad_with_value(mpc):
+    """H-16: pad_with_value (LinReg's and LogReg's bias column) on MPAs, whose compute parties hold additive shares, so
+    the new entries must add up to the value: shares in the clear (each party padded with ones: the column added up to
+    the number of compute parties), encrypted shares and the aggregate (concat asserted on the stored shape, and the
+    aggregate came back as each party's encryption), and shares with their aggregate at once (both kept). A padded
+    aggregate stays the same ciphertexts at every party."""
+    n_cp = mpc.comms.number_of_parties - 1
+    for rows, cols in ((4, 3), (2, 5)):  # encoded column-wise and row-wise
+        with mpc.randomness.global_stream():
+            shares = [array(random_floats((rows, cols))) for _ in range(n_cp)]
+        total = shares[0].copy()
+        for q in range(1, n_cp):
+            total = total + shares[q]
+        expected = with_columns(total, 1, 1.0)
+        share = shares[mpc.pid - 1] if mpc.pid else zeros((rows, cols))
+
+        plain = MPA(mpc, share)
+        encrypted = MPA(mpc, Ciphertensor[ckks.Ciphertext].enc(mpc, share)) if mpc.pid else MPA(mpc, zeros((rows, cols)))
+        both = MPA(mpc, share)
+        both.aggregate()
+        aggregate_only = MPA[Tuple[int, int], float]._from_parts(
+            mpc, zeros((rows, cols)) if mpc.pid == 0 else ndarray[Tuple[int, int], float](), Ciphertensor[ckks.Ciphertext](),
+            both._aggregate.copy() if mpc.pid else Ciphertensor[ckks.Ciphertext]())
+
+        padded_plain = plain.pad_with_value(1.0, 1, 1)
+        padded_encrypted = encrypted.pad_with_value(1.0, 1, 1)
+        padded_both = both.pad_with_value(1.0, 1, 1)
+        padded_aggregate = aggregate_only.pad_with_value(1.0, 1, 1)
+        if mpc.pid:
+            label = f"MPA pad_with_value, {rows} x {cols}"
+            assert_eq(f"CP{mpc.pid}:\t{label}: representations kept", (padded_plain.is_plain(), padded_encrypted.is_distributed(), padded_both.has_plain() and padded_both.has_aggregate(), padded_aggregate.is_aggregate()), (True, True, True, True))
+            assert_eq(f"CP{mpc.pid}:\t{label}: the padded aggregate is the same at every party", same_at_every_party(mpc, padded_aggregate._aggregate._data), True)
+            assert_eq(f"CP{mpc.pid}:\t{label}: shares and aggregate, the aggregate the same at every party", same_at_every_party(mpc, padded_both._aggregate._data), True)
+        assert_parties_in_step(mpc, f"MPA pad_with_value, {rows} x {cols}")
+
+        revealed_plain = padded_plain.reveal()
+        revealed_encrypted = padded_encrypted.reveal()
+        revealed_both = padded_both.reveal()
+        revealed_both_plain = MPA[Tuple[int, int], float]._from_parts(mpc, padded_both._plain, Ciphertensor[ckks.Ciphertext](), Ciphertensor[ckks.Ciphertext]()).reveal()
+        revealed_aggregate = padded_aggregate.reveal()
+        revealed_operand = plain.reveal()
+        if mpc.pid:
+            label = f"MPA pad_with_value, {rows} x {cols}"
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: shares in the clear", revealed_plain, expected, error=1e-9)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: encrypted shares", revealed_encrypted, expected, error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: shares and their aggregate", revealed_both, expected, error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: shares and their aggregate, the shares", revealed_both_plain, expected, error=1e-9)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: aggregate", revealed_aggregate, expected, error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: operand kept", revealed_operand, total, error=1e-9)
+        assert_parties_in_step(mpc, f"MPA pad_with_value, {rows} x {cols}: reveals")
+
+
+def test_mpa_negative_indices(mpc):
+    """M-MHE-19's MPA part: negative int indices of a 1-dim MPA (m[-1] read the empty slice(-1, 0))
+    and of a 2-dim one's columns (m[:, -1] too), in the clear and encrypted; an index out of range raises IndexError at
+    every party."""
+    a = cohort_matrix(mpc, 3, 4)
+    values = [a[0, j] for j in range(4)]
+    for encrypted in (False, True):
+        label = f"MPA {'encrypted' if encrypted else 'in the clear'}"
+        v = MPA[Tuple[int], float](mpc, array(values) if mpc.pid <= 1 else array([0.0 for _ in range(4)]))
+        m = MPA[Tuple[int, int], float](mpc, a if mpc.pid <= 1 else a.zeros())
+        if encrypted:
+            v.encrypt()
+            m.encrypt()
+        last = v[-1]
+        col = m[:, -1]
+        row = m[-1]
+        revealed_last = last.reveal()
+        revealed_col = col.reveal()
+        revealed_row = row.reveal()
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\t{label} 1-dim m[-1]", revealed_last, array([values[3]]), error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label} m[:, -1]", revealed_col, array([[a[i, 3]] for i in range(3)]), error=1e-3)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label} m[-1]", revealed_row, array([a[2, j] for j in range(4)]), error=1e-3)
+        assert_parties_in_step(mpc, f"{label}: negative indices")
+        raised = False
+        try:
+            v[4]
+        except IndexError:
+            raised = True
+        assert_eq(f"CP{mpc.pid}:\t{label} 1-dim m[4] of 4 raises IndexError", raised, True)
+        assert_parties_in_step(mpc, f"{label}: m[4]")
+        # A 2-dim MPA's row index in setitem: negative from the end, out of range IndexError at every party, CP0 included
+        # (review c19-cr3-2). On a copy: an MPA in the clear holds its share's data, which setitem writes into
+        m = MPA[Tuple[int, int], float](mpc, a.copy() if mpc.pid <= 1 else a.zeros())
+        if encrypted:
+            m.encrypt()
+        m[-1] = m[0]
+        revealed_m = m.reveal()
+        if mpc.pid:
+            expected_m = a.copy()
+            for j in range(4):
+                expected_m[2, j] = a[0, j]
+            assert_eq_approx(f"CP{mpc.pid}:\t{label} m[-1] = m[0]", revealed_m, expected_m, error=1e-3)
+        raised = False
+        try:
+            m[9] = m[0]
+        except IndexError:
+            raised = True
+        assert_eq(f"CP{mpc.pid}:\t{label} 2-dim m[9] = row of 3 rows raises IndexError", raised, True)
+        assert_parties_in_step(mpc, f"{label}: m[9] = row")
+
+
+MPA_STATES = ["shares in the clear", "shares in the clear beside their encryption", "shares only encrypted",
+              "shares in the clear beside their aggregate", "only an aggregate", "mixed (CP1 encrypted, the others in the clear)"]
+
+
+def mpa_in_state(mpc, value, state: int) -> MPA[Tuple[int, int], float]:
+    # An MPA of value whose shares every compute party holds (CP1 three quarters, the others the rest in equal parts, so a
+    # sum of the shares' powers differs from the power of their sum), in one of MPA_STATES. A copy of value: an MPA in
+    # the clear holds its share's data, which a setitem writes into
+    n_cp = mpc.comms.number_of_parties - 1
+    weight = 0.75 if mpc.pid == 1 else 0.25 / float(n_cp - 1)
+    share = value.copy() * weight if mpc.pid else value.zeros()
+    if (state == 2 and mpc.pid) or (state == 5 and mpc.pid == 1):
+        return MPA[Tuple[int, int], float](mpc, Ciphertensor[ckks.Ciphertext].enc(mpc, share, encoding=ENC_ROW))
+    m = MPA[Tuple[int, int], float](mpc, share)
+    if state == 1:
+        m.encrypt()
+    elif state == 3 or state == 4:
+        m.aggregate()
+        if state == 4 and mpc.pid:
+            m._plain = ndarray[Tuple[int, int], float]()
+    return m
+
+
+def held_flags(mpc, m) -> List[int]:
+    # What a compute party's MPA holds: [plain, encryption, aggregate]
+    return [int(m.has_plain()), int(m.has_encryption()), int(m.has_aggregate())]
+
+
+def test_mpa_powers(mpc):
+    """H-28: M ** p is the power of the value (the sum of the shares), for p = 0..3 and every MPA state. Each party raised
+    its own share (in the clear and encrypted), which gave the sum of the shares' powers whenever two parties hold nonzero
+    shares; p = 0 asserted on an encryption and gave N - 1 in the clear; a mixed MPA (CP1 encrypted) desynced. M ** 2
+    equals M * M in value and in what the result holds (an aggregate for an MPA that is only one, encrypted shares
+    otherwise), and a negative power raises ValueError at every party, CP0 included."""
+    a = cohort_matrix(mpc, 3, 4)
+    for state in range(len(MPA_STATES)):
+        label = f"MPA {MPA_STATES[state]}"
+        for p in (0, 1, 2, 3):
+            m = mpa_in_state(mpc, a, state)
+            r = m ** p
+            revealed = r.reveal()
+            want = ones((3, 4))
+            for _ in range(p):
+                want = want * a
+            if mpc.pid:
+                assert_eq_approx(f"CP{mpc.pid}:\t{label} ** {p}", revealed, want, error=0.05, rel_error=1e-3)
+            assert_parties_in_step(mpc, f"{label} ** {p}")
+        m = mpa_in_state(mpc, a, state)
+        squared = m * m
+        m2 = mpa_in_state(mpc, a, state)
+        powered = m2 ** 2
+        squared_flags = held_flags(mpc, squared)
+        powered_flags = held_flags(mpc, powered)
+        revealed_squared = squared.reveal()
+        revealed_powered = powered.reveal()
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: M ** 2 equals M * M", revealed_powered, revealed_squared, error=0.05, rel_error=1e-3)
+            assert_eq(f"CP{mpc.pid}:\t{label}: M ** 2 holds what M * M holds ({powered_flags} vs {squared_flags})", powered_flags == squared_flags, True)
+        assert_parties_in_step(mpc, f"{label}: M ** 2 and M * M")
+
+    raised = False
+    try:
+        mpa_in_state(mpc, a, 0) ** -1
+    except ValueError:
+        raised = True
+    assert_eq(f"CP{mpc.pid}:\tMPA ** -1 raises ValueError", raised, True)
+    assert_parties_in_step(mpc, "MPA ** -1")
+
+
+def test_mpa_ones_and_float_setitem(mpc):
+    """H-29: MPA.ones() and float setitems put the value into the hub's share only (every compute party's share held it,
+    so the MPA held N - 1 times the value), in every representation the MPA holds: shares in the clear, encrypted
+    (row-wise and column-wise), and the aggregate (the same at every party afterwards). The setitem asserted on anything
+    but shares in the clear; an encryption or aggregate kept beside shares in the clear is dropped, not left stale (the
+    reveal and the next operation read the value set). Rows, cells and blocks of 2-dim MPAs, elements of 1-dim ones."""
+    a = cohort_matrix(mpc, 3, 4)
+    for state in range(len(MPA_STATES) - 1):
+        label = f"MPA {MPA_STATES[state]}"
+        o = mpa_in_state(mpc, a, state).ones()
+        revealed_ones = o.reveal()
+        if mpc.pid:
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: ones()", revealed_ones, ones((3, 4)), error=1e-9)
+        for kind in range(3):
+            m = mpa_in_state(mpc, a, state)
+            want = a.copy()
+            if kind == 0:
+                m[1] = 0.5
+                for j in range(4): want[1, j] = 0.5
+            elif kind == 1:
+                m[1, -2] = 0.5
+                want[1, 2] = 0.5
+            else:
+                m[0:2, 1:3] = -1.25
+                for i in range(2):
+                    for j in range(1, 3): want[i, j] = -1.25
+            what = ["M[1] = 0.5", "M[1, -2] = 0.5", "M[0:2, 1:3] = -1.25"][kind]
+            if mpc.pid and m.has_aggregate():
+                assert_eq(f"CP{mpc.pid}:\t{label}: {what}: the aggregate the same at every party", same_at_every_party(mpc, m._aggregate._data), True)
+            doubled = m * 2.0
+            revealed = m.reveal()
+            revealed_doubled = doubled.reveal()
+            if mpc.pid:
+                assert_eq_approx(f"CP{mpc.pid}:\t{label}: {what}", revealed, want, error=1e-3)
+                assert_eq_approx(f"CP{mpc.pid}:\t{label}: {what}, then M * 2", revealed_doubled, want * 2.0, error=1e-2)
+            assert_parties_in_step(mpc, f"{label}: {what}")
+
+    # Shares only encrypted column-wise (a tall matrix, stored transposed): a row is a stored column
+    tall = cohort_matrix(mpc, 6, 2)
+    n_cp = mpc.comms.number_of_parties - 1
+    weight = 0.75 if mpc.pid == 1 else 0.25 / float(n_cp - 1)
+    if mpc.pid:
+        enc = Ciphertensor[ckks.Ciphertext].enc(mpc, (tall * weight).T.copy(), encoding=ENC_ROW)
+        enc._transposed = True
+        cw = MPA[Tuple[int, int], float](mpc, enc)
+    else:
+        cw = MPA[Tuple[int, int], float](mpc, tall.zeros())
+    cw[4] = 0.5
+    cw[1, 0] = -0.75
+    revealed_cw = cw.reveal()
+    if mpc.pid:
+        want_cw = tall.copy()
+        want_cw[4, 0] = 0.5
+        want_cw[4, 1] = 0.5
+        want_cw[1, 0] = -0.75
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA shares encrypted column-wise: M[4] = 0.5, M[1, 0] = -0.75", revealed_cw, want_cw, error=1e-3)
+    assert_parties_in_step(mpc, "MPA shares encrypted column-wise: setitems")
+
+    # A row of column-wise shares (review c20-cr3-2): getitem keeps it in 2-dim storage ([2, 1] flagged transposed), whose
+    # length the compute parties took as 1 (CP0 as 2): setitems raised at the compute parties only, ** 0 held one value,
+    # and the switch to MPC kept one value (also on HEAD)
+    if mpc.pid:
+        enc_rows = Ciphertensor[ckks.Ciphertext].enc(mpc, (tall * weight).T.copy(), encoding=ENC_ROW)
+        enc_rows._transposed = True
+        cw_rows = MPA[Tuple[int, int], float](mpc, enc_rows)
+    else:
+        cw_rows = MPA[Tuple[int, int], float](mpc, tall.zeros())
+    row = cw_rows[4]
+    lengths = mpc.comms.collect(len(row), include_trusted_dealer=True)
+    assert_eq(f"CP{mpc.pid}:\tMPA row of column-wise shares: length 2 at every party", all(l == 2 for l in lengths), True)
+    switched_row = row.to_sharetensor().reveal(mpc)
+    doubled_row = (row * 2.0).reveal()
+    row_ones = (row ** 0).reveal()
+    row[0] = 0.5
+    row[-1] = -0.5
+    revealed_row = row.reveal()
+    if mpc.pid:
+        want_row = array([tall[4, 0], tall[4, 1]])
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA row of column-wise shares: to_sharetensor", switched_row, want_row, error=1e-3)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA row of column-wise shares: * 2", doubled_row, want_row * 2.0, error=1e-3)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA row of column-wise shares: ** 0", row_ones, ones((2,)), error=1e-9)
+        assert_eq_approx(f"CP{mpc.pid}:\tMPA row of column-wise shares: v[0] = 0.5, v[-1] = -0.5", revealed_row, array([0.5, -0.5]), error=1e-3)
+    assert_parties_in_step(mpc, "MPA row of column-wise shares")
+
+    # 1-dim MPAs: an element, in the clear, encrypted and as an aggregate
+    values = [a[0, j] for j in range(4)]
+    for state in (0, 2, 4):
+        share = array(values) * weight if mpc.pid else array([0.0 for _ in range(4)])
+        if state == 2 and mpc.pid:
+            v = MPA[Tuple[int], float](mpc, Ciphertensor[ckks.Ciphertext].enc(mpc, share, encoding=ENC_ROW))
+        else:
+            v = MPA[Tuple[int], float](mpc, share)
+            if state == 4:
+                v.aggregate()
+                if mpc.pid:
+                    v._plain = ndarray[Tuple[int], float]()
+        v[2] = 0.5
+        v[-1] = 2.0
+        revealed_v = v.reveal()
+        if mpc.pid:
+            want_v = array([values[0], values[1], 0.5, 2.0])
+            assert_eq_approx(f"CP{mpc.pid}:\t1-dim MPA {MPA_STATES[state]}: v[2] = 0.5, v[-1] = 2.0", revealed_v, want_v, error=1e-3)
+        assert_parties_in_step(mpc, f"1-dim MPA {MPA_STATES[state]}: setitems")
+
+    # Shared storage (review c20-cr2-1, -2; the user chose "Copy before writing"): m + c and m - x give every compute party
+    # but the hub m's own share, and a view's data in the clear is its parent's; a float setitem into the result or the
+    # view changed m too (silently), or left m's cached encryption or aggregate stale. Now m keeps its value, in every
+    # state, and a setitem on a view leaves the parent as it was.
+    for state in range(len(MPA_STATES) - 1):
+        label = f"MPA {MPA_STATES[state]}"
+        m = mpa_in_state(mpc, a, state)
+        r = m + 1.0
+        r[0, 1] = 0.5
+        d = m - mpa_in_state(mpc, a * 0.5, 4)  # an aggregate: the hub subtracts it from its share, the others keep m's
+        d[2, 3] = -2.0
+        sub = m[0:2]
+        sub[1, 2] = 4.0
+        revealed_m = m.reveal()
+        revealed_m_product = (m * 1.0).reveal()
+        revealed_r = r.reveal()
+        revealed_d = d.reveal()
+        revealed_sub = sub.reveal()
+        if mpc.pid:
+            want_r = a + 1.0
+            want_r[0, 1] = 0.5
+            want_d = a * 0.5
+            want_d[2, 3] = -2.0
+            want_sub = array([[a[i, j] for j in range(4)] for i in range(2)])
+            want_sub[1, 2] = 4.0
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: m unchanged by setitems into m + c, m - x and m[0:2]", revealed_m, a, error=1e-2)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: m * 1.0 agrees with m's reveal", revealed_m_product, a, error=1e-2)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: (m + 1)[0, 1] = 0.5", revealed_r, want_r, error=1e-2)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: (m - x)[2, 3] = -2", revealed_d, want_d, error=1e-2)
+            assert_eq_approx(f"CP{mpc.pid}:\t{label}: m[0:2][1, 2] = 4", revealed_sub, want_sub, error=1e-2)
+        assert_parties_in_step(mpc, f"{label}: setitems into shared storage")
+
+
+def aggregate_only(mpc, value, level: int) -> MPA[Tuple[int, int], float]:
+    # An MPA that holds only an aggregate of value (CP1's share), at level: the same ciphertexts at every compute party
+    m = MPA(mpc, value if mpc.pid == 1 else value.zeros())
+    m.aggregate()
+    if mpc.pid:
+        m._plain = ndarray[Tuple[int, int], float]()
+        m._aggregate._data = mpc.mhe.drop_level(m._aggregate._data, level)
+    return m
+
+
+def test_mpa_aggregate_operations_stay_identical(mpc):
+    """M-MHE-26 through MPA: operations on an MPA that holds only an aggregate, at the bootstrap level and one level
+    above it: sums over either axis, a dot product, a product with a public matrix and a product of two aggregates. A sum
+    refreshed the aggregate's mask product at every party in a round of its own (one bootstrap per party per
+    ciphertext), and the copies came apart; now the copies stay the same at every compute party, with at most one
+    bootstrap per ciphertext refreshed."""
+    lb = mpc.mhe.bootstrap_min_level
+    m35 = cohort_matrix(mpc, 3, 5) * 0.5
+    m53 = cohort_matrix(mpc, 5, 3) * 0.5
+    for level in (lb, lb + 1):
+        cases = [("sum(0)", 0), ("sum(1)", 1), ("dot(1)", 2), ("@ public 5x3", 3), ("@ an aggregate's transpose", 4)]
+        for name, op in cases:
+            a = aggregate_only(mpc, m35, level)
+            before = mpc.mhe.stats.secure_bootstrap_count
+            if op == 0:
+                r = a.sum(0)
+                want = array([[sum(m35[i, j] for i in range(3)) for j in range(5)]])
+                most = 1
+            elif op == 1:
+                r = a.sum(1)
+                want = array([[sum(m35[i, j] for j in range(5)) for i in range(3)]])
+                most = 3
+            elif op == 2:
+                r = a.dot(1)
+                want = array([[sum(m35[i, j] * m35[i, j] for j in range(5)) for i in range(3)]])
+                most = 6
+            elif op == 3:
+                r2 = a @ m53
+                bootstraps = mpc.mhe.stats.secure_bootstrap_count - before
+                label = f"MPA (an aggregate at level {level}) {name}"
+                if mpc.pid:
+                    assert_eq(f"CP{mpc.pid}:\t{label}: the copies the same at every compute party", same_at_every_party(mpc, r2._aggregate._data), True)
+                    assert_eq(f"CP{mpc.pid}:\t{label}: at most 3 bootstraps (got {bootstraps})", bootstraps <= 3, True)
+                revealed2 = r2.reveal()
+                if mpc.pid:
+                    assert_eq_approx(f"CP{mpc.pid}:\t{label}", revealed2, m35 @ m53, error=2e-2)
+                assert_parties_in_step(mpc, label)
+                continue
+            else:
+                b = aggregate_only(mpc, m35, level)
+                r2 = a @ b.T
+                bootstraps = mpc.mhe.stats.secure_bootstrap_count - before
+                label = f"MPA (an aggregate at level {level}) {name}"
+                if mpc.pid:
+                    assert_eq(f"CP{mpc.pid}:\t{label}: the copies the same at every compute party", same_at_every_party(mpc, r2._aggregate._data), True)
+                    assert_eq(f"CP{mpc.pid}:\t{label}: at most 12 bootstraps (got {bootstraps})", bootstraps <= 12, True)
+                revealed2 = r2.reveal()
+                if mpc.pid:
+                    assert_eq_approx(f"CP{mpc.pid}:\t{label}", revealed2, m35 @ m35.T, error=2e-2)
+                assert_parties_in_step(mpc, label)
+                continue
+            bootstraps = mpc.mhe.stats.secure_bootstrap_count - before
+            label = f"MPA (an aggregate at level {level}).{name}"
+            if mpc.pid:
+                assert_eq(f"CP{mpc.pid}:\t{label}: the copies the same at every compute party", same_at_every_party(mpc, r._aggregate._data), True)
+                assert_eq(f"CP{mpc.pid}:\t{label}: at most {most} bootstraps (got {bootstraps})", bootstraps <= most, True)
+            revealed = r.reveal()
+            if mpc.pid:
+                assert_eq_approx(f"CP{mpc.pid}:\t{label}", revealed, want[0], error=2e-2)
+            assert_parties_in_step(mpc, label)
+
 
 def test_mpa[TP](mpc: MPCEnv[TP], modulus: TP):
     mpc.comms.sync_parties()
@@ -175,5 +856,18 @@ def test_mpa[TP](mpc: MPCEnv[TP], modulus: TP):
     test_mpa_mpc_switching(mpa_a, raw_a)
     test_mpa_elem_wise_operations(mpa_a, mpa_b, raw_a, raw_b)
     test_mpa_matmul_operations(mpa_a, mpa_b, raw_a, raw_b)
+    test_mpa_aggregates_stay_identical(mpa_a, raw_a)
+    test_mpa_matmul_operand_order(mpa_a, mpa_b, raw_a, raw_b)
+    test_mpa_matmul_cost_agreement(mpa_a, raw_a)
+    test_mpa_int_to_sharetensor(mpc)
+    test_mpa_public_product_via_mpc(mpc)
+    test_mpa_via_mpc_default_mode(mpc)
+    test_mpa_reveal_sums_only(mpc)
+    test_mpa_mixed_to_sharetensor(mpc)
+    test_mpa_pad_with_value(mpc)
+    test_mpa_negative_indices(mpc)
+    test_mpa_powers(mpc)
+    test_mpa_ones_and_float_setitem(mpc)
+    test_mpa_aggregate_operations_stay_identical(mpc)
 
     print(f'CP{mpc.pid}:\tSequre MHE MPA tests on {alg_struct} passed.\n')

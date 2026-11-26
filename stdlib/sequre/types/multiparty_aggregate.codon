@@ -10,9 +10,16 @@ from sequre.mpc.env import MPCEnv
 from sequre.lattiseq.ckks import Ciphertext
 from sequre.stdlib.builtin import sign
 from sequre.types.builtin import *
-from sequre.types.ciphertensor import Ciphertensor
+from sequre.types.ciphertensor import Ciphertensor, MATMUL_VIA_MPC
 from sequre.utils.io import read_ndarray
-from sequre.constants import HE_ENC_COST_ESTIMATE, MHE_MUL_TO_ADD_THRESHOLD
+from sequre.types.utils import double_to_fp, fp_to_double
+from sequre.constants import HE_ENC_COST_ESTIMATE, MHE_MUL_TO_ADD_THRESHOLD, MPC_MODULUS_BITS, MPC_NBIT_F, ENC_ROW
+
+
+# Fixed point of the shares MPA.reveal masks (_masked_plain_share): twice the MPC fraction bits, and as many integer
+# bits as the field leaves once the compute parties' shares are summed (MPA._plain_encoding), so masking adds no
+# range limit a float share would plausibly hit (|x| < 2^105 with 192-bit fields and up to seven compute parties)
+MPA_REVEAL_FRAC_BITS: Static[int] = 2 * MPC_NBIT_F
 
 
 # Multiparty aggregate
@@ -40,6 +47,10 @@ class MPA[S, dtype]:
         self._plain = ndarray[S, dtype]()
         self._encryption = Ciphertensor[Ciphertext]() if aggregate else encryption
         self._aggregate = encryption if aggregate else Ciphertensor[Ciphertext]()
+        # An aggregate is the same ciphertexts at every party: refreshes bootstrap it once, collectively, and keep it so.
+        # An encryption is each party's own (also when an operation derived it from a copy of an aggregate).
+        if aggregate: self._aggregate._is_broadcast = True
+        else: self._encryption._is_broadcast = False
 
     @staticmethod
     def _from_plain(mpc: MPCEnv[mpc_uint], plain: ndarray[S, dtype]) -> MPA[S, dtype]:
@@ -54,6 +65,8 @@ class MPA[S, dtype]:
         out = MPA[S, dtype](mpc, plain)
         out._encryption = encryption
         out._aggregate = aggregate
+        if encryption: out._encryption._is_broadcast = False
+        if aggregate: out._aggregate._is_broadcast = True
         return out
     
     def __len__(self) -> int:
@@ -83,10 +96,10 @@ class MPA[S, dtype]:
 
     def __setitem__(self, index, other: MPA):
         mpc = self._mpc
+        # The index is checked at every party, CP0 included (an int out of range raises IndexError alike)
+        adj_index = self._adjust_indices(index)
         if mpc.pid == 0:
             return
-        
-        adj_index = self._adjust_indices(index)
         
         if other.has_plain():
             assert self.has_plain(), "MPA: cannot set MPA with plain value into MPA without plain value"
@@ -101,14 +114,99 @@ class MPA[S, dtype]:
             self._aggregate._setitem(mpc, adj_index, other._aggregate)
     
     def __setitem__(self, index, other: float):
-        assert self.is_plain(), "MPA: Cannot set float value into plain MPA"
-        
-        if self._mpc.pid == 0:
-            return
-        
+        # The selected entries take the value in every representation the MPA holds, so that its value (the sum of the
+        # shares) has it there: the hub's share holds the value and the other compute parties' shares 0, in the clear or
+        # encrypted, as MPA.enc and ones() split a value (every party writing the value made it N - 1 times the value,
+        # H-29); an aggregate holds it in every copy alike, in the broadcast mode. An encryption or an aggregate kept
+        # beside the shares (encrypt(), aggregate()) would go stale: it is dropped, as MPA ± MPP drops what it does not
+        # update, and the operations rebuild it when they need it. What it writes gets storage of its own first (the
+        # user's choice, 2026-11-16): an MPA can share its share with another (a view's data in the clear is its
+        # parent's, and m + c gives every party but the hub m's own share), which an in-place write changed too, and a
+        # parent's cached encryption or aggregate went stale; so a float setitem on a view leaves the parent as it was.
+        # Shares in the clear are copied; an encryption or aggregate gets a list of its own of the same ciphertexts
+        # (_own_list): the setitem replaces list entries, and its refreshes change no value. The index is
+        # checked at every party, CP0 included. The compute parties are expected to hold the MPA alike, all in the
+        # clear or all encrypted (M-MP-28): setting into encrypted shares refreshes them in councils among the compute
+        # parties.
+        mpc = self._mpc
         adj_index = self._adjust_indices(index)
-        self._plain[adj_index] = other
-        
+        if mpc.pid == 0:
+            return
+
+        share_value = other if mpc.pid == mpc.comms.hub_pid else type(other)(0)
+        if self.has_plain():
+            self._plain = self._plain.copy()
+            self._plain[adj_index] = share_value
+            self._encryption = Ciphertensor[Ciphertext]()
+            self._aggregate = Ciphertensor[Ciphertext]()
+        elif self.has_encryption():
+            self._encryption = MPA._own_list(self._encryption)
+            MPA[S, dtype]._set_constant(mpc, self._encryption, adj_index, float(share_value), self.shape)
+            self._aggregate = Ciphertensor[Ciphertext]()
+        else:
+            assert self.has_aggregate(), "MPA: cannot set a value into an empty MPA"
+            self._aggregate = MPA._own_list(self._aggregate)
+            MPA[S, dtype]._set_constant(mpc, self._aggregate, adj_index, float(other), self.shape)
+
+    @staticmethod
+    def _own_list(ct: Ciphertensor[Ciphertext]) -> Ciphertensor[Ciphertext]:
+        # The same ciphertexts in a list of the tensor's own, for a setitem: it replaces list entries, and its refreshes
+        # change no value (an aggregate's run alike at every party), so whoever shares the old list keeps its values.
+        # Ciphertensor.copy would copy every ciphertext (List.copy copies the elements).
+        out = ct.copy(shallow=True)
+        out._data = ct._data[:]
+        return out
+
+    @staticmethod
+    def _set_constant(mpc, target: Ciphertensor[Ciphertext], index, value: float, shape):
+        # The entries `index` (as _adjust_indices gives it) of an encrypted share or of the aggregate set to a public
+        # value: trivial ciphertexts of the value (no noise; every party knows the value) in the target's layout, set in
+        # the target's own refresh mode, so that an aggregate's copies stay the same at every party. A diagonal-encoded
+        # target raises NotImplementedError (Ciphertensor's setitem).
+        if static.len(S) == 1:
+            start, stop = Ciphertensor._range_of(index, shape[0])
+            if target.ndim == 2:
+                # A 1-dim MPA kept in 2-dim storage (a row of column-wise shares, [n, 1] flagged transposed, as getitem
+                # gives it): the positions along its logical row (or column)
+                rows, _ = target.actual_shape
+                whole = slice(start=0, stop=1, step=1)
+                span = slice(start=start, stop=stop, step=1)
+                block = ones((1, stop - start) if rows == 1 else (stop - start, 1), dtype=float) * value
+                if target._transposed:
+                    item = Ciphertensor[Ciphertext].enc_public(mpc, block.T.copy(), encoding=ENC_ROW)
+                    item._transposed = True
+                else:
+                    item = Ciphertensor[Ciphertext].enc_public(mpc, block, encoding=ENC_ROW)
+                item._is_broadcast = target._is_broadcast
+                target._setitem(mpc, (whole, span) if rows == 1 else (span, whole), item)
+                return
+            item = Ciphertensor[Ciphertext].enc_public(mpc, ones((stop - start,), dtype=float) * value, encoding=ENC_ROW)
+            item._is_broadcast = target._is_broadcast
+            target._setitem(mpc, slice(start=start, stop=stop, step=1), item)
+        elif static.len(S) == 2:
+            r_start, r_stop, c_start, c_stop = MPA._index_ranges(index, shape[0], shape[1])
+            block = ones((r_stop - r_start, c_stop - c_start), dtype=float) * value
+            if target.ndim == 2 and target._transposed:
+                item = Ciphertensor[Ciphertext].enc_public(mpc, block.T.copy(), encoding=ENC_ROW)
+                item._transposed = True
+            else:
+                item = Ciphertensor[Ciphertext].enc_public(mpc, block, encoding=ENC_ROW)
+            item._is_broadcast = target._is_broadcast
+            target._setitem(mpc, (slice(start=r_start, stop=r_stop, step=1), slice(start=c_start, stop=c_stop, step=1)), item)
+        else:
+            compile_error("MPA: setitem supports 1-dim and 2-dim MPAs")
+
+    @staticmethod
+    def _index_ranges(index, rows: int, cols: int) -> Tuple[int, int, int, int]:
+        # The row and column ranges [start, stop) of a 2-dim MPA's index as _adjust_indices gives it: a row, a row slice,
+        # or a (row, column) pair of ints and slices
+        if isinstance(index, tuple):
+            r_start, r_stop = Ciphertensor._range_of(index[0], rows)
+            c_start, c_stop = Ciphertensor._range_of(index[1], cols)
+            return r_start, r_stop, c_start, c_stop
+        r_start, r_stop = Ciphertensor._range_of(index, rows)
+        return r_start, r_stop, 0, cols
+
     def __gt__(self, other) -> MPA[S, dtype]:
         if isinstance(other, MPA) or isinstance(other, Ciphertensor):
             compile_error("Not implemented yet: Comparison between MPAs and Ciphertensors")
@@ -145,6 +243,12 @@ class MPA[S, dtype]:
     
     def __matmul__(self, other):
         _self, _other = self._check_binary_operands(other)
+        if isinstance(_other, ndarray) and static.len(S) == 2:
+            if _self._public_matmul_via_mpc(list(_other.shape)):
+                # One conversion of the whole MPA (the aggregate, or the sum of the encrypted shares) to MPC and back to
+                # an aggregate, at every party, CP0 included
+                mpc = self._mpc
+                return _self.via_mpc(lambda stensor: secure_operator.matmul(mpc, stensor, _other))
         return MPA[S, _self.dtype]._matmul(self._mpc, _self, _other)
     
     def __truediv__(self, other) -> MPA[S, dtype]:
@@ -153,11 +257,31 @@ class MPA[S, dtype]:
         raise NotImplementedError("MPAs cannot be divided by secure value yet")
     
     def __pow__(self, other: int) -> MPA[S, dtype]:
-        return MPA[S, dtype]._from_parts(
-            self._mpc,
-            self._plain ** other,
-            secure_operator.pow(self._mpc, self._encryption, other),
-            secure_operator.pow(self._mpc, self._aggregate, other))
+        # The value (the sum of the shares) to the power, as other - 1 products M * M give it (MPA._mul), in value and in
+        # representation: an MPA that is only an aggregate gives the aggregate's power (refreshed in the broadcast mode,
+        # every party alike); one that holds shares gives each compute party's encrypted share times the aggregate's
+        # power other - 1, encrypted shares of the power, with the share's encryption and the aggregate kept beside the
+        # shares (as M * M keeps them). Each party raising its own share gave the sum of the shares' powers (H-28). Every
+        # compute party takes the same branch however it holds its share (in the clear, encrypted, or both); the product
+        # converts the factor to a party's share's layout through MPC, so the parties' encrypted shares are expected in
+        # one layout, as for M * M (a mixed MPA whose shares encrypt into different layouts hangs there: M-MP-28). CP0
+        # returns a placeholder. Power 0 is ones (held as ones() holds them), power 1 a copy; a negative power raises
+        # ValueError at every party.
+        if other < 0:
+            raise ValueError(f"MPA: negative powers are not supported (got {other})")
+        if other == 0:
+            return self.ones()
+        if other == 1:
+            return self.copy()
+        mpc = self._mpc
+        if mpc.pid == 0:
+            return MPA[S, dtype]._from_plain(mpc, self._plain)
+        if self.is_aggregate():
+            return MPA[S, dtype](mpc, secure_operator.pow(mpc, self._aggregate, other), aggregate=True)
+        self.encrypt()
+        self.aggregate()
+        factor = self._aggregate if other == 2 else secure_operator.pow(mpc, self._aggregate, other - 1)
+        return MPA[S, dtype](mpc, self._encryption.mul(mpc, factor))
 
     def enc[S, dtype](self, mpc, data: ndarray[S, dtype]) -> MPA[S, dtype]:
         return MPA[S, dtype]._from_plain(mpc, data if mpc.pid == 1 else data.zeros())
@@ -229,7 +353,11 @@ class MPA[S, dtype]:
             enc = self._aggregate
         
         if static.len(S) == 1:
-            return (enc.actual_shape[0],)
+            # A 1-dim MPA can be kept in 2-dim storage (a row of column-wise shares is [n, 1] flagged transposed, actual
+            # shape [1, n]): its length is the storage's size; actual_shape[0] gave 1 at the compute parties while CP0
+            # gave n
+            actual = enc.actual_shape
+            return (actual[0] * actual[1],) if enc.ndim == 2 else (actual[0],)
         elif static.len(S) == 2:
             m, n = enc.actual_shape
             return (m, n)
@@ -296,11 +424,21 @@ class MPA[S, dtype]:
         if mpc.pid == 0 or self.has_encryption():
             return
         
-        if self.has_aggregate():
-            self._encryption = self._aggregate if mpc.pid == mpc.comms.hub_pid else Ciphertensor[Ciphertext].zeros(mpc, self._aggregate.shape)
+        if not self.has_plain():
+            # Only an aggregate: it is encrypted already, and held alike at every compute party, which the operations
+            # rely on. Nothing to do (M-MP-19: it used to fall through to the assertion and raise).
+            assert self.has_aggregate(), "MPA: Cannot encrypt empty MPA"
+            return
         
-        assert self.has_plain(), "MPA: Cannot encrypt empty MPA"
-        self._encryption = Ciphertensor[Ciphertext].enc(mpc, self._plain)
+        self._encryption = MPA[S, dtype]._encrypted_share(mpc, self._plain)
+
+    @staticmethod
+    def _encrypted_share(mpc, plain: ndarray[S, dtype]) -> Ciphertensor[Ciphertext]:
+        # A share held in the clear, encrypted: a vector row-wise, its only layout, whatever the ambient encoding (which
+        # it asserted on); a matrix in the ambient encoding, as before
+        if static.len(S) == 1:
+            return Ciphertensor[Ciphertext].enc(mpc, plain, encoding=ENC_ROW)
+        return Ciphertensor[Ciphertext].enc(mpc, plain)
     
     def aggregate(self):
         mpc = self._mpc
@@ -311,20 +449,23 @@ class MPA[S, dtype]:
             enc = self._encryption
         else:
             assert self.has_plain(), "MPA: Cannot aggregate empty MPA"
-            enc = Ciphertensor[Ciphertext].enc(mpc, self._plain)
+            enc = MPA[S, dtype]._encrypted_share(mpc, self._plain)
         
         self._aggregate = enc.aggregate(mpc)
     
     def reveal(self, *args) -> ndarray[S, dtype]:
+        # The sum of the shares, to every party; nothing else about the shares
         mpc = self._mpc
         if mpc.pid == 0:
             return self._plain
         
-        if mpc.council(self.is_plain() or self.is_empty()).all():
-            print(
-                f"CP{mpc.pid}: WARNING! Revealing MPA partition without secure "
-                f"aggregation since all parties have plaintext data")
-            return mpc.comms.collect(self._plain).sum()
+        # One round among the compute parties decides the branch: whether every one holds its share in the clear (or
+        # none), and the shape of those shares, which a party without one needs
+        mine = [int(self.is_plain() or self.is_empty())]
+        mine.extend(list(self._plain.shape) if self.has_plain() else [0 for _ in range(static.len(S))])
+        council = mpc.comms.collect(mine)
+        if all(bool(d[0]) for d in council):
+            return self._reveal_plain_sum(council)
         
         self.aggregate()
         revealed_matrix = self._aggregate.reveal(mpc, T=dtype)
@@ -337,7 +478,94 @@ class MPA[S, dtype]:
         else:
             compile_error("MPA reveal: invalid shape")
     
+    def _reveal_plain_sum(self, council: List[List[int]]) -> ndarray[S, dtype]:
+        # The sum of the shares every compute party holds in the clear (or none), and nothing else about them (M-MP-15):
+        # each party sends the others its share under pairwise masks that cancel in the sum (_masked_plain_share)
+        mpc = self._mpc
+        shape = List[int]()
+        for d in council:
+            if any(e != 0 for e in d[1:]):
+                shape = d[1:]
+                break
+        if not shape:
+            return self._plain  # every party's share is empty
+        size = 1
+        for e in shape: size *= e
+
+        modulus = self.modulus
+        total = List[mpc_uint](size)
+        for _ in range(size): total.append(mpc_uint(0))
+        for masked in mpc.comms.collect(self._masked_plain_share(size)):
+            total = total.add_mod(masked, modulus)
+        values = MPA._decode_plain_sum(total, modulus, mpc.comms.number_of_parties - 1, T=dtype)
+
+        if static.len(S) == 1:
+            return array(values, dtype=dtype)
+        elif static.len(S) == 2:
+            return array(values, dtype=dtype).reshape((shape[0], shape[1]))
+        else:
+            compile_error("MPA reveal: invalid shape")
+
+    def _masked_plain_share(self, size: int) -> List[mpc_uint]:
+        # This compute party's share in the clear (zeros of the given size if it holds none), in fixed point modulo the
+        # MPC field, plus a uniform mask from the PRG stream it shares with each other compute party: added towards a
+        # higher party and subtracted towards a lower one, so the masks cancel in the sum of every party's vector. With
+        # three or more compute parties the vector each party sends is uniform to any other (it lacks a mask); with two,
+        # the sum and one's own share give the other's anyway. Every compute party calls it, in step (the pairs' streams).
+        mpc = self._mpc
+        modulus = self.modulus
+        if self.has_plain():
+            values = self._plain.flatten().tolist()
+        else:
+            values = [dtype(0) for _ in range(size)]
+        assert len(values) == size, f"MPA reveal: the compute parties' shares differ in size ({len(values)} vs {size})"
+
+        k, f = MPA._plain_encoding(mpc.comms.number_of_parties - 1)
+        encoded = List[mpc_uint](size)
+        for v in values:
+            if isinstance(dtype, float):
+                encoded.append(double_to_fp(v, modulus, k, f))
+            elif isinstance(dtype, int):
+                encoded.append(v.to_int_t(modulus))
+            else:
+                compile_error("MPA reveal: shares in the clear must be float or int")
+
+        for q in range(1, mpc.comms.number_of_parties):
+            if q == mpc.pid:
+                continue
+            with mpc.randomness.seed_switch(q):
+                mask = encoded.rand(modulus, "uniform")
+            encoded = encoded.add_mod(mask, modulus) if mpc.pid < q else encoded.sub_mod(mask, modulus)
+        return encoded
+
+    @staticmethod
+    def _plain_encoding(compute_parties: int) -> Tuple[int, int]:
+        # The fixed point (total bits k, fraction bits f) of a float share in _masked_plain_share: a sum of the compute
+        # parties' shares stays below 2^(MPC_MODULUS_BITS - 2) in magnitude, inside half the field
+        return MPC_MODULUS_BITS - 1 - compute_parties.bitlen(), MPA_REVEAL_FRAC_BITS
+
+    @staticmethod
+    def _decode_plain_sum[T](total: List[mpc_uint], modulus: mpc_uint, compute_parties: int) -> List[T]:
+        # The sum of the masked shares (the masks cancelled) back to values: centered modulo the field
+        out = List[T](len(total))
+        if isinstance(T, float):
+            _, f = MPA._plain_encoding(compute_parties)
+            k_sum = MPC_MODULUS_BITS - 1
+            for v in total:
+                out.append(0.0 if v == mpc_uint(0) else fp_to_double(v, modulus, k_sum, f))
+        elif isinstance(T, int):
+            half = modulus >> mpc_uint(1)
+            for v in total:
+                out.append(int(v) if v <= half else -int(modulus - v))
+        else:
+            compile_error("MPA reveal: shares in the clear must be float or int")
+        return out
+
     def reveal_local(self, *args) -> ndarray[S, dtype]:
+        # This compute party's own share: in the clear as it is; an encrypted share decrypted to this party alone
+        # (MPCMHE.decrypt's default mode, in which every compute party takes part, so call it at every party). An MPA
+        # that holds only its aggregate, the same ciphertexts at every party, has no share of its own: revealing it
+        # reveals the sum, to every party.
         mpc = self._mpc
         if self.has_distributed():
             print(f"CP{mpc.pid}: INFO: Revealing local MPA share")
@@ -404,7 +632,11 @@ class MPA[S, dtype]:
         return MPA[S, dtype]._from_plain(self._mpc, zeros(self.shape, dtype=dtype))
     
     def ones(self, *args) -> MPA[S, dtype]:
-        return MPA[S, dtype]._from_plain(self._mpc, ones(self.shape, dtype=dtype))
+        # An MPA whose value is ones, in the clear: the hub's share ones and the other compute parties' zeros, as
+        # MPA.enc splits a value (every party's share ones made the value N - 1, H-29)
+        mpc = self._mpc
+        data = ones(self.shape, dtype=dtype)
+        return MPA[S, dtype]._from_plain(mpc, data if mpc.pid == mpc.comms.hub_pid else data.zeros())
 
     def hstack(self, other: MPA[S, dtype]) -> MPA[S, dtype]:
         if self.is_plain() and other.is_plain():
@@ -424,19 +656,21 @@ class MPA[S, dtype]:
             compile_error("MPA: only 2-dim MPPs can be padded with values")
         
         assert axis == 1, "Not implemented yet: MPA pad_with_value over 0-axes"
-        shared_value = val if mpc.pid == 1 else type(val)(0)
+        assert not self.is_empty(), "MPA: empty MPA"
 
-        if self.has_plain():
-            return MPA[S, dtype]._from_plain(mpc, self._plain.pad_with_value(shared_value, size, axis))
-        elif self.has_encryption():
-            return MPA[S, dtype](mpc, self._encryption.pad_with_value(shared_value, size, axis, mpc))
-        else:
-            assert self.has_aggregate(), "MPA: empty MPA"
-            return MPA[S, dtype](mpc, self._aggregate.pad_with_value(val, size, axis, mpc))
+        # The new entries add up to val over the compute parties. Each representation present is padded and kept as
+        # what it is: a share in the clear and its encryption with val at the hub (CP1) and 0 elsewhere; the aggregate,
+        # the same ciphertexts at every party, with val itself.
+        shared_value = val if mpc.pid == 1 else type(val)(0)
+        plain = self._plain.pad_with_value(shared_value, size, axis) if self.has_plain() else ndarray[S, dtype]()
+        encryption = self._encryption.pad_with_value(shared_value, size, axis, mpc) if self.has_encryption() else Ciphertensor[Ciphertext]()
+        aggregate = self._aggregate.pad_with_value(val, size, axis, mpc) if self.has_aggregate() else Ciphertensor[Ciphertext]()
+
+        return MPA[S, dtype]._from_parts(mpc, plain, encryption, aggregate)
 
     @staticmethod
     def rand(shape: S, distribution: str, mpc, plain: bool = False) -> MPA[S, dtype]:
-        with mpc.randomness.seed_switch(-1):
+        with mpc.randomness.global_stream():
             rand_data = rand(shape, distribution)
 
         if plain or mpc.pid == 0:
@@ -448,7 +682,8 @@ class MPA[S, dtype]:
             if transpose:
                 rand_data = rand_data.T
 
-        enc = Ciphertensor[Ciphertext].enc(mpc, rand_data)
+        # Every party drew the same data: encrypt it trivially, so the aggregate is the same ciphertexts everywhere.
+        enc = Ciphertensor[Ciphertext].enc_public(mpc, rand_data)
         if transpose:
             enc = enc.T
         
@@ -486,13 +721,15 @@ class MPA[S, dtype]:
     @staticmethod
     def _get_matmul_public_cost(first: MPA[S, dtype], other: ndarray[S, dtype]) -> float:
         if first._mpc.pid == 0 or first.has_plain():
-            return first._plain.get_matmul_cost(other)
-        
-        if first.has_aggregate():
-            return first._aggregate.get_matmul_cost(other)
-        
-        assert first.has_encryption(), "MPA: invalid/empty factor"
-        return first._encryption.get_matmul_cost(other)
+            cost = first._plain.get_matmul_cost(other)
+        elif first.has_aggregate():
+            cost = first._aggregate.get_matmul_cost(other)
+        else:
+            assert first.has_encryption(), "MPA: invalid/empty factor"
+            cost = first._encryption.get_matmul_cost(other)
+
+        # Every party, CP0 included, decides on the same estimate: the compute parties' largest.
+        return max(first._mpc.comms.collect(cost, True)[1:])
     
     # Internal typechecker hack
     @property
@@ -533,14 +770,30 @@ class MPA[S, dtype]:
             if static.len(index) != 2:
                 compile_error("MPA indexing error: MPA can be indexed only up to two dimensions")
             row_idx, col_idx = index
+            if isinstance(row_idx, int):
+                row_idx = MPA._normalized_index(row_idx, self.shape[0])
             if isinstance(col_idx, int):
-                return (row_idx, slice(start=col_idx, stop=col_idx + 1, step=1))
-        
-        if static.len(S) == 1:
-            if isinstance(index, int):
-                return slice(start=index, stop=index + 1, step=1)
+                j = MPA._normalized_index(col_idx, self.shape[1])
+                return (row_idx, slice(start=j, stop=j + 1, step=1))
+            return (row_idx, col_idx)
+
+        if isinstance(index, int):
+            # Checked at every party alike, CP0 included: a 1-dim MPA's index as a slice, a 2-dim one's row as an int
+            i = MPA._normalized_index(index, self.shape[0])
+            if static.len(S) == 1:
+                return slice(start=i, stop=i + 1, step=1)
+            return i
 
         return index
+
+    @staticmethod
+    def _normalized_index(index: int, n: int) -> int:
+        # An int index: counted from the end when negative (as a slice, slice(-1, 0) was empty: M-MHE-19), and IndexError
+        # out of range, at every party alike (the shape is the same at each)
+        i = index + n if index < 0 else index
+        if not (0 <= i < n):
+            raise IndexError(f"MPA: index {index} is out of range for an axis of {n}")
+        return i
 
     @sequre
     def _add_public[S, dtype](mpc, self: MPA[S, dtype], other) -> MPA[S, dtype]:
@@ -662,7 +915,8 @@ class MPA[S, dtype]:
                 return MPA[S, dtype](mpc, (self._encryption - other._aggregate) if mpc.pid == mpc.comms.hub_pid else self._encryption)
         
         if self.has_aggregate() and other.has_encryption() and not Ciphertensor.requires_collective(self._aggregate, other._encryption):
-            return MPA[S, dtype](mpc, (self._aggregate - other._encryption) if mpc.pid == mpc.comms.hub_pid else -other._encryption)
+            # Ciphertensor.neg: a unary minus on a Ciphertensor is not rewritten here and raised at every party but the hub
+            return MPA[S, dtype](mpc, (self._aggregate - other._encryption) if mpc.pid == mpc.comms.hub_pid else other._encryption.neg(mpc))
 
         self.aggregate()
         other.aggregate()
@@ -733,12 +987,40 @@ class MPA[S, dtype]:
     def _matmul_public[S, dtype](mpc, self: MPA[S, dtype], other: ndarray[S, dtype]) -> MPA[S, dtype]:
         if mpc.pid == 0 or self.has_plain():
             return MPA[S, dtype](mpc, self._plain @ other)
-        
+
+        # Whether to switch to MPC was decided for the whole MPA (_matmul): this product stays in HE, as a switch here
+        # would need CP0 and would convert every party's copy of an aggregate
+        allow_mpc_switch = mpc.default_allow_mpc_switch
+        mpc.default_allow_mpc_switch = False
         if self.has_aggregate():
-            return MPA[S, dtype](mpc, self._aggregate @ other, aggregate=True)
-        
-        assert self.has_encryption(), "MPA: invalid/empty factor"
-        return MPA[S, dtype](mpc, self._encryption @ other)
+            result = MPA[S, dtype](mpc, self._aggregate @ other, aggregate=True)
+        else:
+            assert self.has_encryption(), "MPA: invalid/empty factor"
+            result = MPA[S, dtype](mpc, self._encryption @ other)
+        mpc.default_allow_mpc_switch = allow_mpc_switch
+        return result
+
+    def _public_matmul_via_mpc(self, other_shape: List[int]) -> bool:
+        # Under allow_mpc_switch: whether the product with a plaintext matrix of other_shape switches to MPC (H-53).
+        # The switch is estimated on the MPA's shape as Ciphertensor's router estimates a row-wise tensor's, from public
+        # data; it applies only if the compute parties hold the MPA encrypted (as an aggregate or as encrypted shares)
+        # and row-wise, which CP0 cannot see: one round with every party, CP0 included, settles it. Call it at every
+        # party.
+        mpc = self._mpc
+        if not mpc.default_allow_mpc_switch or static.len(S) != 2:
+            return False
+        slots = mpc.mhe.crypto_params.params.slots()
+        shape = list(self.shape)
+        placeholder = Ciphertensor[Ciphertext].placeholder(shape, slots)
+        if placeholder._ndarray_matmul_route(other_shape, True, True, mpc.pid, debug=False) != MATMUL_VIA_MPC:
+            return False
+
+        if mpc.pid == 0 or self.has_plain():
+            eligible = mpc.pid == 0
+        else:
+            enc = self._aggregate if self.has_aggregate() else self._encryption
+            eligible = not enc._transposed and not enc._diagonal_contiguous
+        return all(mpc.comms.collect(eligible, include_trusted_dealer=True)[1:])
     
     @sequre
     def _matmul[S, dtype](mpc, self: MPA[S, dtype], other) -> MPA[S, dtype]:
@@ -756,10 +1038,10 @@ class MPA[S, dtype]:
         if other.has_distributed():
             other.encrypt()
             self.aggregate()
-            return MPA[S, dtype](mpc, other._encryption @ self._aggregate)
-        
+            return MPA[S, dtype](mpc, self._aggregate @ other._encryption)
+
         assert self.is_aggregate() and other.is_aggregate(), "MPA: invalid/empty factor"
-        return MPA[S, dtype](mpc, other._aggregate @ self._aggregate, aggregate=True)
+        return MPA[S, dtype](mpc, self._aggregate @ other._aggregate, aggregate=True)
 
     # Temporary helpers
     def slice_local(self, idx: int, *args) -> MPA[S, dtype]:

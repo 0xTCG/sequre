@@ -33,6 +33,8 @@ mask = mpu > 0.5
 | `"partition"` | MPP | Data naturally split by rows (e.g., each hospital holds patients) |
 | `"additive"` | MPA | Data that needs to be additively split across parties |
 
+A partition-mode MPU's sums across its partitions (`X.sum(0)`, column sums) come back as an additive-mode MPU: each compute party's share is its partial sum, in the clear only if every partition is. Its sums within the partitions (`X.sum(1)`) stay in partition mode. See `MPU.sum` in the [MPU Reference](mpu.md#methods).
+
 ## See also
 
 - [MPC ↔ MHE Switching](../user-guide/switching.md) — How `via_mpc` enables switching between protocols mid-computation

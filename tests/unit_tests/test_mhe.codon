@@ -1,3 +1,4 @@
+import math
 import prg
 
 from copy import copy
@@ -7,10 +8,15 @@ import sequre.lattiseq.ring as ring
 import sequre.lattiseq.ringqp as ringqp
 
 from sequre.utils.stats import precision_stats
-from sequre.utils.testing import assert_eq
+from sequre.utils.testing import assert_eq, assert_eq_approx, same_at_every_party
 from sequre.utils.utils import random_floats
-from sequre.constants import MPC_FIELD_SIZE, MPC_RING_SIZE
+from sequre.constants import MPC_MODULUS_BITS, mpc_uint
 from sequre.types.utils import fp_to_double, double_to_fp
+
+from sequre.stdlib.numpy.create import array
+from sequre.types.ciphertensor import Ciphertensor
+
+from multiparty_testing import decryption_bytes, assert_parties_in_step
 
 
 def test_send_receive_poly(mpc):
@@ -78,7 +84,7 @@ def test_send_receive_ciphertext(mpc):
 
 
 def test_decryption(mpc):
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         values = random_floats((mpc.mhe.crypto_params.params.slots(),))
     
     if mpc.pid > 0:
@@ -94,7 +100,7 @@ def test_decryption(mpc):
 
 
 def test_const_addition(mpc):
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         values = random_floats((mpc.mhe.crypto_params.params.slots(),))
         constant = prg.random() * 7
 
@@ -113,7 +119,7 @@ def test_const_addition(mpc):
 
 
 def test_const_subtraction(mpc):
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         values = random_floats((mpc.mhe.crypto_params.params.slots(),))
         constant = prg.random() * 7
 
@@ -132,7 +138,7 @@ def test_const_subtraction(mpc):
 
 
 def test_const_multiplication(mpc):
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         values = random_floats((mpc.mhe.crypto_params.params.slots(),))
         constant = prg.random() * 7
     
@@ -152,7 +158,7 @@ def test_const_multiplication(mpc):
 
 
 def test_addition(mpc):
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         values_1 = random_floats((mpc.mhe.crypto_params.params.slots(),))
         values_2 = random_floats((mpc.mhe.crypto_params.params.slots(),))
 
@@ -172,7 +178,7 @@ def test_addition(mpc):
 
 
 def test_subtraction(mpc):
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         values_1 = random_floats((mpc.mhe.crypto_params.params.slots(),))
         values_2 = random_floats((mpc.mhe.crypto_params.params.slots(),))
 
@@ -192,7 +198,7 @@ def test_subtraction(mpc):
 
 
 def test_multiplication(mpc):
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         values_1 = random_floats((mpc.mhe.crypto_params.params.slots(),))
         values_2 = random_floats((mpc.mhe.crypto_params.params.slots(),))
     
@@ -213,7 +219,7 @@ def test_multiplication(mpc):
 
 
 def test_rotation(mpc):
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         values = random_floats((mpc.mhe.crypto_params.params.slots(),))
         k = prg.randint(1, 10)
         expected_values = values[k:]
@@ -233,6 +239,50 @@ def test_rotation(mpc):
         assert_eq(f"CP{mpc.pid}:\tMHE rotation by {k} result", stats.min_precision.l2 > 10, True)
 
 
+def test_rotation_any_step(mpc):
+    """M-MHE-02: mhe.rotate by negative steps beyond the dedicated keys (a direct rotation by -100 had no key), by steps
+    near the slots either way and beyond them."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    with mpc.randomness.global_stream():
+        values = random_floats((slots,))
+    
+    if mpc.pid > 0:
+        ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
+        for k in (-1, -100, -1000, slots - 3, slots + 3, -(slots + 70), 2 * slots):
+            s = ((k % slots) + slots) % slots
+            expected_values = values[s:]
+            expected_values.extend(values[:s])
+            stats = precision_stats(
+                mpc=mpc,
+                result=mpc.mhe.decode(enc=mpc.mhe.decrypt(mpc.mhe.rotate(ciphervector, k)), dtype=float),
+                expected=expected_values)
+            assert_eq(f"CP{mpc.pid}:\tMHE rotation by {k} result", stats.min_precision.l2 > 10, True)
+
+
+def test_masks(mpc):
+    """L-076 and H-20: mask_range keeps [start, stop) with a stop of the slots as the end (stop % slots made it 0: an
+    empty mask), or every other slot; mask_one's complement keeps the other ciphertexts (it filled them with ones). The
+    masks are plaintexts."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    with mpc.randomness.global_stream():
+        values = random_floats((slots + 10,))
+    
+    if mpc.pid > 0:
+        ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
+        first = values[:slots]
+        kept = mpc.mhe.decode(enc=mpc.mhe.decrypt([mpc.mhe.mask_range(ciphervector[0], 100, slots)]), dtype=float)
+        assert_eq_approx(f"CP{mpc.pid}:\tMHE mask_range [100, slots)", kept, [(first[i] if i >= 100 else 0.0) for i in range(slots)], error=1e-3)
+        others = mpc.mhe.decode(enc=mpc.mhe.decrypt([mpc.mhe.mask_range(ciphervector[0], 100, slots, complement=True)]), dtype=float)
+        assert_eq_approx(f"CP{mpc.pid}:\tMHE mask_range [100, slots) complement", others, [(first[i] if i < 100 else 0.0) for i in range(slots)], error=1e-3)
+        expected_one = [0.0 for _ in range(2 * slots)]
+        expected_one[slots + 5] = values[slots + 5]
+        one = mpc.mhe.decode(enc=mpc.mhe.decrypt(mpc.mhe.mask_one(ciphervector, slots + 5)), dtype=float)
+        assert_eq_approx(f"CP{mpc.pid}:\tMHE mask_one at slots + 5", one, expected_one, error=1e-3)
+        expected_all_but = [(values[i] if i < slots + 10 and i != slots + 5 else 0.0) for i in range(2 * slots)]
+        all_but = mpc.mhe.decode(enc=mpc.mhe.decrypt(mpc.mhe.mask_one(ciphervector, slots + 5, complement=True)), dtype=float)
+        assert_eq_approx(f"CP{mpc.pid}:\tMHE mask_one at slots + 5 complement", all_but, expected_all_but, error=1e-3)
+
+
 def test_arithmetics(mpc):
     test_const_addition(mpc)
     test_const_subtraction(mpc)
@@ -241,10 +291,12 @@ def test_arithmetics(mpc):
     test_subtraction(mpc)
     test_multiplication(mpc)
     test_rotation(mpc)
+    test_rotation_any_step(mpc)
+    test_masks(mpc)
 
 
 def test_collective_bootstrapping(mpc):
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         values = random_floats((mpc.mhe.crypto_params.params.slots(),))
         ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
 
@@ -269,7 +321,7 @@ def test_collective_bootstrapping(mpc):
 
 
 def test_cipher_to_additive_plaintext_conversion(mpc):
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         values = random_floats((mpc.mhe.crypto_params.params.slots(),))
 
     if mpc.pid > 0:
@@ -290,7 +342,7 @@ def test_cipher_to_additive_plaintext_conversion(mpc):
 
 
 def test_cipher_to_additive_share_vec_conversion(mpc, mpc_modulus):
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         values = random_floats((mpc.mhe.crypto_params.params.slots(),))
 
     if mpc.pid > 0:
@@ -311,7 +363,7 @@ def test_cipher_to_additive_share_vec_conversion(mpc, mpc_modulus):
 
 def test_mhe_mpc_conversion_additive_shares_sum_correctly(mpc, mpc_modulus):
     """Test that additive shares from all parties sum to the original value."""
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         values = random_floats((mpc.mhe.crypto_params.params.slots(),), scale=5.0)
 
     if mpc.pid > 0:
@@ -332,7 +384,7 @@ def test_mhe_mpc_conversion_additive_shares_sum_correctly(mpc, mpc_modulus):
 
 def test_mhe_mpc_conversion_double_roundtrip(mpc, mpc_modulus):
     """Test that double round-trip conversion preserves values."""
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         values = random_floats((mpc.mhe.crypto_params.params.slots(),), scale=3.0)
 
     if mpc.pid > 0:
@@ -358,7 +410,7 @@ def test_mhe_mpc_conversion_double_roundtrip(mpc, mpc_modulus):
 def test_mhe_mpc_conversion_negative_values(mpc, mpc_modulus):
     """Test conversion with negative values."""
     slots = mpc.mhe.crypto_params.params.slots()
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         # Generate values in range [-5, 5]
         values = [prg.random() * 10.0 - 5.0 for _ in range(slots)]
 
@@ -382,7 +434,7 @@ def test_mhe_mpc_conversion_partial_slots(mpc, mpc_modulus):
     slots = mpc.mhe.crypto_params.params.slots()
     partial_size = slots // 3  # Use only 1/3 of slots
     
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         values = random_floats((partial_size,), scale=4.0)
 
     if mpc.pid > 0:
@@ -404,7 +456,7 @@ def test_mhe_mpc_conversion_multiple_ciphertexts(mpc, mpc_modulus):
     slots = mpc.mhe.crypto_params.params.slots()
     num_values = slots * 2 + slots // 2  # 2.5 ciphertexts worth
     
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         values = random_floats((num_values,), scale=2.0)
 
     if mpc.pid > 0:
@@ -425,7 +477,7 @@ def test_mhe_mpc_conversion_multiple_ciphertexts(mpc, mpc_modulus):
 
 def test_mhe_mpc_conversion_mpc_operations_on_shares(mpc, mpc_modulus):
     """Test that MPC operations work correctly on converted shares."""
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         values = random_floats((mpc.mhe.crypto_params.params.slots(),), scale=2.0)
 
     if mpc.pid > 0:
@@ -455,7 +507,7 @@ def test_mhe_mpc_conversion_from_different_sources(mpc, mpc_modulus):
     """Test conversion when ciphertext originates from different parties."""
     slots = mpc.mhe.crypto_params.params.slots()
     
-    with mpc.randomness.seed_switch(-1):
+    with mpc.randomness.global_stream():
         values = random_floats((slots,), scale=3.0)
     
     if mpc.pid > 0:
@@ -475,27 +527,326 @@ def test_mhe_mpc_conversion_from_different_sources(mpc, mpc_modulus):
         assert_eq(f"CP{mpc.pid}:\tMHE->MPC from source_pid=1", stats.min_precision.l2 > 10, True)
 
 
-def test_mhe(mpc):
+def switch_precision_bound(mpc) -> float:
+    # Bits of precision the HE->MPC switch keeps on values below 4 (the worst of the slots): its error is the
+    # encryption's rounding noise times the collective secret key, whose variance grows with the compute parties, so the
+    # precision falls by half a bit when they double. Measured since Lattiseq's mod-down rounds (L-232), 30 runs each,
+    # field and ring, the four checks below: 18.7 to 19.9 bits with two compute parties (median 19.5), 18.3 to 19.6 with
+    # three (median 19.2). The bound, 17 bits at two, is 1.6 bits below the lowest of those 240 values; a loss of 3
+    # bits fails it. (Before the fix a mod-down that floored left a bias set by the keys: 13.9 to 17.6 bits.)
+    return 17.0 - 0.5 * math.log2(float(mpc.comms.number_of_parties - 1) / 2.0)
+
+
+def test_mhe_mpc_switch_masks(mpc, mpc_modulus):
+    """The MHE->MPC shares hide x: every compute party's share is masked far beyond x, and the shares still sum to x."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    with mpc.randomness.global_stream():
+        values = random_floats((slots,), scale=4.0)
+
+    if mpc.pid > 0:
+        ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
+        secret_share = mpc.mhe.ciphervector_to_additive_share_vector(ciphervector, slots, mpc_modulus, source_pid=1)
+        own = fp_to_double(secret_share, mpc_modulus, k=MPC_MODULUS_BITS)  # the default k keeps only 63 bits
+        masked = sum(1 for v in own if abs(v) > 2.0 ** 100)
+        assert_eq(f"CP{mpc.pid}:\tMHE->MPC share masked beyond 2^100 ({masked} of {slots} slots)", masked > slots * 99 // 100, True)
+
+        stats = precision_stats(mpc=mpc, result=fp_to_double(mpc.comms.reveal(secret_share, mpc_modulus), mpc_modulus), expected=values)
+        # The worst of the 8192 slots carries the public-key encryption noise: about 19.5 bits of precision since
+        # Lattiseq's mod-down rounds (see switch_precision_bound; 13.1 to 14.8 bits before). A conversion that loses
+        # the value (wrong masks, a share missing) gives about 0 bits.
+        assert_eq(f"CP{mpc.pid}:\tMHE->MPC masked shares sum to x", stats.min_precision.l2 > 12, True)
+
+
+def test_mhe_mpc_switch_levels(mpc, mpc_modulus):
+    """A ciphertext at the lowest level whose modulus holds the masks converts as it is; one a level lower is first
+    bootstrapped. Both convert correctly."""
+    params = mpc.mhe.crypto_params.params
+    slots = params.slots()
+    with mpc.randomness.global_stream():
+        values = random_floats((slots,), scale=4.0)
+
+    if mpc.pid > 0:
+        mask_bits = mpc.mhe._mhe_to_mpc_mask_bits(params.default_scale)
+        level = mpc.mhe._mhe_to_mpc_level(mask_bits)
+        assert_eq(f"CP{mpc.pid}:\tMHE->MPC mask bits", mask_bits, 128 + params.logn + 34 + 32)
+        assert_eq(f"CP{mpc.pid}:\tMHE->MPC switch level", level, 5)
+
+        ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
+        for at, bootstraps in ((level, 0), (level - 1, 1)):
+            low = mpc.mhe.drop_level(ciphervector, at)
+            before = mpc.mhe.stats.secure_bootstrap_count
+            secret_share = mpc.mhe.ciphervector_to_additive_share_vector(low, slots, mpc_modulus, source_pid=1)
+            assert_eq(f"CP{mpc.pid}:\tMHE->MPC from level {at}: {bootstraps} bootstrap(s)", mpc.mhe.stats.secure_bootstrap_count - before, bootstraps)
+            stats = precision_stats(mpc=mpc, result=fp_to_double(mpc.comms.reveal(secret_share, mpc_modulus), mpc_modulus), expected=values)
+            assert_eq(f"CP{mpc.pid}:\tMHE->MPC from level {at}", stats.min_precision.l2 > switch_precision_bound(mpc), True)
+
+
+def test_mhe_mpc_switch_from_one_holder(mpc, mpc_modulus):
+    """A single holder drops its ciphertexts to the switch level before it broadcasts them: the hub as the holder sends
+    exactly that much. A ciphertext below the level goes out as it is and is bootstrapped. All convert correctly."""
+    params = mpc.mhe.crypto_params.params
+    slots = params.slots()
+    with mpc.randomness.global_stream():
+        values = random_floats((2 * slots,), scale=4.0)
+
+    if mpc.pid > 0:
+        level = mpc.mhe._mhe_to_mpc_level(mpc.mhe._mhe_to_mpc_mask_bits(params.default_scale))
+        fresh = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
+        hub = mpc.comms.hub_pid
+        receivers = mpc.comms.number_of_parties - 2
+
+        # The hub sends nothing else in a switch without bootstraps: it only receives the others' shares.
+        sent = mpc.stats.bytes_sent
+        secret_share = mpc.mhe.ciphervector_to_additive_share_vector(fresh, 2 * slots, mpc_modulus, source_pid=hub)
+        if mpc.pid == hub:
+            expected = receivers * (sizeof(int) + mpc.mhe.drop_level(fresh, level)._pickle_size())
+            assert_eq(f"CP{mpc.pid}:\tMHE->MPC holder sends its ciphertexts at the switch level", mpc.stats.bytes_sent - sent, expected)
+        stats = precision_stats(mpc=mpc, result=fp_to_double(mpc.comms.reveal(secret_share, mpc_modulus), mpc_modulus), expected=values)
+        assert_eq(f"CP{mpc.pid}:\tMHE->MPC from one holder", stats.min_precision.l2 > switch_precision_bound(mpc), True)
+
+        mixed = [fresh[0], mpc.mhe.drop_level(fresh[1:], level - 1)[0]]
+        before = mpc.mhe.stats.secure_bootstrap_count
+        secret_share = mpc.mhe.ciphervector_to_additive_share_vector(mixed, 2 * slots, mpc_modulus, source_pid=2)
+        assert_eq(f"CP{mpc.pid}:\tMHE->MPC from one holder at two levels: 1 bootstrap", mpc.mhe.stats.secure_bootstrap_count - before, 1)
+        stats = precision_stats(mpc=mpc, result=fp_to_double(mpc.comms.reveal(secret_share, mpc_modulus), mpc_modulus), expected=values)
+        assert_eq(f"CP{mpc.pid}:\tMHE->MPC from one holder at two levels", stats.min_precision.l2 > switch_precision_bound(mpc), True)
+
+
+def test_public_ciphertexts(mpc):
+    """Ciphertexts of public data (zero_cipher, enc_public_vector) are trivial encryptions: the same at every party, and
+    they decrypt to the data."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    values = [float(i % 7) - 3.0 for i in range(slots)]
+    if mpc.pid > 0:
+        ciphertexts = [mpc.mhe.zero_cipher()]
+        ciphertexts.extend(mpc.mhe.enc_public_vector(values))
+        assert_eq(f"CP{mpc.pid}:\tPublic ciphertexts are the same at every party", same_at_every_party(mpc, ciphertexts), True)
+        decrypted = mpc.mhe.reveal(ciphertexts, -1, dtype=float)
+        error = max(max(abs(decrypted[i]) for i in range(slots)), max(abs(decrypted[slots + i] - values[i]) for i in range(slots)))
+        assert_eq(f"CP{mpc.pid}:\tPublic ciphertexts decrypt to their data (error {error:.2e})", error < 1e-3, True)
+
+
+def test_mhe_mpc_switch_large_values(mpc, mpc_modulus):
+    """Values up to 2^20 make the round trip MHE -> MPC -> MHE with an absolute error independent of their size."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    with mpc.randomness.global_stream():
+        values = [(2.0 * prg.random() - 1.0) * 2.0 ** 20 for _ in range(slots)]
+
+    if mpc.pid > 0:
+        ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
+        secret_share = mpc.mhe.ciphervector_to_additive_share_vector(ciphervector, slots, mpc_modulus, source_pid=1)
+        back = mpc.mhe.decode(enc=mpc.mhe.decrypt(mpc.mhe.additive_share_vector_to_ciphervector(secret_share, mpc_modulus, True)), dtype=float)
+        error = max(abs(back[i] - values[i]) for i in range(slots))
+        assert_eq(f"CP{mpc.pid}:\tMHE<->MPC round trip of 2^20 values (error {error:.2e})", error < 1e-3, True)
+
+
+def test_mpc_mhe_switch_integers(mpc, mpc_modulus):
+    """Integer (not fixed-point) shares switch to ciphertexts encoding the integers."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    with mpc.randomness.global_stream():
+        values = [int(prg.getrandbits(11)) - 1024 for _ in range(slots)]
+
+    if mpc.pid > 0:
+        # CP1 holds the integers modulo the modulus, the other compute parties zero.
+        share = [(mpc_uint(v) if v >= 0 else mpc_modulus - mpc_uint(-v)) if mpc.pid == 1 else mpc_uint(0) for v in values]
+        back = mpc.mhe.decode(enc=mpc.mhe.decrypt(mpc.mhe.additive_share_vector_to_ciphervector(share, mpc_modulus, False)), dtype=float)
+        error = max(abs(back[i] - float(values[i])) for i in range(slots))
+        assert_eq(f"CP{mpc.pid}:\tMPC->MHE of integer shares (error {error:.2e})", error < 1e-4, True)
+
+
+def test_decryption_to_holders(mpc):
+    """decrypt's default mode gives each compute party the plaintexts of its own ciphertexts, and no party anything of
+    another's (C-03): a party sends the others only the c1 of its ciphertexts, and each holder only the decryption shares
+    of the holder's own ciphertexts (the old protocol sent every party's whole ciphertexts to every party, and every
+    aggregated share back, so each could decrypt all). Every compute party takes part whatever it holds: CP1 holds no
+    ciphertext, CP2 one and a nil-ideal placeholder (decrypted to zeros), CP3 two. CP0 sends nothing. A single holder's
+    ciphertexts still decrypt for every party, whatever the others pass."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    count = max(mpc.pid - 1, 0)
+    values = random_floats((max(count, 1) * slots,))  # this party's private stream: the others cannot know them
+    ciphertexts = List[ckks.Ciphertext]()
+    if mpc.pid and count:
+        ciphertexts = mpc.mhe.enc_vector(values[:count * slots], T=ckks.Ciphertext)
+    if mpc.pid == 2:
+        ciphertexts.append(ckks.Ciphertext.nil_ideal())
+
+    expected_bytes = decryption_bytes(mpc, ciphertexts) if mpc.pid else 0
+    sent = mpc.stats.bytes_sent
+    plaintexts = mpc.mhe.decrypt(ciphertexts)
+    sent = mpc.stats.bytes_sent - sent
+    assert_eq(f"CP{mpc.pid}:\tMHE decryption to the holders: a party sends c1s and decryption shares only", sent, expected_bytes)
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tMHE decryption to the holders: a plaintext per ciphertext", len(plaintexts), len(ciphertexts))
+        if count:
+            decoded = mpc.mhe.decode(plaintexts[:count], dtype=float)
+            error = max(abs(decoded[i] - values[i]) for i in range(count * slots))
+            assert_eq(f"CP{mpc.pid}:\tMHE decryption to the holders: its own values (error {error:.2e})", error < 1e-3, True)
+        if mpc.pid == 2:
+            placeholder = mpc.mhe.decode(plaintexts[count:], dtype=float)
+            assert_eq(f"CP{mpc.pid}:\tMHE decryption to the holders: a nil-ideal decrypts to zeros", max(abs(v) for v in placeholder), 0.0)
+    assert_parties_in_step(mpc, "MHE decryption to the holders")
+
+    # Ciphertensor.reveal at every compute party with CP1's tensor empty: CP1 still takes part in the decryption (it
+    # returned without a message, and the others then waited for it)
+    held = Ciphertensor[ckks.Ciphertext].enc(mpc, array([values[:8]])) if mpc.pid > 1 else Ciphertensor[ckks.Ciphertext]()
+    revealed_tensor = held.reveal(mpc)
+    if mpc.pid > 1:
+        error = max(abs(revealed_tensor[0, j] - values[j]) for j in range(8))
+        assert_eq(f"CP{mpc.pid}:\tCiphertensor.reveal with CP1's tensor empty: its own values (error {error:.2e})", error < 1e-3, True)
+    elif mpc.pid == 1:
+        assert_eq(f"CP{mpc.pid}:\tCiphertensor.reveal of an empty tensor takes part and returns nothing", revealed_tensor.size, 0)
+    assert_parties_in_step(mpc, "Ciphertensor.reveal with an empty tensor")
+
+    with mpc.randomness.global_stream():
+        shared = random_floats((slots,))
+    held = mpc.mhe.enc_vector(shared, T=ckks.Ciphertext) if mpc.pid == 2 else List[ckks.Ciphertext]()
+    revealed = mpc.mhe.decrypt(held, 2)
+    if mpc.pid:
+        decoded = mpc.mhe.decode(revealed, dtype=float)
+        error = max(abs(decoded[i] - shared[i]) for i in range(slots))
+        assert_eq(f"CP{mpc.pid}:\tMHE decryption of CP2's ciphertexts for every party, the others passing none (error {error:.2e})", len(revealed) == 1 and error < 1e-3, True)
+    assert_parties_in_step(mpc, "MHE decryption from one holder")
+
+
+def max_slot_error(got: list[float], want: list[float]) -> float:
+    worst = 0.0
+    for i in range(len(want)):
+        d = abs(got[i] - want[i])
+        if d > worst or d != d:
+            worst = d if d == d else 1e300
+    return worst
+
+
+def test_sum_of_product_and_fresh(mpc):
+    """A refreshed product (its scale a modulus's ratio off the default, one level down) plus a fresh ciphertext: the sum
+    is right to the noise of the collective encryption and decryption (2e-5 to 4e-5 here). It used to take the two scales
+    as equal: an error of about 1e-5 of the values (5.6e-4 here), the same sign on every slot. With the fresh one dropped
+    to the product's level the sum keeps that residual and the level (exactness would spend a level of the sum)."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    with mpc.randomness.global_stream():
+        x_vals = random_floats((slots,))
+        y_vals = random_floats((slots,))
+    if mpc.pid > 0:
+        want = [x_vals[i] * y_vals[i] + x_vals[i] for i in range(slots)]
+        product = mpc.mhe.mul(mpc.mhe.enc_vector(x_vals, T=ckks.Ciphertext), mpc.mhe.enc_vector(y_vals, T=ckks.Ciphertext))
+        mpc.mhe.refresh(product)
+        fresh = mpc.mhe.enc_vector(x_vals, T=ckks.Ciphertext)
+        apart = mpc.mhe.add(product, fresh)
+        error = max_slot_error(mpc.mhe.decode(enc=mpc.mhe.decrypt(apart), dtype=float), want)
+        assert_eq(f"CP{mpc.pid}:\tMHE a refreshed product plus a fresh ciphertext one level up: error {error:.1e}, values up to 56", error < 1.5e-4 and apart[0].level() == product[0].level(), True)
+        dropped = mpc.mhe.drop_level(fresh, product[0].level())
+        same = mpc.mhe.add(product, dropped)
+        # As Lattigo: the smaller-scale operand read at the larger scale
+        hi, lo = max(product[0].scale, dropped[0].scale), min(product[0].scale, dropped[0].scale)
+        factor = lo / hi
+        lattigo = [x_vals[i] * y_vals[i] * (factor if product[0].scale < dropped[0].scale else 1.0) + x_vals[i] * (factor if dropped[0].scale < product[0].scale else 1.0) for i in range(slots)]
+        residual = max_slot_error(mpc.mhe.decode(enc=mpc.mhe.decrypt(same), dtype=float), lattigo)
+        assert_eq(f"CP{mpc.pid}:\tMHE the same at the product's level keeps the level and Lattigo's residual (departure {residual:.1e})", residual < 1.5e-4 and same[0].level() == product[0].level(), True)
+
+
+def test_sum_at_bootstrap_level(mpc):
+    """A ciphertext at the bootstrap level (MPCMHE.drop_level puts it there) plus a product, then a product by a constant,
+    whose refresh bootstraps the sum. The sum used to take the product's scale, and the refresh's rescale left it below
+    the level bootstrapping needs: every compute party aborted. Now MPCMHE rescales the product before the addition, from
+    any level above (MPCMHE._unstranded): the values are right, with one bootstrap per party. With x one level above the
+    bootstrap level, the sum keeps the product's scale, and its refresh rescales it to the bootstrap level and bootstraps
+    it, as before: one bootstrap per party. The same on an aggregate (the same ciphertexts at every party, refreshed in
+    the broadcast mode): one bootstrap for every party, and the copies stay the same."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    with mpc.randomness.global_stream():
+        x_vals = random_floats((slots,))
+        y_vals = random_floats((slots,))
+        z_vals = random_floats((slots,))
+    low = mpc.mhe.bootstrap_min_level
+    parties = mpc.comms.number_of_parties - 1
+    want = [(x_vals[i] + y_vals[i] * z_vals[i]) * 2.5 for i in range(slots)]
+    if mpc.pid > 0:
+        for target, product_level, bootstraps in ((low, -1, parties), (low + 1, -1, parties), (low, low + 1, parties)):
+            x = mpc.mhe.drop_level(mpc.mhe.enc_vector(x_vals, T=ckks.Ciphertext), target)
+            y = mpc.mhe.enc_vector(y_vals, T=ckks.Ciphertext)
+            z = mpc.mhe.enc_vector(z_vals, T=ckks.Ciphertext)
+            if product_level >= 0:
+                y = mpc.mhe.drop_level(y, product_level)
+                z = mpc.mhe.drop_level(z, product_level)
+            product = mpc.mhe.mul(y, z)
+            total = mpc.mhe.add(x, product)
+            before = mpc.mhe.stats.secure_bootstrap_count
+            result = mpc.mhe.mul_const(total, 2.5)
+            spent = mpc.mhe.stats.secure_bootstrap_count - before
+            error = max_slot_error(mpc.mhe.decode(enc=mpc.mhe.decrypt(result), dtype=float), want)
+            assert_eq(f"CP{mpc.pid}:\tMHE (x + y * z) * 2.5 with x at level {target} and y * z at level {product[0].level()}: {spent} bootstraps, error {error:.1e} (values up to 140)", error < 2e-4 * 140.0 and spent == bootstraps, True)
+
+    # An aggregate: CP1's encryptions, the same ciphertexts at every compute party
+    if mpc.pid > 0:
+        x = mpc.comms.broadcast_from(mpc.mhe.drop_level(mpc.mhe.enc_vector(x_vals, T=ckks.Ciphertext), low), 1)
+        y = mpc.comms.broadcast_from(mpc.mhe.drop_level(mpc.mhe.enc_vector(y_vals, T=ckks.Ciphertext), low + 1), 1)
+        z = mpc.comms.broadcast_from(mpc.mhe.drop_level(mpc.mhe.enc_vector(z_vals, T=ckks.Ciphertext), low + 1), 1)
+        total = mpc.mhe.add(x, mpc.mhe.mul(y, z, True, True))
+        before = mpc.mhe.stats.secure_bootstrap_count
+        result = mpc.mhe.mul_const(total, 2.5, True)
+        spent = mpc.mhe.stats.secure_bootstrap_count - before
+        same = same_at_every_party(mpc, result)
+        error = max_slot_error(mpc.mhe.decode(enc=mpc.mhe.decrypt(result, -1), dtype=float), want)
+        assert_eq(f"CP{mpc.pid}:\tMHE an aggregate's (x + y * z) * 2.5 at the bootstrap level: {spent} bootstrap(s), copies the same {same}, error {error:.1e}", error < 2e-4 * 140.0 and spent == 1 and same, True)
+    assert_parties_in_step(mpc, "MHE sums at the bootstrap level")
+
+
+def test_same_level_sum_above_bootstrap_level(mpc):
+    """Two products at one level above the bootstrap level whose scales differ by a rescale's ratio (p * p and p * x, p
+    with a rescale history), summed, then a product by a constant: the sum keeps its level, so its refresh rescales it to
+    the bootstrap level and bootstraps it. Bringing such a sum onto one scale exactly would spend its level, leave it at
+    the bootstrap level with a rescale still pending, and make that refresh impossible at every compute party."""
+    slots = mpc.mhe.crypto_params.params.slots()
+    with mpc.randomness.global_stream():
+        p_vals = [0.9 + 0.2 * v for v in random_floats((slots,), scale=1.0)]
+        x_vals = random_floats((slots,), scale=1.0)
+    low = mpc.mhe.bootstrap_min_level
+    if mpc.pid > 0:
+        ones = [1.0 for _ in range(slots)]
+        p = mpc.mhe.enc_vector(p_vals, T=ckks.Ciphertext)
+        while p[0].level() > low + 1:
+            p = mpc.mhe.mul(p, mpc.mhe.enc_vector(ones, T=ckks.Ciphertext))
+            mpc.mhe.refresh(p)
+        x = mpc.mhe.enc_vector(x_vals, T=ckks.Ciphertext)
+        total = mpc.mhe.add(mpc.mhe.mul(p, p), mpc.mhe.mul(p, x))
+        level = total[0].level()
+        result = mpc.mhe.mul_const(total, 2.5)
+        want = [(p_vals[i] * p_vals[i] + p_vals[i] * x_vals[i]) * 2.5 for i in range(slots)]
+        error = max_slot_error(mpc.mhe.decode(enc=mpc.mhe.decrypt(result), dtype=float), want)
+        assert_eq(f"CP{mpc.pid}:\tMHE p * p + p * x at level {low + 1} (sum at level {level}), then * 2.5: error {error:.1e} (values up to 8)", level == low + 1 and error < 1e-3, True)
+    assert_parties_in_step(mpc, "MHE same-level sums above the bootstrap level")
+
+
+def test_mhe(mpc, modulus):
+    # The HE tests, then the MHE <-> MPC conversions on the run's modulus (the field, or the ring with --use-ring)
     print(f'CP{mpc.pid}:\tTesting MHE ... \n')
 
     test_send_receive_poly(mpc)
     test_send_receive_ciphertext(mpc)
     test_decryption(mpc)
+    test_decryption_to_holders(mpc)
     test_arithmetics(mpc)
     test_collective_bootstrapping(mpc)
+    test_sum_of_product_and_fresh(mpc)
+    test_sum_at_bootstrap_level(mpc)
+    test_same_level_sum_above_bootstrap_level(mpc)
     test_cipher_to_additive_plaintext_conversion(mpc)
-    test_cipher_to_additive_share_vec_conversion(mpc, MPC_FIELD_SIZE)
-    
-    # Extended MHE<->MPC conversion tests
-    test_mhe_mpc_conversion_additive_shares_sum_correctly(mpc, MPC_FIELD_SIZE)
-    test_mhe_mpc_conversion_double_roundtrip(mpc, MPC_FIELD_SIZE)
-    test_mhe_mpc_conversion_negative_values(mpc, MPC_FIELD_SIZE)
-    test_mhe_mpc_conversion_partial_slots(mpc, MPC_FIELD_SIZE)
-    test_mhe_mpc_conversion_multiple_ciphertexts(mpc, MPC_FIELD_SIZE)
-    test_mhe_mpc_conversion_mpc_operations_on_shares(mpc, MPC_FIELD_SIZE)
-    test_mhe_mpc_conversion_from_different_sources(mpc, MPC_FIELD_SIZE)
-    
-    # with mpc.default_modulus(MPC_RING_SIZE):
-    #     test_cipher_to_additive_share_vec_conversion(mpc, MPC_RING_SIZE)
+    with mpc.default_modulus(modulus):
+        test_cipher_to_additive_share_vec_conversion(mpc, modulus)
+
+        # Extended MHE<->MPC conversion tests
+        test_mhe_mpc_conversion_additive_shares_sum_correctly(mpc, modulus)
+        test_mhe_mpc_conversion_double_roundtrip(mpc, modulus)
+        test_mhe_mpc_conversion_negative_values(mpc, modulus)
+        test_mhe_mpc_conversion_partial_slots(mpc, modulus)
+        test_mhe_mpc_conversion_multiple_ciphertexts(mpc, modulus)
+        test_mhe_mpc_conversion_mpc_operations_on_shares(mpc, modulus)
+        test_mhe_mpc_conversion_from_different_sources(mpc, modulus)
+        test_mhe_mpc_switch_masks(mpc, modulus)
+        test_mhe_mpc_switch_levels(mpc, modulus)
+        test_mhe_mpc_switch_from_one_holder(mpc, modulus)
+        test_public_ciphertexts(mpc)
+        test_mhe_mpc_switch_large_values(mpc, modulus)
+        test_mpc_mhe_switch_integers(mpc, modulus)
 
     print(f'CP{mpc.pid}:\tMHE tests passed.\n')

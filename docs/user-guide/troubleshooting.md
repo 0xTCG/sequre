@@ -24,9 +24,9 @@ Use debug mode only when a backtrace diagnostics are needed. Switch to `-release
 
 ### libgmp (GMP)
 
-GMP is **bundled** with Sequre releases and auto-detected by the launcher. It checks bundled paths and common system locations.
+GMP is **bundled** with Sequre releases (`lib/codon/plugins/sequre/lib/` in the install). The Sequre runtime looks for it in this order: `SEQURE_GMP_PATH`, the bundled copy (where the plugin was when the program was compiled, so a built binary finds it too), then common system locations (`libgmp.so` and `libgmp.so.10` on Linux, `libgmp.dylib` and `libgmp.10.dylib` on macOS). The `sequre` launcher also points `SEQURE_GMP_PATH` at the bundled copy for `sequre run`. If the plugin's `stdlib` directory is a symlink (to a source checkout, say), the runtime follows the symlink and looks next to the checkout instead: built binaries then use a system GMP unless `SEQURE_GMP_PATH` is set.
 
-If auto-detection fails, install GMP and set the path to it to `SEQURE_GMP_PATH` env variable (Sequre repository also provides these libraries in `external/GMP/lib` dir):
+If no GMP is found (the error lists the paths tried), install GMP and set the path to it to `SEQURE_GMP_PATH` env variable (Sequre repository also provides these libraries in `external/GMP/lib` dir: x86-64 Linux and arm64 macOS):
 
 ```bash
 # Linux
@@ -40,7 +40,7 @@ export SEQURE_GMP_PATH=/opt/homebrew/lib/libgmp.dylib
 
 ### OpenSSL (libssl / libcrypto)
 
-The Sequre launcher auto-detects common OpenSSL paths on Linux and macOS. If auto-detection fails, install OpenSSL and point to it manually:
+The Sequre runtime looks for OpenSSL at common paths on Linux and macOS. If it finds none, install OpenSSL and point to it manually:
 
 ```bash
 # Linux
@@ -68,8 +68,15 @@ export CODON_PYTHON=/usr/lib/x86_64-linux-gnu/libpython3.12.so
 export CODON_PYTHON=$(python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")/libpython3.12.dylib
 ```
 
+A binary from `sequre build` runs without the launcher, so a program that uses Python interop needs `CODON_PYTHON` set when you run the binary (without it, it stops at start with `CError: libpython.so: cannot open shared object file`). To set it to the shared library of the `python3` on your `PATH` (a Python version your Codon release supports):
+
+```bash
+export CODON_PYTHON=$(python3 -c "import sysconfig, glob; d = sysconfig.get_config_var('LIBDIR'); v = sysconfig.get_config_var('LDVERSION'); print(sorted(glob.glob(f'{d}/libpython{v}.so*') + glob.glob(f'{d}/libpython{v}.dylib'))[0])")
+./my_protocol --local
+```
+
 !!! note
-    `libpython` is **not required** unless the program uses the `@python` decorator. Most Sequre programs do not need it.
+    `libpython` is **not required** unless the program uses the `@python` decorator or `from python import`. Most Sequre programs do not need it.
 
 ---
 
@@ -131,6 +138,29 @@ export SEQURE_CA_CERT_FILE=my-ca.pem
 
 See [TLS configuration](running-distributed.md#tls-configuration) for the full list of environment variables.
 
+### Peer certificate rejected
+
+Every connection between two parties checks that the peer's certificate comes from the CA and names the party it connects as (see [TLS configuration](running-distributed.md#tls-configuration)). If it does not, the handshake fails, the party stops, and its error names the connection, the party it expected and OpenSSL's reason:
+
+```
+ValueError: TLS handshake with CP1 at CP0 (server side, 0.0.0.0:9001, connection from 10.0.0.12:53418) failed:
+CP1's certificate was rejected: hostname mismatch; expected a certificate from the CA in certs/ca.pem that names
+"cp1" (SEQURE_PARTY_CERT_NAME sets the names the parties expect) [TLS protocol error; OpenSSL: error:0A000086:SSL
+routines::certificate verify failed]
+```
+
+The reason after "was rejected:" is OpenSSL's verification result:
+
+| Reason | Cause | Fix |
+|---|---|---|
+| `hostname mismatch` | The certificate names another party, or not in the form the parties expect | Check its names with `openssl x509 -in certs/cp1.pem -noout -text \| grep -E "Subject:\|DNS:"`: it must carry the name `SEQURE_PARTY_CERT_NAME` gives that party (default `cp1`), as a subjectAltName DNS entry or, if it has none, as the CN. Run every party with the same `SEQURE_PARTY_CERT_NAME`. |
+| `unable to get local issuer certificate`, `authority and subject key identifier mismatch`, `certificate signature failure` | The certificate is not signed by the CA in `SEQURE_CA_CERT_FILE` | Give every party the same `ca.pem`, and certificates that CA signed (one run of `generate_certs.sh` for all parties) |
+| `certificate has expired`, `certificate is not yet valid` | Outside its validity period | Issue a new one; check the clocks |
+
+When the other side rejected this party, the error says so instead: "`CP0 did not confirm the handshake, so it rejected this party`" or "`CP1 rejected the handshake (with an alert ...)`", followed by the alert OpenSSL received, such as `sslv3 alert bad certificate` or `tlsv1 alert unknown ca`. The reason is then in the other party's error.
+
+The connection's address helps tell a misconfigured party from a stranger: the server side reports where the connection came from.
+
 ### Expired or invalid certificates
 
 If connections fail with TLS handshake errors, check certificate validity:
@@ -156,23 +186,42 @@ export SEQURE_USE_TLS=0
 
 ### Parties cannot connect
 
-- Verify all parties use the same `SEQURE_CP_IPS` with IPs in the same order
+- Verify all parties use the same `SEQURE_CP_IPS` with IPs in the same order. The entries must be IPv4 addresses: a host name stops every party at startup with "`... is not an IPv4 address`"
 - Check that ports `9000+` and `9999` are open between machines (see [network configuration](running-distributed.md#network-configuration))
 - Ensure all parties start within a reasonable time window — the connection has a retry mechanism, but it will eventually time out
 
 ### UNIX socket errors (local mode)
 
-Stale socket files (`sock.*`) from a previous crashed run can prevent new connections. The Sequre launcher cleans these up automatically on startup, but if running via `codon` directly:
+Local runs connect their parties through UNIX socket files (`sock.<port>`) in the working directory. The party that creates a file removes it once its peer has connected, so a finished run leaves none behind, and a run that crashed before its parties connected leaves files that the next run in that directory replaces. Two local runs in one directory at the same time use the same file names and can connect to each other's parties: run them in different directories.
 
-```bash
-rm -f sock.*
-```
+### Segmentation fault in MHE code (x86-64)
+
+Codon (through v0.19.6) emits aligned vector moves for heap-resident SIMD vectors, which the garbage collector only 16-byte-aligns, so on x86-64 CPUs with AVX2 or AVX-512 Sequre's MHE/CKKS code crashes with `SIGSEGV` (in `lattiseq.ring.GaussianSampler.__init__`, within a second of the MHE setup). Sequre's alignment shim, `lib/sequre_align64.so` in the install, over-aligns those allocations: the `sequre` launcher preloads it for `sequre run` and links it into every binary `sequre build` makes, and warns when it is missing. When you run `codon` directly, preload it yourself (`LD_PRELOAD=<install>/lib/sequre_align64.so codon run ...`), or link it into a binary with `codon build -l :sequre_align64.so ...` (it must be in Codon's `lib` directory, as in an installed Sequre). A binary linked with it stops at start if the shim is missing (`sequre_align64.so: cannot open shared object file`). `SEQURE_NO_ALIGN_SHIM=1` makes the launcher neither preload nor link it.
 
 ---
 
-## `--use-ring` instability
+## Nonlinear functions refuse an interval or a degree
 
-The `--use-ring` flag (ring modulus instead of field modulus) is currently unstable. Division and square root operations may produce incorrect results approximately 50% of the time due to a modulus-switching bug. Avoid this flag for production workloads.
+Before any communication, every party checks the nonlinear function's parameters (see
+[Nonlinear Functions](nonlinear-functions.md#intervals-clipping-and-admissibility)). A failed check raises `ValueError`
+at every party, so the parties stay in step. The messages, and what to do:
+
+| Message (default build, F = 32) | Cause | Fix |
+|---|---|---|
+| `Decor exp on (-16, 16): h term 0 (dealer side, v in [-8, 24]) reaches 2.651e+10, beyond the fixed-point range 2.147e+09 (MPC_NBIT_K - MPC_NBIT_F - 1 = 31 integer bits); narrow the interval or use another method` | a value the protocol encodes (here a power of $e$ on the dealer's side) leaves the fixed-point range, $2^{K-F-1}$ | narrow the interval (exp up to about ±14 at F = 32), or use a 256-bit build (F = 64) |
+| `Decor sigmoid on (-14, 14): the combiner's denominator falls to 8.31e-07, below the division's smallest divisor 9.54e-07 (2^-(F - 12)); narrow the interval or use another method` | sigmoid's or tanh's denominator gets too small to divide by on this interval | narrow the interval (sigmoid up to about ±12.3 at F = 32, tanh about ±6.5) |
+| `Decor <function> on <interval>: the estimated worst-case error <bound> exceeds the tolerance <tolerance> times <scale> (max(1, max |f|) on the interval); narrow the interval, pass a larger tolerance or use another method` | `decor_error_bound` exceeds `tolerance` times $\max(1, \max \lvert f \rvert)$ on the interval | narrow the interval, pass a larger `tolerance`, or use another method |
+| `nonlinear.exp (chebyshev) on (-20, 20): Clenshaw's intermediates reach 4.411e+09, beyond the fixed-point range 2.147e+09; narrow the interval or lower the degree` | the Chebyshev coefficients are too large for this interval and degree | narrow the interval or lower the degree |
+| `nonlinear.sin: Decor's sin takes no interval`, `nonlinear.sin: clip applies to functions on an interval (Decor's sin takes none)`, `nonlinear.sin: Decor takes no degree` | Decor's sin, cos, tan and cot take any input (inv any admissible divisor), and Decor takes no degree | drop the argument, or pick a polynomial method |
+| `nonlinear.sigmoid: the auto method picks the Chebyshev degree on field shares itself (method chebyshev takes a degree)` | sigmoid's and tanh's default, `"auto"`, chooses the degree of its field interpolant from Decor's error bound | drop the degree, or pass `method="chebyshev"` with it |
+| `nonlinear.exp: the Taylor method takes no default interval (a Taylor polynomial is accurate near its centre only): pass one` | Taylor without an interval | pass an interval that suits the series (well inside its radius around the centre) |
+| `via_chebyshev (naive) of degree 44 on (-8, 8): the estimated worst-case error 8.36 exceeds the tolerance 0.000244 ...`, `... the powers or the sum reach ...`, `... the scaling to [-1, 1] errs by up to ...` | the secure-powers evaluation of a Chebyshev or Taylor polynomial: large monomial coefficients, powers of a half-width above 1, or a very wide interval | lower the degree, narrow the interval, or use Clenshaw (Chebyshev) or Decor's evaluation |
+| `via_decor: cannot run inside MPCEnv.delayed_truncation(): its internal truncations cannot be deferred` | division, square root, Decor and Chebyshev's recurrence truncate internally | call them outside the `delayed_truncation()` block |
+
+Inputs outside the interval do not raise: with `clip=False` they give method-dependent results (for example, Decor's
+bounded functions give $f(x - kp)$ on secure types). Pass `clip=True` when inputs may leave the interval. The
+Chebyshev method checks only its range, not its accuracy: an interval that reaches a singularity (log on (0, 8)) is
+accepted, and the interpolant is inaccurate near it.
 
 ---
 
@@ -182,10 +231,10 @@ In case of `cannot find plugin 'sequre'`, ensure:
 
 1. Sequre is installed in the Codon plugins directory: `$HOME/.sequre/lib/codon/plugins/sequre/`
 2. The directory contains `plugin.toml`, `build/`, and `stdlib/`
-3. If using `codon` directly instead of the `sequre` launcher, pass `--plugin=sequre`:
+3. If using `codon` directly instead of the `sequre` launcher, pass `--plugin=sequre`, and `--disable-opt=core-pythonic-list-addition-opt` as the launcher does (Sequre's list `+` is element-wise, and Codon would otherwise rewrite `l1 + l2 + l3` as a concatenation). On x86-64 Linux, also preload the alignment shim (see [Segmentation fault in MHE code](#segmentation-fault-in-mhe-code-x86-64)):
 
 ```bash
-codon run --plugin=sequre my_protocol.codon
+codon run --disable-opt=core-pythonic-list-addition-opt --plugin=sequre my_protocol.codon
 ```
 
 In case of `cannot find plugin 'seq'`, add the additional `--plugin=seq` flag to the run or build command.
