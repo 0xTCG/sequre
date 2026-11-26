@@ -152,9 +152,7 @@ if ! tar -xzf "$TMP/sequre.tar.gz" -C "$TMP/probe" "$LAUNCHER" ||
   exit 1
 fi
 
-# 1. Codon, then 2. Sequre (plugin, launcher, alignment shim) on top. Sequre's numpy is a fork (its ndarray is
-# defined differently and is incompatible with Codon's own); it ships inside the plugin and is imported only through
-# the `sequre.stdlib.numpy` namespace, so Codon's own numpy/ is left intact.
+# 1. Codon, then 2. Sequre (plugin, launcher, alignment shim) on top.
 if ! mkdir -p "$SEQURE_INSTALL_DIR" ||
    ! tar -xzf "$TMP/codon.tar.gz" -C "$SEQURE_INSTALL_DIR" --strip-components=1 ||
    ! tar -xzf "$TMP/sequre.tar.gz" -C "$SEQURE_INSTALL_DIR"; then

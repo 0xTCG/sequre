@@ -21,13 +21,6 @@ cmake -S . -B build \
 cmake --build build --target sequre
 cmake --install build --prefix=$HOME/.sequre/lib/codon/plugins/sequre
 
-# Sequre's numpy is a fork (its ndarray is defined differently and is
-# incompatible with Codon's own; for now — the plan is to eventually migrate
-# Sequre to use Codon's numpy directly). It is shipped inside the plugin (via
-# the `install(DIRECTORY stdlib ...)` rule) and imported exclusively through
-# the `sequre.stdlib.numpy` namespace, so it never collides with Codon's
-# native `numpy`, which is left intact.
-
 # Build the sequre launcher (it preloads the x86-64 over-align shim for `sequre run` and links it into the binaries
 # of `sequre build`)
 $CC -O2 -o $HOME/.sequre/bin/sequre "$SRC/sequre_launcher.c"

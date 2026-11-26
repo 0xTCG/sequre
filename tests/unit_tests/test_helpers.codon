@@ -1,14 +1,14 @@
 from sequre.utils.testing import assert_eq, assert_eq_approx, assert_geq, assert_leq
 from sequre.utils.utils import __rand_mat
 from sequre.constants import MPC_FIELD_SIZE
-from sequre.utils.io import write_matrix, read_matrix
+from sequre.utils.io import write_matrix, read_matrix, write_ndarray, read_ndarray
 import math
 import os
 
 from pickler import pickle, unpickle, dump, load
 
-from sequre.stdlib.numpy.create import array, ones, zeros
-from sequre.stdlib.numpy.ndarray import ndarray
+from numpy import array, arange, ones, zeros
+from numpy import ndarray
 from sequre.network.common import (
     accept, close, listen, shutdown, recv, send, init_openssl, ssl_error_queue,
     TLS_client_method, TLS_server_method, SSL_CTX_new, SSL_CTX_free, SSL_new, SSL_free,
@@ -30,7 +30,27 @@ def test_io():
         write_matrix(f, random_matrix, binary=True, TP=type(MPC_FIELD_SIZE))
     with open(data_path) as f:
         assert_eq('Binary file i/o', read_matrix(f, rows, cols, True, TP=type(MPC_FIELD_SIZE)), random_matrix)
-    
+    # The same read through a binary-mode File (File[bytes] since Codon 0.20)
+    with open(data_path, 'rb') as f:
+        assert_eq('Binary file i/o from a binary-mode file', read_matrix(f, rows, cols, True, TP=type(MPC_FIELD_SIZE)),
+                  random_matrix)
+
+    # ndarray views (a transpose, a stepped slice) go out in C order, in binary and in text
+    x = array([[1., -2., 3.], [4., 5., -6.]])
+    for binary in (True, False):
+        mode = 'binary' if binary else 'text'
+        with open(data_path, 'wb') as f:
+            write_ndarray(f, x.T, binary)
+            write_ndarray(f, x[:, ::2], binary)
+        with open(data_path) as f:
+            assert_eq(f'ndarray file i/o ({mode}): a transposed view', read_ndarray(f, (3, 2), binary, dtype=float),
+                      x.T.copy())
+            assert_eq(f'ndarray file i/o ({mode}): a stepped view', read_ndarray(f, (2, 2), binary, dtype=float),
+                      x[:, ::2].copy())
+        with open(data_path, 'rb') as f:
+            assert_eq(f'ndarray file i/o ({mode}) from a binary-mode file',
+                      read_ndarray(f, (3, 2), binary, dtype=float), x.T.copy())
+
 
 def _fails(check) -> bool:
     try:
@@ -264,9 +284,23 @@ def test_pickle_round_trips():
     _int_round_trips(512)
 
     x = array([[1., -2., 3.], [4., 5., -6.]])
-    assert_eq('Pickle: a 2-dim ndarray (gz)', _gz_round_trip(x, ndarray[Tuple[int, int], float]), x)
-    assert_eq('Pickle: a 1-dim ndarray (gz)', _gz_round_trip(array([7, -8, 9]), ndarray[Tuple[int], int]),
+    assert_eq('Pickle: a 2-dim ndarray (gz)', _gz_round_trip(x, ndarray[float, 2]), x)
+    assert_eq('Pickle: a 1-dim ndarray (gz)', _gz_round_trip(array([7, -8, 9]), ndarray[int, 1]),
               array([7, -8, 9]))
+    # Any rank, and views: the elements in C order whatever the strides (a view's buffer holds them in another order)
+    c = arange(24).reshape((2, 3, 4))
+    for name, a in (('a 3-dim ndarray', c), ('a stepped 3-dim view', c[:, 1:3, ::2]), ('a transposed 3-dim view', c.T)):
+        assert_eq(f'Pickle: {name} (raw)', _pickle_round_trip(a, ndarray[int, 3]), a.copy())
+        assert_eq(f'Pickle: {name} (gz)', _gz_round_trip(a, ndarray[int, 3]), a.copy())
+    for name, a in (('a transposed view', x.T), ('a reversed view', x[::-1, ::-1])):
+        assert_eq(f'Pickle: {name} (raw)', _pickle_round_trip(a, ndarray[float, 2]), a.copy())
+        assert_eq(f'Pickle: {name} (gz)', _gz_round_trip(a, ndarray[float, 2]), a.copy())
+    shares = array([~UInt[192](0), UInt[192](12345), UInt[192](1) << UInt[192](150)])
+    assert_eq('Pickle: a UInt[192] ndarray (raw)', _pickle_round_trip(shares, ndarray[UInt[192], 1]), shares)
+    assert_eq('Pickle: a UInt[192] ndarray (gz)', _gz_round_trip(shares[::2], ndarray[UInt[192], 1]),
+              shares[::2].copy())
+    assert_eq('Pickle: an ndarray without elements (raw)', _pickle_round_trip(zeros((0, 3)), ndarray[float, 2]).shape,
+              (0, 3))
 
     print(f'Pickle round trip tests passed.\n')
 
@@ -297,8 +331,8 @@ def test_ndarray_views():
     assert_eq('ndarray views: sqrt (each element through a function)', odd.sqrt(), array([1., math.sqrt(3.), math.sqrt(5.)]))
     assert_eq('ndarray views: to_list of a column', col.to_list(), [-2., 5., -8.])
     assert_eq('ndarray views: to_list of every other row', rows.to_list(), [[1., -2., 3.], [7., -8., 9.]])
-    assert_eq('ndarray views: resize a column', col.resize((2,)), array([-2., 5.]))
-    assert_eq('ndarray views: resize every other element', odd.resize((4,)), array([1., 3., 5., 0.]))
+    assert_eq('ndarray views: pad_or_crop a column', col.pad_or_crop((2,)), array([-2., 5.]))
+    assert_eq('ndarray views: pad_or_crop every other element', odd.pad_or_crop((4,)), array([1., 3., 5., 0.]))
     assert_eq('ndarray views: expand_dims of a column, axis 0', col.expand_dims(), array([[-2., 5., -8.]]))
     assert_eq('ndarray views: expand_dims of a column, axis 1', col.expand_dims(1), array([[-2.], [5.], [-8.]]))
     expanded = col.expand_dims()
@@ -306,18 +340,18 @@ def test_ndarray_views():
     assert_eq('ndarray views: expand_dims shares the view\'s elements, as for a contiguous array', x[1, 1], 50.)
     x[1, 1] = 5.
 
-    first = x[:, 0]
-    first.extend(x[:, 2])
-    assert_eq('ndarray views: extend a column by a column', first, array([1., -4., 7., 3., -6., 9.]))
-    assert_eq('ndarray views: extend leaves a C-contiguous array', first.flags.c_contiguous, True)
-    stacked = x[::2]
-    stacked.extend(x[1:2])
-    assert_eq('ndarray views: extend every other row by a row', stacked, array([[1., -2., 3.], [7., -8., 9.], [-4., 5., -6.]]))
-    assert_eq('ndarray views: x unchanged by extending its views', x, array([[1., -2., 3.], [-4., 5., -6.], [7., -8., 9.]]))
+    first = x[:, 0].concat(x[:, 2])
+    assert_eq('ndarray views: concat a column and a column', first, array([1., -4., 7., 3., -6., 9.]))
+    assert_eq('ndarray views: concat gives a C-contiguous array', first.flags.c_contiguous, True)
+    stacked = x[::2].concat(x[1:2])
+    assert_eq('ndarray views: concat every other row and a row', stacked,
+              array([[1., -2., 3.], [7., -8., 9.], [-4., 5., -6.]]))
+    assert_eq('ndarray views: x unchanged by concatenating its views', x,
+              array([[1., -2., 3.], [-4., 5., -6.], [7., -8., 9.]]))
 
-    assert_eq('ndarray views: pickling a column', _pickle_round_trip(col, ndarray[Tuple[int], float]), array([-2., 5., -8.]))
-    assert_eq('ndarray views: pickling every other row', _pickle_round_trip(rows, ndarray[Tuple[int, int], float]), array([[1., -2., 3.], [7., -8., 9.]]))
-    assert_eq('ndarray views: pickling a contiguous array', _pickle_round_trip(x, ndarray[Tuple[int, int], float]), x)
+    assert_eq('ndarray views: pickling a column', _pickle_round_trip(col, ndarray[float, 1]), array([-2., 5., -8.]))
+    assert_eq('ndarray views: pickling every other row', _pickle_round_trip(rows, ndarray[float, 2]), array([[1., -2., 3.], [7., -8., 9.]]))
+    assert_eq('ndarray views: pickling a contiguous array', _pickle_round_trip(x, ndarray[float, 2]), x)
 
     nan = float('nan')
     w = array([[1., 7.], [nan, 4.], [nan, 6.]])  # the buffer's first three elements are not column 0
@@ -359,8 +393,8 @@ def test_ndarray_padding():
 
 
 def test_ndarray_slices():
-    """L-046: slice steps in 2-dim get/setitem, and the fork's strided writes, which took the contiguous shortcut by the
-    parent's flags; L-228 (.T of no rows), L-051 (erase_element(-1)), L-053 (a full rotate_local), M-NUM-05 (sign
+    """L-046: slice steps in 2-dim get/setitem, and strided writes (Sequre's NumPy fork took the contiguous shortcut by
+    the parent's flags); L-228 (.T of no rows), L-051 (erase_element(-1)), L-053 (a full rotate_local), M-NUM-05 (sign
     read element 0); on lists L-047 (expand_dims(1) of a vector), L-051, L-052 (vstack shared the other's rows)."""
     print(f'Testing ndarray slices ... \n')
     z = zeros((6,))

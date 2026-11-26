@@ -27,7 +27,7 @@ In production, **each party holds its own data on disk** and brings it into the 
 To write a binary file from within Sequre:
 
 ```python
-from numpy.create import array
+from numpy import array
 from sequre.utils.io import write_ndarray
 from sequre.utils.utils import __rand_mat
 
@@ -38,7 +38,7 @@ with open("my_data.bin", "wb") as f:
     write_ndarray(f, data, binary=True)
 ```
 
-When `binary=True`, each file is a flat dump of the ndarray's memory — no headers, no delimiters, just raw element bytes.
+When `binary=True`, each file holds the array's elements as raw bytes in C (row-major) order, also for a view such as `data.T` — no headers, no delimiters.
 
 !!! tip
     In a distributed deployment every party naturally has its own filesystem, so file paths can be identical across machines (e.g. `/data/patients.bin`).  In **local mode** (all parties on one machine) paths must differ — parameterise by party ID: `f"data/cp{mpc.pid}.bin"`.

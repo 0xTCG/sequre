@@ -2,8 +2,9 @@ import internal.static as static
 
 import secure_operator
 
-from sequre.stdlib.numpy.ndarray import ndarray
-from sequre.stdlib.numpy.create import array, zeros, zeros_like, ones, rand
+from numpy import ndarray
+from numpy import array, zeros, zeros_like, ones
+from sequre.utils.arrays import rand, empty_ndarray, empty_of
 
 from sequre.attributes import sequre
 from sequre.mpc.env import MPCEnv
@@ -25,18 +26,50 @@ MPA_REVEAL_FRAC_BITS: Static[int] = 2 * MPC_NBIT_F
 # Multiparty aggregate
 class MPA[S, dtype]:
     _mpc: MPCEnv[mpc_uint]
-    _plain: ndarray[S, dtype]
+    # The share in the clear, an ndarray of S's rank: Codon's ndarray takes its rank as a type parameter, which a field
+    # type cannot compute from S, so there is a field per rank, and the _plain property reads and writes S's
+    _plain_1: ndarray[dtype, 1]
+    _plain_2: ndarray[dtype, 2]
     _encryption: Ciphertensor[Ciphertext]
     _aggregate: Ciphertensor[Ciphertext]
 
+    @property
+    def _plain(self):
+        if static.len(S) == 1:
+            return self._plain_1
+        elif static.len(S) == 2:
+            return self._plain_2
+        else:
+            compile_error("MPA: only 1-dim and 2-dim MPAs are supported")
+
+    @_plain.setter
+    def _plain(self, value):
+        if static.len(S) == 1:
+            self._plain_1 = value
+        elif static.len(S) == 2:
+            self._plain_2 = value
+        else:
+            compile_error("MPA: only 1-dim and 2-dim MPAs are supported")
+
     def __init__(self: MPA[S, dtype], mpc: MPCEnv[mpc_uint]):
         self._mpc = mpc
-        self._plain = ndarray[S, dtype]()
+        self._plain_1 = empty_ndarray(dtype, 1)
+        self._plain_2 = empty_ndarray(dtype, 2)
         self._encryption = Ciphertensor[Ciphertext]()
         self._aggregate = Ciphertensor[Ciphertext]()
     
-    def __init__(self: MPA[S, dtype], mpc: MPCEnv[mpc_uint], plain: ndarray[S, dtype]):
+    # MPA(mpc, plain) takes S and dtype from the array (an overload per rank: Codon 0.20 infers a class's
+    # Tuple[ndim, int] wrongly where the call is a keyword one or inside a generic function, M-TOOL-29)
+    def __init__(self: MPA[Tuple[int], dtype], mpc: MPCEnv[mpc_uint], plain: ndarray[dtype, 1]):
+        self._init_plain(mpc, plain)
+
+    def __init__(self: MPA[Tuple[int, int], dtype], mpc: MPCEnv[mpc_uint], plain: ndarray[dtype, 2]):
+        self._init_plain(mpc, plain)
+
+    def _init_plain(self, mpc: MPCEnv[mpc_uint], plain: ndarray):
         self._mpc = mpc
+        self._plain_1 = empty_ndarray(dtype, 1)
+        self._plain_2 = empty_ndarray(dtype, 2)
         self._plain = plain if mpc.pid else zeros_like(plain)
         self._encryption = Ciphertensor[Ciphertext]()
         self._aggregate = Ciphertensor[Ciphertext]()
@@ -44,7 +77,8 @@ class MPA[S, dtype]:
     def __init__(self: MPA[S, dtype], mpc: MPCEnv[mpc_uint], encryption: Ciphertensor[Ciphertext], aggregate: bool = False):
         assert mpc.pid, "MPA: encrypted MPA should be separatelly initialized at CP0 for now"
         self._mpc = mpc
-        self._plain = ndarray[S, dtype]()
+        self._plain_1 = empty_ndarray(dtype, 1)
+        self._plain_2 = empty_ndarray(dtype, 2)
         self._encryption = Ciphertensor[Ciphertext]() if aggregate else encryption
         self._aggregate = encryption if aggregate else Ciphertensor[Ciphertext]()
         # An aggregate is the same ciphertexts at every party: refreshes bootstrap it once, collectively, and keep it so.
@@ -53,13 +87,13 @@ class MPA[S, dtype]:
         else: self._encryption._is_broadcast = False
 
     @staticmethod
-    def _from_plain(mpc: MPCEnv[mpc_uint], plain: ndarray[S, dtype]) -> MPA[S, dtype]:
+    def _from_plain(mpc: MPCEnv[mpc_uint], plain: ndarray) -> MPA[S, dtype]:
         return MPA[S, dtype](mpc, plain)
 
     @staticmethod
     def _from_parts(
         mpc: MPCEnv[mpc_uint],
-        plain: ndarray[S, dtype],
+        plain: ndarray,
         encryption: Ciphertensor[Ciphertext],
         aggregate: Ciphertensor[Ciphertext]) -> MPA[S, dtype]:
         out = MPA[S, dtype](mpc, plain)
@@ -75,20 +109,28 @@ class MPA[S, dtype]:
     def __getitem__(self, index) -> MPA:
         adj_index = self._adjust_indices(index)
         
-        if isinstance(type(self._plain[adj_index]), ByVal):
-            _plain = ndarray[Tuple[int], dtype]()
+        # An element is a 1-dim MPA of one (a scalar, not an ndarray, though both are ByVal since Codon 0.20)
+        if not isinstance(type(self._plain[adj_index]), ndarray):
+            _plain = empty_ndarray(dtype, 1)
         else:
-            _plain = type(self._plain[adj_index])()
+            _plain = empty_of(type(self._plain[adj_index]))
     
         if self.has_plain():
             _plain_val = self._plain[adj_index]
-            _plain = array([_plain_val]) if isinstance(_plain_val, ByVal) else _plain_val
+            if not isinstance(_plain_val, ndarray):
+                _plain = array([_plain_val])
+            elif isinstance(adj_index, Tuple[slice, slice]):
+                # A block: a copy (a NumPy view would share the parent's share, which the MPA-valued setitem writes in
+                # place)
+                _plain = _plain_val.copy()
+            else:
+                _plain = _plain_val
 
         mpc = self._mpc
         if mpc.pid == 0:
-            return MPA[_plain.S, dtype]._from_plain(mpc, _plain)
+            return MPA[type(_plain.shape), dtype]._from_plain(mpc, _plain)
         
-        return MPA[_plain.S, dtype]._from_parts(
+        return MPA[type(_plain.shape), dtype]._from_parts(
             self._mpc,
             _plain,
             self._encryption._getitem(mpc, adj_index) if self.has_encryption() else Ciphertensor[Ciphertext](),
@@ -252,7 +294,7 @@ class MPA[S, dtype]:
         return MPA[S, _self.dtype]._matmul(self._mpc, _self, _other)
     
     def __truediv__(self, other) -> MPA[S, dtype]:
-        if isinstance(other, ByVal):
+        if isinstance(other, ByVal) and not isinstance(other, ndarray):
             return self * (1 / other)
         raise NotImplementedError("MPAs cannot be divided by secure value yet")
     
@@ -283,7 +325,8 @@ class MPA[S, dtype]:
         factor = self._aggregate if other == 2 else secure_operator.pow(mpc, self._aggregate, other - 1)
         return MPA[S, dtype](mpc, self._encryption.mul(mpc, factor))
 
-    def enc[S, dtype](self, mpc, data: ndarray[S, dtype]) -> MPA[S, dtype]:
+    def enc[dtype, ndim: Literal[int]](self, mpc, data: ndarray[dtype, ndim]):
+        S = type(data.shape)
         return MPA[S, dtype]._from_plain(mpc, data if mpc.pid == 1 else data.zeros())
     
     @staticmethod
@@ -323,7 +366,7 @@ class MPA[S, dtype]:
             compile_error("MPA: only 1-dim MPPs can be expanded")
         assert axis == 0, "Not implemented yet: MPA dim expansion over secondary axes"
         
-        _plain = ndarray[Tuple[int, int], dtype]()
+        _plain = empty_ndarray(dtype, 2)
         _encryption = Ciphertensor[Ciphertext]()
         _aggregate = Ciphertensor[Ciphertext]()
         
@@ -381,14 +424,15 @@ class MPA[S, dtype]:
     def T(self):
         return MPA[S, dtype]._from_parts(
             self._mpc,
-            self._plain.T if self.has_plain() else self._plain,
+            # A copy: a NumPy view would share this MPA's share, which setitems write in place
+            self._plain.T.copy() if self.has_plain() else self._plain,
             self._encryption.T,
             self._aggregate.T)
     
     @property
     def I(self):
         mpc = self._mpc
-        id_mat = ndarray[S, dtype].diag(self.shape, dtype(1))
+        id_mat = ndarray[dtype, static.len(S)].diag(self.shape, dtype(1))
         return MPA[S, dtype]._from_plain(mpc, id_mat if mpc.pid == mpc.comms.hub_pid else zeros_like(id_mat))
     
     @property
@@ -433,7 +477,7 @@ class MPA[S, dtype]:
         self._encryption = MPA[S, dtype]._encrypted_share(mpc, self._plain)
 
     @staticmethod
-    def _encrypted_share(mpc, plain: ndarray[S, dtype]) -> Ciphertensor[Ciphertext]:
+    def _encrypted_share(mpc, plain: ndarray) -> Ciphertensor[Ciphertext]:
         # A share held in the clear, encrypted: a vector row-wise, its only layout, whatever the ambient encoding (which
         # it asserted on); a matrix in the ambient encoding, as before
         if static.len(S) == 1:
@@ -453,7 +497,7 @@ class MPA[S, dtype]:
         
         self._aggregate = enc.aggregate(mpc)
     
-    def reveal(self, *args) -> ndarray[S, dtype]:
+    def reveal(self, *args):
         # The sum of the shares, to every party; nothing else about the shares
         mpc = self._mpc
         if mpc.pid == 0:
@@ -478,7 +522,7 @@ class MPA[S, dtype]:
         else:
             compile_error("MPA reveal: invalid shape")
     
-    def _reveal_plain_sum(self, council: List[List[int]]) -> ndarray[S, dtype]:
+    def _reveal_plain_sum(self, council: List[List[int]]):
         # The sum of the shares every compute party holds in the clear (or none), and nothing else about them (M-MP-15):
         # each party sends the others its share under pairwise masks that cancel in the sum (_masked_plain_share)
         mpc = self._mpc
@@ -561,7 +605,7 @@ class MPA[S, dtype]:
             compile_error("MPA reveal: shares in the clear must be float or int")
         return out
 
-    def reveal_local(self, *args) -> ndarray[S, dtype]:
+    def reveal_local(self, *args):
         # This compute party's own share: in the clear as it is; an encrypted share decrypted to this party alone
         # (MPCMHE.decrypt's default mode, in which every compute party takes part, so call it at every party). An MPA
         # that holds only its aggregate, the same ciphertexts at every party, has no share of its own: revealing it
@@ -662,7 +706,7 @@ class MPA[S, dtype]:
         # what it is: a share in the clear and its encryption with val at the hub (CP1) and 0 elsewhere; the aggregate,
         # the same ciphertexts at every party, with val itself.
         shared_value = val if mpc.pid == 1 else type(val)(0)
-        plain = self._plain.pad_with_value(shared_value, size, axis) if self.has_plain() else ndarray[S, dtype]()
+        plain = self._plain.pad_with_value(shared_value, size, axis) if self.has_plain() else empty_ndarray(dtype, static.len(S))
         encryption = self._encryption.pad_with_value(shared_value, size, axis, mpc) if self.has_encryption() else Ciphertensor[Ciphertext]()
         aggregate = self._aggregate.pad_with_value(val, size, axis, mpc) if self.has_aggregate() else Ciphertensor[Ciphertext]()
 
@@ -690,7 +734,7 @@ class MPA[S, dtype]:
         return MPA[S, dtype](mpc, enc, aggregate=True)
 
     # def rand(shape: S, distribution: str, mpc) -> MPA[S, dtype]:
-    #     rand_data = ndarray[S, dtype].rand(shape, distribution)
+    #     rand_data = ndarray[dtype, static.len(S)].rand(shape, distribution)
     #     return MPA[S, dtype](mpc, rand_data if mpc.pid == 1 else zeros(shape, dtype=dtype))
 
     # self typed: Codon 0.20 lets an untyped self take a class-qualified call meant for the static
@@ -721,7 +765,7 @@ class MPA[S, dtype]:
         return MPA[S, dtype]._from_plain(self._mpc, self._plain.erase_element(index))
 
     @staticmethod
-    def _get_matmul_public_cost(first: MPA[S, dtype], other: ndarray[S, dtype]) -> float:
+    def _get_matmul_public_cost(first: MPA[S, dtype], other: ndarray) -> float:
         if first._mpc.pid == 0 or first.has_plain():
             cost = first._plain.get_matmul_cost(other)
         elif first.has_aggregate():
@@ -986,7 +1030,7 @@ class MPA[S, dtype]:
         return MPA[S, dtype](mpc, other._aggregate * self._aggregate, aggregate=True)
 
     @sequre
-    def _matmul_public[S, dtype](mpc, self: MPA[S, dtype], other: ndarray[S, dtype]) -> MPA[S, dtype]:
+    def _matmul_public[S, dtype](mpc, self: MPA[S, dtype], other: ndarray) -> MPA[S, dtype]:
         if mpc.pid == 0 or self.has_plain():
             return MPA[S, dtype](mpc, self._plain @ other)
 

@@ -116,11 +116,6 @@ if has_step plugin; then
   echo "$CODON_VERSION" > "$PLUGIN/codon-version"
 fi
 
-# Sequre's numpy is a fork (its ndarray is defined differently and is incompatible with Codon's own; for now — the
-# plan is to eventually migrate Sequre to use Codon's numpy directly). It is shipped inside the plugin (via the
-# `install(DIRECTORY stdlib ...)` rule) and imported exclusively through the `sequre.stdlib.numpy` namespace, so it
-# never collides with Codon's native `numpy`, which is left intact.
-
 if has_step launcher; then
   mkdir -p "$PREFIX/bin" "$PREFIX/lib"
   "$CC" -O2 -o "$PREFIX/bin/sequre" "$SRC/sequre_launcher.c"
@@ -146,9 +141,8 @@ if has_step gmp; then
 fi
 
 if has_step pack; then
-  # Only Sequre's own files (not the whole lib/codon/stdlib tree): install.sh unpacks Codon itself separately.
-  # Sequre's numpy fork travels inside the plugin (lib/codon/plugins/sequre/stdlib/numpy), so Codon's native numpy/
-  # is neither bundled nor replaced.
+  # Only Sequre's own files (not the whole lib/codon/stdlib tree): install.sh unpacks Codon itself separately, and
+  # Sequre uses Codon's own numpy.
   case "$OS" in
     darwin) DLL=dylib ;;
     *) DLL=so ;;
