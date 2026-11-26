@@ -6,9 +6,14 @@
 #
 # Both archives are downloaded into a temporary directory and checked, and the new launcher must run on this machine,
 # before either is unpacked: a missing asset, a failed download or an archive for another platform stops the install
-# with a message naming it, and leaves an existing install as it was. Then Codon and Sequre are unpacked over the
-# install directory (files an earlier install has and the new one lacks stay); a failure there (permissions, disk
-# space) says that the install is incomplete.
+# with a message naming it, and leaves an existing install as it was. Then the directories each archive owns are
+# replaced, each named in the output: Codon's lib/codon/stdlib and include/codon, and Sequre's lib/codon/plugins/sequre
+# (moved to lib/codon/plugins/sequre.previous when it holds entries the new archive lacks, a user's files say); the seq
+# plugin that Sequre's archives for Codon 0.19 bundled goes too, as it does not load into Codon 0.20. Codon and Sequre
+# are then unpacked over the install directory (other files an earlier install has and the new one lacks stay); a
+# failure there (permissions, disk space) says that the install is incomplete. An install directory whose lib,
+# lib/codon, lib/codon/plugins or include is a symbolic link is refused before anything is downloaded: replacing the
+# directories under it would change the link's target, outside the install.
 #
 # Environment (all optional):
 #   SEQURE_INSTALL_DIR    install directory (default: ~/.sequre; a relative path is taken from the current one)
@@ -45,6 +50,19 @@ else
   echo "error: Pre-built binaries only exist for Linux (x86_64, aarch64) and macOS (arm64)." >&2
   exit 1
 fi
+
+# The directories the install replaces lie under these; through a symbolic link, replacing them would change the
+# link's target, outside the install
+for d in lib lib/codon lib/codon/plugins include; do
+  if [ -L "$SEQURE_INSTALL_DIR/$d" ]; then
+    echo "error: $SEQURE_INSTALL_DIR/$d is a symbolic link (to $(readlink "$SEQURE_INSTALL_DIR/$d"))," >&2
+    echo "and the installer replaces Codon's and Sequre's directories under it, which would change the" >&2
+    echo "link's target. Install into another directory (SEQURE_INSTALL_DIR), or replace the link with a" >&2
+    echo "copy of what it points to." >&2
+    echo "Nothing was installed." >&2
+    exit 1
+  fi
+done
 
 CODON_BUILD_ARCHIVE=codon-$OS-$ARCH.tar.gz
 SEQURE_BUILD_ARCHIVE=sequre-$OS-$ARCH.tar.gz
@@ -152,8 +170,49 @@ if ! tar -xzf "$TMP/sequre.tar.gz" -C "$TMP/probe" "$LAUNCHER" ||
   exit 1
 fi
 
-# 1. Codon, then 2. Sequre (plugin, launcher, alignment shim) on top.
+# 1. Codon, then 2. Sequre (plugin, launcher, alignment shim) on top. Each archive owns some directories outright, so
+# they are replaced, not unpacked over: an install over an earlier one would keep that one's files that this one lacks
+# (Codon's stdlib and headers of another release, the files an older plugin had).
+in_sequre_archive() {  # in_sequre_archive <path>: the Sequre archive has <path> or something under it
+  awk -v p="$1" '{ sub(/^\.\//, ""); if ($0 == p || $0 == p "/" || index($0, p "/") == 1) { found = 1; exit } }
+                 END { exit !found }' "$TMP/sequre.tar.gz.list"
+}
+clear_owned_directories() {
+  plugins="$SEQURE_INSTALL_DIR/lib/codon/plugins"
+  if [ -e "$SEQURE_INSTALL_DIR/lib/codon/stdlib" ] || [ -e "$SEQURE_INSTALL_DIR/include/codon" ]; then
+    echo "Replacing Codon's stdlib and headers (lib/codon/stdlib, include/codon)."
+    rm -rf "$SEQURE_INSTALL_DIR/lib/codon/stdlib" "$SEQURE_INSTALL_DIR/include/codon" || return 1
+  fi
+  # The seq plugin that Sequre's archives for Codon 0.19 bundled (their plugin has no codon-version) does not load into
+  # Codon 0.20; a seq installed beside a later Sequre is the user's own and stays
+  if [ -d "$plugins/seq" ] && [ -d "$plugins/sequre" ] && [ ! -f "$plugins/sequre/codon-version" ] &&
+     ! in_sequre_archive lib/codon/plugins/seq; then
+    echo "Removing the seq plugin that the earlier Sequre release bundled (built for Codon 0.19, it does not load into"
+    echo "Codon $CODON_VERSION)."
+    rm -rf "$plugins/seq" || return 1
+  fi
+  # Sequre's plugin directory comes whole from the archive. Entries the archive lacks (a backup of the user's, an
+  # earlier layout's files) are kept: the old directory is moved aside instead of removed.
+  if [ -e "$plugins/sequre" ] || [ -L "$plugins/sequre" ]; then
+    extra=""
+    for entry in "$plugins/sequre"/* "$plugins/sequre"/.[!.]*; do
+      if [ -e "$entry" ] || [ -L "$entry" ]; then
+        in_sequre_archive "lib/codon/plugins/sequre/${entry##*/}" || extra="$extra ${entry##*/}"
+      fi
+    done
+    if [ -n "$extra" ]; then
+      rm -rf "$plugins/sequre.previous" || return 1
+      mv "$plugins/sequre" "$plugins/sequre.previous" || return 1
+      echo "Moved the earlier Sequre plugin to $plugins/sequre.previous: it holds entries this release lacks"
+      echo "(${extra# }); delete it when you no longer need them."
+    else
+      echo "Replacing the Sequre plugin (lib/codon/plugins/sequre)."
+      rm -rf "$plugins/sequre" || return 1
+    fi
+  fi
+}
 if ! mkdir -p "$SEQURE_INSTALL_DIR" ||
+   ! clear_owned_directories ||
    ! tar -xzf "$TMP/codon.tar.gz" -C "$SEQURE_INSTALL_DIR" --strip-components=1 ||
    ! tar -xzf "$TMP/sequre.tar.gz" -C "$SEQURE_INSTALL_DIR"; then
   echo "error: unpacking into $SEQURE_INSTALL_DIR failed (see above), so the install there is incomplete." >&2
@@ -161,15 +220,18 @@ if ! mkdir -p "$SEQURE_INSTALL_DIR" ||
   exit 1
 fi
 
-# 3. x86-64 heap-vector alignment workaround for Codon (Linux x86_64 only). A freshly downloaded Codon ships an
-#    unpatched stdlib, so patch its Ptr load/store to be unaligned. Inlined (not delegated to a sibling script) so it
-#    also works when this installer is run via `curl ... | bash`. The over-align shim ships in the Sequre archive; the
-#    launcher preloads it for `sequre run` and links it into the binaries of `sequre build`.
-if [ "$OS" = "linux" ] && [ "$ARCH" = "x86_64" ]; then
+# 3. Codon 0.19 only (the archives of Sequre v0.1.6 and earlier), Linux x86_64: Codon emits aligned vector moves for
+#    heap vectors, which the collector only 16-byte-aligns, and 0.19.6's Ptr load/store are patched to be unaligned
+#    (those releases' `sequre build` binaries run without the over-align shim). Codon 0.20 needs no patch: its own
+#    simd.codon makes loads and stores through Ptr[Vec] unaligned, and the over-align shim, which the launcher preloads
+#    for `sequre run` and links into the binaries of `sequre build`, covers the other aligned moves (tuples of vectors,
+#    struct fields, generator frames). Inlined (not delegated to a sibling script) so that it also works when this
+#    installer is run via `curl ... | bash`.
+if [ "$OS" = "linux" ] && [ "$ARCH" = "x86_64" ] && [ "${CODON_VERSION#v0.19.}" != "$CODON_VERSION" ]; then
   PTR="$SEQURE_INSTALL_DIR/lib/codon/stdlib/internal/types/ptr.codon"
   if [ -f "$PTR" ] && ! grep -q ', align 1' "$PTR"; then
     sed -i -E '/(^|[[:space:]])(load|store)[[:space:]]/ { /align/! { /%0$/ s/$/, align 1/ } }' "$PTR"
-    echo "Applied the x86-64 Ptr unaligned-load patch."
+    echo "Applied the x86-64 Ptr unaligned-load patch (Codon $CODON_VERSION)."
   fi
 fi
 

@@ -8,20 +8,20 @@ set -o pipefail
 # moves fault (SIGSEGV) on x86-64 CPUs with AVX2 or AVX-512. Hit by Sequre's
 # MHE/CKKS path (e.g. `sequre run ... --local`).
 #
-# Applies the install-side pieces that a fresh/bundled Codon does not carry:
-#   1. Patch Codon's stdlib Ptr load/store to be unaligned (covers Ptr[Vec][i]
-#      / Vec._load at arbitrary offsets).
-#   2. Build the over-align shim into $PREFIX/lib (covers compiler-emitted
-#      aligned stores: Vec struct fields, vectorized loops). The launcher
-#      preloads it for `sequre run` and links it into the binaries of
-#      `sequre build`. Rebuilt when sequre_align64.c is newer than it, so a
-#      source update reaches it.
+# Builds the over-align shim into $PREFIX/lib: it 64-aligns heap blocks, so the
+# aligned moves Codon emits for them (tuples of vectors, Vec struct fields,
+# generator frames, vectorized loops) are safe. The launcher preloads it for
+# `sequre run` and links it into the binaries of `sequre build`. Rebuilt when
+# sequre_align64.c is newer than it, so a source update reaches it.
 #
-# The third piece (stdlib/prg.codon's @llvm vector loads -> align 1) lives in
-# Sequre's own source and ships in the plugin (lib/codon/plugins/sequre/stdlib),
-# so it needs no install-time action. The launcher is rebuilt by the build
-# scripts from the patched sequre_launcher.c; pass SEQURE_WORKAROUND_SKIP_LAUNCHER=1
-# to skip rebuilding it here (e.g. when the build already did).
+# Codon 0.20's own simd.codon makes loads and stores through Ptr[Vec] unaligned
+# (Codon 0.19.6 also needed its stdlib's Ptr patched, which the installer still
+# does for the archives built for it), and stdlib/prg.codon's @llvm vector loads
+# are unaligned in Sequre's own source, which ships in the plugin
+# (lib/codon/plugins/sequre/stdlib): neither needs an install-time action. The
+# launcher is rebuilt by the build scripts from sequre_launcher.c; pass
+# SEQURE_WORKAROUND_SKIP_LAUNCHER=1 to skip rebuilding it here (e.g. when the
+# build already did).
 #
 # Idempotent. No-op on non-x86_64 (e.g. macOS/arm64, which is unaffected).
 #
@@ -38,31 +38,10 @@ if [ "$ARCH" != "x86_64" ]; then
   exit 0
 fi
 
-PTR="$SEQURE_PREFIX/lib/codon/stdlib/internal/types/ptr.codon"
 SHIM_SO="$SEQURE_PREFIX/lib/sequre_align64.so"
 SHIM_C="$SRC/sequre_align64.c"
 
-# 1. Patch Codon's Ptr.__getitem__/__setitem__ to use unaligned load/store.
-#    Append ', align 1' to the @llvm load/store lines that end in the GEP result
-#    '%0'. Handles both opaque ('ptr %0') and typed ('{=T}* %0') pointer syntax,
-#    and is idempotent (lines already carrying 'align' are skipped).
-if [ ! -f "$PTR" ]; then
-  echo "apply_avx512_workaround: $PTR not found; skipping Ptr patch (Codon stdlib not present here)."
-else
-  before=$(grep -cE 'align 1' "$PTR" || true)
-  sed -i -E '/(^|[[:space:]])(load|store)[[:space:]]/ { /align/! { /%0$/ s/$/, align 1/ } }' "$PTR"
-  after=$(grep -cE 'align 1' "$PTR" || true)
-  if [ "$after" -gt "$before" ]; then
-    echo "Patched Ptr load/store to unaligned (+$((after - before)) sites): $PTR"
-  elif [ "$after" -gt 0 ]; then
-    echo "Ptr load/store already unaligned; skipping: $PTR"
-  else
-    echo "WARNING: could not patch $PTR (unexpected layout)." >&2
-    echo "         The x86-64 alignment workaround is incomplete; sequre --local may crash." >&2
-  fi
-fi
-
-# 2. Build the over-align shim, when it is missing or older than its source (so
+# 1. Build the over-align shim, when it is missing or older than its source (so
 #    a stale shim never stays behind a source update). Built into a temporary
 #    file first: a failed build keeps the shim that was there.
 if [ -f "$SHIM_SO" ] && { [ ! -f "$SHIM_C" ] || [ ! "$SHIM_C" -nt "$SHIM_SO" ]; }; then
@@ -85,7 +64,7 @@ else
   fi
 fi
 
-# 3. Rebuild the launcher so it preloads and links the shim, unless the caller
+# 2. Rebuild the launcher so it preloads and links the shim, unless the caller
 #    already built it from the current source.
 if [ "${SEQURE_WORKAROUND_SKIP_LAUNCHER:-0}" != "1" ]; then
   LAUNCHER_C="$SRC/sequre_launcher.c"

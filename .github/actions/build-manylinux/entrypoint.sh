@@ -120,8 +120,8 @@ if has_step launcher; then
   mkdir -p "$PREFIX/bin" "$PREFIX/lib"
   "$CC" -O2 -o "$PREFIX/bin/sequre" "$SRC/sequre_launcher.c"
   # The x86-64 heap-vector over-align shim: the launcher preloads it for `sequre run` and links it into the binaries
-  # of `sequre build`; install.sh patches Codon's Ptr separately (Codon's stdlib is not bundled here). ARM is
-  # unaffected, so no shim is built or bundled there.
+  # of `sequre build` (Codon's stdlib is not bundled here: install.sh unpacks Codon's own release, whose Ptr needs no
+  # patch since Codon 0.20). ARM is unaffected, so no shim is built or bundled there.
   if [ "$PLATFORM" = "linux-x86_64" ]; then
     "$CC" -shared -fPIC -O2 -o "$PREFIX/lib/sequre_align64.so" "$SRC/sequre_align64.c" -ldl
   fi

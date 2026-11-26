@@ -16,12 +16,14 @@
 #                   CODON_PYTHON) with the MHE setup and N parties (3 and 4), prints the results, loads the GMP bundled
 #                   with the plugin (Linux and macOS) and leaves no socket file behind
 #   shim            x86-64 Linux: shrinking and freeing over-aligned blocks leaves their neighbours intact
-#   seq             a program that uses the seq plugin and Sequre, built with `sequre build -release -plugin seq`, runs
 #   installer-*     with the archive given, scripts/install.sh: a download that fails (HTTP 404), a broken archive and
 #                   an archive whose launcher does not run each stop it with a non-zero status and leave an existing
 #                   install (a scratch one) as it was; with no terminal and the script on stdin (curl | bash) it
-#                   completes and leaves shell profiles alone, and SEQURE_UPDATE_PATH=yes adds one PATH line. Every
-#                   installer run gets a scratch HOME and a scratch install directory.
+#                   completes and leaves shell profiles alone, and SEQURE_UPDATE_PATH=yes adds one PATH line; over
+#                   an install of an earlier release it replaces Codon's stdlib and headers and Sequre's plugin, drops
+#                   the seq plugin that release bundled, and keeps the user's files in the old plugin directory
+#                   (moved to sequre.previous); an install whose lib/codon is a symbolic link is refused, its target
+#                   untouched. Every installer run gets a scratch HOME and a scratch install directory.
 # Environment: SMOKE_TIMEOUT (seconds per program run, default 600), SMOKE_INSTALL_SH (the installer to test,
 # default scripts/install.sh).
 set -uo pipefail
@@ -239,39 +241,6 @@ EOF
   fi
 fi
 
-# seq: the seq plugin bundled with the release loads alongside Sequre's (the launcher puts -plugin seq first)
-if [ -f "$PREFIX/lib/codon/plugins/seq/plugin.toml" ]; then
-  D=$WORK/seq
-  mkdir -p "$D"
-  cat > "$D/seq.codon" << 'EOF'
-from bio import *
-from sequre import main, Sharetensor as Stensor
-
-@main
-def run(mpc, n):
-    x = Stensor.enc(mpc, n)
-    print(f"CP{mpc.pid}: {~s'ACGTTT'} {x.reveal(mpc)}")
-
-run(len(s'ACGTACGT'))
-EOF
-  (cd "$D" && run_timeout "$TIMEOUT" env CODON_DEBUG=0 "$SEQURE" build -release -plugin seq seq.codon -o seqbin \
-    > build.txt 2>&1 < /dev/null)
-  rc=$?
-  if [ $rc -eq 0 ]; then
-    (cd "$D" && run_timeout "$TIMEOUT" env -i HOME="$HOME" PATH=/usr/bin:/bin ./seqbin --local --skip-mhe-setup \
-      > log.txt 2>&1 < /dev/null)
-  fi
-  if [ $rc -ne 0 ]; then
-    tail -5 "$D/build.txt" | sed 's/^/      /'
-    fail seq "\`sequre build -release -plugin seq\` failed with exit status $rc"
-  elif [ "$(grep -c 'AAACGT 8' "$D/log.txt")" -ne 2 ]; then
-    tail -5 "$D/log.txt" | sed 's/^/      /'
-    fail seq "the program did not print its results"
-  else
-    ok seq "bio and Sequre in one release build"
-  fi
-fi
-
 # installer-*
 if [ -n "$ARCHIVE" ]; then
   # A stand-in for Codon's archive (the checks are about the installer, not Codon), an archive whose launcher does not
@@ -356,6 +325,51 @@ if [ -n "$ARCHIVE" ]; then
     ok installer-update-path "one PATH line added"
   else
     fail installer-update-path "exit status $rc, $lines PATH lines in .bashrc"
+  fi
+
+  # installer-upgrade: over an install of an earlier release (a Sequre plugin without codon-version, with the seq
+  # plugin it bundled, a stale stdlib file and header, and a file of the user's in the plugin directory)
+  h=$WORK/installer-upgrade
+  mkdir -p "$h/prefix/lib/codon/stdlib" "$h/prefix/include/codon" "$h/prefix/lib/codon/plugins/seq" \
+    "$h/prefix/lib/codon/plugins/sequre/user-backup"
+  echo "stale" > "$h/prefix/lib/codon/stdlib/stale.codon"
+  echo "stale" > "$h/prefix/include/codon/stale.h"
+  echo 'version = "0.11.3"' > "$h/prefix/lib/codon/plugins/seq/plugin.toml"
+  echo "earlier" > "$h/prefix/lib/codon/plugins/sequre/plugin.toml"
+  echo "the user's" > "$h/prefix/lib/codon/plugins/sequre/user-backup/kept.txt"
+  run_timeout "$TIMEOUT" env HOME="$h" SEQURE_INSTALL_DIR="$h/prefix" SEQURE_CODON_ARCHIVE="$FAKE_CODON" \
+    SEQURE_ARCHIVE="$ARCHIVE" SEQURE_UPDATE_PATH=no bash "$INSTALL_SH" > "$h/log.txt" 2>&1 < /dev/null
+  rc=$?
+  P=$h/prefix/lib/codon/plugins
+  problems=""
+  [ $rc -eq 0 ] || problems="$problems exit status $rc;"
+  [ ! -e "$h/prefix/lib/codon/stdlib/stale.codon" ] || problems="$problems the stale stdlib file stayed;"
+  [ ! -e "$h/prefix/include/codon/stale.h" ] || problems="$problems the stale header stayed;"
+  [ ! -e "$P/seq" ] || problems="$problems the earlier seq plugin stayed;"
+  [ -f "$P/sequre/codon-version" ] || problems="$problems no new plugin;"
+  [ -f "$P/sequre.previous/user-backup/kept.txt" ] || problems="$problems the user's file is gone;"
+  grep -q 'Moved the earlier Sequre plugin' "$h/log.txt" || problems="$problems no message about the moved plugin;"
+  if [ -z "$problems" ]; then
+    ok installer-upgrade "stdlib, headers and plugin replaced, bundled seq removed, user's file in sequre.previous"
+  else
+    tail -5 "$h/log.txt" | sed 's/^/      /'
+    fail installer-upgrade "${problems% ;}"
+  fi
+
+  # installer-symlink: an install whose lib/codon is a symbolic link stops before anything is downloaded
+  h=$WORK/installer-symlink
+  mkdir -p "$h/target/stdlib" "$h/prefix/lib"
+  echo "kept" > "$h/target/stdlib/kept.codon"
+  ln -s "$h/target" "$h/prefix/lib/codon"
+  run_timeout "$TIMEOUT" env HOME="$h" SEQURE_INSTALL_DIR="$h/prefix" SEQURE_CODON_ARCHIVE="$FAKE_CODON" \
+    SEQURE_ARCHIVE="$ARCHIVE" SEQURE_UPDATE_PATH=no bash "$INSTALL_SH" > "$h/log.txt" 2>&1 < /dev/null
+  rc=$?
+  if [ $rc -ne 0 ] && [ -L "$h/prefix/lib/codon" ] && [ -f "$h/target/stdlib/kept.codon" ] &&
+     grep -q 'Nothing was installed' "$h/log.txt"; then
+    ok installer-symlink "exit status $rc, the link and its target untouched"
+  else
+    tail -5 "$h/log.txt" | sed 's/^/      /'
+    fail installer-symlink "exit status $rc$([ -f "$h/target/stdlib/kept.codon" ] || echo ', target lost files')"
   fi
 fi
 
