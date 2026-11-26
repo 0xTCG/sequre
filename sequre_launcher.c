@@ -189,6 +189,17 @@ static int takes_value(const char *a) {
 
 static int has_prefix(const char *s, const char *prefix) { return strncmp(s, prefix, strlen(prefix)) == 0; }
 
+/* Whether the user chose the numeric semantics (-numerics c, --numerics=py, ...) among argv[from..to). */
+static int user_sets_numerics(int argc, char **argv, int from, int to) {
+  for (int i = from; i < to && i < argc; i++) {
+    if (!strcmp(argv[i], "-numerics") || !strcmp(argv[i], "--numerics") || has_prefix(argv[i], "-numerics=") ||
+        has_prefix(argv[i], "--numerics=")) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int has_suffix(const char *s, const char *suffix) {
   size_t ns = strlen(s);
   size_t nf = strlen(suffix);
@@ -709,6 +720,8 @@ static void print_help(const char *codon) {
   printf("\n");
   printf("Codon flags such as -release go before the input file: after it, `sequre run` passes them to the\n");
   printf("program. `sequre build` takes -o <binary> and other codon flags on either side.\n");
+  printf("The launcher passes -numerics=c (C semantics for integer division, as in Codon before 0.20, but for\n");
+  printf("divmod, which Codon 0.19 always floored) unless a -numerics flag is given.\n");
   printf("\n");
   printf("Program flags (after the .codon file, or after a built binary):\n");
   printf("  --local            Run all parties on this machine (programs that use the @main decorator)\n");
@@ -832,8 +845,8 @@ int main(int argc, char **argv) {
 
   size_t pn = strlen(plugin_path) + sizeof("--plugin=");
   char *plugin_arg = malloc(pn);
-  /* codon <mode> --disable-opt=... --plugin=<path> [-l :<shim> [--linker-flags=...]] <user args> NULL */
-  char **args = calloc((size_t)argc + 8, sizeof(char *));
+  /* codon <mode> --disable-opt=... [-numerics=c] --plugin=<path> [-l :<shim> [--linker-flags=...]] <user args> NULL */
+  char **args = calloc((size_t)argc + 9, sizeof(char *));
   if (!plugin_arg || !args) {
     fprintf(stderr, "Out of memory.\n");
     return 1;
@@ -853,6 +866,13 @@ int main(int argc, char **argv) {
   args[k++] = codon;
   args[k++] = (char *)mode;
   args[k++] = (char *)"--disable-opt=core-pythonic-list-addition-opt";
+  /* C numerics unless the user chose: Codon's default until 0.20, which made Python semantics the default (signed //
+   * rounds down, integer division checks for zero). Sequre's arithmetic is written for C semantics, so its results
+   * stay those of earlier Codon versions. One difference remains: Codon 0.19's divmod floored whatever the mode, and
+   * Codon 0.20's follows the mode (Sequre doesn't call it). */
+  if (!user_sets_numerics(argc, argv, arg_start, user_plugins_end)) {
+    args[k++] = (char *)"-numerics=c";
+  }
   for (int i = arg_start; i < user_plugins_end; i++) {
     int n = plugin_option(argv[i]);
     if (n == 2 && i + 1 >= argc) {

@@ -1,7 +1,7 @@
 #!/bin/sh -l
 set -e
 
-# Build script for sequre (Codon/LLVM/seq already pre-installed in image)
+# Build script for sequre (Codon/LLVM already pre-installed in image)
 # Usage: /build-sequre.sh /path/to/sequre/source
 
 SRC=$1

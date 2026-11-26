@@ -16,7 +16,7 @@ BETNode::BETNode( Value *value )
 BETNode::BETNode( std::string const operation, BETNode *leftChild, BETNode *rightChild )
   : value(nullptr), irType(nullptr), operation(operation), leftChild(leftChild), rightChild(rightChild), expanded(false) {}
 
-BETNode::BETNode( Value *value, types::Type *irType, std::string const operation, bool expanded )
+BETNode::BETNode( Value *value, Type *irType, std::string const operation, bool expanded )
   : value(value), irType(irType), operation(operation), leftChild(nullptr), rightChild(nullptr), expanded(expanded) {}
 
 BETNode *BETNode::copy() const {
@@ -84,7 +84,7 @@ void BETNode::replace( BETNode *other ) {
   expanded   = other->isExpanded();
 }
 
-types::Type *BETNode::getOrRealizeIRType( bool force ) {
+Type *BETNode::getOrRealizeIRType( bool force ) {
   if ( irType && !force) return irType;
   if ( isLeaf() && checkIsTypeable() ) {
     irType = value->getType();

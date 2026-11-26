@@ -5,8 +5,9 @@
 #   entrypoint.sh <sequre source directory>
 #
 # Steps, in this order (SEQURE_BUILD_STEPS selects some of them):
-#   toolchain  download Codon, LLVM-codon and the seq plugin (pinned versions below) into the prefixes
-#   plugin     build the Sequre plugin with cmake and install it into <prefix>/lib/codon/plugins/sequre
+#   toolchain  download Codon and LLVM-codon (pinned versions below) into the prefixes
+#   plugin     build the Sequre plugin with cmake and install it into <prefix>/lib/codon/plugins/sequre, with the
+#              Codon version it is built for in codon-version (install.sh installs that Codon with the archive)
 #   launcher   build the sequre launcher and, on x86-64 Linux, the alignment shim
 #   gmp        bundle GMP built for the target: the repository's copy (external/GMP/lib: x86-64 Linux, arm64 macOS)
 #              or, on other Linux architectures, one built from source (scripts/build_gmp.sh)
@@ -29,9 +30,8 @@ PLATFORM=$OS-$ARCH
 PLUGIN=$PREFIX/lib/codon/plugins/sequre
 ARCHIVE=$SRC/sequre-$PLATFORM.tar.gz
 
-CODON_VERSION=v0.19.6
+CODON_VERSION=v0.20.8
 LLVM_VERSION=20.1.7
-SEQ_VERSION=v0.11.5
 
 has_step() {
   case " $STEPS " in
@@ -58,7 +58,6 @@ if has_step toolchain; then
   download "https://github.com/exaloop/codon/releases/download/$CODON_VERSION/codon-$PLATFORM.tar.gz" "$TMP/codon.tar.gz"
   download "https://github.com/exaloop/llvm-project/releases/download/codon-$LLVM_VERSION/llvm-codon-$LLVM_VERSION-$PLATFORM.tar.bz2" \
     "$TMP/llvm.tar.bz2"
-  download "https://github.com/exaloop/seq/releases/download/$SEQ_VERSION/seq-$PLATFORM.tar.gz" "$TMP/seq.tar.gz"
   tar -xzf "$TMP/codon.tar.gz" -C "$PREFIX" --strip-components=1
   rm -f "$TMP/codon.tar.gz"
   # The LLVM tarball may be rooted at opt/ or at llvm-codon/; either way it lands at $OPT/llvm-codon
@@ -69,7 +68,6 @@ if has_step toolchain; then
     tar -xjf "$TMP/llvm.tar.bz2" -C "$OPT"
   fi
   rm -f "$TMP/llvm.tar.bz2"
-  tar -xzf "$TMP/seq.tar.gz" -C "$PREFIX/lib/codon/plugins"
 fi
 
 # Pick the C/C++ compiler:
@@ -115,6 +113,7 @@ if has_step plugin; then
     -DCMAKE_CXX_COMPILER="$CXX"
   cmake --build "$SRC/build" --target sequre
   cmake --install "$SRC/build" --prefix "$PLUGIN"
+  echo "$CODON_VERSION" > "$PLUGIN/codon-version"
 fi
 
 # Sequre's numpy is a fork (its ndarray is defined differently and is incompatible with Codon's own; for now — the
@@ -156,7 +155,7 @@ if has_step pack; then
   esac
   set -- bin/sequre lib/codon/plugins/sequre/plugin.toml lib/codon/plugins/sequre/build/libsequre.$DLL \
     lib/codon/plugins/sequre/lib/libgmp.$DLL lib/codon/plugins/sequre/stdlib/sequre/__init__.codon \
-    lib/codon/plugins/seq/plugin.toml
+    lib/codon/plugins/sequre/codon-version
   if [ "$PLATFORM" = "linux-x86_64" ]; then
     set -- "$@" lib/sequre_align64.so
   fi
@@ -166,7 +165,7 @@ if has_step pack; then
       exit 1
     fi
   done
-  set -- bin/sequre lib/codon/plugins/sequre lib/codon/plugins/seq
+  set -- bin/sequre lib/codon/plugins/sequre
   if [ "$PLATFORM" = "linux-x86_64" ]; then
     set -- "$@" lib/sequre_align64.so
   fi

@@ -14,8 +14,10 @@
 #   SEQURE_INSTALL_DIR    install directory (default: ~/.sequre; a relative path is taken from the current one)
 #   SEQURE_ARCHIVE        the Sequre archive, a URL or a local file (default: the latest release's archive for this
 #                         platform, https://github.com/0xTCG/sequre/releases/latest/download/sequre-<os>-<arch>.tar.gz)
-#   SEQURE_CODON_ARCHIVE  the Codon archive, a URL or a local file (default: Codon's release archive for this
-#                         platform, https://github.com/exaloop/codon/releases/download/v0.19.6/codon-<os>-<arch>.tar.gz)
+#   SEQURE_CODON_ARCHIVE  the Codon archive, a URL or a local file (default: Codon's release archive for this platform
+#                         and the Codon version the Sequre archive was built for, which its
+#                         lib/codon/plugins/sequre/codon-version names, v0.19.6 when it has none (v0.1.6 and earlier):
+#                         https://github.com/exaloop/codon/releases/download/<version>/codon-<os>-<arch>.tar.gz)
 #   SEQURE_UPDATE_PATH    yes or no: whether to add the install's bin directory to PATH in your shell profiles.
 #                         Unset, the script asks on the terminal; with no terminal (CI, a pipe without a tty) it skips
 #                         the update and says so.
@@ -44,11 +46,9 @@ else
   exit 1
 fi
 
-CODON_VERSION=v0.19.6
 CODON_BUILD_ARCHIVE=codon-$OS-$ARCH.tar.gz
 SEQURE_BUILD_ARCHIVE=sequre-$OS-$ARCH.tar.gz
 SEQURE_RELEASES=https://github.com/0xTCG/sequre/releases
-CODON_SRC=${SEQURE_CODON_ARCHIVE:-https://github.com/exaloop/codon/releases/download/$CODON_VERSION/$CODON_BUILD_ARCHIVE}
 SEQURE_SRC=${SEQURE_ARCHIVE:-$SEQURE_RELEASES/latest/download/$SEQURE_BUILD_ARCHIVE}
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/sequre-install.XXXXXX")
@@ -111,13 +111,31 @@ if ! fetch "the Sequre archive ($SEQURE_BUILD_ARCHIVE)" "$SEQURE_SRC" "$TMP/sequ
   echo "Nothing was installed." >&2
   exit 1
 fi
+if ! check_archive "the Sequre archive ($SEQURE_SRC)" "$TMP/sequre.tar.gz" bin/sequre '^(\./)?bin/sequre$' \
+     lib/codon/plugins/sequre/plugin.toml '^(\./)?lib/codon/plugins/sequre/plugin\.toml$'; then
+  echo "Nothing was installed." >&2
+  exit 1
+fi
+
+# The Codon release the Sequre archive was built for: the version its plugin's codon-version file names. An archive
+# without one (v0.1.6 and earlier) was built for v0.19.6.
+CODON_VERSION=v0.19.6
+VERSION_MEMBER=$(grep -m 1 -E '^(\./)?lib/codon/plugins/sequre/codon-version$' "$TMP/sequre.tar.gz.list" || true)
+if [ -n "$VERSION_MEMBER" ]; then
+  if ! CODON_VERSION=$(tar -xzOf "$TMP/sequre.tar.gz" "$VERSION_MEMBER" | tr -d '[:space:]') ||
+     ! echo "$CODON_VERSION" | grep -q -E '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+    echo "error: the Sequre archive ($SEQURE_SRC) names no valid Codon version in $VERSION_MEMBER: '$CODON_VERSION'" >&2
+    echo "Nothing was installed." >&2
+    exit 1
+  fi
+fi
+CODON_SRC=${SEQURE_CODON_ARCHIVE:-https://github.com/exaloop/codon/releases/download/$CODON_VERSION/$CODON_BUILD_ARCHIVE}
+
 if ! fetch "the Codon $CODON_VERSION archive ($CODON_BUILD_ARCHIVE)" "$CODON_SRC" "$TMP/codon.tar.gz"; then
   echo "Nothing was installed." >&2
   exit 1
 fi
-if ! check_archive "the Sequre archive ($SEQURE_SRC)" "$TMP/sequre.tar.gz" bin/sequre '^(\./)?bin/sequre$' \
-       lib/codon/plugins/sequre/plugin.toml '^(\./)?lib/codon/plugins/sequre/plugin\.toml$' ||
-   ! check_archive "the Codon archive ($CODON_SRC)" "$TMP/codon.tar.gz" bin/codon '^[^/]+/bin/codon$'; then
+if ! check_archive "the Codon archive ($CODON_SRC)" "$TMP/codon.tar.gz" bin/codon '^[^/]+/bin/codon$'; then
   echo "Nothing was installed." >&2
   exit 1
 fi

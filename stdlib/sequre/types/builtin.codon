@@ -5,6 +5,7 @@ import math
 import prg
 
 from functools import partial
+from internal.types.str import LEN_MASK as STR_LEN_MASK
 from internal.gc import sizeof, atomic, alloc
 from simd import Vec
 from sequre.stdlib.numpy.ndarray import ndarray
@@ -132,10 +133,13 @@ class bool:
 @extend
 class str:
     def __getitem__(self, indices: list[int]):
-        substr_ptr = Ptr[byte](len(indices))
+        # The characters at indices, kept in self's kind (1, 2 or 4 bytes per character), as Codon's own slices are
+        width = self._width()
+        n = len(indices)
+        substr_ptr = Ptr[u8](n * width)
         for i, ind in enumerate(indices):
-            str.memcpy(substr_ptr + i, self.ptr + ind, 1)
-        return str(substr_ptr, len(indices))
+            str.memcpy(substr_ptr + i * width, self._ptr + ind * width, width)
+        return str(substr_ptr, (self._meta & ~STR_LEN_MASK) | n)
     
     def to_int(self) -> int:
         return int(self)
@@ -146,10 +150,8 @@ class str:
         return mpc_uint(self) % modulus
     
     def nbytes(self) -> int:
-        return len(self)
-    
-    def _pickle_size(self) -> int:
-        return self.nbytes() + sizeof(int)
+        # The characters' bytes; pickler.codon's _pickle_size adds the meta word
+        return len(self) * self._width()
 
 
 @extend
@@ -224,8 +226,25 @@ class float:
     
 
 @extend
-class int:
-    def __truediv__[T](self, other: List[T]) -> List[float]:
+class Int:
+    # int is Int[64] since Codon 0.20, so this block also extends int. A method typed `self: int` (or taking an int
+    # base) is int's alone, as when int was a type of its own; the others hold for every width and give int's results
+    # at 64 bits.
+    def __new__(other) -> Int[N]:
+        if isinstance(other, int): return superf(other)
+        elif isinstance(other, float):
+            if N == 64:
+                # int(x): Codon's own conversion (float.__int__), as when int was a type of its own. The path below
+                # asserts on NaN, infinities and |x| >= 2^64.
+                return superf(other)
+            negative = other < 0
+            if negative: other = -other
+            other_int = Int[N](UInt[N](other))
+            if negative: return -other_int
+            return other_int
+        else: return superf(other)
+
+    def __truediv__[T](self: int, other: List[T]) -> List[float]:
         return [self / other[i] for i in range(len(other))]
 
     def __mod__(self: int, other: int) -> int:
@@ -234,15 +253,35 @@ class int:
     
     def astype[t](self) -> t:
         return t(self)
+
+    def __fast_mod_aided_64_bits(self, q: u64) -> u64:
+        s_neg = self < Int[N](0)
+        if s_neg: self = -self
+        
+        r = UInt[N](self).__fast_mod_aided_64_bits(q)
+        if s_neg:
+            return q - r
+        
+        return r
     
-    def bitlen(self: int) -> int:
-        if self >> 63: self = -self
-        return int(u64(self).bitlen())
+    def __fast_mod_aided_64_bits_mod_const(self, q: u64, mod_const: u64) -> u64:
+        s_neg = self < Int[N](0)
+        if s_neg: self = -self
+        
+        r = UInt[N](self).__fast_mod_aided_64_bits_mod_const(q, mod_const)
+        if s_neg:
+            return q - r
+        
+        return r
+    
+    def bitlen(self: Int[N]) -> Int[N]:
+        if self < Int[N](0): self = -self
+        return Int[N](UInt[N](self).bitlen())
     
     def bit_reverse_subset(self: int, bitlen: int) -> int:
         return self.bit_reverse() >> (64 - bitlen)
     
-    def reveal(self, *args) -> int:
+    def reveal(self, *args) -> Int[N]:
         return self
     
     def neg_mod(self: int, modulus: int) -> int:
@@ -263,13 +302,13 @@ class int:
     def lsh_mod(self: int, other: int, modulus: int) -> int:
         return (self << other) % modulus
     
-    def to_fp(self, modulus) -> mpc_uint:
+    def to_fp(self: int, modulus) -> mpc_uint:
         return double_to_fp(float(self), modulus)
     
     def iter(self):
         for _ in static.range(1): yield self
     
-    def to_int_t(self, modulus: mpc_uint) -> mpc_uint:
+    def to_int_t(self: int, modulus: mpc_uint) -> mpc_uint:
         return (modulus + self) % modulus
     
     @staticmethod
@@ -282,41 +321,53 @@ class int:
         return __rand_int(base)
     
     @staticmethod
-    def zeros() -> int:
-        return 0
+    def zeros() -> Int[N]:
+        return Int[N](0)
     
-    def to_float(self) -> float:
-        return float(self)
+    def to_float(self: Int[N]) -> float:
+        # TODO: Implement a more efficient and hardware-friendly solution        
+        if N <= 64: return float(self)
+
+        sign = 1.0
+        if self >> Int[N]((N - 1)):  # Case negative
+            self = -self
+            sign = -1.0
+
+        return UInt[N](self).to_float() * sign
     
-    def to_complex(self) -> complex:
-        return complex(self)
+    def to_complex(self: Int[N]) -> complex:
+        return self.to_float().to_complex()
     
-    def copy(self: int) -> int:
-        return int(self)
+    def copy(self) -> Int[N]:
+        return self
     
     @staticmethod
     def zeros_float() -> float:
         return 0.0
     
     @staticmethod
-    def ones() -> int:
-        return 1
+    def ones() -> Int[N]:
+        return Int[N](1)
     
-    def has_zero(self: int) -> bool:
-        return self == 0
+    def has_zero(self) -> bool:
+        return self == Int[N](0)
+    
+    def __repr__(self) -> str:
+        # The decimal value at every width (Codon's own repr wraps widths other than 64 as "Int[N](...)")
+        return self.__str__()
     
     @staticmethod
     def nbytes() -> int:
-        return sizeof(int)
+        return (N + 7) // 8
     
     @staticmethod
     def _pickle_size() -> int:
-        return int.nbytes()
+        return Int[N].nbytes()
     
-    def flatten(self) -> int:
+    def flatten(self) -> Int[N]:
         return self
     
-    def sqrt(self) -> float:
+    def sqrt(self: int) -> float:
         return math.sqrt(self)
 
 
@@ -419,23 +470,8 @@ class UInt:
         return self.__naive_mod(other)
     
     def __repr__(self: UInt[N]) -> str:
-        # TODO: Implement faster solution
-        self_cp = self
-        int_str = ''
-        while self_cp:
-            remainder = 0
-            quotient = UInt[N](0)
-            # Euclidean division
-            for bit_idx in static.range(N - 1, -1, -1):
-                mask = int((self_cp & (UInt[N](1) << UInt[N](bit_idx))) != UInt[N](0))
-                remainder = (remainder << 1) + mask
-                if remainder >= 10:
-                    quotient = (quotient << UInt[N](1)) + UInt[N](1)
-                    remainder -= 10
-                else: quotient = quotient << UInt[N](1)
-            int_str = str(remainder) + int_str
-            self_cp = quotient
-        return int_str if int_str else '0'
+        # The decimal value, as str() gives it (Codon's own repr wraps it as "UInt[N](...)")
+        return self.__str__()
     
     def split_lo_hi_u64(self: UInt[64]) -> Tuple[UInt[64], UInt[64]]:
         self_lo = self & MASK32
@@ -712,75 +748,6 @@ class UInt:
         return UInt[N].nbytes()
     
     def flatten(self) -> UInt:
-        return self
-
-
-@extend
-class Int:
-    def __new__(other) -> Int[N]:
-        if isinstance(other, int): return superf(other)
-        elif isinstance(other, float):
-            negative = other < 0
-            if negative: other = -other
-            other_int = Int[N](UInt[N](other))
-            if negative: return -other_int
-            return other_int
-        else: return superf(other)
-    
-    def __fast_mod_aided_64_bits(self, q: u64) -> u64:
-        s_neg = self < Int[N](0)
-        if s_neg: self = -self
-        
-        r = UInt[N](self).__fast_mod_aided_64_bits(q)
-        if s_neg:
-            return q - r
-        
-        return r
-    
-    def __fast_mod_aided_64_bits_mod_const(self, q: u64, mod_const: u64) -> u64:
-        s_neg = self < Int[N](0)
-        if s_neg: self = -self
-        
-        r = UInt[N](self).__fast_mod_aided_64_bits_mod_const(q, mod_const)
-        if s_neg:
-            return q - r
-        
-        return r
-    
-    def bitlen(self: Int[N]) -> Int[N]:
-        if self < Int[N](0): self = -self
-        return Int[N](UInt[N](self).bitlen())
-    
-    def to_float(self: Int[N]) -> float:
-        # TODO: Implement a more efficient and hardware-friendly solution        
-        if N <= 64: return float(self)
-
-        sign = 1.0
-        if self >> Int[N]((N - 1)):  # Case negative
-            self = -self
-            sign = -1.0
-
-        return UInt[N](self).to_float() * sign
-    
-    def to_complex(self: Int[N]):
-        return self.to_float().to_complex()
-    
-    def __repr__(self: Int[N]) -> str:
-        negative = self < Int[N](0)
-        if negative: self = -self
-        _str = UInt[N](self).__repr__()
-        if negative: return f"-{_str}"
-        return _str
-    
-    @staticmethod
-    def nbytes() -> int:
-        return (N + 7) // 8
-    
-    @staticmethod
-    def _pickle_size() -> int:
-        return Int[N].nbytes()
-    
-    def flatten(self) -> Int:
         return self
 
 
@@ -2062,11 +2029,7 @@ class List:
     
     def slice_reference(self: list[T], begin: int, end: int) -> list[T]:
         len_: int = end - begin
-        return list[T](
-            arr=Array(
-                ptr=self.arr.ptr + begin,
-                sz=len_),
-            len=len_)
+        return list[T](self._ptr + begin, len_)
 
     def nbytes(self: List[T]) -> int:
         sum_of_sizes = 0
@@ -2092,15 +2055,14 @@ class List:
     
     def scatter_bitcast(self: List[u64xN]) -> List[u64]:
         n = len(self) * SIMD_LANE_SIZE
-        _arr = Array(ptr=bitcast_scatter(self.arr.ptr, N=SIMD_LANE_SIZE), sz=n)
-        return List(arr=_arr, len=n)
+        return List[u64](bitcast_scatter(self._ptr, N=SIMD_LANE_SIZE), n)
     
     def scatter_bitcast(self: List[List[u64xN]]) -> List[List[u64]]:
         return [row.scatter_bitcast() for row in self]
 
     def shuffle(self: List[u64], vec: Vec[u64, SIMD_LANE_SIZE]) -> Vec[u64, SIMD_LANE_SIZE]:
         if SIMD_LANE_SIZE == 8:
-            return _mm_gather8(self.arr.ptr, vec)
+            return _mm_gather8(self._ptr, vec)
         else:
             return Vec[u64, SIMD_LANE_SIZE](self[[vec[i] for i in static.range(SIMD_LANE_SIZE)]])
     
@@ -2108,14 +2070,13 @@ class List:
         if isinstance(T, List):
             return [e.vectorize(lane_size) for e in self]
         elif isinstance(T, u64) or isinstance(T, float):
-            return [Vec[T, lane_size](self.arr.ptr + i) for i in range(0, len(self), lane_size)]
+            return [Vec[T, lane_size](self._ptr + i) for i in range(0, len(self), lane_size)]
         else:
             compile_error("Invalid vectorization argument.")
     
     def vectorize_bitcast(self: List[u64]) -> List[u64xN]:
         _mm_n = len(self) // SIMD_LANE_SIZE
-        _arr = Array(ptr=bitcast_vectorize(self.arr.ptr, N=SIMD_LANE_SIZE), sz=_mm_n)
-        return List(arr=_arr, len=_mm_n)
+        return List[u64xN](bitcast_vectorize(self._ptr, N=SIMD_LANE_SIZE), _mm_n)
     
     def vectorize_bitcast(self: List[List[u64]]) -> List[List[u64xN]]:
         return [row.vectorize_bitcast() for row in self]
@@ -2251,12 +2212,15 @@ class ndarray:
     def abbrv(self) -> str:
         return self.tolist().abbrv()
     
-    def rand(self, distribution: str, *args) -> ndarray[S, T]:
-        return rand(self.shape, distribution)
-
     @staticmethod
     def rand(shape: S, distribution: str, mpc, *args) -> ndarray[S, T]:
         return rand(shape, distribution)
+
+    def rand(self: ndarray[S, T], distribution: str, *args) -> ndarray[S, T]:
+        # After the static overload, with self typed: Codon 0.20 resolves a call on an instance against the newest
+        # overload of a name only, and lets an untyped self take a class-qualified call meant for the static one
+        # (M-TOOL-27)
+        return rand(self.shape, distribution)
     
     def savetxt(self, path: str):
         with open(path, "w") as f:
@@ -2466,9 +2430,9 @@ class ndarray:
         if static.len(self.shape) == 0:
             return List[T]()
         elif static.len(self.shape) == 1:
-            return List(arr=Array(ptr=data, sz=self.shape[0]), len=self.shape[0])
+            return List[T](data, self.shape[0])
         else:
-            return [List(arr=Array(ptr=data + i * self.shape[1], sz=self.shape[1]), len=self.shape[1]) for i in range(self.shape[0])]
+            return [List[T](data + i * self.shape[1], self.shape[1]) for i in range(self.shape[0])]
 
     def count(self, elem: T) -> int:
         counter = 0
@@ -2510,7 +2474,9 @@ class ndarray:
             diag_arr[i][i] = value
         return diag_arr
 
-    def diag(self, value: T) -> ndarray[S, T]:
+    # self typed: Codon 0.20 lets an untyped self take a class-qualified call meant for the static
+    # overload of this name
+    def diag(self: ndarray[S, T], value: T) -> ndarray[S, T]:
         return ndarray[S, T].diag(self.shape, value)
     
     def dot_axis(self, other: ndarray[S, T], axis: int, preserve_dim: Static[int] = 1):
@@ -2557,7 +2523,8 @@ class ndarray:
         return self._propagate_call(math.log)
     
     def round(self, decimals=0) -> ndarray[S, float]:
-        return self._propagate_call(partial(round, n=decimals))
+        # Halves away from zero, as Codon 0.19's round(x, n) (Codon 0.20's rounds halves to even)
+        return self._propagate_call(lambda x: float(x).round_half_away(decimals))
 
     def _propagate_call(self, _call):
         # TODO: Write an IR pass that will call this automatically to enable bar.foo(ndarray) for any byVal-arg foo in bar
@@ -2654,7 +2621,9 @@ class ndarray:
     def zeros(shape: S, *args) -> ndarray[S, T]:
         return zeros(shape, dtype=T)
     
-    def zeros[S1](self, shape: S1) -> ndarray[S1, T]:
+    # self typed: Codon 0.20 lets an untyped self take a class-qualified call meant for the static
+    # overload of this name
+    def zeros[S1](self: ndarray[S, T], shape: S1) -> ndarray[S1, T]:
         return zeros(shape, dtype=T)
     
     def zeros(self: ndarray[S, T]) -> ndarray[S, T]:

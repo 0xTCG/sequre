@@ -19,9 +19,9 @@ void Profiler::attachProfiler(CallInstr *v) {
 
   Module *M = v->getModule();
   Value *funcVal = M->Nr<VarValue>(f->getActual());
-  types::Type *funcType = cast<types::FuncType>(f->getType());
+  Type *funcType = cast<FuncType>(f->getType());
   std::vector<Value *> args = {M->getString(f->getName()), funcVal};
-  std::vector<types::Type *> argsTypes = {M->getStringType(), funcType};
+  std::vector<Type *> argsTypes = {M->getStringType(), funcType};
 
   for (auto it = v->begin(); it != v->end(); ++it) {
     args.push_back(*it);
