@@ -7,12 +7,11 @@ Ported from https://github.com/tuneinsight/lattigo/tree/master/rlwe
 import prg
 
 import ring, ringqp, utils
-
-from copy import copy
+from threads import lattiseq_threads
 
 from pickler import pickle, unpickle
 
-from sequre.types.builtin import u64xN
+from sequre.types.builtin import *
 from sequre.utils.utils import zeros_vec
 from sequre.constants import (
     lattiseq_uint,
@@ -25,6 +24,24 @@ from sequre.constants import (
     LATTISEQ_MAX_MODULI_SIZE,
     LATTISEQ_GALOIS_GEN,
     LATTISEQ_CONJUGATE_INVARIANT_RING_ENUM)
+
+
+# product_bitlen returns the size in bits of the product of the moduli, whatever its size.
+# The product is kept as base-2^64 digits, least significant first, so it never wraps.
+def product_bitlen(moduli: list[u64]) -> int:
+    digits = [u64(1)]
+
+    for m in moduli:
+        carry = u64(0)
+        for i in range(len(digits)):
+            hi, lo = digits[i].mul_overflow_u64(m)
+            lo_sum = lo + carry
+            if lo_sum < lo: hi += u64(1)
+            digits[i] = lo_sum
+            carry = hi
+        if carry != u64(0): digits.append(carry)
+
+    return 64 * (len(digits) - 1) + int(digits[-1].bitlen())
 
 
 class Parameters:
@@ -73,6 +90,59 @@ class Parameters:
                 \tRing p: {self.ring_p}
                 \tRing type: {self.ring_type}
         """
+    
+    def __pickle__(self, jar: Jar, pasteurized: bool):
+        pickle(self.qi, jar, pasteurized)
+        if not pasteurized: jar += self.qi._pickle_size()
+        pickle(self.pi, jar, pasteurized)
+        if not pasteurized: jar += self.pi._pickle_size()
+        pickle(self.logn, jar, pasteurized)
+        if not pasteurized: jar += self.logn._pickle_size()
+        pickle(self.pow2_base, jar, pasteurized)
+        if not pasteurized: jar += self.pow2_base._pickle_size()
+        pickle(self.sigma, jar, pasteurized)
+        if not pasteurized: jar += self.sigma._pickle_size()
+        pickle(self.h, jar, pasteurized)
+        if not pasteurized: jar += self.h._pickle_size()
+        pickle(self.ring_q, jar, pasteurized)
+        if not pasteurized: jar += self.ring_q._pickle_size()
+        pickle(self.ring_p, jar, pasteurized)
+        if not pasteurized: jar += self.ring_p._pickle_size()
+        pickle(self.ring_type, jar, pasteurized)
+
+    def __unpickle__(jar: Jar, pasteurized: bool) -> Parameters:
+        qi = unpickle(jar, pasteurized, list[u64])
+        if not pasteurized: jar += qi._pickle_size()
+        pi = unpickle(jar, pasteurized, list[u64])
+        if not pasteurized: jar += pi._pickle_size()
+        logn = unpickle(jar, pasteurized, int)
+        if not pasteurized: jar += logn._pickle_size()
+        pow2_base = unpickle(jar, pasteurized, int)
+        if not pasteurized: jar += pow2_base._pickle_size()
+        sigma = unpickle(jar, pasteurized, float)
+        if not pasteurized: jar += sigma._pickle_size()
+        h = unpickle(jar, pasteurized, int)
+        if not pasteurized: jar += h._pickle_size()
+        ring_q = unpickle(jar, pasteurized, ring.Ring)
+        if not pasteurized: jar += ring_q._pickle_size()
+        ring_p = unpickle(jar, pasteurized, ring.Ring)
+        if not pasteurized: jar += ring_p._pickle_size()
+        ring_type = unpickle(jar, pasteurized, int)
+
+        params = Parameters(
+            logn=logn, qi=qi, pi=pi,
+            pow2_base=pow2_base, h=h, sigma=sigma,
+            ring_q=ring_q, ring_p=ring_p,
+            ring_type=ring_type)
+
+        return params
+
+    def _pickle_size(self) -> int:
+        return (self.qi._pickle_size() + 
+                self.pi._pickle_size() + self.logn._pickle_size() +
+                self.pow2_base._pickle_size() + self.sigma._pickle_size() +
+                self.h._pickle_size() + self.ring_q._pickle_size() +
+                self.ring_p._pickle_size() + self.ring_type._pickle_size())
     
     def init_rings(self):
         self.ring_q = ring.new_ring_from_type(1 << self.logn, self.qi, self.ring_type)
@@ -127,7 +197,7 @@ class Parameters:
         c = 0
 
         for qi in self.q().slice_reference(0, levelq + 1): c = max(c, int(qi.bitlen()))
-        for pi in self.q().slice_reference(0, levelp + 1): c = max(c, int(pi.bitlen()))
+        for pi in self.p().slice_reference(0, levelp + 1): c = max(c, int(pi.bitlen()))
 
         return c
     
@@ -141,11 +211,9 @@ class Parameters:
     
     # LogQP returns the size of the extended modulus QP in bits
     def log_qp(self) -> int:
-        tmp = lattiseq_uint(1)
-        for qi in self.qi: tmp *= qi.ext_to_lattiseq_uint()
-        for pi in self.pi: tmp *= pi.ext_to_lattiseq_uint()
-
-        return int(tmp.bitlen())
+        moduli = self.q()
+        moduli.extend(self.p())
+        return product_bitlen(moduli)
 
     # qi_overflow_margin returns floor(2^64 / max(Qi)), i.e. the number of times elements of Z_max{Qi} can
     # be added together before overflowing 2^64.
@@ -210,6 +278,19 @@ class SecretKey:
         return f"""\tRLWESecretKey:
                 \t{self.value}
         """
+
+    def __bool__(self):
+        return bool(self.value)
+
+    def __pickle__(self, jar: Jar, pasteurized: bool):
+        pickle(self.value, jar, pasteurized)
+
+    def __unpickle__(jar: Jar, pasteurized: bool) -> SecretKey:
+        value = unpickle(jar, pasteurized, ringqp.Poly)
+        return SecretKey(value=value)
+
+    def _pickle_size(self) -> int:
+        return self.value._pickle_size()
     
     # level_q returns the level of the modulus q of the target.
     def level_q(self):
@@ -327,6 +408,9 @@ class CiphertextQP:
         self.value = list[ringqp.Poly](2)
         self.value.append(rqp_1)
         self.value.append(rqp_2)
+    
+    def __repr__(self) -> str:
+        return str(self.value)
     
     def __pickle__(self, jar: Jar, pasteurized: bool):
         pickle(self.value, jar, pasteurized)
@@ -611,14 +695,14 @@ class SwitchingKey(Static[GadgetCiphertext]):
         self.value = gadget_ciphertext.value
     
     def __pickle__(self, jar: Jar, pasteurized: bool):
-        superf(self, jar, pasteurized)
+        pickle(self.value, jar, pasteurized)
     
     def __unpickle__(jar: Jar, pasteurized: bool) -> SwitchingKey:
-        value = superf(jar, pasteurized).value
+        value = unpickle(jar, pasteurized, list[list[CiphertextQP]])
         return SwitchingKey(value=value)
     
     def _pickle_size(self) -> int:
-        return superf(self)
+        return self.value._pickle_size()
     
     def gadget_ciphertext(self):
         return GadgetCiphertext(self.value)
@@ -640,6 +724,16 @@ class RelinearizationKey:
 
     def __bool__(self):
         return bool(len(self.keys))
+    
+    def __pickle__(self, jar: Jar, pasteurized: bool):
+        pickle(self.keys, jar, pasteurized)
+
+    def __unpickle__(jar: Jar, pasteurized: bool) -> RelinearizationKey:
+        keys = unpickle(jar, pasteurized, list[SwitchingKey])
+        return RelinearizationKey(keys=keys)
+
+    def _pickle_size(self) -> int:
+        return self.keys._pickle_size()
 
 
 # NewGadgetCiphertext returns a new Ciphertext key with pre-allocated zero-value.
@@ -822,7 +916,7 @@ def _mm_add_poly_times_gadget_vector_to_gadget_ciphertext(pt, cts, ring_qp, logb
             # q_star = q/qprod
             # q_tild = q_star^-1 mod q_prod
             # Therefore : (pt * p * w^2j) * (q_star * q_tild) = pt*p*w^2j mod q[i*#Pi+j], else 0
-            @par(num_threads=NUM_THREADS)
+            @par(num_threads=lattiseq_threads())
             for k in range(level_p + 1):
                 index = i * (level_p + 1) + k
 
@@ -872,14 +966,31 @@ class RotationKeySet:
         return bool(len(self.keys))
     
     def __pickle__(self, jar: Jar, pasteurized: bool):
-        pickle(self.keys, jar, pasteurized)
+        ks = list(self.keys.keys())
+        vs = list(self.keys.values())
+        assert len(ks) == len(vs), "invalid RotationKeySet: keys and values length mismatch"
+
+        pickle(ks, jar, pasteurized)
+        if not pasteurized: jar += ks._pickle_size()
+        pickle(vs, jar, pasteurized)
     
     def __unpickle__(jar: Jar, pasteurized: bool) -> RotationKeySet:
-        keys = unpickle(jar, pasteurized, dict[u64, SwitchingKey])
+        ks = unpickle(jar, pasteurized, list[u64])
+        if not pasteurized: jar += ks._pickle_size()
+        vs = unpickle(jar, pasteurized, list[SwitchingKey])
+
+        assert len(ks) == len(vs), "invalid pickle data for RotationKeySet: keys and values length mismatch"
+        keys = dict[u64, SwitchingKey]()
+        for i in range(len(ks)):
+            keys[ks[i]] = vs[i]
+        
         return RotationKeySet(keys=keys)
     
     def _pickle_size(self) -> int:
-        return self.keys._pickle_size()
+        ks = list(self.keys.keys())
+        vs = list(self.keys.values())
+
+        return ks._pickle_size() + vs._pickle_size()
     
     # GetRotationKey return the rotation key for the given galois element or None if such key is not in the set. The
     # second argument is True iff the first one is non-None.
@@ -948,8 +1059,13 @@ class KeyGenerator(Static[SkEncryptor]):
         return SkEncryptor(self.get_rlwe_encryptorbase(), self.sk, self.uniform_sampler)
     
     # gen_secret_key generates a new SecretKey with the distribution [1/3, 1/3, 1/3].
-    def gen_secret_key(self):
-        return self._mm_gen_secret_key_from_sampler(self.ternary_sampler)
+    def gen_secret_key(self, store_key=False):
+        sk = self._mm_gen_secret_key_from_sampler(self.ternary_sampler)
+
+        if store_key:
+            self.sk = sk
+
+        return sk
 
     # gen_secret_key_from_sampler generates a new SecretKey sampled from the provided Sampler.
     def _mm_gen_secret_key_from_sampler(self, sampler):
@@ -1049,6 +1165,19 @@ def new_key_generator(params):
 class PublicKey:
     value: list[ringqp.Poly]  # [2]
 
+    def __repr__(self) -> str:
+        return str(self.value)
+
+    def __pickle__(self, jar: Jar, pasteurized: bool):
+        pickle(self.value, jar, pasteurized)
+
+    def __unpickle__(jar: Jar, pasteurized: bool) -> PublicKey:
+        value = unpickle(jar, pasteurized, list[ringqp.Poly])
+        return PublicKey(value=value)
+
+    def _pickle_size(self) -> int:
+        return self.value._pickle_size()
+
 
 # NewPublicKey returns a new PublicKey with zero values.
 def new_public_key(params: Parameters) -> PublicKey:
@@ -1060,6 +1189,14 @@ def new_public_key(params: Parameters) -> PublicKey:
 		pk.value[1].p.is_ntt = True
 
 	return pk
+
+
+@extend
+class KeyGenerator:
+    def gen_public_key(self) -> PublicKey:
+        pk = new_public_key(self.params)
+        self._mm_encrypt_zero(CiphertextQP(pk.value))
+        return pk
 
 
 class PkEncryptor(Static[EncryptorBase]):
@@ -1253,6 +1390,8 @@ class Decryptor:
                 \tsk: {self.sk}
         """
     
+    def __bool__(self):
+        return bool(self.sk)
 
     # decrypt decrypts the ciphertext and write the result in ptOut.
     # The level of the output plaintext is min(ciphertext.level(), plaintext.level())
@@ -1378,7 +1517,7 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers]):
         # NOTE: the copy branch writes in-place (no fresh list allocation) so the
         # @par workers never contend on the GC allocation lock -- an allocation
         # here serializes the parallel NTTs on the key-switch hot path.
-        @par(num_threads=NUM_THREADS)
+        @par(num_threads=lattiseq_threads())
         for x in range(level_q + 1):
             if p0_idx_st <= x and x < p0_idx_ed:
                 src = c2_ntt._mm_coeffs[x]
@@ -1422,6 +1561,7 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers]):
         el = gadget_ct.value
 
         # Key switching with CRT decomposition for the Qi
+        # The loops over the moduli are sequential: they all go through the one buffer _mm_cw_ntt
         reduce = 0
         for i in range(decomp_rns):
             for j in range(decomp_pw2):
@@ -1429,23 +1569,19 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers]):
                 ring._mm_mask_vec(cx_inv_ntt._mm_coeffs[i], _mm_cw, _mm_w, _mm_mask)
 
                 if i == 0 and j == 0:
-                    @par(num_threads=NUM_THREADS)
                     for u in range(level_q + 1):
                         ring_q._mm_ntt_single_lazy(u, _mm_cw, _mm_cw_ntt)
                         ring._mm_mul_coeffs_montgomery_constant_vec(el[i][j].value[0].q._mm_coeffs[u], _mm_cw_ntt, p0_qp.q._mm_coeffs[u], ring_q._mm_modulus[u], ring_q._mm_mred_params[u])
                         ring._mm_mul_coeffs_montgomery_constant_vec(el[i][j].value[1].q._mm_coeffs[u], _mm_cw_ntt, p1_qp.q._mm_coeffs[u], ring_q._mm_modulus[u], ring_q._mm_mred_params[u])
-                    @par(num_threads=NUM_THREADS)
                     for u in range(level_p + 1):
                         ring_p._mm_ntt_single_lazy(u, _mm_cw, _mm_cw_ntt)
                         ring._mm_mul_coeffs_montgomery_constant_vec(el[i][j].value[0].p._mm_coeffs[u], _mm_cw_ntt, p0_qp.p._mm_coeffs[u], ring_p._mm_modulus[u], ring_p._mm_mred_params[u])
                         ring._mm_mul_coeffs_montgomery_constant_vec(el[i][j].value[1].p._mm_coeffs[u], _mm_cw_ntt, p1_qp.p._mm_coeffs[u], ring_p._mm_modulus[u], ring_p._mm_mred_params[u])
                 else:
-                    @par(num_threads=NUM_THREADS)
                     for u in range(level_q + 1):
                         ring_q._mm_ntt_single_lazy(u, _mm_cw, _mm_cw_ntt)
                         ring._mm_mul_coeffs_montgomery_constant_and_add_no_mod_vec(el[i][j].value[0].q._mm_coeffs[u], _mm_cw_ntt, p0_qp.q._mm_coeffs[u], ring_q._mm_modulus[u], ring_q._mm_mred_params[u])
                         ring._mm_mul_coeffs_montgomery_constant_and_add_no_mod_vec(el[i][j].value[1].q._mm_coeffs[u], _mm_cw_ntt, p1_qp.q._mm_coeffs[u], ring_q._mm_modulus[u], ring_q._mm_mred_params[u])
-                    @par(num_threads=NUM_THREADS)
                     for u in range(level_p + 1):
                         ring_p._mm_ntt_single_lazy(u, _mm_cw, _mm_cw_ntt)
                         ring._mm_mul_coeffs_montgomery_constant_and_add_no_mod_vec(el[i][j].value[0].p._mm_coeffs[u], _mm_cw_ntt, p0_qp.p._mm_coeffs[u], ring_p._mm_modulus[u], ring_p._mm_mred_params[u])
@@ -1558,7 +1694,10 @@ class Evaluator(Static[EvaluatorBase], Static[EvaluatorBuffers]):
             raise ValueError("cannot apply Automorphism: input and output Ciphertext must be of degree 1")
 
         if gal_el == 1:
-            if ct_out != ct_in: ct_out = ct_in.copy()
+            # ct_in and ct_out may be wrappers around the same list of polynomials (in-place call).
+            # The copies are stored in the list ct_out shares with its owner, so that they reach it.
+            if ct_out.value is not ct_in.value:
+                for i in range(len(ct_in.value)): ct_out.value[i] = ct_in.value[i].copy()
             return
 
         rtk, generated = self.rtks.get_rotation_key(gal_el)

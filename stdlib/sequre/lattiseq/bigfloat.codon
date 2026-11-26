@@ -1,0 +1,156 @@
+"""
+Arbitrary-precision floats for Lattiseq.
+
+Lattigo relies on Go's math/big.Float where float64 is not accurate enough (the cosine approximation
+of ckks/advanced/cosine_approx.go works with 1000 bits). Codon has no such type, so this module
+wraps GMP's mpf floats, which Sequre already links through GMP_PATH.
+
+The API follows math/big.Float: the receiver is the destination (z.mul(x, y) sets z = x * y and
+returns z), so the Go sources and their ports can be read side by side.
+
+Differences from math/big.Float that a port has to keep in mind:
+  - GMP rounds every operation towards zero and keeps at least (not exactly) the requested number
+    of bits, where Go rounds to nearest even at exactly that precision. Results agree to about
+    2^-prec relative.
+  - float64() below rounds to nearest, like Go's Float64(), and unlike mpf_get_d which truncates.
+"""
+import math
+
+from sequre.constants import GMP_PATH, GMP_LIMB_SIZE, gmp_limb_t
+
+
+# Mirrors GMP's __mpf_struct.
+class mpf_t:
+    _mp_prec: i32             # Precision, in limbs
+    _mp_size: i32             # Number of limbs in use. Negative for a negative number
+    _mp_exp: int              # Exponent, in limbs
+    _mp_d: Ptr[gmp_limb_t]    # The _mp_prec + 1 limbs
+
+
+from C import GMP_PATH.__gmpf_set(mpf_t, mpf_t) as mpf_set
+from C import GMP_PATH.__gmpf_set_d(mpf_t, float) as mpf_set_d
+from C import GMP_PATH.__gmpf_set_str(mpf_t, cobj, i32) -> i32 as mpf_set_str
+from C import GMP_PATH.__gmpf_add(mpf_t, mpf_t, mpf_t) as mpf_add
+from C import GMP_PATH.__gmpf_sub(mpf_t, mpf_t, mpf_t) as mpf_sub
+from C import GMP_PATH.__gmpf_mul(mpf_t, mpf_t, mpf_t) as mpf_mul
+from C import GMP_PATH.__gmpf_div(mpf_t, mpf_t, mpf_t) as mpf_div
+from C import GMP_PATH.__gmpf_abs(mpf_t, mpf_t) as mpf_abs
+from C import GMP_PATH.__gmpf_cmp(mpf_t, mpf_t) -> i32 as mpf_cmp
+from C import GMP_PATH.__gmpf_get_d(mpf_t) -> float as mpf_get_d
+
+
+# _new_mpf_t allocates a zero-valued mpf_t with at least prec bits of precision.
+# The limbs are allocated the way mpf_init2 sizes them, but on the garbage-collected heap: GMP never
+# reallocates the limbs of an mpf_t after its initialization, so no mpf_clear is needed.
+def _new_mpf_t(prec: int) -> mpf_t:
+    limbs = (max(prec, 53) + 2 * GMP_LIMB_SIZE - 1) // GMP_LIMB_SIZE
+    d = Ptr[gmp_limb_t](limbs + 1)
+    for i in range(limbs + 1): d[i] = gmp_limb_t(0)
+    return mpf_t(i32(limbs), i32(0), 0, d)
+
+
+# _next_away_from_zero returns the float that follows the finite non-zero float x, away from zero.
+def _next_away_from_zero(x: float) -> float:
+    bits = Ptr[u64](__ptr__(x).as_byte())[0] + u64(1)
+    return Ptr[float](__ptr__(bits).as_byte())[0]
+
+
+# BigFloat is a multi-precision floating point number, the counterpart of Go's math/big.Float.
+class BigFloat:
+    _mpf: mpf_t
+    _prec: int
+
+    def __init__(self, prec: int):
+        self._prec = prec
+        self._mpf = _new_mpf_t(prec)
+
+    def __repr__(self) -> str:
+        return f"BigFloat({self.float64()})"
+
+    # prec returns the precision of the mantissa in bits.
+    def prec(self) -> int:
+        return self._prec
+
+    # set_float64 sets z to x and returns z.
+    def set_float64(self, x: float) -> BigFloat:
+        mpf_set_d(self._mpf, x)
+        return self
+
+    # set_string sets z to the value of the base-10 number in s and returns z.
+    def set_string(self, s: str) -> BigFloat:
+        if mpf_set_str(self._mpf, s.c_str(), i32(10)) != i32(0):
+            raise ValueError(f"BigFloat.set_string: invalid number {s}")
+        return self
+
+    # set sets z to x and returns z.
+    def set(self, x: BigFloat) -> BigFloat:
+        mpf_set(self._mpf, x._mpf)
+        return self
+
+    # copy returns a newly allocated BigFloat with the precision and value of the receiver.
+    def copy(self) -> BigFloat:
+        return BigFloat(self._prec).set(self)
+
+    # add sets z to x + y and returns z.
+    def add(self, x: BigFloat, y: BigFloat) -> BigFloat:
+        mpf_add(self._mpf, x._mpf, y._mpf)
+        return self
+
+    # sub sets z to x - y and returns z.
+    def sub(self, x: BigFloat, y: BigFloat) -> BigFloat:
+        mpf_sub(self._mpf, x._mpf, y._mpf)
+        return self
+
+    # mul sets z to x * y and returns z.
+    def mul(self, x: BigFloat, y: BigFloat) -> BigFloat:
+        mpf_mul(self._mpf, x._mpf, y._mpf)
+        return self
+
+    # quo sets z to x / y and returns z.
+    def quo(self, x: BigFloat, y: BigFloat) -> BigFloat:
+        if int(y._mpf._mp_size) == 0:
+            raise ValueError("BigFloat.quo: division by zero")
+        mpf_div(self._mpf, x._mpf, y._mpf)
+        return self
+
+    # abs sets z to |x| and returns z.
+    def abs(self, x: BigFloat) -> BigFloat:
+        mpf_abs(self._mpf, x._mpf)
+        return self
+
+    # cmp returns -1 if z < y, 0 if z == y and +1 if z > y.
+    def cmp(self, y: BigFloat) -> int:
+        c = int(mpf_cmp(self._mpf, y._mpf))
+        if c < 0: return -1
+        if c > 0: return 1
+        return 0
+
+    # sign returns -1 if z < 0, 0 if z == 0 and +1 if z > 0.
+    def sign(self) -> int:
+        s = int(self._mpf._mp_size)
+        if s < 0: return -1
+        if s > 0: return 1
+        return 0
+
+    # float64 returns the float nearest to z.
+    def float64(self) -> float:
+        # mpf_get_d truncates towards zero: z lies between lo and the next float away from zero.
+        lo = mpf_get_d(self._mpf)
+        if lo == 0.0 or math.isinf(lo): return lo
+        hi = _next_away_from_zero(lo)
+        if math.isinf(hi): return lo
+
+        prec = max(self._prec, 128)
+        err_lo = BigFloat(prec).set_float64(lo)
+        err_lo.sub(self, err_lo)
+        err_lo.abs(err_lo)
+        err_hi = BigFloat(prec).set_float64(hi)
+        err_hi.sub(err_hi, self)
+        err_hi.abs(err_hi)
+
+        return hi if err_hi.cmp(err_lo) < 0 else lo
+
+
+# new_big_float creates a new BigFloat with value x and prec bits of precision.
+def new_big_float(x: float, prec: int) -> BigFloat:
+    return BigFloat(prec).set_float64(x)
