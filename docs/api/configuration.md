@@ -72,7 +72,7 @@ _Defined in `stdlib/sequre/settings.codon` and `stdlib/sequre/constants.codon`_
 - **`MPC_RING_SIZE`**: Power-of-two ring $2^k$
 - **`MPC_NBIT_K`**: The total bit-width in fixed-point representation
 - **`MPC_NBIT_F`**: The fractional bit-width in fixed-point representation
-- **`MPC_NBIT_V`**: The statistical security padding for fixed-point representation (needed only in comparison protocols on finite fields)
+- **`MPC_NBIT_V`**: The statistical padding of the fixed-point truncation's mask, on both moduli: the dealer's mask has $K + F + V$ bits, so an opened truncation hides its input to about $2^{-V}$ and fails with probability below $2^{-(V + 1)}$ per element (see [Security Assumptions](../crypto-corner/security-assumptions.md#the-mpc-modulus-and-its-statistical-parameters)); the field's normalizer pads its mask by $V$ bits too
 
 `MPC_INT_SIZE` sets the fixed-point precision: F = 32 fractional bits at 128 and 192 bits, F = 64 at 256 bits. Decor's
 nonlinear functions compute the function itself, so their error comes from the fixed-point encodings ($2^{-F}$) and,
@@ -135,5 +135,6 @@ The list of `sequre` CLI arguments:
 | Flag | Description |
 |---|---|
 | `--skip-mhe-setup` | Skip MHE key generation (useful when running MPC-only) |
-| `--use-ring` | Use ring arithmetic ($\mathbb{Z}_{2^k}$) instead of field ($\mathbb{F}_p$) |
+| `--use-field` | Run MPC on the prime field $\mathbb{F}_p$, $p = 2^k - c$ (the default) |
+| `--use-ring` | Run MPC on the power-of-two ring $\mathbb{Z}_{2^k}$. Not together with `--use-field`; start every party with the same modulus flag (the parties compare their moduli when they connect and stop if they differ) |
 | `-release` | Enable release mode (better performance, no backtrace) |

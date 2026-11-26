@@ -1,8 +1,9 @@
 import math
 
-from sequre.constants import DEBUG, MPC_MODULUS_BITS, MPC_FIELD_SIZE, MPC_NBIT_K, MPC_NBIT_F, MPC_THIRD_FIELD_SIZE, mpc_uint
+from sequre.constants import DEBUG, MPC_MODULUS_BITS, MPC_FIELD_SIZE, MPC_NBIT_K, MPC_NBIT_F, MPC_THIRD_FIELD_SIZE, PACKING_SIZE, mpc_uint, size_t
 from sequre.utils.utils import zeros_mat
 from sequre.types.utils import num_to_bits
+from sequre.utils.primitives import require_prime_modulus
 
 from stats import MPCStats
 from randomness import MPCRandomness
@@ -10,6 +11,27 @@ from comms import MPCComms
 from arithmetic import MPCArithmetic
 from polynomial import MPCPolynomial
 from bitwise import MPCBitwise
+
+
+def _pack_bytes(values: list[list[int]], width: int) -> list[list[size_t]]:
+    # Rows of `width` values below 256, one byte each, PACKING_SIZE // 8 to a size_t register (the first in the low byte)
+    lanes = PACKING_SIZE // 8
+    words = (width + lanes - 1) // lanes
+    packed = [[size_t(0) for _ in range(words)] for _ in range(len(values))]
+    for i in range(len(values)):
+        for j in range(width):
+            packed[i][j // lanes] |= size_t(values[i][j]) << size_t(8 * (j % lanes))
+    return packed
+
+
+def _unpack_bytes(packed: list[list[size_t]], width: int) -> list[list[int]]:
+    # _pack_bytes' inverse
+    lanes = PACKING_SIZE // 8
+    values = [[0 for _ in range(width)] for _ in range(len(packed))]
+    for i in range(len(packed)):
+        for j in range(width):
+            values[i][j] = int((packed[i][j // lanes] >> size_t(8 * (j % lanes))) & size_t(255))
+    return values
 
 
 class MPCBoolean[TP]:
@@ -108,12 +130,17 @@ class MPCBoolean[TP]:
 
         dbits = self.bit_add(rbits, cbits, public=True, modulus=small_modulus)
 
-        field_bits = num_to_bits([modulus], MPC_MODULUS_BITS + 1, True)
-        field_bits_spanned = [field_bits[0] for _ in range(len(a))]
+        # q = [r + c >= modulus], which adds 2^L - modulus back. On the ring 2^L - modulus is 0, so q is never needed:
+        # it is skipped there, and with it a comparison that would need a prime small modulus (less_than_bits_public)
+        if modulus.popcnt() == 1:
+            q = [type(small_modulus)(0) for _ in range(len(a))]
+        else:
+            field_bits = num_to_bits([modulus], MPC_MODULUS_BITS + 1, True)
+            field_bits_spanned = [field_bits[0] for _ in range(len(a))]
 
-        q = self.flip_bit(self.less_than_bits_public(
-            list(reversed(dbits.transpose())).transpose(),
-            list(reversed(field_bits_spanned.transpose())).transpose(), small_modulus), small_modulus)
+            q = self.flip_bit(self.less_than_bits_public(
+                list(reversed(dbits.transpose())).transpose(),
+                list(reversed(field_bits_spanned.transpose())).transpose(), small_modulus), small_modulus)
         fbits = num_to_bits([((TP(1) << MPC_MODULUS_BITS) - modulus)], MPC_MODULUS_BITS + 1, True)
         fbits_spanned = [fbits[0] for _ in range(len(a))]
 
@@ -125,6 +152,7 @@ class MPCBoolean[TP]:
         return hbits.transpose()[:-2 - cutoff].transpose()
     
     def demultiplexer(self, bits_matrix, modulus):
+        require_prime_modulus(modulus, "MPCBoolean.demultiplexer", "fan-in ANDs: MPCBitwise.land on XOR-shared bits")
         demuxi = []
         rows, bits_len = bits_matrix.shape
 
@@ -138,6 +166,9 @@ class MPCBoolean[TP]:
         return demuxi
 
     def fan_in_or(self, a, modulus):
+        # OR over each row of arithmetic shares of bits, by a Lagrange interpolant (field-only: it divides by the gaps
+        # between its points, and even numbers have no inverse modulo a power of two)
+        require_prime_modulus(modulus, "MPCBoolean.fan_in_or", "MPCBitwise.lor and prefix_or on XOR-shared bits")
         n, d = a.shape
         a_sum = [type(modulus)(0) for _ in range(n)]
 
@@ -160,6 +191,7 @@ class MPCBoolean[TP]:
         return bmat[0]
         
     def prefix_or(self, a, modulus):
+        require_prime_modulus(modulus, "MPCBoolean.prefix_or", "MPCBitwise.prefix_or on XOR-shared bits")
         # TODO: #57 Performance warning. Allocation/assignment is redundant in this method.
         n, m = a.shape
 
@@ -258,6 +290,7 @@ class MPCBoolean[TP]:
         We combine De Morgan identities with fan-in-or to compute fan-in-and:
             fan_in_and(a) = neg(fan_in_or(neg(a)))
         """
+        require_prime_modulus(modulus, "MPCBoolean.fan_in_and", "MPCBitwise.land on XOR-shared bits")
         return self.flip_bit(self.fan_in_or(self.flip_bit(a, modulus), modulus), modulus)
     
     def prefix_and(self, a, modulus):
@@ -265,6 +298,7 @@ class MPCBoolean[TP]:
         We combine De Morgan identities with prefix-or to compute prefix-and:
             prefix_and(a) = neg(prefix_or(neg(a)))
         """
+        require_prime_modulus(modulus, "MPCBoolean.prefix_and", "MPCBitwise's prefix operations on XOR-shared bits")
         return self.flip_bit(self.prefix_or(self.flip_bit(a, modulus), modulus), modulus)
 
     def less_than_bits_public(self, a, b_pub, modulus):
@@ -274,6 +308,8 @@ class MPCBoolean[TP]:
         return self.less_than_bits_aux(a, b, 0, modulus)
     
     def less_than_bits_aux(self, a, b, public_flag, modulus):
+        # Before its first product: every party refuses at the same call, before any draw or message
+        require_prime_modulus(modulus, "MPCBoolean.less_than_bits", "MPCBitwise.carry_out_public on XOR-shared bits")
         if DEBUG:
             assert a.shape == b.shape, f"Unaligned bits shapes at CP{self.pid}: {a.shape} and {b.shape}"
 
@@ -346,15 +382,25 @@ class MPCBoolean[TP]:
         return self.__is_positive(a, modulus, nbits)
     
     def is_nonzero(self, a, modulus, nbits: int = MPC_MODULUS_BITS):
-        # [a != 0] on the field. The compute parties open a + r for a uniform field element r whose low nbits bits the
-        # dealer shares; a = 0 exactly when the opening equals r, so an OR over the XOR of their low nbits bits decides.
-        # Exact for every |a| < 2^nbits - c, where p = 2^L - c (c = MPC_MERSENNE_OFFSET: 1, 3 and 9 with 128-, 192- and
-        # 256-bit shares), not just with high probability: below that bound a nonzero a never leaves the low bits of the
-        # opening equal to r's, with or without a wrap mod p. With the default (the field's L bits) that is every value;
-        # with K + F bits, any difference of two fixed-point values (|a| < 2^K). One opening, two fan-in ORs (blocks of
-        # small-field-size - 1 bits, then the blocks) and one table lookup: about a quarter of is_positive's cost at the
-        # same width. The ring compares with its sign test instead.
-        assert modulus.popcnt() != 1, "is_nonzero: field shares only (the ring uses its sign test)"
+        # [a != 0], exact (not just with high probability), on both moduli.
+        # Field: the compute parties open a + r for a uniform field element r whose low nbits bits the dealer shares; a
+        # = 0 exactly when the opening equals r, so an OR over the XOR of their low nbits bits decides. Exact for every
+        # |a| < 2^nbits - c, where p = 2^L - c (c = MPC_MERSENNE_OFFSET: 1, 3 and 9 with 128-, 192- and 256-bit shares):
+        # below that bound a nonzero a never leaves the low bits of the opening equal to r's, with or without a wrap mod
+        # p. With the default (the field's L bits) that is every value; with K + F bits, any difference of two
+        # fixed-point values (|a| < 2^K). One opening, two fan-in ORs (blocks of small-field-size - 1 bits, then the
+        # blocks) and one table lookup: 4 rounds, about a quarter of is_positive's cost at the same width.
+        # Ring: exact for every |a| < 2^nbits (__is_nonzero_ring_aux): 3 rounds. An empty vector gives an empty result on
+        # the ring (the field's asserts a value).
+        if modulus.popcnt() == 1:
+            if isinstance(a, mpc_uint):
+                return self.__is_nonzero_ring_aux([a], modulus, nbits)[0]
+            elif isinstance(a, list[mpc_uint]):
+                return self.__is_nonzero_ring_aux(a, modulus, nbits)
+            elif isinstance(a, list[list[mpc_uint]]):
+                return self.__is_nonzero_ring_aux(a.flatten(), modulus, nbits).reshape(a.shape)
+            else:
+                compile_error(f'Invalid type of {a}')
         if isinstance(a, mpc_uint):
             return self.__is_nonzero_aux([a], modulus, nbits)[0]
         elif isinstance(a, list[mpc_uint]):
@@ -583,6 +629,102 @@ class MPCBoolean[TP]:
         # To the large modulus: table 0 maps 1 to 1 and 2 to 0, so look up 2 - [a != 0] (CP1 adds the 2)
         lifted = [TP(((2 if self.pid == 1 else 0) - any_bit[i]) % small_modulus) if self.pid > 0 else TP(0) for i in range(n)]
         return self.polynomial.table_lookup(lifted, 0, modulus)[0]
+
+    def __is_nonzero_ring_aux(self, a: list[TP], modulus: TP, nbits: int) -> list[TP]:
+        # [a != 0] for ring shares mod modulus = 2^L, exact for every |a| < 2^nbits (raw units, either sign). Three
+        # openings, each uniform:
+        #   1. c = a + r mod 2^nbits, for the dealer's uniform r < 2^nbits. 2^nbits divides the modulus, so the low
+        #      nbits bits of the parties' shares are shares mod 2^nbits, and c = r exactly when a = 0 mod 2^nbits, which
+        #      for |a| < 2^nbits means a = 0.
+        #   2. u = t + s mod q, q = nbits + 1, where t is the number of positions at which the bits of c and r differ
+        #      (linear in the dealer's shares mod q of r's bits; 0 <= t <= nbits < q, so no wrap) and s < q is the
+        #      dealer's uniform shift. t = 0 exactly when a = 0, so [a = 0] is bit u of the one-hot vector of s, which
+        #      the dealer XOR-shares: each party takes bit u of its share (the hub flips it for [a != 0]).
+        #   3. That XOR-shared bit becomes arithmetic shares mod the modulus (MPCBitwise._bit_to_arithmetic: one
+        #      opening of the bit masked by a dealer bit).
+        # The dealer receives nothing and draws r, s and the masks from its private stream. Its shares mod q of r's
+        # bits travel one byte each (q <= L + 1 < 256), packed into size_t registers.
+        n = len(a)
+        if n == 0:
+            # Every party returns here, before any draw or message
+            return list[TP]()
+        assert 0 < nbits <= MPC_MODULUS_BITS and nbits < 255, f"is_nonzero: invalid comparison width {nbits}"
+        q = nbits + 1
+        op_modulus = TP(1) << TP(nbits)
+        low = op_modulus - TP(1)
+        regs = (q + PACKING_SIZE - 1) // PACKING_SIZE  # size_t registers of the one-hot vector
+
+        r = [TP(0) for _ in range(n)]
+        r_bits = [[0 for _ in range(nbits)] for _ in range(n)]
+        s = [0 for _ in range(n)]
+        e = [[size_t(0) for _ in range(regs)] for _ in range(n)]
+        if self.pid == 0:
+            with self.randomness.private():
+                r = r.rand_bits(nbits)
+                # int draws are uniform over [1, q] (prg.randint): an index needs [0, q). (As masks mod q they need no
+                # reduction: [1, q] holds every residue once.)
+                s = [v % q for v in s.rand(q, "uniform")]
+            r_bits = num_to_bits(r, nbits)
+            for i in range(n):
+                e[i][s[i] // PACKING_SIZE] = size_t(1) << size_t(s[i] % PACKING_SIZE)
+
+            r_mask = r.zeros()
+            r_bits_mask = r_bits.zeros()
+            s_mask = s.zeros()
+            e_mask = e.zeros()
+            for p in range(2, self.comms.number_of_parties):
+                with self.randomness.seed_switch(p):
+                    r_mask = r_mask.add_mod(r.rand(modulus, "uniform"), modulus)
+                    r_bits_mask = r_bits_mask.add_mod(r_bits.rand(q, "uniform"), q)
+                    s_mask = s_mask.add_mod(s.rand(q, "uniform"), q)
+                    e_mask ^= e.rand_full()
+
+            self.comms.send(r.sub_mod(r_mask, modulus), 1)
+            self.comms.send(_pack_bytes(r_bits.sub_mod(r_bits_mask, q), nbits), 1)
+            self.comms.send(s.sub_mod(s_mask, q), 1)
+            self.comms.send(e ^ e_mask, 1)
+        elif self.pid == 1:
+            r = self.comms.receive(0, T=type(r))
+            r_bits = _unpack_bytes(self.comms.receive(0, T=list[list[size_t]]), nbits)
+            s = self.comms.receive(0, T=type(s))
+            e = self.comms.receive(0, T=type(e))
+        else:
+            with self.randomness.seed_switch(0):
+                r = r.rand(modulus, "uniform")
+                r_bits = r_bits.rand(q, "uniform")
+                s = s.rand(q, "uniform")
+                e = e.rand_full()
+
+        # 1. c = a + r mod 2^nbits
+        c = self.comms.reveal([a[i].add_mod(r[i], modulus) & low for i in range(n)] if self.pid else r.zeros(), op_modulus)
+
+        # 2. u = t + s mod q: bit j of c XOR r is r_j where c_j = 0 and 1 - r_j where c_j = 1 (the hub adds the 1)
+        hub = self.pid == self.comms.hub_pid
+        t = list[int](n)
+        if self.pid:
+            c_bits = num_to_bits(c, nbits)
+            for i in range(n):
+                ti = s[i]
+                for j in range(nbits):
+                    if c_bits[i][j]:
+                        ti += (1 if hub else 0) - r_bits[i][j]
+                    else:
+                        ti += r_bits[i][j]
+                t.append(((ti % q) + q) % q)  # in [0, q) whatever the sign convention of % (C numerics)
+        else:
+            t = s.zeros()
+        u = self.comms.reveal(t, q)
+
+        # 3. [a != 0] = NOT e_u, XOR-shared, to arithmetic shares
+        bits = list[size_t](n)
+        for i in range(n):
+            bit = size_t(0)
+            if self.pid:
+                bit = (e[i][u[i] // PACKING_SIZE] >> size_t(u[i] % PACKING_SIZE)) & size_t(1)
+                if hub:
+                    bit ^= size_t(1)
+            bits.append(bit)
+        return self.bitwise._bit_to_arithmetic(bits, modulus)
 
     def __less_than_public(self, a, bpub, modulus):
         b_a = self.arithmetic.add_public(a.neg_mod(modulus), bpub, modulus) if self.pid != 0 else a.zeros()

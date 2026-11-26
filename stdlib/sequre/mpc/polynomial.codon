@@ -2,14 +2,18 @@ from copy import copy
 
 from sequre.utils.approximations import SIGMOID_POINTS
 from sequre.utils.utils import zeros_mat, ones_vec, zeros_vec
-from sequre.constants import DEBUG, MPC_FIELD_SIZE, MPC_NBIT_K, MPC_SECOND_FIELD_SIZE, MPC_THIRD_FIELD_SIZE
-from sequre.utils.primitives import mod_inv
+from sequre.constants import DEBUG, MPC_FIELD_SIZE, MPC_NBIT_K, MPC_SECOND_FIELD_SIZE, MPC_THIRD_FIELD_SIZE, modulus_name
+from sequre.utils.primitives import mod_inv, require_prime_modulus
 from sequre.types.utils import double_to_fp
 
 from stats import MPCStats
 from randomness import MPCRandomness
 from comms import MPCComms
 from arithmetic import MPCArithmetic
+
+
+# The modulus of the lookup tables (table_lookup): the field's protocols are their only users
+TABLES_MODULUS = MPC_FIELD_SIZE
 
 
 class MPCPolynomial[TP]:
@@ -24,6 +28,8 @@ class MPCPolynomial[TP]:
     pascal_cache: dict[int, list[list[TP]]]
     table_cache: dict[int, list[list[TP]]]
     table_type_modular: dict[int, bool]
+    # The lookup tables' interpolants (table_lookup), over the field they are built for (TABLES_MODULUS); each built when
+    # a field protocol first looks it up, so a ring run builds none (table 2 has no caller)
     lagrange_cache: dict[int, list[list[TP]]]
 
     def __init__(self, arithmetic: MPCArithmetic[TP]):
@@ -37,8 +43,6 @@ class MPCPolynomial[TP]:
         self.table_cache = dict[int, list[list[TP]]]()
         self.table_type_modular = dict[int, bool]()
         self.lagrange_cache = dict[int, list[list[TP]]]()
-
-        self.__setup_tables()
     
     def lagrange_interp_simple(self, y, modulus):
         n = len(y)
@@ -48,9 +52,20 @@ class MPCPolynomial[TP]:
 
     def table_lookup(self, x, table_id, modulus):
         # Warning: Negative x value might cause bad results
+        # The tables' interpolants are over the field (TABLES_MODULUS): looked up under another modulus they give wrong
+        # values, so that is refused, before any draw or message
+        if modulus != TABLES_MODULUS:
+            raise ValueError(
+                f"MPCPolynomial.table_lookup: its tables are built for {modulus_name(TABLES_MODULUS)}, not "
+                f"{modulus_name(modulus)}: the field's protocols (is_positive, is_nonzero, the normalizer) use them; "
+                f"ring shares use MPCBitwise's sign test and normalizer, and the ring's is_nonzero")
+        if table_id not in self.lagrange_cache:
+            self.__setup_table(table_id)
         return self.evaluate_poly(x, self.lagrange_cache[table_id], modulus=modulus)
     
     def lagrange_interp(self, x: list[int], y, modulus):
+        # Lagrange interpolation modulo a prime: it divides by the gaps between the points
+        require_prime_modulus(modulus, "MPCPolynomial.lagrange_interp", "MPCBitwise's XOR-shared protocols in place of interpolated lookups")
         n = len(y)
 
         inv_table = dict[int, type(modulus)]()
@@ -298,73 +313,78 @@ class MPCPolynomial[TP]:
             yield power_mask
             eo_iter = self.__increment_power_mask(power_mask, exp_term, len(exp_term) - 1)
 
-    def __setup_tables(self, modulus = MPC_FIELD_SIZE):
-        # Table 0
-        table = [[TP(1), TP(0)]] if self.pid > 0 else [[TP(0), TP(0)]]
+    def __setup_table(self, cid: int, modulus = TABLES_MODULUS):
+        # The values of table cid and their interpolants (local work: no draw, no message), built when a field protocol
+        # first looks the table up (table_lookup), at every party alike. Interpolating them takes the compute parties
+        # about 0.3 s, which every start paid before.
+        if cid == 0:
+            # Table 0
+            table = [[TP(1), TP(0)]] if self.pid > 0 else [[TP(0), TP(0)]]
 
-        self.table_type_modular[0] = True
-        self.table_cache[0] = copy(table)
+            self.table_type_modular[0] = True
+            self.table_cache[0] = copy(table)
+        elif cid == 1:
+            # Table 1
+            half_len = MPC_NBIT_K // 2
+            table = [list[TP](half_len + 1), list[TP](half_len + 1)]
+            table[0].append(TP(1))
+            table[1].append(TP(1))
+            # Warning: Not having table instantiated to zeros_mat might be problematic for CP0
+            if self.pid > 0:
+                for i in range(1, half_len + 1):
+                    table[0].append(table[0][i - 1] << 1)
+                    table[1].append(table[1][i - 1] << 2)
+            else:
+                for i in range(1, half_len + 1):
+                    table[0].append(TP(0))
+                    table[1].append(TP(0))
 
-        # Table 1
-        half_len = MPC_NBIT_K // 2
-        table = [list[TP](half_len + 1), list[TP](half_len + 1)]
-        table[0].append(TP(1))
-        table[1].append(TP(1))
-        # Warning: Not having table instantiated to zeros_mat might be problematic for CP0
-        if self.pid > 0:
-            for i in range(1, half_len + 1):
-                table[0].append(table[0][i - 1] << 1)
-                table[1].append(table[1][i - 1] << 2)
+            self.table_type_modular[1] = True
+            self.table_cache[1] = copy(table)
+        elif cid == 2:
+            # Table 2: parameters (intercept, slope) for piecewise-linear approximation
+            # of negative log-sigmoid function
+            table = [list[TP](64), list[TP](64)]  # zeros_mat((2, 64))
+            # Warning: Not having table instantiated to zeros_mat might be problematic for CP0
+            if self.pid > 0:
+                for intercept, slope in SIGMOID_POINTS:
+                    fp_intercept = double_to_fp(float(intercept), modulus)
+                    fp_slope = double_to_fp(float(slope), modulus)
+
+                    table[0].append(fp_intercept)
+                    table[1].append(fp_slope)
+            else:
+                for i in range(64):
+                    table[0].append(TP(0))
+                    table[1].append(TP(0))
+
+            self.table_type_modular[2] = False
+            self.table_cache[2] = copy(table)
         else:
-            for i in range(1, half_len + 1):
-                table[0].append(TP(0))
-                table[1].append(TP(0))
-
-        self.table_type_modular[1] = True
-        self.table_cache[1] = copy(table)
-
-        # Table 2: parameters (intercept, slope) for piecewise-linear approximation
-        # of negative log-sigmoid function
-        table = [list[TP](64), list[TP](64)]  # zeros_mat((2, 64))
-        # Warning: Not having table instantiated to zeros_mat might be problematic for CP0
-        if self.pid > 0:
-            for intercept, slope in SIGMOID_POINTS:
-                fp_intercept = double_to_fp(float(intercept), modulus)
-                fp_slope = double_to_fp(float(slope), modulus)
-
-                table[0].append(fp_intercept)
-                table[1].append(fp_slope)
-        else:
-            for i in range(64):
-                table[0].append(TP(0))
-                table[1].append(TP(0))
-
-        self.table_type_modular[2] = False
-        self.table_cache[2] = copy(table)
+            raise ValueError(f"MPCPolynomial.table_lookup: no table {cid} (tables 0, 1 and 2)")
 
         pcount = self.comms.number_of_parties - 1
-        for cid in range(len(self.table_cache)):
-            field_size = MPC_SECOND_FIELD_SIZE if cid == 1 else MPC_THIRD_FIELD_SIZE
-            nrow = len(self.table_cache[cid])
-            ncol = len(self.table_cache[cid][0])
+        field_size = MPC_SECOND_FIELD_SIZE if cid == 1 else MPC_THIRD_FIELD_SIZE
+        nrow = len(self.table_cache[cid])
+        ncol = len(self.table_cache[cid][0])
 
-            self.lagrange_cache[cid] = list[list[TP]](nrow)
+        self.lagrange_cache[cid] = list[list[TP]](nrow)
 
-            if self.pid > 0:
-                for i in range(nrow):
-                    x = [0 for _ in range(ncol * (pcount if self.table_type_modular[cid] else 1))]
-                    y = [TP(0) for _ in range(ncol * (pcount if self.table_type_modular[cid] else 1))]
+        if self.pid > 0:
+            for i in range(nrow):
+                x = [0 for _ in range(ncol * (pcount if self.table_type_modular[cid] else 1))]
+                y = [TP(0) for _ in range(ncol * (pcount if self.table_type_modular[cid] else 1))]
 
-                    for j in range(ncol):
-                        x[j] = j + 1
-                        y[j] = self.table_cache[cid][i][j]
-    
-                        if self.table_type_modular[cid]:
-                            for p in range(1, pcount):
-                                x[j + ncol * p] = x[j + ncol * (p - 1)] + field_size
-                                y[j + ncol * p] = self.table_cache[cid][i][j]
-                    
-                    self.lagrange_cache[cid].append(self.lagrange_interp(x, y, modulus))
-            else:
-                for _ in range(nrow):
-                    self.lagrange_cache[cid].append([TP(0) for _ in range(ncol * (pcount if self.table_type_modular[cid] else 1))])
+                for j in range(ncol):
+                    x[j] = j + 1
+                    y[j] = self.table_cache[cid][i][j]
+
+                    if self.table_type_modular[cid]:
+                        for p in range(1, pcount):
+                            x[j + ncol * p] = x[j + ncol * (p - 1)] + field_size
+                            y[j + ncol * p] = self.table_cache[cid][i][j]
+                
+                self.lagrange_cache[cid].append(self.lagrange_interp(x, y, modulus))
+        else:
+            for _ in range(nrow):
+                self.lagrange_cache[cid].append([TP(0) for _ in range(ncol * (pcount if self.table_type_modular[cid] else 1))])

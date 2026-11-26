@@ -24,6 +24,13 @@
 #   e-no-tls          SEQURE_USE_TLS=0, plain TCP: the run completes
 #   f-dead-peer       CP2 exits without closing its connections while CP0 sends it 100 messages of 800 KB: CP0's TLS
 #                     send fails and stops CP0 (a failed SSL_write used to count as a success)
+#   g-modulus-default, g-modulus-field, g-modulus-ring
+#                     every party with no modulus flag, with --use-field, with --use-ring: the run completes, and every
+#                     party says it ran on the same modulus (the field, the ring as asked)
+#   g-odd-0, g-odd-1, g-odd-2
+#                     that party with --use-ring, the others with --use-field: every party stops at start with a
+#                     message that names both moduli, and none gets to the end; g-odd-1-mhe the same with the MHE setup
+#   g-both-flags      --use-ring and --use-field at every party: each refuses to start, before it connects
 #
 # Needs bash, openssl, and the parties' ports free on 127.0.0.1: 9001-9006 (COMMUNICATION_PORT + 1 to + 6). The program
 # runs MHE code, which needs Sequre's alignment shim on x86-64: `sequre build` links it into the binary; for a binary
@@ -34,7 +41,8 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ALL_SCENARIOS=(a-san-3 a-san-4 a-cn-3 a-cn-4 b-server b-client c-other-ca d-names d-wrong-names d-no-pid e-no-tls
-               f-dead-peer)
+               f-dead-peer g-modulus-default g-modulus-field g-modulus-ring g-odd-0 g-odd-1 g-odd-2 g-odd-1-mhe
+               g-both-flags)
 PORTS=(9001 9002 9003 9004 9005 9006)
 PASS_LIMIT=180    # seconds a run that should complete may take
 REJECT_LIMIT=60   # seconds a run that should stop may take
@@ -140,6 +148,35 @@ env_d_no_pid() { export SEQURE_PARTY_CERT_NAME=party; }
 env_e_no_tls() { export SEQURE_USE_TLS=0; }
 env_f_dead_peer() { export TLS_CHECK_DEAD_PEER=1; }
 
+# run_parties_flags SCENARIO N LIMIT FLAG_FN [ARGS...]: run_parties with per-party arguments: FLAG_FN <pid> prints the
+# party's modulus flag (or nothing)
+run_parties_flags() {
+    local name=$1 n=$2 limit=$3 flag_fn=$4
+    shift 4
+    PARTY_FLAG_FN=$flag_fn run_parties "$name" "$n" "$limit" env_std "$@"
+}
+flag_none() { :; }
+flag_field() { echo --use-field; }
+flag_ring() { echo --use-ring; }
+flag_both() { echo --use-ring --use-field; }
+ODD=0
+flag_odd() { if [[ $1 == "$ODD" ]]; then echo --use-ring; else echo --use-field; fi; }
+
+# expect_same_modulus SCENARIO N TEXT: every party said it ran on the same modulus, whose name contains TEXT
+expect_same_modulus() {
+    local name=$1 n=$2 text=$3 p first=""
+    for ((p = 0; p < n; p++)); do
+        local line
+        line="$(log_line "$name" $p "ran on ")"
+        line="${line#*ran on }"
+        [[ -n "$line" ]] || { PROBLEMS+=("CP$p did not say which modulus it ran on"); continue; }
+        [[ -n "$first" ]] || first="$line"
+        [[ "$line" == "$first" ]] || PROBLEMS+=("CP$p ran on $line, CP0 on $first")
+        [[ "$line" == *"$text"* ]] || PROBLEMS+=("CP$p ran on $line, not $text")
+        log_has "$name" $p "MPC initialized on $line" || PROBLEMS+=("CP$p's start-up line does not name $line")
+    done
+}
+
 # run_parties SCENARIO N LIMIT ENV_FN [ARGS...]: runs parties 0..N-1 in $WORK/SCENARIO, each with the certificates in
 # $CERTS/std unless ENV_FN changes its environment, until all have exited, LIMIT seconds have passed, or GRACE seconds
 # after the first failure. Parties still running then are stopped (cp<pid>.stopped). Exit codes go to cp<pid>.rc.
@@ -157,7 +194,8 @@ run_parties() {
             cd "$dir" || exit 99
             export SEQURE_CP_IPS="$ips" SEQURE_CERT_DIR="$CERTS/std"
             "$env_fn" "$p"
-            "$BIN" "$p" "$@" > "cp$p.log" 2>&1
+            # shellcheck disable=SC2046
+            "$BIN" "$p" $([[ -n "${PARTY_FLAG_FN:-}" ]] && "$PARTY_FLAG_FN" "$p") "$@" > "cp$p.log" 2>&1
             echo $? > "cp$p.rc"
         ) 2> /dev/null &  # (the subshell's own notices, such as "Aborted", would clutter the summary)
         subshells+=($!)
@@ -288,6 +326,42 @@ run_scenario() {
             expect_failure "$s" 0 "TLS connection broken: sent"
             ! log_has "$s" 0 "CP0: sent 100 messages" || PROBLEMS+=("CP0's sends to the exited CP2 all went through")
             [[ "$(party_rc "$s" 2)" == 0 ]] || PROBLEMS+=("CP2 did not exit with 0 ($(party_rc "$s" 2))") ;;
+        g-modulus-default)
+            run_parties_flags "$s" 3 $PASS_LIMIT flag_none --skip-mhe-setup
+            expect_complete "$s" 3
+            log_has "$s" 1 "ok comparison and != over the network" || PROBLEMS+=("CP1 printed no comparison ok line")
+            expect_same_modulus "$s" 3 "the " ;;
+        g-modulus-field)
+            run_parties_flags "$s" 3 $PASS_LIMIT flag_field --skip-mhe-setup
+            expect_complete "$s" 3
+            log_has "$s" 1 "ok comparison and != over the network" || PROBLEMS+=("CP1 printed no comparison ok line")
+            expect_same_modulus "$s" 3 "the field" ;;
+        g-modulus-ring)
+            run_parties_flags "$s" 3 $PASS_LIMIT flag_ring --skip-mhe-setup
+            expect_complete "$s" 3
+            log_has "$s" 1 "ok comparison and != over the network" || PROBLEMS+=("CP1 printed no comparison ok line")
+            expect_same_modulus "$s" 3 "the ring" ;;
+        g-odd-0|g-odd-1|g-odd-2|g-odd-1-mhe)
+            ODD=${s#g-odd-}
+            ODD=${ODD%-mhe}
+            if [[ $s == *-mhe ]]; then
+                run_parties_flags "$s" 3 $REJECT_LIMIT flag_odd
+            else
+                run_parties_flags "$s" 3 $REJECT_LIMIT flag_odd --skip-mhe-setup
+            fi
+            expect_stopped "$s" 3
+            for p in 0 1 2; do
+                expect_failure "$s" $p "the parties' MPC settings differ" "on the ring 2^" "on the field 2^" \
+                    "start every party with the same modulus flag"
+            done ;;
+        g-both-flags)
+            run_parties_flags "$s" 3 $REJECT_LIMIT flag_both --skip-mhe-setup
+            expect_stopped "$s" 3
+            for p in 0 1 2; do
+                expect_failure "$s" $p "--use-ring and --use-field were both given"
+                ! log_has "$s" $p "Secure seed exchange" || PROBLEMS+=("CP$p connected before it refused")
+                [[ "$(party_rc "$s" $p)" == 2 ]] || PROBLEMS+=("CP$p exited with $(party_rc "$s" $p), not 2")
+            done ;;
     esac
 }
 
@@ -298,6 +372,8 @@ evidence() {
         b-client|d-wrong-names) log_line "$1" 1 "TLS handshake with CP0 at CP1" ;;
         d-no-pid) log_line "$1" 0 "must contain" ;;
         f-dead-peer) log_line "$1" 0 "TLS connection broken" ;;
+        g-odd-*) log_line "$1" 0 "settings differ" | cut -c1-200 ;;
+        g-both-flags) log_line "$1" 0 "both given" ;;
     esac
 }
 

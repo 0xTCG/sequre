@@ -15,8 +15,16 @@ These flags can be passed to any Sequre program:
 | Flag | Description |
 |---|---|
 | `--use-ring` | Use the power-of-two ring $\mathbb{Z}_{2^k}$ instead of the prime field as the secret-sharing modulus. Every operation runs on either modulus: on the ring, comparisons, division, square root and the nonlinear functions use ring protocols (sign tests and normalizers built from shared random bits). |
+| `--use-field` | Use the prime field $\mathbb{F}_p$, $p = 2^k - c$ (the default). Not together with `--use-ring`. |
 | `--skip-mhe-setup` | Skip the multiparty homomorphic encryption key-generation phase. Useful when the protocol only uses secret sharing (MPC) without any HE operations. |
 | `-h`, `--help` | Print usage information and exit. |
+
+Every party must be started with the same modulus flag and run the same version of Sequre. The parties compare their
+modulus, share width and fixed-point settings when they connect: if they differ, every party stops before any protocol
+message and names both sides (`CP1 runs on the ring 2^174, CP2 on the field 2^174 - 3: ...`). A party that runs an
+older Sequre exchanges no settings: the newer parties stop at start, and the older one at its next receive (see
+[Troubleshooting](troubleshooting.md#the-mpc-modulus-the-ring-and-the-field)). Each party prints the modulus it runs on
+(`CP1: MPC initialized on the field 2^174 - 3`): a misspelt flag is not an error, as programs take flags of their own.
 
 The `--local` flag selects local execution in programs that use the `@main` decorator. It is also used by the built-in test runner (`scripts/invoke.codon`). For programs that hard-code their mode, use `@local` for local execution, `@online` for distributed execution, or `mpc()` for manual control — see [Execution modes](#execution-modes) below.
 

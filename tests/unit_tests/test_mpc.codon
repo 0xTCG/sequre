@@ -1,12 +1,19 @@
+import os
+
+from internal.gc import sizeof  # a builtin no more since Codon 0.20
 from numpy import arange
 
 from sequre.utils.testing import assert_eq, assert_eq_approx 
 from sequre.constants import *
 from sequre.utils.utils import offline_evaluate_poly, zeros_vec
+from sequre.utils.primitives import mod_inv
 from sequre.types.utils import double_to_fp
+from sequre.types.internal import InternalMPC
 from sequre.mpc.collections import oblivious_get
 
-from sequre.mpc.env import MPCEnv
+from sequre.mpc.env import MPCEnv, _settings, _settings_difference
+
+from .. import write_share_record, check_share_record, share_record_path, mark_share_record_incomplete
 
 from test_mhe import test_mhe
 from test_randomness import test_randomness
@@ -24,6 +31,268 @@ def test_share_from_round_trip[TP](mpc: MPCEnv[TP], modulus: TP, alg_struct: str
         if mpc.pid != 0:
             assert_eq(f'CP{mpc.pid}:\tShare from CP{source} and reveal on {alg_struct} ({mpc.comms.number_of_parties} parties)',
                       revealed, data)
+
+
+def _ne_plain[TP](values: List[TP]) -> List[TP]:
+    return [TP(0) if v == TP(0) else TP(1) for v in values]
+
+
+def test_ring_equality[TP](mpc: MPCEnv[TP], modulus: TP, wide_values: List[TP]):
+    # [a != 0] by the ring's equality test (MPCBoolean.is_nonzero on ring shares): exact for every |a| < 2^nbits, zero
+    # and both signs, at the widths InternalMPC.ne gives it (K for a difference of two fixed-point values, K + F + 1
+    # inside delayed_truncation(), L for integers and wide differences), against plaintext and, where the sign test is
+    # exact, against the ring's earlier != (InternalMPC.__ne_ring: [d > 0] + [-d > 0])
+    for nbits in (MPC_NBIT_K, MPC_NBIT_K + MPC_NBIT_F + 1, MPC_MODULUS_BITS):
+        top = (TP(1) << TP(nbits)) - TP(1)  # the largest admissible magnitude
+        values = [TP(0), TP(1), modulus - TP(1), TP(2), modulus - TP(2), top, modulus - top, TP(0)]
+        for k in (MPC_NBIT_F - 1, MPC_NBIT_F, MPC_NBIT_F + 1, MPC_NBIT_K - 1, MPC_NBIT_K, nbits - 2, nbits - 1):
+            if k < nbits:
+                values.append(TP(1) << TP(k))
+                values.append(modulus - (TP(1) << TP(k)))
+        with mpc.randomness.global_stream():
+            drawn = [TP(0) for _ in range(40)].rand_bits(nbits)
+        for i in range(len(drawn)):
+            values.append(drawn[i] if i % 2 == 0 else (modulus - drawn[i]) % modulus)
+            if i % 8 == 0:
+                values.append(TP(0))
+        shared = mpc.comms.share_from_trusted_dealer(values, modulus)
+        got = mpc.comms.reveal(mpc.boolean.is_nonzero(shared, modulus, nbits=nbits), modulus)
+        if mpc.pid != 0:
+            assert_eq(f'CP{mpc.pid}:\tIs nonzero (ring) over {nbits} bits: zero, both signs, the edge 2^{nbits} - 1, random', got, _ne_plain(values))
+
+    # The sign-test reference, where the sign test is exact: a fixed-point difference (|d| < 2^K: K + 1 bits) and the
+    # integers below 2^(L - 1) (L bits)
+    narrow = [TP(0), TP(1), modulus - TP(1), (TP(1) << TP(MPC_NBIT_K)) - TP(1), modulus - ((TP(1) << TP(MPC_NBIT_K)) - TP(1)), TP(1) << TP(MPC_NBIT_F), TP(0), modulus - (TP(1) << TP(MPC_NBIT_K - 1))]
+    shared = mpc.comms.share_from_trusted_dealer(narrow, modulus)
+    new_ne = mpc.comms.reveal(mpc.boolean.is_nonzero(shared, modulus, nbits=MPC_NBIT_K), modulus)
+    old_ne = mpc.comms.reveal(InternalMPC.__ne_ring(mpc, shared, True, False, modulus), modulus)
+    wide = [v for v in wide_values if v < (TP(1) << TP(MPC_MODULUS_BITS - 1)) - TP(1) or v > (TP(1) << TP(MPC_MODULUS_BITS - 1)) + TP(1)]
+    wide_shared = mpc.comms.share_from_trusted_dealer(wide, modulus)
+    new_wide = mpc.comms.reveal(mpc.boolean.is_nonzero(wide_shared, modulus), modulus)
+    old_wide = mpc.comms.reveal(InternalMPC.__ne_ring(mpc, wide_shared, False, True, modulus), modulus)
+    # Shapes: a scalar, a matrix and an empty vector (every party returns at once, before any draw or message)
+    scalar = mpc.comms.reveal(mpc.boolean.is_nonzero(mpc.comms.share_from_trusted_dealer(modulus - TP(7), modulus), modulus, nbits=MPC_NBIT_K), modulus)
+    matrix = mpc.comms.reveal(mpc.boolean.is_nonzero(mpc.comms.share_from_trusted_dealer([[TP(0), TP(5)], [modulus - TP(5), TP(0)]], modulus), modulus, nbits=MPC_NBIT_K), modulus)
+    before = mpc.stats.bytes_sent
+    empty = mpc.boolean.is_nonzero(List[TP](), modulus, nbits=MPC_NBIT_K)
+    if mpc.pid != 0:
+        assert_eq(f'CP{mpc.pid}:\tIs nonzero (ring) over K bits equals the sign test of (d, -d)', new_ne, old_ne)
+        assert_eq(f'CP{mpc.pid}:\tIs nonzero (ring) over K bits against plaintext', new_ne, _ne_plain(narrow))
+        assert_eq(f'CP{mpc.pid}:\tIs nonzero (ring) far beyond the fixed-point range equals the sign test of (d, -d)', new_wide, old_wide)
+        assert_eq(f'CP{mpc.pid}:\tIs nonzero (ring) far beyond the fixed-point range against plaintext', new_wide, _ne_plain(wide))
+        assert_eq(f'CP{mpc.pid}:\tIs nonzero (ring) of a scalar', scalar, TP(1))
+        assert_eq(f'CP{mpc.pid}:\tIs nonzero (ring) on a matrix', matrix, [[TP(0), TP(1)], [TP(1), TP(0)]])
+        assert_eq(f'CP{mpc.pid}:\tIs nonzero (ring) of an empty vector: empty, nothing sent', (len(empty), mpc.stats.bytes_sent - before), (0, 0))
+
+
+def test_equality_cost[TP](mpc: MPCEnv[TP], modulus: TP):
+    # The rounds and the bytes of one equality test of n values at the width of a fixed-point difference (InternalMPC.ne:
+    # K bits on the ring, K + F on the field), at every compute party. Ring: 3 openings (c, the shifted count, the bit
+    # conversion); field: 4 (the opening, two fan-in ORs, the table lookup). Each message is send_as_jar's size field
+    # and the pickled list (its length and its elements); the hub sends each opening to every other compute party, the
+    # others send theirs to the hub.
+    n = 100
+    ring = modulus.popcnt() == 1
+    nbits = MPC_NBIT_K if ring else MPC_NBIT_K + MPC_NBIT_F
+    shared = mpc.comms.share_from_trusted_dealer([TP(i % 3) for i in range(n)], modulus)
+    mpc.comms.sync_parties()
+    rounds, sent = mpc.stats.rounds, mpc.stats.bytes_sent
+    res = mpc.boolean.is_nonzero(shared, modulus, nbits=nbits)
+    rounds, sent = mpc.stats.rounds - rounds, mpc.stats.bytes_sent - sent
+    word = MPC_INT_SIZE // 8
+    if ring:
+        per_peer = 3 * 2 * sizeof(int) + n * (word + sizeof(int) + PACKING_SIZE // 8)
+        want_rounds = 3
+    else:
+        blocks = (nbits + MPC_THIRD_FIELD_SIZE - 2) // (MPC_THIRD_FIELD_SIZE - 1)
+        per_peer = 4 * 2 * sizeof(int) + n * (2 * word + sizeof(int) * (blocks + 1))
+        want_rounds = 4
+    want_sent = per_peer * (mpc.comms.number_of_parties - 2) if mpc.pid == mpc.comms.hub_pid else per_peer
+    got = mpc.comms.reveal(res, modulus)
+    if mpc.pid != 0:
+        assert_eq(f'CP{mpc.pid}:\tIs nonzero ({"ring" if ring else "field"}) of {n} values: right', got, [TP(int(i % 3 != 0)) for i in range(n)])
+        assert_eq(f'CP{mpc.pid}:\tIs nonzero ({"ring" if ring else "field"}) of {n} values over {nbits} bits: {want_rounds} rounds', rounds, want_rounds)
+        assert_eq(f'CP{mpc.pid}:\tIs nonzero ({"ring" if ring else "field"}) of {n} values over {nbits} bits: bytes sent', sent, want_sent)
+
+
+def _streams(mpc) -> List[int]:
+    # The bytes this party sent and where each of its streams is (private, pairwise, global): unchanged by a call that
+    # refused before any draw or message
+    state = [mpc.stats.bytes_sent, mpc.randomness.stream_digest(-1)]
+    for p in range(mpc.comms.number_of_parties):
+        state.append(mpc.randomness.stream_digest(p))
+    return state
+
+
+def test_field_only_guards(mpc):
+    # Field-only primitives refuse a power-of-two modulus (the ring's, or a small one) with a ValueError, at every party at
+    # the same call, before any draw or message; on a prime modulus they compute as before. Whatever the run's modulus:
+    # every call names its modulus.
+    ring = MPC_RING_SIZE
+    small_ring = MPC_SECOND_RING_SIZE
+    bits = mpc.comms.share_from_trusted_dealer([[mpc_uint(1), mpc_uint(0), mpc_uint(1)], [mpc_uint(0), mpc_uint(0), mpc_uint(0)]], ring)
+    small_bits = mpc.comms.share_from_trusted_dealer([[1, 0, 1], [0, 0, 0]], MPC_SECOND_FIELD_SIZE)
+    values = mpc.comms.share_from_trusted_dealer([mpc_uint(5), mpc_uint(1) << mpc_uint(MPC_NBIT_F)], ring)
+    mpc.comms.sync_parties()
+    names = List[str]()
+    refused = List[bool]()
+    intact = List[bool]()
+    for case in range(14):
+        before = _streams(mpc)
+        raised = False
+        try:
+            if case == 0:
+                names.append("mod_inv on the ring")
+                mod_inv(mpc_uint(3), ring)
+            elif case == 1:
+                names.append("mod_inv modulo 16")
+                mod_inv(3, small_ring)
+            elif case == 2:
+                names.append("lagrange_interp on the ring")
+                mpc.polynomial.lagrange_interp([1, 2, 3], [mpc_uint(0), mpc_uint(1), mpc_uint(1)], ring)
+            elif case == 3:
+                names.append("lagrange_interp_simple on the ring")
+                mpc.polynomial.lagrange_interp_simple([mpc_uint(0), mpc_uint(1), mpc_uint(1)], ring)
+            elif case == 4:
+                names.append("fan_in_or on the ring")
+                mpc.boolean.fan_in_or(bits, ring)
+            elif case == 5:
+                names.append("fan_in_or modulo 16")
+                mpc.boolean.fan_in_or(small_bits, small_ring)
+            elif case == 6:
+                names.append("prefix_or on the ring")
+                mpc.boolean.prefix_or(bits, ring)
+            elif case == 7:
+                names.append("fan_in_and on the ring")
+                mpc.boolean.fan_in_and(bits, ring)
+            elif case == 8:
+                names.append("prefix_and on the ring")
+                mpc.boolean.prefix_and(bits, ring)
+            elif case == 9:
+                names.append("less_than_bits on the ring")
+                mpc.boolean.less_than_bits(bits, bits, ring)
+            elif case == 10:
+                names.append("less_than_bits_public on the ring")
+                mpc.boolean.less_than_bits_public(bits, bits, ring)
+            elif case == 11:
+                names.append("demultiplexer modulo 16")
+                mpc.boolean.demultiplexer(small_bits, small_ring)
+            elif case == 12:
+                names.append("the field normalizer on the ring")
+                mpc.fp.__normalizer_even_exp(values, ring)
+            else:
+                names.append("table_lookup on the ring")
+                mpc.polynomial.table_lookup(values, 0, ring)
+        except ValueError:
+            raised = True
+        refused.append(raised)
+        intact.append(_streams(mpc) == before)
+    mpc.comms.sync_parties()  # the parties stayed in step (it checks the global stream)
+    # On a prime modulus the same calls compute (the fan-in OR of each row)
+    ors = mpc.comms.reveal(mpc.boolean.fan_in_or(small_bits, MPC_SECOND_FIELD_SIZE), MPC_SECOND_FIELD_SIZE)
+    inverse = mod_inv(mpc_uint(3), MPC_FIELD_SIZE).mul_mod(mpc_uint(3), MPC_FIELD_SIZE)
+    for i in range(len(names)):
+        assert_eq(f'CP{mpc.pid}:\t{names[i]} refused before any draw or message', (refused[i], intact[i]), (True, True))
+    if mpc.pid != 0:
+        assert_eq(f'CP{mpc.pid}:\tfan_in_or on a prime modulus computes', ors, [1, 0])
+    assert_eq(f'CP{mpc.pid}:\tmod_inv on the field computes', inverse, mpc_uint(1))
+
+
+def test_settings_digest(mpc):
+    # The settings the parties compare at start (MPCEnv; a run with differing settings stops there, tests/network), and
+    # the messages that name both sides
+    ring = _settings(MPC_RING_SIZE)
+    field = _settings(MPC_FIELD_SIZE)
+    # Another width's field settings, as a build at that width sends them: L and c, K, F and V follow from the width
+    widths = {128: (127, 1, 64, 32, 28), 192: (174, 3, 64, 32, 64), 256: (251, 9, 128, 64, 56)}
+    other = 256 if MPC_INT_SIZE == 128 else 128
+    wider = field.copy()
+    wider[2] = other
+    w = widths[other]
+    wider[4] = w[0]
+    wider[5] = w[1]
+    wider[6] = w[2]
+    wider[7] = w[3]
+    wider[8] = w[4]
+    debug = field.copy()
+    debug[10] = 1 - debug[10]
+    foreign = [0 for _ in range(len(field))]
+    on_ring = f"the ring 2^{MPC_MODULUS_BITS}"
+    on_field = f"the field 2^{MPC_MODULUS_BITS} - {MPC_MERSENNE_OFFSET}"
+    assert_eq(f'CP{mpc.pid}:\tSettings: the ring and the field differ', ring != field, True)
+    assert_eq(f'CP{mpc.pid}:\tSettings: the run agrees with itself', _settings(mpc.default_mpc_modulus) == _settings(mpc.default_mpc_modulus), True)
+    assert_eq(f'CP{mpc.pid}:\tSettings message names both moduli', f"CP1 runs on {on_ring}, CP2 on {on_field}" in _settings_difference(1, ring, 2, field), True)
+    assert_eq(f'CP{mpc.pid}:\tSettings message names both share widths', f"CP1 has {MPC_INT_SIZE}-bit shares, CP2 {other}-bit ones" in _settings_difference(1, field, 2, wider), True)
+    width_only = _settings_difference(1, field, 2, wider)
+    assert_eq(f'CP{mpc.pid}:\tSettings message: another width alone (no modulus flag, no fixed point)', "modulus flag" not in width_only and "fixed point" not in width_only and "runs on" not in width_only, True)
+    both = _settings_difference(1, ring, 2, wider)
+    assert_eq(f'CP{mpc.pid}:\tSettings message: another width and the other modulus', "-bit shares" in both and f"CP1 runs on {on_ring}" in both and "modulus flag" in both, True)
+    assert_eq(f'CP{mpc.pid}:\tSettings message names DEBUG', "DEBUG is" in _settings_difference(0, field, 1, debug), True)
+    assert_eq(f'CP{mpc.pid}:\tSettings of another layout name the version', "another version of Sequre" in _settings_difference(2, field, 0, foreign), True)
+
+
+def test_share_records(mpc):
+    # The record share_data writes beside a party's share files (applications/utils/data_sharing.codon), checked before
+    # the files are read: matched, refused under the other modulus or share width or when share_data did not finish, and
+    # files without a record (an older Sequre's) read on the field with a warning and refused on the ring. Each party its
+    # own record, as share_data writes.
+    directory = 'tests/data'
+    protocol = 'record-test'
+    path = share_record_path(directory, protocol, mpc.pid)
+    files = [(f'__x_shares_{mpc.pid}.bin', 4, 3, True), (f'__y_r_{mpc.pid}.bin', 2, 5, False)]
+    verdicts = List[str]()
+    for written in (MPC_FIELD_SIZE, MPC_RING_SIZE):
+        write_share_record(directory, protocol, mpc.pid, files, written)
+        for read in (MPC_FIELD_SIZE, MPC_RING_SIZE):
+            try:
+                verdicts.append("loaded" if check_share_record(directory, protocol, mpc.pid, read) else "warned")
+            except ValueError:
+                verdicts.append("refused")
+    # The record of an interrupted share_data
+    mark_share_record_incomplete(directory, protocol, mpc.pid)
+    for read in (MPC_FIELD_SIZE, MPC_RING_SIZE):
+        try:
+            verdicts.append("loaded" if check_share_record(directory, protocol, mpc.pid, read) else "warned")
+        except ValueError as e:
+            verdicts.append("refused" if "incomplete" in e.message else "refused, not as incomplete")
+    # Another share width in the record
+    write_share_record(directory, protocol, mpc.pid, files, MPC_FIELD_SIZE)
+    with open(path) as f:
+        lines = [line for line in f]
+    with open(path, 'w') as f:
+        for line in lines:
+            f.write(f"mpc_int_size={2 * MPC_INT_SIZE}\n" if line.startswith("mpc_int_size=") else line.rstrip("\n") + "\n")
+    try:
+        verdicts.append("loaded" if check_share_record(directory, protocol, mpc.pid, MPC_FIELD_SIZE) else "warned")
+    except ValueError:
+        verdicts.append("refused")
+    # No record
+    os.remove(path)
+    for read in (MPC_FIELD_SIZE, MPC_RING_SIZE):
+        try:
+            verdicts.append("loaded" if check_share_record(directory, protocol, mpc.pid, read) else "warned")
+        except ValueError:
+            verdicts.append("refused")
+    assert_eq(f'CP{mpc.pid}:\tShare records: field and ring records read under each modulus, incomplete, another width, none',
+              verdicts, ["loaded", "refused", "refused", "loaded", "refused", "refused", "refused", "warned", "refused"])
+    mpc.comms.sync_parties()
+
+
+def test_security_parameters(mpc):
+    # The numbers docs/crypto-corner/security-assumptions.md quotes, per MPC_INT_SIZE: a change of the constants that
+    # lowers one fails here. (L, K, F, V); the truncation's mask bits K + F + V and its statistical hiding 2^-V; the
+    # MPC->MHE switch masks (MPCMHE._mpc_to_mhe_mask_bits) with 3 compute parties' worth of headroom, the same for both
+    # moduli; the MHE->MPC switch's lambda
+    expected = {128: (127, 64, 32, 28, 124), 192: (174, 64, 32, 64, 160), 256: (251, 128, 64, 56, 248)}
+    L, K, F, V, trunc_bits = expected[MPC_INT_SIZE]
+    assert_eq(f'CP{mpc.pid}:\tSecurity parameters: L, K, F, V at {MPC_INT_SIZE}-bit shares', (MPC_MODULUS_BITS, MPC_NBIT_K, MPC_NBIT_F, MPC_NBIT_V), (L, K, F, V))
+    assert_eq(f'CP{mpc.pid}:\tSecurity parameters: the truncation mask has K + F + V bits, below L', (MPC_NBIT_K + MPC_NBIT_F + MPC_NBIT_V, MPC_NBIT_K + MPC_NBIT_F + MPC_NBIT_V < MPC_MODULUS_BITS), (trunc_bits, True))
+    n_cp = mpc.comms.number_of_parties - 1
+    switch_bits = L - 2 - (n_cp - 1).bitlen()
+    for m in (MPC_FIELD_SIZE, MPC_RING_SIZE):
+        assert_eq(f'CP{mpc.pid}:\tSecurity parameters: MPC->MHE mask bits on {modulus_name(m)} with {n_cp} compute parties', mpc.mhe._mpc_to_mhe_mask_bits(m), switch_bits)
+    assert_eq(f'CP{mpc.pid}:\tSecurity parameters: the MPC->MHE opening hides x to 2^-{switch_bits - (K - 1)}', switch_bits - (K - 1) >= 60, True)
+    assert_eq(f'CP{mpc.pid}:\tSecurity parameters: MHE->MPC lambda', MHE_MPC_SWITCH_LAMBDA, 128)
 
 
 def test_mpc_core[TP](mpc: MPCEnv[TP], modulus: TP):
@@ -259,6 +528,8 @@ def test_mpc_core[TP](mpc: MPCEnv[TP], modulus: TP):
         assert_eq('Evaluate polynomial', revealed_p, expected_mat)
     
     size = 10
+    # Fan-in and prefix OR and AND interpolate a polynomial over the modulus (Lagrange: field-only, as even numbers
+    # have no inverse modulo a power of two): field shares only. On the ring they refuse (test_field_only_guards).
     if modulus.popcnt() != 1:
         input_bits = [
             [(TP(0) if i != (size - 1) else e) for i in range(size)] for e in a_bits]
@@ -294,13 +565,15 @@ def test_mpc_core[TP](mpc: MPCEnv[TP], modulus: TP):
     
     shared_a_bits = mpc.comms.share_from_trusted_dealer([a_bits], modulus)
     shared_b_bits = mpc.comms.share_from_trusted_dealer([b_bits], modulus)
-    not_less_results = mpc.boolean.less_than_bits(shared_a_bits, shared_b_bits, modulus)
-    less_results = mpc.boolean.less_than_bits(shared_b_bits, shared_a_bits, modulus)
-    revealed_not_less_results = mpc.comms.reveal(not_less_results, modulus)
-    revealed_less_results = mpc.comms.reveal(less_results, modulus)
-    if mpc.pid != 0:
-        assert_eq('Not less than bits', revealed_not_less_results, [TP(0)])
-        if modulus.popcnt() != 1:  # TODO: Check why it fails on rings
+    # The bit comparison builds on prefix OR (an interpolation over the modulus): field-only, as the fan-in ORs above.
+    # On the ring it refuses (test_field_only_guards); its "Not less than bits" passed there only by chance.
+    if modulus.popcnt() != 1:
+        not_less_results = mpc.boolean.less_than_bits(shared_a_bits, shared_b_bits, modulus)
+        less_results = mpc.boolean.less_than_bits(shared_b_bits, shared_a_bits, modulus)
+        revealed_not_less_results = mpc.comms.reveal(not_less_results, modulus)
+        revealed_less_results = mpc.comms.reveal(less_results, modulus)
+        if mpc.pid != 0:
+            assert_eq('Not less than bits', revealed_not_less_results, [TP(0)])
             assert_eq('Less than bits', revealed_less_results, [TP(1)])
     
     pos_neg = [
@@ -324,7 +597,9 @@ def test_mpc_core[TP](mpc: MPCEnv[TP], modulus: TP):
     wide_positive = mpc.comms.reveal(mpc.boolean.is_positive(wide_shared, modulus), modulus)
     if mpc.pid != 0:
         assert_eq('Is positive far beyond the fixed-point range', wide_positive, wide_signs)
-    if modulus.popcnt() != 1:
+    if modulus.popcnt() == 1:
+        test_ring_equality(mpc, modulus, wide_values)
+    else:
         # [a != 0] by the field's equality test: exact over the modulus' bits, and over K + F bits below 2^(K + F) - c
         # (p = 2^L - c): the largest such value included
         nonzero = mpc.comms.reveal(mpc.boolean.is_nonzero(wide_shared, modulus), modulus)
@@ -490,7 +765,9 @@ def test_mpc_core[TP](mpc: MPCEnv[TP], modulus: TP):
         double_to_fp(128.0, modulus),
         double_to_fp(32.0, modulus),
         double_to_fp(50.0, modulus)]
-    if modulus.popcnt() != 1:  # It doesn't work on rings yet
+    # The field's normalizer: bit comparisons over a small field and table 1 (field-only). The ring's is
+    # MPCBitwise.normalizer (test_bitwise); on ring shares this one refuses (test_field_only_guards)
+    if modulus.popcnt() != 1:
         nee, nee_sqrt = mpc.fp.__normalizer_even_exp(nee_input, modulus)
         if mpc.pid != 0:
             revealed_nee = mpc.comms.reveal(nee, modulus)
@@ -514,6 +791,7 @@ def test_mpc_core[TP](mpc: MPCEnv[TP], modulus: TP):
         assert_eq(f'Polynomial optimization on {alg_struct} 2', mpc.comms.reveal(poly_eval, modulus), expected_poly_eval)
 
     test_share_from_round_trip(mpc, modulus, alg_struct)
+    test_equality_cost(mpc, modulus)
 
     print(f'CP{mpc.pid}:\tMPC tests passed on {alg_struct}.\n')
 
@@ -559,6 +837,10 @@ def test_mpc(mpc, modulus):
     test_pickle_comms(mpc)
     with mpc.default_modulus(modulus):
         test_mpc_core(mpc, modulus)
+    test_field_only_guards(mpc)
+    test_settings_digest(mpc)
+    test_share_records(mpc)
+    test_security_parameters(mpc)
     test_mhe(mpc, modulus)
     test_randomness(mpc, modulus)
 

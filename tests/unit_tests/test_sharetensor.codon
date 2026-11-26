@@ -13,6 +13,7 @@ from sequre.stdlib.lin_alg import *
 from sequre.stdlib.fp import *
 from sequre.stdlib.protocols import bit_add as bit_add_protocol, bit_decomposition as bit_decomposition_protocol
 from sequre.types.sharetensor import Sharetensor
+from sequre.types.internal import InternalMPC
 from sequre.attributes import sequre
 
 
@@ -379,6 +380,11 @@ def _st_add(mpc, a, b):
 
 
 @sequre
+def _st_div(mpc, a, b):
+    return a / b
+
+
+@sequre
 def _st_sub(mpc, a, b):
     return a - b
 
@@ -696,6 +702,166 @@ def test_equality_ranges[TP](mpc, modulus: TP):
         assert_eq(f"CP{mpc.pid}:\t40 products near the fixed-point range's edge inside delayed_truncation(): > 0 on {alg_struct}", delayed_v, array([1.0 if i % 2 == 0 else 0.0 for i in range(40)]))
 
 
+def _fp_raw_shares[TP](mpc, raw: List[TP], modulus: TP) -> Sharetensor[List[TP]]:
+    # fixed-point shares of the given raw encodings (value * 2^F, mod the modulus)
+    st = Sharetensor(mpc.comms.share_from_trusted_dealer(raw, modulus), modulus)
+    st.fp = True
+    return st
+
+
+def _signed_raw[TP](v: int, shift: int, modulus: TP) -> TP:
+    magnitude = TP(abs(v)) << TP(shift)
+    return (modulus - magnitude) % modulus if v < 0 else magnitude
+
+
+def test_ring_equality_api[TP](mpc, modulus: TP):
+    """!= and == on ring shares through the Sharetensor API: the ring's equality test (MPCBoolean.is_nonzero) at the
+    width of each kind of difference, exact at the edges (zero, one raw unit, powers of two around F and K, the largest
+    difference of two fixed-point values, both signs), on fixed point and integers, wide differences, public operands,
+    inside delayed_truncation(), on a scalar, a vector, a matrix and an empty vector; against plaintext and against the
+    ring's earlier != (the sign test of (d, -d), InternalMPC.__ne_ring), and in 3 rounds."""
+    F, K, L = MPC_NBIT_F, MPC_NBIT_K, MPC_MODULUS_BITS
+    # Fixed point: raw differences 0, +-1, +-2^k (k around F and K), and the extremes 2^(K-1) - 1 against -(2^(K-1) - 1)
+    top = (TP(1) << TP(K - 1)) - TP(1)
+    xs_raw = [TP(5) << TP(F), TP(5) << TP(F), TP(5) << TP(F), TP(0), TP(0), top, (modulus - top) % modulus]
+    ys_raw = [TP(5) << TP(F), (TP(5) << TP(F)) + TP(1), (TP(5) << TP(F)) - TP(1), TP(1) << TP(K - 2), modulus - (TP(1) << TP(K - 2)), (modulus - top) % modulus, top]
+    for k in (F - 1, F, F + 1, K - 3, K - 2):
+        xs_raw.append(TP(0))
+        ys_raw.append(TP(1) << TP(k))
+        xs_raw.append(TP(1) << TP(k))
+        ys_raw.append(TP(0))
+    x = _fp_raw_shares(mpc, xs_raw, modulus)
+    y = _fp_raw_shares(mpc, ys_raw, modulus)
+    want = array([0.0 if xs_raw[i] == ys_raw[i] else 1.0 for i in range(len(xs_raw))])
+    rounds = mpc.stats.rounds
+    fp_ne = _st_ne(mpc, x, y)
+    rounds = mpc.stats.rounds - rounds
+    fp_eq = _st_eq(mpc, x, y)
+    d = _st_sub(mpc, x, y)
+    old = Sharetensor(InternalMPC.__ne_ring(mpc, d.share, True, False, modulus), modulus)
+    # Integers (the ring's L bits): multiples of 2^(L-4), equal, opposite and of both signs (the sign test of (d, -d) is
+    # exact for |d| < 2^(L-1)); and -2^(L-2) against 2^(L-2), whose difference -2^(L-1) is beyond the sign test's range
+    # and still nonzero for the equality test
+    ints_a = _int_shares(mpc, [1, -1, 1, -1, 0, 3, -3], L - 4, modulus)
+    ints_b = _int_shares(mpc, [1, 1, -1, -1, 0, 3, 3], L - 4, modulus)
+    ints_ne = _st_ne(mpc, ints_a, ints_b)
+    ints_old = Sharetensor(InternalMPC.__ne_ring(mpc, _st_sub(mpc, ints_a, ints_b).share, False, True, modulus), modulus)
+    half_ne = _st_ne(mpc, _int_shares(mpc, [-1], L - 2, modulus), _int_shares(mpc, [1], L - 2, modulus))
+    # Wide: integer shares against fixed point (the integer is scaled into fixed point; L bits)
+    wide_ne = _st_ne(mpc, _int_shares(mpc, [1, -1, 0], K, modulus), Sharetensor.enc(mpc, [0.0, 0.0, 0.0], 0, modulus))
+    # Public operands: an int, a float and a raw TP
+    xp = Sharetensor.enc(mpc, [3.0, 0.5, -2.25, 0.0], 0, modulus)
+    ne_int = _st_ne(mpc, xp, 3)
+    ne_float = _st_ne(mpc, xp, 0.5)
+    eq_raw = _st_eq(mpc, xp, double_to_fp(-2.25, modulus))
+    # Inside delayed_truncation(): products at scale 2^(2F) a raw unit apart, equal, and of opposite signs
+    pa = Sharetensor.enc(mpc, [1.5, -2.0, 3.0, 0.25], 0, modulus)
+    pb = Sharetensor.enc(mpc, [2.0, 2.0, -1.0, 4.0], 0, modulus)
+    pc = Sharetensor.enc(mpc, [2.0, -2.0, -1.0, 4.0], 0, modulus)
+    with mpc.delayed_truncation():
+        delayed_ne = _st_ne(mpc, _st_mul(mpc, pa, pb), _st_mul(mpc, pa, pc))
+    # Shapes: a scalar, a matrix and an empty vector
+    scalar_ne = _st_ne(mpc, Sharetensor.enc(mpc, 2.5, 0, modulus), Sharetensor.enc(mpc, 2.5, 0, modulus))
+    m1 = Sharetensor.enc(mpc, [[1.0, 2.0], [3.0, -4.0]], 0, modulus)
+    m2 = Sharetensor.enc(mpc, [[1.0, -2.0], [3.0, 4.0]], 0, modulus)
+    matrix_ne = _st_ne(mpc, m1, m2)
+    empty = Sharetensor(List[TP](), modulus)
+    empty.fp = True
+    sent = mpc.stats.bytes_sent
+    empty_ne = _st_ne(mpc, empty, empty)
+    sent = mpc.stats.bytes_sent - sent
+
+    fp_ne_v, fp_eq_v, old_v = fp_ne.reveal(mpc), fp_eq.reveal(mpc), old.reveal(mpc)
+    ints_v, ints_old_v, wide_v, half_v = ints_ne.reveal(mpc), ints_old.reveal(mpc), wide_ne.reveal(mpc), half_ne.reveal(mpc)
+    ne_int_v, ne_float_v, eq_raw_v = ne_int.reveal(mpc), ne_float.reveal(mpc), eq_raw.reveal(mpc)
+    delayed_v, scalar_v, matrix_v = delayed_ne.reveal(mpc), scalar_ne.reveal(mpc), matrix_ne.reveal(mpc)
+    if mpc.pid:
+        assert_eq(f"CP{mpc.pid}:\tring != of fixed point at the edges (0, +-1 raw unit, +-2^k, the largest difference)", fp_ne_v, want)
+        assert_eq(f"CP{mpc.pid}:\tring == of fixed point at the edges", fp_eq_v, 1.0 - want)
+        assert_eq(f"CP{mpc.pid}:\tring != of fixed point equals the sign test of (d, -d)", fp_ne_v, old_v)
+        assert_eq(f"CP{mpc.pid}:\tring != of fixed point: 3 rounds", rounds, 3)
+        assert_eq(f"CP{mpc.pid}:\tring != of integers +-2^(L-4), 0, +-3*2^(L-4)", ints_v, array([0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0]))
+        assert_eq(f"CP{mpc.pid}:\tring != of integers equals the sign test of (d, -d)", ints_v, ints_old_v)
+        assert_eq(f"CP{mpc.pid}:\tring != of integers -2^(L-2) and 2^(L-2) (a difference of -2^(L-1))", half_v, array([1.0]))
+        assert_eq(f"CP{mpc.pid}:\tring != of integer shares of +-2^K against fixed-point 0 (wide)", wide_v, array([1.0, 1.0, 0.0]))
+        assert_eq(f"CP{mpc.pid}:\tring != 3 (int)", ne_int_v, array([0.0, 1.0, 1.0, 1.0]))
+        assert_eq(f"CP{mpc.pid}:\tring != 0.5 (float)", ne_float_v, array([1.0, 0.0, 1.0, 1.0]))
+        assert_eq(f"CP{mpc.pid}:\tring == a raw encoding of -2.25", eq_raw_v, array([0.0, 0.0, 1.0, 0.0]))
+        assert_eq(f"CP{mpc.pid}:\tring != of products inside delayed_truncation()", delayed_v, array([0.0, 1.0, 0.0, 0.0]))
+        assert_eq(f"CP{mpc.pid}:\tring != of a scalar", scalar_v, 0.0)
+        assert_eq(f"CP{mpc.pid}:\tring != of a matrix", matrix_v, array([[0.0, 1.0], [0.0, 1.0]]))
+    assert_eq(f"CP{mpc.pid}:\tring != of an empty vector: empty, nothing sent", (len(empty_ne.share), sent), (0, 0))
+
+
+def test_mixed_moduli(mpc):
+    """Operands on two moduli (ring shares and field shares) are refused by every operation on two Sharetensors with a
+    ValueError that names both moduli, at every party at the same call, before any draw or message (they computed with
+    the left operand's modulus, without an error; / after the inverse of its divisor; @, dot, hstack, vstack and item
+    assignment with a bare assert)."""
+    x = Sharetensor.enc(mpc, [1.5, -2.0], 0, MPC_RING_SIZE)
+    y = Sharetensor.enc(mpc, [1.5, 2.0], 0, MPC_FIELD_SIZE)
+    py = Sharetensor.enc(mpc, [1.5, 2.0], 0, MPC_FIELD_SIZE)
+    py.public = True
+    a = Sharetensor.enc(mpc, [[1.0, 2.0], [3.0, 4.0]], 0, MPC_RING_SIZE)
+    b = Sharetensor.enc(mpc, [[1.0, 2.0], [3.0, 4.0]], 0, MPC_FIELD_SIZE)
+    mpc.comms.sync_parties()
+    ops = ["+", "-", "*", ">", "<", "==", "!=", "+ a public field tensor", "/", "@", "dot", "append", "extend", "hstack",
+           "vstack", "item assignment", "matrix + vector (broadcast)", "vector + scalar (broadcast)"]
+    verdicts = List[bool]()
+    messages = List[bool]()
+    for i in range(len(ops)):
+        sent = mpc.stats.bytes_sent
+        digest = mpc.randomness.stream_digest(-1)
+        raised = False
+        named = False
+        try:
+            if i == 0:
+                _st_add(mpc, x, y)
+            elif i == 1:
+                _st_sub(mpc, x, y)
+            elif i == 2:
+                _st_mul(mpc, x, y)
+            elif i == 3:
+                _st_gt(mpc, x, y)
+            elif i == 4:
+                _st_lt(mpc, x, y)
+            elif i == 5:
+                _st_eq(mpc, x, y)
+            elif i == 6:
+                _st_ne(mpc, x, y)
+            elif i == 7:
+                _st_add(mpc, x, py)
+            elif i == 8:
+                _st_div(mpc, x, y)
+            elif i == 9:
+                _st_matmul(mpc, a, b)
+            elif i == 10:
+                x.dot(mpc, y)
+            elif i == 11:
+                Sharetensor(x).append(y[0])
+            elif i == 12:
+                Sharetensor(x).extend(y)
+            elif i == 13:
+                a.hstack(b)
+            elif i == 14:
+                a.vstack(b)
+            elif i == 15:
+                xc = Sharetensor(x)
+                xc[0] = y[0]
+            elif i == 16:
+                _st_add(mpc, a, y)
+            else:
+                _st_add(mpc, x, y[0])
+        except ValueError as e:
+            raised = True
+            named = modulus_name(MPC_RING_SIZE) in e.message and modulus_name(MPC_FIELD_SIZE) in e.message
+        verdicts.append(raised and mpc.stats.bytes_sent == sent and mpc.randomness.stream_digest(-1) == digest)
+        messages.append(named)
+    mpc.comms.sync_parties()
+    for i in range(len(ops)):
+        assert_eq(f"CP{mpc.pid}:\tring and field operands refused by {ops[i]} before any message, both moduli named", (verdicts[i], messages[i]), (True, True))
+
+
 def test_expand_dims_and_vstack[TP](mpc, modulus: TP):
     """L-047: expand_dims(1) of a vector (the new axis last) asserted; L-052: vstack shared the other operand's share
     rows, so a write into the result changed the operand."""
@@ -757,6 +923,9 @@ def test_sharetensor[TP](mpc: MPCEnv[TP], modulus: TP):
     test_comparisons(mpc, sv_vec)
     test_comparison_constants(mpc, modulus)
     test_equality_ranges(mpc, modulus)
+    if modulus.popcnt() == 1:
+        test_ring_equality_api(mpc, modulus)
+    test_mixed_moduli(mpc)
     test_public_matmul(mpc, modulus)
     test_broadcast_partitions(mpc, modulus)
     test_public_sums_alias_nothing(mpc, modulus)

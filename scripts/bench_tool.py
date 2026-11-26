@@ -466,7 +466,7 @@ def sequre_config(res):
         for path in glob.glob(os.path.join(seg, "CP*.tsv")):
             meta = read_tsv(path)[0]
             for k in ("harness_version", "MPC_INT_SIZE", "NUM_THREADS", "lattiseq_threads", "parties", "reps_scale",
-                      "gc_each_rep", "gc_forced", "long_rep_s", "gc_markers_restarted"):
+                      "gc_each_rep", "gc_forced", "long_rep_s", "gc_markers_restarted", "modulus"):
                 if k in meta:
                     cfg.setdefault(k, meta[k])
             if "pin" in meta:
@@ -531,6 +531,9 @@ def write_manifest(res, label, argv):
             "gc_initial_heap_size": env.get("gc_heap", ""),
             "omp_env": {k: v for k, v in os.environ.items() if k.startswith("OMP_")},
             "reps_scale": env.get("reps_scale", "1"),
+            # bench.sh run --modulus: the flag passed to the MPC binaries ("" = none: the runtime's default modulus; the
+            # modulus the run used is sequre.modulus, from the binaries' headers)
+            "modulus_flag": env.get("modulus_flag", ""),
             "selection": {"cases": env.get("cases", ""), "skip": env.get("skip", "")},
             "transport": "local mode: UNIX-domain sockets, no TLS/TCP (TLS and Nagle effects are not measured)",
         },

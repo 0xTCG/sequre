@@ -200,6 +200,25 @@ Codon emits aligned vector moves for heap-resident SIMD vectors (tuples of vecto
 
 ---
 
+## The MPC modulus: the ring and the field
+
+Sequre's MPC runs on the power-of-two ring $\mathbb{Z}_{2^L}$ (`--use-ring`) or on the prime field $2^L - c$
+(`--use-field`), never on both in one run. Every party prints the modulus it runs on at start
+(`CP1: MPC initialized on the ring 2^174`). These errors name a wrong combination:
+
+| Message | Cause | Fix |
+|---|---|---|
+| `CP1: the parties' MPC settings differ: CP1 runs on the ring 2^174, CP2 on the field 2^174 - 3: start every party with the same modulus flag (--use-ring or --use-field, or neither)` | the parties were started with different modulus flags (or built with different settings: the message then names `MPC_INT_SIZE` or `DEBUG`). Every party stops at start, before any protocol message | start every party with the same flags, from programs built with the same Sequre |
+| `CP1: CP0 did not send its MPC settings at start (it sent a message of 104 bytes where 96 were expected): it runs another version of Sequre` | one party runs a Sequre that does not exchange settings (an older version). The newer parties stop at start; the older one fails at its next receive (an older dealer can run its program to the end first), or on the settings message it does not expect, and then the others report a closed connection | run the same Sequre version at every party |
+| `Sequre: --use-ring and --use-field were both given` | both modulus flags on one command line | pass one of them, or neither for the default |
+| `Sharetensor +: the operands are on two moduli, the ring 2^174 and the field 2^174 - 3: ...` (also `-`, `*`, `/`, `@`, the comparisons, `dot`, `append`, `extend`, `hstack`, `vstack` and item assignment) | shares built on one modulus (say with `MPC_FIELD_SIZE` passed explicitly) met shares on another (`Sharetensor.enc` takes `mpc.default_mpc_modulus` unless given another) | build both operands on one modulus: drop the explicit modulus, or pass the same one to both |
+| `MPCBoolean.fan_in_or: field-only: it needs a prime modulus, and the ring 2^174 is a power of two ...` (also `mod_inv`, `lagrange_interp`, `prefix_or`, `fan_in_and`, `prefix_and`, `less_than_bits`, `demultiplexer`, `MPCFP.__normalizer_even_exp`, and `table_lookup`'s "its tables are built for the field") | a field-only primitive (it interpolates a polynomial, or inverts modulo the modulus) was called on ring shares, or with a power-of-two small modulus. They used to return wrong values without an error | use the ring's protocol the message names, or run on the field (`--use-field`) |
+| `CP1: the gwas share files in tests/data/gwas/input were written with modulus=field (their record, ...), and this run has modulus=ring: share the data again ...` | share files written by `share_data` under one modulus (or share width) read under another | share the data again under the run's modulus (`share_data`), or run under the modulus they were written with |
+| `CP1: the gwas share files in tests/data/gwas/input are incomplete: their record (...) says share_data did not finish writing them: ...` | a `share_data` run stopped before it had written all of the party's files | share the data again |
+| `... have no record (...): ... this run is on the ring 2^174: ...` (and, on the field, a warning instead) | share files written before Sequre recorded the modulus beside them: field shares, unless that run passed `--use-ring` | share the data again, or read them on the field (`--use-field`) |
+
+---
+
 ## Nonlinear functions refuse an interval or a degree
 
 Before any communication, every party checks the nonlinear function's parameters (see

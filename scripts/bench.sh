@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sequre performance-regression benchmark driver (tests/bench/bench_{mpc,mhe,btp}.codon).
 #
-#   scripts/bench.sh run  [--label NAME] [--cases P1,P2] [--skip P1,P2] [--reps-scale F]
+#   scripts/bench.sh run  [--label NAME] [--cases P1,P2] [--skip P1,P2] [--reps-scale F] [--modulus default|field|ring]
 #                         [--binaries mpc,mhe,btp] [--cpus auto|LIST|none] [--pin auto|C0:C1:C2|none]
 #                         [--timeout SEC] [--iso-timeout SEC]
 #                         [--gc-adaptive | --gc-none] [--gc-heap 4G|none] [--rebuild] [--dry-run]
@@ -14,6 +14,11 @@
 # directory (local mode leaves sock.* files behind) under `timeout`, with the AVX alignment shim preloaded as the
 # `sequre` launcher does. Cases flagged "iso" in the registry, and known-broken cases asked for by exact name
 # (--cases name$), run in processes of their own after the rest.
+# --modulus passes the runtime's modulus flag to the MPC binaries (bench_mpc, bench_mhe): field --use-field, ring
+# --use-ring; default (the default) passes none, so the runtime's default modulus applies. It decides the modulus of
+# the cases that name none (a case with a twin, or that names a modulus, is pinned to it); each party's file records
+# the run's modulus (modulus=field|ring in its header), the manifest has it as sequre.modulus, and compare warns when
+# two runs differ in it.
 # CPU placement is fixed so that runs do not differ by where the scheduler put the parties. --cpus auto (the
 # default) restricts the binaries to one hardware thread per physical core; --pin auto splits those cores into
 # parties + 1 equal blocks of consecutive cores and gives one to each party (CP0, CP1, CP2; bench_btp uses CP1's),
@@ -72,6 +77,7 @@ case "$cmd" in
 esac
 
 LABEL="" CASES="" SKIP="" REPS_SCALE="1" BINS="mpc,mhe,btp" CPUS="auto" TIMEOUT=1200 ISO_TIMEOUT=600 REBUILD=0 DRY=0
+MODULUS="default"
 GC_MODE="each-rep" GC_HEAP="4G"
 PIN="auto"
 while [[ $# -gt 0 ]]; do
@@ -80,6 +86,7 @@ while [[ $# -gt 0 ]]; do
         --cases) CASES="$2"; shift 2 ;;      --cases=*) CASES="${1#*=}"; shift ;;
         --skip) SKIP="$2"; shift 2 ;;        --skip=*) SKIP="${1#*=}"; shift ;;
         --reps-scale) REPS_SCALE="$2"; shift 2 ;;  --reps-scale=*) REPS_SCALE="${1#*=}"; shift ;;
+        --modulus) MODULUS="$2"; shift 2 ;;  --modulus=*) MODULUS="${1#*=}"; shift ;;
         --binaries) BINS="$2"; shift 2 ;;    --binaries=*) BINS="${1#*=}"; shift ;;
         --cpus) CPUS="$2"; shift 2 ;;        --cpus=*) CPUS="${1#*=}"; shift ;;
         --pin) PIN="$2"; shift 2 ;;          --pin=*) PIN="${1#*=}"; shift ;;
@@ -95,6 +102,12 @@ while [[ $# -gt 0 ]]; do
         *) echo "bench.sh: unknown option '$1'" >&2; exit 2 ;;
     esac
 done
+case "$MODULUS" in
+    default) MODULUS_FLAG="" ;;
+    field) MODULUS_FLAG="--use-field" ;;
+    ring) MODULUS_FLAG="--use-ring" ;;
+    *) echo "bench.sh: --modulus takes default, field or ring, not '$MODULUS'" >&2; exit 2 ;;
+esac
 if [[ "$CPUS" != "none" ]] && ! command -v taskset >/dev/null 2>&1; then
     echo "bench.sh: taskset not found; not restricting the binaries' CPUs" >&2
     CPUS="none"
@@ -126,7 +139,8 @@ mkdir -p "$RES/build" "$RES/runs" "$CACHE"
 START_ALL=$(date +%s.%N)
 echo "== results: $RES"
 "${TOOL[@]}" event --dir "$RES" type=env "ld_preload=$( [[ -f "$SHIM" ]] && echo "$SHIM" )" "gmp=$GMP" "cpus=$CPUS" "pin=$PIN" \
-    "reps_scale=$REPS_SCALE" "cases=$CASES" "skip=$SKIP" "load=$(cut -d' ' -f1-3 /proc/loadavg)" "gc_flags=${GC_FLAGS[*]}" "gc_heap=$GC_HEAP"
+    "reps_scale=$REPS_SCALE" "cases=$CASES" "skip=$SKIP" "load=$(cut -d' ' -f1-3 /proc/loadavg)" "gc_flags=${GC_FLAGS[*]}" "gc_heap=$GC_HEAP" \
+    "modulus_flag=$MODULUS_FLAG"
 
 LOAD1="$(cut -d' ' -f1 /proc/loadavg)"
 if awk -v l="$LOAD1" 'BEGIN { exit !(l > 4.0) }'; then
@@ -184,7 +198,10 @@ run_segment() {
     mkdir -p "$dir"
     wd="$(mktemp -d "${TMPDIR:-/tmp}/sequre-bench-run.XXXXXX")"
     local args=(--out="$dir" --reps-scale="$REPS_SCALE" --cases="$cases" --pin="$PIN" "${GC_FLAGS[@]}")
-    [[ "$b" != "btp" ]] && args=(--local --skip-mhe-setup "${args[@]}")
+    if [[ "$b" != "btp" ]]; then
+        args=(--local --skip-mhe-setup "${args[@]}")
+        [[ -n "$MODULUS_FLAG" ]] && args=("$MODULUS_FLAG" "${args[@]}")
+    fi
     local pin=()
     [[ -n "$CPUS" ]] && pin=(taskset -c "$CPUS")
     local preload=()
@@ -224,7 +241,7 @@ for b in "${NEEDED[@]}"; do
     done < <(echo "$PLAN" | awk -v b="$b" '$1 == b && $2 == "iso"')
 done
 
-"${TOOL[@]}" manifest --dir "$RES" --label "$LABEL" --argv "run --cases '$CASES' --skip '$SKIP' --reps-scale $REPS_SCALE --binaries $BINS --cpus '$CPUS' --pin '$PIN' --gc-heap '$GC_HEAP' ${GC_FLAGS[*]}"
+"${TOOL[@]}" manifest --dir "$RES" --label "$LABEL" --argv "run --cases '$CASES' --skip '$SKIP' --reps-scale $REPS_SCALE --modulus $MODULUS --binaries $BINS --cpus '$CPUS' --pin '$PIN' --gc-heap '$GC_HEAP' ${GC_FLAGS[*]}"
 echo "== summary"
 "${TOOL[@]}" summary --dir "$RES"
 END_ALL=$(date +%s.%N)
