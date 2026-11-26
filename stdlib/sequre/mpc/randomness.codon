@@ -15,7 +15,8 @@ class MPCRandomness:
     A party's PRG streams, all served by the process's one generator (prg._rnd): its private stream (key: its own pid;
     seeded from RAND_bytes, known to it alone), one stream shared with each other party p (key p; the seed the two
     exchanged) and the global stream (key -1; the seed CP0 broadcast, known to every party). One stream is live at a
-    time, and draws come from it; prg_states holds the saved state of every other stream.
+    time, and draws come from it; prg_states holds the saved state of every other stream (the live stream's entry is
+    empty: its state is in the generator).
 
     Switches nest. switch_seed(q) pushes the live stream onto a stack and makes q live; restore_seed(q) closes the
     innermost switch, which must be one to q, and makes the stream below it live again. A switch to the stream already
@@ -30,22 +31,24 @@ class MPCRandomness:
     """
     pid: int
     stats: MPCStats
-    prg_states: dict[int, tuple[array[u32], int]]
+    prg_states: dict[int, tuple[prg.StateArray, int]]
     other_seeds: dict[int, seed_t]
     global_seed: seed_t
     live: int  # the stream loaded in the generator
     switch_stack: List[int]  # one entry per open switch: the stream live before it
-    frozen_states: dict[int, tuple[array[u32], int]]  # freeze_seed's saved states, keyed by the switch's stack depth
+    # freeze_seed's saved states, keyed by the switch's stack depth
+    frozen_states: dict[int, tuple[prg.StateArray, int]]
 
     def __init__(self: MPCRandomness, stats: MPCStats):
         self.pid = stats.pid
         self.stats = stats
-        self.prg_states = dict[int, tuple[array[u32], int]]()
+        self.prg_states = dict[int, tuple[prg.StateArray, int]]()
         self.other_seeds = dict[int, seed_t]()
         self.global_seed = seed_t(0)
         self.live = self.pid
+        self.prg_states[self.pid] = _no_state()
         self.switch_stack = List[int]()
-        self.frozen_states = dict[int, tuple[array[u32], int]]()
+        self.frozen_states = dict[int, tuple[prg.StateArray, int]]()
 
         for other_pid in set(range(NUMBER_OF_PARTIES)) - {self.pid}:
             self.other_seeds[other_pid] = seed_t(hash(
@@ -81,11 +84,11 @@ class MPCRandomness:
         # changes, and the live stream stays live.
         self.reset_seed(-1, self.global_seed)
 
-    def get_state(self: MPCRandomness) -> tuple[array[u32], int]:
+    def get_state(self: MPCRandomness) -> tuple[prg.StateArray, int]:
         # A copy of the live stream's state
         return prg._rnd.gen.get_state()
 
-    def set_state(self: MPCRandomness, state: tuple[array[u32], int]):
+    def set_state(self: MPCRandomness, state: tuple[prg.StateArray, int]):
         # Puts a copy of state into the live stream (later draws leave state as it is)
         prg._rnd.gen.set_state((copy(state[0]), state[1]))
 
@@ -98,7 +101,7 @@ class MPCRandomness:
             return
 
         gen = prg._rnd.gen
-        live_state = gen.swap_state((array[u32](prg.N), 0))
+        live_state = gen.swap_state((prg.StateArray(prg.N), 0))
         prg.seed(seed)
         self.prg_states[pid] = gen.swap_state(live_state)
 
@@ -143,11 +146,16 @@ class MPCRandomness:
         prg._rnd.gen.swap_state((copy(frozen[0]), frozen[1]))
 
     def _make_live(self, pid: int):
-        # The live state goes back to the live stream's slot and pid's comes out of its own, moved rather than copied:
-        # the live stream has no saved state, so nothing can go stale or alias the generator's state
+        # The live state goes back to the live stream's entry and pid's comes out of its own, moved rather than copied:
+        # pid's entry is left empty, so nothing can go stale or alias the generator's state. Both entries change in
+        # place: Codon's dict appends an entry on every insertion and reallocates its arrays once they fill, which a
+        # pop and an insertion per switch would make happen at about every other switch.
         if pid not in self.prg_states:
             raise ValueError(f"CP{self.pid}: there is no PRG stream {pid}")
-        state = self.prg_states.pop(pid)
+        if pid == self.live:
+            return
+        state = self.prg_states[pid]
+        self.prg_states[pid] = _no_state()
         self.prg_states[self.live] = prg._rnd.gen.swap_state(state)
         self.live = pid
 
@@ -179,6 +187,11 @@ class MPCRandomness:
             f"CP{self.pid}: seed_switch({pid}) exits with {open_inside} switch(es) opened inside the block still open "
             f"(the innermost to stream {innermost}): an exception skipped their restore_seed, or one is missing. This "
             f"error replaces an exception the block raised.")
+
+
+def _no_state() -> tuple[prg.StateArray, int]:
+    # The live stream's entry in prg_states: no words (a generator given it would fault on its first draw)
+    return prg.StateArray(Ptr[u32](), 0), 0
 
 
 class SeedSwitch:

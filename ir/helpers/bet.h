@@ -11,7 +11,7 @@ using namespace codon::ir;
 
 class BETNode {
   Value       *value;
-  types::Type *irType;
+  Type *irType;
   std::string  operation;
   BETNode     *leftChild;
   BETNode     *rightChild;
@@ -21,7 +21,7 @@ public:
   BETNode();
   BETNode( Value *value );
   BETNode( std::string const operation, BETNode *leftChild, BETNode *rightChild );
-  BETNode( Value *value, types::Type *irType, std::string const operation, bool expanded );
+  BETNode( Value *value, Type *irType, std::string const operation, bool expanded );
   ~BETNode() {
     if ( leftChild )  delete leftChild;
     if ( rightChild ) delete rightChild;
@@ -39,7 +39,7 @@ public:
   codon::ir::id_t    getVariableId()  const { return getVariable()->getId(); };
   
   void setValue( Value *value )                    { this->value = value; }
-  void setIRType( types::Type *irType )            { this->irType = irType; }
+  void setIRType( Type *irType )                   { this->irType = irType; }
   void setOperation( std::string const operation ) { this->operation = operation; }
   void setLeftChild( BETNode *leftChild )          { this->leftChild = leftChild; }
   void setRightChild( BETNode *rightChild )        { this->rightChild = rightChild; }
@@ -68,7 +68,7 @@ public:
   
   void swapChildren() { std::swap(leftChild, rightChild); }
   void replace( BETNode * );
-  types::Type *getOrRealizeIRType( bool force = false);
+  Type *getOrRealizeIRType( bool force = false);
 
   void elementsCount( int &, int & ) const;
 

@@ -196,7 +196,7 @@ Local runs connect their parties through UNIX socket files (`sock.<port>`) in th
 
 ### Segmentation fault in MHE code (x86-64)
 
-Codon (through v0.19.6) emits aligned vector moves for heap-resident SIMD vectors, which the garbage collector only 16-byte-aligns, so on x86-64 CPUs with AVX2 or AVX-512 Sequre's MHE/CKKS code crashes with `SIGSEGV` (in `lattiseq.ring.GaussianSampler.__init__`, within a second of the MHE setup). Sequre's alignment shim, `lib/sequre_align64.so` in the install, over-aligns those allocations: the `sequre` launcher preloads it for `sequre run` and links it into every binary `sequre build` makes, and warns when it is missing. When you run `codon` directly, preload it yourself (`LD_PRELOAD=<install>/lib/sequre_align64.so codon run ...`), or link it into a binary with `codon build -l :sequre_align64.so ...` (it must be in Codon's `lib` directory, as in an installed Sequre). A binary linked with it stops at start if the shim is missing (`sequre_align64.so: cannot open shared object file`). `SEQURE_NO_ALIGN_SHIM=1` makes the launcher neither preload nor link it.
+Codon emits aligned vector moves for heap-resident SIMD vectors (tuples of vectors, struct fields, generator frames), which the garbage collector only 16-byte-aligns, so on x86-64 CPUs with AVX2 or AVX-512 Sequre's MHE/CKKS code crashes with `SIGSEGV` (in `lattiseq.ring.Ring.set_parameters`, during the MHE setup). Sequre's alignment shim, `lib/sequre_align64.so` in the install, over-aligns those allocations: the `sequre` launcher preloads it for `sequre run` and links it into every binary `sequre build` makes, and warns when it is missing. When you run `codon` directly, preload it yourself (`LD_PRELOAD=<install>/lib/sequre_align64.so codon run ...`), or link it into a binary with `codon build -l :sequre_align64.so ...` (it must be in Codon's `lib` directory, as in an installed Sequre). A binary linked with it stops at start if the shim is missing (`sequre_align64.so: cannot open shared object file`). `SEQURE_NO_ALIGN_SHIM=1` makes the launcher neither preload nor link it.
 
 ---
 
@@ -231,10 +231,16 @@ In case of `cannot find plugin 'sequre'`, ensure:
 
 1. Sequre is installed in the Codon plugins directory: `$HOME/.sequre/lib/codon/plugins/sequre/`
 2. The directory contains `plugin.toml`, `build/`, and `stdlib/`
-3. If using `codon` directly instead of the `sequre` launcher, pass `--plugin=sequre`, and `--disable-opt=core-pythonic-list-addition-opt` as the launcher does (Sequre's list `+` is element-wise, and Codon would otherwise rewrite `l1 + l2 + l3` as a concatenation). On x86-64 Linux, also preload the alignment shim (see [Segmentation fault in MHE code](#segmentation-fault-in-mhe-code-x86-64)):
+3. If using `codon` directly instead of the `sequre` launcher, pass `--plugin=sequre`, `--disable-opt=core-pythonic-list-addition-opt` and `-numerics=c` as the launcher does (Sequre's list `+` is element-wise, and Codon would otherwise rewrite `l1 + l2 + l3` as a concatenation; `-numerics=c` keeps C semantics for signed division and remainder, Codon's default before v0.20). On x86-64 Linux, also preload the alignment shim (see [Segmentation fault in MHE code](#segmentation-fault-in-mhe-code-x86-64)):
 
 ```bash
-codon run --disable-opt=core-pythonic-list-addition-opt --plugin=sequre my_protocol.codon
+codon run -numerics=c --disable-opt=core-pythonic-list-addition-opt --plugin=sequre my_protocol.codon
 ```
 
-In case of `cannot find plugin 'seq'`, add the additional `--plugin=seq` flag to the run or build command.
+Sequre's releases for Codon v0.20 no longer bundle the seq plugin (`cannot find plugin 'seq'`): seq does not load on Codon v0.20.8.
+
+---
+
+## Codon library functions misbehave in a Sequre program
+
+Sequre makes `+` and `* int` on lists element-wise, for every list in the program, Codon's own library modules included. Library code that builds a list with `[x] * n`, or joins two with `+`, then misbehaves when the program imports Sequre: `np.interp` raises `IndexError` when it has three or more sample points and at least as many query points, and `os.path.relpath` returns a wrong path. In your own code, build such lists with a comprehension (`[x for _ in range(n)]`) or use arrays (`np.zeros(n)`), and avoid those library functions in Sequre programs.

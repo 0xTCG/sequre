@@ -10,7 +10,7 @@ set -e
 # the image builds Linux binaries (on macOS, use scripts/install.sh).
 #
 # Options:
-#   --rebuild    Force rebuild of Docker image (re-downloads Codon/LLVM/seq)
+#   --rebuild    Force rebuild of Docker image (re-downloads Codon/LLVM)
 
 REBUILD_IMAGE=0
 if [ "$1" = "--rebuild" ]; then
@@ -29,6 +29,17 @@ if [ -z "$1" ]; then
 fi
 
 INSTALL_PATH=$1
+
+# The directories the install replaces lie under these; through a symbolic link, replacing them would change the
+# link's target, outside the install
+for d in lib lib/codon lib/codon/plugins include; do
+  if [ -L "$INSTALL_PATH/$d" ]; then
+    echo "Error: $INSTALL_PATH/$d is a symbolic link (to $(readlink "$INSTALL_PATH/$d")): the install replaces"
+    echo "Codon's and Sequre's directories under it, which would change the link's target. Install into another"
+    echo "directory, or replace the link with a copy of what it points to."
+    exit 1
+  fi
+done
 
 # Default to parent of scripts directory (i.e., the sequre repo root)
 if [ -z "$2" ]; then
@@ -62,11 +73,15 @@ case "$ARCH" in
     exit 1
     ;;
 esac
-DOCKER_IMAGE="sequre-builder-$DOCKERFILE_ARCH"
+# The image caches the Codon release its Dockerfile names, so the name carries that release: an image built for another
+# one (before a Codon upgrade) is not reused
+DOCKERFILE="$SEQURE_SRC/docker/local-build/Dockerfile.$DOCKERFILE_ARCH"
+CODON_TAG=$(grep -o 'releases/download/v[0-9.]*' "$DOCKERFILE" | head -n 1 | sed 's|.*/||')
+DOCKER_IMAGE="sequre-builder-$DOCKERFILE_ARCH${CODON_TAG:+-codon-${CODON_TAG#v}}"
 
-# Build Docker image if it doesn't exist or --rebuild requested (caches Codon/LLVM/seq)
+# Build Docker image if it doesn't exist or --rebuild requested (caches Codon/LLVM)
 if [ "$REBUILD_IMAGE" = "1" ] || ! docker image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
-  echo "Building Docker image $DOCKER_IMAGE (this caches Codon/LLVM/seq for future builds)..."
+  echo "Building Docker image $DOCKER_IMAGE (this caches Codon/LLVM for future builds)..."
   docker build \
     -t "$DOCKER_IMAGE" \
     -f "$SEQURE_SRC/docker/local-build/Dockerfile.$DOCKERFILE_ARCH" \
@@ -103,12 +118,42 @@ fi
 
 echo "Build complete. Extracting to $INSTALL_PATH..."
 
-# Create install directory and extract
+# Create the install directory and extract. As install.sh does, first replace what the tarball owns outright, so that
+# an install over an earlier one keeps none of that one's files: Codon's stdlib and headers (the tarball carries no
+# headers) and Sequre's plugin, which is moved to lib/codon/plugins/sequre.previous when it holds entries this build
+# lacks (a user's files). The seq plugin that Sequre's archives for Codon 0.19 bundled goes too.
 mkdir -p "$INSTALL_PATH"
+tar -tzf "$TARBALL" > "$BUILD_OUTPUT/tarball.list"
+in_tarball() {  # in_tarball <path>: the tarball has <path> or something under it
+  awk -v p="$1" '{ sub(/^\.\//, ""); if ($0 == p || $0 == p "/" || index($0, p "/") == 1) { found = 1; exit } }
+                 END { exit !found }' "$BUILD_OUTPUT/tarball.list"
+}
+PLUGINS="$INSTALL_PATH/lib/codon/plugins"
+rm -rf "$INSTALL_PATH/lib/codon/stdlib" "$INSTALL_PATH/include/codon"
+if [ -d "$PLUGINS/seq" ] && [ -d "$PLUGINS/sequre" ] && [ ! -f "$PLUGINS/sequre/codon-version" ] &&
+   ! in_tarball lib/codon/plugins/seq; then
+  echo "Removing the seq plugin that the earlier Sequre release bundled (built for Codon 0.19)."
+  rm -rf "$PLUGINS/seq"
+fi
+if [ -e "$PLUGINS/sequre" ] || [ -L "$PLUGINS/sequre" ]; then
+  extra=""
+  for entry in "$PLUGINS/sequre"/* "$PLUGINS/sequre"/.[!.]*; do
+    if [ -e "$entry" ] || [ -L "$entry" ]; then
+      in_tarball "lib/codon/plugins/sequre/${entry##*/}" || extra="$extra ${entry##*/}"
+    fi
+  done
+  if [ -n "$extra" ]; then
+    rm -rf "$PLUGINS/sequre.previous"
+    mv "$PLUGINS/sequre" "$PLUGINS/sequre.previous"
+    echo "Moved the earlier Sequre plugin to $PLUGINS/sequre.previous: it holds entries this build lacks (${extra# })."
+  else
+    rm -rf "$PLUGINS/sequre"
+  fi
+fi
 tar xzvf "$TARBALL" -C "$INSTALL_PATH"
 
-# Apply the x86-64 alignment workaround: patch Codon's bundled Ptr (the shim and
-# the launcher are already in the tarball). No-op off x86_64.
+# The x86-64 alignment workaround: the shim and the launcher are already in the tarball, so this only rebuilds the
+# shim if its source is newer. No-op off x86_64.
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 if [ -f "$SCRIPT_DIR/apply_avx512_workaround.sh" ]; then
   SEQURE_WORKAROUND_SKIP_LAUNCHER=1 bash "$SCRIPT_DIR/apply_avx512_workaround.sh" "$INSTALL_PATH"

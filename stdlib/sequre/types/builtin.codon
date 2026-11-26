@@ -5,10 +5,12 @@ import math
 import prg
 
 from functools import partial
+from internal.types.str import LEN_MASK as STR_LEN_MASK
 from internal.gc import sizeof, atomic, alloc
 from simd import Vec
-from sequre.stdlib.numpy.ndarray import ndarray
-from sequre.stdlib.numpy.create import zeros, ones, zeros_like, array, identity, rand
+from numpy import ndarray, ndindex
+from numpy import zeros, ones, zeros_like, array, identity
+from sequre.utils.arrays import rand, shape_count, empty_ndarray, default_of
 
 from pickler import pickle, unpickle, _write_raw, _read_raw
 from patch import pickle_tuple_unpasteurized, unpickle_tuple_unpasteurized, tuple_pickle_size, bitcast_scatter, bitcast_vectorize
@@ -132,10 +134,13 @@ class bool:
 @extend
 class str:
     def __getitem__(self, indices: list[int]):
-        substr_ptr = Ptr[byte](len(indices))
+        # The characters at indices, kept in self's kind (1, 2 or 4 bytes per character), as Codon's own slices are
+        width = self._width()
+        n = len(indices)
+        substr_ptr = Ptr[u8](n * width)
         for i, ind in enumerate(indices):
-            str.memcpy(substr_ptr + i, self.ptr + ind, 1)
-        return str(substr_ptr, len(indices))
+            str.memcpy(substr_ptr + i * width, self._ptr + ind * width, width)
+        return str(substr_ptr, (self._meta & ~STR_LEN_MASK) | n)
     
     def to_int(self) -> int:
         return int(self)
@@ -146,10 +151,8 @@ class str:
         return mpc_uint(self) % modulus
     
     def nbytes(self) -> int:
-        return len(self)
-    
-    def _pickle_size(self) -> int:
-        return self.nbytes() + sizeof(int)
+        # The characters' bytes; pickler.codon's _pickle_size adds the meta word
+        return len(self) * self._width()
 
 
 @extend
@@ -224,8 +227,25 @@ class float:
     
 
 @extend
-class int:
-    def __truediv__[T](self, other: List[T]) -> List[float]:
+class Int:
+    # int is Int[64] since Codon 0.20, so this block also extends int. A method typed `self: int` (or taking an int
+    # base) is int's alone, as when int was a type of its own; the others hold for every width and give int's results
+    # at 64 bits.
+    def __new__(other) -> Int[N]:
+        if isinstance(other, int): return superf(other)
+        elif isinstance(other, float):
+            if N == 64:
+                # int(x): Codon's own conversion (float.__int__), as when int was a type of its own. The path below
+                # asserts on NaN, infinities and |x| >= 2^64.
+                return superf(other)
+            negative = other < 0
+            if negative: other = -other
+            other_int = Int[N](UInt[N](other))
+            if negative: return -other_int
+            return other_int
+        else: return superf(other)
+
+    def __truediv__[T](self: int, other: List[T]) -> List[float]:
         return [self / other[i] for i in range(len(other))]
 
     def __mod__(self: int, other: int) -> int:
@@ -234,15 +254,35 @@ class int:
     
     def astype[t](self) -> t:
         return t(self)
+
+    def __fast_mod_aided_64_bits(self, q: u64) -> u64:
+        s_neg = self < Int[N](0)
+        if s_neg: self = -self
+        
+        r = UInt[N](self).__fast_mod_aided_64_bits(q)
+        if s_neg:
+            return q - r
+        
+        return r
     
-    def bitlen(self: int) -> int:
-        if self >> 63: self = -self
-        return int(u64(self).bitlen())
+    def __fast_mod_aided_64_bits_mod_const(self, q: u64, mod_const: u64) -> u64:
+        s_neg = self < Int[N](0)
+        if s_neg: self = -self
+        
+        r = UInt[N](self).__fast_mod_aided_64_bits_mod_const(q, mod_const)
+        if s_neg:
+            return q - r
+        
+        return r
+    
+    def bitlen(self: Int[N]) -> Int[N]:
+        if self < Int[N](0): self = -self
+        return Int[N](UInt[N](self).bitlen())
     
     def bit_reverse_subset(self: int, bitlen: int) -> int:
         return self.bit_reverse() >> (64 - bitlen)
     
-    def reveal(self, *args) -> int:
+    def reveal(self, *args) -> Int[N]:
         return self
     
     def neg_mod(self: int, modulus: int) -> int:
@@ -263,13 +303,13 @@ class int:
     def lsh_mod(self: int, other: int, modulus: int) -> int:
         return (self << other) % modulus
     
-    def to_fp(self, modulus) -> mpc_uint:
+    def to_fp(self: int, modulus) -> mpc_uint:
         return double_to_fp(float(self), modulus)
     
     def iter(self):
         for _ in static.range(1): yield self
     
-    def to_int_t(self, modulus: mpc_uint) -> mpc_uint:
+    def to_int_t(self: int, modulus: mpc_uint) -> mpc_uint:
         return (modulus + self) % modulus
     
     @staticmethod
@@ -282,41 +322,53 @@ class int:
         return __rand_int(base)
     
     @staticmethod
-    def zeros() -> int:
-        return 0
+    def zeros() -> Int[N]:
+        return Int[N](0)
     
-    def to_float(self) -> float:
-        return float(self)
+    def to_float(self: Int[N]) -> float:
+        # TODO: Implement a more efficient and hardware-friendly solution        
+        if N <= 64: return float(self)
+
+        sign = 1.0
+        if self >> Int[N]((N - 1)):  # Case negative
+            self = -self
+            sign = -1.0
+
+        return UInt[N](self).to_float() * sign
     
-    def to_complex(self) -> complex:
-        return complex(self)
+    def to_complex(self: Int[N]) -> complex:
+        return self.to_float().to_complex()
     
-    def copy(self: int) -> int:
-        return int(self)
+    def copy(self) -> Int[N]:
+        return self
     
     @staticmethod
     def zeros_float() -> float:
         return 0.0
     
     @staticmethod
-    def ones() -> int:
-        return 1
+    def ones() -> Int[N]:
+        return Int[N](1)
     
-    def has_zero(self: int) -> bool:
-        return self == 0
+    def has_zero(self) -> bool:
+        return self == Int[N](0)
+    
+    def __repr__(self) -> str:
+        # The decimal value at every width (Codon's own repr wraps widths other than 64 as "Int[N](...)")
+        return self.__str__()
     
     @staticmethod
     def nbytes() -> int:
-        return sizeof(int)
+        return (N + 7) // 8
     
     @staticmethod
     def _pickle_size() -> int:
-        return int.nbytes()
+        return Int[N].nbytes()
     
-    def flatten(self) -> int:
+    def flatten(self) -> Int[N]:
         return self
     
-    def sqrt(self) -> float:
+    def sqrt(self: int) -> float:
         return math.sqrt(self)
 
 
@@ -419,23 +471,8 @@ class UInt:
         return self.__naive_mod(other)
     
     def __repr__(self: UInt[N]) -> str:
-        # TODO: Implement faster solution
-        self_cp = self
-        int_str = ''
-        while self_cp:
-            remainder = 0
-            quotient = UInt[N](0)
-            # Euclidean division
-            for bit_idx in static.range(N - 1, -1, -1):
-                mask = int((self_cp & (UInt[N](1) << UInt[N](bit_idx))) != UInt[N](0))
-                remainder = (remainder << 1) + mask
-                if remainder >= 10:
-                    quotient = (quotient << UInt[N](1)) + UInt[N](1)
-                    remainder -= 10
-                else: quotient = quotient << UInt[N](1)
-            int_str = str(remainder) + int_str
-            self_cp = quotient
-        return int_str if int_str else '0'
+        # The decimal value, as str() gives it (Codon's own repr wraps it as "UInt[N](...)")
+        return self.__str__()
     
     def split_lo_hi_u64(self: UInt[64]) -> Tuple[UInt[64], UInt[64]]:
         self_lo = self & MASK32
@@ -712,75 +749,6 @@ class UInt:
         return UInt[N].nbytes()
     
     def flatten(self) -> UInt:
-        return self
-
-
-@extend
-class Int:
-    def __new__(other) -> Int[N]:
-        if isinstance(other, int): return superf(other)
-        elif isinstance(other, float):
-            negative = other < 0
-            if negative: other = -other
-            other_int = Int[N](UInt[N](other))
-            if negative: return -other_int
-            return other_int
-        else: return superf(other)
-    
-    def __fast_mod_aided_64_bits(self, q: u64) -> u64:
-        s_neg = self < Int[N](0)
-        if s_neg: self = -self
-        
-        r = UInt[N](self).__fast_mod_aided_64_bits(q)
-        if s_neg:
-            return q - r
-        
-        return r
-    
-    def __fast_mod_aided_64_bits_mod_const(self, q: u64, mod_const: u64) -> u64:
-        s_neg = self < Int[N](0)
-        if s_neg: self = -self
-        
-        r = UInt[N](self).__fast_mod_aided_64_bits_mod_const(q, mod_const)
-        if s_neg:
-            return q - r
-        
-        return r
-    
-    def bitlen(self: Int[N]) -> Int[N]:
-        if self < Int[N](0): self = -self
-        return Int[N](UInt[N](self).bitlen())
-    
-    def to_float(self: Int[N]) -> float:
-        # TODO: Implement a more efficient and hardware-friendly solution        
-        if N <= 64: return float(self)
-
-        sign = 1.0
-        if self >> Int[N]((N - 1)):  # Case negative
-            self = -self
-            sign = -1.0
-
-        return UInt[N](self).to_float() * sign
-    
-    def to_complex(self: Int[N]):
-        return self.to_float().to_complex()
-    
-    def __repr__(self: Int[N]) -> str:
-        negative = self < Int[N](0)
-        if negative: self = -self
-        _str = UInt[N](self).__repr__()
-        if negative: return f"-{_str}"
-        return _str
-    
-    @staticmethod
-    def nbytes() -> int:
-        return (N + 7) // 8
-    
-    @staticmethod
-    def _pickle_size() -> int:
-        return Int[N].nbytes()
-    
-    def flatten(self) -> Int:
         return self
 
 
@@ -1729,6 +1697,16 @@ class List:
             return [e for row in self for e in row]
 
     def unfence(self: list[T], *args):
+        if isinstance(T, ndarray):
+            # The non-empty arrays' rows one after the other, in a new array: concat returns it (Codon's ndarray is a
+            # value type), where the in-place path below would drop it
+            result = empty_ndarray(T.dtype, T.ndim)
+            first = True
+            for e in self:
+                if not e.is_empty():
+                    result = e.copy() if first else result.concat(e)
+                    first = False
+            return result
         return self._conditional_iop(T.extend, *args, PREPEND_ARGS=1)
 
     def resize(self: list[T], shape) -> list[T]:
@@ -1982,7 +1960,8 @@ class List:
         new_list = list[T](len(self))
 
         for e in self:
-            new_list.append(e if isinstance(e, ByVal) else e.copy())
+            # Codon's ndarray is a value type (ByVal) that shares its buffer: copy it like the reference types
+            new_list.append(e.copy() if isinstance(e, ndarray) or not isinstance(e, ByVal) else e)
         
         return new_list
     
@@ -2018,13 +1997,14 @@ class List:
         return l
     
     def sum(self: list[T]) -> T:
-        if isinstance(T, ByVal):
+        if isinstance(T, ByVal) and not isinstance(T, ndarray):
             if not self:
                 return T(0)
         
         assert len(self), "Cannot sum an empty list"
         init_val = self[0]
-        s = init_val if isinstance(init_val, ByVal) else init_val.copy()
+        # A copy of an ndarray too (a value type sharing its buffer): the sum must not write into the list's first item
+        s = init_val.copy() if isinstance(init_val, ndarray) or not isinstance(init_val, ByVal) else init_val
         for i in range(1, len(self)): s += self[i]
         return s
 
@@ -2062,11 +2042,7 @@ class List:
     
     def slice_reference(self: list[T], begin: int, end: int) -> list[T]:
         len_: int = end - begin
-        return list[T](
-            arr=Array(
-                ptr=self.arr.ptr + begin,
-                sz=len_),
-            len=len_)
+        return list[T](self._ptr + begin, len_)
 
     def nbytes(self: List[T]) -> int:
         sum_of_sizes = 0
@@ -2092,15 +2068,14 @@ class List:
     
     def scatter_bitcast(self: List[u64xN]) -> List[u64]:
         n = len(self) * SIMD_LANE_SIZE
-        _arr = Array(ptr=bitcast_scatter(self.arr.ptr, N=SIMD_LANE_SIZE), sz=n)
-        return List(arr=_arr, len=n)
+        return List[u64](bitcast_scatter(self._ptr, N=SIMD_LANE_SIZE), n)
     
     def scatter_bitcast(self: List[List[u64xN]]) -> List[List[u64]]:
         return [row.scatter_bitcast() for row in self]
 
     def shuffle(self: List[u64], vec: Vec[u64, SIMD_LANE_SIZE]) -> Vec[u64, SIMD_LANE_SIZE]:
         if SIMD_LANE_SIZE == 8:
-            return _mm_gather8(self.arr.ptr, vec)
+            return _mm_gather8(self._ptr, vec)
         else:
             return Vec[u64, SIMD_LANE_SIZE](self[[vec[i] for i in static.range(SIMD_LANE_SIZE)]])
     
@@ -2108,14 +2083,13 @@ class List:
         if isinstance(T, List):
             return [e.vectorize(lane_size) for e in self]
         elif isinstance(T, u64) or isinstance(T, float):
-            return [Vec[T, lane_size](self.arr.ptr + i) for i in range(0, len(self), lane_size)]
+            return [Vec[T, lane_size](self._ptr + i) for i in range(0, len(self), lane_size)]
         else:
             compile_error("Invalid vectorization argument.")
     
     def vectorize_bitcast(self: List[u64]) -> List[u64xN]:
         _mm_n = len(self) // SIMD_LANE_SIZE
-        _arr = Array(ptr=bitcast_vectorize(self.arr.ptr, N=SIMD_LANE_SIZE), sz=_mm_n)
-        return List(arr=_arr, len=_mm_n)
+        return List[u64xN](bitcast_vectorize(self._ptr, N=SIMD_LANE_SIZE), _mm_n)
     
     def vectorize_bitcast(self: List[List[u64]]) -> List[List[u64xN]]:
         return [row.vectorize_bitcast() for row in self]
@@ -2193,7 +2167,7 @@ class List:
     
     def _conditional_iop[PREPEND_ARGS: Static[int] = 0](self, iop, *args):
         if len(self) == 0:
-            return T()
+            return default_of(T)
         
         start_idx = 0
         while start_idx < len(self):
@@ -2202,7 +2176,7 @@ class List:
             start_idx += 1
         
         init_val = self[start_idx]
-        result = init_val if isinstance(init_val, ByVal) else init_val.copy()
+        result = init_val.copy() if isinstance(init_val, ndarray) or not isinstance(init_val, ByVal) else init_val
         for i in range(start_idx + 1, len(self)):
             next_item = self[i]
             check = (not next_item.is_empty()) if isinstance(T, ndarray) else bool(next_item)
@@ -2217,10 +2191,13 @@ class List:
 
 @extend
 class ndarray:
-    # The methods below read an array's elements in C order through the fork's _contiguous(): the buffer itself when
-    # the array is C-contiguous, else a C-ordered copy gathered through its strides. A view (x[:, j], a slice with a
-    # step, a transposed MPP's column) is not contiguous, and its buffer starts at its first element only.
+    # Sequre's methods on Codon's ndarray[dtype, ndim]. Sequre-only names, and overloads of other arities or with secure
+    # operands: a method with the signature of one of Codon's would replace it for every caller, Codon's NumPy itself
+    # included. The methods below read an array's elements in C order through Codon's _contiguous(): the buffer itself
+    # when the array is C-contiguous, else a C-ordered copy gathered through its strides (a transposed view, a slice
+    # with a step, a column).
     def __pickle__(self, jar: Jar, pasteurized: bool):
+        # Sequre's protocol (no default for pasteurized: with one, this would replace Codon's __pickle__(jar))
         pickle(self.nbytes, jar, pasteurized)
         if not pasteurized: jar += self.nbytes._pickle_size()
         _write_raw(jar, self._contiguous().as_byte(), self.nbytes, pasteurized)
@@ -2228,157 +2205,156 @@ class ndarray:
             jar += self.nbytes
             pickle_tuple_unpasteurized(self.shape, jar)
         else: native_pickle(self.shape, jar)
-    
-    def __unpickle__(jar: Jar, pasteurized: bool) -> ndarray[S, T]:
+
+    def __unpickle__(jar: Jar, pasteurized: bool) -> ndarray[dtype, ndim]:
         _nbytes = unpickle(jar, pasteurized, int)
         if not pasteurized: jar += _nbytes._pickle_size()
         _data_bytes = Ptr[byte](_nbytes)
         _read_raw(jar, _data_bytes, _nbytes, pasteurized)
-        _data = Ptr[T](_data_bytes)
+        _data = Ptr[dtype](_data_bytes)
         if not pasteurized:
             jar += _nbytes
-            _shape = unpickle_tuple_unpasteurized(jar, S=S)
-        else: _shape = native_unpickle(jar, S)
+            _shape = unpickle_tuple_unpasteurized(jar, S=type((0,) * ndim))
+        else: _shape = native_unpickle(jar, type((0,) * ndim))
 
-        return ndarray[S, T]._new_contig(_shape, _data)
+        return ndarray(_shape, _data)
 
     def _pickle_size(self) -> int:
         return \
             self.nbytes._pickle_size() + \
             self.nbytes + \
-            tuple_pickle_size(S)
-    
+            tuple_pickle_size(type((0,) * ndim))
+
     def abbrv(self) -> str:
         return self.tolist().abbrv()
-    
-    def rand(self, distribution: str, *args) -> ndarray[S, T]:
-        return rand(self.shape, distribution)
 
     @staticmethod
-    def rand(shape: S, distribution: str, mpc, *args) -> ndarray[S, T]:
+    def rand(shape, distribution: str, mpc, *args):
         return rand(shape, distribution)
-    
+
+    def rand(self: ndarray[dtype, ndim], distribution: str, *args):
+        # After the static overload, with self typed: Codon resolves a call against the newest overload of a name, and
+        # since 0.20 an untyped self takes a class-qualified call meant for the static one (M-TOOL-27)
+        return rand(self.shape, distribution)
+
     def savetxt(self, path: str):
         with open(path, "w") as f:
             f.write(str(self.tolist()))
-    
-    def nan_to_num(self, copy: bool = True, nan=0) -> ndarray[S, T]:
+
+    def nan_to_num(self, copy: bool = True, nan=0) -> ndarray[dtype, ndim]:
         new_arr = self.copy() if copy else self
 
         if new_arr.flags.c_contiguous:
             for i in range(new_arr.size):
                 if math.isnan(new_arr._data[i]):
-                    new_arr._data[i] = T(nan)
+                    new_arr._data[i] = dtype(nan)
         else:
             # In place on a view: through its strides
-            for idx in ndarray._multirange(new_arr.shape):
-                p = new_arr._ptr_for_index(idx, check=False)
-                if math.isnan(p[0]):
-                    p[0] = T(nan)
+            for idx in ndindex(new_arr.shape):
+                if math.isnan(new_arr[idx]):
+                    new_arr[idx] = dtype(nan)
 
         return new_arr
 
-    def erase_element(self, index: int) -> ndarray[S, T]:
+    def erase_element(self, index: int) -> ndarray[dtype, ndim]:
         assert self.ndim == 1, "not implemented yet: ndarray erase_element for arbitrary dimension"
         if index < 0:
             index += len(self)  # -1 is the last element, as in a list
         assert 0 <= index < len(self), f"ndarray: erase_element index {index} out of range for length {len(self)}"
 
-        new_arr = zeros((len(self) - 1,), dtype=T)
+        new_arr = zeros((len(self) - 1,), dtype=dtype)
 
         for i in range(index):
             new_arr[i] = self[i]
-        
+
         for i in range(index + 1, len(self)):
             new_arr[i - 1] = self[i]
-        
+
         return new_arr
-    
+
     def is_empty(self) -> bool:
-        return ndarray._count(self.shape) == 0
-    
-    def local_broadcast[S2](self, target_shape: S2) -> ndarray[S2, T]:
-        if static.len(S2) > static.len(S):
+        # No elements; a 0-dim array counts as empty too (Sequre's callers rely on it)
+        return shape_count(self.shape) == 0
+
+    def local_broadcast[S2](self, target_shape: S2):
+        if static.len(S2) > ndim:
             assert self.ndim == 1 and len(target_shape) == 2, "Broadcasting enabled only for 1-dim to 2-dim ndarrays at the moment"
-        
+
             if self.shape[0] == 1:
-                return zeros(target_shape, dtype=T) + self[0]
-            
+                return zeros(target_shape, dtype=dtype) + self[0]
+
             if self.shape[0] == target_shape[1]:
-                return zeros(target_shape, dtype=T) + self
-            
+                return zeros(target_shape, dtype=dtype) + self
+
             if self.shape[0] == target_shape[0]:
-                return zeros(target_shape, dtype=T) + self.reshape((self.shape[0], 1))
-            
+                return zeros(target_shape, dtype=dtype) + self.reshape((self.shape[0], 1))
+
             raise ValueError(f"ndarray: Cannot broadcast shape {self.shape} into {target_shape}")
-        elif static.len(S) == 1 and self.shape[0] == 1:
+        elif ndim == 1 and self.shape[0] == 1:
             assert target_shape[0] >= self.shape[0], "ndarray: cannot broadcast to a smaller size"
-            return zeros(target_shape, dtype=T) + self[0]
-        elif static.len(S2) == static.len(S):
+            return zeros(target_shape, dtype=dtype) + self[0]
+        elif static.len(S2) == ndim:
             return self
         else:
             compile_error("ndarray: incomatible shapes for broadcast")
 
     def expand_dims(self, axis: int = 0):
         # The same elements (the buffer is shared) with a new axis of length 1 first (axis 0) or last; a view keeps its
-        # strides, and the new axis's stride is never stepped over
-        if static.len(S) == 1:
+        # strides, and the new axis's stride is never stepped over. np.expand_dims inserts the axis at position axis.
+        if ndim == 1:
             new_shape = (1, self.shape[0]) if axis == 0 else (self.shape[0], 1)
             if self.flags.c_contiguous:
-                return ndarray[Tuple[int, int], T]._new_contig(new_shape, self._data)
+                return ndarray(new_shape, self._data)
             s = self.strides[0]
             new_strides = (s * self.shape[0], s) if axis == 0 else (s, s)
-            return ndarray[Tuple[int, int], T]._new(new_shape, new_strides, self._data, self.flags._unown())
-        elif static.len(S) == 2:
+            return ndarray(new_shape, new_strides, self._data)
+        elif ndim == 2:
             new_shape = (1, *self.shape) if axis == 0 else (*self.shape, 1)
             if self.flags.c_contiguous:
-                return ndarray[Tuple[int, int, int], T]._new_contig(new_shape, self._data)
+                return ndarray(new_shape, self._data)
             s0, s1 = self.strides
             new_strides = (s0 * self.shape[0], s0, s1) if axis == 0 else (s0, s1, s1)
-            return ndarray[Tuple[int, int, int], T]._new(new_shape, new_strides, self._data, self.flags._unown())
+            return ndarray(new_shape, new_strides, self._data)
         else:
             compile_error("Invalid ndarray shape (not supported yet for expand_dims)")
 
-    def extend(self, other: ndarray[S, T], axis: int = 0) -> ndarray[S, T]:
-        # In place: self becomes a C-contiguous array of its rows and then other's (either may be a view)
+    def concat(self, other: ndarray[dtype, ndim], axis: int = 0) -> ndarray[dtype, ndim]:
+        # A new C-contiguous array: self's rows, then other's (either may be a view). Sequre's ndarray.extend, which this
+        # replaces, did it in place, which Codon's ndarray (a value type) cannot; np.concatenate also returns a new array.
         assert axis == 0, "ndarray: Only axis=0 supported for extension at the moment"
         assert self.shape[1:] == other.shape[1:], f"ndarray: Shapes mismatch while extending over 0 axis: {self.shape} vs {other.shape}"
 
-        new_data = ptr[byte](self.nbytes + other.nbytes)
-        str.memcpy(new_data, self._contiguous().as_byte(), self.nbytes)
-        str.memcpy(new_data + self.nbytes, other._contiguous().as_byte(), other.nbytes)
+        new_data = Ptr[dtype](self.size + other.size)
+        str.memcpy(new_data.as_byte(), self._contiguous().as_byte(), self.nbytes)
+        str.memcpy((new_data + self.size).as_byte(), other._contiguous().as_byte(), other.nbytes)
 
-        extended = ndarray[S, T]._new_contig((self.shape[0] + other.shape[0], *self.shape[1:]), ptr[T](new_data))
-        self._shape = extended._shape
-        self._strides = extended._strides
-        self._data = extended._data
-        self._flags = extended._flags
+        return ndarray((self.shape[0] + other.shape[0], *self.shape[1:]), new_data)
 
-        return self
-
-    def resize(self, shape: S) -> ndarray[S, T]:
+    def pad_or_crop(self, shape) -> ndarray[dtype, ndim]:
+        # Zeros of the given shape with the overlapping indices copied from self (self itself when the shape is equal).
+        # NumPy's resize repeats the data in flat order instead.
         if self.shape == shape:
             return self
 
-        new_array = zeros(shape, dtype=T)
+        new_array = zeros(shape, dtype=dtype)
 
-        if static.len(S) == 1:
+        if ndim == 1:
             for i in range(min(self.shape[-1], shape[-1])):
                 new_array._data[i] = self[i]
-        elif static.len(S) == 2:
+        elif ndim == 2:
             new_rows, new_cols = shape
             old_rows, old_cols = self.shape
 
             for i in range(min(old_rows, new_rows)):
                 for j in range(min(old_cols, new_cols)):
-                    new_array[i][j] = self[i][j]
+                    new_array[i, j] = self[i, j]
         else:
             compile_error("ndarray: can resize only 1-dim and 2-dim ndarrays at the moment")
-        
+
         return new_array
-    
-    def pad(self, padding: int, axis: Static[int]) -> ndarray[S, T]:
-        if static.len(S) <= axis:
+
+    def pad(self, padding: int, axis: Literal[int]) -> ndarray[dtype, ndim]:
+        if ndim <= axis:
             compile_error("ndarray: axis does not exist (too large)")
 
         assert padding >= 0, f"ndarray: cannot pad by {padding}"
@@ -2388,11 +2364,11 @@ class ndarray:
         # Zeros after the last index along axis. In C order each of the prod(shape[:axis]) outer blocks is contiguous in
         # both arrays (one block in all along axis 0), so it is one copy per block.
         new_shape = (*self.shape[:axis], self.shape[axis] + padding, *self.shape[axis + 1:])
-        new_arr = zeros(new_shape, dtype=T)
+        new_arr = zeros(new_shape, dtype=dtype)
         if self.size == 0:
             return new_arr
 
-        outer = 1 if axis == 0 else ndarray._count(self.shape[:axis])
+        outer = 1 if axis == 0 else shape_count(self.shape[:axis])
         block = self.size // outer
         new_block = new_arr.size // outer
         data = self._contiguous()
@@ -2400,16 +2376,16 @@ class ndarray:
             str.memcpy((new_arr._data + o * new_block).as_byte(), (data + o * block).as_byte(), block * self.itemsize)
 
         return new_arr
-    
-    def pad_left(self, padding: int) -> ndarray[S, T]:
-        return zeros((padding, *self.shape[1:]), dtype=T).extend(self)
-    
-    def pad_right(self, padding: int) -> ndarray[S, T]:
-        return self.copy().extend(zeros((padding, *self.shape[1:]), dtype=T))
 
-    def pad_with_value(self, val, size: int, axis: int, *args) -> ndarray[S, T]:
-        # A copy with size more rows (axis 0) or columns (axis 1), each entry T(val)
-        if static.len(S) != 2:
+    def pad_left(self, padding: int) -> ndarray[dtype, ndim]:
+        return zeros((padding, *self.shape[1:]), dtype=dtype).concat(self)
+
+    def pad_right(self, padding: int) -> ndarray[dtype, ndim]:
+        return self.concat(zeros((padding, *self.shape[1:]), dtype=dtype))
+
+    def pad_with_value(self, val, size: int, axis: int, *args) -> ndarray[dtype, ndim]:
+        # A copy with size more rows (axis 0) or columns (axis 1), each entry dtype(val)
+        if ndim != 2:
             compile_error("ndarray: pad_with_value pads 2-dim arrays only")
         assert -1 < axis < 2, "ndarray: pad_with_value axis missmatch"
         assert size >= 0, f"ndarray: cannot pad by {size}"
@@ -2417,8 +2393,8 @@ class ndarray:
         rows, cols = self.shape
         new_rows = rows + size if axis == 0 else rows
         new_cols = cols if axis == 0 else cols + size
-        new_arr = zeros((new_rows, new_cols), dtype=T)
-        value = T(val)
+        new_arr = zeros((new_rows, new_cols), dtype=dtype)
+        value = dtype(val)
         data = self._contiguous()
 
         for i in range(new_rows):
@@ -2432,7 +2408,7 @@ class ndarray:
 
         return new_arr
 
-    def abs(self) -> ndarray[S, T]:
+    def abs(self) -> ndarray[dtype, ndim]:
         new_array = self.zeros()
         data = self._contiguous()
 
@@ -2441,79 +2417,71 @@ class ndarray:
 
         return new_array
 
-    def copy(self) -> ndarray[S, T]:
-        # A C-contiguous copy in a buffer of its own
-        if not self.flags.c_contiguous:
-            return ndarray[S, T]._new_contig(self.shape, self._contiguous())  # a fresh buffer already
-
-        n = self.size
-        data = Ptr[T](n)
-        str.memcpy(data.as_byte(), self._data.as_byte(), n * self.itemsize)
-        return ndarray[S, T]._new_contig(self.shape, data)
-    
-    def replicate(self, new_size: int) -> ndarray[S, T]:
+    def replicate(self, new_size: int) -> ndarray[dtype, ndim]:
         return array(self.tolist().replicate(new_size))
-    
+
     # Temp method to match ciphertensor signature. Will be removed after Ciphertensor is switched to use static shape.
-    def replicate(self, mpc, new_size: int) -> ndarray[S, T]:
+    def replicate(self, mpc, new_size: int) -> ndarray[dtype, ndim]:
         return self.replicate(new_size)
-    
+
     def to_list(self) -> List:
         # Lists over the array's own buffer, so that writes through either show in both, when it is C-contiguous; over
         # a copy of a view's elements otherwise (a list cannot step over strides)
-        assert static.len(self.shape) <= 2, "Bitcast to_list is supported only for ndarrays of dimension less than 3 at the moment."
+        assert ndim <= 2, "Bitcast to_list is supported only for ndarrays of dimension less than 3 at the moment."
         data = self._contiguous()
-        if static.len(self.shape) == 0:
-            return List[T]()
-        elif static.len(self.shape) == 1:
-            return List(arr=Array(ptr=data, sz=self.shape[0]), len=self.shape[0])
+        if ndim == 0:
+            return List[dtype]()
+        elif ndim == 1:
+            return List[dtype](data, self.shape[0])
         else:
-            return [List(arr=Array(ptr=data + i * self.shape[1], sz=self.shape[1]), len=self.shape[1]) for i in range(self.shape[0])]
+            return [List[dtype](data + i * self.shape[1], self.shape[1]) for i in range(self.shape[0])]
 
-    def count(self, elem: T) -> int:
+    def count(self, elem: dtype) -> int:
         counter = 0
         data = self._contiguous()
 
         for i in range(self.size):
             if elem == data[i]:
                 counter += 1
-        
+
         return counter
-    
-    def cyclic_diag(self, idx: int) -> ndarray[Tuple[int], T]:
+
+    def cyclic_diag(self, idx: int) -> ndarray[dtype, 1]:
         assert self.ndim == 2, "ndarray: Cannot fetch cyclic diagonal of tensor other than matrix"
         m, n = self.shape
         size = max(m, n)
-        diagonal = Ptr[T](alloc(size * sizeof(T)))
+        diagonal = Ptr[dtype](size)
 
         for i in range(size):
-            diagonal[i] = self[(i + idx) % m][i % n]
-        
-        return ndarray[Tuple[int], T]._new_contig((size,), diagonal)
-    
-    def diagonal_contig(self, antidiagonal: bool = False) -> ndarray[S, T]:
+            diagonal[i] = self[(i + idx) % m, i % n]
+
+        return ndarray((size,), diagonal)
+
+    def diagonal_contig(self, antidiagonal: bool = False) -> ndarray[dtype, ndim]:
         return array(self.tolist().diagonal_contig(antidiagonal))
 
     def diagonal_transpose(self, skinny: bool):
         return array(self.tolist().diagonal_transpose(skinny))
 
-    def shift_like_cipher(self, step: int, slots: int, cols: int) -> ndarray[S, T]:
+    def shift_like_cipher(self, step: int, slots: int, cols: int) -> ndarray[dtype, ndim]:
         return array(self.tolist().shift_like_cipher(step, slots, cols))
-    
+
     @staticmethod
-    def diag(shape: S, value: T) -> ndarray[S, T]:
-        if not static.len(S) == 2:
+    def diag(shape, value: dtype) -> ndarray[dtype, ndim]:
+        if not ndim == 2:
             compile_error("ndarray: can compute diag only for 2-dim ndarray")
-        
-        diag_arr = zeros(shape, dtype=T)
+
+        diag_arr = zeros(shape, dtype=dtype)
         for i in range(min(shape)):
-            diag_arr[i][i] = value
+            diag_arr[i, i] = value
         return diag_arr
 
-    def diag(self, value: T) -> ndarray[S, T]:
-        return ndarray[S, T].diag(self.shape, value)
-    
-    def dot_axis(self, other: ndarray[S, T], axis: int, preserve_dim: Static[int] = 1):
+    # self typed: Codon 0.20 lets an untyped self take a class-qualified call meant for the static
+    # overload of this name
+    def diag(self: ndarray[dtype, ndim], value: dtype) -> ndarray[dtype, ndim]:
+        return ndarray[dtype, ndim].diag(self.shape, value)
+
+    def dot_axis(self, other: ndarray[dtype, ndim], axis: int, preserve_dim: Literal[int] = 1):
         assert self.shape == other.shape, "ndarray: shapes missmatch for dot-axis product"
         assert axis < self.ndim, "ndarray: axis does not exist"
 
@@ -2521,43 +2489,38 @@ class ndarray:
 
         if preserve_dim == 0:
             return _dot
-        
+
         if self.is_empty():
             return self
 
-        if static.len(S) == 1: return array([_dot])
+        if ndim == 1: return array([_dot])
         return _dot.expand_dims(axis=axis)
-    
-    def dot_axis(self, axis: int, preserve_dim: Static[int] = 1):
+
+    def dot_axis(self, axis: int, preserve_dim: Literal[int] = 1):
         return self.dot_axis(self, axis, preserve_dim)
-    
-    def sum_axis(self, axis: int) -> ndarray[Tuple[int], T]:
-        if static.len(S) != 2 and static.len(S) != 1:
+
+    def sum_axis(self, axis: int) -> ndarray[dtype, 1]:
+        if ndim != 2 and ndim != 1:
             compile_error("ndarray: only 1-dim and 2-dim ndarrays can be summed")
-        
+
         result = self.sum(axis)
-        if static.len(S) == 2:
+        if ndim == 2:
             return self.sum(axis)
-        
+
         return array([result])
-    
-    def dot(self, other: ndarray, axis: int):
-        return self.dot_axis(other, axis, preserve_dim=0)
-    
-    def dot(self, axis: int):
-        return self.dot_axis(axis, preserve_dim=0)
-    
-    def sqrt(self) -> ndarray[S, float]:
+
+    def sqrt(self) -> ndarray[float, ndim]:
         return self._propagate_call(math.sqrt)
-    
-    def sigmoid(self) -> ndarray[S, float]:
+
+    def sigmoid(self) -> ndarray[float, ndim]:
         return self._propagate_call(lambda x: 1 / (1 + math.exp(-x)))
-    
-    def log(self) -> ndarray[S, float]:
+
+    def log(self) -> ndarray[float, ndim]:
         return self._propagate_call(math.log)
-    
-    def round(self, decimals=0) -> ndarray[S, float]:
-        return self._propagate_call(partial(round, n=decimals))
+
+    def round_half_away(self, decimals: int = 0) -> ndarray[float, ndim]:
+        # Halves away from zero, as Codon 0.19's round(x, n); NumPy's round rounds halves to even and keeps the dtype
+        return self._propagate_call(lambda x: float(x).round_half_away(decimals))
 
     def _propagate_call(self, _call):
         # TODO: Write an IR pass that will call this automatically to enable bar.foo(ndarray) for any byVal-arg foo in bar
@@ -2566,42 +2529,39 @@ class ndarray:
         for i in range(self.size):
             new_arr._data[i] = _call(data[i])
         return new_arr
-    
-    def getitemdup(self, i: int, new_size: int) -> ndarray[S, T]:
+
+    def getitemdup(self, i: int, new_size: int) -> ndarray[dtype, ndim]:
         assert self.ndim == 1, "ndarray: getitemdup expects ndarray to be 1-dimensional"
-        return zeros((new_size,), dtype=type(self._data[0])) + self[i]
-    
-    def hstack(self, other: ndarray[S, T]) -> ndarray[S, T]:
+        return zeros((new_size,), dtype=dtype) + self[i]
+
+    def hstack(self, other: ndarray[dtype, ndim]) -> ndarray[dtype, ndim]:
         assert self.ndim == other.ndim == 2, "ndarray: hstack possible only on 2-dimensional arrays at the moment"
 
         m, n = self.shape
         p, q = other.shape
         assert m == p, "ndarray: shapes missmatch for hstack"
 
-        new_arr = zeros((m, n + q), dtype=T)
+        new_arr = zeros((m, n + q), dtype=dtype)
         new_arr[:, :n] = self
         new_arr[:, n:n+q] = other
 
         return new_arr
-    
-    def vstack(self, other: ndarray[S, T]) -> ndarray[S, T]:
+
+    def vstack(self, other: ndarray[dtype, ndim]) -> ndarray[dtype, ndim]:
         assert self.ndim == other.ndim == 2, "ndarray: vstack possible only on 2-dimensional arrays at the moment"
 
         m, n = self.shape
         p, q = other.shape
         assert n == q, "ndarray: shapes missmatch for vstack"
 
-        new_arr = self.copy()
-        new_arr.extend(other)
+        return self.concat(other)
 
-        return new_arr
-    
-    def sign(self, *args) -> ndarray[S, T]:
+    def sign(self, *args) -> ndarray[dtype, ndim]:
         new_arr = self.zeros()
         data = self._contiguous()
 
         for i in range(self.size):
-            new_arr._data[i] = T(-1) if data[i] < 0 else T(1) if data[i] > 0 else T(0)
+            new_arr._data[i] = dtype(-1) if data[i] < 0 else dtype(1) if data[i] > 0 else dtype(0)
 
         return new_arr
 
@@ -2610,165 +2570,107 @@ class ndarray:
         x, y = self, self.T
         mask = ((x - y) > 0).astype(float)
         return x * mask - y * (mask - 1)
-    
+
     @staticmethod
-    def enc[S, T](mpc, data: ndarray[S, T]) -> ndarray[S, T]:
+    def enc(mpc, data):
         return data
-    
+
     def encrypt(self):
         return self
-    
+
     def via_mpc(self, foo, *args):
         return foo(self, *args)
-    
+
     def check_valid(self):
         pass
-    
+
     @property
     def actual_shape(self):
         return self.shape
-    
+
     def to_int_t(self, modulus) -> list:
         return self.tolist().to_int_t(modulus)
-    
+
     def reveal(self, *args):
         return self
-    
+
     @property
     def I(self):
-        return self.diag(T(1))
-    
+        return self.diag(dtype(1))
+
     @property
-    def cohort_shape(self) -> S:
+    def cohort_shape(self):
         return self.shape
-    
+
     @property
-    def partition_shape(self) -> S:
+    def partition_shape(self):
         return self.shape
-    
+
     @property
-    def modulus(self) -> T:
-        return T(0)
-    
+    def modulus(self) -> dtype:
+        return dtype(0)
+
     @staticmethod
-    def zeros(shape: S, *args) -> ndarray[S, T]:
-        return zeros(shape, dtype=T)
-    
-    def zeros[S1](self, shape: S1) -> ndarray[S1, T]:
-        return zeros(shape, dtype=T)
-    
-    def zeros(self: ndarray[S, T]) -> ndarray[S, T]:
-        return zeros(self.shape, dtype=T)
-    
+    def zeros(shape, *args) -> ndarray[dtype, ndim]:
+        return zeros(shape, dtype=dtype)
+
+    # self typed: Codon 0.20 lets an untyped self take a class-qualified call meant for the static
+    # overload of this name
+    def zeros[S1](self: ndarray[dtype, ndim], shape: S1):
+        return zeros(shape, dtype=dtype)
+
+    def zeros(self: ndarray[dtype, ndim]) -> ndarray[dtype, ndim]:
+        return zeros(self.shape, dtype=dtype)
+
     @staticmethod
-    def ones(shape: S, *args) -> ndarray[S, T]:
-        return ones(shape, dtype=T)
-    
-    def ones(self: ndarray[S, T], *args) -> ndarray[S, T]:
-        return ones(self.shape, dtype=T)
-    
-    def to_fp(self) -> ndarray[S, float]:
-        return self.astype(float)
-    
+    def ones(shape, *args) -> ndarray[dtype, ndim]:
+        return ones(shape, dtype=dtype)
+
+    def ones(self: ndarray[dtype, ndim], *args) -> ndarray[dtype, ndim]:
+        return ones(self.shape, dtype=dtype)
+
+    def to_fp(self) -> ndarray[float, ndim]:
+        # In C order: Codon's astype keeps a transposed view's order, and callers read the buffer in C order
+        return self.astype(float, order='C')
+
     def to_fp(self, modulus) -> list:
         return self.tolist().to_fp(modulus)
-    
+
     def filter(self, mask):
         return array([e.tolist() for e, m in zip(self, mask) if bool(m)])
-    
-    def maximum(self, axis: int, keepdims: Static[bool] = False):
-        return self.max(axis, keepdims=keepdims)
 
     # Internal
     def _slice_cols(self, start_col: int, end_col: int):
-        if static.len(S) == 2: return self[:, start_col:end_col]
-        elif static.len(S) == 1: return self[start_col:end_col]
+        if ndim == 2: return self[:, start_col:end_col]
+        elif ndim == 1: return self[start_col:end_col]
         else: compile_error("ndarray: _slice_cols works only for 1-dim and 2-dim arrays")
-    
+
     # Internal typechecker hack
     @property
-    def _internal_type(self) -> T:
-        return T()
-    
+    def _internal_type(self) -> dtype:
+        return dtype()
+
     # Matmul cost calculation
     def get_matmul_cost(self, other: ndarray) -> float:
         return self.shape[0] * self.shape[1] * other.shape[1] * SMALL_CYCLES_INSTR_COST_ESTIMATE
-    
-    # Temp bugfixes. The original methods are buggy.
-    def __str__(self) -> str:
-        return self.tolist().__repr__()
-    
-    def __repr__(self) -> str:
-        return self.tolist().__repr__()
-    
-    def transpose(self) -> ndarray[S, T]:
-        # A C-ordered copy, not the fork's strided view. array() of an empty list has no shape to read.
-        if self.is_empty():
-            return zeros(self.shape[::-1], dtype=T)
-        return array(self.tolist().transpose(), dtype=T)
-
-    def __getitem__(self, s: Tuple[slice, slice]) -> ndarray[S, T]:
-        # A copy of the rows and columns the slices pick, steps included
-        if not static.len(S) == 2:
-            compile_error("ndarray: can only do sliced 2-dim getitem on 2-dim arrays")
-
-        rs, cs = s
-        r_start, _, r_step, r_len = rs.adjust_indices(self.shape[0])
-        c_start, _, c_step, c_len = cs.adjust_indices(self.shape[1])
-
-        new_array = zeros((r_len, c_len), dtype=T)
-
-        for r_idx in range(r_len):
-            i = r_start + r_idx * r_step
-            for c_idx in range(c_len):
-                new_array[r_idx][c_idx] = self[i][c_start + c_idx * c_step]
-
-        return new_array
-
-    def __setitem__(self, s: Tuple[slice, slice], other: ndarray[S, T]):
-        if not static.len(S) == 2:
-            compile_error("ndarray: can only do sliced 2-dim setitem on 2-dim arrays")
-
-        rs, cs = s
-        start, _, step, length = rs.adjust_indices(self.shape[0])
-        for o_idx in range(length):
-            self[start + o_idx * step][cs] = other[o_idx][:]
-
-    def __mul__[dtype](self: ndarray[S, dtype], other: ndarray[S, bool]) -> ndarray[S, dtype]:
-        return self * other.astype(dtype)
-    
-    def __matmul__(self, other: ndarray[S, T]) -> ndarray[S, T]:
-        assert self.shape[1] == other.shape[0] and self.ndim == other.ndim == 2, f"ndarray matmul: Invalid shapes: {self.shape} vs {other.shape}"
-            
-        m, n = self.shape[0], other.shape[1]
-        _data = ptr[T](m * n)
-        _other_t = other.T
-
-        for i in range(m):
-            self_row = self[i]
-            start = i * n
-            for j in range(n):
-                _data[start + j] = (self_row * _other_t[j]).sum(axis=0)
-        
-        return ndarray[S, T]._new_contig((m, n), _data)
 
     # Temporary helpers
-    def slice_local(self, i: int, cp_1_size: int) -> ndarray[S, T]:
+    def slice_local(self, i: int, cp_1_size: int) -> ndarray[dtype, ndim]:
         new_arr = zeros_like(self)
         new_arr[:-1, :cp_1_size-1] = self[1:, 1:cp_1_size]
         new_arr[:-1, cp_1_size:] = self[1:, cp_1_size:]
         return new_arr
-    
-    def rotate_local(self, i: int, cp_1_size: int) -> ndarray[S, T]:
+
+    def rotate_local(self, i: int, cp_1_size: int) -> ndarray[dtype, ndim]:
         assert self.ndim == 2 and self.shape[0] == 1, "Not implemented case"
         assert i <= 0, "Not implemented case"
-        
+
         i_pos = -i
         assert i_pos <= cp_1_size, f"Not implemented case: i_pos {i_pos} > cp_1_size {cp_1_size}"
-        
+
         if i_pos == 0:
             return self.copy()
-        
+
         new_arr = zeros_like(self[0])
 
         if i_pos != cp_1_size:

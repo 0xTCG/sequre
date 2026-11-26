@@ -2,30 +2,40 @@
 
 ## Prerequisites
 
-- **Linux** (x86_64, aarch64) or **macOS** (Apple Silicon / arm64).
+- **Linux** (x86_64, aarch64) or **macOS 15 or later** (Apple Silicon / arm64).
 
 ## 1. Install Sequre
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/0xTCG/sequre/main/scripts/install.sh)"
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/0xTCG/sequre/develop/scripts/install.sh)"
 ```
 
 This installs Codon and Sequre to `~/.sequre` and offers to add it to your `PATH`. The installer downloads both archives and checks them before it unpacks either, so a failed download leaves an existing install as it was. Its environment variables: `SEQURE_INSTALL_DIR` (another install directory), `SEQURE_ARCHIVE` and `SEQURE_CODON_ARCHIVE` (a URL or a local file in place of the default downloads), and `SEQURE_UPDATE_PATH=yes` or `no` (answers the `PATH` question; with no terminal to ask on, the installer leaves `PATH` alone and says so).
 
 ??? note "Manual install"
+    The Sequre archive names the Codon release it was built for in `lib/codon/plugins/sequre/codon-version`:
+
     ```bash
-    mkdir -p $HOME/.sequre
-    curl -fL https://github.com/exaloop/codon/releases/download/v0.19.6/codon-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz \
-      | tar zxvf - -C $HOME/.sequre --strip-components=1
-    curl -fL https://github.com/0xTCG/sequre/releases/latest/download/sequre-$(uname -s | awk '{print tolower($0)}')-$(uname -m).tar.gz \
-      | tar zxvf - -C $HOME/.sequre
-    # Linux x86_64 only: Codon's Ptr loads and stores must be unaligned (the x86-64 alignment workaround)
-    if [ "$(uname -s)-$(uname -m)" = "Linux-x86_64" ]; then
-      sed -i -E '/(^|[[:space:]])(load|store)[[:space:]]/ { /align/! { /%0$/ s/$/, align 1/ } }' \
-        $HOME/.sequre/lib/codon/stdlib/internal/types/ptr.codon
+    PLATFORM=$(uname -s | awk '{print tolower($0)}')-$(uname -m)
+    D=$(mktemp -d)
+    if curl -fL -o "$D/sequre.tar.gz" \
+         https://github.com/0xTCG/sequre/releases/latest/download/sequre-$PLATFORM.tar.gz; then
+      if CODON_VERSION=$(tar -xzOf "$D/sequre.tar.gz" lib/codon/plugins/sequre/codon-version 2>/dev/null); then
+        mkdir -p $HOME/.sequre &&
+          curl -fL https://github.com/exaloop/codon/releases/download/$CODON_VERSION/codon-$PLATFORM.tar.gz \
+            | tar zxvf - -C $HOME/.sequre --strip-components=1 &&
+          tar zxvf "$D/sequre.tar.gz" -C $HOME/.sequre &&
+          export PATH=$HOME/.sequre/bin:$PATH
+      else
+        echo "This Sequre archive names no Codon release (Sequre v0.1.6 or earlier): use the installer above"
+      fi
     fi
-    export PATH=$HOME/.sequre/bin:$PATH
+    rm -rf "$D"
     ```
+
+    Unpack into an empty directory: over an earlier install, this keeps that install's files that the new release
+    lacks (the installer replaces `lib/codon/stdlib`, `include/codon`, `lib/codon/plugins/sequre` and the old
+    `lib/codon/plugins/seq` itself).
 
 ## 2. Run first example
 
@@ -40,12 +50,12 @@ This forks three processes (a trusted dealer + two compute parties) and runs a s
 
 Expected output:
 ```
-CP0:    addmul: 0
-CP0:    innerprod: 0
-CP1:    addmul: 471
-CP2:    addmul: 471
-CP1:    innerprod: 32
-CP2:    innerprod: 32
+CP0:    addmul: 0.0
+CP0:    innerprod: 0.0
+CP1:    addmul: 471.0
+CP2:    addmul: 471.0
+CP1:    innerprod: 32.0
+CP2:    innerprod: 32.0
 ```
 
 The result `7*13 + 13*19 + 7*19 = 471` was computed entirely on secret-shared data — no party ever saw the raw inputs of another.

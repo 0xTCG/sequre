@@ -50,7 +50,7 @@ static constexpr std::array<const char *, 2> sequreOptimizationModules = {
   "std.sequre.stdlib.optimization.ir.__init__",
 };
 
-static bool hasTypeSuffix(types::Type *t, const std::string &suffix) {
+static bool hasTypeSuffix(Type *t, const std::string &suffix) {
   if (!t) return false;
   // Only match against the type's own base name, not nested generic
   // arguments (e.g. List[Ciphertensor[Ciphertext]] must not match
@@ -74,9 +74,9 @@ static bool hasAttributeInAnyModule(Func *f, const std::array<const char *, 2> &
   return false;
 }
 
-static types::Type *getOrRealizeAnyType(Module *M, const std::array<const char *, 2> &modules,
-                                        const char *name,
-                                        const std::vector<types::Generic> &generics) {
+static Type *getOrRealizeAnyType(Module *M, const std::array<const char *, 2> &modules,
+                                 const char *name,
+                                 const std::vector<Generic> &generics) {
   for (const auto *module : modules) {
     if (auto *type = M->getOrRealizeType(codon::ast::getMangledClass(module, name), generics))
       return type;
@@ -86,9 +86,9 @@ static types::Type *getOrRealizeAnyType(Module *M, const std::array<const char *
 }
 
 
-std::pair<std::vector<Value *>, std::vector<types::Type *>> getTypedArgs( CallInstr *v, int skip) {
+std::pair<std::vector<Value *>, std::vector<Type *>> getTypedArgs( CallInstr *v, int skip) {
     std::vector<Value *> args;
-    std::vector<types::Type *> types;
+    std::vector<Type *> types;
 
     int idx = 0;
     for ( auto it = v->begin(); it != v->end(); ++it, ++idx ) {
@@ -138,47 +138,47 @@ bool hasDebugAttr( Func *f ) {
   return hasAttributeInAnyModule(f, sequreAttributeModules, "debug");
 }
 
-bool hasCKKSPlaintext( types::Type *t ) {
+bool hasCKKSPlaintext( Type *t ) {
   return hasTypeSuffix(t, ckksPlaintextTypeSuffix);
 }
 
-bool hasCKKSCiphertext( types::Type *t ) {
+bool hasCKKSCiphertext( Type *t ) {
   return hasTypeSuffix(t, ckksCiphertextTypeSuffix);
 }
 
-bool isCKKSPlaintext( types::Type *t ) {
+bool isCKKSPlaintext( Type *t ) {
   return hasTypeSuffix(t, ckksPlaintextTypeSuffix);
 }
 
-bool isCKKSCiphertext( types::Type *t ) {
+bool isCKKSCiphertext( Type *t ) {
   return hasTypeSuffix(t, ckksCiphertextTypeSuffix);
 }
 
-bool isSharetensor( types::Type *t ) {
+bool isSharetensor( Type *t ) {
   return hasTypeSuffix(t, sharetensorTypeSuffix);
 }
 
-bool isCiphertensor( types::Type *t ) {
+bool isCiphertensor( Type *t ) {
   return hasTypeSuffix(t, cipherTensorTypeSuffix);
 }
 
-bool isMPP( types::Type *t ) {
+bool isMPP( Type *t ) {
   return hasTypeSuffix(t, MPPTypeSuffix);
 }
 
-bool isMPA( types::Type *t ) {
+bool isMPA( Type *t ) {
   return hasTypeSuffix(t, MPATypeSuffix);
 }
 
-bool isMPU( types::Type *t ) {
+bool isMPU( Type *t ) {
   return hasTypeSuffix(t, MPUTypeSuffix);
 }
 
-bool isMP( types::Type *t ) {
+bool isMP( Type *t ) {
   return isMPP(t) || isMPA(t) || isMPU(t);
 }
 
-bool isSecureContainer( types::Type *t ) {
+bool isSecureContainer( Type *t ) {
   return isSharetensor(t) || isCiphertensor(t) || isMP(t);
 }
 
@@ -191,21 +191,21 @@ bool isMPC( Value *value ) {
   return value->getType()->is(mpcType);
 }
 
-types::Type *getTupleType( int n, types::Type *elemType, Module *M ) {
-  std::vector<types::Type *> tupleTypes;
+Type *getTupleType( int n, Type *elemType, Module *M ) {
+  std::vector<Type *> tupleTypes;
   for (int i = 0; i != n; ++i) tupleTypes.push_back(elemType);
   return M->getTupleType(tupleTypes);
 }
 
-types::Type *getTupleType( std::vector<Value *> vals, Module *M ) {
-  std::vector<types::Type *> tupleTypes;
+Type *getTupleType( std::vector<Value *> vals, Module *M ) {
+  std::vector<Type *> tupleTypes;
   for ( auto *v : vals ) tupleTypes.push_back(v->getType());
   return M->getTupleType(tupleTypes);
 }
 
 Func *getOrRealizeSequreInternalMethod( Module *M, std::string const &methodName,
-                                        std::vector<types::Type *> args,
-                                        std::vector<types::Generic> generics ) {
+                                        std::vector<Type *> args,
+                                        std::vector<Generic> generics ) {
   auto *sequreInternalType = getOrRealizeAnyType(M, sequreInternalModules, "Internal", {});
   auto *method = M->getOrRealizeMethod(sequreInternalType, methodName, args, generics);
 
@@ -223,8 +223,8 @@ Func *getOrRealizeSequreInternalMethod( Module *M, std::string const &methodName
 }
 
 Func *getOrRealizeSequreOptimizationHelper( Module *M, std::string const &funcName,
-                                            std::vector<types::Type *> args,
-                                            std::vector<types::Generic> generics ) {
+                                            std::vector<Type *> args,
+                                            std::vector<Generic> generics ) {
   Func *func = nullptr;
   for (const auto *module : sequreOptimizationModules) {
     func = M->getOrRealizeFunc(funcName, args, generics, module);

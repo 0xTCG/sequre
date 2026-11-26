@@ -1,7 +1,7 @@
 #!/bin/sh -l
 set -e
 
-# Build script for sequre (Codon/LLVM/seq already pre-installed in image)
+# Build script for sequre (Codon/LLVM already pre-installed in image)
 # Usage: /build-sequre.sh /path/to/sequre/source
 
 SRC=$1
@@ -21,19 +21,11 @@ cmake -S . -B build \
 cmake --build build --target sequre
 cmake --install build --prefix=$HOME/.sequre/lib/codon/plugins/sequre
 
-# Sequre's numpy is a fork (its ndarray is defined differently and is
-# incompatible with Codon's own; for now — the plan is to eventually migrate
-# Sequre to use Codon's numpy directly). It is shipped inside the plugin (via
-# the `install(DIRECTORY stdlib ...)` rule) and imported exclusively through
-# the `sequre.stdlib.numpy` namespace, so it never collides with Codon's
-# native `numpy`, which is left intact.
-
 # Build the sequre launcher (it preloads the x86-64 over-align shim for `sequre run` and links it into the binaries
 # of `sequre build`)
 $CC -O2 -o $HOME/.sequre/bin/sequre "$SRC/sequre_launcher.c"
 
-# Build the x86-64 over-align shim into lib/ (bundled via the lib/ tar entry below; install-via-docker.sh patches
-# Codon's Ptr post-extraction). x86_64 only.
+# Build the x86-64 over-align shim into lib/ (bundled via the lib/ tar entry below). x86_64 only.
 if [ "$(uname -m)" = "x86_64" ]; then
   $CC -shared -fPIC -O2 -o $HOME/.sequre/lib/sequre_align64.so "$SRC/sequre_align64.c" -ldl
 fi
@@ -46,6 +38,10 @@ case "$(uname -m)" in
   x86_64) cp "$SRC/external/GMP/lib/libgmp.so" $SEQURE_PREFIX/lib/libgmp.so ;;
   *) sh "$SRC/scripts/build_gmp.sh" $SEQURE_PREFIX/lib/libgmp.so ;;
 esac
+
+# The Codon release the plugin is built for, as the release build writes it (installers tell a plugin built for Codon
+# 0.20 or later by this file)
+echo "v$($HOME/.sequre/bin/codon --version | tr -d '[:space:]')" > $SEQURE_PREFIX/codon-version
 
 # Create tarball in /output (include codon runtime so `sequre` launcher can find it)
 TARBALL=/output/sequre-linux-$(uname -m).tar.gz

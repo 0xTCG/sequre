@@ -26,7 +26,7 @@ const int BET_ARITHMETICS_OP_THRESHOLD = BET_REVEAL_OP;
 class MPCBETNode {
   int64_t value;
   Var *variable;
-  types::Type *nodeType;
+  Type *nodeType;
   int op;
   MPCBETNode *leftChild;
   MPCBETNode *rightChild;
@@ -73,7 +73,7 @@ public:
   MPCBETNode *copy() const;
   void print(int) const;
 
-  types::Type *getType();
+  Type *getType();
   std::string const getOperatorIRName() const;
 };
 
@@ -181,10 +181,10 @@ void MPCBETNode::print(int level = 0) const {
     rightChild->print(level + 1);
 }
 
-types::Type *MPCBETNode::getType() {
+Type *MPCBETNode::getType() {
   if (!nodeType) {
     if (isConstant())
-      nodeType = new types::IntType();
+      nodeType = new IntType(64, true);
     else if (isLeaf())
       nodeType = variable->getType();
     else
@@ -872,7 +872,7 @@ CallInstr *nextPolynomialCall(CallInstr *v, BodiedFunc *bf, MPCBET *bet) {
   auto *M = v->getModule();
   auto *self = M->Nr<VarValue>(bf->arg_front());
   auto *selfType = self->getType();
-  auto *funcType = cast<types::FuncType>(bf->getType());
+  auto *funcType = cast<FuncType>(bf->getType());
   auto *returnType = funcType->getReturnType();
   auto *inputsType = getTupleType(vars.size(), returnType, M);
   auto *coefsType = getTupleType(coefs.size(), M->getIntType(), M);
@@ -972,7 +972,7 @@ Value *generateExpression(Module *M, MPCBETNode *node) {
 }
 
 Value *generateProduct(Module *M, std::vector<Value *> factors,
-                       types::Type *returnType) {
+                       Type *returnType) {
   assert(
       factors.size() &&
       "Matrix factorization pass -> Product of shapes: Factors need to be non-empty.");

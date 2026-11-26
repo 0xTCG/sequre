@@ -50,8 +50,12 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOOL=(python3 "$REPO/scripts/bench_tool.py")
 COMPARE=(python3 "$REPO/scripts/bench_compare.py")
-SHIM="$HOME/.sequre/lib/sequre_align64.so"
-GMP="$HOME/.sequre/lib/codon/plugins/sequre/lib/libgmp.so"
+# The prefix of the launcher that builds the binaries (the sequre on PATH, else ~/.sequre): its alignment shim, and
+# the GMP of the plugin it builds with (SEQURE_PLUGIN_PATH, else the prefix's)
+LAUNCHER_BIN="$(command -v sequre || echo "$HOME/.sequre/bin/sequre")"
+PREFIX="$(cd "$(dirname "$(readlink -f "$LAUNCHER_BIN")")/.." 2>/dev/null && pwd || echo "$HOME/.sequre")"
+SHIM="$PREFIX/lib/sequre_align64.so"
+GMP="${SEQURE_PLUGIN_PATH:-$PREFIX/lib/codon/plugins/sequre}/lib/libgmp.so"
 CACHE="$REPO/results/bench/.cache"
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"; }

@@ -1,6 +1,7 @@
 import internal.static as static
 
-from sequre.stdlib.numpy.ndarray import ndarray
+from numpy import ndarray
+from sequre.utils.arrays import shape_count
 from internal.gc import sizeof
 
 from pickler import dump, load
@@ -8,16 +9,59 @@ from pickler import dump, load
 from C import access(cobj, int) -> int
 
 
+def _c_stream(f) -> cobj:
+    # The C stream behind a File: since Codon 0.20 it is the internal _state._fp, the only handle there is. Binary
+    # data goes straight through it (fwrite, fread), whatever mode the File was opened in: a text-mode File now decodes
+    # what it reads as UTF-8, and shares are not text. The stream is brought level with the File first.
+    _sync_c_stream(f)
+    return f._state._fp
+
+
+def _sync_c_stream(f):
+    # Codon 0.20's File keeps buffers of its own past the C stream: small writes are staged, and lines are read ahead.
+    # Text written before binary data must reach the stream first, and binary data read after a line must start where
+    # the line ended, not after the read-ahead. Nothing to do (no flush, no seek) when both buffers are empty.
+    st = f._state
+    if st._write_length > 0:
+        f.flush()
+    if st._read_length > st._read_offset or len(st._text_pending) > st._text_pending_offset:
+        f.seek(f.tell(), 0)
+
+
+def _read_binary(f, p: cobj, nbytes: int):
+    got = int(_C.fread(p, 1, nbytes, _c_stream(f)))
+    if got != nbytes:
+        raise IOError(f"binary read: {got} of {nbytes} bytes before the end of the file")
+
+
+def _write_text(f, s: str):
+    # A binary-mode File (File[bytes] since Codon 0.20) takes the text as UTF-8 bytes: the binary and the text branches
+    # below are type-checked for either kind of File
+    if isinstance(f, File[bytes]):
+        f.write(s.encode())
+    else:
+        f.write(s)
+
+
+def _read_text(line) -> str:
+    # A binary-mode File (File[bytes] since Codon 0.20) yields its lines as bytes: the text branches below are
+    # type-checked for either kind of File, as the writers' are
+    if isinstance(line, bytes):
+        return line.decode()
+    else:
+        return line
+
+
 def write_vector[TP](f: File, vector: list, binary: bool):
     if binary:
-        _C.fwrite(vector.arr.ptr.as_byte(), sizeof(TP), vector.size(), f.fp)
+        _C.fwrite(vector._ptr.as_byte(), sizeof(TP), vector.size(), _c_stream(f))
         f._errcheck("error in write")
     else:
         s = ''
         for i in range(len(vector) - 1):
             s += f"{vector[i]} "
         s += f"{vector[-1]}\n"
-        f.write(s)
+        _write_text(f, s)
 
 
 def write_matrix[TP](f: File, mat: list[list], binary: bool):
@@ -26,26 +70,27 @@ def write_matrix[TP](f: File, mat: list[list], binary: bool):
 
 def write_ndarray(f: File, arr: ndarray, binary: bool):
     if binary:
-        _C.fwrite(arr.data.as_byte(), arr.itemsize, arr.size, f.fp)
+        # The elements in C order: a view's buffer (a transposed or sliced array) holds them in another order
+        _C.fwrite(arr._contiguous().as_byte(), arr.itemsize, arr.size, _c_stream(f))
         f._errcheck("error in write")
     else:
         if not arr.ndim:
             return
         
-        if static.len(arr.S) == 1:
-            write_vector(f, arr.tolist(), False, TP=arr.T)
+        if static.len(arr.shape) == 1:
+            write_vector(f, arr.tolist(), False, TP=arr.dtype)
         else:
             for sub_tensor in arr:
                 write_ndarray(f, sub_tensor, False)
-                f.write('\n')
+                _write_text(f, '\n')
 
 
 def read_vector[TP](f: File, length: int, binary: bool) -> list[TP]:
     if binary:
-        arr = Array[TP](length)
-        for i in range(length): arr[i] = ptr[TP](f.read(sizeof(TP)).ptr.as_byte())[0]
+        arr = Ptr[TP](length)
+        _read_binary(f, arr.as_byte(), length * sizeof(TP))
         return list[TP](arr, length)
-    return [TP(e.strip()) for e in next(f).split()[:length]]
+    return [TP(e.strip()) for e in _read_text(next(f)).split()[:length]]
 
 
 def read_matrix[TP](f: File, rows: int, cols: int, binary: bool) -> list[list[TP]]:
@@ -55,7 +100,7 @@ def read_matrix[TP](f: File, rows: int, cols: int, binary: bool) -> list[list[TP
     line_count = 0
     new_matrix = []
     for line in f:
-        new_matrix.append([TP(e.strip()) for e in line.split()[:cols]])
+        new_matrix.append([TP(e.strip()) for e in _read_text(line).split()[:cols]])
         line_count += 1
 
         if line_count == rows:
@@ -69,14 +114,16 @@ def read_matrix[TP](f: File, rows: int, cols: int, binary: bool) -> list[list[TP
 
 def read_ndarray(f: File, shape, binary: bool, dtype: type):
     if binary:
-        return ndarray._new_contig(
-            shape, ptr[dtype](f.read(ndarray._count(shape) * sizeof(dtype)).ptr.as_byte()))
+        count = shape_count(shape)
+        data = Ptr[dtype](count)
+        _read_binary(f, data.as_byte(), count * sizeof(dtype))
+        return ndarray(shape, data)
     
-    total = ndarray._count(shape)
+    total = shape_count(shape)
     data = Ptr[dtype](total)
     idx = 0
     for line in f:
-        for token in line.split():
+        for token in _read_text(line).split():
             t = token.strip()
             if t:
                 data[idx] = dtype(t)
@@ -89,7 +136,7 @@ def read_ndarray(f: File, shape, binary: bool, dtype: type):
     if idx < total:
         print(f"IO warning: (ndarray read) file contains fewer values ({idx}) than expected ({total})")
     
-    return ndarray._new_contig(shape, data)
+    return ndarray(shape, data)
 
 
 def read_matrix_start[TP](f: File, rows: int, cols: int, start: int) -> list[list[TP]]:
