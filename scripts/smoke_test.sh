@@ -19,6 +19,12 @@
 #                   examples/fixed_point.codon, built once and run with 3 parties on the default modulus (the ring)
 #                   and with --use-field: a fixed-point product (a truncation), a comparison, != and a division give
 #                   the expected values at every compute party, and each party says which modulus it ran on
+#   arithmetic      scripts/smoke_arithmetic.codon, built with -release and run in one process: known answers
+#                   (literals, the same on every platform) for the limb division at several widths and shapes, its rare
+#                   branches included, the operators on integers wider than 128 bits, the MPC field's product at 128,
+#                   192 and 256 bits, Lattiseq's CRT reconstruction on both of its paths and a decode, BigFloat's
+#                   operations, the exact encoder's roots of unity and bootstrapping's sine polynomial; every check
+#                   must run and pass
 #   shim            x86-64 Linux: shrinking and freeing over-aligned blocks leaves their neighbours intact
 #   installer-*     with the archive given, scripts/install.sh: a download that fails (HTTP 404), a broken archive and
 #                   an archive whose launcher does not run each stop it with a non-zero status and leave an existing
@@ -215,6 +221,31 @@ for modulus in ring field; do
     ok "$check" "product, comparison, != and division right at every compute party, on the $modulus"
   fi
 done
+
+# arithmetic
+D=$WORK/arithmetic
+mkdir -p "$D"
+(cd "$D" && run_timeout "$TIMEOUT" env CODON_DEBUG=0 "$SEQURE" build -release "$REPO/scripts/smoke_arithmetic.codon" \
+  -o "$D/arith" > build.txt 2>&1 < /dev/null)
+rc=$?
+if [ $rc -ne 0 ] || [ ! -x "$D/arith" ]; then
+  tail -10 "$D/build.txt" | sed 's/^/      /'
+  fail arithmetic "the check did not build (exit status $rc)"
+else
+  (cd "$D" && run_timeout "$TIMEOUT" "$D/arith" > log.txt 2>&1 < /dev/null)
+  rc=$?
+  summary=$(grep '^arithmetic: ' "$D/log.txt" | tail -1)
+  if [ $rc -ne 0 ] || [ -z "$summary" ]; then
+    if [ -n "$summary" ]; then
+      grep '^FAIL' "$D/log.txt" | head -20 | sed 's/^/      /'
+    else
+      tail -10 "$D/log.txt" | sed 's/^/      /'
+    fi
+    fail arithmetic "exit status $rc${summary:+; ${summary#arithmetic: }}"
+  else
+    ok arithmetic "${summary#arithmetic: }"
+  fi
+fi
 
 # binary-3, binary-4
 if [ -n "$BIN" ]; then

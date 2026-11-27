@@ -25,8 +25,7 @@ from gmp import *
 from llvm import *
 from utils import double_to_fp
 
-from sequre.experimental.fast_modular_multiplication.u128_w_llvm_overflow_intrinsic import modular_mul_u128u128_v1, modular_mul_u128u64_v1
-from sequre.experimental.fast_modular_multiplication.u192_w_llvm_overflow_intrinsic import modular_mul_u192u192, modular_mul_u192u64
+import limbs
 
 
 # Frequently used vectors
@@ -275,6 +274,16 @@ class Int:
         
         return r
     
+    def div_floor(self, other: Int[N]) -> Int[N]:
+        # self / other rounded towards minus infinity, at every width (// truncates towards zero: C numerics);
+        # ZeroDivisionError for other == 0
+        return limbs.floor_div(self, other)
+
+    def mod_nonneg(self, other: Int[N]) -> Int[N]:
+        # self mod |other| in [0, |other|), whatever the signs, at every width (% takes the dividend's sign: C
+        # numerics); ZeroDivisionError for other == 0
+        return limbs.nonneg_mod(self, other)
+
     def bitlen(self: Int[N]) -> Int[N]:
         if self < Int[N](0): self = -self
         return Int[N](UInt[N](self).bitlen())
@@ -466,7 +475,7 @@ class UInt:
                 return self.__fast_mod_field()
 
         if N > 128:
-            return self.gmp_mod(other)
+            return limbs.umod(self, other)
 
         return self.__naive_mod(other)
     
@@ -594,12 +603,8 @@ class UInt:
         return m
     
     def __fast_mod_field(self: UInt[N]):
-        if isinstance(self, UInt[192]):
-            return self.__fast_mod_semi_mersenne_fixed()
-        if isinstance(self, UInt[128]):
-            return self.__fast_mod_mersenne_fixed()
-        
-        return self.gmp_mod(MPC_FIELD_SIZE)
+        # self mod the field 2^L - c (L = MPC_MODULUS_BITS, c = MPC_MERSENNE_OFFSET) for any self < 2^N
+        return limbs.pm_reduce(self, MPC_MODULUS_BITS, MPC_MERSENNE_OFFSET)
     
     def __fast_mod_ring(self: UInt[N]) -> UInt[N]:
         return self & MPC_RING_MASK
@@ -644,31 +649,26 @@ class UInt:
                 return (self * other) & MPC_RING_MASK
         
         if modulus == MPC_FIELD_SIZE:
-            if isinstance(self, UInt[128]):
-                if isinstance(other, UInt[N]):
-                    return modular_mul_u128u128_v1(self, other)
-                if isinstance(other, u64) or isinstance(other, int):
-                    return modular_mul_u128u64_v1(self, u64(other))
-            
-            elif isinstance(self, UInt[192]):
-                if isinstance(other, UInt[N]):
-                    return modular_mul_u192u192(self, other)
-                if isinstance(other, u64) or isinstance(other, int):
-                    return modular_mul_u192u64(self, u64(other))
-            
+            # The field's product (limbs.pm_mul and its u64 and int variants: exact for any factors below 2^N, the
+            # result in [0, p)); a negative int factor (which DEBUG builds refuse above) multiplies as a negative number
             if isinstance(other, int):
-                return self.gmp_mul_mod_si(other, modulus)
+                return limbs.pm_mul_int(self, other, MPC_MODULUS_BITS, MPC_MERSENNE_OFFSET)
             elif isinstance(other, u64):
-                return self.gmp_mul_mod_ui(other, modulus)
+                return limbs.pm_mul_u64(self, other, MPC_MODULUS_BITS, MPC_MERSENNE_OFFSET)
             else:
-                return self.gmp_mul_mod(other, modulus)
+                return limbs.pm_mul(self, other, MPC_MODULUS_BITS, MPC_MERSENNE_OFFSET)
         
-        if DEBUG:
-            assert self == int(self), f"Factor {self} is not within the length of 64 bits.\nIt must be no longer than 64 bits if the modulus differs the size of field/ring."
-            assert other == int(other), f"Factor {other} is not within the length of 64 bits.\nIt must be no longer than 64 bits if the modulus differs the size of field/ring."
-            assert modulus == int(modulus), f"Modulus {modulus} is not within the length of 64 bits.\nIt must be no longer than 64 bits if it differs the size of field/ring."
-        
-        return UInt[N]((int(self) * int(other)) % int(modulus))        
+        # Any other modulus: the product modulo it, exactly (a negative int factor, refused in DEBUG builds, multiplies
+        # as a negative number)
+        if isinstance(other, int):
+            if other < 0:
+                r = limbs.mul_mod_any(self, limbs.from_u64(u64(0) - u64(other), N), modulus)
+                return modulus - r if r != UInt[N](0) else r
+            return limbs.mul_mod_any(self, limbs.from_u64(u64(other), N), modulus)
+        elif isinstance(other, u64):
+            return limbs.mul_mod_any(self, limbs.from_u64(other, N), modulus)
+        else:
+            return limbs.mul_mod_any(self, other, modulus)
 
     def pow_mod(self, other, modulus) -> UInt[N]:
         return mod_pow(self, other, modulus)

@@ -7,6 +7,8 @@ import sequre.lattiseq.params as ckks_params
 import sequre.lattiseq.ring as ring
 
 from sequre.lattiseq.exact_encoder import new_exact_encoder
+
+from test_bigfloat import test_bigfloat
 from sequre.lattiseq.stats import plot_precision_stats
 from sequre.utils.testing import assert_eq
 from sequre.utils.utils import random_complex
@@ -822,12 +824,15 @@ def crt_wrong_coefficients(literal, level: int) -> int:
             x ^= x >> u64(7)
             x ^= x << u64(17)
             p._buf_coeffs[k][j] = (qk - u64(1) - (x % u64(1000))) if j % 2 == 0 else (x % qk)
+            if j % 7 == 3: p._buf_coeffs[k][j] = u64(0)
+            if j % 11 == 5: p._buf_coeffs[k][j] = qk - u64(1)
     coeffs = [lattiseq_uint(0) for _ in range(ring_q.n)]
     ring_q.poly_to_bigint_lvl(level, p._buf_coeffs, 1, coeffs)
     wrong = 0
     for j in range(ring_q.n):
         for k in range(level + 1):
-            if coeffs[j].gmp_mod(ring_q.modulus[k].ext_to_lattiseq_uint()) != p._buf_coeffs[k][j].ext_to_lattiseq_uint():
+            # the remainder by a word: __fast_mod_aided_64_bits, not the division the reconstruction uses
+            if coeffs[j].__fast_mod_aided_64_bits(ring_q.modulus[k]) != p._buf_coeffs[k][j]:
                 wrong += 1
                 break
     return wrong
@@ -846,6 +851,8 @@ def crt_centered_wrong_coefficients(literal, level: int) -> int:
             x ^= x >> u64(7)
             x ^= x << u64(17)
             p._buf_coeffs[k][j] = (qk - u64(1) - (x % u64(1000))) if j % 2 == 0 else (x % qk)
+            if j % 7 == 3: p._buf_coeffs[k][j] = u64(0)
+            if j % 11 == 5: p._buf_coeffs[k][j] = qk - u64(1)
     coeffs = [lattiseq_int(0) for _ in range(ring_q.n)]
     ring_q.poly_to_bigint_centered_lvl(level, p, 1, coeffs)
     big_q = lattiseq_int(ring_q.modulus_at_level[level])
@@ -857,7 +864,10 @@ def crt_centered_wrong_coefficients(literal, level: int) -> int:
             wrong += 1
             continue
         for k in range(level + 1):
-            if c.gmp_mod(lattiseq_int(ring_q.modulus[k].ext_to_lattiseq_uint())) != lattiseq_int(p._buf_coeffs[k][j].ext_to_lattiseq_uint()):
+            # c mod q_k in [0, q_k) (__fast_mod_aided_64_bits gives q_k for a negative multiple of q_k)
+            qk = ring_q.modulus[k]
+            r = c.__fast_mod_aided_64_bits(qk)
+            if (u64(0) if r == qk else r) != p._buf_coeffs[k][j]:
                 wrong += 1
                 break
     return wrong
@@ -880,6 +890,42 @@ def test_crt_long_chains():
     except ValueError:
         refused = True
     assert_eq("Lattiseq CRT reconstruction refuses a level whose modulus does not fit the bigint in use", refused, True)
+
+
+def crt_factor_errors(literal) -> Tuple[int, int]:
+    # The CRT basis at every level the ring reconstructs: crt_k = (Q / q_k)((Q / q_k)^-1 mod q_k) is 1 modulo q_k, 0
+    # modulo every other q_j, and below Q. Returns (levels, wrong factors).
+    params = ckks.new_parameters_from_literal(literal)
+    ring_q = params.ring_q
+    levels, wrong = 0, 0
+    for level in range(len(ring_q.modulus_at_level)):
+        big_q = ring_q.modulus_at_level[level]
+        crt = ring_q._crt_reconstruction(level, big_q)
+        levels += 1
+        for k in range(level + 1):
+            ok = crt[k] < big_q
+            for j in range(level + 1):
+                r = crt[k].__fast_mod_aided_64_bits(ring_q.modulus[j])
+                ok = ok and r == (u64(1) if j == k else u64(0))
+            if not ok:
+                wrong += 1
+    return levels, wrong
+
+
+def test_crt_every_level():
+    """The CRT basis and the reconstruction (both branches: the sum that fits the bigint and the wider one) at every level
+    of the parameter sets the tests and the bootstrapping parameters use, residues at the edges (0, q - 1) included."""
+    levels, wrong = 0, 0
+    for literal in [ckks_params.PN14QP438, ckks_params.PN15QP880, ckks_params.PN16QP1761]:
+        l, w = crt_factor_errors(literal)
+        levels += l
+        wrong += w
+    assert_eq(f"Lattiseq CRT basis: 1 modulo its own modulus, 0 modulo the others, below Q, at all {levels} levels", wrong, 0)
+    wrong = 0
+    for literal, top in [(ckks_params.PN14QP438, 8), (ckks_params.PN15QP880, 11), (ckks_params.PN16QP1761, 9)]:
+        for level in range(top + 1):
+            wrong += crt_wrong_coefficients(literal, level) + crt_centered_wrong_coefficients(literal, level)
+    assert_eq("Lattiseq CRT reconstruction, plain and centered, at every level up to the long chains' widest", wrong, 0)
 
 
 def test_e2s_bound():
@@ -921,6 +967,8 @@ def test_he():
     test_check_binary_ntt(params, encoder, encryptor, evaluator)
     test_constants_out_of_place(params, encoder, encryptor, decryptor, evaluator)
     test_crt_long_chains()
+    test_crt_every_level()
     test_e2s_bound()
+    test_bigfloat()
 
     print('HE tests passed.\n')

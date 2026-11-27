@@ -1,68 +1,114 @@
 """
 Arbitrary-precision floats for Lattiseq.
 
-Lattigo relies on Go's math/big.Float where float64 is not accurate enough (the cosine approximation
-of ckks/advanced/cosine_approx.go works with 1000 bits). Codon has no such type, so this module
-wraps GMP's mpf floats, which Sequre already links through GMP_PATH.
+Lattigo relies on Go's math/big.Float where float64 is not accurate enough: the cosine approximation of
+ckks/advanced/cosine_approx.go works with 1000 bits, and the exact encoder computes its roots of unity with a few
+hundred. Codon has no such type, so this module implements the part of math/big.Float they use, on the 64-bit limb
+arithmetic of the limbs module (integer arithmetic only: every platform computes the same bits).
 
-The API follows math/big.Float: the receiver is the destination (z.mul(x, y) sets z = x * y and
-returns z), so the Go sources and their ports can be read side by side.
+The API follows math/big.Float: the receiver is the destination (z.mul(x, y) sets z = x * y and returns z), and may be
+one of the operands, so the Go sources and their ports can be read side by side.
 
-Differences from math/big.Float that a port has to keep in mind:
-  - GMP rounds every operation towards zero and keeps at least (not exactly) the requested number
-    of bits, where Go rounds to nearest even at exactly that precision. Results agree to about
-    2^-prec relative.
-  - float64() below rounds to nearest, like Go's Float64(), and unlike mpf_get_d which truncates.
+As in math/big.Float with its default rounding mode (ToNearestEven):
+  - a value is a sign, a binary exponent and a mantissa of exactly prec bits (the precision given to the
+    constructor);
+  - set_float64, set, set_mant_exp, abs, add, sub, mul and quo compute the exact result and round it once to the
+    receiver's precision, to the nearest value, ties to even;
+  - zeros are signed: x - x is +0, and a product or quotient with a zero operand takes the xor of the signs;
+  - float64 rounds to the nearest double, ties to even, denormals at their own precision; a value that rounds to
+    2^1024 or more in magnitude gives +-inf, and one of at most half the smallest denormal +-0.
+
+Differences from math/big.Float:
+  - the precision is set once, at construction, and is never 0 (no "precision of the first operand");
+  - no infinities and no NaN: set_float64 and set_string raise ValueError on them, quo raises ValueError for a zero
+    divisor (Go returns an infinity or panics);
+  - set_string takes decimal numbers only, [+-]digits[.[digits]] or [+-].digits (no exponent, no other base, no
+    underscores, no spaces), and rounds them correctly (Go's Parse may round twice);
+  - no accuracy results, rounding modes or MantExp, but to_fixed(bits, N): round(x * 2^bits) to an Int[N], ties away
+    from zero, computed exactly on the mantissa.
 """
 import math
-
-from sequre.constants import GMP_PATH, GMP_LIMB_SIZE, gmp_limb_t
-
-
-# Mirrors GMP's __mpf_struct.
-class mpf_t:
-    _mp_prec: i32             # Precision, in limbs
-    _mp_size: i32             # Number of limbs in use. Negative for a negative number
-    _mp_exp: int              # Exponent, in limbs
-    _mp_d: Ptr[gmp_limb_t]    # The _mp_prec + 1 limbs
+import limbs
 
 
-from C import GMP_PATH.__gmpf_set(mpf_t, mpf_t) as mpf_set
-from C import GMP_PATH.__gmpf_set_d(mpf_t, float) as mpf_set_d
-from C import GMP_PATH.__gmpf_set_str(mpf_t, cobj, i32) -> i32 as mpf_set_str
-from C import GMP_PATH.__gmpf_add(mpf_t, mpf_t, mpf_t) as mpf_add
-from C import GMP_PATH.__gmpf_sub(mpf_t, mpf_t, mpf_t) as mpf_sub
-from C import GMP_PATH.__gmpf_mul(mpf_t, mpf_t, mpf_t) as mpf_mul
-from C import GMP_PATH.__gmpf_div(mpf_t, mpf_t, mpf_t) as mpf_div
-from C import GMP_PATH.__gmpf_abs(mpf_t, mpf_t) as mpf_abs
-from C import GMP_PATH.__gmpf_cmp(mpf_t, mpf_t) -> i32 as mpf_cmp
-from C import GMP_PATH.__gmpf_get_d(mpf_t) -> float as mpf_get_d
+@pure
+@llvm
+def _f64_bits(x: float) -> u64:
+    %0 = bitcast double %x to i64
+    ret i64 %0
 
 
-# _new_mpf_t allocates a zero-valued mpf_t with at least prec bits of precision.
-# The limbs are allocated the way mpf_init2 sizes them, but on the garbage-collected heap: GMP never
-# reallocates the limbs of an mpf_t after its initialization, so no mpf_clear is needed.
-def _new_mpf_t(prec: int) -> mpf_t:
-    limbs = (max(prec, 53) + 2 * GMP_LIMB_SIZE - 1) // GMP_LIMB_SIZE
-    d = Ptr[gmp_limb_t](limbs + 1)
-    for i in range(limbs + 1): d[i] = gmp_limb_t(0)
-    return mpf_t(i32(limbs), i32(0), 0, d)
+def _bit(a: Ptr[u64], i: int) -> bool:
+    # bit i of the integer a (i >= 0, inside a)
+    return (a[i >> 6] >> u64(i & 63)) & u64(1) != u64(0)
 
 
-# _next_away_from_zero returns the float that follows the finite non-zero float x, away from zero.
-def _next_away_from_zero(x: float) -> float:
-    bits = Ptr[u64](__ptr__(x).as_byte())[0] + u64(1)
-    return Ptr[float](__ptr__(bits).as_byte())[0]
+def _any_below(a: Ptr[u64], i: int) -> bool:
+    # whether any of the bits 0 .. i - 1 of a is set
+    q, r = i >> 6, i & 63
+    for j in range(q):
+        if a[j] != u64(0):
+            return True
+    return r > 0 and (a[q] & ((u64(1) << u64(r)) - u64(1))) != u64(0)
+
+
+def _shift_into(dst: Ptr[u64], dn: int, src: Ptr[u64], sn: int, d: int):
+    # dst = the low dn limbs of src >> d (d >= 0) or src << -d (d < 0); src's limbs beyond sn read as zero. dst must
+    # not overlap src.
+    if d >= 0:
+        q, r = d >> 6, d & 63
+        for j in range(dn):
+            k = j + q
+            lo = src[k] if k < sn else u64(0)
+            if r == 0:
+                dst[j] = lo
+            else:
+                hi = src[k + 1] if k + 1 < sn else u64(0)
+                dst[j] = (lo >> u64(r)) | (hi << u64(64 - r))
+    else:
+        e = -d
+        q, r = e >> 6, e & 63
+        for j in range(dn):
+            k = j - q
+            hi = src[k] if 0 <= k < sn else u64(0)
+            if r == 0:
+                dst[j] = hi
+            else:
+                lo = src[k - 1] if 0 <= k - 1 < sn else u64(0)
+                dst[j] = (hi << u64(r)) | (lo >> u64(64 - r))
+
+
+def _low_limb(a: Ptr[u64], n: int) -> int:
+    # the index of the lowest non-zero limb of a non-zero a
+    i = 0
+    while a[i] == u64(0):
+        i += 1
+    return i
 
 
 # BigFloat is a multi-precision floating point number, the counterpart of Go's math/big.Float.
 class BigFloat:
-    _mpf: mpf_t
-    _prec: int
+    _prec: int        # mantissa bits
+    _n: int           # mantissa limbs: (prec + 63) // 64
+    _zero: bool
+    _neg: bool        # the sign (zeros are signed)
+    _exp: int         # a non-zero value is 0.mant * 2^exp: mant's top bit stands for 2^(exp - 1)
+    _mant: Ptr[u64]   # _n limbs, the top bit of the top limb set; the bits below the precision are zero
+    _tmp: Ptr[u64]    # scratch owned by this object, grown when an operation needs more
+    _tmp_n: int
 
     def __init__(self, prec: int):
+        if prec <= 0:
+            raise ValueError(f"BigFloat: the precision must be positive, not {prec}")
         self._prec = prec
-        self._mpf = _new_mpf_t(prec)
+        self._n = (prec + 63) // 64
+        self._zero = True
+        self._neg = False
+        self._exp = 0
+        self._mant = Ptr[u64](self._n)
+        limbs.zero(self._mant, self._n)
+        self._tmp = Ptr[u64]()
+        self._tmp_n = 0
 
     def __repr__(self) -> str:
         return f"BigFloat({self.float64()})"
@@ -71,84 +117,412 @@ class BigFloat:
     def prec(self) -> int:
         return self._prec
 
-    # set_float64 sets z to x and returns z.
+    def _scratch(self, n: int) -> Ptr[u64]:
+        if n > self._tmp_n:
+            self._tmp_n = max(n, 2 * self._tmp_n)
+            self._tmp = Ptr[u64](self._tmp_n)
+        return self._tmp
+
+    def _set_zero(self, neg: bool):
+        self._zero = True
+        self._neg = neg
+        self._exp = 0
+        limbs.zero(self._mant, self._n)
+
+    def _round_from(self, src: Ptr[u64], sn: int, e0: int, sticky: bool, neg: bool):
+        # Sets the receiver to (-1)^neg (S + s) 2^e0, rounded to its precision, nearest, ties to even: S is the integer
+        # in src (sn limbs, which must not overlap the receiver's mantissa) and s is 0, or, with sticky, some value
+        # strictly between 0 and 1. With sticky, S must have at least prec + 2 bits (the callers make sure).
+        sn = limbs.normlen(src, sn)
+        if sn == 0:
+            self._set_zero(neg)
+            return
+        nbits = 64 * sn - limbs._clz64(src[sn - 1])
+        prec, n = self._prec, self._n
+        self._zero = False
+        self._neg = neg
+        self._exp = e0 + nbits
+        pad = 64 * n - prec  # the zero bits below the precision
+        # The top nbits of S, left-aligned in the mantissa (exact when nbits <= prec)
+        _shift_into(self._mant, n, src, sn, nbits - 64 * n)
+        if nbits <= prec:
+            return
+        k = nbits - prec  # bits dropped
+        round_bit = _bit(src, k - 1)
+        rest = sticky or _any_below(src, k - 1)
+        self._mant[0] &= ~((u64(1) << u64(pad)) - u64(1)) if pad > 0 else ~u64(0)
+        lsb = (self._mant[0] >> u64(pad)) & u64(1) != u64(0)
+        if round_bit and (rest or lsb):
+            if limbs.add_1(self._mant, self._mant, n, u64(1) << u64(pad)) != u64(0):
+                # the mantissa was all ones: it becomes 0.1 binary, one exponent up
+                self._mant[n - 1] = u64(1) << u64(63)
+                self._exp += 1
+
+    def _set_from(self, x: BigFloat, neg: bool):
+        # self = (-1)^neg |x|, rounded to self's precision
+        if x is self:
+            self._neg = neg
+            return
+        if x._zero:
+            self._set_zero(neg)
+            return
+        self._round_from(x._mant, x._n, x._exp - 64 * x._n, False, neg)
+
+    # set_float64 sets z to x (rounded to z's precision) and returns z.
     def set_float64(self, x: float) -> BigFloat:
-        mpf_set_d(self._mpf, x)
+        if math.isnan(x) or math.isinf(x):
+            raise ValueError(f"BigFloat.set_float64: {x} is not finite")
+        bits = _f64_bits(x)
+        neg = bits >> u64(63) != u64(0)
+        e = int((bits >> u64(52)) & u64(0x7ff))
+        f = bits & ((u64(1) << u64(52)) - u64(1))
+        if e == 0 and f == u64(0):
+            self._set_zero(neg)
+            return self
+        m = __array__[u64](1)
+        if e == 0:
+            m[0] = f
+            self._round_from(m, 1, -1074, False, neg)
+        else:
+            m[0] = f | (u64(1) << u64(52))
+            self._round_from(m, 1, e - 1075, False, neg)
         return self
 
-    # set_string sets z to the value of the base-10 number in s and returns z.
+    # set_string sets z to the value of the decimal number in s, correctly rounded to z's precision, and returns z.
+    # It takes [+-]digits[.[digits]] or [+-].digits ("12", "12.", "-.5", "1.25"), and raises ValueError on anything else.
     def set_string(self, s: str) -> BigFloat:
-        if mpf_set_str(self._mpf, s.c_str(), i32(10)) != i32(0):
+        i, n = 0, len(s)
+        neg = False
+        if i < n and (s[i] == '+' or s[i] == '-'):
+            neg = s[i] == '-'
+            i += 1
+        digits = 0
+        frac = 0
+        seen_point = False
+        j = i
+        while j < n:
+            c = s[j]
+            if c == '.':
+                if seen_point:
+                    raise ValueError(f"BigFloat.set_string: invalid number {s}")
+                seen_point = True
+            elif '0' <= c <= '9':
+                digits += 1
+                if seen_point:
+                    frac += 1
+            else:
+                raise ValueError(f"BigFloat.set_string: invalid number {s}")
+            j += 1
+        if digits == 0:
             raise ValueError(f"BigFloat.set_string: invalid number {s}")
+        # D, the digits as an integer, 19 at a time (10^19 < 2^64)
+        dn_max = digits * 2136 // 41100 + 2  # limbs: digits * log2(10) / 64, rounded up
+        d = Ptr[u64](dn_max)
+        limbs.zero(d, dn_max)
+        dn = 1
+        chunk, chunk_len = u64(0), 0
+        for j in range(i, n):
+            c = s[j]
+            if c == '.':
+                continue
+            chunk = chunk * u64(10) + u64(ord(c) - 48)
+            chunk_len += 1
+            if chunk_len == 19:
+                dn = _mul_add_small(d, dn, u64(10000000000000000000), chunk)
+                chunk, chunk_len = u64(0), 0
+        if chunk_len > 0:
+            p10 = u64(1)
+            for _ in range(chunk_len):
+                p10 *= u64(10)
+            dn = _mul_add_small(d, dn, p10, chunk)
+        dn = limbs.normlen(d, dn)
+        if dn == 0:
+            self._set_zero(neg)
+            return self
+        if frac == 0:
+            self._round_from(d, dn, 0, False, neg)
+            return self
+        # T = 10^frac
+        tn_max = frac * 2136 // 41100 + 2
+        t = Ptr[u64](tn_max)
+        limbs.zero(t, tn_max)
+        t[0] = u64(1)
+        tn = 1
+        left = frac
+        while left > 0:
+            step = min(left, 19)
+            p10 = u64(1)
+            for _ in range(step):
+                p10 *= u64(10)
+            tn = _mul_add_small(t, tn, p10, u64(0))
+            left -= step
+        tn = limbs.normlen(t, tn)
+        # Q = floor(D 2^(64 k) / T) with at least prec + 2 bits, and whether the division leaves a remainder
+        k = max(0, (self._prec + 2 + 63) // 64 + tn - dn + 1)
+        un = dn + k
+        u = Ptr[u64](un + 1)
+        limbs.zero(u, k)
+        limbs.copy(u + k, d, dn)
+        qn = un - tn + 1
+        q = Ptr[u64](qn)
+        sticky = False
+        if tn == 1:
+            sticky = limbs.divrem_1(q, u, un, t[0]) != u64(0)
+        else:
+            r = Ptr[u64](tn)
+            us = Ptr[u64](un + 1)
+            vs = Ptr[u64](tn)
+            limbs.divrem(q, r, u, un, t, tn, us, vs)
+            sticky = limbs.normlen(r, tn) != 0
+        self._round_from(q, qn, -64 * k, sticky, neg)
         return self
 
-    # set sets z to x and returns z.
+    # set sets z to x (rounded to z's precision) and returns z.
     def set(self, x: BigFloat) -> BigFloat:
-        mpf_set(self._mpf, x._mpf)
+        self._set_from(x, x._neg)
+        return self
+
+    # set_mant_exp sets z to x * 2^exp (rounded to z's precision) and returns z.
+    def set_mant_exp(self, x: BigFloat, exp: int) -> BigFloat:
+        if x is self:
+            if not self._zero:
+                self._exp += exp
+            return self
+        self._set_from(x, x._neg)
+        if not self._zero:
+            self._exp += exp
         return self
 
     # copy returns a newly allocated BigFloat with the precision and value of the receiver.
     def copy(self) -> BigFloat:
         return BigFloat(self._prec).set(self)
 
-    # add sets z to x + y and returns z.
-    def add(self, x: BigFloat, y: BigFloat) -> BigFloat:
-        mpf_add(self._mpf, x._mpf, y._mpf)
-        return self
-
-    # sub sets z to x - y and returns z.
-    def sub(self, x: BigFloat, y: BigFloat) -> BigFloat:
-        mpf_sub(self._mpf, x._mpf, y._mpf)
-        return self
-
-    # mul sets z to x * y and returns z.
-    def mul(self, x: BigFloat, y: BigFloat) -> BigFloat:
-        mpf_mul(self._mpf, x._mpf, y._mpf)
-        return self
-
-    # quo sets z to x / y and returns z.
-    def quo(self, x: BigFloat, y: BigFloat) -> BigFloat:
-        if int(y._mpf._mp_size) == 0:
-            raise ValueError("BigFloat.quo: division by zero")
-        mpf_div(self._mpf, x._mpf, y._mpf)
-        return self
-
-    # abs sets z to |x| and returns z.
+    # abs sets z to |x| (rounded to z's precision) and returns z.
     def abs(self, x: BigFloat) -> BigFloat:
-        mpf_abs(self._mpf, x._mpf)
+        self._set_from(x, False)
         return self
 
-    # cmp returns -1 if z < y, 0 if z == y and +1 if z > y.
-    def cmp(self, y: BigFloat) -> int:
-        c = int(mpf_cmp(self._mpf, y._mpf))
-        if c < 0: return -1
-        if c > 0: return 1
+    # neg sets z to -x (rounded to z's precision) and returns z.
+    def neg(self, x: BigFloat) -> BigFloat:
+        self._set_from(x, not x._neg)
+        return self
+
+    def _ucmp(self, y: BigFloat) -> int:
+        # -1, 0 or 1 as |self| < |y|, ==, > (both non-zero)
+        if self._exp != y._exp:
+            return -1 if self._exp < y._exp else 1
+        i, j = self._n - 1, y._n - 1
+        while i >= 0 and j >= 0:
+            a, b = self._mant[i], y._mant[j]
+            if a != b:
+                return -1 if a < b else 1
+            i -= 1
+            j -= 1
+        while i >= 0:
+            if self._mant[i] != u64(0):
+                return 1
+            i -= 1
+        while j >= 0:
+            if y._mant[j] != u64(0):
+                return -1
+            j -= 1
         return 0
+
+    def _add(self, x: BigFloat, y: BigFloat, yneg: bool):
+        # self = x + (-1)^yneg |y|, rounded once
+        if x._zero:
+            if y._zero:
+                self._set_zero(x._neg and yneg)  # -0 + -0 = -0, otherwise +0
+            else:
+                self._set_from(y, yneg)
+            return
+        if y._zero:
+            self._set_from(x, x._neg)
+            return
+        # The operand with the larger magnitude is big: its top bit at the top of a window of w limbs, w at least two
+        # limbs more than any of the precisions involved (so a sticky result keeps prec + 2 bits). The other is shifted
+        # into the window by the difference of the exponents; its bits below the window only set sticky.
+        sub = x._neg != yneg
+        c = x._ucmp(y)
+        if sub and c == 0:
+            self._set_zero(False)  # x - x = +0
+            return
+        big, small = (x, y) if c >= 0 else (y, x)
+        neg = x._neg if c >= 0 else yneg
+        w = max(self._n, max(x._n, y._n)) + 2
+        # window (w + 1 limbs, the top one for a carry), then room for the shifted small operand (w limbs)
+        win = self._scratch(2 * w + 1)
+        sw = win + (w + 1)
+        limbs.zero(win, w + 1)
+        limbs.copy(win + (w - big._n), big._mant, big._n)
+        d = big._exp - small._exp  # >= 0
+        # small's top bit goes to window bit 64 w - 1 - d: a left shift of its mantissa by 64 (w - n_small) - d
+        shift = 64 * (w - small._n) - d
+        sticky = False
+        if shift >= 0:
+            _shift_into(sw, w, small._mant, small._n, -shift)
+        else:
+            if -shift >= 64 * small._n:
+                limbs.zero(sw, w)
+                sticky = True
+            else:
+                _shift_into(sw, w, small._mant, small._n, -shift)
+                sticky = _any_below(small._mant, -shift)
+        if sub:
+            limbs.sub_n(win, win, sw, w)
+            if sticky:
+                # the true difference is slightly below: borrow one unit and keep the fraction as sticky
+                limbs.sub_1(win, win, w, u64(1))
+        else:
+            win[w] = limbs.add_n(win, win, sw, w)
+        self._round_from(win, w + 1, big._exp - 64 * w, sticky, neg)
+
+    # add sets z to the rounded sum x + y and returns z.
+    def add(self, x: BigFloat, y: BigFloat) -> BigFloat:
+        self._add(x, y, y._neg)
+        return self
+
+    # sub sets z to the rounded difference x - y and returns z.
+    def sub(self, x: BigFloat, y: BigFloat) -> BigFloat:
+        self._add(x, y, not y._neg)
+        return self
+
+    # mul sets z to the rounded product x * y and returns z.
+    def mul(self, x: BigFloat, y: BigFloat) -> BigFloat:
+        neg = x._neg != y._neg
+        if x._zero or y._zero:
+            self._set_zero(neg)
+            return self
+        # only the limbs from the lowest non-zero one up (a short value, such as 0.5, has one)
+        nx, ny = x._n, y._n
+        lx, ly = _low_limb(x._mant, nx), _low_limb(y._mant, ny)
+        mx, my = nx - lx, ny - ly
+        r = self._scratch(mx + my)
+        limbs.mul(r, x._mant + lx, mx, y._mant + ly, my)
+        self._round_from(r, mx + my, (x._exp - 64 * mx) + (y._exp - 64 * my), False, neg)
+        return self
+
+    # quo sets z to the rounded quotient x / y and returns z; ValueError for y = 0.
+    def quo(self, x: BigFloat, y: BigFloat) -> BigFloat:
+        if y._zero:
+            raise ValueError("BigFloat.quo: division by zero")
+        neg = x._neg != y._neg
+        if x._zero:
+            self._set_zero(neg)
+            return self
+        # Q = floor(X 2^(64 k) / Y) with at least prec + 2 bits (X >= 2^(64 nx - 1), Y < 2^(64 ny)), and whether the
+        # division leaves a remainder; Y without its zero low limbs (a short divisor, such as 2.0, takes one)
+        nx, yn = x._n, y._n
+        ly = _low_limb(y._mant, yn)
+        ny = yn - ly
+        ym = y._mant + ly
+        k = max(0, (self._prec + 2 + 63) // 64 + ny - nx + 1)
+        un = nx + k
+        qn = un - ny + 1
+        # scratch: u (un), q (qn), r (ny), us (un + 1), vs (ny)
+        u = self._scratch(un + qn + ny + (un + 1) + ny)
+        q = u + un
+        r = q + qn
+        us = r + ny
+        vs = us + (un + 1)
+        limbs.zero(u, k)
+        limbs.copy(u + k, x._mant, nx)
+        sticky = False
+        if ny == 1:
+            sticky = limbs.divrem_1(q, u, un, ym[0]) != u64(0)
+        else:
+            limbs.divrem(q, r, u, un, ym, ny, us, vs)
+            sticky = limbs.normlen(r, ny) != 0
+        self._round_from(q, qn, (x._exp - 64 * nx - 64 * k) - (y._exp - 64 * ny), sticky, neg)
+        return self
+
+    # cmp returns -1 if z < y, 0 if z == y and +1 if z > y (the zeros are equal).
+    def cmp(self, y: BigFloat) -> int:
+        if self._zero and y._zero:
+            return 0
+        if self._zero:
+            return 1 if y._neg else -1
+        if y._zero:
+            return -1 if self._neg else 1
+        if self._neg != y._neg:
+            return -1 if self._neg else 1
+        c = self._ucmp(y)
+        return -c if self._neg else c
 
     # sign returns -1 if z < 0, 0 if z == 0 and +1 if z > 0.
     def sign(self) -> int:
-        s = int(self._mpf._mp_size)
-        if s < 0: return -1
-        if s > 0: return 1
-        return 0
+        if self._zero:
+            return 0
+        return -1 if self._neg else 1
 
-    # float64 returns the float nearest to z.
+    # float64 returns the float nearest to z (ties to even): denormals are rounded at their precision, a value that
+    # rounds to 2^1024 or more in magnitude gives +-inf, and one of at most half the smallest denormal +-0.
     def float64(self) -> float:
-        # mpf_get_d truncates towards zero: z lies between lo and the next float away from zero.
-        lo = mpf_get_d(self._mpf)
-        if lo == 0.0 or math.isinf(lo): return lo
-        hi = _next_away_from_zero(lo)
-        if math.isinf(hi): return lo
+        if self._zero:
+            return -0.0 if self._neg else 0.0
+        e = self._exp  # the value is in [2^(e - 1), 2^e)
+        if e > 1024:
+            return -math.inf if self._neg else math.inf
+        p = 53 if e - 1 >= -1022 else e + 1074  # mantissa bits of the float at this exponent
+        if p < 0:
+            return -0.0 if self._neg else 0.0
+        n = self._n
+        total = 64 * n  # the mantissa's bits (the value is mant * 2^(e - total))
+        m = u64(0)
+        if p > 0:
+            # the top p bits
+            q = __array__[u64](1)
+            _shift_into(q, 1, self._mant, n, total - p)
+            m = q[0]
+        round_bit = _bit(self._mant, total - p - 1)
+        rest = _any_below(self._mant, total - p - 1)
+        if round_bit and (rest or (m & u64(1)) != u64(0)):
+            m += u64(1)
+            if p == 53 and m == (u64(1) << u64(53)):
+                m = u64(1) << u64(52)
+                e += 1
+                if e > 1024:
+                    return -math.inf if self._neg else math.inf
+                p = 53
+        v = math.ldexp(float(m), e - p)
+        return -v if self._neg else v
 
-        prec = max(self._prec, 128)
-        err_lo = BigFloat(prec).set_float64(lo)
-        err_lo.sub(self, err_lo)
-        err_lo.abs(err_lo)
-        err_hi = BigFloat(prec).set_float64(hi)
-        err_hi.sub(err_hi, self)
-        err_hi.abs(err_hi)
+    # to_fixed returns round(z * 2^bits) as an Int[N] (N a multiple of 64), the halves rounded away from zero,
+    # computed exactly; OverflowError when the magnitude does not fit below 2^(N - 1).
+    def to_fixed(self, bits: int, N: Literal[int]) -> Int[N]:
+        if N % 64 != 0:
+            compile_error("BigFloat.to_fixed: N must be a multiple of 64")
+        if self._zero:
+            return Int[N](0)
+        K: Literal[int] = N // 64
+        n = self._n
+        sh = self._exp - 64 * n + bits  # the value times 2^bits is mant * 2^sh
+        if self._exp + bits > N - 1:
+            raise OverflowError(f"BigFloat.to_fixed: the value does not fit Int[{N}] at {bits} fractional bits")
+        out = UInt[N](0)
+        op = Ptr[u64](__ptr__(out).as_byte())
+        if sh >= 0:
+            _shift_into(op, K, self._mant, n, -sh)
+        else:
+            if -sh <= 64 * n:
+                _shift_into(op, K, self._mant, n, -sh)
+                if _bit(self._mant, -sh - 1):
+                    limbs.add_1(op, op, K, u64(1))
+            # else the value is below 2^-1 units: it rounds to zero
+        if out >> UInt[N](N - 1) != UInt[N](0):
+            raise OverflowError(f"BigFloat.to_fixed: the value does not fit Int[{N}] at {bits} fractional bits")
+        v = Int[N](out)
+        return -v if self._neg else v
 
-        return hi if err_hi.cmp(err_lo) < 0 else lo
+
+def _mul_add_small(a: Ptr[u64], n: int, m: u64, c: u64) -> int:
+    # a = a * m + c in place (a has room for one more limb); returns the new length
+    top = limbs.mul_1(a, a, n, m)
+    top += limbs.add_1(a, a, n, c)
+    if top != u64(0):
+        a[n] = top
+        return n + 1
+    return n
 
 
 # new_big_float creates a new BigFloat with value x and prec bits of precision.

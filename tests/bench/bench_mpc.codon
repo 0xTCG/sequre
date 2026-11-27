@@ -15,7 +15,8 @@ import internal.static as static
 
 from sequre import main
 from sequre.constants import (
-    MPC_FIELD_SIZE, MPC_RING_SIZE, MPC_MODULUS_BITS, MPC_NBIT_K, MPC_NBIT_F, MPC_NBIT_V, PACKING_SIZE, mpc_uint, size_t)
+    MPC_FIELD_SIZE, MPC_RING_SIZE, MPC_MODULUS_BITS, MPC_NBIT_K, MPC_NBIT_F, MPC_NBIT_V, PACKING_SIZE, mpc_uint, size_t,
+    MPC_INT_SIZE, MPC_SECOND_FIELD_SIZE)
 from sequre.decor import decor_div, via_decor, via_fourier, via_taylor, fourier_coeffs
 from sequre.stdlib.chebyshev import via_chebyshev
 from sequre.stdlib.nonlinear import (
@@ -171,6 +172,11 @@ CASES = [
     ("mpc.bcast.sub_scalar_sq_vec_1e4", "", "(x - m) * (x - m): an fp vector with cached Beaver partitions minus a secret scalar (broadcast_add), then the square, 1e4"),
     ("mpc.ndarray.rmatmul_float_128", "", "fp Sharetensor @ float ndarray 128x128"),
     ("mpc.public.add_identity_mat_256", "", "A + I for a 256x256 fp Sharetensor and a public identity (the diagonal public add)"),
+    # Run after bench_late_mpc, on values from a local generator (no stream moves): reductions by a modulus that is
+    # neither the ring nor the field. Witness: a digest of the results.
+    ("prim.mod.small_add_vec_1e5", "", "List[UInt192].add_mod by a small prime (MPC_SECOND_FIELD_SIZE), operands below it, 1e5: the share arithmetic of the bitwise protocols"),
+    ("prim.mod.limb_vec_1e5", "", "x % q of 1e5 full-width values by a 61-bit modulus (one limb)"),
+    ("prim.mod.wide_vec_1e5", "", "x % m of 1e5 full-width values by a full-width odd modulus, neither the ring nor the field"),
 ]
 
 handle_list_flag("mpc", CASES)
@@ -1629,6 +1635,94 @@ def bench_late_mpc(mpc, b: Bench):
         b.report(f"{size}x{size}", t, err)
 
 
+def local_uints(n: int, bits: int, seed: u64) -> List[mpc_uint]:
+    # Values below 2^bits from a local xorshift generator: CP1 alone draws them, so they move no random stream
+    state = seed
+    out = List[mpc_uint](n)
+    for _ in range(n):
+        x = mpc_uint(0)
+        left = bits
+        while left > 0:
+            state ^= state << u64(13)
+            state ^= state >> u64(7)
+            state ^= state << u64(17)
+            take = min(left, 60)
+            x = (x << mpc_uint(take)) | mpc_uint(int(state >> u64(64 - take)))
+            left -= take
+        out.append(x)
+    return out
+
+
+def local_small_uints(n: int, bound: int, seed: u64) -> List[mpc_uint]:
+    # Values below a small bound from a local xorshift generator (64-bit arithmetic only)
+    state = seed
+    out = List[mpc_uint](n)
+    for _ in range(n):
+        state ^= state << u64(13)
+        state ^= state >> u64(7)
+        state ^= state << u64(17)
+        out.append(mpc_uint(int(state % u64(bound))))
+    return out
+
+
+def digest(xs: List[mpc_uint]) -> float:
+    # The low 50 bits of a position-weighted sum of the values (mod 2^MPC_INT_SIZE): the same results, the same witness
+    acc = mpc_uint(0)
+    for i in range(len(xs)):
+        acc += xs[i] * mpc_uint(2 * i + 1)
+    return float(int(acc & mpc_uint((1 << 50) - 1)))
+
+
+def bench_reductions(mpc, b: Bench):
+    # After every other section, on values from a local generator: no other case's data move. CP1 times.
+    if not b.any_selected("prim.mod."):
+        return
+    n = 100000
+
+    if b.want(mpc, "prim.mod.small_add_vec_1e5"):
+        if mpc.pid == 1:
+            q = mpc_uint(MPC_SECOND_FIELD_SIZE)
+            va = local_small_uints(n, MPC_SECOND_FIELD_SIZE, u64(0x9E3779B97F4A7C15))
+            vb = local_small_uints(n, MPC_SECOND_FIELD_SIZE, u64(0xC2B2AE3D27D4EB4F))
+            r = va
+            t = Timer(b.reps(9), sync=False, batch=5)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    r = va.add_mod(vb, q)
+                t.end(mpc)
+            b.report(f"n={n};q={MPC_SECOND_FIELD_SIZE};check=digest", t, digest(r))
+
+    if b.want(mpc, "prim.mod.limb_vec_1e5"):
+        if mpc.pid == 1:
+            q = mpc_uint(0x1C3F2A9B4D5E6F71)  # 61 bits, odd
+            va = local_uints(n, MPC_INT_SIZE, u64(0x165667B19E3779F9))
+            r = local_uints(n, 1, u64(1))
+            t = Timer(b.reps(9), sync=False, batch=5)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    for i in range(n):
+                        r[i] = va[i] % q
+                t.end(mpc)
+            b.report(f"n={n};modulus_bits=61;check=digest", t, digest(r))
+
+    if b.want(mpc, "prim.mod.wide_vec_1e5"):
+        if mpc.pid == 1:
+            # MPC_INT_SIZE - 3 bits with the top one set, odd: neither the ring nor the field
+            m = local_uints(1, MPC_INT_SIZE - 3, u64(0x27D4EB2F165667C5))[0] | (mpc_uint(1) << mpc_uint(MPC_INT_SIZE - 4)) | mpc_uint(1)
+            va = local_uints(n, MPC_INT_SIZE, u64(0x85EBCA77C2B2AE63))
+            r = local_uints(n, 1, u64(1))
+            t = Timer(b.reps(9), sync=False, batch=5)
+            while t.next():
+                t.begin(mpc)
+                for _ in range(t.batch):
+                    for i in range(n):
+                        r[i] = va[i] % m
+                t.end(mpc)
+            b.report(f"n={n};modulus_bits={MPC_INT_SIZE - 3};check=digest", t, digest(r))
+
+
 @main
 def bench_mpc_main(mpc):
     b = Bench("mpc", mpc.pid, CASES)
@@ -1652,6 +1746,7 @@ def bench_mpc_main(mpc):
     bench_twins(mpc, b)
     bench_streams(mpc, b)
     bench_late_mpc(mpc, b)
+    bench_reductions(mpc, b)
     b.finish(mpc)
 
 

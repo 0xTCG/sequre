@@ -1,0 +1,751 @@
+"""
+Multi-precision naturals on 64-bit limbs.
+
+The integer arithmetic behind every operation on integers wider than 128 bits that LLVM cannot do well itself: the
+remainder and quotient of UInt and Int (LLVM compiles a wide udiv or urem into a loop over the bits, and AArch64 has no
+instruction for it), and with them the reductions of Lattiseq's CRT reconstruction; the product and the reduction
+modulo the MPC field's prime; the mantissas of sequre.lattiseq.bigfloat.
+
+A number is a little-endian array of 64-bit limbs, given as a pointer and a length. Functions write their result to
+memory the caller owns (its own stack, or an object's buffer): nothing here allocates, so every function is reentrant
+and safe in parallel loops. Scratch space is the caller's too: the fixed-width wrappers below put theirs on the stack,
+sized by the static width.
+
+The divisions use 64 x 64 -> 128-bit products and 128 / 64-bit divisions (a runtime library call that every platform
+has; a divisor's reciprocal replaces most of them); the field's product uses LLVM's wide multiplications, shifts and
+additions. Nothing here divides, takes the remainder of or converts to float an integer wider than 128 bits, so every
+platform computes the same bits.
+
+The fixed-width functions (udivrem, umod, udiv, sdivrem, ...) view a UInt[N] in memory as N / 64 limbs. That needs
+little-endian limbs, which every platform Sequre builds for has (checked at import). A width that is not a multiple of
+64 is zero-extended to the next multiple first: LLVM leaves the bits above such a width unspecified in memory.
+"""
+
+import internal.static as static
+
+LIMB_BITS: Literal[int] = 64
+
+
+# --- 64-bit and 128-bit helpers -------------------------------------------------------------------------------------
+
+@pure
+@llvm
+def _clz64(x: u64) -> int:
+    # Leading zeros of x; 64 for zero
+    declare i64 @llvm.ctlz.i64(i64, i1)
+    %0 = call i64 @llvm.ctlz.i64(i64 %x, i1 false)
+    ret i64 %0
+
+
+@pure
+@llvm
+def _ctz64(x: u64) -> int:
+    # Trailing zeros of x; 64 for zero
+    declare i64 @llvm.cttz.i64(i64, i1)
+    %0 = call i64 @llvm.cttz.i64(i64 %x, i1 false)
+    ret i64 %0
+
+
+@pure
+@llvm
+def _wide(x: u64) -> UInt[128]:
+    %0 = zext i64 %x to i128
+    ret i128 %0
+
+
+@pure
+@llvm
+def _lo(x: UInt[128]) -> u64:
+    %0 = trunc i128 %x to i64
+    ret i64 %0
+
+
+@pure
+@llvm
+def _hi(x: UInt[128]) -> u64:
+    %0 = lshr i128 %x, 64
+    %1 = trunc i128 %0 to i64
+    ret i64 %1
+
+
+@pure
+@llvm
+def _join(hi: u64, lo: u64) -> UInt[128]:
+    %0 = zext i64 %hi to i128
+    %1 = shl i128 %0, 64
+    %2 = zext i64 %lo to i128
+    %3 = or i128 %1, %2
+    ret i128 %3
+
+
+@pure
+@llvm
+def _mul(a: u64, b: u64) -> UInt[128]:
+    # The full 128-bit product
+    %0 = zext i64 %a to i128
+    %1 = zext i64 %b to i128
+    %2 = mul i128 %0, %1
+    ret i128 %2
+
+
+@pure
+@llvm
+def _udiv128(n: UInt[128], d: UInt[128]) -> UInt[128]:
+    %0 = udiv i128 %n, %d
+    ret i128 %0
+
+
+@pure
+@llvm
+def _udiv64(n: u64, d: u64) -> u64:
+    %0 = udiv i64 %n, %d
+    ret i64 %0
+
+
+@pure
+@llvm
+def _urem64(n: u64, d: u64) -> u64:
+    %0 = urem i64 %n, %d
+    ret i64 %0
+
+
+def _div_2by1(hi: u64, lo: u64, d: u64) -> Tuple[u64, u64]:
+    # (hi * 2^64 + lo) / d and its remainder, for hi < d (the quotient fits a limb)
+    q = _lo(_udiv128(_join(hi, lo), _wide(d)))
+    return q, lo - q * d
+
+
+def _reciprocal(d: u64) -> u64:
+    # floor((2^128 - 1) / d) - 2^64 for a normalized d (top bit set): the quotient of (~d) * 2^64 + (2^64 - 1) by d,
+    # which fits a limb since ~d < d
+    return _lo(_udiv128(_join(~d, ~u64(0)), _wide(d)))
+
+
+def _div_2by1_pre(hi: u64, lo: u64, d: u64, v: u64) -> Tuple[u64, u64]:
+    # (hi * 2^64 + lo) / d and its remainder for a normalized d with reciprocal v and hi < d: two products and a few
+    # additions in place of a division (Moller and Granlund, "Improved division by invariant integers", 2011,
+    # algorithm 4)
+    p = _mul(v, hi) + _join(hi, lo)
+    q1 = _hi(p) + u64(1)
+    q0 = _lo(p)
+    r = lo - q1 * d
+    if r > q0:
+        q1 -= u64(1)
+        r += d
+    if r >= d:
+        q1 += u64(1)
+        r -= d
+    return q1, r
+
+
+# --- limb arrays ----------------------------------------------------------------------------------------------------
+
+def normlen(a: Ptr[u64], n: int) -> int:
+    # The length of a without its zero limbs at the top
+    while n > 0 and a[n - 1] == u64(0):
+        n -= 1
+    return n
+
+
+def cmp(a: Ptr[u64], b: Ptr[u64], n: int) -> int:
+    # -1, 0 or 1 as a < b, a == b, a > b (both n limbs)
+    i = n - 1
+    while i >= 0:
+        x, y = a[i], b[i]
+        if x != y:
+            return 1 if x > y else -1
+        i -= 1
+    return 0
+
+
+def copy(r: Ptr[u64], a: Ptr[u64], n: int):
+    for i in range(n):
+        r[i] = a[i]
+
+
+def zero(r: Ptr[u64], n: int):
+    for i in range(n):
+        r[i] = u64(0)
+
+
+def add_n(r: Ptr[u64], a: Ptr[u64], b: Ptr[u64], n: int) -> u64:
+    # r = a + b (n limbs each; r may be a or b); returns the carry out
+    c = UInt[128](0)
+    for i in range(n):
+        s = _wide(a[i]) + _wide(b[i]) + c
+        r[i] = _lo(s)
+        c = s >> UInt[128](64)
+    return _lo(c)
+
+
+def add_1(r: Ptr[u64], a: Ptr[u64], n: int, b: u64) -> u64:
+    # r = a + b (r may be a); returns the carry out
+    c = b
+    for i in range(n):
+        s = a[i] + c
+        c = u64(1) if s < c else u64(0)
+        r[i] = s
+    return c
+
+
+def sub_n(r: Ptr[u64], a: Ptr[u64], b: Ptr[u64], n: int) -> u64:
+    # r = a - b (n limbs each; r may be a or b); returns the borrow out (0 or 1)
+    borrow = u64(0)
+    for i in range(n):
+        x, y = a[i], b[i]
+        d = x - y
+        b1 = u64(1) if x < y else u64(0)
+        r[i] = d - borrow
+        b2 = u64(1) if d < borrow else u64(0)
+        borrow = b1 | b2
+    return borrow
+
+
+def sub_1(r: Ptr[u64], a: Ptr[u64], n: int, b: u64) -> u64:
+    # r = a - b (r may be a); returns the borrow out
+    borrow = b
+    for i in range(n):
+        x = a[i]
+        r[i] = x - borrow
+        borrow = u64(1) if x < borrow else u64(0)
+    return borrow
+
+
+def neg(r: Ptr[u64], a: Ptr[u64], n: int) -> u64:
+    # r = -a mod 2^(64 n) (r may be a); returns 1 unless a is zero
+    borrow = u64(0)
+    for i in range(n):
+        x = a[i]
+        d = u64(0) - x
+        b1 = u64(1) if x != u64(0) else u64(0)
+        r[i] = d - borrow
+        b2 = u64(1) if d < borrow else u64(0)
+        borrow = b1 | b2
+    return borrow
+
+
+def lshift(r: Ptr[u64], a: Ptr[u64], n: int, s: int) -> u64:
+    # r = a << s for 0 < s < 64 (r may be a; n >= 1); returns the bits shifted out of the top limb
+    sl, sr = u64(s), u64(64 - s)
+    out = a[n - 1] >> sr
+    i = n - 1
+    while i > 0:
+        r[i] = (a[i] << sl) | (a[i - 1] >> sr)
+        i -= 1
+    r[0] = a[0] << sl
+    return out
+
+
+def rshift(r: Ptr[u64], a: Ptr[u64], n: int, s: int) -> u64:
+    # r = a >> s for 0 < s < 64 (r may be a; n >= 1); returns the bits shifted out of the bottom limb, at the top
+    sl, sr = u64(64 - s), u64(s)
+    out = a[0] << sl
+    for i in range(n - 1):
+        r[i] = (a[i] >> sr) | (a[i + 1] << sl)
+    r[n - 1] = a[n - 1] >> sr
+    return out
+
+
+def mul_1(r: Ptr[u64], a: Ptr[u64], n: int, b: u64) -> u64:
+    # r = a * b (r may be a); returns the top limb of the product
+    c = u64(0)
+    for i in range(n):
+        p = _mul(a[i], b) + _wide(c)
+        r[i] = _lo(p)
+        c = _hi(p)
+    return c
+
+
+def addmul_1(r: Ptr[u64], a: Ptr[u64], n: int, b: u64) -> u64:
+    # r += a * b over n limbs; returns the carry out (a limb)
+    c = u64(0)
+    for i in range(n):
+        p = _mul(a[i], b) + _wide(r[i]) + _wide(c)
+        r[i] = _lo(p)
+        c = _hi(p)
+    return c
+
+
+def submul_1(r: Ptr[u64], a: Ptr[u64], n: int, b: u64) -> u64:
+    # r -= a * b over n limbs; returns the borrow out (a limb, to subtract from the limb above)
+    c = u64(0)
+    for i in range(n):
+        p = _mul(a[i], b) + _wide(c)
+        lo = _lo(p)
+        x = r[i]
+        r[i] = x - lo
+        c = _hi(p) + (u64(1) if x < lo else u64(0))
+    return c
+
+
+def mul(r: Ptr[u64], a: Ptr[u64], an: int, b: Ptr[u64], bn: int):
+    # r = a * b, an + bn limbs (an, bn >= 1); r must not overlap a or b
+    r[an] = mul_1(r, a, an, b[0])
+    for j in range(1, bn):
+        r[an + j] = addmul_1(r + j, a, an, b[j])
+
+
+def sqr(r: Ptr[u64], a: Ptr[u64], n: int):
+    # r = a * a, 2 n limbs; r must not overlap a
+    mul(r, a, n, a, n)
+
+
+# --- division -------------------------------------------------------------------------------------------------------
+
+def divrem_1(q: Ptr[u64], a: Ptr[u64], n: int, d: u64) -> u64:
+    # q = a / d (n limbs; q may be a, or null for no quotient) for d != 0; returns a mod d. The divisor is normalized
+    # (shifted until its top bit is set) and the dividend shifted with it on the fly; each limb then takes a division by
+    # the divisor's reciprocal.
+    s = _clz64(d)
+    dn = d << u64(s)
+    v = _reciprocal(dn)
+    sl = u64(s)
+    sr = u64(64 - s) if s > 0 else u64(0)
+    r = (a[n - 1] >> sr) if s > 0 else u64(0)
+    j = n - 1
+    while j >= 0:
+        u0 = a[j] << sl
+        if s > 0 and j > 0:
+            u0 |= a[j - 1] >> sr
+        qj, r = _div_2by1_pre(r, u0, dn, v)
+        if q:
+            q[j] = qj
+        j -= 1
+    return r >> sl
+
+
+def divrem(q: Ptr[u64], r: Ptr[u64], u: Ptr[u64], un: int, v: Ptr[u64], vn: int, us: Ptr[u64], vs: Ptr[u64]):
+    """
+    q = u / v and r = u mod v, by Knuth's algorithm D (TAOCP vol. 2, 4.3.1), for un >= vn >= 2 and v[vn - 1] != 0.
+
+    q has un - vn + 1 limbs and r has vn limbs; either may be null when it is not wanted. Neither may overlap u or v.
+    us (un + 1 limbs) and vs (vn limbs) are scratch.
+    """
+    # D1: normalize, so that the divisor's top limb has its top bit set. A shift by 64 is undefined: s = 0 copies.
+    s = _clz64(v[vn - 1])
+    if s > 0:
+        lshift(vs, v, vn, s)
+        us[un] = lshift(us, u, un, s)
+    else:
+        copy(vs, v, vn)
+        copy(us, u, un)
+        us[un] = u64(0)
+    vh = vs[vn - 1]
+    vl = vs[vn - 2]
+    # The divisor's reciprocal costs one division and saves one per quotient limb: worth it from three on
+    pre = un - vn >= 2
+    vinv = _reciprocal(vh) if pre else u64(0)
+    j = un - vn
+    while j >= 0:
+        # D3: estimate the quotient limb from the top two limbs of the partial remainder and the divisor's top limb,
+        # then correct it with the next limb of each: afterwards it is the true one or one too large.
+        u2 = us[j + vn]
+        u1 = us[j + vn - 1]
+        u0 = us[j + vn - 2]
+        qhat = u64(0)
+        rhat = UInt[128](0)
+        if u2 >= vh:
+            # The estimate does not fit a limb (u2 == vh, since the partial remainder is below the divisor): the
+            # largest limb, with the remainder u2 * 2^64 + u1 - (2^64 - 1) * vh = u1 + vh
+            qhat = ~u64(0)
+            rhat = _wide(u1) + _wide(vh)
+        else:
+            qhat, rh = _div_2by1_pre(u2, u1, vh, vinv) if pre else _div_2by1(u2, u1, vh)
+            rhat = _wide(rh)
+        while rhat >> UInt[128](64) == UInt[128](0) and _mul(qhat, vl) > _join(_lo(rhat), u0):
+            qhat -= u64(1)
+            rhat += _wide(vh)
+        # D4: multiply and subtract; D5, D6: if that went below zero, the estimate was one too large: add back
+        borrow = submul_1(us + j, vs, vn, qhat)
+        top = us[j + vn]
+        us[j + vn] = top - borrow
+        if top < borrow:
+            qhat -= u64(1)
+            us[j + vn] += add_n(us + j, us + j, vs, vn)
+        if q:
+            q[j] = qhat
+        j -= 1
+    # D8: unnormalize the remainder (the limbs above it are zero now)
+    if r:
+        if s > 0:
+            rshift(r, us, vn, s)
+        else:
+            copy(r, us, vn)
+
+
+# --- fixed-width integers -------------------------------------------------------------------------------------------
+
+def _round_up(N: Literal[int]) -> Literal[int]:
+    return (N + 63) // 64 * 64
+
+
+@pure
+@llvm
+def _zext(x: UInt[N], M: Literal[int], N: Literal[int]) -> UInt[M]:
+    %0 = zext i{=N} %x to i{=M}
+    ret i{=M} %0
+
+
+@pure
+@llvm
+def _trunc(x: UInt[N], M: Literal[int], N: Literal[int]) -> UInt[M]:
+    %0 = trunc i{=N} %x to i{=M}
+    ret i{=M} %0
+
+
+@pure
+@llvm
+def _low_u64(x: UInt[N], N: Literal[int]) -> u64:
+    %0 = trunc i{=N} %x to i64
+    ret i64 %0
+
+
+@pure
+@llvm
+def _from_u64(x: u64, N: Literal[int]) -> UInt[N]:
+    %0 = zext i64 %x to i{=N}
+    ret i{=N} %0
+
+
+@pure
+@llvm
+def _fits_u64(x: UInt[N], N: Literal[int]) -> bool:
+    %0 = lshr i{=N} %x, 64
+    %1 = icmp eq i{=N} %0, 0
+    %2 = zext i1 %1 to i8
+    ret i8 %2
+
+
+@pure
+@llvm
+def _is_pow2(x: UInt[N], N: Literal[int]) -> bool:
+    # x is a power of two (x != 0 and x & (x - 1) == 0)
+    %0 = sub i{=N} %x, 1
+    %1 = and i{=N} %x, %0
+    %2 = icmp eq i{=N} %1, 0
+    %3 = icmp ne i{=N} %x, 0
+    %4 = and i1 %2, %3
+    %5 = zext i1 %4 to i8
+    ret i8 %5
+
+
+@pure
+@llvm
+def _ctz_n(x: UInt[N], N: Literal[int]) -> int:
+    declare i{=N} @llvm.cttz.i{=N}(i{=N}, i1)
+    %0 = call i{=N} @llvm.cttz.i{=N}(i{=N} %x, i1 false)
+    %1 = trunc i{=N} %0 to i64
+    ret i64 %1
+
+
+@pure
+@llvm
+def _udiv_n(a: UInt[N], b: UInt[N], N: Literal[int]) -> UInt[N]:
+    %0 = udiv i{=N} %a, %b
+    ret i{=N} %0
+
+
+@pure
+@llvm
+def _urem_n(a: UInt[N], b: UInt[N], N: Literal[int]) -> UInt[N]:
+    %0 = urem i{=N} %a, %b
+    ret i{=N} %0
+
+
+def _divrem_limbs(a: UInt[N], b: UInt[N], WANT_Q: Literal[bool], WANT_R: Literal[bool], N: Literal[int]) -> Tuple[UInt[N], UInt[N]]:
+    # (a / b, a mod b) for N a multiple of 64, a >= b > 0 and a >= 2^64; the half not wanted is zero
+    K: Literal[int] = N // 64
+    q = UInt[N](0)
+    r = UInt[N](0)
+    ap = Ptr[u64](__ptr__(a).as_byte())
+    bp = Ptr[u64](__ptr__(b).as_byte())
+    qp = Ptr[u64](__ptr__(q).as_byte()) if WANT_Q else Ptr[u64]()
+    rp = Ptr[u64](__ptr__(r).as_byte()) if WANT_R else Ptr[u64]()
+    an = normlen(ap, K)
+    bn = normlen(bp, K)
+    if bn == 1:
+        rem = divrem_1(qp, ap, an, bp[0])
+        if WANT_R:
+            rp[0] = rem
+    else:
+        us = __array__[u64](K + 1)
+        vs = __array__[u64](K)
+        divrem(qp, rp, ap, an, bp, bn, us, vs)
+    return q, r
+
+
+def _udivrem(a: UInt[N], b: UInt[N], WANT_Q: Literal[bool], WANT_R: Literal[bool], N: Literal[int]) -> Tuple[UInt[N], UInt[N]]:
+    # (a / b, a mod b), the half not wanted zero; ZeroDivisionError for b == 0. Up to 128 bits LLVM's instructions;
+    # above, the cheap exits first (both operands in 64 bits: one machine division; a < b; a power of two), then the
+    # division of limbs.
+    if N <= 128:
+        if b == UInt[N](0):
+            raise ZeroDivisionError("integer division or modulo by zero")
+        return (_udiv_n(a, b, N) if WANT_Q else UInt[N](0), _urem_n(a, b, N) if WANT_R else UInt[N](0))
+    if _fits_u64(b, N):
+        y = _low_u64(b, N)
+        if y == u64(0):
+            raise ZeroDivisionError("integer division or modulo by zero")
+        if _fits_u64(a, N):
+            x = _low_u64(a, N)
+            return (_from_u64(_udiv64(x, y), N) if WANT_Q else UInt[N](0),
+                    _from_u64(_urem64(x, y), N) if WANT_R else UInt[N](0))
+        if y & (y - u64(1)) == u64(0):
+            return ((a >> UInt[N](_ctz64(y))) if WANT_Q else UInt[N](0),
+                    (a & _from_u64(y - u64(1), N)) if WANT_R else UInt[N](0))
+    else:
+        if a < b:
+            return UInt[N](0), (a if WANT_R else UInt[N](0))
+        if _is_pow2(b, N):
+            return ((a >> UInt[N](_ctz_n(b, N))) if WANT_Q else UInt[N](0),
+                    (a & (b - UInt[N](1))) if WANT_R else UInt[N](0))
+    if N % 64 == 0:
+        return _divrem_limbs(a, b, WANT_Q, WANT_R, N)
+    else:
+        W: Literal[int] = _round_up(N)
+        q, r = _divrem_limbs(_zext(a, W, N), _zext(b, W, N), WANT_Q, WANT_R, W)
+        return _trunc(q, N, W), _trunc(r, N, W)
+
+
+def udivrem(a: UInt[N], b: UInt[N], N: Literal[int]) -> Tuple[UInt[N], UInt[N]]:
+    # (a // b, a % b); ZeroDivisionError for b == 0
+    return _udivrem(a, b, True, True, N)
+
+
+def udiv(a: UInt[N], b: UInt[N], N: Literal[int]) -> UInt[N]:
+    # a // b; ZeroDivisionError for b == 0
+    return _udivrem(a, b, True, False, N)[0]
+
+
+def umod(a: UInt[N], b: UInt[N], N: Literal[int]) -> UInt[N]:
+    # a % b; ZeroDivisionError for b == 0
+    return _udivrem(a, b, False, True, N)[1]
+
+
+@pure
+@llvm
+def _sign_bit(x: Int[N], N: Literal[int]) -> bool:
+    %0 = icmp slt i{=N} %x, 0
+    %1 = zext i1 %0 to i8
+    ret i8 %1
+
+
+@pure
+@llvm
+def _magnitude(x: Int[N], N: Literal[int]) -> UInt[N]:
+    # |x| as an unsigned integer (2^(N - 1) for the most negative value)
+    %0 = sub i{=N} 0, %x
+    %1 = icmp slt i{=N} %x, 0
+    %2 = select i1 %1, i{=N} %0, i{=N} %x
+    ret i{=N} %2
+
+
+@pure
+@llvm
+def _signed(x: UInt[N], negate: bool, N: Literal[int]) -> Int[N]:
+    # x, or -x when negate (mod 2^N), as a signed integer
+    %0 = trunc i8 %negate to i1
+    %1 = sub i{=N} 0, %x
+    %2 = select i1 %0, i{=N} %1, i{=N} %x
+    ret i{=N} %2
+
+
+def sdivrem(a: Int[N], b: Int[N], N: Literal[int]) -> Tuple[Int[N], Int[N]]:
+    # C's quotient and remainder: the quotient truncated towards zero, the remainder with the dividend's sign
+    # (the most negative value divided by -1 wraps to itself, as two's complement does); ZeroDivisionError for b == 0
+    na, nb = _sign_bit(a, N), _sign_bit(b, N)
+    q, r = _udivrem(_magnitude(a, N), _magnitude(b, N), True, True, N)
+    return _signed(q, na != nb, N), _signed(r, na, N)
+
+
+def sdiv(a: Int[N], b: Int[N], N: Literal[int]) -> Int[N]:
+    # a / b truncated towards zero (C)
+    na, nb = _sign_bit(a, N), _sign_bit(b, N)
+    q = _udivrem(_magnitude(a, N), _magnitude(b, N), True, False, N)[0]
+    return _signed(q, na != nb, N)
+
+
+def smod(a: Int[N], b: Int[N], N: Literal[int]) -> Int[N]:
+    # a mod b with the dividend's sign (C)
+    r = _udivrem(_magnitude(a, N), _magnitude(b, N), False, True, N)[1]
+    return _signed(r, _sign_bit(a, N), N)
+
+
+def floor_div(a: Int[N], b: Int[N], N: Literal[int]) -> Int[N]:
+    # floor(a / b): the quotient rounded towards minus infinity; ZeroDivisionError for b == 0
+    na, nb = _sign_bit(a, N), _sign_bit(b, N)
+    q, r = _udivrem(_magnitude(a, N), _magnitude(b, N), True, True, N)
+    if na != nb and r != UInt[N](0):
+        q += UInt[N](1)
+    return _signed(q, na != nb, N)
+
+
+def nonneg_mod(a: Int[N], b: Int[N], N: Literal[int]) -> Int[N]:
+    # a mod |b| in [0, |b|), whatever the signs; ZeroDivisionError for b == 0
+    mb = _magnitude(b, N)
+    r = _udivrem(_magnitude(a, N), mb, False, True, N)[1]
+    if _sign_bit(a, N) and r != UInt[N](0):
+        r = mb - r
+    return _signed(r, False, N)
+
+
+def from_u64(x: u64, N: Literal[int]) -> UInt[N]:
+    # x as a UInt[N] (truncated below 64 bits)
+    if N > 64:
+        return _from_u64(x, N)
+    elif N == 64:
+        return UInt[N](x)
+    else:
+        return _trunc(x, N, 64)
+
+
+def to_u64(x: UInt[N], N: Literal[int]) -> u64:
+    # the low 64 bits of x
+    if N > 64:
+        return _low_u64(x, N)
+    elif N == 64:
+        return u64(x)
+    else:
+        return _zext(x, 64, N)
+
+
+def _mul_mod_u64(a: u64, b: u64, m: u64) -> u64:
+    # a b mod m: the 128-bit product and one 128 / 64-bit division; ZeroDivisionError for m == 0
+    if m == u64(0):
+        raise ZeroDivisionError("integer division or modulo by zero")
+    p = _mul(a, b)
+    return _div_2by1(_urem64(_hi(p), m), _lo(p), m)[1]
+
+
+def mul_mod_any(a: UInt[N], b: UInt[N], m: UInt[N], N: Literal[int]) -> UInt[N]:
+    # a b mod m for any modulus m: within 64 bits a 128-bit product and one division, else the double-width product
+    # divided by limbs; ZeroDivisionError for m == 0
+    if N <= 64:
+        return from_u64(_mul_mod_u64(to_u64(a, N), to_u64(b, N), to_u64(m, N)), N)
+    if _fits_u64(a, N) and _fits_u64(b, N) and _fits_u64(m, N):
+        return _from_u64(_mul_mod_u64(_low_u64(a, N), _low_u64(b, N), _low_u64(m, N)), N)
+    return _trunc(umod(_zext(a, 2 * N, N) * _zext(b, 2 * N, N), _zext(m, 2 * N, N)), N, 2 * N)
+
+
+# --- pseudo-Mersenne moduli p = 2^L - C ----------------------------------------------------------------------------
+# The product and the reduction modulo 2^L - C (the MPC field's prime) for any width N, L and C that _pm_check
+# accepts, exact for every operand below 2^N: the bits above L fold back in times C (2^L = C mod p), once for an N-bit
+# value and twice for a product, then one conditional subtraction.
+
+def _pm_check(L: Literal[int], C: Literal[int], N: Literal[int]):
+    # Compile-time conditions: 0 < L < N and 0 < C < 2^20; N - L <= 43, so that the first fold of a double-width
+    # product fits N + 64 bits (y < 2^L + C 2^(2N - L)); and L >= 2 (N - L) + 41, so that the second fold leaves less
+    # than 2p (C^2 2^(2N - 2L) + 2C <= 2^L), as one fold of an N-bit value does (C 2^(N - L) + C <= 2^L)
+    if L <= 0 or L >= N or C <= 0 or C >= (1 << 20):
+        compile_error("limbs: a pseudo-Mersenne modulus 2^L - C needs 0 < L < N and 0 < C < 2^20")
+    if N - L > 43 or L < 2 * (N - L) + 41:
+        compile_error("limbs: a pseudo-Mersenne modulus 2^L - C in UInt[N] needs N - L <= 43 and L >= 2 (N - L) + 41")
+
+
+def _resize(x: UInt[M], R: Literal[int], M: Literal[int]) -> UInt[R]:
+    # x in R bits: truncated, zero-extended or as it is
+    if R < M:
+        return _trunc(x, R, M)
+    elif R > M:
+        return _zext(x, R, M)
+    else:
+        return x
+
+
+def _pm_fold(x: UInt[M], L: Literal[int], C: Literal[int], R: Literal[int], M: Literal[int]) -> UInt[R]:
+    # (x mod 2^L) + (x >> L) C, congruent to x modulo 2^L - C, in R bits (the callers' bounds make it fit)
+    mask = (UInt[R](1) << UInt[R](L)) - UInt[R](1)
+    return (_resize(x, R, M) & mask) + _resize(x >> UInt[M](L), R, M) * UInt[R](C)
+
+
+def _pm_sub(m: UInt[N], L: Literal[int], C: Literal[int], N: Literal[int]) -> UInt[N]:
+    # m mod (2^L - C) for m < 2p: one conditional subtraction
+    p = (UInt[N](1) << UInt[N](L)) - UInt[N](C)
+    return m - p if m >= p else m
+
+
+def pm_reduce(x: UInt[N], L: Literal[int], C: Literal[int], N: Literal[int]) -> UInt[N]:
+    # x mod (2^L - C) for any x < 2^N, in [0, p): one fold leaves m < 2^L + C 2^(N - L) <= 2p, and one subtraction
+    # finishes
+    _pm_check(L, C, N)
+    return _pm_sub(_pm_fold(x, L, C, N, N), L, C, N)
+
+
+def _pm_reduce_product(x: UInt[M], L: Literal[int], C: Literal[int], N: Literal[int], M: Literal[int]) -> UInt[N]:
+    # x mod (2^L - C) for any x < 2^(2N) held in M bits, in [0, p): the first fold leaves y < 2^L + C 2^(2N - L) in
+    # N + 64 bits, the second m <= 2^L - 1 + C^2 2^(2N - 2L) < 2p in N bits (_pm_check), and one subtraction finishes
+    y = _pm_fold(x, L, C, N + 64, M)
+    return _pm_sub(_pm_fold(y, L, C, N, N + 64), L, C, N)
+
+
+def pm_mul(a: UInt[N], b: UInt[N], L: Literal[int], C: Literal[int], N: Literal[int]) -> UInt[N]:
+    # a b mod (2^L - C) for any a, b < 2^N, in [0, p): LLVM's double-width product, then the folds
+    _pm_check(L, C, N)
+    return _pm_reduce_product(_zext(a, 2 * N, N) * _zext(b, 2 * N, N), L, C, N, 2 * N)
+
+
+def pm_mul_u64(a: UInt[N], b: u64, L: Literal[int], C: Literal[int], N: Literal[int]) -> UInt[N]:
+    # a b mod (2^L - C) for any a < 2^N and a 64-bit b, in [0, p): the product by limbs in N + 64 bits; for L >= 85 one
+    # fold fits N bits (2^L + C 2^(N + 64 - L) <= 2^N) and pm_reduce finishes, else the folds of a product (below
+    # 2^(2N))
+    _pm_check(L, C, N)
+    if N % 64 != 0:
+        compile_error("limbs.pm_mul_u64: N must be a multiple of 64")
+    K: Literal[int] = N // 64
+    x = UInt[N + 64](0)
+    c = u64(0)
+    for i in static.range(K):
+        pr = _mul(to_u64(a >> UInt[N](64 * i), N), b) + _wide(c)
+        x |= _from_u64(_lo(pr), N + 64) << UInt[N + 64](64 * i)
+        c = _hi(pr)
+    x |= _from_u64(c, N + 64) << UInt[N + 64](64 * K)
+    if L >= 85:
+        return pm_reduce(_pm_fold(x, L, C, N, N + 64), L, C)
+    return _pm_reduce_product(x, L, C, N, N + 64)
+
+
+def pm_mul_int(a: UInt[N], b: int, L: Literal[int], C: Literal[int], N: Literal[int]) -> UInt[N]:
+    # a b mod (2^L - C) for any a < 2^N and a signed 64-bit b (a negative b multiplies as a negative number), in [0, p)
+    if b >= 0:
+        return pm_mul_u64(a, u64(b), L, C, N)
+    m = pm_mul_u64(a, u64(0) - u64(b), L, C, N)
+    p = (UInt[N](1) << UInt[N](L)) - UInt[N](C)
+    return p - m if m != UInt[N](0) else m
+
+
+# --- words ----------------------------------------------------------------------------------------------------------
+
+@pure
+@llvm
+def _s128(x: u64) -> Int[128]:
+    %0 = zext i64 %x to i128
+    ret i128 %0
+
+
+def inv_mod_u64(a: u64, m: u64) -> u64:
+    # The inverse of a modulo m (m >= 2), by the extended Euclidean algorithm on words; ValueError when there is none.
+    # The coefficient t stays below m in magnitude, and so do the products q * t (q * |t| <= m), in 128-bit signed
+    # integers.
+    if m < u64(2):
+        raise ValueError(f"limbs.inv_mod_u64: no inverse modulo {m}")
+    r0, r1 = m, _urem64(a, m)
+    t0, t1 = Int[128](0), Int[128](1)
+    while r1 != u64(0):
+        qq = _udiv64(r0, r1)
+        r0, r1 = r1, r0 - qq * r1
+        t0, t1 = t1, t0 - _s128(qq) * t1
+    if r0 != u64(1):
+        raise ValueError(f"limbs.inv_mod_u64: {a} has no inverse modulo {m}")
+    if t0 < Int[128](0):
+        t0 += _s128(m)
+    return _lo(UInt[128](t0))
+
+
+# The limbs of a fixed-width integer in memory are little-endian on every supported platform: checked once
+def _check_little_endian():
+    x = UInt[128](1)
+    if Ptr[u64](__ptr__(x).as_byte())[0] != u64(1):
+        raise SystemError("limbs: integers are not stored as little-endian 64-bit limbs on this platform")
+
+
+_check_little_endian()
