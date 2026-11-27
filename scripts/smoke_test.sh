@@ -15,6 +15,10 @@
 #   binary-N        the built binary, run directly in a clean environment (env -i: no LD_PRELOAD, SEQURE_GMP_PATH or
 #                   CODON_PYTHON) with the MHE setup and N parties (3 and 4), prints the results, loads the GMP bundled
 #                   with the plugin (Linux and macOS) and leaves no socket file behind
+#   fixed-point-ring, fixed-point-field
+#                   examples/fixed_point.codon, built once and run with 3 parties on the default modulus (the ring)
+#                   and with --use-field: a fixed-point product (a truncation), a comparison, != and a division give
+#                   the expected values at every compute party, and each party says which modulus it ran on
 #   shim            x86-64 Linux: shrinking and freeing over-aligned blocks leaves their neighbours intact
 #   installer-*     with the archive given, scripts/install.sh: a download that fails (HTTP 404), a broken archive and
 #                   an archive whose launcher does not run each stop it with a non-zero status and leave an existing
@@ -98,6 +102,15 @@ snapshot() {
 # The socket files a local run left in directory $1 ("sock." and digits: the runtime's names)
 run_sockets() { (cd "$1" && ls -1 | grep -E '^sock\.[0-9]+$' | tr '\n' ' '); }
 
+# check_fixed_point <log> <parties>: every compute party printed the four results of examples/fixed_point.codon
+check_fixed_point() {
+  local want=$(($2 - 1)) line
+  for line in 'product: [3.0, -9.0, 9.0, -0.0625]' 'greater: [0.0, 0.0, 0.0, 1.0]' 'differ: [1.0, 1.0, 0.0, 1.0]' \
+      'quotient: [0.75, -0.5625, 1.0, -0.25]'; do
+    [ "$(grep -c -F "$line" "$1")" -eq "$want" ] || return 1
+  done
+}
+
 # check_results <log> <parties>: every compute party printed both results of examples/addmul.codon
 check_results() {
   local want=$(($2 - 1)) a b
@@ -173,6 +186,35 @@ elif [ "$PLATFORM" = "linux-x86_64" ] && command -v readelf > /dev/null 2>&1; th
 else
   ok build
 fi
+
+# fixed-point-ring, fixed-point-field
+D=$WORK/fixed-point
+mkdir -p "$D"
+FP_BIN=$D/fixed_point
+(cd "$D" && run_timeout "$TIMEOUT" env CODON_DEBUG=0 "$SEQURE" build "$REPO/examples/fixed_point.codon" -o "$FP_BIN" \
+  > build.txt 2>&1 < /dev/null)
+rc=$?
+for modulus in ring field; do
+  check=fixed-point-$modulus
+  if [ $rc -ne 0 ] || [ ! -x "$FP_BIN" ]; then
+    tail -10 "$D/build.txt" | sed 's/^/      /'
+    fail "$check" "the example did not build (exit status $rc)"
+    continue
+  fi
+  flag=
+  [ "$modulus" = field ] && flag=--use-field
+  (cd "$D" && run_timeout "$TIMEOUT" env SEQURE_CP_COUNT=3 "$FP_BIN" --local --skip-mhe-setup $flag \
+    > "log-$modulus.txt" 2>&1 < /dev/null)
+  run_rc=$?
+  if [ $run_rc -ne 0 ] || ! check_fixed_point "$D/log-$modulus.txt" 3; then
+    tail -20 "$D/log-$modulus.txt" | sed 's/^/      /'
+    fail "$check" "exit status $run_rc"
+  elif [ "$(grep -c "MPC initialized on the $modulus" "$D/log-$modulus.txt")" -ne 3 ]; then
+    fail "$check" "the parties did not all run on the $modulus: $(grep -m1 'MPC initialized' "$D/log-$modulus.txt")"
+  else
+    ok "$check" "product, comparison, != and division right at every compute party, on the $modulus"
+  fi
+done
 
 # binary-3, binary-4
 if [ -n "$BIN" ]; then

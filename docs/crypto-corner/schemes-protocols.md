@@ -4,7 +4,10 @@ This page provides [some of] the mathematical details of the cryptographic schem
 
 ## 1. Additive secret sharing
 
-Sequre's MPC uses **additive secret sharing** over a finite field or ring (if specified by user via `--use-ring` flag).
+Sequre's MPC uses **additive secret sharing** over the power-of-two ring $\mathbb{Z}_{2^L}$ (the default) or a prime
+field $\mathbb{F}_p$, $p = 2^L - c$ (`--use-field`). The formulas below write the modulus as $p$; on the ring read
+$2^L$ for it (the fixed-point truncation and the comparisons differ by modulus: see
+[the MPC modulus](security-assumptions.md#the-mpc-modulus-and-its-statistical-parameters)).
 
 ### Sharing
 

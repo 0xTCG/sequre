@@ -68,7 +68,7 @@ _Defined in `stdlib/sequre/settings.codon` and `stdlib/sequre/constants.codon`_
 | `MPC_NBIT_F` | 32 | 32 | 64 |
 | `MPC_NBIT_V` | 28 | 64 | 56 |
 
-- **`MPC_FIELD_SIZE`**: Mersenne prime field $2^k - c$ where $k$ = `MPC_MODULUS_BITS`
+- **`MPC_FIELD_SIZE`**: The prime field $2^k - c$ where $k$ = `MPC_MODULUS_BITS` ($c$ = 1, 3, 9 with 128-, 192- and 256-bit shares; a Mersenne prime at 128 bits only)
 - **`MPC_RING_SIZE`**: Power-of-two ring $2^k$
 - **`MPC_NBIT_K`**: The total bit-width in fixed-point representation
 - **`MPC_NBIT_F`**: The fractional bit-width in fixed-point representation
@@ -135,6 +135,5 @@ The list of `sequre` CLI arguments:
 | Flag | Description |
 |---|---|
 | `--skip-mhe-setup` | Skip MHE key generation (useful when running MPC-only) |
-| `--use-field` | Run MPC on the prime field $\mathbb{F}_p$, $p = 2^k - c$ (the default) |
-| `--use-ring` | Run MPC on the power-of-two ring $\mathbb{Z}_{2^k}$. Not together with `--use-field`; start every party with the same modulus flag (the parties compare their moduli when they connect and stop if they differ) |
+| `--use-field` | Run MPC on the prime field $\mathbb{F}_p$, $p = 2^k - c$, instead of the default ring $\mathbb{Z}_{2^k}$. At every party or at none (the parties compare their moduli when they connect and stop if they differ). `--use-ring`, which selected the ring before it became the default, is gone: the runtime ignores it like any flag it does not know, and the test runner refuses it |
 | `-release` | Enable release mode (better performance, no backtrace) |

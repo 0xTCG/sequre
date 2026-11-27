@@ -24,13 +24,12 @@
 #   e-no-tls          SEQURE_USE_TLS=0, plain TCP: the run completes
 #   f-dead-peer       CP2 exits without closing its connections while CP0 sends it 100 messages of 800 KB: CP0's TLS
 #                     send fails and stops CP0 (a failed SSL_write used to count as a success)
-#   g-modulus-default, g-modulus-field, g-modulus-ring
-#                     every party with no modulus flag, with --use-field, with --use-ring: the run completes, and every
-#                     party says it ran on the same modulus (the field, the ring as asked)
+#   g-modulus-default, g-modulus-field, g-modulus-old-flag
+#                     every party with no modulus flag, with --use-field, with the retired --use-ring (ignored): the run
+#                     completes, and every party says it ran on the same modulus (the ring, the field, the ring)
 #   g-odd-0, g-odd-1, g-odd-2
-#                     that party with --use-ring, the others with --use-field: every party stops at start with a
+#                     that party with no flag (the ring), the others with --use-field: every party stops at start with a
 #                     message that names both moduli, and none gets to the end; g-odd-1-mhe the same with the MHE setup
-#   g-both-flags      --use-ring and --use-field at every party: each refuses to start, before it connects
 #
 # Needs bash, openssl, and the parties' ports free on 127.0.0.1: 9001-9006 (COMMUNICATION_PORT + 1 to + 6). The program
 # runs MHE code, which needs Sequre's alignment shim on x86-64: `sequre build` links it into the binary; for a binary
@@ -41,8 +40,7 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ALL_SCENARIOS=(a-san-3 a-san-4 a-cn-3 a-cn-4 b-server b-client c-other-ca d-names d-wrong-names d-no-pid e-no-tls
-               f-dead-peer g-modulus-default g-modulus-field g-modulus-ring g-odd-0 g-odd-1 g-odd-2 g-odd-1-mhe
-               g-both-flags)
+               f-dead-peer g-modulus-default g-modulus-field g-modulus-old-flag g-odd-0 g-odd-1 g-odd-2 g-odd-1-mhe)
 PORTS=(9001 9002 9003 9004 9005 9006)
 PASS_LIMIT=180    # seconds a run that should complete may take
 REJECT_LIMIT=60   # seconds a run that should stop may take
@@ -157,10 +155,9 @@ run_parties_flags() {
 }
 flag_none() { :; }
 flag_field() { echo --use-field; }
-flag_ring() { echo --use-ring; }
-flag_both() { echo --use-ring --use-field; }
+flag_old() { echo --use-ring; }
 ODD=0
-flag_odd() { if [[ $1 == "$ODD" ]]; then echo --use-ring; else echo --use-field; fi; }
+flag_odd() { [[ $1 == "$ODD" ]] || echo --use-field; }
 
 # expect_same_modulus SCENARIO N TEXT: every party said it ran on the same modulus, whose name contains TEXT
 expect_same_modulus() {
@@ -330,14 +327,14 @@ run_scenario() {
             run_parties_flags "$s" 3 $PASS_LIMIT flag_none --skip-mhe-setup
             expect_complete "$s" 3
             log_has "$s" 1 "ok comparison and != over the network" || PROBLEMS+=("CP1 printed no comparison ok line")
-            expect_same_modulus "$s" 3 "the " ;;
+            expect_same_modulus "$s" 3 "the ring" ;;
         g-modulus-field)
             run_parties_flags "$s" 3 $PASS_LIMIT flag_field --skip-mhe-setup
             expect_complete "$s" 3
             log_has "$s" 1 "ok comparison and != over the network" || PROBLEMS+=("CP1 printed no comparison ok line")
             expect_same_modulus "$s" 3 "the field" ;;
-        g-modulus-ring)
-            run_parties_flags "$s" 3 $PASS_LIMIT flag_ring --skip-mhe-setup
+        g-modulus-old-flag)
+            run_parties_flags "$s" 3 $PASS_LIMIT flag_old --skip-mhe-setup
             expect_complete "$s" 3
             log_has "$s" 1 "ok comparison and != over the network" || PROBLEMS+=("CP1 printed no comparison ok line")
             expect_same_modulus "$s" 3 "the ring" ;;
@@ -354,14 +351,6 @@ run_scenario() {
                 expect_failure "$s" $p "the parties' MPC settings differ" "on the ring 2^" "on the field 2^" \
                     "start every party with the same modulus flag"
             done ;;
-        g-both-flags)
-            run_parties_flags "$s" 3 $REJECT_LIMIT flag_both --skip-mhe-setup
-            expect_stopped "$s" 3
-            for p in 0 1 2; do
-                expect_failure "$s" $p "--use-ring and --use-field were both given"
-                ! log_has "$s" $p "Secure seed exchange" || PROBLEMS+=("CP$p connected before it refused")
-                [[ "$(party_rc "$s" $p)" == 2 ]] || PROBLEMS+=("CP$p exited with $(party_rc "$s" $p), not 2")
-            done ;;
     esac
 }
 
@@ -373,7 +362,6 @@ evidence() {
         d-no-pid) log_line "$1" 0 "must contain" ;;
         f-dead-peer) log_line "$1" 0 "TLS connection broken" ;;
         g-odd-*) log_line "$1" 0 "settings differ" | cut -c1-200 ;;
-        g-both-flags) log_line "$1" 0 "both given" ;;
     esac
 }
 

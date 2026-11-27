@@ -197,7 +197,7 @@ the final full runs (the rest from the full suite).
 
 ## Ring or field
 
-Sequre runs MPC on a prime field by default, or on the ring $\mathbb{Z}_{2^L}$ with `--use-ring`. Every nonlinear
+Sequre runs MPC on the ring $\mathbb{Z}_{2^L}$ by default, or on a prime field with `--use-field`. Every nonlinear
 function works on both and gives the same results within the errors above.
 
 - exp, sinh, cosh, sin, cos and polynomials cost the same on both.
@@ -224,8 +224,8 @@ function works on both and gives the same results within the errors above.
 
 Chebyshev without `clip` runs Clenshaw's recurrence on the input's own arithmetic for every type but plain lists and
 public Sharetensors (for example, homomorphically on encrypted MPP partitions). `"auto"` evaluates MPP, MPA, MPU and
-Ciphertensor through MPC (MPP partitions in the clear locally) on the default MPC modulus: Decor with `--use-ring`,
-the interpolant on the field.
+Ciphertensor through MPC (MPP partitions in the clear locally) on the default MPC modulus: Decor on the ring (the
+default), the interpolant with `--use-field`.
 
 ---
 
@@ -246,12 +246,12 @@ runs):
 
 | Model | Decor, field | Chebyshev, field | Decor, ring | Chebyshev, ring |
 |---|---|---|---|---|
-| Neural network, 64 x 8 (tanh 16 + sigmoid, binary cross-entropy, 2 epochs) | 1.28 s | 0.40 s | 0.052 s | 0.045 s |
+| Neural network, 64 x 8 (tanh 16 + sigmoid, binary cross-entropy, 2 epochs) | 1.27 s | 0.38 s | 0.053 s | 0.048 s |
 | GWAS logistic association, 64 individuals x 3 SNPs (a binary logistic regression per SNP, 10 epochs) | 1.82 s | 0.53 s | 0.14 s | 0.16 s |
 | Multinomial logistic regression, 256 x 8, 3 classes (5 epochs) | 1.12 s | 1.16 s | 0.065 s | 0.135 s |
 
 On the field Chebyshev is the cheaper method for the networks and the binary regression, by about 3.2 to 3.4 times. On
-the ring the cheaper method depends on the model: Decor takes 15% more for the network, 11% less for the binary
-regression and 52% less for the softmax regression, and it is the exact one. Hence the defaults: Chebyshev for the
-network on both moduli, Decor for the softmax regression on both, and each modulus's cheaper method for the binary
-regression and the GWAS application.
+the ring the cheaper method depends on the model: Decor takes about 10% more for the network (323 rounds against 287),
+11% less for the binary regression and 52% less for the softmax regression, and it is the exact one. Hence the defaults:
+Chebyshev for the network on both moduli, Decor for the softmax regression on both, and each modulus's cheaper method
+for the binary regression and the GWAS application.

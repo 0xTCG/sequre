@@ -16,7 +16,7 @@ _Defined in `stdlib/sequre/mpc/env.codon`_
 |---|---|---|
 | `pid` | `int` | This party's ID (0 = trusted dealer, 1..N = compute parties) |
 | `local` | `bool` | Whether running in local (forked) mode |
-| `default_mpc_modulus` | `TP` | Default modulus for MPC arithmetic |
+| `default_mpc_modulus` | `TP` | Default modulus for MPC arithmetic: the ring $2^L$, or the field $2^L - c$ with `--use-field` |
 | `default_ciphertensor_encoding` | `str` | Default encoding for ciphertensors |
 | `default_allow_mpc_switch` | `bool` | Whether automatic MPC ↔ MHE switching is enabled |
 | `default_allow_diagonal_results` | `bool` | Whether a matrix product may take a kernel whose result is diagonal-encoded (TNT, for a column-wise first factor); `True` by default. MPP and MPU operations clear it around their per-partition products by a plaintext operand, which they cut back to each party's rows (a diagonal storage cannot be cut by rows): such a product then takes M2 on the transposes. A product of two ciphertext operands sets it, whatever it was, and takes TNT where its first factor is column-wise and its second is not stored transposed; TNT's diagonal-encoded result is converted once through MPC, to row-wise partitions or, where each party's product has fewer columns than rows, column-wise ones, and cut to each party's rows on the shares where a party holds rows but fewer than the most |
@@ -555,8 +555,8 @@ operation on shares of two moduli raises.
 ```python
 from sequre import MPC_FIELD_SIZE, MPC_RING_SIZE
 
-with mpc.default_modulus(MPC_RING_SIZE):
-    # new shares are ring shares
+with mpc.default_modulus(MPC_FIELD_SIZE):
+    # new shares are field shares (the run's default is the ring, unless it was started with --use-field)
     ...
 ```
 

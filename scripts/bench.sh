@@ -15,10 +15,11 @@
 # `sequre` launcher does. Cases flagged "iso" in the registry, and known-broken cases asked for by exact name
 # (--cases name$), run in processes of their own after the rest.
 # --modulus passes the runtime's modulus flag to the MPC binaries (bench_mpc, bench_mhe): field --use-field, ring
-# --use-ring; default (the default) passes none, so the runtime's default modulus applies. It decides the modulus of
-# the cases that name none (a case with a twin, or that names a modulus, is pinned to it); each party's file records
-# the run's modulus (modulus=field|ring in its header), the manifest has it as sequre.modulus, and compare warns when
-# two runs differ in it.
+# --use-ring (which selects the ring in trees from before the ring became the default, and which later ones ignore: the
+# ring is their default); default (the default) passes none, so the runtime's default modulus applies. It decides the
+# modulus of the cases that name none (a case with a twin, or that names a modulus, is pinned to it); each party's file
+# records the run's modulus (modulus=field|ring in its header), the manifest has it as sequre.modulus, and compare warns
+# when two runs differ in it.
 # CPU placement is fixed so that runs do not differ by where the scheduler put the parties. --cpus auto (the
 # default) restricts the binaries to one hardware thread per physical core; --pin auto splits those cores into
 # parties + 1 equal blocks of consecutive cores and gives one to each party (CP0, CP1, CP2; bench_btp uses CP1's),

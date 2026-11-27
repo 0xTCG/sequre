@@ -49,17 +49,18 @@ Sequre does **not** use Paillier or other DCR-based schemes. All HE is RLWE-base
 
 ## Additive secret sharing security
 
-For the MPC (non-HE) path, values are additively shared over a prime field (or a power-of-two ring):
+For the MPC (non-HE) path, values are additively shared over the power-of-two ring $\mathbb{Z}_{2^L}$ (the default) or a
+prime field $\mathbb{F}_p$ (`--use-field`):
 
-$$x = x_1 + x_2 + \cdots + x_N \pmod{p}$$
+$$x = x_1 + x_2 + \cdots + x_N \pmod{m}, \quad m = 2^L \text{ or } p$$
 
-Shares and masks are drawn uniformly from the whole field with a cryptographically secure PRG, seeded pairwise between the parties over TLS. The shares seen by a coalition that misses at least one party (subject to the dealer caveat above) are therefore computationally indistinguishable from uniform: security rests on the PRG, not on perfect (information-theoretic) secrecy.
+Shares and masks are drawn uniformly from the whole modulus with a cryptographically secure PRG, seeded pairwise between the parties over TLS. The shares seen by a coalition that misses at least one party (subject to the dealer caveat above) are therefore computationally indistinguishable from uniform: security rests on the PRG, not on perfect (information-theoretic) secrecy.
 
 Values a single party must keep to itself come from its private stream, seeded from the operating system's randomness: the dealer's masks and random bits (truncation, comparisons, bit decomposition, the bitwise protocols) and each compute party's MPC ↔ MHE switching masks. The HE protocols' masks (collective bootstrapping, encryption to shares) come from Lattiseq's own generators, seeded the same way. Every such draw names its stream, so it stays private when a caller runs the protocol under the global stream (`global_stream()`, which every party, CP0 included, can compute). See [the PRG streams](../api/mpc-instance.md#mpcrandomness-mpcrandomness).
 
 ## The MPC modulus and its statistical parameters
 
-Sequre's MPC runs on one of two moduli of the same width $L$: the power-of-two ring $\mathbb{Z}_{2^L}$ (`--use-ring`)
+Sequre's MPC runs on one of two moduli of the same width $L$: the power-of-two ring $\mathbb{Z}_{2^L}$ (the default)
 and the prime field $\mathbb{F}_p$, $p = 2^L - c$ (`--use-field`). Every party must run on the same one: the parties
 compare their moduli and fixed-point settings when they connect, and stop if they differ. The parameters below depend
 on the share width (`MPC_INT_SIZE`) and are the same on both moduli; `test_mpc`'s `test_security_parameters` pins them.

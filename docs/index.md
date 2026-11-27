@@ -13,7 +13,7 @@
 | | Sequre | Shechi |
 |---|---|---|
 | **Scope** | Full framework (superset) | MHE sub-system within Sequre |
-| **Primary mechanism** | Additive secret sharing over Mersenne-prime fields | Multiparty CKKS homomorphic encryption |
+| **Primary mechanism** | Additive secret sharing over the ring $\mathbb{Z}_{2^k}$ (or, with `--use-field`, the prime field $\mathbb{F}_p$, $p = 2^k - c$) | Multiparty CKKS homomorphic encryption |
 | **Core type** | `Sharetensor` | `Ciphertensor`, `MPU`, `MPP`, `MPA` |
 | **Non-linear ops** | Beaver triples + network rounds | Local HE evaluation + collective key-switching |
 | **Best for** | Integer/fixed-point MPC, smaller data scale | Floating-point, batched linear algebra, large scale ML |

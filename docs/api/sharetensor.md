@@ -112,7 +112,8 @@ party.
 `mpc_uint` constant, or a public Sharetensor (counted once). Fixed point on either side puts both in fixed point. What
 they compute is the difference $d = a - b$ (in raw units: scaled by $2^F$ in fixed point) and its sign or whether it is
 zero. Both operands must be on one modulus: shares of two moduli raise `ValueError` naming both, as in every operation
-on two Sharetensors (`+`, `-`, `*`, `/`, `@`, `dot`, `append`, `extend`, `hstack`, `vstack`, item assignment).
+on two Sharetensors (`+`, `-`, `*`, `/`, `@`, `dot`, `append`, `extend`, `hstack`, `vstack`, item assignment) and in the
+division helpers `fp_div` and `decor_div`, before any round.
 
 | Modulus | `>`, `<` | `==`, `!=` |
 |---|---|---|
