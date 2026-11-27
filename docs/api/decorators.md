@@ -89,7 +89,7 @@ def my_protocol(mpc):
     print(f"CP{mpc.pid}: done")
 ```
 
-Command-line flags (e.g., `--use-ring`, `--skip-mhe-setup`) are parsed from `sys.argv` and passed as control toggles.
+Command-line flags (e.g., `--use-field`, `--skip-mhe-setup`) are parsed from `sys.argv` and passed as control toggles.
 
 ### `@online`
 

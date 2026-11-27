@@ -325,7 +325,7 @@ On Sharetensor layers Decor's sin and cos with a `pre_act_scale` fold the scale 
 cos from the same opening. With the default method a sin, cos, tan or cot layer saturates beyond
 (−π, π), (−π, π), (−1.2, 1.2) or (0.4, 2.7): size `activation_interval` to the pre-activations, or use
 `method="decor"` (any argument). On the field a Decor sigmoid, tanh, tan, cot, silu or gelu layer costs a few times a
-Chebyshev one (the field's division); on the ring about as much as the default Chebyshev (degree 20, which errs by
+Chebyshev one (the field's division); on the ring about 10% more than the default Chebyshev (degree 20, which errs by
 about $2 \times 10^{-3}$ for sigmoid and $4 \times 10^{-3}$ for tanh, against about $4 \times 10^{-6}$ for Decor), and
 less than a Chebyshev interpolant as accurate as Decor.
 

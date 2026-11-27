@@ -4,7 +4,10 @@ This page provides [some of] the mathematical details of the cryptographic schem
 
 ## 1. Additive secret sharing
 
-Sequre's MPC uses **additive secret sharing** over a finite field or ring (if specified by user via `--use-ring` flag).
+Sequre's MPC uses **additive secret sharing** over the power-of-two ring $\mathbb{Z}_{2^L}$ (the default) or a prime
+field $\mathbb{F}_p$, $p = 2^L - c$ (`--use-field`). The formulas below write the modulus as $p$; on the ring read
+$2^L$ for it (the fixed-point truncation and the comparisons differ by modulus: see
+[the MPC modulus](security-assumptions.md#the-mpc-modulus-and-its-statistical-parameters)).
 
 ### Sharing
 
@@ -137,7 +140,7 @@ Sequre can convert between the two representations:
 Secure comparisons ($>, <, ==$) cannot be done natively in CKKS. Sequre handles comparisons via MPC:
 
 1. Switch from MHE to MPC (if currently in HE)
-2. Execute the comparison in the MPC domain: a sign test (on the ring over XOR-shared bits; on the field from the parity of $2a$ behind a masked opening), and on the field an equality test for $==$ and $\ne$ (a masked opening and an OR over bits). What each guarantees: [Sharetensor comparisons](../api/sharetensor.md#comparisons)
+2. Execute the comparison in the MPC domain: a sign test (on the ring over XOR-shared bits; on the field from the parity of $2a$ behind a masked opening), and an equality test for $==$ and $\ne$ (on the field a masked opening and an OR over bits; on the ring a masked opening mod $2^n$, a uniformly shifted count of the differing bits and a bit of the dealer's one-hot vector). What each guarantees: [Sharetensor comparisons](../api/sharetensor.md#comparisons)
 3. Switch back to MHE (if needed)
 
 This is one of the key motivations for the hybrid MPC+MHE approach: MPC handles non-linear operations while MHE handles linear algebra efficiently.

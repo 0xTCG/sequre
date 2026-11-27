@@ -14,9 +14,16 @@ These flags can be passed to any Sequre program:
 
 | Flag | Description |
 |---|---|
-| `--use-ring` | Use the power-of-two ring $\mathbb{Z}_{2^k}$ instead of the prime field as the secret-sharing modulus. Every operation runs on either modulus: on the ring, comparisons, division, square root and the nonlinear functions use ring protocols (sign tests and normalizers built from shared random bits). |
+| `--use-field` | Use the prime field $\mathbb{F}_p$, $p = 2^k - c$, instead of the default power-of-two ring $\mathbb{Z}_{2^k}$ as the secret-sharing modulus. Every operation runs on either modulus: on the ring, comparisons, division, square root and the nonlinear functions that divide (sigmoid, tanh, tan, cot, softmax) use ring protocols (sign tests, an equality test and normalizers built from shared random bits), which are several times faster, while products, exp, sin, cos and the polynomial series cost the same on both; programs, results and benchmarks of Sequre versions before the ring became the default ran on the field. Earlier versions' `--use-ring` is gone: the runtime ignores it like any flag it does not know (the ring is the default), and the test runner refuses it. |
 | `--skip-mhe-setup` | Skip the multiparty homomorphic encryption key-generation phase. Useful when the protocol only uses secret sharing (MPC) without any HE operations. |
 | `-h`, `--help` | Print usage information and exit. |
+
+Every party must be started with the same modulus flag and run the same version of Sequre. The parties compare their
+modulus, share width and fixed-point settings when they connect: if they differ, every party stops before any protocol
+message and names both sides (`CP1 runs on the ring 2^174, CP2 on the field 2^174 - 3: ...`). A party that runs an
+older Sequre exchanges no settings: the newer parties stop at start, and the older one at its next receive (see
+[Troubleshooting](troubleshooting.md#the-mpc-modulus-the-ring-and-the-field)). Each party prints the modulus it runs on
+(`CP1: MPC initialized on the ring 2^174`): a misspelt flag is not an error, as programs take flags of their own.
 
 The `--local` flag selects local execution in programs that use the `@main` decorator. It is also used by the built-in test runner (`scripts/invoke.codon`). For programs that hard-code their mode, use `@local` for local execution, `@online` for distributed execution, or `mpc()` for manual control — see [Execution modes](#execution-modes) below.
 
@@ -30,8 +37,8 @@ sequre run my_protocol.codon --skip-mhe-setup
 # Distributed run as party 1
 sequre run my_protocol.codon 1
 
-# Distributed run as party 2, ring arithmetic
-sequre run my_protocol.codon 2 --use-ring
+# Distributed run as party 2, on the field
+sequre run my_protocol.codon 2 --use-field
 ```
 
 ### Test/benchmark flags
@@ -84,8 +91,9 @@ When using the built-in test runner (`scripts/invoke.codon`), additional flags s
 Give at least one selector. The runner stops before starting any party if a flag is unknown, if the chosen command does not run it, or if no selector is given; `sequre run scripts/invoke.codon --help` lists the selectors of each command. `--opal` and `--ganon` currently have no runner.
 
 ```bash
-# Run all tests locally
+# Run all tests locally, on the default modulus (the ring), then on the field
 sequre run scripts/invoke.codon run-tests --local --all
+sequre run scripts/invoke.codon run-tests --local --all --use-field
 
 # Run only sharetensor unit tests
 sequre run scripts/invoke.codon run-tests --local --sharetensor

@@ -1,9 +1,105 @@
+import os
+import sys
+
 from param import PRIVATE_DATA, PRIVATE_DATA_PATH
 
 from sequre.utils.utils import zeros_mat
-from sequre.constants import mpc_uint, CP_IPS
+from sequre.constants import (
+    mpc_uint, CP_IPS, MPC_INT_SIZE, MPC_MODULUS_BITS, MPC_FIELD_SIZE, MPC_RING_SIZE, RUN_TOGGLES, modulus_name)
 from sequre.types.utils import double_to_fp
 from sequre.utils.io import read_matrix, write_matrix
+
+
+# The share files say what they hold: share_data writes a text record beside each party's files (the modulus by name,
+# its bits, MPC_INT_SIZE, and each file's shape and fixed-point flag), and the loaders check it against their modulus
+# before they read (check_share_record). Until share_data has written a party's last file, that party's record says the
+# files are incomplete. The files themselves stay raw mpc_uint arrays (utils/io.codon).
+SHARE_RECORD_FORMAT = 1
+
+
+def share_record_path(directory: str, protocol: str, pid: int) -> str:
+    return f'{directory}/__{protocol}_record_{pid}.txt'
+
+
+def _modulus_label(modulus) -> str:
+    # A record's name for a modulus: field, ring, or its value
+    if modulus == MPC_FIELD_SIZE:
+        return "field"
+    if modulus == MPC_RING_SIZE:
+        return "ring"
+    return str(modulus)
+
+
+def write_share_record[TP](directory: str, protocol: str, pid: int, files: List[Tuple[str, int, int, bool]], modulus: TP):
+    # files: (file name, rows, cols, fixed point) for each share file of the party
+    with open(share_record_path(directory, protocol, pid), 'w') as f:
+        f.write(f"# Sequre share files of {protocol} at CP{pid}, written by share_data: read them only under this modulus\n")
+        f.write(f"format={SHARE_RECORD_FORMAT}\n")
+        f.write(f"modulus={_modulus_label(modulus)}\n")
+        f.write(f"modulus_bits={MPC_MODULUS_BITS}\n")
+        f.write(f"mpc_int_size={MPC_INT_SIZE}\n")
+        for name, rows, cols, fp in files:
+            f.write(f"file={name} rows={rows} cols={cols} fp={int(fp)}\n")
+
+
+def mark_share_record_incomplete(directory: str, protocol: str, pid: int):
+    # share_data's first step: an interrupted run leaves a record no loader accepts, not an older record beside a mix
+    # of new and old files
+    with open(share_record_path(directory, protocol, pid), 'w') as f:
+        f.write(f"# Sequre share files of {protocol} at CP{pid}: share_data started writing them and did not finish\n")
+        f.write(f"format={SHARE_RECORD_FORMAT}\n")
+        f.write("state=incomplete\n")
+
+
+def _read_share_record(path: str) -> Dict[str, str]:
+    # The record's key=value lines (file lines are kept under file:<name>)
+    record = Dict[str, str]()
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, value = line.split('=', 1)
+            if key == 'file':
+                record[f'file:{value.split(" ")[0]}'] = value
+            else:
+                record[key] = value
+    return record
+
+
+def check_share_record[TP](directory: str, protocol: str, pid: int, modulus: TP) -> bool:
+    """
+    Before a party reads its share files of `protocol` under `modulus`: True if their record matches the run's modulus
+    and share width. A record of another modulus or width stops the run (the shares would load without an error and give
+    wrong results), as does the record of an interrupted share_data. Files without a record come from a Sequre that
+    wrote none: field shares, unless that run passed --use-ring. They load on the field, with a warning (False), and
+    stop the run on the ring.
+    """
+    path = share_record_path(directory, protocol, pid)
+    again = (f"share the data again under this run's modulus (applications/utils/data_sharing.codon, share_data), "
+             f"or run with the modulus they were written under")
+    if not os.path.exists(path):
+        if modulus == MPC_FIELD_SIZE:
+            print(f"CP{pid}:\tWARNING: the {protocol} share files in {directory} have no record ({path}): read as "
+                  f"field shares, as a Sequre that wrote no record shared them unless that run passed --use-ring",
+                  file=sys.stderr)
+            return False
+        raise ValueError(
+            f"CP{pid}: the {protocol} share files in {directory} have no record ({path}), so they were written by a "
+            f"Sequre that wrote none, on the field unless that run passed --use-ring; this run is on "
+            f"{modulus_name(modulus)}: {again} ({RUN_TOGGLES.USE_FIELD_FLAG} for field shares)")
+    record = _read_share_record(path)
+    if record.get("state", "") == "incomplete":
+        raise ValueError(
+            f"CP{pid}: the {protocol} share files in {directory} are incomplete: their record ({path}) says share_data "
+            f"did not finish writing them: share the data again (applications/utils/data_sharing.codon, share_data)")
+    want = {"modulus": _modulus_label(modulus), "modulus_bits": str(MPC_MODULUS_BITS), "mpc_int_size": str(MPC_INT_SIZE)}
+    for key, value in want.items():
+        if record.get(key, "") != value:
+            raise ValueError(
+                f"CP{pid}: the {protocol} share files in {directory} were written with {key}={record.get(key, '?')} "
+                f"(their record, {path}), and this run has {key}={value}: {again}")
+    return True
 
 
 def shares_paths(mpc, protocol, data_name):
@@ -46,11 +142,24 @@ def share_protocol_data[TP](mpc, protocol, data_name, data_params, modulus: TP):
 
 def share_data(mpc, protocol, modulus):
     params = PRIVATE_DATA[protocol]
+    files = List[Tuple[str, int, int, bool]]()
+    mark_share_record_incomplete(PRIVATE_DATA_PATH[protocol], protocol, mpc.pid)
     for data_name, data_params in params.items():
         print(f'CP{mpc.pid}:\tSharing {protocol}-{data_name} ...')
         share_protocol_data(mpc, protocol, data_name, data_params, modulus)
         mpc.comms.sync_parties()
         print(f'CP{mpc.pid}:\tShared {protocol}-{data_name}')
+        rows, cols, partitioned, fp = data_params
+        _, output_path, partition_path = shares_paths(mpc, protocol, data_name)
+        files.append((output_path.split('/')[-1], rows, cols, fp))
+        if partitioned:
+            files.append((partition_path.split('/')[-1], rows, cols, fp))
+    write_share_record(PRIVATE_DATA_PATH[protocol], protocol, mpc.pid, files, modulus)
+
+
+def check_protocol_shares(mpc, protocol, modulus) -> bool:
+    # check_share_record for the party's files of a protocol of PRIVATE_DATA, before a loader reads them
+    return check_share_record(PRIVATE_DATA_PATH[protocol], protocol, mpc.pid, modulus)
 
 
 def share_all_data(mpc, modulus):

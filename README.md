@@ -14,7 +14,7 @@ Write Python-like code; the Sequre compiler handles encrypted arithmetic and int
 - 🚀 **Fast**: Compiled to native code; outperforms interpreter-based MPC frameworks by orders of magnitude
 - 🔀 **Unified**: MPC + HE + MHE in one framework — switch between schemes within a single protocol
 - 🧩 **Batteries included**: Built-in linear algebra, statistics, machine learning (linear/logistic regression, PCA, SVM, neural networks), and biomedical pipelines (GWAS, DTI, Metagenomic binning, Kinship estimation)
-- 📈 **Exact nonlinear functions**: exp, sigmoid, tanh, trigonometric and hyperbolic functions, division and softmax by [Decor](https://0xTCG.github.io/sequre/user-guide/nonlinear-functions/) — the function itself, up to the errors of its fixed-point encodings, in a constant number of rounds — with Chebyshev, Fourier and Taylor approximations as alternatives (on the field, where Decor's division is slow, sigmoid and tanh default to a Chebyshev interpolant within Decor's error bound)
+- 📈 **Exact nonlinear functions**: exp, sigmoid, tanh, trigonometric and hyperbolic functions, division and softmax by [Decor](https://0xTCG.github.io/sequre/user-guide/nonlinear-functions/) — the function itself, up to the errors of its fixed-point encodings, in a constant number of rounds — with Chebyshev, Fourier and Taylor approximations as alternatives (on the field, `--use-field`, where Decor's division is slow, sigmoid and tanh default to a Chebyshev interpolant within Decor's error bound)
 - 🔒 **Secure by default**: Mutual TLS between parties, automatic key management, secured PRG streams
 
 ## Quick start
@@ -69,6 +69,7 @@ The [examples/](examples/) directory contains self-contained programs that demon
 | Example | File | Domain | What it shows |
 |---|---|---|---|
 | Simple expression | `examples/addmul.codon` | Intro | Additions, multiplications, and innerprod examples — local with `--local` flag, online otherwise |
+| Fixed point | `examples/fixed_point.codon` | Intro | A fixed-point product (with its truncation), a comparison, `!=` and a division on the default modulus, the ring (`--use-field` for the field) |
 | Credit scoring | `examples/credit_scoring.codon` | Finance | Secure neural-network classification with `MPU` partitioning |
 | Genetic kinship | `examples/genetic_kinship.codon` | Genomics | Pairwise kinship estimation on MHE-encrypted genotype data |
 | Linear regression | `examples/linear_regression.codon` | Healthcare | Multi-hospital model training with `MPU` and `LinReg` |
@@ -82,6 +83,7 @@ Run any example locally:
 
 ```bash
 sequre examples/addmul.codon --local --skip-mhe-setup
+sequre examples/fixed_point.codon --local --skip-mhe-setup
 sequre -release examples/credit_scoring.codon --local
 sequre -release examples/genetic_kinship.codon --local
 sequre -release examples/linear_regression.codon --local

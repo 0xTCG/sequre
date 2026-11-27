@@ -725,7 +725,7 @@ static void print_help(const char *codon) {
   printf("\n");
   printf("Program flags (after the .codon file, or after a built binary):\n");
   printf("  --local            Run all parties on this machine (programs that use the @main decorator)\n");
-  printf("  --use-ring         Use ring modulus instead of field modulus\n");
+  printf("  --use-field        Run MPC on the prime field 2^L - c instead of the ring 2^L (the default)\n");
   printf("  --skip-mhe-setup   Skip the MHE key-generation setup phase\n");
   printf("\n");
   printf("Launcher flags (before the input file):\n");
@@ -766,7 +766,7 @@ static void print_help(const char *codon) {
   printf("  sequre build -release my_protocol.codon -o my_protocol # compile to a binary\n");
   printf("  ./my_protocol --local                                  # run the binary, local mode\n");
   printf("  sequre run my_protocol.codon 1                         # distributed, party 1\n");
-  printf("  sequre run my_protocol.codon 1 --use-ring              # distributed, party 1, use ring modulus\n");
+  printf("  sequre run my_protocol.codon 1 --use-field             # distributed, party 1, on the field\n");
   printf("\n");
   printf("For Codon compiler flags, run: %s run --help\n", codon);
 }

@@ -7,8 +7,10 @@ This tutorial walks through writing secure multiparty computations using Sequre'
 In Sequre's baseline MPC protocol, a secret value \(x\) is split into \(n\) additive shares:
 
 \[
-x = \sum_{i=1}^{n} x_i \pmod{p}
+x = \sum_{i=1}^{n} x_i \pmod{m}
 \]
+
+where \(m\) is the MPC modulus: the ring \(2^L\) by default, or a prime field \(p = 2^L - c\) with `--use-field`.
 
 Each party \(i\) holds only \(x_i\). No individual share reveals anything about \(x\).
 

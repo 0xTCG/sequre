@@ -11,7 +11,7 @@ import sequre.lattiseq.ringqp as ringqp
 from sequre.utils.stats import precision_stats
 from sequre.utils.testing import assert_eq, assert_eq_approx, same_at_every_party
 from sequre.utils.utils import random_floats
-from sequre.constants import MPC_MODULUS_BITS, mpc_uint
+from sequre.constants import MPC_MODULUS_BITS, MPC_NBIT_K, MPC_NBIT_F, mpc_uint
 from sequre.types.utils import fp_to_double, double_to_fp
 
 from numpy import array
@@ -548,8 +548,12 @@ def test_mhe_mpc_switch_masks(mpc, mpc_modulus):
         ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
         secret_share = mpc.mhe.ciphervector_to_additive_share_vector(ciphervector, slots, mpc_modulus, source_pid=1)
         own = fp_to_double(secret_share, mpc_modulus, k=MPC_MODULUS_BITS)  # the default k keeps only 63 bits
-        masked = sum(1 for v in own if abs(v) > 2.0 ** 100)
-        assert_eq(f"CP{mpc.pid}:\tMHE->MPC share masked beyond 2^100 ({masked} of {slots} slots)", masked > slots * 99 // 100, True)
+        # A share uniform over the modulus decodes beyond 2^(L - 1 - F - 10) in magnitude with probability 1 - 2^-10, far
+        # beyond x (below 4 here) at every width (2^84, 2^131 and 2^176 with 128-, 192- and 256-bit shares; L-291: a
+        # fixed 2^100 is beyond what a 128-bit share decodes to)
+        bound_bits = MPC_MODULUS_BITS - 1 - MPC_NBIT_F - 10
+        masked = sum(1 for v in own if abs(v) > 2.0 ** float(bound_bits))
+        assert_eq(f"CP{mpc.pid}:\tMHE->MPC share masked beyond 2^{bound_bits} ({masked} of {slots} slots)", masked > slots * 99 // 100, True)
 
         stats = precision_stats(mpc=mpc, result=fp_to_double(mpc.comms.reveal(secret_share, mpc_modulus), mpc_modulus), expected=values)
         # The worst of the 8192 slots carries the public-key encryption noise: about 19.5 bits of precision since
@@ -569,8 +573,20 @@ def test_mhe_mpc_switch_levels(mpc, mpc_modulus):
     if mpc.pid > 0:
         mask_bits = mpc.mhe._mhe_to_mpc_mask_bits(params.default_scale)
         level = mpc.mhe._mhe_to_mpc_level(mask_bits)
-        assert_eq(f"CP{mpc.pid}:\tMHE->MPC mask bits", mask_bits, 128 + params.logn + 34 + 32)
-        assert_eq(f"CP{mpc.pid}:\tMHE->MPC switch level", level, 5)
+        # lambda + log2(n) + log2(scale) + K - F (L-252: K - F was written as 32, which fails at 256-bit shares)
+        assert_eq(f"CP{mpc.pid}:\tMHE->MPC mask bits", mask_bits, 128 + params.logn + 34 + MPC_NBIT_K - MPC_NBIT_F)
+        if MPC_NBIT_K - MPC_NBIT_F == 32:
+            assert_eq(f"CP{mpc.pid}:\tMHE->MPC switch level", level, 5)
+        else:
+            # the lowest level whose modulus holds the masks and the plaintext (mpc.mhe._mhe_to_mpc_level)
+            needed = float(mask_bits + (mpc.comms.number_of_parties - 1).bitlen())
+            below, at = 0.0, 0.0
+            for i, q in enumerate(params.q()):
+                if i < level:
+                    below += math.log2(float(q))
+                if i <= level:
+                    at += math.log2(float(q))
+            assert_eq(f"CP{mpc.pid}:\tMHE->MPC switch level {level}: the lowest that holds {needed:.0f} bits", below < needed <= at, True)
 
         ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
         for at, bootstraps in ((level, 0), (level - 1, 1)):
@@ -819,7 +835,8 @@ def test_same_level_sum_above_bootstrap_level(mpc):
 
 
 def test_mhe(mpc, modulus):
-    # The HE tests, then the MHE <-> MPC conversions on the run's modulus (the field, or the ring with --use-ring)
+    # The HE tests, then the MHE <-> MPC conversions on the run's modulus (the ring, the default, or the field with
+    # --use-field)
     print(f'CP{mpc.pid}:\tTesting MHE ... \n')
 
     test_send_receive_poly(mpc)

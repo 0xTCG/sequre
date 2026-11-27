@@ -68,11 +68,11 @@ _Defined in `stdlib/sequre/settings.codon` and `stdlib/sequre/constants.codon`_
 | `MPC_NBIT_F` | 32 | 32 | 64 |
 | `MPC_NBIT_V` | 28 | 64 | 56 |
 
-- **`MPC_FIELD_SIZE`**: Mersenne prime field $2^k - c$ where $k$ = `MPC_MODULUS_BITS`
+- **`MPC_FIELD_SIZE`**: The prime field $2^k - c$ where $k$ = `MPC_MODULUS_BITS` ($c$ = 1, 3, 9 with 128-, 192- and 256-bit shares; a Mersenne prime at 128 bits only)
 - **`MPC_RING_SIZE`**: Power-of-two ring $2^k$
 - **`MPC_NBIT_K`**: The total bit-width in fixed-point representation
 - **`MPC_NBIT_F`**: The fractional bit-width in fixed-point representation
-- **`MPC_NBIT_V`**: The statistical security padding for fixed-point representation (needed only in comparison protocols on finite fields)
+- **`MPC_NBIT_V`**: The statistical padding of the fixed-point truncation's mask, on both moduli: the dealer's mask has $K + F + V$ bits, so an opened truncation hides its input to about $2^{-V}$ and fails with probability below $2^{-(V + 1)}$ per element (see [Security Assumptions](../crypto-corner/security-assumptions.md#the-mpc-modulus-and-its-statistical-parameters)); the field's normalizer pads its mask by $V$ bits too
 
 `MPC_INT_SIZE` sets the fixed-point precision: F = 32 fractional bits at 128 and 192 bits, F = 64 at 256 bits. Decor's
 nonlinear functions compute the function itself, so their error comes from the fixed-point encodings ($2^{-F}$) and,
@@ -135,5 +135,5 @@ The list of `sequre` CLI arguments:
 | Flag | Description |
 |---|---|
 | `--skip-mhe-setup` | Skip MHE key generation (useful when running MPC-only) |
-| `--use-ring` | Use ring arithmetic ($\mathbb{Z}_{2^k}$) instead of field ($\mathbb{F}_p$) |
+| `--use-field` | Run MPC on the prime field $\mathbb{F}_p$, $p = 2^k - c$, instead of the default ring $\mathbb{Z}_{2^k}$. At every party or at none (the parties compare their moduli when they connect and stop if they differ). `--use-ring`, which selected the ring before it became the default, is gone: the runtime ignores it like any flag it does not know, and the test runner refuses it |
 | `-release` | Enable release mode (better performance, no backtrace) |

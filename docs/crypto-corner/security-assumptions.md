@@ -49,13 +49,69 @@ Sequre does **not** use Paillier or other DCR-based schemes. All HE is RLWE-base
 
 ## Additive secret sharing security
 
-For the MPC (non-HE) path, values are additively shared over a prime field (or a power-of-two ring):
+For the MPC (non-HE) path, values are additively shared over the power-of-two ring $\mathbb{Z}_{2^L}$ (the default) or a
+prime field $\mathbb{F}_p$ (`--use-field`):
 
-$$x = x_1 + x_2 + \cdots + x_N \pmod{p}$$
+$$x = x_1 + x_2 + \cdots + x_N \pmod{m}, \quad m = 2^L \text{ or } p$$
 
-Shares and masks are drawn uniformly from the whole field with a cryptographically secure PRG, seeded pairwise between the parties over TLS. The shares seen by a coalition that misses at least one party (subject to the dealer caveat above) are therefore computationally indistinguishable from uniform: security rests on the PRG, not on perfect (information-theoretic) secrecy.
+Shares and masks are drawn uniformly from the whole modulus with a cryptographically secure PRG, seeded pairwise between the parties over TLS. The shares seen by a coalition that misses at least one party (subject to the dealer caveat above) are therefore computationally indistinguishable from uniform: security rests on the PRG, not on perfect (information-theoretic) secrecy.
 
 Values a single party must keep to itself come from its private stream, seeded from the operating system's randomness: the dealer's masks and random bits (truncation, comparisons, bit decomposition, the bitwise protocols) and each compute party's MPC ↔ MHE switching masks. The HE protocols' masks (collective bootstrapping, encryption to shares) come from Lattiseq's own generators, seeded the same way. Every such draw names its stream, so it stays private when a caller runs the protocol under the global stream (`global_stream()`, which every party, CP0 included, can compute). See [the PRG streams](../api/mpc-instance.md#mpcrandomness-mpcrandomness).
+
+## The MPC modulus and its statistical parameters
+
+Sequre's MPC runs on one of two moduli of the same width $L$: the power-of-two ring $\mathbb{Z}_{2^L}$ (the default)
+and the prime field $\mathbb{F}_p$, $p = 2^L - c$ (`--use-field`). Every party must run on the same one: the parties
+compare their moduli and fixed-point settings when they connect, and stop if they differ. The parameters below depend
+on the share width (`MPC_INT_SIZE`) and are the same on both moduli; `test_mpc`'s `test_security_parameters` pins them.
+
+| `MPC_INT_SIZE` | $L$ | Field $p$ | $K$ | $F$ | $V$ | Truncation mask ($K + F + V$ bits), hiding | MPC → HE masks (3 parties), hiding | HE → MPC |
+|---|---|---|---|---|---|---|---|---|
+| 128 | 127 | $2^{127} - 1$ | 64 | 32 | 28 | 124 bits, $2^{-28}$ | 124 bits, $2^{-61}$ | $\lambda = 128$ |
+| 192 (default) | 174 | $2^{174} - 3$ | 64 | 32 | 64 | 160 bits, $2^{-64}$ | 171 bits, $2^{-108}$ | $\lambda = 128$ |
+| 256 | 251 | $2^{251} - 9$ | 128 | 64 | 56 | 248 bits, $2^{-56}$ | 248 bits, $2^{-121}$ | $\lambda = 128$ |
+
+$K$ is a fixed-point value's total bits (values below $2^{K - F - 1}$ in magnitude), $F$ its fractional bits, $V$ the
+truncation's statistical padding (`MPC_NBIT_K`, `MPC_NBIT_F`, `MPC_NBIT_V`). The MPC → HE masks have
+$L - 2 - \lceil \log_2 n \rceil$ bits for $n$ compute parties (the table's column: two, besides the dealer): one bit
+fewer, and hiding one bit less, with three or four compute parties, two with five to eight.
+
+**Perfect hiding** (up to the PRG). Shares, Beaver partitions and Decor's openings are masked uniformly over the whole
+modulus. The comparisons open values masked uniformly over the width they look at: the ring's sign test $-a + r \bmod
+2^{\text{bits}}$, the field's $2a + r$ over $\mathbb{F}_p$, the equality test $a + r$ (mod $2^{n}$ on the ring, over
+$\mathbb{F}_p$ on the field) and, on the ring, a uniformly shifted count and a masked bit; the ring normalizer opens $X -
+r \bmod 2^K$ and masked bits. None of these depends on a statistical parameter.
+
+**Statistical hiding.**
+
+- **Truncation** (every fixed-point product). The dealer's mask $r$ has $K + F + V$ bits, and the parties open $a + r$
+  (field) or $r - a$ (ring) for a product $a$ of $K + F$ bits: the opening is within a statistical distance of about
+  $2^{-V}$ of $r$ alone. The truncated result is wrong (off by $2^{L - F}$ raw units on the ring, a random value on the
+  field) when the masked sum wraps, with probability about $|a| / 2^{K + F + V}$: below $2^{-(V + 1)}$ for a product in
+  the fixed-point range. With 128-bit shares that is $2^{-28}$ hiding and a failure probability up to about $2^{-29}$
+  per truncated element, on either modulus: about one wrong element in $5 \cdot 10^8$ truncations of full-range
+  products. With 192-bit shares (the default width) both are below $2^{-64}$.
+- **The field's normalizer** (division and square root on field shares) opens its input under a mask of $K + V$ bits:
+  hiding to $2^{-V}$.
+- **The switches** between MPC and HE: see [Noise and masks in the MHE protocols](#noise-and-masks-in-the-mhe-protocols).
+  They depend on the modulus' bit length, not on which modulus it is.
+
+**Where the protocols are exact.** Comparisons of fixed-point values are exact on the ring and statistical on the field;
+equality tests are exact on both.
+
+| Protocol | Ring $\mathbb{Z}_{2^L}$ | Field $\mathbb{F}_p$, $p = 2^L - c$ |
+|---|---|---|
+| `>`, `<` of two fixed-point values ($|d| < 2^K$) | exact: sign test over $K + 1$ bits | wrong with probability about $2|d| / 2^{K + F}$ ($< 2^{1 - F}$) |
+| `>`, `<` of integers, wide differences, inside `delayed_truncation()` | exact for $|d| < 2^{L - 1}$ ($2^{K + F}$ inside `delayed_truncation()`) | exact for $|d| \le (p - 1) / 2$ |
+| `==`, `!=` | exact for $|d| < 2^n$: $n = K$ (fixed point), $K + F + 1$ (inside `delayed_truncation()`), $L$ (integers, wide) | exact for $|d| < 2^n - c$: $n = K + F$ (fixed point), $L$ (otherwise) |
+| Division, inverse, square root | normalizer exact for $0 < X < 2^{K - 1}$ raw units | normalizer exact for $0 < X < 2^K$ raw units (its opening hides to $2^{-V}$) |
+
+Outside the fixed-point range the two moduli's comparisons differ. A difference of two fixed-point values is below $2^K$
+raw units ($2^{K - F}$) in magnitude; a value built past that range (a sum of fixed-point values that reaches
+$2^{K - F - 1}$, for example) is outside the range on both moduli, and `reveal` decodes it wrongly on both. The field's
+`==`, `!=`, `>` and `<` look at $K + F$ bits of such a difference and the ring's at $K$ (`==`, `!=`) and $K + 1$ (`>`,
+`<`): a fixed-point difference of $2^{K - F}$ compares equal to 0 on the ring and unequal on the field. Integer shares
+use the modulus' $L$ bits on both.
 
 ## Decor and bitwise (XOR) sharing
 

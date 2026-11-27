@@ -95,7 +95,7 @@ All standard operators are supported and are automatically rewritten by the `@se
 | Matrix multiply | `a @ b` | Beaver triple; with a public `ndarray` operand, each party multiplies its own shares (exactly mod the modulus), plus a truncation for a float `ndarray` times fixed-point shares |
 | Division | `a / b` | Fixed-point iterative protocol |
 | Power | `a ** n` | Repeated multiplication |
-| Comparison | `a > b`, `a < b`, `a == b`, `a != b` | Sign test; equality test on the field (see [Comparisons](#comparisons)) |
+| Comparison | `a > b`, `a < b`, `a == b`, `a != b` | Sign test; equality test (see [Comparisons](#comparisons)) |
 | Dot product | `a.dot(mpc, b, axis=0)` | Beaver inner product |
 
 In-place variants (`+=`, `-=`, `*=`, `**=`) are also supported.
@@ -111,12 +111,14 @@ party.
 `a > b`, `a < b`, `a == b` and `a != b` return 0/1 integer shares. Either operand may be a public int, float or
 `mpc_uint` constant, or a public Sharetensor (counted once). Fixed point on either side puts both in fixed point. What
 they compute is the difference $d = a - b$ (in raw units: scaled by $2^F$ in fixed point) and its sign or whether it is
-zero:
+zero. Both operands must be on one modulus: shares of two moduli raise `ValueError` naming both, as in every operation
+on two Sharetensors (`+`, `-`, `*`, `/`, `@`, `dot`, `append`, `extend`, `hstack`, `vstack`, item assignment) and in the
+division helpers `fp_div` and `decor_div`, before any round.
 
 | Modulus | `>`, `<` | `==`, `!=` |
 |---|---|---|
-| Ring ($2^L$) | Exact. The ring's sign test over $K + 1$ bits for a difference of two fixed-point values ($\lvert d \rvert < 2^K$), $K + F + 1$ inside `mpc.delayed_truncation()`, all $L$ bits for integers and wide differences (an integer operand put in fixed point, a constant beyond the fixed-point range) | Exact: $[d > 0] + [-d > 0]$ from one sign test of $(d, -d)$ |
-| Field ($p = 2^L - c$) | Integers, wide differences and inside `mpc.delayed_truncation()`: exact (`mpc.boolean.is_positive` over all $L$ bits). A difference of two fixed-point values: over $K + F$ bits, wrong with probability about $2\lvert d \rvert / 2^{K+F}$, which stays below $2^{1-F}$ in the fixed-point range ($2^{-31}$ with 192-bit shares, $2^{-63}$ with 256-bit ones) and is about $2^{-63}$ for values near 1 with 192-bit shares | Exact for every difference: an equality test (`mpc.boolean.is_nonzero`), about a quarter of a sign test's cost |
+| Ring ($2^L$) | Exact. The ring's sign test over $K + 1$ bits for a difference of two fixed-point values ($\lvert d \rvert < 2^K$), $K + F + 1$ inside `mpc.delayed_truncation()`, all $L$ bits for integers and wide differences (an integer operand put in fixed point, a constant beyond the fixed-point range) | Exact: an equality test (`mpc.boolean.is_nonzero`, 3 rounds) over $K$ bits for a difference of two fixed-point values, $K + F + 1$ inside `mpc.delayed_truncation()`, all $L$ bits for integers and wide differences |
+| Field ($p = 2^L - c$) | Integers, wide differences and inside `mpc.delayed_truncation()`: exact (`mpc.boolean.is_positive` over all $L$ bits). A difference of two fixed-point values: over $K + F$ bits, wrong with probability about $2\lvert d \rvert / 2^{K+F}$, which stays below $2^{1-F}$ in the fixed-point range ($2^{-31}$ with 192-bit shares, $2^{-63}$ with 256-bit ones) and is about $2^{-63}$ for values near 1 with 192-bit shares | Exact for every difference: an equality test (`mpc.boolean.is_nonzero`, 4 rounds), about a quarter of a sign test's cost |
 
 ## Fixed-point support
 

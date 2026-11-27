@@ -16,7 +16,7 @@ _Defined in `stdlib/sequre/mpc/env.codon`_
 |---|---|---|
 | `pid` | `int` | This party's ID (0 = trusted dealer, 1..N = compute parties) |
 | `local` | `bool` | Whether running in local (forked) mode |
-| `default_mpc_modulus` | `TP` | Default modulus for MPC arithmetic |
+| `default_mpc_modulus` | `TP` | Default modulus for MPC arithmetic: the ring $2^L$, or the field $2^L - c$ with `--use-field` |
 | `default_ciphertensor_encoding` | `str` | Default encoding for ciphertensors |
 | `default_allow_mpc_switch` | `bool` | Whether automatic MPC ↔ MHE switching is enabled |
 | `default_allow_diagonal_results` | `bool` | Whether a matrix product may take a kernel whose result is diagonal-encoded (TNT, for a column-wise first factor); `True` by default. MPP and MPU operations clear it around their per-partition products by a plaintext operand, which they cut back to each party's rows (a diagonal storage cannot be cut by rows): such a product then takes M2 on the transposes. A product of two ciphertext operands sets it, whatever it was, and takes TNT where its first factor is column-wise and its second is not stored transposed; TNT's diagonal-encoded result is converted once through MPC, to row-wise partitions or, where each party's product has fewer columns than rows, column-wise ones, and cut to each party's rows on the shares where a party holds rows but fewer than the most |
@@ -115,9 +115,14 @@ _Defined in `stdlib/sequre/mpc/boolean.codon`_
 
 Boolean circuits and comparison protocols over secret-shared values. Implements algorithms from _"Unconditionally Secure Constant-Rounds MPC for Equality, Comparison, Bits and Exponentiation"_ by Damgård et al.
 
+The bit protocols that interpolate a polynomial over their modulus (`fan_in_or` and the protocols built on it:
+`prefix_or`, `fan_in_and`, `prefix_and`, `less_than_bits`, `less_than_bits_public`, `demultiplexer`) need a prime
+modulus: given a power of two (the ring, or a small one such as 16) they raise `ValueError` at every party before any
+communication (they returned wrong values before). Ring shares use `mpc.bitwise`'s XOR-shared protocols instead.
+
 | Method | Signature | Description |
 |---|---|---|
-| `bit_decomposition` | `(a, bitlen, small_modulus, modulus)` | Decompose secret-shared values into secret-shared bits |
+| `bit_decomposition` | `(a, bitlen, small_modulus, modulus)` | Decompose secret-shared values into secret-shared bits, over `small_modulus` (prime on the field; on the ring any, a power of two included) |
 | `demultiplexer` | `(bits_matrix, modulus)` | One-hot decode from a matrix of secret-shared bits |
 | `carries` | `(a_bits, b_bits, public, modulus)` | Compute carry bits when adding two secret-shared bit representations |
 | `bit_add` | `(a_bits, b_bits, public, modulus)` | Bitwise addition of secret-shared bit decompositions |
@@ -127,7 +132,7 @@ Boolean circuits and comparison protocols over secret-shared values. Implements 
 | `prefix_and` | `(a, modulus)` | Compute prefix-AND (via De Morgan + `prefix_or`) |
 | `flip_bit` | `(a, modulus)` | Negate shared bits: $1 - a$ |
 | `is_positive` | `(a, modulus, nbits=MPC_MODULUS_BITS)` | $[a > 0]$ as a shared bit. On the ring: the sign test over the modulus' bits (`mpc.bitwise.sign_ring`), exact for every $\lvert a \rvert < 2^{L-1}$ (`nbits` is ignored). On the field: the parity of $2a$, masked by a uniform field element and opened, whose overflow is found by comparing the low `nbits` bits of the mask and the opening: exact for every $\lvert a \rvert \le (p-1)/2$ with the default (all $L$ bits), wrong with probability about $2\lvert a \rvert / 2^{\text{nbits}}$ with fewer (Sharetensor comparisons pass $K + F$ for differences of two fixed-point values) |
-| `is_nonzero` | `(a, modulus, nbits=MPC_MODULUS_BITS)` | $[a \ne 0]$ as a shared bit, field only: $a + r$ is opened for a uniform field element $r$, and an OR over the XOR of the low `nbits` bits of $r$ and the opening decides. Exact (not just with high probability) for every $\lvert a \rvert < 2^{\text{nbits}} - c$, where $p = 2^L - c$ ($c$ = 1, 3 and 9 with 128-, 192- and 256-bit shares): with the default, every value. About a quarter of `is_positive`'s cost at the same width. Sharetensor `==` and `!=` use it on the field |
+| `is_nonzero` | `(a, modulus, nbits=MPC_MODULUS_BITS)` | $[a \ne 0]$ as a shared bit, exact (not just with high probability). On the field: $a + r$ is opened for a uniform field element $r$, and an OR over the XOR of the low `nbits` bits of $r$ and the opening decides (two fan-in ORs, a table lookup: 4 rounds); exact for every $\lvert a \rvert < 2^{\text{nbits}} - c$, where $p = 2^L - c$ ($c$ = 1, 3 and 9 with 128-, 192- and 256-bit shares): with the default, every value. On the ring: $a + r \bmod 2^{\text{nbits}}$ is opened, then the count of its bits that differ from $r$'s under a uniform shift, and a one-hot bit of the dealer's becomes the result (3 rounds); exact for every $\lvert a \rvert < 2^{\text{nbits}}$, and an empty input gives an empty result. Sharetensor `==` and `!=` use it on both moduli (over $K + F$ bits on the field and $K$ on the ring for differences of two fixed-point values, all $L$ bits for integers and wide differences, $K + F + 1$ on the ring inside `delayed_truncation()`) |
 | `less_than_bits_public` | `(a, b_pub, modulus)` | Bitwise comparison $a < b$ where `b` is public |
 | `less_than_bits` | `(a, b, modulus)` | Bitwise comparison $a < b$ where both are secret-shared |
 | `less_than_public` | `(a, bpub, modulus)` | Comparison $a < b$ where `b` is public. Works on scalars, 1D, and 2D inputs |
@@ -161,6 +166,7 @@ carry, use them.
 | `share_from_trusted_dealer` | `(data)` | XOR-share the dealer's data |
 | `reveal` | `(value)` | Open XOR shares to the compute parties |
 | `land`, `lor`, `lor_public` | `(a, b)` | AND (two rounds: each operand is partitioned in its own opening; the carry and prefix circuits partition both in one), OR (the same), OR with a public operand (local) |
+| `prefix_or` | `(x, bitlen, dtype=mpc_uint)` | Bit $j$ of the result is the OR of bits $bitlen - 1, \dots, j$ of the XOR-shared registers $x$, in $\lceil \log_2 bitlen \rceil$ rounds (the ring normalizer finds the leading one with it). Other associative operations go through `_prefix_op(x, op, bitlen, dtype)`, as the carries do |
 | `carry_out_public` | `(a_pub, b, num_bits)` | The carry out of adding a public value and an XOR-shared one ($\log_2$ depth) |
 | `carry_out_public_arithmetic` | `(a_pub, b, num_bits, modulus)` | The same carry, returned as arithmetic shares |
 | `sign_ring` | `(a, modulus, bits)` | $[a > 0]$ for ring shares whose value lies in $(-2^{bits - 1}, 2^{bits - 1})$ |
@@ -193,9 +199,9 @@ Polynomial operations over secret-shared values, including Lagrange interpolatio
 
 | Method | Signature | Description |
 |---|---|---|
-| `lagrange_interp` | `(x: list[int], y, modulus)` | Lagrange interpolation on given `(x, y)` points |
+| `lagrange_interp` | `(x: list[int], y, modulus)` | Lagrange interpolation on given `(x, y)` points, modulo a prime (a power-of-two modulus raises `ValueError`) |
 | `lagrange_interp_simple` | `(y, modulus)` | Lagrange interpolation with implicit $x = [1, 2, \ldots, n]$ |
-| `table_lookup` | `(x, table_id, modulus)` | Evaluate a pre-cached polynomial lookup table on secret-shared `x` |
+| `table_lookup` | `(x, table_id, modulus)` | Evaluate a polynomial lookup table on secret-shared `x`. The tables are built for the field (`MPC_FIELD_SIZE`), each on its first lookup; another modulus raises `ValueError` |
 | `powers` | `(x, power, modulus)` | Compute all powers $[x^0, x^1, \ldots, x^{\text{power}}]$ of a secret-shared value using Beaver triples and Pascal's triangle |
 | `powers_cached` | `(x_r, r, power, modulus)` | Same as `powers`, but with pre-computed Beaver partition `(x_r, r)` |
 | `evaluate_poly` | `(x, coeff, modulus)` | Evaluate polynomials defined by `coeff` matrix at secret-shared points `x` |
@@ -542,11 +548,15 @@ See the dedicated [MPC ↔ MHE Switching](../user-guide/switching.md) page for d
 
 ### `mpc.default_modulus(modulus)`
 
-Temporarily switch the working modulus (e.g., from field to ring). Restores the original modulus on exit.
+Temporarily switch the default modulus (`mpc.default_mpc_modulus`, which `Sharetensor.enc` and the MP types' conversions
+to MPC take when given none). Restores the original modulus on exit. Shares made under one modulus stay on it: an
+operation on shares of two moduli raises.
 
 ```python
-with mpc.default_modulus(RING_MODULUS):
-    # all operations use RING_MODULUS
+from sequre import MPC_FIELD_SIZE, MPC_RING_SIZE
+
+with mpc.default_modulus(MPC_FIELD_SIZE):
+    # new shares are field shares (the run's default is the ring, unless it was started with --use-field)
     ...
 ```
 

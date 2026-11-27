@@ -164,4 +164,5 @@ Run the test suite from the repository root to confirm everything works:
 <codon-path>/install/bin/sequre scripts/invoke.codon run-tests --local --all
 ```
 
-With an installed release, the same command is `sequre scripts/invoke.codon run-tests --local --all`.
+With an installed release, the same command is `sequre scripts/invoke.codon run-tests --local --all`. It runs on the
+default modulus, the ring; run it again with `--use-field` to cover the field's own protocols too.

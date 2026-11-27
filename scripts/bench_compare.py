@@ -139,11 +139,15 @@ SETTINGS = [("machine", "host"), ("machine", "cpu_model"), ("environment", "task
             ("environment", "reps_scale"), ("environment", "selection"), ("sequre", "parties"),
             ("sequre", "NUM_THREADS"), ("sequre", "lattiseq_threads"), ("sequre", "MPC_INT_SIZE"),
             ("sequre", "DEFAULT_HE_PARAMS"), ("sequre", "harness_version"), ("sequre", "gc_markers_restarted"),
-            ("sequre", "gc_parallel_by_party")]
+            ("sequre", "gc_parallel_by_party"), ("sequre", "modulus")]
 
 
-# Harness versions whose timings compare: v4 only appended the rounds_per_rep column.
-TIMING_EQUIVALENT_HARNESS = {"4": "3"}
+# Harness versions whose timings compare: v4 only appended the rounds_per_rep column, v5 the header's modulus.
+TIMING_EQUIVALENT_HARNESS = {"4": "3", "5": "3"}
+
+# The modulus of a run made before the harness recorded it (v4 and earlier): bench.sh passed no modulus flag, so the
+# cases that name no modulus ran on the runtime's default then, the field.
+UNRECORDED_MODULUS = "field"
 
 
 def settings_differences(mb, mc):
@@ -153,6 +157,8 @@ def settings_differences(mb, mc):
     out = []
     for section, key in SETTINGS:
         b, c = mb.get(section, {}).get(key), mc.get(section, {}).get(key)
+        if key == "modulus":
+            b, c = b or UNRECORDED_MODULUS, c or UNRECORDED_MODULUS
         if key == "harness_version":
             same = TIMING_EQUIVALENT_HARNESS.get(str(b), str(b)) == TIMING_EQUIVALENT_HARNESS.get(str(c), str(c))
         else:
