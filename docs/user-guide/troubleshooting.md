@@ -22,22 +22,6 @@ Use debug mode only when a backtrace diagnostics are needed. Switch to `-release
 
 ## Missing shared libraries
 
-### libgmp (GMP)
-
-GMP is **bundled** with Sequre releases (`lib/codon/plugins/sequre/lib/` in the install). The Sequre runtime looks for it in this order: `SEQURE_GMP_PATH`, the bundled copy (where the plugin was when the program was compiled, so a built binary finds it too), then common system locations (`libgmp.so` and `libgmp.so.10` on Linux, `libgmp.dylib` and `libgmp.10.dylib` on macOS). The `sequre` launcher also points `SEQURE_GMP_PATH` at the bundled copy for `sequre run`. If the plugin's `stdlib` directory is a symlink (to a source checkout, say), the runtime follows the symlink and looks next to the checkout instead: built binaries then use a system GMP unless `SEQURE_GMP_PATH` is set.
-
-If no GMP is found (the error lists the paths tried), install GMP and set the path to it to `SEQURE_GMP_PATH` env variable (Sequre repository also provides these libraries in `external/GMP/lib` dir: x86-64 Linux and arm64 macOS):
-
-```bash
-# Linux
-sudo apt install libgmp-dev
-export SEQURE_GMP_PATH=/usr/lib/x86_64-linux-gnu/libgmp.so
-
-# macOS
-brew install gmp
-export SEQURE_GMP_PATH=/opt/homebrew/lib/libgmp.dylib
-```
-
 ### OpenSSL (libssl / libcrypto)
 
 The Sequre runtime looks for OpenSSL at common paths on Linux and macOS. If it finds none, install OpenSSL and point to it manually:

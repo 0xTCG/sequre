@@ -1,6 +1,6 @@
 #!/bin/sh
 # Checks that every binary under the given paths is built for the given platform, so that a release archive never
-# ships a binary of another architecture (an x86-64 libgmp in an aarch64 archive, say). Binaries are recognised by
+# ships a binary of another architecture (an x86-64 plugin in an aarch64 archive, say). Binaries are recognised by
 # their magic number: ELF, Mach-O (thin or universal) and static archives (by their first object file).
 #
 #   scripts/check_machine_types.sh <platform> <file | directory | archive.tar.gz>...

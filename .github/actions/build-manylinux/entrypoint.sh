@@ -6,24 +6,23 @@
 #
 # Steps, in this order (SEQURE_BUILD_STEPS selects some of them):
 #   toolchain  download Codon and LLVM-codon (pinned versions below) into the prefixes
-#   plugin     build the Sequre plugin with cmake and install it into <prefix>/lib/codon/plugins/sequre, with the
-#              Codon version it is built for in codon-version (install.sh installs that Codon with the archive)
+#   plugin     build the Sequre plugin with cmake and install it into <prefix>/lib/codon/plugins/sequre (in place of
+#              what is there), with the Codon version it is built for in codon-version (install.sh installs that
+#              Codon with the archive)
 #   launcher   build the sequre launcher and, on x86-64 Linux, the alignment shim
-#   gmp        bundle GMP built for the target: the repository's copy (external/GMP/lib: x86-64 Linux, arm64 macOS)
-#              or, on other Linux architectures, one built from source (scripts/build_gmp.sh)
 #   pack       write sequre-<os>-<arch>.tar.gz into the source directory
 #   check      check that every binary in the archive is built for the target (scripts/check_machine_types.sh)
 # Environment (defaults in brackets):
 #   SEQURE_BUILD_PREFIX  the prefix the archive is assembled in [$HOME/.sequre]
 #   SEQURE_LLVM_PREFIX   where LLVM-codon is unpacked [/opt]
-#   SEQURE_BUILD_STEPS   [toolchain plugin launcher gmp pack check]
+#   SEQURE_BUILD_STEPS   [toolchain plugin launcher pack check]
 #   CC, CXX              compilers [macOS: the system clang; Linux: LLVM-codon's clang if unpacked, else cc, c++]
 set -eu
 
 SRC=$(cd "${1:?usage: entrypoint.sh <sequre source directory>}" && pwd)
 PREFIX=${SEQURE_BUILD_PREFIX:-$HOME/.sequre}
 OPT=${SEQURE_LLVM_PREFIX:-/opt}
-STEPS=${SEQURE_BUILD_STEPS:-toolchain plugin launcher gmp pack check}
+STEPS=${SEQURE_BUILD_STEPS:-toolchain plugin launcher pack check}
 OS=$(uname -s | awk '{print tolower($0)}')
 ARCH=$(uname -m)
 PLATFORM=$OS-$ARCH
@@ -112,6 +111,9 @@ if has_step plugin; then
     -DCMAKE_C_COMPILER="$CC" \
     -DCMAKE_CXX_COMPILER="$CXX"
   cmake --build "$SRC/build" --target sequre
+  # The plugin directory holds this build alone: an earlier install's files there (a library earlier releases
+  # bundled, a module since removed) would otherwise go into the archive
+  rm -rf "$PLUGIN"
   cmake --install "$SRC/build" --prefix "$PLUGIN"
   echo "$CODON_VERSION" > "$PLUGIN/codon-version"
 fi
@@ -127,19 +129,6 @@ if has_step launcher; then
   fi
 fi
 
-if has_step gmp; then
-  mkdir -p "$PLUGIN/lib"
-  case "$PLATFORM" in
-    darwin-arm64) cp "$SRC/external/GMP/lib/libgmp.dylib" "$PLUGIN/lib/libgmp.dylib" ;;
-    linux-x86_64) cp "$SRC/external/GMP/lib/libgmp.so" "$PLUGIN/lib/libgmp.so" ;;
-    linux-*) sh "$SRC/scripts/build_gmp.sh" "$PLUGIN/lib/libgmp.so" ;;
-    *)
-      echo "error: no GMP for $PLATFORM" >&2
-      exit 1
-      ;;
-  esac
-fi
-
 if has_step pack; then
   # Only Sequre's own files (not the whole lib/codon/stdlib tree): install.sh unpacks Codon itself separately, and
   # Sequre uses Codon's own numpy.
@@ -148,8 +137,7 @@ if has_step pack; then
     *) DLL=so ;;
   esac
   set -- bin/sequre lib/codon/plugins/sequre/plugin.toml lib/codon/plugins/sequre/build/libsequre.$DLL \
-    lib/codon/plugins/sequre/lib/libgmp.$DLL lib/codon/plugins/sequre/stdlib/sequre/__init__.codon \
-    lib/codon/plugins/sequre/codon-version
+    lib/codon/plugins/sequre/stdlib/sequre/__init__.codon lib/codon/plugins/sequre/codon-version
   if [ "$PLATFORM" = "linux-x86_64" ]; then
     set -- "$@" lib/sequre_align64.so
   fi

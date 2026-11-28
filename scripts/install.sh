@@ -8,7 +8,8 @@
 # before either is unpacked: a missing asset, a failed download or an archive for another platform stops the install
 # with a message naming it, and leaves an existing install as it was. Then the directories each archive owns are
 # replaced, each named in the output: Codon's lib/codon/stdlib and include/codon, and Sequre's lib/codon/plugins/sequre
-# (moved to lib/codon/plugins/sequre.previous when it holds entries the new archive lacks, a user's files say); the seq
+# (moved to lib/codon/plugins/sequre.previous when it holds entries the new archive lacks, a user's files say, but not
+# for a lib/ of nothing but the shared libraries that earlier releases bundled there); the seq
 # plugin that Sequre's archives for Codon 0.19 bundled goes too, as it does not load into Codon 0.20. Codon and Sequre
 # are then unpacked over the install directory (other files an earlier install has and the new one lacks stay); a
 # failure there (permissions, disk space) says that the install is incomplete. An install directory whose lib,
@@ -177,6 +178,17 @@ in_sequre_archive() {  # in_sequre_archive <path>: the Sequre archive has <path>
   awk -v p="$1" '{ sub(/^\.\//, ""); if ($0 == p || $0 == p "/" || index($0, p "/") == 1) { found = 1; exit } }
                  END { exit !found }' "$TMP/sequre.tar.gz.list"
 }
+only_shared_libraries() {  # only_shared_libraries <dir>: a directory of regular *.so, *.so.* or *.dylib files only
+  [ -d "$1" ] && [ ! -L "$1" ] || return 1
+  for f in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    if [ -e "$f" ] || [ -L "$f" ]; then
+      case "${f##*/}" in
+        *.so|*.so.*|*.dylib) [ -f "$f" ] && [ ! -L "$f" ] || return 1 ;;
+        *) return 1 ;;
+      esac
+    fi
+  done
+}
 clear_owned_directories() {
   plugins="$SEQURE_INSTALL_DIR/lib/codon/plugins"
   if [ -e "$SEQURE_INSTALL_DIR/lib/codon/stdlib" ] || [ -e "$SEQURE_INSTALL_DIR/include/codon" ]; then
@@ -195,8 +207,13 @@ clear_owned_directories() {
   # earlier layout's files) are kept: the old directory is moved aside instead of removed.
   if [ -e "$plugins/sequre" ] || [ -L "$plugins/sequre" ]; then
     extra=""
-    for entry in "$plugins/sequre"/* "$plugins/sequre"/.[!.]*; do
+    for entry in "$plugins/sequre"/* "$plugins/sequre"/.[!.]* "$plugins/sequre"/..?*; do
       if [ -e "$entry" ] || [ -L "$entry" ]; then
+        # lib: the shared libraries that earlier releases bundled beside the plugin, which this archive does not: the
+        # archive's own, not the user's, as long as it holds nothing else
+        if [ "${entry##*/}" = lib ] && ! in_sequre_archive lib/codon/plugins/sequre/lib && only_shared_libraries "$entry"; then
+          continue
+        fi
         in_sequre_archive "lib/codon/plugins/sequre/${entry##*/}" || extra="$extra ${entry##*/}"
       fi
     done

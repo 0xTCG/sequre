@@ -82,9 +82,9 @@ cmake --build build --config Release
 cmake --install build --prefix="<codon-path>/install/lib/codon/plugins/sequre"
 ```
 
-### 4. The launcher, the alignment shim and GMP
+### 4. The launcher and the alignment shim
 
-The release archives also carry the `sequre` launcher, the x86-64 alignment shim and a GMP library. Add them to the source build:
+The release archives also carry the `sequre` launcher and the x86-64 alignment shim. Add them to the source build:
 
 ```bash
 # The launcher
@@ -92,16 +92,6 @@ cc -O2 -o <codon-path>/install/bin/sequre sequre_launcher.c
 
 # Linux x86_64: the alignment shim (see below)
 scripts/apply_avx512_workaround.sh <codon-path>/install
-
-# GMP, where the Sequre runtime looks for the bundled copy (<plugin>/lib): the repository's library on x86-64 Linux
-# and arm64 macOS; on Linux aarch64 one built from source (or skip this and rely on a system libgmp)
-GMP_DIR=<codon-path>/install/lib/codon/plugins/sequre/lib
-mkdir -p "$GMP_DIR"
-case "$(uname -s)-$(uname -m)" in
-  Linux-x86_64) cp external/GMP/lib/libgmp.so "$GMP_DIR/" ;;
-  Darwin-arm64) cp external/GMP/lib/libgmp.dylib "$GMP_DIR/" ;;
-  Linux-aarch64) scripts/build_gmp.sh "$GMP_DIR/libgmp.so" ;;
-esac
 
 <codon-path>/install/bin/sequre examples/addmul.codon --local
 ```
