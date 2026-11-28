@@ -56,12 +56,10 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOOL=(python3 "$REPO/scripts/bench_tool.py")
 COMPARE=(python3 "$REPO/scripts/bench_compare.py")
-# The prefix of the launcher that builds the binaries (the sequre on PATH, else ~/.sequre): its alignment shim, and
-# the GMP of the plugin it builds with (SEQURE_PLUGIN_PATH, else the prefix's)
+# The prefix of the launcher that builds the binaries (the sequre on PATH, else ~/.sequre): its alignment shim
 LAUNCHER_BIN="$(command -v sequre || echo "$HOME/.sequre/bin/sequre")"
 PREFIX="$(cd "$(dirname "$(readlink -f "$LAUNCHER_BIN")")/.." 2>/dev/null && pwd || echo "$HOME/.sequre")"
 SHIM="$PREFIX/lib/sequre_align64.so"
-GMP="${SEQURE_PLUGIN_PATH:-$PREFIX/lib/codon/plugins/sequre}/lib/libgmp.so"
 CACHE="$REPO/results/bench/.cache"
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"; }
@@ -139,7 +137,7 @@ if [[ -e "$RES" ]]; then echo "bench.sh: $RES exists; pick another --label" >&2;
 mkdir -p "$RES/build" "$RES/runs" "$CACHE"
 START_ALL=$(date +%s.%N)
 echo "== results: $RES"
-"${TOOL[@]}" event --dir "$RES" type=env "ld_preload=$( [[ -f "$SHIM" ]] && echo "$SHIM" )" "gmp=$GMP" "cpus=$CPUS" "pin=$PIN" \
+"${TOOL[@]}" event --dir "$RES" type=env "ld_preload=$( [[ -f "$SHIM" ]] && echo "$SHIM" )" "cpus=$CPUS" "pin=$PIN" \
     "reps_scale=$REPS_SCALE" "cases=$CASES" "skip=$SKIP" "load=$(cut -d' ' -f1-3 /proc/loadavg)" "gc_flags=${GC_FLAGS[*]}" "gc_heap=$GC_HEAP" \
     "modulus_flag=$MODULUS_FLAG"
 
@@ -211,7 +209,7 @@ run_segment() {
     load_before="$(cut -d' ' -f1-3 /proc/loadavg)"
     echo "== run $seg (timeout ${limit}s, load $load_before)"
     t0=$(date +%s.%N)
-    (cd "$wd" && env "${preload[@]}" "SEQURE_GMP_PATH=$GMP" \
+    (cd "$wd" && env "${preload[@]}" \
         timeout --kill-after=30 "$limit" "${pin[@]}" "${BIN_PATH[$b]}" "${args[@]}") > "$dir/stdout.log" 2>&1
     rc=$?
     t1=$(date +%s.%N)

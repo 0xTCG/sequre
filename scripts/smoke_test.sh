@@ -8,17 +8,22 @@
 #   machine-types   every binary of Sequre's in the install (the launcher, the shim, the plugins), and in the archive
 #                   if given, is built for this machine (scripts/check_machine_types.sh)
 #   launcher-files  sock.* files in the working directory survive `sequre --help` and `sequre build`
-#   run             `sequre run examples/addmul.codon --local`, with the MHE setup (the alignment shim and GMP), prints
+#   run             `sequre run examples/addmul.codon --local`, with the MHE setup (the alignment shim), prints
 #                   the results and leaves no socket file behind
 #   build           `sequre build examples/addmul.codon`: the launcher runs the codon and the plugin of its own install
 #                   (it finds itself), and on x86-64 Linux the shim comes before libcodonrt in the binary's NEEDED list
-#   binary-N        the built binary, run directly in a clean environment (env -i: no LD_PRELOAD, SEQURE_GMP_PATH or
-#                   CODON_PYTHON) with the MHE setup and N parties (3 and 4), prints the results, loads the GMP bundled
-#                   with the plugin (Linux and macOS) and leaves no socket file behind
+#   binary-N        the built binary, run directly in a clean environment (env -i: no LD_PRELOAD or CODON_PYTHON) with
+#                   the MHE setup and N parties (3 and 4), prints the results and leaves no socket file behind
 #   fixed-point-ring, fixed-point-field
 #                   examples/fixed_point.codon, built once and run with 3 parties on the default modulus (the ring)
 #                   and with --use-field: a fixed-point product (a truncation), a comparison, != and a division give
 #                   the expected values at every compute party, and each party says which modulus it ran on
+#   arithmetic      scripts/smoke_arithmetic.codon, built with -release and run in one process: known answers
+#                   (literals, the same on every platform) for the limb division at several widths and shapes, its rare
+#                   branches included, the operators on integers wider than 128 bits, the MPC field's product at 128,
+#                   192 and 256 bits, Lattiseq's CRT reconstruction on both of its paths and a decode, BigFloat's
+#                   operations, the exact encoder's roots of unity and bootstrapping's sine polynomial; every check
+#                   must run and pass
 #   shim            x86-64 Linux: shrinking and freeing over-aligned blocks leaves their neighbours intact
 #   installer-*     with the archive given, scripts/install.sh: a download that fails (HTTP 404), a broken archive and
 #                   an archive whose launcher does not run each stop it with a non-zero status and leave an existing
@@ -26,8 +31,9 @@
 #                   completes and leaves shell profiles alone, and SEQURE_UPDATE_PATH=yes adds one PATH line; over
 #                   an install of an earlier release it replaces Codon's stdlib and headers and Sequre's plugin, drops
 #                   the seq plugin that release bundled, and keeps the user's files in the old plugin directory
-#                   (moved to sequre.previous); an install whose lib/codon is a symbolic link is refused, its target
-#                   untouched. Every installer run gets a scratch HOME and a scratch install directory.
+#                   (moved to sequre.previous), but replaces a plugin whose only such entry is a lib/ of shared
+#                   libraries; an install whose lib/codon is a symbolic link is refused, its target untouched. Every
+#                   installer run gets a scratch HOME and a scratch install directory.
 # Environment: SMOKE_TIMEOUT (seconds per program run, default 600), SMOKE_INSTALL_SH (the installer to test,
 # default scripts/install.sh).
 set -uo pipefail
@@ -51,7 +57,6 @@ case "$OS" in
   darwin) DLL=dylib ;;
   *) DLL=so ;;
 esac
-BUNDLED_GMP=$PREFIX/lib/codon/plugins/sequre/lib/libgmp.$DLL
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/sequre-smoke.XXXXXX")
 WORK=$(cd "$WORK" && pwd -P)
@@ -216,29 +221,46 @@ for modulus in ring field; do
   fi
 done
 
+# arithmetic
+D=$WORK/arithmetic
+mkdir -p "$D"
+(cd "$D" && run_timeout "$TIMEOUT" env CODON_DEBUG=0 "$SEQURE" build -release "$REPO/scripts/smoke_arithmetic.codon" \
+  -o "$D/arith" > build.txt 2>&1 < /dev/null)
+rc=$?
+if [ $rc -ne 0 ] || [ ! -x "$D/arith" ]; then
+  tail -10 "$D/build.txt" | sed 's/^/      /'
+  fail arithmetic "the check did not build (exit status $rc)"
+else
+  (cd "$D" && run_timeout "$TIMEOUT" "$D/arith" > log.txt 2>&1 < /dev/null)
+  rc=$?
+  summary=$(grep '^arithmetic: ' "$D/log.txt" | tail -1)
+  if [ $rc -ne 0 ] || [ -z "$summary" ]; then
+    if [ -n "$summary" ]; then
+      grep '^FAIL' "$D/log.txt" | head -20 | sed 's/^/      /'
+    else
+      tail -10 "$D/log.txt" | sed 's/^/      /'
+    fi
+    fail arithmetic "exit status $rc${summary:+; ${summary#arithmetic: }}"
+  else
+    ok arithmetic "${summary#arithmetic: }"
+  fi
+fi
+
 # binary-3, binary-4
 if [ -n "$BIN" ]; then
   for n in 3 4; do
     D=$WORK/binary-$n
     mkdir -p "$D"
-    trace=()
-    case "$OS" in
-      linux) trace=(LD_DEBUG=libs LD_DEBUG_OUTPUT="$D/ld") ;;
-      darwin) trace=(DYLD_PRINT_LIBRARIES=1) ;;
-    esac
-    (cd "$D" && run_timeout "$TIMEOUT" env -i HOME="$HOME" PATH=/usr/bin:/bin SEQURE_CP_COUNT=$n ${trace[@]+"${trace[@]}"} \
+    (cd "$D" && run_timeout "$TIMEOUT" env -i HOME="$HOME" PATH=/usr/bin:/bin SEQURE_CP_COUNT=$n \
       "$BIN" --local > log.txt 2>&1 < /dev/null)
     rc=$?
-    gmp=$(cat "$D"/ld.* "$D/log.txt" 2> /dev/null | grep -o -E '/[^ ]*libgmp[^ ]*' | sort -u | tr '\n' ' ')
     if [ $rc -ne 0 ] || ! check_results "$D/log.txt" $n; then
-      grep -v -E '^ *[0-9]+:|^dyld' "$D/log.txt" | tail -20 | sed 's/^/      /'
+      tail -20 "$D/log.txt" | sed 's/^/      /'
       fail binary-$n "exit status $rc"
     elif [ -n "$(run_sockets "$D")" ]; then
       fail binary-$n "socket files left: $(run_sockets "$D")"
-    elif [ "$gmp" != "$BUNDLED_GMP " ]; then
-      fail binary-$n "loaded GMP [$gmp], not the bundled $BUNDLED_GMP"
     else
-      ok binary-$n "clean environment, MHE setup, results from every compute party; GMP $BUNDLED_GMP"
+      ok binary-$n "clean environment, MHE setup, results from every compute party"
     fi
   done
 fi
@@ -396,6 +418,47 @@ if [ -n "$ARCHIVE" ]; then
   else
     tail -5 "$h/log.txt" | sed 's/^/      /'
     fail installer-upgrade "${problems% ;}"
+  fi
+
+  # installer-upgrade-lib: over an install of an earlier release whose plugin directory holds a lib/ of shared
+  # libraries (which earlier releases bundled there) and nothing else this archive lacks, the plugin is replaced, not
+  # moved aside; with a file of another kind in that lib/, it is moved aside (only for an archive without that lib/)
+  if [ -d "$WORK/fake/bad/lib/codon/plugins/sequre/lib" ]; then
+    ok installer-upgrade-lib "not applicable: the archive has its own lib/codon/plugins/sequre/lib"
+  else
+    problems=""
+    failed_logs=""
+    for kind in libraries mixed; do
+      h=$WORK/installer-upgrade-$kind
+      before=$problems
+      mkdir -p "$h/prefix/lib/codon/plugins/sequre/lib"
+      echo "earlier" > "$h/prefix/lib/codon/plugins/sequre/plugin.toml"
+      echo "earlier" > "$h/prefix/lib/codon/plugins/sequre/lib/libbundled.so"
+      echo "earlier" > "$h/prefix/lib/codon/plugins/sequre/lib/libbundled.so.10"
+      echo "earlier" > "$h/prefix/lib/codon/plugins/sequre/lib/libbundled.dylib"
+      [ $kind = mixed ] && echo "the user's" > "$h/prefix/lib/codon/plugins/sequre/lib/notes.txt"
+      run_timeout "$TIMEOUT" env HOME="$h" SEQURE_INSTALL_DIR="$h/prefix" SEQURE_CODON_ARCHIVE="$FAKE_CODON" \
+        SEQURE_ARCHIVE="$ARCHIVE" SEQURE_UPDATE_PATH=no bash "$INSTALL_SH" > "$h/log.txt" 2>&1 < /dev/null
+      rc=$?
+      P=$h/prefix/lib/codon/plugins
+      [ $rc -eq 0 ] || problems="$problems $kind: exit status $rc;"
+      [ -f "$P/sequre/codon-version" ] || problems="$problems $kind: no new plugin;"
+      if [ $kind = libraries ]; then
+        [ ! -e "$P/sequre.previous" ] || problems="$problems libraries: the plugin was moved aside;"
+        [ ! -e "$P/sequre/lib" ] || problems="$problems libraries: the earlier lib/ stayed;"
+        grep -q 'Replacing the Sequre plugin' "$h/log.txt" || problems="$problems libraries: no message about the replaced plugin;"
+      else
+        [ -f "$P/sequre.previous/lib/notes.txt" ] || problems="$problems mixed: the user's file is gone;"
+        grep -q 'Moved the earlier Sequre plugin' "$h/log.txt" || problems="$problems mixed: no message about the moved plugin;"
+      fi
+      [ "$problems" = "$before" ] || failed_logs="$failed_logs $h/log.txt"
+    done
+    if [ -z "$problems" ]; then
+      ok installer-upgrade-lib "an earlier lib/ of shared libraries replaced with the plugin; with another file in it, moved aside"
+    else
+      for l in $failed_logs; do tail -5 "$l" | sed 's/^/      /'; done
+      fail installer-upgrade-lib "${problems% ;}"
+    fi
   fi
 
   # installer-symlink: an install whose lib/codon is a symbolic link stops before anything is downloaded

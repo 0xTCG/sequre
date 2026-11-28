@@ -30,14 +30,7 @@ if [ "$(uname -m)" = "x86_64" ]; then
   $CC -shared -fPIC -O2 -o $HOME/.sequre/lib/sequre_align64.so "$SRC/sequre_align64.c" -ldl
 fi
 
-# Bundle GMP built for the target, as the release build does: the repository's x86-64 copy, or one built from source
-# on other architectures
 SEQURE_PREFIX=$HOME/.sequre/lib/codon/plugins/sequre
-mkdir -p $SEQURE_PREFIX/lib
-case "$(uname -m)" in
-  x86_64) cp "$SRC/external/GMP/lib/libgmp.so" $SEQURE_PREFIX/lib/libgmp.so ;;
-  *) sh "$SRC/scripts/build_gmp.sh" $SEQURE_PREFIX/lib/libgmp.so ;;
-esac
 
 # The Codon release the plugin is built for, as the release build writes it (installers tell a plugin built for Codon
 # 0.20 or later by this file)

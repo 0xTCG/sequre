@@ -202,7 +202,7 @@ Build the program once with `sequre build -release my_protocol.codon -o my_proto
 
 A built binary runs without the `sequre` launcher, but not without Sequre. Each machine needs:
 
-- **Sequre installed at the same path as on the build machine** (the same `SEQURE_INSTALL_DIR`, `~/.sequre` by default, under the same user name). The binary refers to Codon's runtime (`libcodonrt`, `libomp`) and, on x86-64 Linux, to Sequre's alignment shim by absolute path, and looks for the bundled GMP library where the plugin was at build time. To use another path, set `LD_LIBRARY_PATH` to the install's `lib` and `lib/codon` directories (`DYLD_LIBRARY_PATH` on macOS) and `SEQURE_GMP_PATH` to its `lib/codon/plugins/sequre/lib/libgmp.so` (`.dylib` on macOS).
+- **Sequre installed at the same path as on the build machine** (the same `SEQURE_INSTALL_DIR`, `~/.sequre` by default, under the same user name). The binary refers to Codon's runtime (`libcodonrt`, `libomp`) and, on x86-64 Linux, to Sequre's alignment shim by absolute path. To use another path, set `LD_LIBRARY_PATH` to the install's `lib` and `lib/codon` directories (`DYLD_LIBRARY_PATH` on macOS).
 - **OpenSSL 3** (`libssl` and `libcrypto`, for TLS), as for `sequre run`: at a standard location, or set `SEQURE_OPENSSL_PATH` and `SEQURE_LIBCRYPTO_PATH`.
 - **`CODON_PYTHON`**, only if the program uses Python interop (see [libpython](troubleshooting.md#libpython-for-python-interop)).
 - The same machine type and OS as the build machine.

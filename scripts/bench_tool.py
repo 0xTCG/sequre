@@ -524,7 +524,6 @@ def write_manifest(res, label, argv):
             "ld_preload_shim": env.get("ld_preload", ""),
             "shim_set": bool(env.get("ld_preload")),
             "shim_exists": os.path.exists(shim),
-            "sequre_gmp_path": env.get("gmp", ""),
             "taskset_cpus": env.get("cpus", ""),
             "party_pinning": env.get("pin", ""),
             "gc_flags": env.get("gc_flags", ""),

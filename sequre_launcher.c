@@ -27,7 +27,7 @@
 
 /* The directory of this executable as an absolute path with symlinks resolved, or NULL. Linux reads /proc/self/exe;
  * macOS has no /proc and asks dyld (_NSGetExecutablePath, then realpath). Everything the launcher finds by its own
- * location (codon, the plugin, the bundled GMP, the shim) depends on it. */
+ * location (codon, the plugin, the shim) depends on it. */
 static char *self_dir(void) {
   char self[PATH_MAX];
 #ifdef __APPLE__
@@ -682,33 +682,6 @@ static void maybe_set_codon_python(void) {
   }
 }
 
-/* Point SEQURE_GMP_PATH at the libgmp bundled inside the plugin (<plugin>/lib/libgmp.{so,dylib}) for the codon child.
- * The Sequre runtime looks there itself after SEQURE_GMP_PATH (_find_lib and _plugin_lib in
- * stdlib/sequre/constants.codon), through the path of its own source at compile time; with the plugin's stdlib
- * symlinked elsewhere that path leads away from the plugin, and this keeps `sequre run` on the bundled copy.
- * Respects a user-set SEQURE_GMP_PATH and does nothing if the bundled library is absent. */
-static void maybe_set_gmp_path(const char *plugin_path) {
-  const char *existing = getenv("SEQURE_GMP_PATH");
-  if (existing && *existing) {
-    return; /* respect user override */
-  }
-  if (!plugin_path || !*plugin_path) {
-    return;
-  }
-
-#ifdef __APPLE__
-  const char *libname = "lib/libgmp.dylib";
-#else
-  const char *libname = "lib/libgmp.so";
-#endif
-
-  char *gmp = join_path(plugin_path, libname);
-  if (path_exists(gmp)) {
-    setenv("SEQURE_GMP_PATH", gmp, 1);
-  }
-  free(gmp);
-}
-
 static void print_help(const char *codon) {
   printf("Sequre — Secure computation framework\n");
   printf("\n");
@@ -742,7 +715,6 @@ static void print_help(const char *codon) {
   printf("Environment variables:\n");
   printf("  CODON_BIN              Path to the codon executable\n");
   printf("  CODON_PYTHON           Path to libpython, for Python interop (auto-detected via python3)\n");
-  printf("  SEQURE_GMP_PATH        Override the libgmp path (default: the copy bundled with Sequre)\n");
   printf("  SEQURE_CP_IPS          Comma-separated party IPv4 addresses\n");
   printf("  SEQURE_CERT_DIR        TLS certificate directory (default: certs)\n");
   printf("  SEQURE_CA_CERT_FILE    CA certificate file (default: ca.pem)\n");
@@ -840,8 +812,6 @@ int main(int argc, char **argv) {
       return 1;
     }
   }
-
-  maybe_set_gmp_path(plugin_path);
 
   size_t pn = strlen(plugin_path) + sizeof("--plugin=");
   char *plugin_arg = malloc(pn);

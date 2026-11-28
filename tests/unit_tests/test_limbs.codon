@@ -1,0 +1,389 @@
+import internal.static as static
+
+import limbs
+
+from sequre.utils.testing import assert_eq
+from sequre.constants import MPC_INT_SIZE, MPC_MODULUS_BITS, MPC_MERSENNE_OFFSET, MPC_FIELD_SIZE, MPC_RING_SIZE, mpc_uint
+from sequre.settings import DEBUG
+from sequre.utils.primitives import strassen
+# The hand-written field kernels: the generic one (limbs.pm_mul) is checked against them at 128 and 192 bits, whatever
+# MPC_INT_SIZE is, where they are right (wide factors below 2^L; a u64 factor with any operand)
+from sequre.experimental.fast_modular_multiplication.u128_w_llvm_overflow_intrinsic import modular_mul_u128u128_v1, modular_mul_u128u64_v1
+from sequre.experimental.fast_modular_multiplication.u192_w_llvm_overflow_intrinsic import modular_mul_u192u192, modular_mul_u192u64
+
+
+# Python's integers as a second opinion: C's truncated quotient and remainder, the floor quotient and the remainder
+# in [0, |b|)
+@python
+def py_divisions(a: str, b: str) -> str:
+    x, y = int(a), int(b)
+    q = abs(x) // abs(y)
+    if (x < 0) != (y < 0):
+        q = -q
+    return f"{q} {x - q * y} {x // y} {x % abs(y)}"
+
+
+@python
+def py_mul_mod(a: str, b: str, m: str) -> str:
+    return str(int(a) * int(b) % int(m))
+
+
+@python
+def py_hex(a: str) -> str:
+    return format(int(a), 'x')
+
+
+@python
+def py_power_of_two_plus(e: int, c: int) -> str:
+    return str(2 ** e + c)
+
+
+class _Rng:
+    # splitmix64: local data, no random stream of Sequre's moves
+    s: u64
+
+    def next(self) -> u64:
+        self.s += u64(0x9E3779B97F4A7C15)
+        z = self.s
+        z = (z ^ (z >> u64(30))) * u64(0xBF58476D1CE4E5B9)
+        z = (z ^ (z >> u64(27))) * u64(0x94D049BB133111EB)
+        return z ^ (z >> u64(31))
+
+    def bits(self, nbits: int, N: Literal[int]) -> UInt[N]:
+        # uniform below 2^nbits
+        x = UInt[N](0)
+        for i in static.range((N + 63) // 64):
+            if 64 * i < N:
+                x |= limbs.from_u64(self.next(), N) << UInt[N](64 * i)
+        if nbits < N:
+            x &= (UInt[N](1) << UInt[N](nbits)) - UInt[N](1)
+        return x
+
+    def pattern(self, nbits: int, N: Literal[int]) -> UInt[N]:
+        # exactly nbits bits (top bit set): random, all ones, a single top bit, random limbs of all ones and zeros,
+        # or odd
+        if nbits == 0:
+            return UInt[N](0)
+        top = UInt[N](1) << UInt[N](nbits - 1)
+        mask = (top - UInt[N](1)) | top
+        k = int(self.next() % u64(5))
+        x = UInt[N](0)
+        if k == 0:
+            x = self.bits(nbits, N)
+        elif k == 1:
+            x = mask
+        elif k == 2:
+            x = top
+        elif k == 3:
+            for i in range((N + 63) // 64):
+                r = self.next() % u64(3)
+                limb = ~u64(0) if r == u64(0) else (u64(0) if r == u64(1) else self.next())
+                x |= limbs.from_u64(limb, N) << UInt[N](64 * i)
+            x &= mask
+        else:
+            x = self.bits(nbits, N) | UInt[N](1)
+        return x | top
+
+
+def _identity(a: UInt[N], b: UInt[N], N: Literal[int]) -> bool:
+    # a = q b + r and r < b, checked in twice the width (LLVM's own multiplication), and the three entry points agree
+    q, r = limbs.udivrem(a, b)
+    W: Literal[int] = 2 * N
+    ok = r < b and limbs._zext(q, W, N) * limbs._zext(b, W, N) + limbs._zext(r, W, N) == limbs._zext(a, W, N)
+    return ok and limbs.umod(a, b) == r and limbs.udiv(a, b) == q
+
+
+def _division_at(N: Literal[int], rng: _Rng, per_pair: int) -> int:
+    # every pair of operand lengths on a grid from one bit to the full width, patterned operands; returns failures
+    lengths = [1, 2, 63, 64, 65, 127, 128, 129, 191, 192, 193, N // 2, N - 65, N - 64, N - 1, N]
+    bad = 0
+    for la in lengths:
+        if la < 1 or la > N: continue
+        for lb in lengths:
+            if lb < 1 or lb > N: continue
+            for _ in range(per_pair):
+                if not _identity(rng.pattern(la, N), rng.pattern(lb, N)): bad += 1
+    for _ in range(4 * per_pair):
+        b = rng.pattern(int(rng.next() % u64(N)) + 1, N)
+        for a in [UInt[N](0), UInt[N](1), b, b - UInt[N](1), ~UInt[N](0)]:
+            if not _identity(a, b): bad += 1
+    return bad
+
+
+def _limb_list_value(v: List[u64], N: Literal[int]) -> UInt[N]:
+    x = UInt[N](0)
+    for i in range(len(v)):
+        x |= limbs.from_u64(v[i], N) << UInt[N](64 * i)
+    return x
+
+
+def test_limb_division():
+    rng = _Rng(u64(20261127))
+    for N in static.tuple(192, 256, 384, 512, 640, 1024):
+        assert_eq(f'Limb division at {N} bits: a = q b + r and r < b over every pair of operand lengths', _division_at(N, rng, 3), 0)
+    for N in static.tuple(129, 174, 251):
+        assert_eq(f'Limb division at {N} bits (not a multiple of 64)', _division_at(N, rng, 2), 0)
+
+    # The rare branches of the long division, by construction (a counted copy of limbs.divrem reached each on these
+    # operands): the add-back (u = q v - 1 with a non-zero limb of v below its top two: the estimate from the top limbs
+    # is q, the quotient q - 1), two corrections of the estimate (a divisor's top limbs just above 2^63 and just below
+    # 2^64, a dividend's top limb just below the divisor's), an estimate that does not fit a limb (the partial
+    # remainder's top limb equal to the divisor's)
+    bad = 0
+    for vn in [3, 4, 6]:
+        for _ in range(30):
+            v = [rng.next() | u64(1) for _ in range(vn - 1)]
+            v.append(rng.next() | (u64(1) << u64(63)))
+            b = _limb_list_value(v, 512)
+            q = limbs.from_u64((rng.next() >> u64(rng.next() % u64(60))) | u64(2), 512)
+            a = q * b - UInt[512](1)
+            qq, rr = limbs.udivrem(a, b)
+            if qq != q - UInt[512](1) or rr != b - UInt[512](1): bad += 1
+    assert_eq('Long division: the add-back step (u = q v - 1)', bad, 0)
+    bad = 0
+    for e in [(u64(0x8000000000044aab), u64(0xc9e9c616612e7696), u64(0x7ce42c8218072e8c), u64(0x8000000000044cb6), u64(0xfffffffffffdfb07)),
+              (u64(0x80000000000c794b), u64(0x7204e52db2221a58), u64(0xcd447e35b8b6d8fe), u64(0x80000000000c7950), u64(0xfffffffffff226c5))]:
+        u2, u1, u0, vh, vl = e
+        if not _identity(_limb_list_value([u0, u1, u2], 256), _limb_list_value([vl, vh], 256)): bad += 1
+    for _ in range(2000):
+        vh = (u64(1) << u64(63)) + (rng.next() >> u64(44))
+        vl = ~u64(0) - (rng.next() >> u64(44))
+        u2 = vh - u64(1) - (rng.next() >> u64(54))
+        if not _identity(_limb_list_value([rng.next(), rng.next(), u2], 256), _limb_list_value([vl, vh], 256)): bad += 1
+    assert_eq('Long division: quotient estimates corrected twice', bad, 0)
+    bad = 0
+    for vn in [2, 3, 5]:
+        for _ in range(100):
+            v = [rng.next() for _ in range(vn - 1)]
+            v.append(rng.next() | (u64(1) << u64(63)))
+            u = [rng.next() for _ in range(vn)]
+            u[vn - 1] = v[vn - 2] - (rng.next() >> u64(1)) - u64(1) if v[vn - 2] > u64(1) else u64(0)
+            u.append(v[vn - 1])
+            if not _identity(_limb_list_value(u, 512), _limb_list_value(v, 512)): bad += 1
+    assert_eq('Long division: quotient estimates that do not fit a limb', bad, 0)
+
+    # A zero divisor raises (it used to kill the process), at every party alike
+    raised = 0
+    for i in range(4):
+        try:
+            if i == 0: limbs.umod(UInt[192](5) << UInt[192](150), UInt[192](0))
+            elif i == 1: limbs.udiv(UInt[256](7), UInt[256](0))
+            elif i == 2: UInt[512](3) % UInt[512](0)
+            else: Int[512](-3) // Int[512](0)
+        except ZeroDivisionError:
+            raised += 1
+    assert_eq('Division by zero on integers wider than 128 bits raises ZeroDivisionError', raised, 4)
+
+    # Python's integers as a second opinion on a sample
+    bad = 0
+    for i in range(150):
+        a = rng.pattern(int(rng.next() % u64(512)) + 1, 512)
+        b = rng.pattern(int(rng.next() % u64(512)) + 1, 512)
+        q, r = limbs.udivrem(a, b)
+        want = py_divisions(str(a), str(b)).split(' ')
+        if str(q) != want[0] or str(r) != want[1]: bad += 1
+    assert_eq('Limb division agrees with Python on a sample of 512-bit operands', bad, 0)
+
+
+def _signed_checks(N: Literal[int], rng: _Rng, count: int) -> int:
+    # //, % (C: truncated, the dividend's sign), div_floor and mod_nonneg (floored, non-negative) against Python, all
+    # four sign combinations, divisors of one limb and of several
+    bad = 0
+    for i in range(count):
+        a = Int[N](rng.pattern(int(rng.next() % u64(N - 1)) + 1, N))
+        nb = 60 if i % 3 == 0 else int(rng.next() % u64(N - 1)) + 1
+        b = Int[N](rng.pattern(nb, N))
+        if i & 1: a = -a
+        if i & 2: b = -b
+        want = py_divisions(str(a), str(b)).split(' ')
+        if str(a // b) != want[0] or str(a % b) != want[1]: bad += 1
+        if str(a.div_floor(b)) != want[2] or str(a.mod_nonneg(b)) != want[3]: bad += 1
+        q, r = divmod(a, b)
+        if q != a // b or r != a % b: bad += 1
+    return bad
+
+
+def test_wide_operators():
+    rng = _Rng(u64(7))
+    # %, // and divmod on unsigned integers: the field, the ring, both operands in 64 bits, a dividend below the
+    # divisor, a power of two, one limb, several, against the long division
+    bad = 0
+    for i in range(3000):
+        a = rng.bits(MPC_INT_SIZE, MPC_INT_SIZE)
+        k = i % 7
+        m = mpc_uint(1)
+        if k == 0: m = MPC_FIELD_SIZE
+        elif k == 1: m = MPC_RING_SIZE
+        elif k == 2:
+            a = a & mpc_uint((1 << 62) - 1)
+            m = mpc_uint(37)
+        elif k == 3: m = a + mpc_uint(1) if a != ~mpc_uint(0) else a
+        elif k == 4: m = mpc_uint(1) << mpc_uint(int(rng.next() % u64(MPC_INT_SIZE)))
+        elif k == 5: m = rng.pattern(61, MPC_INT_SIZE)
+        else: m = rng.pattern(int(rng.next() % u64(MPC_INT_SIZE)) + 1, MPC_INT_SIZE)
+        q, r = limbs.udivrem(a, m)
+        if a % m != r or a // m != q or divmod(a, m) != (q, r): bad += 1
+    assert_eq('UInt %, // and divmod above 128 bits (the field, the ring, 64-bit, small, power-of-two, one-limb and wide moduli)', bad, 0)
+    assert_eq('Int //, %, divmod, div_floor and mod_nonneg at 192 bits against Python (all sign combinations)', _signed_checks(192, rng, 300), 0)
+    assert_eq('Int //, %, divmod, div_floor and mod_nonneg at 512 bits against Python (all sign combinations)', _signed_checks(512, rng, 300), 0)
+    assert_eq('Int div_floor and mod_nonneg at 64 bits', (Int[64](-7).div_floor(Int[64](2)), Int[64](-7).mod_nonneg(Int[64](-3)), Int[64](7).mod_nonneg(Int[64](-3))), (Int[64](-4), Int[64](2), Int[64](1)))
+    # The most negative value divided by -1 wraps to itself (two's complement), as limbs.sdiv documents (LLVM's sdiv
+    # leaves it undefined, and x86-64's idiv traps)
+    lo = Int[192](1) << Int[192](191)
+    assert_eq('Int[192]: the most negative value // -1', lo // Int[192](-1), lo)
+    # Codon's parser (its overflow cutoff) and its format specs divide wide integers through the same methods (str()
+    # divides by 10 bit by bit): decimal and hexadecimal round trips against Python
+    bad = 0
+    for i in range(50):
+        x = rng.pattern(int(rng.next() % u64(512)) + 1, 512)
+        s = str(x)
+        if UInt[512](s) != x or f"{x:x}" != py_hex(s) or str(Int[512](x >> UInt[512](1))) != str(x >> UInt[512](1)): bad += 1
+    assert_eq('Wide integers formatted and parsed (decimal and hexadecimal) as Python does', bad, 0)
+
+
+def _hand(a: UInt[N], b: UInt[N], N: Literal[int]) -> UInt[N]:
+    if N == 128:
+        return modular_mul_u128u128_v1(a, b)
+    else:
+        return modular_mul_u192u192(a, b)
+
+
+def _hand_u64(a: UInt[N], b: u64, N: Literal[int]) -> UInt[N]:
+    if N == 128:
+        return modular_mul_u128u64_v1(a, b)
+    else:
+        return modular_mul_u192u64(a, b)
+
+
+def _reference(a: UInt[N], b: UInt[N], p: UInt[N], N: Literal[int]) -> UInt[N]:
+    # the product modulo p by division: the double-width product, divided
+    W: Literal[int] = 2 * N
+    return limbs._trunc(limbs.umod(limbs._zext(a, W, N) * limbs._zext(b, W, N), limbs._zext(p, W, N)), N, W)
+
+
+def _field_kernel_at(L: Literal[int], C: Literal[int], N: Literal[int], rng: _Rng, count: int) -> int:
+    # The generic kernel at (N, L, C) against the division for any operands below 2^N: random ones below p and below
+    # 2^N, and the edges (0, 1, p - 1, so (p - 1)^2 among the products, p and just above, 2^L, 2^N - 1); at 128 and
+    # 192 bits also against the hand-written kernels, where those are right (wide factors below 2^L, a u64 factor with
+    # any operand)
+    T = UInt[N]
+    p = (T(1) << T(L)) - T(C)
+    l2 = T(1) << T(L)
+    full = ~T(0)
+    edges = [T(0), T(1), T(2), T(C), p - T(1), p - T(2), (p - T(1)) >> T(1), T(1) << T(L - 1), l2 - T(1), l2,
+             l2 + T(1), full, full - T(1), T(1) << T(N - 1)]
+    for k in range(C):
+        edges.append(p + T(k))
+    pairs = List[Tuple[T, T]]()
+    for x in edges:
+        for y in edges:
+            pairs.append((x, y))
+    for i in range(count):
+        if i % 2:
+            pairs.append((rng.bits(L, N) % p, rng.bits(L, N) % p))
+        else:
+            pairs.append((rng.bits(N, N), rng.bits(N, N)))
+    bad = 0
+    for a, b in pairs:
+        g = limbs.pm_mul(a, b, L, C)
+        if g != _reference(a, b, p, N): bad += 1
+        bl = limbs.to_u64(b, N)
+        gu = limbs.pm_mul_u64(a, bl, L, C)
+        if gu != _reference(a, limbs.from_u64(bl, N), p, N): bad += 1
+        s = int(bl >> u64(1))
+        sn = limbs.pm_mul_int(a, -s, L, C)
+        r = _reference(a, limbs.from_u64(u64(s), N), p, N)
+        if sn != (p - r if r != T(0) else r): bad += 1
+        if (N == 128 and L == 127 and C == 1) or (N == 192 and L == 174 and C == 3):
+            if a < l2 and b < l2 and g != _hand(a, b, N): bad += 1
+            if gu != _hand_u64(a, bl, N): bad += 1
+    return bad
+
+
+def test_field_kernel():
+    rng = _Rng(u64(11))
+    assert_eq('The generic field kernel at 2^127 - 1 (128 bits): the division for any operands, the hand-written kernels where they are right', _field_kernel_at(127, 1, 128, rng, 3000), 0)
+    assert_eq('The generic field kernel at 2^174 - 3 (192 bits): the division for any operands, the hand-written kernels where they are right', _field_kernel_at(174, 3, 192, rng, 3000), 0)
+    assert_eq('The generic field kernel at 2^251 - 9 (256 bits): the division for any operands', _field_kernel_at(251, 9, 256, rng, 3000), 0)
+
+    # The build's field: mul_mod by a share, a u64 and an int (a negative int multiplies as a negative number; DEBUG
+    # builds refuse one, so they get positive ints only), %, add_mod, sub_mod and lsh_mod, against the division
+    p = MPC_FIELD_SIZE
+    bad = 0
+    for i in range(3000):
+        a = rng.bits(MPC_MODULUS_BITS, MPC_INT_SIZE) % p
+        b = rng.bits(MPC_MODULUS_BITS, MPC_INT_SIZE) % p
+        w = rng.bits(MPC_INT_SIZE, MPC_INT_SIZE)
+        u = rng.next()
+        s = int(u >> u64(1)) * (-1 if i & 1 and not DEBUG else 1)
+        if a.mul_mod(b, p) != _reference(a, b, p): bad += 1
+        if a.mul_mod(u, p) != _reference(a, limbs.from_u64(u, MPC_INT_SIZE), p): bad += 1
+        sp = _reference(a, limbs.from_u64(u64(s if s >= 0 else -s), MPC_INT_SIZE), p)
+        if a.mul_mod(s, p) != (sp if s >= 0 else (p - sp) % p): bad += 1
+        if w % p != limbs.umod(w, p): bad += 1
+        if a.add_mod(b, p) != limbs.umod(limbs._zext(a, MPC_INT_SIZE + 64, MPC_INT_SIZE) + limbs._zext(b, MPC_INT_SIZE + 64, MPC_INT_SIZE), limbs._zext(p, MPC_INT_SIZE + 64, MPC_INT_SIZE)).trunc_to(MPC_INT_SIZE): bad += 1
+        if a.sub_mod(b, p) != (a - b if a >= b else p - (b - a)): bad += 1
+        sh = int(rng.next() % u64(MPC_MODULUS_BITS))
+        if a.lsh_mod(sh, p) != _reference(a, mpc_uint(1) << mpc_uint(sh), p): bad += 1
+    assert_eq(f'The field 2^{MPC_MODULUS_BITS} - {MPC_MERSENNE_OFFSET}: mul_mod (share, u64, int), %, add_mod, sub_mod and lsh_mod against the division', bad, 0)
+
+    # matmul_mod and Strassen's product on the field, random full-range entries, against per-entry sums of products
+    for n in [7, 33]:
+        x = [[rng.bits(MPC_MODULUS_BITS, MPC_INT_SIZE) % p for _ in range(n)] for _ in range(n)]
+        y = [[rng.bits(MPC_MODULUS_BITS, MPC_INT_SIZE) % p for _ in range(n)] for _ in range(n)]
+        want = [[mpc_uint(0) for _ in range(n)] for _ in range(n)]
+        for i in range(n):
+            for j in range(n):
+                acc = mpc_uint(0)
+                for k in range(n):
+                    acc = (acc + _reference(x[i][k], y[k][j], p)) % p
+                want[i][j] = acc
+        assert_eq(f'matmul_mod on the field, {n}x{n} random entries', x.matmul_mod(y, p), want)
+        assert_eq(f'Strassen on the field, {n}x{n} random entries', strassen(x, y, p), want)
+
+
+def test_mul_mod_any():
+    # UInt.mul_mod for a modulus that is neither the field nor the ring: exact for any width (L-295: the old path
+    # multiplied in 64 bits)
+    rng = _Rng(u64(13))
+    moduli = [mpc_uint(1000003), mpc_uint((1 << 61) - 1), (mpc_uint(1) << mpc_uint(65)) + mpc_uint(13),
+              rng.pattern(100, MPC_INT_SIZE) | mpc_uint(1), rng.pattern(MPC_INT_SIZE - 3, MPC_INT_SIZE) | mpc_uint(1)]
+    bad = 0
+    for m in moduli:
+        for i in range(60):
+            a = rng.bits(MPC_INT_SIZE, MPC_INT_SIZE) % m
+            b = rng.bits(MPC_INT_SIZE, MPC_INT_SIZE) % m
+            if str(a.mul_mod(b, m)) != py_mul_mod(str(a), str(b), str(m)): bad += 1
+            s = int(rng.next() >> u64(2)) * (-1 if i & 1 and not DEBUG else 1)  # DEBUG builds refuse a negative one
+            if str(a.mul_mod(s, m)) != py_mul_mod(str(a), str(s), str(m)): bad += 1
+    assert_eq('mul_mod modulo 2^61 - 1, 2^65 + 13 and wider moduli against Python (share and signed int factors)', bad, 0)
+    # Moduli within 64 bits (the tests' 16 and 37 among them): a power of two takes a mask, a product within 64 bits
+    # one 64-bit division, a wider one the 128 / 64-bit division; operands of any size up to 2^64, u64 factors included
+    bad = 0
+    for m in [mpc_uint(16), mpc_uint(37), mpc_uint(1), mpc_uint(1) << mpc_uint(63), mpc_uint(0xffffffff),
+              (mpc_uint(1) << mpc_uint(64)) - mpc_uint(59)]:
+        for i in range(60):
+            nbits = [5, 31, 32, 33, 63, 64][i % 6]
+            a = rng.bits(nbits, MPC_INT_SIZE)
+            b = rng.bits(nbits, MPC_INT_SIZE)
+            if str(a.mul_mod(b, m)) != py_mul_mod(str(a), str(b), str(m)): bad += 1
+            u = rng.next() | (u64(1) << u64(63))
+            if str(a.mul_mod(u, m)) != py_mul_mod(str(a), str(u), str(m)): bad += 1
+    assert_eq('mul_mod modulo 16, 37, 1, 2^63, 2^32 - 1 and 2^64 - 59 against Python (operands to 64 bits, u64 factors of 2^63 or more)', bad, 0)
+
+
+def test_wide_repr():
+    # Importing the hand-written kernels (above) leaves the printing of wider integers alone: their __repr__ walked 128
+    # or 175 bits, and would have won over Sequre's had they still extended UInt with one
+    x = (UInt[512](1) << UInt[512](500)) + UInt[512](12345)
+    want = py_power_of_two_plus(500, 12345)
+    assert_eq('A 512-bit value prints in full where the hand-written kernels are imported', x.__repr__(), want)
+    assert_eq('A list of 512-bit values prints in full where the hand-written kernels are imported', [x, UInt[512](7)].__repr__(), f"[{want}, 7]")
+
+
+def test_limbs():
+    test_limb_division()
+    test_wide_operators()
+    test_field_kernel()
+    test_mul_mod_any()
+    test_wide_repr()

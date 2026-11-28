@@ -45,7 +45,7 @@ sequre build examples/addmul.codon -o addmul
 ./addmul --local
 ```
 
-> **Note:** A built binary runs without the `sequre` launcher: on x86-64 Linux, `sequre build` links Sequre's alignment shim into it, and it finds the GMP library bundled with Sequre itself. A program that uses Python interop also needs `CODON_PYTHON` (see [troubleshooting](https://0xTCG.github.io/sequre/user-guide/troubleshooting/#libpython-for-python-interop)). The binary refers to Sequre's libraries by absolute path: to run it on another machine, install Sequre there at the same path.
+> **Note:** A built binary runs without the `sequre` launcher: on x86-64 Linux, `sequre build` links Sequre's alignment shim into it. A program that uses Python interop also needs `CODON_PYTHON` (see [troubleshooting](https://0xTCG.github.io/sequre/user-guide/troubleshooting/#libpython-for-python-interop)). The binary refers to Sequre's libraries by absolute path: to run it on another machine, install Sequre there at the same path.
 
 ### Release vs debug mode
 

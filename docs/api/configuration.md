@@ -15,7 +15,6 @@ Sequre's behavior is controlled through compile-time constants and environment v
 
 | Variable | Default | Description |
 |---|---|---|
-| `SEQURE_GMP_PATH` | _(auto-detected)_ | Path to GMP shared library (`.so` on Linux, `.dylib` on macOS). Unset, the runtime takes the copy bundled with the plugin (`<plugin>/lib`, located when the program is compiled, so built binaries find it too), then a system library (see [libgmp](../user-guide/troubleshooting.md#libgmp-gmp)). |
 | `SEQURE_OPENSSL_PATH` | _(auto-detected)_ | Path to OpenSSL `libssl` |
 | `SEQURE_LIBCRYPTO_PATH` | _(auto-detected)_ | Path to OpenSSL `libcrypto` |
 

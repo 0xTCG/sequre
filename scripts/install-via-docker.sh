@@ -73,11 +73,13 @@ case "$ARCH" in
     exit 1
     ;;
 esac
-# The image caches the Codon release its Dockerfile names, so the name carries that release: an image built for another
-# one (before a Codon upgrade) is not reused
+# The image caches the Codon release its Dockerfile names and the build script it copies, so the name carries that
+# release and a digest of the two files: an image built from others (before a Codon upgrade or a change to the build)
+# is not reused
 DOCKERFILE="$SEQURE_SRC/docker/local-build/Dockerfile.$DOCKERFILE_ARCH"
 CODON_TAG=$(grep -o 'releases/download/v[0-9.]*' "$DOCKERFILE" | head -n 1 | sed 's|.*/||')
-DOCKER_IMAGE="sequre-builder-$DOCKERFILE_ARCH${CODON_TAG:+-codon-${CODON_TAG#v}}"
+BUILD_DIGEST=$(cat "$DOCKERFILE" "$SEQURE_SRC/docker/local-build/build-sequre.sh" | sha256sum | cut -c1-12)
+DOCKER_IMAGE="sequre-builder-$DOCKERFILE_ARCH${CODON_TAG:+-codon-${CODON_TAG#v}}-$BUILD_DIGEST"
 
 # Build Docker image if it doesn't exist or --rebuild requested (caches Codon/LLVM)
 if [ "$REBUILD_IMAGE" = "1" ] || ! docker image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
@@ -121,12 +123,24 @@ echo "Build complete. Extracting to $INSTALL_PATH..."
 # Create the install directory and extract. As install.sh does, first replace what the tarball owns outright, so that
 # an install over an earlier one keeps none of that one's files: Codon's stdlib and headers (the tarball carries no
 # headers) and Sequre's plugin, which is moved to lib/codon/plugins/sequre.previous when it holds entries this build
-# lacks (a user's files). The seq plugin that Sequre's archives for Codon 0.19 bundled goes too.
+# lacks (a user's files), but not for a lib/ of nothing but the shared libraries that earlier builds bundled there.
+# The seq plugin that Sequre's archives for Codon 0.19 bundled goes too.
 mkdir -p "$INSTALL_PATH"
 tar -tzf "$TARBALL" > "$BUILD_OUTPUT/tarball.list"
 in_tarball() {  # in_tarball <path>: the tarball has <path> or something under it
   awk -v p="$1" '{ sub(/^\.\//, ""); if ($0 == p || $0 == p "/" || index($0, p "/") == 1) { found = 1; exit } }
                  END { exit !found }' "$BUILD_OUTPUT/tarball.list"
+}
+only_shared_libraries() {  # only_shared_libraries <dir>: a directory of regular *.so, *.so.* or *.dylib files only
+  [ -d "$1" ] && [ ! -L "$1" ] || return 1
+  for f in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    if [ -e "$f" ] || [ -L "$f" ]; then
+      case "${f##*/}" in
+        *.so|*.so.*|*.dylib) [ -f "$f" ] && [ ! -L "$f" ] || return 1 ;;
+        *) return 1 ;;
+      esac
+    fi
+  done
 }
 PLUGINS="$INSTALL_PATH/lib/codon/plugins"
 rm -rf "$INSTALL_PATH/lib/codon/stdlib" "$INSTALL_PATH/include/codon"
@@ -137,8 +151,13 @@ if [ -d "$PLUGINS/seq" ] && [ -d "$PLUGINS/sequre" ] && [ ! -f "$PLUGINS/sequre/
 fi
 if [ -e "$PLUGINS/sequre" ] || [ -L "$PLUGINS/sequre" ]; then
   extra=""
-  for entry in "$PLUGINS/sequre"/* "$PLUGINS/sequre"/.[!.]*; do
+  for entry in "$PLUGINS/sequre"/* "$PLUGINS/sequre"/.[!.]* "$PLUGINS/sequre"/..?*; do
     if [ -e "$entry" ] || [ -L "$entry" ]; then
+      # lib: the shared libraries that earlier builds bundled beside the plugin, which this one does not: the build's
+      # own, not the user's, as long as it holds nothing else
+      if [ "${entry##*/}" = lib ] && ! in_tarball lib/codon/plugins/sequre/lib && only_shared_libraries "$entry"; then
+        continue
+      fi
       in_tarball "lib/codon/plugins/sequre/${entry##*/}" || extra="$extra ${entry##*/}"
     fi
   done
